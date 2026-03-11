@@ -16,10 +16,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Messages — what goes into and out of the LLM
-# ---------------------------------------------------------------------------
-
 
 class Role(StrEnum):
     """Message roles in a conversation."""
@@ -42,11 +38,6 @@ class Message:
     content: str
     name: str | None = None  # Tool name when role=TOOL
     meta: dict[str, Any] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Actions — what the agent decides to do at each step
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -73,13 +64,7 @@ class Clarification:
     options: list[str] = field(default_factory=list)
 
 
-# Union of all possible actions an agent can take
 Action = ToolCall | Finish | Clarification
-
-
-# ---------------------------------------------------------------------------
-# AgentStep — one iteration of the agent loop
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -94,11 +79,6 @@ class AgentStep:
     action: Action
     raw_response: str | None = None  # Original LLM text (for tracing)
     meta: dict[str, Any] = field(default_factory=dict)  # extra_fields land here
-
-
-# ---------------------------------------------------------------------------
-# Tool execution types
-# ---------------------------------------------------------------------------
 
 
 class ToolTarget(StrEnum):
@@ -139,11 +119,6 @@ class ToolResult:
     duration_ms: int = 0
 
 
-# ---------------------------------------------------------------------------
-# LLM types — what the provider returns
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class UsageStats:
     """Token usage from an LLM call."""
@@ -166,11 +141,6 @@ class LLMResponse:
     tool_calls: list[ToolCall] | None = None
     raw: Any = None  # Full provider response for debugging
     usage: UsageStats = field(default_factory=UsageStats)
-
-
-# ---------------------------------------------------------------------------
-# Run types — the final output
-# ---------------------------------------------------------------------------
 
 
 class RunStatus(StrEnum):
@@ -201,9 +171,4 @@ class RunResult:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Input types
-# ---------------------------------------------------------------------------
-
-# RunInput can be a simple string or a dict with structured input
 RunInput = str | dict[str, Any]
