@@ -1,6 +1,9 @@
 # AI instructions
 CLAUDE.md
 
+# Private design docs (tracked in separate private repo)
+owner-docs/
+
 # Python
 __pycache__/
 *.py[cod]
