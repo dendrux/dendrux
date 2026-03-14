@@ -1,5 +1,4 @@
-# Private docs and AI instructions
-owner-docs/
+# AI instructions
 CLAUDE.md
 
 # Python
@@ -23,7 +22,7 @@ venv/
 *.swp
 *.swo
 *~
-
+backup/
 # Environment / secrets
 .env
 *.local
