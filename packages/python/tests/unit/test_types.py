@@ -1,5 +1,7 @@
 """Tests for core types."""
 
+import pytest
+
 from dendrite.types import (
     Action,
     AgentStep,
@@ -7,6 +9,7 @@ from dendrite.types import (
     Finish,
     LLMResponse,
     Message,
+    ProviderCapabilities,
     Role,
     RunResult,
     RunStatus,
@@ -24,22 +27,91 @@ class TestMessage:
         assert msg.role == Role.USER
         assert msg.content == "Hello"
         assert msg.name is None
+        assert msg.tool_calls is None
+        assert msg.call_id is None
         assert msg.meta == {}
 
+    def test_create_system_message(self) -> None:
+        msg = Message(role=Role.SYSTEM, content="You are helpful")
+        assert msg.role == Role.SYSTEM
+
+    def test_create_assistant_message(self) -> None:
+        msg = Message(role=Role.ASSISTANT, content="Hello!")
+        assert msg.role == Role.ASSISTANT
+        assert msg.tool_calls is None
+
+    def test_create_assistant_message_with_tool_calls(self) -> None:
+        tc = ToolCall(name="add", params={"a": 1, "b": 2})
+        msg = Message(role=Role.ASSISTANT, content="Let me calculate", tool_calls=[tc])
+        assert msg.tool_calls is not None
+        assert len(msg.tool_calls) == 1
+        assert msg.tool_calls[0].name == "add"
+
     def test_create_tool_message(self) -> None:
-        msg = Message(role=Role.TOOL, content='{"result": 42}', name="add")
+        msg = Message(role=Role.TOOL, content='{"result": 42}', name="add", call_id="01ABC")
         assert msg.name == "add"
+        assert msg.call_id == "01ABC"
 
     def test_message_is_frozen(self) -> None:
         msg = Message(role=Role.USER, content="Hello")
-        try:
+        with pytest.raises(AttributeError):
             msg.content = "Changed"  # type: ignore[misc]
-            raise AssertionError("Should have raised FrozenInstanceError")
-        except AttributeError:
-            pass
 
 
-class TestActions:
+class TestMessageInvariants:
+    """Role-dependent invariants enforced via __post_init__."""
+
+    def test_tool_message_requires_name(self) -> None:
+        with pytest.raises(ValueError, match="TOOL messages require name"):
+            Message(role=Role.TOOL, content="result", call_id="01ABC")
+
+    def test_tool_message_requires_call_id(self) -> None:
+        with pytest.raises(ValueError, match="TOOL messages require call_id"):
+            Message(role=Role.TOOL, content="result", name="add")
+
+    def test_tool_message_cannot_have_tool_calls(self) -> None:
+        tc = ToolCall(name="add", params={})
+        with pytest.raises(ValueError, match="TOOL messages cannot have tool_calls"):
+            Message(
+                role=Role.TOOL,
+                content="result",
+                name="add",
+                call_id="01ABC",
+                tool_calls=[tc],
+            )
+
+    def test_assistant_cannot_have_call_id(self) -> None:
+        with pytest.raises(ValueError, match="ASSISTANT messages cannot have call_id"):
+            Message(role=Role.ASSISTANT, content="Hi", call_id="01ABC")
+
+    def test_assistant_cannot_have_name(self) -> None:
+        with pytest.raises(ValueError, match="ASSISTANT messages cannot have name"):
+            Message(role=Role.ASSISTANT, content="Hi", name="bot")
+
+    def test_user_cannot_have_tool_calls(self) -> None:
+        tc = ToolCall(name="add", params={})
+        with pytest.raises(ValueError, match="USER messages cannot have tool_calls"):
+            Message(role=Role.USER, content="Hi", tool_calls=[tc])
+
+    def test_user_cannot_have_call_id(self) -> None:
+        with pytest.raises(ValueError, match="USER messages cannot have call_id"):
+            Message(role=Role.USER, content="Hi", call_id="01ABC")
+
+    def test_user_cannot_have_name(self) -> None:
+        with pytest.raises(ValueError, match="USER messages cannot have name"):
+            Message(role=Role.USER, content="Hi", name="alice")
+
+    def test_system_cannot_have_tool_calls(self) -> None:
+        tc = ToolCall(name="add", params={})
+        with pytest.raises(ValueError, match="SYSTEM messages cannot have tool_calls"):
+            Message(role=Role.SYSTEM, content="prompt", tool_calls=[tc])
+
+    def test_system_cannot_have_name(self) -> None:
+        with pytest.raises(ValueError, match="SYSTEM messages cannot have name"):
+            Message(role=Role.SYSTEM, content="prompt", name="sys")
+
+
+class TestToolCall:
     def test_tool_call(self) -> None:
         tc = ToolCall(name="search", params={"q": "test"})
         assert tc.name == "search"
@@ -49,6 +121,30 @@ class TestActions:
         tc = ToolCall(name="get_metadata")
         assert tc.params == {}
 
+    def test_tool_call_has_dendrite_id(self) -> None:
+        tc = ToolCall(name="add", params={"a": 1})
+        assert tc.id is not None
+        assert len(tc.id) > 0
+
+    def test_tool_call_ids_are_unique(self) -> None:
+        tc1 = ToolCall(name="add")
+        tc2 = ToolCall(name="add")
+        assert tc1.id != tc2.id
+
+    def test_tool_call_provider_id_defaults_none(self) -> None:
+        tc = ToolCall(name="add")
+        assert tc.provider_tool_call_id is None
+
+    def test_tool_call_with_provider_id(self) -> None:
+        tc = ToolCall(
+            name="add",
+            params={"a": 1},
+            provider_tool_call_id="toolu_abc123",
+        )
+        assert tc.provider_tool_call_id == "toolu_abc123"
+
+
+class TestActions:
     def test_finish(self) -> None:
         f = Finish(answer="The answer is 42")
         assert f.answer == "The answer is 42"
@@ -126,14 +222,43 @@ class TestToolDef:
 
 class TestToolResult:
     def test_success_result(self) -> None:
-        tr = ToolResult(name="add", result=42)
+        tr = ToolResult(name="add", call_id="01ABC", payload='{"result": 42}')
         assert tr.success is True
         assert tr.error is None
+        assert tr.call_id == "01ABC"
+        assert tr.payload == '{"result": 42}'
 
     def test_error_result(self) -> None:
-        tr = ToolResult(name="add", result=None, success=False, error="Division by zero")
+        tr = ToolResult(
+            name="add",
+            call_id="01ABC",
+            payload="null",
+            success=False,
+            error="Division by zero",
+        )
         assert tr.success is False
         assert tr.error == "Division by zero"
+
+
+class TestProviderCapabilities:
+    def test_defaults_are_conservative(self) -> None:
+        caps = ProviderCapabilities()
+        assert caps.supports_native_tools is False
+        assert caps.supports_streaming is False
+        assert caps.supports_system_prompt is True  # Most providers support this
+        assert caps.max_context_tokens is None
+
+    def test_custom_capabilities(self) -> None:
+        caps = ProviderCapabilities(
+            supports_native_tools=True,
+            supports_tool_call_ids=True,
+            supports_streaming=True,
+            supports_streaming_tool_deltas=True,
+            supports_parallel_tool_calls=True,
+            max_context_tokens=200_000,
+        )
+        assert caps.supports_native_tools is True
+        assert caps.max_context_tokens == 200_000
 
 
 class TestLLMResponse:
@@ -149,6 +274,17 @@ class TestLLMResponse:
         assert resp.text is None
         assert resp.tool_calls is not None
         assert len(resp.tool_calls) == 1
+
+    def test_tool_call_response_has_ids(self) -> None:
+        tc = ToolCall(
+            name="search",
+            params={"q": "test"},
+            provider_tool_call_id="toolu_xyz",
+        )
+        resp = LLMResponse(tool_calls=[tc])
+        assert resp.tool_calls is not None
+        assert resp.tool_calls[0].id is not None
+        assert resp.tool_calls[0].provider_tool_call_id == "toolu_xyz"
 
     def test_usage_stats(self) -> None:
         usage = UsageStats(input_tokens=100, output_tokens=50, total_tokens=150)

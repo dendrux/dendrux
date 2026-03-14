@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from dendrite.types import StreamEvent, StreamEventType
+from dendrite.types import ProviderCapabilities, StreamEvent, StreamEventType
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -20,16 +20,20 @@ if TYPE_CHECKING:
 class LLMProvider(ABC):
     """Base class for LLM providers.
 
-    Subclasses must implement complete(). The complete_stream() method has a
-    default fallback that calls complete() and yields the result as events.
-    Override complete_stream() for real token-by-token streaming.
+    Subclasses must implement complete() and declare capabilities.
+    The complete_stream() method has a default fallback that calls complete()
+    and yields the result as events. Override for real token-by-token streaming.
 
     Usage:
         class MyProvider(LLMProvider):
+            capabilities = ProviderCapabilities(supports_native_tools=True, ...)
+
             async def complete(self, messages, tools=None, **kwargs) -> LLMResponse:
                 # call your LLM API here
                 ...
     """
+
+    capabilities: ProviderCapabilities = ProviderCapabilities()
 
     @abstractmethod
     async def complete(

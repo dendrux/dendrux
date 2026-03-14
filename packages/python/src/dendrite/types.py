@@ -16,6 +16,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ulid import ULID
+
+
+def generate_ulid() -> str:
+    """Generate a new ULID string for Dendrite-owned correlation IDs."""
+    return str(ULID())
+
 
 class Role(StrEnum):
     """Message roles in a conversation."""
@@ -27,25 +34,63 @@ class Role(StrEnum):
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    """Agent wants to execute a tool.
+
+    Carries both a Dendrite-owned ID (stable across pause/resume/replay)
+    and the provider's native ID (for building API requests back).
+    """
+
+    name: str
+    params: dict[str, Any] = field(default_factory=dict)
+    id: str = field(default_factory=generate_ulid)
+    provider_tool_call_id: str | None = None
+
+
+@dataclass(frozen=True)
 class Message:
     """A single message in the conversation.
 
-    This is the universal format — strategies convert to/from provider-specific
+    This is the universal format — providers convert to/from their native
     formats internally. Developers and Dendrite internals only deal with Message.
+
+    Role-dependent fields:
+        tool_calls: Present on ASSISTANT messages when the LLM called tools
+                    (NativeToolCalling strategy). None for text-only turns
+                    and all PromptBasedReAct turns.
+        call_id:    Present on TOOL messages. References ToolCall.id (Dendrite ULID)
+                    from the corresponding ASSISTANT message.
+        name:       Present on TOOL messages only. Cached convenience field for
+                    debugging/logging — call_id is the authoritative identity.
     """
 
     role: Role
     content: str
-    name: str | None = None  # Tool name when role=TOOL
+    name: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    call_id: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
-
-@dataclass(frozen=True)
-class ToolCall:
-    """Agent wants to execute a tool."""
-
-    name: str
-    params: dict[str, Any] = field(default_factory=dict)
+    def __post_init__(self) -> None:
+        if self.role == Role.TOOL:
+            if not self.name:
+                raise ValueError("TOOL messages require name")
+            if not self.call_id:
+                raise ValueError("TOOL messages require call_id")
+            if self.tool_calls is not None:
+                raise ValueError("TOOL messages cannot have tool_calls")
+        elif self.role == Role.ASSISTANT:
+            if self.call_id is not None:
+                raise ValueError("ASSISTANT messages cannot have call_id")
+            if self.name is not None:
+                raise ValueError("ASSISTANT messages cannot have name")
+        else:
+            if self.tool_calls is not None:
+                raise ValueError(f"{self.role.value.upper()} messages cannot have tool_calls")
+            if self.call_id is not None:
+                raise ValueError(f"{self.role.value.upper()} messages cannot have call_id")
+            if self.name is not None:
+                raise ValueError(f"{self.role.value.upper()} messages cannot have name")
 
 
 @dataclass(frozen=True)
@@ -110,10 +155,15 @@ class ToolDef:
 
 @dataclass(frozen=True)
 class ToolResult:
-    """Result of executing a tool."""
+    """Result of executing a tool.
+
+    name is a cached convenience field — call_id is the authoritative
+    identity for correlation (call_id → ToolCall.id → ToolCall.name).
+    """
 
     name: str
-    result: Any
+    call_id: str  # References ToolCall.id (Dendrite-owned)
+    payload: str  # Always JSON string — serialized once by execution engine
     success: bool = True
     error: str | None = None
     duration_ms: int = 0
@@ -141,6 +191,26 @@ class LLMResponse:
     tool_calls: list[ToolCall] | None = None
     raw: Any = None  # Full provider response for debugging
     usage: UsageStats = field(default_factory=UsageStats)
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """What an LLM provider can do.
+
+    Layers above check these flags instead of using isinstance.
+    Strategy selection, streaming decisions, and tool handling
+    all key off capabilities, not provider type.
+    """
+
+    supports_native_tools: bool = False
+    supports_tool_call_ids: bool = False
+    supports_streaming: bool = False
+    supports_streaming_tool_deltas: bool = False
+    supports_thinking: bool = False
+    supports_multimodal: bool = False
+    supports_system_prompt: bool = True
+    supports_parallel_tool_calls: bool = False
+    max_context_tokens: int | None = None
 
 
 class RunStatus(StrEnum):
