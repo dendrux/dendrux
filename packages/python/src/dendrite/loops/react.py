@@ -10,6 +10,11 @@ The core agent execution loop. Orchestrates the cycle of:
 
 The loop never touches provider-specific APIs or prompt formatting.
 It operates entirely on Dendrite's universal types.
+
+Observer hooks fire at three kinds of points:
+  - After each history.append() → on_message_appended
+  - After provider.complete() → on_llm_call_completed
+  - After _execute_tool() → on_tool_completed
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -40,7 +46,43 @@ if TYPE_CHECKING:
 
     from dendrite.agent import Agent
     from dendrite.llm.base import LLMProvider
+    from dendrite.loops.base import LoopObserver
     from dendrite.strategies.base import Strategy
+    from dendrite.types import LLMResponse
+
+logger = logging.getLogger(__name__)
+
+
+async def _notify_message(observer: LoopObserver | None, message: Message, iteration: int) -> None:
+    """Notify observer of a message append, swallowing exceptions."""
+    if observer is None:
+        return
+    try:
+        await observer.on_message_appended(message, iteration)
+    except Exception:
+        logger.warning("Observer.on_message_appended failed", exc_info=True)
+
+
+async def _notify_llm(observer: LoopObserver | None, response: LLMResponse, iteration: int) -> None:
+    """Notify observer of an LLM call completion, swallowing exceptions."""
+    if observer is None:
+        return
+    try:
+        await observer.on_llm_call_completed(response, iteration)
+    except Exception:
+        logger.warning("Observer.on_llm_call_completed failed", exc_info=True)
+
+
+async def _notify_tool(
+    observer: LoopObserver | None, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+) -> None:
+    """Notify observer of a tool completion, swallowing exceptions."""
+    if observer is None:
+        return
+    try:
+        await observer.on_tool_completed(tool_call, tool_result, iteration)
+    except Exception:
+        logger.warning("Observer.on_tool_completed failed", exc_info=True)
 
 
 class ReActLoop(Loop):
@@ -66,13 +108,18 @@ class ReActLoop(Loop):
         provider: LLMProvider,
         strategy: Strategy,
         user_input: str,
+        run_id: str | None = None,
+        observer: LoopObserver | None = None,
     ) -> RunResult:
         """Execute the ReAct loop."""
-        run_id = generate_ulid()
+        resolved_run_id = run_id or generate_ulid()
         tool_defs = agent.get_tool_defs()
         tool_lookup = _build_tool_lookup(agent.tools)
 
-        history: list[Message] = [Message(role=Role.USER, content=user_input)]
+        user_msg = Message(role=Role.USER, content=user_input)
+        history: list[Message] = [user_msg]
+        await _notify_message(observer, user_msg, 0)
+
         steps: list[AgentStep] = []
         total_usage = UsageStats()
 
@@ -86,6 +133,7 @@ class ReActLoop(Loop):
 
             # 2. Call the LLM
             response = await provider.complete(messages, tools=tools)
+            await _notify_llm(observer, response, iteration)
 
             # Accumulate usage
             total_usage.input_tokens += response.usage.input_tokens
@@ -99,7 +147,7 @@ class ReActLoop(Loop):
             # 4. Check action type
             if isinstance(step.action, Finish):
                 return RunResult(
-                    run_id=run_id,
+                    run_id=resolved_run_id,
                     status=RunStatus.SUCCESS,
                     answer=step.action.answer,
                     steps=steps,
@@ -115,6 +163,7 @@ class ReActLoop(Loop):
                     tool_calls=response.tool_calls,
                 )
                 history.append(assistant_msg)
+                await _notify_message(observer, assistant_msg, iteration)
 
                 # Execute all tool calls from this turn and append results
                 # in the same order the assistant requested them.
@@ -123,12 +172,14 @@ class ReActLoop(Loop):
                 all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
                 for tc in all_calls:
                     tool_result = await _execute_tool(tc, tool_lookup)
+                    await _notify_tool(observer, tc, tool_result, iteration)
                     result_msg = strategy.format_tool_result(tool_result)
                     history.append(result_msg)
+                    await _notify_message(observer, result_msg, iteration)
 
         # Max iterations reached
         return RunResult(
-            run_id=run_id,
+            run_id=resolved_run_id,
             status=RunStatus.MAX_ITERATIONS,
             steps=steps,
             iteration_count=agent.max_iterations,
