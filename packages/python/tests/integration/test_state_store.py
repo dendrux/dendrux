@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from dendrite.db.models import AgentRun, Base, ReactTrace, TokenUsage, ToolCallRecord
+from dendrite.db.session import get_engine, reset_engine
 from dendrite.runtime.state import SQLAlchemyStateStore
 from dendrite.types import UsageStats
 
@@ -421,6 +422,26 @@ class TestModelRelationships:
                 select(ToolCallRecord).where(ToolCallRecord.agent_run_id == "run_cas2")
             )
             assert result.scalars().all() == []
+
+    async def test_get_engine_raises_on_url_mismatch(self) -> None:
+        """H1: get_engine() must refuse a different URL after first init."""
+        await reset_engine()  # clean slate
+        try:
+            await get_engine("sqlite+aiosqlite:///:memory:")
+            with pytest.raises(RuntimeError, match="already initialized"):
+                await get_engine("sqlite+aiosqlite:///./other.db")
+        finally:
+            await reset_engine()
+
+    async def test_get_engine_allows_same_url(self) -> None:
+        """get_engine() with the same URL should return the cached engine."""
+        await reset_engine()
+        try:
+            e1 = await get_engine("sqlite+aiosqlite:///:memory:")
+            e2 = await get_engine("sqlite+aiosqlite:///:memory:")
+            assert e1 is e2
+        finally:
+            await reset_engine()
 
     async def test_delete_parent_sets_child_null(self, store, session_factory) -> None:
         await store.create_run("parent_del", "Parent")

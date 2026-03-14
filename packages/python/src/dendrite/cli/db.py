@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 from rich.console import Console
 
@@ -72,15 +74,13 @@ def status(
     command.current(alembic_cfg, verbose=True)
 
 
-def _find_alembic_ini():  # noqa: ANN202
+def _find_alembic_ini() -> Path | None:
     """Find alembic.ini by walking up from CWD, or use package-relative path.
 
     TODO(post-alpha): alembic.ini isn't included in the wheel (hatch only packages
     src/dendrite/). For pip-installed users, either ship it as package data via
     importlib.resources or generate the Alembic config programmatically.
     """
-    from pathlib import Path
-
     # First, try CWD and parents
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from dendrite.db.models import Base
 
 _engine: AsyncEngine | None = None
+_engine_url: str | None = None
 _session_factory: sessionmaker | None = None  # type: ignore[type-arg]
 _engine_lock = threading.Lock()
 
@@ -42,16 +43,28 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
     Thread-safe: uses asyncio.Lock to prevent duplicate engine creation
     when multiple coroutines call this concurrently.
     """
-    global _engine, _session_factory  # noqa: PLW0603
+    global _engine, _engine_url, _session_factory  # noqa: PLW0603
+    resolved_url = url or get_database_url()
+
     if _engine is not None:
+        if _engine_url != resolved_url:
+            raise RuntimeError(
+                f"get_engine() already initialized with URL {_engine_url!r}, "
+                f"cannot reinitialize with {resolved_url!r}. "
+                f"Call reset_engine() first to change databases."
+            )
         return _engine
 
     with _engine_lock:
         # Double-check after acquiring lock
         if _engine is not None:
+            if _engine_url != resolved_url:
+                raise RuntimeError(
+                    f"get_engine() already initialized with URL {_engine_url!r}, "
+                    f"cannot reinitialize with {resolved_url!r}. "
+                    f"Call reset_engine() first to change databases."
+                )
             return _engine
-
-        resolved_url = url or get_database_url()
 
         # SQLite needs connect_args for async support
         connect_args = {}
@@ -64,6 +77,7 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
             connect_args=connect_args,
         )
 
+        _engine_url = resolved_url
         _session_factory = sessionmaker(  # type: ignore[call-overload]
             _engine, class_=AsyncSession, expire_on_commit=False
         )
@@ -79,11 +93,12 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
 
 async def reset_engine() -> None:
     """Dispose the current engine and session factory. Used in tests for cleanup."""
-    global _engine, _session_factory  # noqa: PLW0603
+    global _engine, _engine_url, _session_factory  # noqa: PLW0603
     with _engine_lock:
         if _engine is not None:
             await _engine.dispose()
             _engine = None
+            _engine_url = None
             _session_factory = None
 
 

@@ -107,12 +107,18 @@ async def run(
 
         # Create persistence observer
         from dendrite.runtime.observer import PersistenceObserver
+        from dendrite.tool import get_tool_def
 
+        target_lookup = {}
+        for fn in agent.tools:
+            td = get_tool_def(fn)
+            target_lookup[td.name] = td.target
         observer = PersistenceObserver(
             state_store,
             run_id,
             model=agent.model,
             provider_name=type(provider).__name__,
+            target_lookup=target_lookup,
         )
 
     try:

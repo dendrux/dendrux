@@ -4,10 +4,8 @@
 
 ## Installation
 
+Not yet published to PyPI. Install from source:
+
 ```bash
-pip install dendrite
+pip install -e ".[all]"
 ```
-
-## Status
-
-Under active development. Not yet published to PyPI.

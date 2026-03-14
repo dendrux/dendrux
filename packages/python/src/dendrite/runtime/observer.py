@@ -15,7 +15,7 @@ from dendrite.loops.base import LoopObserver
 
 if TYPE_CHECKING:
     from dendrite.runtime.state import StateStore
-    from dendrite.types import LLMResponse, Message, ToolCall, ToolResult
+    from dendrite.types import LLMResponse, Message, ToolCall, ToolResult, ToolTarget
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +34,13 @@ class PersistenceObserver(LoopObserver):
         *,
         model: str | None = None,
         provider_name: str | None = None,
+        target_lookup: dict[str, ToolTarget] | None = None,
     ) -> None:
         self._store = state_store
         self._run_id = run_id
         self._model = model
         self._provider_name = provider_name
+        self._target_lookup = target_lookup or {}
         self._order_index = 0
 
     async def on_message_appended(self, message: Message, iteration: int) -> None:
@@ -98,7 +100,7 @@ class PersistenceObserver(LoopObserver):
             tool_call_id=tool_call.id,
             provider_tool_call_id=tool_call.provider_tool_call_id,
             tool_name=tool_call.name,
-            target="server",  # Sprint 2: all tools are server-side
+            target=self._target_lookup.get(tool_call.name, "server"),
             params=params,
             result_payload=tool_result.payload,
             success=tool_result.success,

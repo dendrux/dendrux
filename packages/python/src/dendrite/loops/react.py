@@ -38,6 +38,7 @@ from dendrite.types import (
     RunStatus,
     ToolCall,
     ToolResult,
+    ToolTarget,
     UsageStats,
     generate_ulid,
 )
@@ -115,7 +116,7 @@ class ReActLoop(Loop):
         """Execute the ReAct loop."""
         resolved_run_id = run_id or generate_ulid()
         tool_defs = agent.get_tool_defs()
-        tool_lookup = _build_tool_lookup(agent.tools)
+        tool_lookup, target_lookup = _build_tool_lookup(agent.tools)
 
         user_msg = Message(role=Role.USER, content=user_input)
         history: list[Message] = [user_msg]
@@ -140,6 +141,10 @@ class ReActLoop(Loop):
             total_usage.input_tokens += response.usage.input_tokens
             total_usage.output_tokens += response.usage.output_tokens
             total_usage.total_tokens += response.usage.total_tokens
+            if response.usage.cost_usd is not None:
+                if total_usage.cost_usd is None:
+                    total_usage.cost_usd = 0.0
+                total_usage.cost_usd += response.usage.cost_usd
 
             # 3. Parse response into AgentStep
             step = strategy.parse_response(response)
@@ -182,7 +187,7 @@ class ReActLoop(Loop):
                 # step.action is only the first (AgentStep models one action).
                 all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
                 for tc in all_calls:
-                    tool_result = await _execute_tool(tc, tool_lookup)
+                    tool_result = await _execute_tool(tc, tool_lookup, target_lookup)
                     await _notify_tool(observer, tc, tool_result, iteration)
                     result_msg = strategy.format_tool_result(tool_result)
                     history.append(result_msg)
@@ -200,20 +205,41 @@ class ReActLoop(Loop):
 
 def _build_tool_lookup(
     tools: list[Callable[..., Any]],
-) -> dict[str, Callable[..., Any]]:
-    """Build a name → function lookup from the agent's tool list."""
-    lookup: dict[str, Callable[..., Any]] = {}
+) -> tuple[dict[str, Callable[..., Any]], dict[str, ToolTarget]]:
+    """Build name → function and name → target lookups from the agent's tool list."""
+    fn_lookup: dict[str, Callable[..., Any]] = {}
+    target_lookup: dict[str, ToolTarget] = {}
     for fn in tools:
         td = get_tool_def(fn)
-        lookup[td.name] = fn
-    return lookup
+        fn_lookup[td.name] = fn
+        target_lookup[td.name] = td.target
+    return fn_lookup, target_lookup
 
 
 async def _execute_tool(
     tool_call: ToolCall,
     tool_lookup: dict[str, Callable[..., Any]],
+    target_lookup: dict[str, ToolTarget] | None = None,
 ) -> ToolResult:
     """Execute a tool function and return a ToolResult."""
+    # Guard: refuse to execute non-server tools locally
+    if target_lookup is not None:
+        target = target_lookup.get(tool_call.name)
+        if target is not None and target != ToolTarget.SERVER:
+            return ToolResult(
+                name=tool_call.name,
+                call_id=tool_call.id,
+                payload=json.dumps(
+                    {
+                        "error": f"Tool '{tool_call.name}' has target={target.value!r} "
+                        f"and cannot be executed server-side. "
+                        f"Client/human/agent tool execution is not yet implemented."
+                    }
+                ),
+                success=False,
+                error=f"Non-server tool target: {target.value}",
+            )
+
     fn = tool_lookup.get(tool_call.name)
     if fn is None:
         return ToolResult(

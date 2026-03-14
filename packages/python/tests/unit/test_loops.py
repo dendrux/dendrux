@@ -580,5 +580,127 @@ class TestReActLoopNonSerializableResults:
         assert result.answer == "Got the items"
 
 
+# ------------------------------------------------------------------
+# ReActLoop — non-server tool guard (H2)
+# ------------------------------------------------------------------
+
+
+class TestReActLoopToolTargetGuard:
+    async def test_client_tool_returns_error_not_executed(self) -> None:
+        """H2: Tools with non-server targets must not be executed locally."""
+
+        @tool(target="client")
+        async def read_range(sheet: str) -> str:
+            """Read from Excel."""
+            return "should never run"
+
+        tc = ToolCall(
+            name="read_range",
+            params={"sheet": "Sheet1"},
+            provider_tool_call_id="t_client",
+        )
+        llm = MockLLM(
+            [
+                LLMResponse(tool_calls=[tc]),
+                LLMResponse(text="Got an error about client tool"),
+            ]
+        )
+        agent = _make_agent(tools=[read_range])
+
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="Read sheet",
+        )
+
+        assert result.status == RunStatus.SUCCESS
+        # The tool result fed back should contain the error
+        second_call_msgs = llm.call_history[1]["messages"]
+        tool_msgs = [m for m in second_call_msgs if m.role == Role.TOOL]
+        assert len(tool_msgs) == 1
+        assert "cannot be executed server-side" in tool_msgs[0].content
+
+
+# ------------------------------------------------------------------
+# ReActLoop — cost_usd accumulation (M1-billing)
+# ------------------------------------------------------------------
+
+
+class TestReActLoopCostAccumulation:
+    async def test_cost_usd_accumulated_across_iterations(self) -> None:
+        """cost_usd should be summed when providers report it."""
+        tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t_c")
+        llm = MockLLM(
+            [
+                LLMResponse(
+                    tool_calls=[tc],
+                    usage=UsageStats(
+                        input_tokens=100, output_tokens=50, total_tokens=150, cost_usd=0.003
+                    ),
+                ),
+                LLMResponse(
+                    text="3",
+                    usage=UsageStats(
+                        input_tokens=200, output_tokens=30, total_tokens=230, cost_usd=0.005
+                    ),
+                ),
+            ]
+        )
+        agent = _make_agent()
+
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="1+2?",
+        )
+
+        assert result.usage.cost_usd == pytest.approx(0.008)
+
+    async def test_cost_usd_stays_none_when_not_reported(self) -> None:
+        """If no provider reports cost, total stays None."""
+        usage = UsageStats(input_tokens=10, output_tokens=5, total_tokens=15)
+        llm = MockLLM([LLMResponse(text="hi", usage=usage)])
+        agent = _make_agent()
+
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="Hello",
+        )
+
+        assert result.usage.cost_usd is None
+
+    async def test_cost_usd_partial_reporting(self) -> None:
+        """If only some calls report cost, sum only those."""
+        tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t_p")
+        llm = MockLLM(
+            [
+                LLMResponse(
+                    tool_calls=[tc],
+                    usage=UsageStats(input_tokens=100, output_tokens=50, total_tokens=150),
+                ),
+                LLMResponse(
+                    text="3",
+                    usage=UsageStats(
+                        input_tokens=200, output_tokens=30, total_tokens=230, cost_usd=0.005
+                    ),
+                ),
+            ]
+        )
+        agent = _make_agent()
+
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="1+2?",
+        )
+
+        assert result.usage.cost_usd == pytest.approx(0.005)
+
+
 # Need to import UsageStats for the usage test
 from dendrite.types import UsageStats  # noqa: E402
