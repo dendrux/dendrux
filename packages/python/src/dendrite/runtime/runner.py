@@ -180,7 +180,13 @@ async def run(
             event_sequencer=sequencer,
         )
 
-    await _emit_event(state_store, run_id, "run.started", sequencer, {"agent_name": agent.name})
+    await _emit_event(
+        state_store,
+        run_id,
+        "run.started",
+        sequencer,
+        {"agent_name": agent.name, "system_prompt": agent.prompt},
+    )
 
     try:
         result = await resolved_loop.run(
