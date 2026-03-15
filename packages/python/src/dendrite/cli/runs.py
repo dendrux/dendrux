@@ -75,7 +75,7 @@ async def _list_runs(limit: int, offset: int, status: str | None, tenant_id: str
         created = str(run.created_at)[:19] if run.created_at else "—"
 
         table.add_row(
-            run.id[:12] + "…",
+            run.id,
             run.agent_name,
             f"[{status_style}]{run.status}[/{status_style}]",
             str(run.iteration_count),

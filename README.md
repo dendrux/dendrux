@@ -266,6 +266,69 @@ See the working demo: [`examples/03_client_tools/`](packages/python/examples/03_
 
 ---
 
+## 🔧 How Tool Calling Works
+
+Dendrite uses **native tool calling** — no prompt engineering, no XML parsing, no regex hacks.
+
+When you decorate a function with `@tool()`, Dendrite extracts the function signature and docstring into a JSON schema. This schema is passed directly to the LLM provider's native tool API (Anthropic's `tool_use` blocks, OpenAI's `function_calling`). The provider returns structured tool call objects, not text that needs parsing.
+
+```
+@tool() decorator          NativeToolCalling strategy         Anthropic API
+      │                              │                              │
+      ├─ extract signature ──>       │                              │
+      ├─ generate JSON schema ──>    ├─ pass schemas to provider ─> ├─ tools parameter
+      │                              │                              │
+      │                              │  <── tool_use blocks ──────  ├─ Claude responds
+      │                              ├─ normalize to ToolCall ──>   │
+      │                              ├─ format result as TOOL msg ─>│
+```
+
+**What this means:**
+- Tool definitions go to the API as structured schemas, not injected into the system prompt
+- Tool calls come back as typed objects, not parsed from free text
+- Tool results are correlated by `call_id` — no ambiguity about which call a result belongs to
+- The strategy layer is swappable — same agent can use different strategies without changing tool code
+
+`NativeToolCalling` is the default. You can pass it explicitly or swap in a different strategy:
+
+```python
+from dendrite.strategies.native import NativeToolCalling
+
+# Default — you don't need to pass this, but you can
+result = await run(
+    agent,
+    provider=provider,
+    user_input="What is 15 + 27?",
+    strategy=NativeToolCalling(),  # explicit
+)
+```
+
+To build a custom strategy (e.g. prompt-based for providers without native tool calling), subclass `Strategy`:
+
+```python
+from dendrite.strategies.base import Strategy
+
+class MyCustomStrategy(Strategy):
+    def build_messages(self, *, system_prompt, history, tool_defs):
+        # Control what messages and tool schemas go to the LLM
+        ...
+
+    def parse_response(self, response):
+        # Interpret the LLM response into an AgentStep
+        ...
+
+    def format_tool_result(self, result):
+        # Format tool results for the next LLM turn
+        ...
+
+# Use it
+result = await run(agent, provider=provider, user_input="...", strategy=MyCustomStrategy())
+```
+
+The strategy never calls the LLM directly — it prepares inputs and interprets outputs. The loop handles execution.
+
+---
+
 ## 💾 Persistence and Database
 
 Dendrite supports SQLite and Postgres.
