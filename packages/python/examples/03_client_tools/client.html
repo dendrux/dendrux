@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dendrite — Client Tool Bridge Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 2rem; max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.5rem; color: #fff; }
+  .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+  #input-section { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+  #user-input { flex: 1; padding: 0.6rem; border: 1px solid #333; border-radius: 6px; background: #1a1a1a; color: #e0e0e0; font-size: 0.9rem; }
+  button { padding: 0.6rem 1.2rem; border: none; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; font-size: 0.9rem; }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #333; cursor: not-allowed; }
+  #events { margin-bottom: 1.5rem; }
+  .event { padding: 0.5rem 0.75rem; margin-bottom: 0.25rem; border-radius: 4px; font-size: 0.82rem; font-family: monospace; }
+  .event-started { background: #1a2332; color: #60a5fa; }
+  .event-step { background: #1a1a2e; color: #a78bfa; }
+  .event-tool-done { background: #1a2e1a; color: #86efac; }
+  .event-paused { background: #2e2a1a; color: #fbbf24; }
+  .event-completed { background: #1a2e1a; color: #4ade80; }
+  .event-error { background: #2e1a1a; color: #f87171; }
+  .event-cancelled { background: #2e1a1a; color: #fb923c; }
+  #tool-form { display: none; padding: 1rem; border: 1px solid #fbbf24; border-radius: 8px; background: #1a1a0f; margin-bottom: 1rem; }
+  #tool-form h3 { font-size: 0.95rem; color: #fbbf24; margin-bottom: 0.5rem; }
+  #tool-form .params { font-family: monospace; font-size: 0.82rem; color: #aaa; margin-bottom: 0.75rem; }
+  #tool-result-input { width: 100%; padding: 0.5rem; border: 1px solid #333; border-radius: 4px; background: #1a1a1a; color: #e0e0e0; font-size: 0.85rem; margin-bottom: 0.5rem; }
+  #status { font-size: 0.8rem; color: #666; margin-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Dendrite Client Tool Bridge</h1>
+<p class="subtitle">Agent pauses for client-side tools, you provide the result, agent resumes.</p>
+
+<div id="input-section">
+  <input id="user-input" type="text" placeholder="e.g. Look up AAPL price, then read cell A1 from my spreadsheet" />
+  <button id="start-btn" onclick="startRun()">Start</button>
+</div>
+
+<div id="events"></div>
+<div id="tool-form">
+  <h3>Tool needed: <span id="tool-name"></span></h3>
+  <div class="params">Params: <span id="tool-params"></span></div>
+  <input id="tool-result-input" type="text" placeholder="Paste the tool result here..." />
+  <button onclick="submitToolResult()">Submit Result</button>
+</div>
+
+<div id="status"></div>
+
+<script>
+  let currentRunId = null;
+  let pendingToolCalls = [];
+  let eventSource = null;
+
+  function log(text, cls) {
+    const el = document.createElement("div");
+    el.className = "event " + cls;
+    el.textContent = text;
+    document.getElementById("events").appendChild(el);
+    el.scrollIntoView({ behavior: "smooth" });
+  }
+
+  function setStatus(text) {
+    document.getElementById("status").textContent = text;
+  }
+
+  function connectSSE(runId) {
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource("/dendrite/runs/" + runId + "/events");
+
+    eventSource.addEventListener("run.started", (e) => {
+      log("Run started: " + runId, "event-started");
+    });
+
+    eventSource.addEventListener("run.step", (e) => {
+      const d = JSON.parse(e.data);
+      const role = d.role || "?";
+      const content = d.content || "";
+      if (content) log("[" + role + "] " + content.substring(0, 200), "event-step");
+    });
+
+    eventSource.addEventListener("run.tool_done", (e) => {
+      const d = JSON.parse(e.data);
+      log("Tool done: " + d.tool_name + " (success=" + d.success + ")", "event-tool-done");
+    });
+
+    eventSource.addEventListener("run.paused.tool_needed", (e) => {
+      const d = JSON.parse(e.data);
+      pendingToolCalls = d.pending_tool_calls || [];
+      setStatus("PAUSED — waiting for client tool");
+      eventSource.close();
+
+      if (pendingToolCalls.length > 0) {
+        const tc = pendingToolCalls[0];
+        document.getElementById("tool-name").textContent = tc.tool_name;
+        document.getElementById("tool-params").textContent = JSON.stringify(tc.params);
+        document.getElementById("tool-form").style.display = "block";
+        log("PAUSED: agent needs " + tc.tool_name + "(" + JSON.stringify(tc.params) + ")", "event-paused");
+      }
+    });
+
+    eventSource.addEventListener("run.paused.input_needed", (e) => {
+      const d = JSON.parse(e.data);
+      setStatus("PAUSED — agent is asking: " + (d.question || ""));
+      log("PAUSED: agent asks: " + (d.question || ""), "event-paused");
+      eventSource.close();
+    });
+
+    eventSource.addEventListener("run.completed", (e) => {
+      const d = JSON.parse(e.data);
+      log("COMPLETED (status=" + d.status + ")", "event-completed");
+      setStatus("Done");
+      eventSource.close();
+      document.getElementById("start-btn").disabled = false;
+    });
+
+    eventSource.addEventListener("run.error", (e) => {
+      const d = JSON.parse(e.data);
+      log("ERROR: " + (d.error || "unknown"), "event-error");
+      setStatus("Error");
+      eventSource.close();
+      document.getElementById("start-btn").disabled = false;
+    });
+
+    eventSource.addEventListener("run.cancelled", (e) => {
+      log("CANCELLED", "event-cancelled");
+      setStatus("Cancelled");
+      eventSource.close();
+      document.getElementById("start-btn").disabled = false;
+    });
+
+    eventSource.onerror = () => {
+      setStatus("SSE connection lost");
+    };
+  }
+
+  async function startRun() {
+    const input = document.getElementById("user-input").value.trim();
+    if (!input) return;
+
+    document.getElementById("events").innerHTML = "";
+    document.getElementById("tool-form").style.display = "none";
+    document.getElementById("start-btn").disabled = true;
+    setStatus("Starting...");
+
+    const resp = await fetch("/dendrite/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_name: "SpreadsheetAnalyst", input: input }),
+    });
+
+    if (!resp.ok) {
+      log("Failed to start run: " + resp.status, "event-error");
+      document.getElementById("start-btn").disabled = false;
+      return;
+    }
+
+    const data = await resp.json();
+    currentRunId = data.run_id;
+    setStatus("Running: " + currentRunId);
+    connectSSE(currentRunId);
+  }
+
+  async function submitToolResult() {
+    if (!currentRunId || pendingToolCalls.length === 0) return;
+
+    const resultText = document.getElementById("tool-result-input").value.trim();
+    if (!resultText) return;
+
+    document.getElementById("tool-form").style.display = "none";
+    setStatus("Submitting tool result...");
+
+    const results = pendingToolCalls.map((tc) => ({
+      tool_call_id: tc.tool_call_id,
+      tool_name: tc.tool_name,
+      result: resultText,
+    }));
+
+    const resp = await fetch("/dendrite/runs/" + currentRunId + "/tool-results", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool_results: results }),
+    });
+
+    if (!resp.ok) {
+      log("Failed to submit tool result: " + resp.status, "event-error");
+      document.getElementById("start-btn").disabled = false;
+      return;
+    }
+
+    log("Tool result submitted, resuming...", "event-tool-done");
+    setStatus("Resumed");
+    pendingToolCalls = [];
+    connectSSE(currentRunId);
+  }
+</script>
+
+</body>
+</html>
