@@ -183,6 +183,7 @@ def create_app(
         async def _run_agent() -> Any:
             """Background task — runs the agent with persistence + transport."""
             from dendrite.runtime.observer import PersistenceObserver
+            from dendrite.runtime.runner import EventSequencer, _emit_event
             from dendrite.tool import get_tool_def
             from dendrite.types import PauseState, RunStatus
 
@@ -192,7 +193,10 @@ def create_app(
             loop = config.loop_factory() if config.loop_factory else None
             redact = config.redact
 
-            # Create persistence observer
+            # Shared sequence counter — monotonic across runner + observer
+            sequencer = EventSequencer()
+
+            # Create persistence observer with shared sequencer
             target_lookup = {}
             for fn in agent.tools:
                 td = get_tool_def(fn)
@@ -205,6 +209,7 @@ def create_app(
                 provider_name=type(provider).__name__,
                 target_lookup=target_lookup,
                 redact=redact,
+                event_sequencer=sequencer,
             )
             transport_obs = TransportObserver(queue)
             composite = CompositeObserver([persistence_obs, transport_obs])
@@ -220,6 +225,14 @@ def create_app(
                 tenant_id=req.tenant_id,
             )
 
+            # Durable run.started event + SSE
+            await _emit_event(
+                state_store,
+                run_id,
+                "run.started",
+                sequencer,
+                {"agent_name": agent.name, "system_prompt": agent.prompt},
+            )
             await queue.put(ServerEvent(event="run.started", data={"run_id": run_id}))
 
             is_paused = False
@@ -253,7 +266,25 @@ def create_app(
                         pause_data=pause_state.to_dict(),
                         iteration_count=result.iteration_count,
                     )
-                    # Emit distinct pause events (D3)
+                    # Durable run.paused event
+                    await _emit_event(
+                        state_store,
+                        run_id,
+                        "run.paused",
+                        sequencer,
+                        {
+                            "status": result.status.value,
+                            "pending_tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "name": tc.name,
+                                    "target": pause_state.pending_targets.get(tc.id),
+                                }
+                                for tc in pause_state.pending_tool_calls
+                            ],
+                        },
+                    )
+                    # Emit distinct SSE pause events (D3)
                     if result.status == RunStatus.WAITING_CLIENT_TOOL:
                         pending = [
                             {
@@ -292,7 +323,15 @@ def create_app(
                         expected_current_status="running",
                     )
                     if finalized:
-                        # CAS winner — buffer + emit terminal event
+                        # Durable run.completed event
+                        await _emit_event(
+                            state_store,
+                            run_id,
+                            "run.completed",
+                            sequencer,
+                            {"status": result.status.value},
+                        )
+                        # CAS winner — buffer + emit terminal SSE event
                         task_manager.buffer_terminal_event(
                             run_id,
                             {
@@ -333,7 +372,15 @@ def create_app(
                 except Exception:
                     logger.warning("Failed to persist ERROR for run %s", run_id, exc_info=True)
                 if error_won:
-                    # CAS winner — buffer + emit terminal event
+                    # Durable run.error event
+                    await _emit_event(
+                        state_store,
+                        run_id,
+                        "run.error",
+                        sequencer,
+                        {"error": str(exc)[:500]},
+                    )
+                    # CAS winner — buffer + emit terminal SSE event
                     task_manager.buffer_terminal_event(
                         run_id,
                         {

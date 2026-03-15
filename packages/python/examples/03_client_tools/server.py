@@ -7,7 +7,9 @@ client to execute it, then resumes reasoning.
 Run with:
     ANTHROPIC_API_KEY=sk-... python examples/03_client_tools/server.py
 
-Then open http://localhost:8000 in your browser.
+Then open:
+    http://localhost:8000           — Client tools demo UI
+    http://localhost:8000/dashboard — Live observability dashboard
 
 Try a prompt like:
     "Look up AAPL price, then read cell A1 from the user's spreadsheet."
@@ -129,6 +131,12 @@ def create_demo_app(
         return FileResponse(client_html, media_type="text/html")
 
     app.mount("/dendrite", dendrite_app)
+
+    # Mount the dashboard for live observability
+    from dendrite.dashboard.api import create_dashboard_api
+
+    dashboard_app = create_dashboard_api(state_store)  # type: ignore[arg-type]
+    app.mount("/dashboard", dashboard_app)
 
     return app
 

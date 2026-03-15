@@ -49,3 +49,7 @@ htmlcov/
 # Database (local dev)
 *.db
 *.sqlite3
+
+# Dashboard (React build artifacts)
+node_modules/
+packages/python/src/dendrite/dashboard/static/

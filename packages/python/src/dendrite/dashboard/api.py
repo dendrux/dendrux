@@ -8,12 +8,16 @@ Never exposes pause_data or unredacted content.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from dendrite.dashboard.normalizer import normalize_timeline, timeline_to_dict
+
+_STATIC_DIR = Path(__file__).parent / "static"
 
 if TYPE_CHECKING:
     from dendrite.runtime.state import StateStore
@@ -187,5 +191,10 @@ def create_dashboard_api(state_store: StateStore) -> FastAPI:
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Serve pre-built React dashboard (if static assets exist).
+    # In development, Vite dev server handles this via proxy.
+    if _STATIC_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="dashboard")
 
     return app

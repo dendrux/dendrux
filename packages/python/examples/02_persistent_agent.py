@@ -104,6 +104,9 @@ if __name__ == "__main__":
             "\n[bold]Inspect persisted data with:[/bold]"
             f"\n  dendrite runs"
             f"\n  dendrite traces {result.run_id} --tools"
+            "\n"
+            "\n[bold]Or view the full timeline in the dashboard:[/bold]"
+            "\n  dendrite dashboard --open"
         )
 
     asyncio.run(main())

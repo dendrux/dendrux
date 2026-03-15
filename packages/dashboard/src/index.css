@@ -1,0 +1,86 @@
+@import "tailwindcss";
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+
+/*
+ * Dendrite Dashboard — Theme Tokens
+ *
+ * Warm-dark system. Every color has visible warmth.
+ * See owner-docs/theme.md for the full design system.
+ */
+
+@theme {
+  /* Surfaces */
+  --color-canvas: #0f0d0b;
+  --color-surface: #151210;
+  --color-elevated: #1c1815;
+  --color-inspector: #12100e;
+
+  /* Borders */
+  --color-border: #312922;
+  --color-border-soft: #26201b;
+
+  /* Text */
+  --color-text-primary: #f3eadb;
+  --color-text-secondary: #cdbfae;
+  --color-text-muted: #8e8172;
+
+  /* State colors */
+  --color-state-llm: #4c7ff7;
+  --color-state-tool: #2f8f6b;
+  --color-state-paused: #c6922b;
+  --color-state-resumed: #4fb7c8;
+  --color-state-error: #b14d43;
+  --color-state-success: #5d9b6c;
+
+  /* Special */
+  --color-accent-brass: #8f6a2e;
+
+  /* Fonts */
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* Base layer */
+html {
+  background-color: var(--color-canvas);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* Scrollbar — subtle, matches the warm dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Selection */
+::selection {
+  background: rgba(140, 106, 46, 0.3);
+  color: var(--color-text-primary);
+}
