@@ -56,7 +56,7 @@ agent = Agent(
         "must wait for the user to provide the data). "
         "Always use the tools when the user asks about prices or spreadsheet data."
     ),
-    tools=[lookup_price, read_excel_range],
+    tools=[lookup_price, read_excel_range]
 )
 
 

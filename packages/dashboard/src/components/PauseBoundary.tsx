@@ -1,9 +1,8 @@
 /**
  * PauseBoundary — the signature Dendrite component.
  *
- * The flow line stops. The segment breathes. The UI acknowledges
- * waiting as a first-class state. The resumed edge reconnects
- * with calm precision.
+ * Centered. Dramatic. The flow line stops, the segment breathes,
+ * the duration is the largest number on the page.
  */
 
 import { motion } from "framer-motion";
@@ -18,83 +17,71 @@ interface PauseBoundaryProps {
 
 export function PauseBoundary({ node, isSelected, onSelect }: PauseBoundaryProps) {
   const isLive = !node.resumed_at;
-  const durationText = isLive ? "waiting..." : formatDuration(node.wait_duration_ms);
+  const durationText = isLive ? "waiting" : formatDuration(node.wait_duration_ms);
 
   return (
     <button
       onClick={onSelect}
-      className={`w-full text-left rounded-[10px] transition-colors duration-120 border ${
-        isSelected
-          ? "bg-state-paused/8 border-state-paused/20"
-          : "bg-state-paused/[0.04] border-transparent hover:bg-state-paused/8"
+      className={`w-full text-left transition-all duration-150 ${
+        isSelected ? "opacity-100" : "opacity-90 hover:opacity-100"
       }`}
     >
-      {/* Top: Pause marker */}
-      <div className="px-4 pt-4 pb-2">
-        <div className="flex items-center gap-2 mb-1">
-          <div className="w-[3px] h-4 rounded-full bg-state-paused" />
-          <span className="text-sm font-medium text-state-paused">Paused</span>
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-state-paused/10 text-state-paused font-medium">
-            {node.pause_status === "waiting_client_tool" ? "client tool" : "human input"}
-          </span>
-        </div>
+      {/* Pause card — centered, dramatic */}
+      <div className="p-6 sm:p-8 rounded-2xl bg-state-paused/[0.05] border border-state-paused/10 flex flex-col items-center justify-center text-center">
+        <span className="text-[10px] uppercase tracking-[0.2em] text-state-paused font-bold mb-2">
+          Suspended Bridge
+        </span>
 
-        {/* Pending tool calls */}
-        <div className="ml-[11px] pl-3 border-l border-dashed border-state-paused/30">
-          {node.pending_tool_calls.map((tc) => (
-            <div key={tc.tool_call_id} className="text-xs text-text-secondary py-0.5">
-              <span className="text-state-paused/80 font-mono">{tc.tool_name}</span>
-              {tc.target && (
-                <span className="text-text-muted ml-1.5">({tc.target})</span>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Duration — the hero number */}
-      <div className="flex items-center justify-center py-3 border-y border-dashed border-state-paused/15">
+        {/* The hero number */}
         {isLive ? (
           <motion.span
-            className="font-mono text-xl font-medium text-state-paused"
+            className="text-4xl sm:text-5xl font-mono font-medium text-state-paused tracking-tighter"
             animate={{ opacity: [0.4, 1, 0.4] }}
             transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
           >
             {durationText}
           </motion.span>
         ) : (
-          <span className="font-mono text-xl font-medium text-state-paused">
+          <span className="text-4xl sm:text-5xl font-mono font-medium text-state-paused tracking-tighter">
             {durationText}
           </span>
         )}
+
+        {/* Pending tool calls */}
+        <div className="mt-4 text-text-muted text-sm max-w-xs">
+          {node.pending_tool_calls.map((tc) => (
+            <span key={tc.tool_call_id} className="block">
+              Awaiting <span className="font-mono text-state-paused/80">{tc.tool_name}</span>
+              {tc.target && <span className="text-text-muted"> ({tc.target})</span>}
+            </span>
+          ))}
+        </div>
       </div>
 
-      {/* Bottom: Resume marker (if resumed) */}
+      {/* Resume section */}
       {node.resumed_at && (
-        <div className="px-4 pt-2 pb-4">
-          <div className="flex items-center gap-2 mb-1">
-            <div className="w-[3px] h-4 rounded-full bg-state-resumed" />
-            <span className="text-sm font-medium text-state-resumed">Resumed</span>
+        <div className="flex items-start gap-4 mt-6">
+          {/* Resume icon */}
+          <div className="w-10 h-10 rounded-full bg-surface border border-state-resumed flex items-center justify-center shadow-lg flex-shrink-0">
+            <span className="material-symbols-outlined text-state-resumed text-xl">play_arrow</span>
           </div>
-
-          {node.submitted_results.length > 0 && (
-            <div className="ml-[11px] pl-3 border-l border-solid border-state-resumed/30">
-              {node.submitted_results.map((r) => (
-                <div key={r.call_id} className="text-xs text-text-secondary py-0.5">
-                  <span className="text-state-resumed/80 font-mono">{r.tool_name}</span>
-                  {!r.success && (
-                    <span className="text-state-error ml-1.5">(failed)</span>
-                  )}
-                </div>
-              ))}
+          <div className="pt-2 min-w-0">
+            <h3 className="text-lg font-bold text-text-primary">Resumed</h3>
+            <div className="flex flex-wrap items-center gap-3 text-sm text-text-muted mt-1">
+              {node.submitted_results.length > 0 && (
+                <span className="flex items-center gap-1">
+                  <span className="material-symbols-outlined text-sm">verified_user</span>
+                  {node.submitted_results.length} result{node.submitted_results.length > 1 ? "s" : ""} submitted
+                </span>
+              )}
+              {node.user_input && (
+                <span className="flex items-center gap-1">
+                  <span className="material-symbols-outlined text-sm">chat</span>
+                  User responded
+                </span>
+              )}
             </div>
-          )}
-
-          {node.user_input && (
-            <p className="ml-[11px] pl-3 mt-1 text-xs text-text-secondary border-l border-solid border-state-resumed/30">
-              "{node.user_input}"
-            </p>
-          )}
+          </div>
         </div>
       )}
     </button>

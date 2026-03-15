@@ -1,4 +1,4 @@
-/** Individual timeline node card — compact by default, detail on selection. */
+/** Individual timeline node — spacious cards with icon markers. */
 
 import type { TimelineNode, LLMCallNode, ToolCallNode, FinishNode, ErrorNode, RunStartedNode, CancelledNode } from "@/lib/types";
 import { formatDuration, formatTokens, formatCost, formatTime } from "@/lib/format";
@@ -13,10 +13,8 @@ export function TimelineNodeCard({ node, isSelected, onSelect }: TimelineNodeCar
   return (
     <button
       onClick={onSelect}
-      className={`w-full text-left rounded-[10px] px-4 py-3 transition-colors duration-120 border ${
-        isSelected
-          ? "bg-elevated border-border"
-          : "bg-transparent border-transparent hover:bg-surface"
+      className={`w-full text-left transition-all duration-150 ${
+        isSelected ? "opacity-100" : "opacity-90 hover:opacity-100"
       }`}
     >
       {node.type === "run_started" && <RunStartedContent node={node} />}
@@ -29,16 +27,22 @@ export function TimelineNodeCard({ node, isSelected, onSelect }: TimelineNodeCar
   );
 }
 
-// -- Node content renderers --
-
 function RunStartedContent({ node }: { node: RunStartedNode }) {
   return (
     <div>
-      <NodeTitle label="Run Started" color="text-text-muted" />
-      <NodeMeta items={[
-        { label: "Agent", value: node.agent_name },
-        ...(node.timestamp ? [{ label: "", value: formatTime(node.timestamp) }] : []),
-      ]} />
+      <h3 className="text-lg font-bold text-text-primary">Run Started</h3>
+      <div className="flex items-center gap-4 text-sm text-text-muted mt-1">
+        <span className="flex items-center gap-1">
+          <span className="material-symbols-outlined text-sm">smart_toy</span>
+          {node.agent_name}
+        </span>
+        {node.timestamp && (
+          <span className="flex items-center gap-1">
+            <span className="material-symbols-outlined text-sm">schedule</span>
+            {formatTime(node.timestamp)}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -46,20 +50,26 @@ function RunStartedContent({ node }: { node: RunStartedNode }) {
 function LLMCallContent({ node }: { node: LLMCallNode }) {
   return (
     <div>
-      <div className="flex items-center gap-2">
-        <div className="w-[3px] h-4 rounded-full bg-state-llm" />
-        <NodeTitle label={`LLM Call`} color="text-state-llm" />
-        <span className="text-xs text-text-muted">Iteration {node.iteration}</span>
+      <h3 className="text-lg font-bold text-text-primary">
+        LLM Call{node.model ? `: ${node.model}` : ""}
+      </h3>
+      <div className="flex items-center gap-4 text-sm text-text-muted mt-1">
+        <span className="flex items-center gap-1">
+          <span className="material-symbols-outlined text-sm">toll</span>
+          {formatTokens(node.input_tokens + node.output_tokens)} tokens
+        </span>
+        {node.cost_usd != null && (
+          <span className="flex items-center gap-1">
+            <span className="material-symbols-outlined text-sm">payments</span>
+            {formatCost(node.cost_usd)}
+          </span>
+        )}
+        <span className="text-xs text-text-muted">Iter {node.iteration}</span>
       </div>
-      <NodeMeta items={[
-        { label: "Tokens", value: `${formatTokens(node.input_tokens)} in / ${formatTokens(node.output_tokens)} out`, mono: true },
-        ...(node.cost_usd != null ? [{ label: "Cost", value: formatCost(node.cost_usd), mono: true }] : []),
-        ...(node.model ? [{ label: "Model", value: node.model }] : []),
-      ]} />
       {node.assistant_text && (
-        <p className="mt-1.5 text-xs text-text-secondary line-clamp-2 leading-relaxed">
+        <div className="mt-3 p-4 rounded-xl bg-surface border border-border-soft text-text-secondary text-sm leading-relaxed line-clamp-3">
           {node.assistant_text}
-        </p>
+        </div>
       )}
     </div>
   );
@@ -67,51 +77,48 @@ function LLMCallContent({ node }: { node: LLMCallNode }) {
 
 function ToolCallContent({ node }: { node: ToolCallNode }) {
   const isServer = node.target === "server";
-
   return (
     <div>
-      <div className="flex items-center gap-2">
-        <div className="w-[3px] h-4 rounded-full bg-state-tool" />
-        <NodeTitle label={node.tool_name} color="text-state-tool" />
-        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-          isServer ? "bg-state-tool/10 text-state-tool" : "bg-state-paused/10 text-state-paused"
-        }`}>
-          {node.target}
+      <h3 className="text-lg font-bold text-text-primary">
+        {isServer ? "Server" : "Client"} Tool: {node.tool_name}
+      </h3>
+      <div className="flex items-center gap-4 text-sm text-text-muted mt-1">
+        <span className={`flex items-center gap-1 ${node.success ? "text-state-tool" : "text-state-error"}`}>
+          <span className="material-symbols-outlined text-sm">
+            {node.success ? "check_circle" : "error"}
+          </span>
+          {node.success ? "Success" : "Failed"}
         </span>
-        {!node.success && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-state-error/10 text-state-error font-medium">
-            failed
+        {node.duration_ms != null && (
+          <span className="flex items-center gap-1">
+            <span className="material-symbols-outlined text-sm">schedule</span>
+            {formatDuration(node.duration_ms)}
           </span>
         )}
       </div>
-      <NodeMeta items={[
-        ...(node.duration_ms != null ? [{ label: "", value: formatDuration(node.duration_ms), mono: true }] : []),
-        { label: "Iter", value: String(node.iteration) },
-      ]} />
     </div>
   );
 }
 
 function FinishContent({ node }: { node: FinishNode }) {
   return (
-    <div>
-      <NodeTitle label="Finished" color="text-text-primary" />
-      <NodeMeta items={[
-        { label: "Status", value: node.status },
-        ...(node.timestamp ? [{ label: "", value: formatTime(node.timestamp) }] : []),
-      ]} />
+    <div className="pt-6">
+      <h3 className="text-lg font-bold text-text-primary">Finish: Success</h3>
+      <p className="text-text-muted text-sm mt-1">Workflow execution completed.</p>
+      {node.timestamp && (
+        <span className="text-xs text-text-muted mt-1 block">{formatTime(node.timestamp)}</span>
+      )}
     </div>
   );
 }
 
 function ErrorContent({ node }: { node: ErrorNode }) {
   return (
-    <div className="bg-state-error/5 -mx-4 -my-3 px-4 py-3 rounded-[10px]">
-      <div className="flex items-center gap-2">
-        <div className="w-[3px] h-4 rounded-full bg-state-error" />
-        <NodeTitle label="Error" color="text-state-error" />
+    <div>
+      <h3 className="text-lg font-bold text-state-error">Error</h3>
+      <div className="mt-3 p-4 rounded-xl bg-state-error/5 border border-state-error/20 text-state-error/80 text-sm leading-relaxed">
+        {node.error}
       </div>
-      <p className="mt-1 text-xs text-state-error/80 leading-relaxed">{node.error}</p>
     </div>
   );
 }
@@ -119,30 +126,10 @@ function ErrorContent({ node }: { node: ErrorNode }) {
 function CancelledContent({ node }: { node: CancelledNode }) {
   return (
     <div>
-      <NodeTitle label="Cancelled" color="text-text-muted" />
-      <NodeMeta items={[
-        ...(node.timestamp ? [{ label: "", value: formatTime(node.timestamp) }] : []),
-      ]} />
-    </div>
-  );
-}
-
-// -- Shared sub-components --
-
-function NodeTitle({ label, color }: { label: string; color: string }) {
-  return <span className={`text-sm font-medium ${color}`}>{label}</span>;
-}
-
-function NodeMeta({ items }: { items: { label: string; value: string; mono?: boolean }[] }) {
-  if (items.length === 0) return null;
-  return (
-    <div className="flex items-center gap-3 mt-1 text-xs text-text-muted">
-      {items.map((item, i) => (
-        <span key={i} className={item.mono ? "font-mono" : ""}>
-          {item.label && <span className="text-text-muted">{item.label} </span>}
-          <span className="text-text-secondary">{item.value}</span>
-        </span>
-      ))}
+      <h3 className="text-lg font-bold text-text-muted">Cancelled</h3>
+      {node.timestamp && (
+        <span className="text-xs text-text-muted mt-1 block">{formatTime(node.timestamp)}</span>
+      )}
     </div>
   );
 }
