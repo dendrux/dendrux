@@ -223,9 +223,25 @@ class ReActLoop(Loop):
                 history.append(assistant_msg)
                 await _notify_message(observer, assistant_msg, iteration, observer_warnings)
 
-                meta = {}
+                # Build PauseState for resume via resume_with_input()
+                clarification_pause = PauseState(
+                    agent_name=agent.name,
+                    pending_tool_calls=[],  # No tool calls — resume is a user message
+                    history=list(history),
+                    steps=list(steps),
+                    iteration=iteration,
+                    trace_order_offset=len(history),
+                    usage=UsageStats(
+                        input_tokens=total_usage.input_tokens,
+                        output_tokens=total_usage.output_tokens,
+                        total_tokens=total_usage.total_tokens,
+                        cost_usd=total_usage.cost_usd,
+                    ),
+                )
+
+                clarification_meta: dict[str, Any] = {"pause_state": clarification_pause}
                 if observer_warnings:
-                    meta["observer_warnings"] = observer_warnings
+                    clarification_meta["observer_warnings"] = observer_warnings
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.WAITING_HUMAN_INPUT,
@@ -233,7 +249,7 @@ class ReActLoop(Loop):
                     steps=steps,
                     iteration_count=iteration,
                     usage=total_usage,
-                    meta=meta,
+                    meta=clarification_meta,
                 )
 
             if isinstance(step.action, ToolCall):
@@ -276,9 +292,16 @@ class ReActLoop(Loop):
                     # from the DB, not trust this value blindly.
                     trace_offset = len(history)
 
+                    # Build target map for pending calls
+                    pending_targets = {
+                        tc.id: target_lookup.get(tc.name, ToolTarget.SERVER).value
+                        for tc in pending_calls
+                    }
+
                     pause_state = PauseState(
                         agent_name=agent.name,
                         pending_tool_calls=pending_calls,
+                        pending_targets=pending_targets,
                         history=list(history),
                         steps=list(steps),
                         iteration=iteration,

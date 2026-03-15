@@ -149,7 +149,8 @@ class StateStore(Protocol):
         error: str | None = None,
         iteration_count: int = 0,
         total_usage: UsageStats | None = None,
-    ) -> None: ...
+        expected_current_status: str | None = None,
+    ) -> bool: ...
 
     async def pause_run(
         self,
@@ -331,7 +332,15 @@ class SQLAlchemyStateStore:
         error: str | None = None,
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
-    ) -> None:
+        expected_current_status: str | None = None,
+    ) -> bool:
+        """Finalize a run. Returns True if the update was applied.
+
+        Args:
+            expected_current_status: If provided, only updates the row if the
+                current DB status matches. Returns False if status has changed
+                (e.g. already cancelled). This prevents cancel/finalize races.
+        """
         from sqlalchemy import func, update
 
         from dendrite.db.models import AgentRun
@@ -355,9 +364,21 @@ class SQLAlchemyStateStore:
             # Clear pause_data on finalize (D1: execution state cleaned up)
             values["pause_data"] = None
 
-            stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
-            await session.execute(stmt)
+            # Conditional finalize: only update if status is still 'running'
+            # (or expected_status if provided). Prevents cancel/finalize races.
+            if expected_current_status is not None:
+                stmt = (
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id, AgentRun.status == expected_current_status)
+                    .values(**values)
+                )
+            else:
+                stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
+            result = await session.execute(stmt)
             await session.commit()
+            return (
+                bool(result.rowcount and result.rowcount > 0) if expected_current_status else True
+            )
 
     async def pause_run(
         self,

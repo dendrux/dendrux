@@ -32,13 +32,13 @@ def _build_alembic_config() -> Any:
 
     # Try to find alembic.ini on disk (repo checkout)
     ini_path = _find_alembic_ini()
-    if ini_path is not None:
-        cfg = Config(str(ini_path))
-    else:
-        # Programmatic config for pip-installed packages
-        cfg = Config()
-        migrations_dir = str(Path(__file__).resolve().parent.parent / "db" / "migrations")
-        cfg.set_main_option("script_location", migrations_dir)
+    cfg = Config(str(ini_path)) if ini_path is not None else Config()
+
+    # Always set script_location to the absolute path — alembic.ini's
+    # relative path only works from packages/python/, but the CLI can
+    # be run from any directory.
+    migrations_dir = str(Path(__file__).resolve().parent.parent / "db" / "migrations")
+    cfg.set_main_option("script_location", migrations_dir)
 
     # Resolve database URL from env var only (no CLI arg — security)
     resolved_url = os.environ.get("DENDRITE_DATABASE_URL", "sqlite+aiosqlite:///./dendrite.db")

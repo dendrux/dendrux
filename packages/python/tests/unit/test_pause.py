@@ -198,6 +198,49 @@ class TestPauseBehavior:
         assert ps.usage.output_tokens == 50
         assert ps.usage.total_tokens == 150
 
+    async def test_clarification_produces_pause_state(self) -> None:
+        """Clarification action builds a PauseState for resume_with_input."""
+        from dendrite.strategies.base import Strategy
+
+        class ClarifyStrategy(Strategy):
+            """Strategy that always returns Clarification."""
+
+            def build_messages(self, *, system_prompt, history, tool_defs):
+                msgs = [Message(role=Role.SYSTEM, content=system_prompt), *history]
+                return msgs, tool_defs or None
+
+            def parse_response(self, response):
+                return AgentStep(
+                    reasoning=response.text,
+                    action=Clarification(question="Which file should I analyze?"),
+                )
+
+            def format_tool_result(self, result):
+                return Message(
+                    role=Role.TOOL, content=result.payload, name=result.name, call_id=result.call_id
+                )
+
+        llm = MockLLM([LLMResponse(text="I need to ask a question")])
+        agent = _make_agent(tools=[server_add])
+
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=ClarifyStrategy(),
+            user_input="Analyze something",
+        )
+
+        assert result.status == RunStatus.WAITING_HUMAN_INPUT
+        assert result.answer == "Which file should I analyze?"
+        # Must have pause_state for resume_with_input
+        assert "pause_state" in result.meta
+        ps = result.meta["pause_state"]
+        assert isinstance(ps, PauseState)
+        assert ps.pending_tool_calls == []  # No tools — resume is a user message
+        assert len(ps.history) >= 2  # user + assistant
+        assert ps.agent_name == agent.name
+        assert ps.iteration == 1
+
 
 # ------------------------------------------------------------------
 # PauseState serialization (D7 — core infrastructure)

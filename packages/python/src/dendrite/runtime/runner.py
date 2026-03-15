@@ -151,7 +151,8 @@ async def run(
                     iteration_count=result.iteration_count,
                 )
             else:
-                # Finalize with success or max_iterations
+                # Finalize with success or max_iterations.
+                # Conditional: only if still running (prevents cancel race).
                 redacted_answer = (
                     redact(result.answer) if redact and result.answer else result.answer
                 )
@@ -161,15 +162,14 @@ async def run(
                     answer=redacted_answer,
                     iteration_count=result.iteration_count,
                     total_usage=result.usage,
+                    expected_current_status="running",
                 )
 
         return result
 
     except Exception as exc:
         # Persist ERROR status before re-raising.
-        # Pass total_usage=None so finalize_run skips overwriting summary
-        # columns with zeros. Per-call token_usage rows (already persisted
-        # by the observer) remain the source of truth for errored runs.
+        # Conditional: only if still running (prevents cancel race).
         if state_store is not None:
             try:
                 redacted_err = redact(str(exc)) if redact else str(exc)
@@ -178,6 +178,7 @@ async def run(
                     status=RunStatus.ERROR.value,
                     error=redacted_err,
                     total_usage=None,
+                    expected_current_status="running",
                 )
             except Exception:
                 logger.warning("Failed to persist ERROR status for run %s", run_id, exc_info=True)
@@ -194,6 +195,7 @@ async def resume(
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     redact: Callable[[str], str] | None = None,
+    extra_observer: Any | None = None,
 ) -> RunResult:
     """Resume a paused run by providing client tool results.
 
@@ -210,6 +212,7 @@ async def resume(
         strategy: Strategy override. Defaults to NativeToolCalling.
         loop: Loop override. Defaults to ReActLoop.
         redact: Redaction policy for persistence.
+        extra_observer: Optional additional observer for SSE streaming.
     """
     return await _resume_core(
         run_id,
@@ -221,6 +224,7 @@ async def resume(
         redact=redact,
         expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
         tool_results=tool_results,
+        extra_observer=extra_observer,
     )
 
 
@@ -234,6 +238,7 @@ async def resume_with_input(
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     redact: Callable[[str], str] | None = None,
+    extra_observer: Any | None = None,
 ) -> RunResult:
     """Resume a paused run by providing clarification input.
 
@@ -249,6 +254,7 @@ async def resume_with_input(
         strategy: Strategy override. Defaults to NativeToolCalling.
         loop: Loop override. Defaults to ReActLoop.
         redact: Redaction policy for persistence.
+        extra_observer: Optional additional observer for SSE streaming.
     """
     return await _resume_core(
         run_id,
@@ -260,6 +266,7 @@ async def resume_with_input(
         redact=redact,
         expected_status=RunStatus.WAITING_HUMAN_INPUT.value,
         user_input=user_input,
+        extra_observer=extra_observer,
     )
 
 
@@ -275,8 +282,14 @@ async def _resume_core(
     expected_status: str,
     tool_results: list[ToolResult] | None = None,
     user_input: str | None = None,
+    extra_observer: Any | None = None,
 ) -> RunResult:
-    """Shared resume logic for tool results and clarification input."""
+    """Shared resume logic for tool results and clarification input.
+
+    Args:
+        extra_observer: Optional additional LoopObserver (e.g. TransportObserver)
+            to compose with the PersistenceObserver for SSE streaming during resume.
+    """
     from dendrite.runtime.observer import PersistenceObserver
     from dendrite.tool import get_tool_def
     from dendrite.types import Message, Role
@@ -336,7 +349,7 @@ async def _resume_core(
     for fn in agent.tools:
         td = get_tool_def(fn)
         target_lookup[td.name] = td.target
-    observer = PersistenceObserver(
+    persistence_obs = PersistenceObserver(
         state_store,
         run_id,
         model=agent.model,
@@ -345,6 +358,15 @@ async def _resume_core(
         redact=redact,
         initial_order_index=trace_order_offset,
     )
+
+    # Compose with extra observer (e.g. TransportObserver for SSE)
+    observer: Any
+    if extra_observer is not None:
+        from dendrite.server.observer import CompositeObserver
+
+        observer = CompositeObserver([persistence_obs, extra_observer])
+    else:
+        observer = persistence_obs
 
     # 7. Notify observer of injected messages and tool completions
     if tool_results is not None:
@@ -384,13 +406,16 @@ async def _resume_core(
             )
         else:
             redacted_answer = redact(result.answer) if redact and result.answer else result.answer
-            await state_store.finalize_run(
+            finalize_won = await state_store.finalize_run(
                 run_id,
                 status=result.status.value,
                 answer=redacted_answer,
                 iteration_count=result.iteration_count,
                 total_usage=result.usage,
+                expected_current_status="running",
             )
+            # Surface CAS result so callers (server) know if they own the terminal event
+            result.meta["_finalize_won"] = finalize_won
 
         return result
 
@@ -403,6 +428,7 @@ async def _resume_core(
                     status=RunStatus.ERROR.value,
                     error=redacted_err,
                     total_usage=None,
+                    expected_current_status="running",
                 )
             except Exception:
                 logger.warning("Failed to persist ERROR status for run %s", run_id, exc_info=True)

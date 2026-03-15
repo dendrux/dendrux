@@ -92,10 +92,14 @@ class RecordingStateStore:
     async def save_usage(self, run_id: str, **kwargs: Any) -> None:
         self.usages.append({"run_id": run_id, **kwargs})
 
-    async def finalize_run(self, run_id: str, **kwargs: Any) -> None:
+    async def finalize_run(self, run_id: str, **kwargs: Any) -> bool:
+        expected = kwargs.pop("expected_current_status", None)
+        if expected is not None and self._run_status.get(run_id) != expected:
+            return False
         self.finalized_runs.append({"run_id": run_id, **kwargs})
         self._run_status[run_id] = kwargs.get("status", "success")
         self._pause_data.pop(run_id, None)
+        return True
 
     async def pause_run(
         self,
@@ -424,16 +428,11 @@ class TestResume:
 
 
 class TestResumeWithInput:
-    async def test_resume_with_input_completes_clarification(self) -> None:
-        """WAITING_HUMAN_INPUT → user input → SUCCESS."""
+    async def test_resume_with_input_via_manual_pause_state(self) -> None:
+        """WAITING_HUMAN_INPUT → user input → SUCCESS (manually constructed state)."""
         agent = _make_agent(tools=[server_add])
         store = RecordingStateStore()
 
-        # Simulate a clarification — the loop returns WAITING_HUMAN_INPUT
-        # when it hits a Clarification action. We need to mock this by
-        # running with a tool-free agent where the LLM produces a clarification.
-        # Since NativeToolCalling doesn't produce Clarification directly,
-        # we test resume_with_input by manually creating pause state.
         pause_state = PauseState(
             agent_name=agent.name,
             pending_tool_calls=[],
@@ -461,10 +460,72 @@ class TestResumeWithInput:
         assert result.status == RunStatus.SUCCESS
         assert result.answer == "I'll analyze report.csv"
 
-        # The user input should be in the LLM call history
         call_msgs = llm.call_history[0]["messages"]
         user_msgs = [m for m in call_msgs if m.role == Role.USER]
         assert any("report.csv" in m.content for m in user_msgs)
+
+    async def test_clarification_end_to_end_through_runner(self) -> None:
+        """Full path: run() → Clarification → resume_with_input() → SUCCESS.
+
+        Exercises the real loop → runner → state store → resume path
+        without manually constructing PauseState.
+        """
+        from dendrite.strategies.base import Strategy
+        from dendrite.types import AgentStep
+        from dendrite.types import Clarification as Clar
+
+        class ClarifyStrategy(Strategy):
+            """Always returns Clarification."""
+
+            def build_messages(self, *, system_prompt, history, tool_defs):  # type: ignore[override]
+                msgs = [Message(role=Role.SYSTEM, content=system_prompt), *history]
+                return msgs, tool_defs or None
+
+            def parse_response(self, response):  # type: ignore[override]
+                return AgentStep(reasoning=response.text, action=Clar(question="Which file?"))
+
+            def format_tool_result(self, result):  # type: ignore[override]
+                return Message(
+                    role=Role.TOOL, content=result.payload, name=result.name, call_id=result.call_id
+                )
+
+        agent = _make_agent(tools=[server_add])
+        store = RecordingStateStore()
+
+        # Phase 1: run() with ClarifyStrategy → WAITING_HUMAN_INPUT
+        llm1 = MockLLM([LLMResponse(text="I need to ask")])
+        r1 = await run(
+            agent,
+            provider=llm1,
+            user_input="Analyze something",
+            state_store=store,
+            strategy=ClarifyStrategy(),
+        )
+        assert r1.status == RunStatus.WAITING_HUMAN_INPUT
+        assert r1.answer == "Which file?"
+        assert len(store.paused_runs) == 1
+        assert store.paused_runs[0]["status"] == "waiting_human_input"
+
+        # Verify pause_state was persisted (not manually created)
+        raw_pause = await store.get_pause_state(r1.run_id)
+        assert raw_pause is not None
+        assert raw_pause["agent_name"] == agent.name
+
+        # Phase 2: resume_with_input() with NativeToolCalling (text → Finish)
+        llm2 = MockLLM([LLMResponse(text="Analyzing report.csv now")])
+        r2 = await resume_with_input(
+            r1.run_id,
+            "report.csv",
+            state_store=store,
+            agent=agent,
+            provider=llm2,
+            # NativeToolCalling is the default — plain text LLM response → Finish
+        )
+        assert r2.status == RunStatus.SUCCESS
+        assert r2.answer == "Analyzing report.csv now"
+
+        # Steps should span both phases
+        assert len(r2.steps) >= 2  # clarification step + finish step
 
     async def test_resume_with_input_rejects_non_waiting_human(self) -> None:
         """resume_with_input on WAITING_CLIENT_TOOL raises ValueError."""

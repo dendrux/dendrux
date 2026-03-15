@@ -45,8 +45,10 @@ class RecordingStateStore:
     async def create_run(self, run_id: str, agent_name: str, **kwargs: Any) -> None:
         self.created_runs.append({"run_id": run_id, "agent_name": agent_name, **kwargs})
 
-    async def finalize_run(self, run_id: str, **kwargs: Any) -> None:
+    async def finalize_run(self, run_id: str, **kwargs: Any) -> bool:
+        kwargs.pop("expected_current_status", None)
         self.finalized_runs.append({"run_id": run_id, **kwargs})
+        return True
 
     async def save_trace(self, run_id: str, role: str, content: str, **kwargs: Any) -> None:
         self.traces.append({"run_id": run_id, "role": role, "content": content, **kwargs})

@@ -263,6 +263,7 @@ class PauseState:
     iteration: int
     trace_order_offset: int
     usage: UsageStats
+    pending_targets: dict[str, str] = field(default_factory=dict)  # tool_call_id → target
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -275,6 +276,7 @@ class PauseState:
         d = {
             "agent_name": self.agent_name,
             "pending_tool_calls": [_tool_call_to_dict(tc) for tc in self.pending_tool_calls],
+            "pending_targets": self.pending_targets,
             "history": [_message_to_dict(m) for m in self.history],
             "steps": [_step_to_dict(s) for s in self.steps],
             "iteration": self.iteration,
@@ -297,6 +299,7 @@ class PauseState:
         return cls(
             agent_name=data["agent_name"],
             pending_tool_calls=[_tool_call_from_dict(tc) for tc in data["pending_tool_calls"]],
+            pending_targets=data.get("pending_targets", {}),
             history=[_message_from_dict(m) for m in data["history"]],
             steps=[_step_from_dict(s) for s in data["steps"]],
             iteration=data["iteration"],
