@@ -456,3 +456,149 @@ class TestModelRelationships:
             result = await session.execute(select(AgentRun).where(AgentRun.id == "child_del"))
             child = result.scalar_one()
             assert child.parent_run_id is None
+
+
+# ------------------------------------------------------------------
+# Pause / Resume (Sprint 3)
+# ------------------------------------------------------------------
+
+
+class TestPauseResume:
+    async def test_pause_run_persists_state(self, store) -> None:
+        """pause_run stores status + pause_data in the DB."""
+        await store.create_run("run_pr", "Agent")
+
+        pause_data = {
+            "agent_name": "Agent",
+            "pending_tool_calls": [
+                {"name": "read", "params": {}, "id": "tc1", "provider_tool_call_id": None}
+            ],
+            "history": [{"role": "user", "content": "hello"}],
+            "steps": [],
+            "iteration": 2,
+            "trace_order_offset": 3,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "cost_usd": None,
+            },
+        }
+        await store.pause_run(
+            "run_pr", status="waiting_client_tool", pause_data=pause_data, iteration_count=2
+        )
+
+        record = await store.get_run("run_pr")
+        assert record is not None
+        assert record.status == "waiting_client_tool"
+        assert record.iteration_count == 2
+
+    async def test_get_pause_state_roundtrip(self, store) -> None:
+        """pause_data survives DB roundtrip via get_pause_state."""
+        await store.create_run("run_gps", "Agent")
+
+        pause_data = {
+            "agent_name": "TestAgent",
+            "pending_tool_calls": [
+                {
+                    "name": "read",
+                    "params": {"sheet": "S1"},
+                    "id": "tc1",
+                    "provider_tool_call_id": "p1",
+                }
+            ],
+            "history": [{"role": "user", "content": "go"}],
+            "steps": [
+                {
+                    "reasoning": "think",
+                    "action": {
+                        "type": "tool_call",
+                        "name": "read",
+                        "params": {},
+                        "id": "tc1",
+                        "provider_tool_call_id": None,
+                    },
+                }
+            ],
+            "iteration": 3,
+            "trace_order_offset": 5,
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 80,
+                "total_tokens": 280,
+                "cost_usd": 0.01,
+            },
+        }
+        await store.pause_run("run_gps", status="waiting_client_tool", pause_data=pause_data)
+
+        loaded = await store.get_pause_state("run_gps")
+        assert loaded is not None
+        assert loaded["agent_name"] == "TestAgent"
+        assert loaded["iteration"] == 3
+        assert len(loaded["pending_tool_calls"]) == 1
+        assert loaded["pending_tool_calls"][0]["name"] == "read"
+        assert loaded["usage"]["cost_usd"] == 0.01
+
+    async def test_get_pause_state_returns_none_for_non_paused(self, store) -> None:
+        """get_pause_state returns None when no pause_data exists."""
+        await store.create_run("run_np", "Agent")
+        assert await store.get_pause_state("run_np") is None
+
+    async def test_get_pause_state_returns_none_for_nonexistent_run(self, store) -> None:
+        """get_pause_state returns None for a run_id that doesn't exist."""
+        assert await store.get_pause_state("nonexistent") is None
+
+    async def test_claim_paused_run_succeeds(self, store) -> None:
+        """claim_paused_run transitions WAITING → RUNNING atomically."""
+        await store.create_run("run_cl", "Agent")
+        await store.pause_run("run_cl", status="waiting_client_tool", pause_data={"x": 1})
+
+        claimed = await store.claim_paused_run("run_cl", expected_status="waiting_client_tool")
+        assert claimed is True
+
+        record = await store.get_run("run_cl")
+        assert record is not None
+        assert record.status == "running"
+
+    async def test_claim_paused_run_fails_wrong_status(self, store) -> None:
+        """claim_paused_run returns False if status doesn't match."""
+        await store.create_run("run_cf", "Agent")
+        await store.pause_run("run_cf", status="waiting_client_tool", pause_data={"x": 1})
+
+        # Try to claim with wrong expected status
+        claimed = await store.claim_paused_run("run_cf", expected_status="waiting_human_input")
+        assert claimed is False
+
+        # Status unchanged
+        record = await store.get_run("run_cf")
+        assert record is not None
+        assert record.status == "waiting_client_tool"
+
+    async def test_double_claim_fails(self, store) -> None:
+        """Second claim on the same run returns False — atomic CAS."""
+        await store.create_run("run_dc", "Agent")
+        await store.pause_run("run_dc", status="waiting_client_tool", pause_data={"x": 1})
+
+        claimed1 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
+        assert claimed1 is True
+
+        # Second claim fails — status is now 'running', not 'waiting_client_tool'
+        claimed2 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
+        assert claimed2 is False
+
+    async def test_finalize_clears_pause_data(self, store) -> None:
+        """finalize_run sets pause_data to None."""
+        await store.create_run("run_fc", "Agent")
+        await store.pause_run("run_fc", status="waiting_client_tool", pause_data={"x": 1})
+
+        # pause_data exists
+        assert await store.get_pause_state("run_fc") is not None
+
+        await store.finalize_run("run_fc", status="success", answer="done")
+
+        # pause_data cleared
+        assert await store.get_pause_state("run_fc") is None
+
+        record = await store.get_run("run_fc")
+        assert record is not None
+        assert record.status == "success"

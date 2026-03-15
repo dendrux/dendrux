@@ -1,0 +1,486 @@
+"""Tests for resume/resume_with_input (Sprint 3, Group 2)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import pytest
+
+from dendrite.agent import Agent
+from dendrite.llm.mock import MockLLM
+from dendrite.runtime.runner import resume, resume_with_input, run
+from dendrite.tool import tool
+from dendrite.types import (
+    LLMResponse,
+    Message,
+    PauseState,
+    Role,
+    RunStatus,
+    ToolCall,
+    ToolResult,
+    UsageStats,
+)
+
+# ------------------------------------------------------------------
+# Test tools
+# ------------------------------------------------------------------
+
+
+@tool()
+async def server_add(a: int, b: int) -> int:
+    """Server-side add."""
+    return a + b
+
+
+@tool(target="client")
+async def read_range(sheet: str) -> str:
+    """Client-side tool."""
+    return "should never run"
+
+
+def _make_agent(**overrides) -> Agent:
+    defaults = {
+        "model": "mock",
+        "prompt": "You are a test agent.",
+        "tools": [server_add, read_range],
+        "max_iterations": 10,
+    }
+    defaults.update(overrides)
+    return Agent(**defaults)
+
+
+# ------------------------------------------------------------------
+# Mock StateStore for resume tests
+# ------------------------------------------------------------------
+
+
+@dataclass
+class RecordingStateStore:
+    """Fake StateStore that records calls and supports pause/resume."""
+
+    created_runs: list[dict[str, Any]] = field(default_factory=list)
+    finalized_runs: list[dict[str, Any]] = field(default_factory=list)
+    paused_runs: list[dict[str, Any]] = field(default_factory=list)
+    traces: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls_saved: list[dict[str, Any]] = field(default_factory=list)
+    usages: list[dict[str, Any]] = field(default_factory=list)
+    _pause_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _run_status: dict[str, str] = field(default_factory=dict)
+    _claimed: set[str] = field(default_factory=set)
+
+    async def create_run(self, run_id: str, agent_name: str, **kwargs: Any) -> None:
+        self.created_runs.append({"run_id": run_id, "agent_name": agent_name, **kwargs})
+        self._run_status[run_id] = "running"
+
+    async def save_trace(
+        self, run_id: str, role: str, content: str, *, order_index: int, meta: Any = None
+    ) -> None:
+        self.traces.append(
+            {
+                "run_id": run_id,
+                "role": role,
+                "content": content,
+                "order_index": order_index,
+                "meta": meta,
+            }
+        )
+
+    async def save_tool_call(self, run_id: str, **kwargs: Any) -> None:
+        self.tool_calls_saved.append({"run_id": run_id, **kwargs})
+
+    async def save_usage(self, run_id: str, **kwargs: Any) -> None:
+        self.usages.append({"run_id": run_id, **kwargs})
+
+    async def finalize_run(self, run_id: str, **kwargs: Any) -> None:
+        self.finalized_runs.append({"run_id": run_id, **kwargs})
+        self._run_status[run_id] = kwargs.get("status", "success")
+        self._pause_data.pop(run_id, None)
+
+    async def pause_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        iteration_count: int | None = None,
+    ) -> None:
+        self.paused_runs.append(
+            {
+                "run_id": run_id,
+                "status": status,
+                "pause_data": pause_data,
+                "iteration_count": iteration_count,
+            }
+        )
+        self._pause_data[run_id] = pause_data
+        self._run_status[run_id] = status
+
+    async def get_pause_state(self, run_id: str) -> dict[str, Any] | None:
+        return self._pause_data.get(run_id)
+
+    async def claim_paused_run(self, run_id: str, *, expected_status: str) -> bool:
+        if self._run_status.get(run_id) != expected_status:
+            return False
+        if run_id in self._claimed:
+            return False
+        self._claimed.add(run_id)
+        self._run_status[run_id] = "running"
+        return True
+
+    async def get_run(self, run_id: str) -> Any:
+        return None
+
+    async def get_traces(self, run_id: str) -> list[Any]:
+        """Return trace records for order_index calculation."""
+
+        @dataclass
+        class _Trace:
+            order_index: int
+
+        return [_Trace(order_index=t["order_index"]) for t in self.traces if t["run_id"] == run_id]
+
+    async def get_tool_calls(self, run_id: str) -> list[Any]:
+        return []
+
+    async def list_runs(self, **kwargs: Any) -> list[Any]:
+        return []
+
+
+# ------------------------------------------------------------------
+# Resume tests
+# ------------------------------------------------------------------
+
+
+class TestResume:
+    async def test_resume_completes_paused_run(self) -> None:
+        """Pause on client tool, resume with result, finish SUCCESS."""
+        # Phase 1: run until pause
+        tc_client = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm_pause = MockLLM([LLMResponse(tool_calls=[tc_client])])
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        result1 = await run(
+            agent,
+            provider=llm_pause,
+            user_input="Read sheet",
+            state_store=store,
+        )
+        assert result1.status == RunStatus.WAITING_CLIENT_TOOL
+        assert len(store.paused_runs) == 1
+
+        # Phase 2: resume with tool result
+        pending = result1.meta["pause_state"].pending_tool_calls
+        tool_result = ToolResult(
+            name="read_range",
+            call_id=pending[0].id,
+            payload='{"data": [1, 2, 3]}',
+            success=True,
+        )
+        llm_finish = MockLLM([LLMResponse(text="The data is [1, 2, 3]")])
+
+        result2 = await resume(
+            result1.run_id,
+            [tool_result],
+            state_store=store,
+            agent=agent,
+            provider=llm_finish,
+        )
+        assert result2.status == RunStatus.SUCCESS
+        assert result2.answer == "The data is [1, 2, 3]"
+        assert len(store.finalized_runs) == 1
+
+    async def test_resume_persists_client_tool_call_records(self) -> None:
+        """Client tool results are persisted via on_tool_completed, not just on_message_appended."""
+        tc_client = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm_pause = MockLLM([LLMResponse(tool_calls=[tc_client])])
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        r1 = await run(agent, provider=llm_pause, user_input="Read", state_store=store)
+        assert r1.status == RunStatus.WAITING_CLIENT_TOOL
+
+        # Clear tool_calls from the initial run to isolate resume's records
+        store.tool_calls_saved.clear()
+
+        pending = r1.meta["pause_state"].pending_tool_calls
+        tr = ToolResult(
+            name="read_range",
+            call_id=pending[0].id,
+            payload='{"data": "ok"}',
+            success=True,
+            duration_ms=100,
+        )
+        llm_finish = MockLLM([LLMResponse(text="Done")])
+        await resume(r1.run_id, [tr], state_store=store, agent=agent, provider=llm_finish)
+
+        # on_tool_completed should have been called for the client tool
+        assert len(store.tool_calls_saved) >= 1
+        client_tc = store.tool_calls_saved[0]
+        assert client_tc["tool_name"] == "read_range"
+        assert client_tc["success"] is True
+        assert client_tc["result_payload"] == '{"data": "ok"}'
+
+    async def test_resume_rejects_wrong_tool_results(self) -> None:
+        """Providing results for wrong call_ids raises ValueError."""
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        result = await run(agent, provider=llm, user_input="Read", state_store=store)
+        assert result.status == RunStatus.WAITING_CLIENT_TOOL
+
+        wrong_result = ToolResult(
+            name="read_range",
+            call_id="wrong_id",
+            payload="{}",
+            success=True,
+        )
+        with pytest.raises(ValueError, match="do not match"):
+            await resume(
+                result.run_id,
+                [wrong_result],
+                state_store=store,
+                agent=agent,
+                provider=MockLLM([]),
+            )
+
+    async def test_validation_failure_does_not_claim_run(self) -> None:
+        """Wrong call_ids should NOT transition the run to RUNNING."""
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        result = await run(agent, provider=llm, user_input="Read", state_store=store)
+        assert result.status == RunStatus.WAITING_CLIENT_TOOL
+
+        wrong_result = ToolResult(
+            name="read_range",
+            call_id="wrong_id",
+            payload="{}",
+            success=True,
+        )
+        with pytest.raises(ValueError, match="do not match"):
+            await resume(
+                result.run_id,
+                [wrong_result],
+                state_store=store,
+                agent=agent,
+                provider=MockLLM([]),
+            )
+
+        # Run should still be in WAITING status — not claimed/stuck as RUNNING
+        assert store._run_status[result.run_id] == "waiting_client_tool"
+
+    async def test_resume_rejects_non_paused_run(self) -> None:
+        """Resuming a run that's not in WAITING status raises ValueError."""
+        store = RecordingStateStore()
+        # No pause data exists for this run
+        with pytest.raises(ValueError, match="no pause state"):
+            await resume(
+                "nonexistent_run",
+                [],
+                state_store=store,
+                agent=_make_agent(),
+                provider=MockLLM([]),
+            )
+
+    async def test_double_pause_resume(self) -> None:
+        """Agent pauses twice in sequence, both resume correctly."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        # Phase 1: first pause
+        tc1 = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm1 = MockLLM([LLMResponse(tool_calls=[tc1])])
+        r1 = await run(agent, provider=llm1, user_input="Step 1", state_store=store)
+        assert r1.status == RunStatus.WAITING_CLIENT_TOOL
+
+        # Phase 2: resume, then pause again on a second client tool call
+        pending1 = r1.meta["pause_state"].pending_tool_calls
+        tr1 = ToolResult(name="read_range", call_id=pending1[0].id, payload='"data1"', success=True)
+        tc2 = ToolCall(name="read_range", params={"sheet": "S2"}, provider_tool_call_id="t2")
+        llm2 = MockLLM([LLMResponse(tool_calls=[tc2])])
+
+        # Need to clear the claim so the second pause can be claimed
+        store._claimed.clear()
+        r2 = await resume(r1.run_id, [tr1], state_store=store, agent=agent, provider=llm2)
+        assert r2.status == RunStatus.WAITING_CLIENT_TOOL
+
+        # Phase 3: resume second pause to completion
+        pending2 = r2.meta["pause_state"].pending_tool_calls
+        tr2 = ToolResult(name="read_range", call_id=pending2[0].id, payload='"data2"', success=True)
+        llm3 = MockLLM([LLMResponse(text="Got both: data1 and data2")])
+
+        store._claimed.clear()
+        r3 = await resume(r1.run_id, [tr2], state_store=store, agent=agent, provider=llm3)
+        assert r3.status == RunStatus.SUCCESS
+        assert r3.answer == "Got both: data1 and data2"
+
+    async def test_iteration_count_continues(self) -> None:
+        """After resume, iteration count continues from where it paused."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm1 = MockLLM([LLMResponse(tool_calls=[tc])])
+        r1 = await run(agent, provider=llm1, user_input="Go", state_store=store)
+        assert r1.iteration_count == 1
+
+        pending = r1.meta["pause_state"].pending_tool_calls
+        tr = ToolResult(name="read_range", call_id=pending[0].id, payload='"ok"', success=True)
+        llm2 = MockLLM([LLMResponse(text="Done")])
+
+        r2 = await resume(r1.run_id, [tr], state_store=store, agent=agent, provider=llm2)
+        assert r2.iteration_count == 2  # continued from 1
+
+    async def test_final_run_result_has_all_steps(self) -> None:
+        """Steps span the full run including pre-pause steps."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm1 = MockLLM([LLMResponse(tool_calls=[tc])])
+        r1 = await run(agent, provider=llm1, user_input="Go", state_store=store)
+        assert len(r1.steps) == 1  # one step before pause
+
+        pending = r1.meta["pause_state"].pending_tool_calls
+        tr = ToolResult(name="read_range", call_id=pending[0].id, payload='"ok"', success=True)
+        llm2 = MockLLM([LLMResponse(text="Done")])
+
+        r2 = await resume(r1.run_id, [tr], state_store=store, agent=agent, provider=llm2)
+        # Should have both pre-pause and post-resume steps
+        assert len(r2.steps) == 2
+
+    async def test_observer_order_index_continues(self) -> None:
+        """Trace order_index continues from max existing index after resume."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm1 = MockLLM([LLMResponse(tool_calls=[tc])])
+        await run(agent, provider=llm1, user_input="Go", state_store=store)
+
+        pre_pause_indices = [t["order_index"] for t in store.traces]
+        max_pre = max(pre_pause_indices)
+
+        pending_data = store.paused_runs[0]["pause_data"]
+        ps = PauseState.from_dict(pending_data)
+        tr = ToolResult(
+            name="read_range", call_id=ps.pending_tool_calls[0].id, payload='"ok"', success=True
+        )
+        llm2 = MockLLM([LLMResponse(text="Done")])
+
+        await resume(
+            store.paused_runs[0]["run_id"], [tr], state_store=store, agent=agent, provider=llm2
+        )
+
+        post_resume_indices = [t["order_index"] for t in store.traces if t["order_index"] > max_pre]
+        assert all(i > max_pre for i in post_resume_indices)
+        # No duplicate indices
+        all_indices = [t["order_index"] for t in store.traces]
+        assert len(all_indices) == len(set(all_indices))
+
+    async def test_atomic_claim_prevents_double_resume(self) -> None:
+        """Second claim returns False — cannot resume twice."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        r = await run(agent, provider=llm, user_input="Go", state_store=store)
+
+        # First claim succeeds
+        claimed1 = await store.claim_paused_run(r.run_id, expected_status="waiting_client_tool")
+        assert claimed1 is True
+
+        # Second claim fails (already claimed)
+        claimed2 = await store.claim_paused_run(r.run_id, expected_status="waiting_client_tool")
+        assert claimed2 is False
+
+    async def test_pause_data_cleared_on_finalize(self) -> None:
+        """pause_data is removed from store after successful finalize."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm1 = MockLLM([LLMResponse(tool_calls=[tc])])
+        r = await run(agent, provider=llm1, user_input="Go", state_store=store)
+
+        # Pause data exists
+        assert await store.get_pause_state(r.run_id) is not None
+
+        # Resume to completion
+        pending = r.meta["pause_state"].pending_tool_calls
+        tr = ToolResult(name="read_range", call_id=pending[0].id, payload='"ok"', success=True)
+        llm2 = MockLLM([LLMResponse(text="Done")])
+        await resume(r.run_id, [tr], state_store=store, agent=agent, provider=llm2)
+
+        # Pause data cleared
+        assert await store.get_pause_state(r.run_id) is None
+
+
+class TestResumeWithInput:
+    async def test_resume_with_input_completes_clarification(self) -> None:
+        """WAITING_HUMAN_INPUT → user input → SUCCESS."""
+        agent = _make_agent(tools=[server_add])
+        store = RecordingStateStore()
+
+        # Simulate a clarification — the loop returns WAITING_HUMAN_INPUT
+        # when it hits a Clarification action. We need to mock this by
+        # running with a tool-free agent where the LLM produces a clarification.
+        # Since NativeToolCalling doesn't produce Clarification directly,
+        # we test resume_with_input by manually creating pause state.
+        pause_state = PauseState(
+            agent_name=agent.name,
+            pending_tool_calls=[],
+            history=[
+                Message(role=Role.USER, content="What file?"),
+                Message(role=Role.ASSISTANT, content="Which file should I analyze?"),
+            ],
+            steps=[],
+            iteration=1,
+            trace_order_offset=2,
+            usage=UsageStats(input_tokens=50, output_tokens=20, total_tokens=70),
+        )
+        run_id = "test_clarification_run"
+        store._pause_data[run_id] = pause_state.to_dict()
+        store._run_status[run_id] = "waiting_human_input"
+
+        llm = MockLLM([LLMResponse(text="I'll analyze report.csv")])
+        result = await resume_with_input(
+            run_id,
+            "report.csv",
+            state_store=store,
+            agent=agent,
+            provider=llm,
+        )
+        assert result.status == RunStatus.SUCCESS
+        assert result.answer == "I'll analyze report.csv"
+
+        # The user input should be in the LLM call history
+        call_msgs = llm.call_history[0]["messages"]
+        user_msgs = [m for m in call_msgs if m.role == Role.USER]
+        assert any("report.csv" in m.content for m in user_msgs)
+
+    async def test_resume_with_input_rejects_non_waiting_human(self) -> None:
+        """resume_with_input on WAITING_CLIENT_TOOL raises ValueError."""
+        agent = _make_agent()
+        store = RecordingStateStore()
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        r = await run(agent, provider=llm, user_input="Go", state_store=store)
+        assert r.status == RunStatus.WAITING_CLIENT_TOOL
+
+        with pytest.raises(ValueError, match="not in status"):
+            await resume_with_input(
+                r.run_id,
+                "some input",
+                state_store=store,
+                agent=agent,
+                provider=MockLLM([]),
+            )

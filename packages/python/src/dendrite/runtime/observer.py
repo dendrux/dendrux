@@ -65,6 +65,7 @@ class PersistenceObserver(LoopObserver):
         provider_name: str | None = None,
         target_lookup: dict[str, ToolTarget] | None = None,
         redact: Callable[[str], str] | None = None,
+        initial_order_index: int = 0,
     ) -> None:
         self._store = state_store
         self._run_id = run_id
@@ -72,7 +73,7 @@ class PersistenceObserver(LoopObserver):
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
         self._redact = redact or _identity
-        self._order_index = 0
+        self._order_index = initial_order_index
 
     async def on_message_appended(self, message: Message, iteration: int) -> None:
         """Persist a message to react_traces."""

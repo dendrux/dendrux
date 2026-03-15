@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrite.loops.react import ReActLoop
 from dendrite.strategies.native import NativeToolCalling
-from dendrite.types import RunStatus, generate_ulid
+from dendrite.types import PauseState, RunStatus, generate_ulid
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from dendrite.loops.base import Loop
     from dendrite.runtime.state import StateStore
     from dendrite.strategies.base import Strategy
-    from dendrite.types import RunResult
+    from dendrite.types import RunResult, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +140,249 @@ async def run(
             observer=observer,
         )
 
-        # Finalize with success or max_iterations
         if state_store is not None:
+            if result.status in (RunStatus.WAITING_CLIENT_TOOL, RunStatus.WAITING_HUMAN_INPUT):
+                # Pause — persist state for resume
+                pause_state: PauseState = result.meta["pause_state"]
+                await state_store.pause_run(
+                    run_id,
+                    status=result.status.value,
+                    pause_data=pause_state.to_dict(),
+                    iteration_count=result.iteration_count,
+                )
+            else:
+                # Finalize with success or max_iterations
+                redacted_answer = (
+                    redact(result.answer) if redact and result.answer else result.answer
+                )
+                await state_store.finalize_run(
+                    run_id,
+                    status=result.status.value,
+                    answer=redacted_answer,
+                    iteration_count=result.iteration_count,
+                    total_usage=result.usage,
+                )
+
+        return result
+
+    except Exception as exc:
+        # Persist ERROR status before re-raising.
+        # Pass total_usage=None so finalize_run skips overwriting summary
+        # columns with zeros. Per-call token_usage rows (already persisted
+        # by the observer) remain the source of truth for errored runs.
+        if state_store is not None:
+            try:
+                redacted_err = redact(str(exc)) if redact else str(exc)
+                await state_store.finalize_run(
+                    run_id,
+                    status=RunStatus.ERROR.value,
+                    error=redacted_err,
+                    total_usage=None,
+                )
+            except Exception:
+                logger.warning("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+        raise
+
+
+async def resume(
+    run_id: str,
+    tool_results: list[ToolResult],
+    *,
+    state_store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    strategy: Strategy | None = None,
+    loop: Loop | None = None,
+    redact: Callable[[str], str] | None = None,
+) -> RunResult:
+    """Resume a paused run by providing client tool results.
+
+    Only works on runs with status WAITING_CLIENT_TOOL. Uses an atomic
+    claim to prevent double-resume races.
+
+    Args:
+        run_id: The paused run's ID.
+        tool_results: Results for the pending tool calls. Each must have
+            a call_id matching one of the pending_tool_calls.
+        state_store: Persistence backend (required for resume).
+        agent: Agent definition (must match the paused run's agent).
+        provider: LLM provider for continuing the run.
+        strategy: Strategy override. Defaults to NativeToolCalling.
+        loop: Loop override. Defaults to ReActLoop.
+        redact: Redaction policy for persistence.
+    """
+    return await _resume_core(
+        run_id,
+        state_store=state_store,
+        agent=agent,
+        provider=provider,
+        strategy=strategy,
+        loop=loop,
+        redact=redact,
+        expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
+        tool_results=tool_results,
+    )
+
+
+async def resume_with_input(
+    run_id: str,
+    user_input: str,
+    *,
+    state_store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    strategy: Strategy | None = None,
+    loop: Loop | None = None,
+    redact: Callable[[str], str] | None = None,
+) -> RunResult:
+    """Resume a paused run by providing clarification input.
+
+    Only works on runs with status WAITING_HUMAN_INPUT. Appends the
+    user's response as a normal USER message and re-enters the loop.
+
+    Args:
+        run_id: The paused run's ID.
+        user_input: Free-text response to the agent's clarification question.
+        state_store: Persistence backend (required for resume).
+        agent: Agent definition (must match the paused run's agent).
+        provider: LLM provider for continuing the run.
+        strategy: Strategy override. Defaults to NativeToolCalling.
+        loop: Loop override. Defaults to ReActLoop.
+        redact: Redaction policy for persistence.
+    """
+    return await _resume_core(
+        run_id,
+        state_store=state_store,
+        agent=agent,
+        provider=provider,
+        strategy=strategy,
+        loop=loop,
+        redact=redact,
+        expected_status=RunStatus.WAITING_HUMAN_INPUT.value,
+        user_input=user_input,
+    )
+
+
+async def _resume_core(
+    run_id: str,
+    *,
+    state_store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    strategy: Strategy | None = None,
+    loop: Loop | None = None,
+    redact: Callable[[str], str] | None = None,
+    expected_status: str,
+    tool_results: list[ToolResult] | None = None,
+    user_input: str | None = None,
+) -> RunResult:
+    """Shared resume logic for tool results and clarification input."""
+    from dendrite.runtime.observer import PersistenceObserver
+    from dendrite.tool import get_tool_def
+    from dendrite.types import Message, Role
+
+    resolved_strategy = strategy or NativeToolCalling()
+    resolved_loop = loop or ReActLoop()
+
+    # 1. Load pause state
+    raw_pause = await state_store.get_pause_state(run_id)
+    if raw_pause is None:
+        raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
+    pause_state = PauseState.from_dict(raw_pause)
+
+    # 2. Validate tool results BEFORE claiming (prevents stuck RUNNING on bad input)
+    if tool_results is not None:
+        pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
+        provided_ids = {tr.call_id for tr in tool_results}
+        if provided_ids != pending_ids:
+            raise ValueError(
+                f"Tool result call_ids {provided_ids} do not match "
+                f"pending tool call_ids {pending_ids}."
+            )
+
+    # 3. Atomic claim — transition WAITING → RUNNING
+    #    Done after validation so a bad request doesn't leave the run stuck.
+    claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
+    if not claimed:
+        raise ValueError(
+            f"Run '{run_id}' is not in status '{expected_status}' — "
+            f"cannot resume. It may have been claimed by another caller."
+        )
+
+    # 4. Build resume history
+    history = list(pause_state.history)
+
+    if tool_results is not None:
+        # Inject tool results into history as TOOL messages
+        for tr in tool_results:
+            result_msg = Message(
+                role=Role.TOOL,
+                content=tr.payload,
+                name=tr.name,
+                call_id=tr.call_id,
+                meta={"is_error": True} if not tr.success else {},
+            )
+            history.append(result_msg)
+    elif user_input is not None:
+        # Append clarification response as USER message
+        history.append(Message(role=Role.USER, content=user_input))
+
+    # 5. Load real trace order offset from DB (not the approximate one in pause_state)
+    traces = await state_store.get_traces(run_id)
+    trace_order_offset = max((t.order_index for t in traces), default=-1) + 1
+
+    # 6. Create observer for resumed run
+    target_lookup = {}
+    for fn in agent.tools:
+        td = get_tool_def(fn)
+        target_lookup[td.name] = td.target
+    observer = PersistenceObserver(
+        state_store,
+        run_id,
+        model=agent.model,
+        provider_name=type(provider).__name__,
+        target_lookup=target_lookup,
+        redact=redact,
+        initial_order_index=trace_order_offset,
+    )
+
+    # 7. Notify observer of injected messages and tool completions
+    if tool_results is not None:
+        pending_by_id = {tc.id: tc for tc in pause_state.pending_tool_calls}
+        injected_start = len(pause_state.history)
+        for i, tr in enumerate(tool_results):
+            # Persist the TOOL message trace
+            await observer.on_message_appended(history[injected_start + i], pause_state.iteration)
+            # Persist the tool_call record (params, result, success, target)
+            await observer.on_tool_completed(pending_by_id[tr.call_id], tr, pause_state.iteration)
+    elif user_input is not None:
+        await observer.on_message_appended(history[-1], pause_state.iteration)
+
+    # 8. Re-enter loop
+    try:
+        result = await resolved_loop.run(
+            agent=agent,
+            provider=provider,
+            strategy=resolved_strategy,
+            user_input="",  # Not used when initial_history is provided
+            run_id=run_id,
+            observer=observer,
+            initial_history=history,
+            initial_steps=pause_state.steps,
+            iteration_offset=pause_state.iteration,
+            initial_usage=pause_state.usage,
+        )
+
+        # 9. Finalize or pause again
+        if result.status in (RunStatus.WAITING_CLIENT_TOOL, RunStatus.WAITING_HUMAN_INPUT):
+            new_pause: PauseState = result.meta["pause_state"]
+            await state_store.pause_run(
+                run_id,
+                status=result.status.value,
+                pause_data=new_pause.to_dict(),
+                iteration_count=result.iteration_count,
+            )
+        else:
             redacted_answer = redact(result.answer) if redact and result.answer else result.answer
             await state_store.finalize_run(
                 run_id,
@@ -154,10 +395,6 @@ async def run(
         return result
 
     except Exception as exc:
-        # Persist ERROR status before re-raising.
-        # Pass total_usage=None so finalize_run skips overwriting summary
-        # columns with zeros. Per-call token_usage rows (already persisted
-        # by the observer) remain the source of truth for errored runs.
         if state_store is not None:
             try:
                 redacted_err = redact(str(exc)) if redact else str(exc)

@@ -133,22 +133,38 @@ class ReActLoop(Loop):
         user_input: str,
         run_id: str | None = None,
         observer: LoopObserver | None = None,
+        initial_history: list[Message] | None = None,
+        initial_steps: list[AgentStep] | None = None,
+        iteration_offset: int = 0,
+        initial_usage: UsageStats | None = None,
     ) -> RunResult:
-        """Execute the ReAct loop."""
+        """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
         tool_defs = agent.get_tool_defs()
         tool_lookup, target_lookup, timeout_lookup = _build_tool_lookup(agent.tools)
 
-        user_msg = Message(role=Role.USER, content=user_input)
-        history: list[Message] = [user_msg]
-        await _notify_message(observer, user_msg, 0)
+        if initial_history is not None:
+            # Resume from pause — use provided history, skip user message creation
+            history = list(initial_history)
+        else:
+            # Fresh run — create initial user message
+            user_msg = Message(role=Role.USER, content=user_input)
+            history = [user_msg]
+            await _notify_message(observer, user_msg, 0)
 
-        steps: list[AgentStep] = []
-        total_usage = UsageStats()
+        steps: list[AgentStep] = list(initial_steps) if initial_steps else []
+        total_usage = UsageStats(
+            input_tokens=initial_usage.input_tokens if initial_usage else 0,
+            output_tokens=initial_usage.output_tokens if initial_usage else 0,
+            total_tokens=initial_usage.total_tokens if initial_usage else 0,
+            cost_usd=initial_usage.cost_usd if initial_usage else None,
+        )
 
         observer_warnings: list[str] = []
 
-        for iteration in range(1, agent.max_iterations + 1):
+        start_iteration = iteration_offset + 1
+        end_iteration = agent.max_iterations + 1
+        for iteration in range(start_iteration, end_iteration):
             # 1. Build messages via strategy
             messages, tools = strategy.build_messages(
                 system_prompt=agent.prompt,

@@ -22,7 +22,15 @@ if TYPE_CHECKING:
     from dendrite.agent import Agent
     from dendrite.llm.base import LLMProvider
     from dendrite.strategies.base import Strategy
-    from dendrite.types import LLMResponse, Message, RunResult, ToolCall, ToolResult
+    from dendrite.types import (
+        AgentStep,
+        LLMResponse,
+        Message,
+        RunResult,
+        ToolCall,
+        ToolResult,
+        UsageStats,
+    )
 
 
 @runtime_checkable
@@ -91,6 +99,10 @@ class Loop(ABC):
         user_input: str,
         run_id: str | None = None,
         observer: LoopObserver | None = None,
+        initial_history: list[Message] | None = None,
+        initial_steps: list[AgentStep] | None = None,
+        iteration_offset: int = 0,
+        initial_usage: UsageStats | None = None,
     ) -> RunResult:
         """Execute the agent loop until completion.
 
@@ -101,6 +113,15 @@ class Loop(ABC):
             user_input: The user's input to process.
             run_id: Optional runner-provided ID. If None, loop generates one.
             observer: Optional observer for persistence/logging hooks.
+            initial_history: Pre-existing conversation history for resume.
+                When provided, skips creating the user message and uses
+                this as the starting history.
+            initial_steps: Pre-existing AgentSteps from before a pause.
+                Merged with new steps so the final RunResult.steps spans
+                the entire run.
+            iteration_offset: Iteration number to resume from. The loop
+                starts counting from iteration_offset + 1.
+            initial_usage: Cumulative token usage from before a pause.
 
         Returns:
             RunResult with status, answer, steps, and usage.

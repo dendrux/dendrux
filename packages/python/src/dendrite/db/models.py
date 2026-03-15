@@ -78,6 +78,10 @@ class AgentRun(Base):
     # Developer's linking data — Dendrite stores it, never reads it
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
+    # Pause state — execution state for resume (D1: not observable, not redacted)
+    # Cleared on finalize. Contains unredacted history for correct LLM resume.
+    pause_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
     # Error details (populated on ERROR status)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 

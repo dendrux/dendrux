@@ -151,6 +151,19 @@ class StateStore(Protocol):
         total_usage: UsageStats | None = None,
     ) -> None: ...
 
+    async def pause_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        iteration_count: int | None = None,
+    ) -> None: ...
+
+    async def get_pause_state(self, run_id: str) -> dict[str, Any] | None: ...
+
+    async def claim_paused_run(self, run_id: str, *, expected_status: str) -> bool: ...
+
     async def get_run(self, run_id: str) -> RunRecord | None: ...
 
     async def get_traces(self, run_id: str) -> list[TraceRecord]: ...
@@ -339,9 +352,73 @@ class SQLAlchemyStateStore:
                 values["total_output_tokens"] = total_usage.output_tokens
                 values["total_cost_usd"] = total_usage.cost_usd
 
+            # Clear pause_data on finalize (D1: execution state cleaned up)
+            values["pause_data"] = None
+
             stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
             await session.execute(stmt)
             await session.commit()
+
+    async def pause_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        iteration_count: int | None = None,
+    ) -> None:
+        """Persist pause state and set WAITING status."""
+        from sqlalchemy import func, update
+
+        from dendrite.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            values: dict[str, Any] = {
+                "status": status,
+                "pause_data": pause_data,
+                "updated_at": func.now(),
+            }
+            if iteration_count is not None:
+                values["iteration_count"] = iteration_count
+            stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
+            await session.execute(stmt)
+            await session.commit()
+
+    async def get_pause_state(self, run_id: str) -> dict[str, Any] | None:
+        """Retrieve pause_data for a run. Returns None if no run or no pause data."""
+        from sqlalchemy import select
+
+        from dendrite.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            stmt = select(AgentRun.pause_data).where(AgentRun.id == run_id)
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            # row is None if run doesn't exist OR if pause_data column is NULL
+            if row is None:
+                return None
+            return dict(row)  # type narrowing for mypy
+
+    async def claim_paused_run(self, run_id: str, *, expected_status: str) -> bool:
+        """Atomically transition a paused run to RUNNING.
+
+        Returns True if the claim succeeded (run was in expected_status).
+        Returns False if someone else already claimed it or status didn't match.
+        Uses UPDATE ... WHERE status=? for atomicity — no race window.
+        """
+        from sqlalchemy import func, update
+
+        from dendrite.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            stmt = (
+                update(AgentRun)
+                .where(AgentRun.id == run_id, AgentRun.status == expected_status)
+                .values(status="running", updated_at=func.now())
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return bool(result.rowcount and result.rowcount > 0)
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         from sqlalchemy import select
