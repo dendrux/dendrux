@@ -140,8 +140,60 @@ class PersistenceObserver(LoopObserver):
         )
         self._order_index += 1
 
-    async def on_llm_call_completed(self, response: LLMResponse, iteration: int) -> None:
-        """Persist token usage and record llm.completed event."""
+    async def on_llm_call_completed(
+        self,
+        response: LLMResponse,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[Any] | None = None,
+    ) -> None:
+        """Persist LLM interaction (primary) + token usage (legacy) and record event."""
+        # Build semantic payloads for the evidence layer
+        semantic_request = None
+        if semantic_messages is not None:
+            semantic_request = {
+                "messages": [
+                    {"role": m.role.value, "content": m.content[:2000]} for m in semantic_messages
+                ],
+            }
+            if semantic_tools is not None:
+                semantic_request["tools"] = [
+                    {"name": t.name, "description": t.description} for t in semantic_tools
+                ]
+
+        semantic_response: dict[str, Any] | None = None
+        if response.text is not None or response.tool_calls is not None:
+            semantic_response = {}
+            if response.text is not None:
+                semantic_response["text"] = response.text[:2000]
+            if response.tool_calls is not None:
+                semantic_response["tool_calls"] = [
+                    {"name": tc.name, "params": tc.params} for tc in response.tool_calls
+                ]
+
+        # Primary write: llm_interactions table
+        try:
+            await self._store.save_llm_interaction(
+                self._run_id,
+                iteration_index=iteration,
+                usage=response.usage,
+                model=self._model,
+                provider=self._provider_name,
+                semantic_request=semantic_request,
+                semantic_response=semantic_response,
+                provider_request=response.provider_request,
+                provider_response=response.provider_response,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to save llm_interaction for run %s iteration %d",
+                self._run_id,
+                iteration,
+                exc_info=True,
+            )
+
+        # Legacy dual-write: token_usage table (backcompat)
         await self._store.save_usage(
             self._run_id,
             iteration_index=iteration,

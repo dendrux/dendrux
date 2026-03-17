@@ -93,6 +93,25 @@ class RunEventRecord:
     created_at: datetime | None = None
 
 
+@dataclass
+class LLMInteractionRecord:
+    """Lightweight read model for a persisted LLM interaction."""
+
+    id: str
+    iteration_index: int
+    model: str | None = None
+    provider: str | None = None
+    semantic_request: dict[str, Any] | None = None
+    semantic_response: dict[str, Any] | None = None
+    provider_request: dict[str, Any] | None = None
+    provider_response: dict[str, Any] | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    created_at: datetime | None = None
+
+
 class StateStore(Protocol):
     """Persistence interface for agent runs.
 
@@ -152,6 +171,23 @@ class StateStore(Protocol):
         duration_ms: int | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None: ...
+
+    async def save_llm_interaction(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int,
+        usage: UsageStats,
+        model: str | None = None,
+        provider: str | None = None,
+        duration_ms: int | None = None,
+        semantic_request: dict[str, Any] | None = None,
+        semantic_response: dict[str, Any] | None = None,
+        provider_request: dict[str, Any] | None = None,
+        provider_response: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    async def get_llm_interactions(self, run_id: str) -> list[LLMInteractionRecord]: ...
 
     async def finalize_run(
         self,
@@ -348,6 +384,73 @@ class SQLAlchemyStateStore:
             )
             session.add(record)
             await session.commit()
+
+    async def save_llm_interaction(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int,
+        usage: UsageStats,
+        model: str | None = None,
+        provider: str | None = None,
+        duration_ms: int | None = None,
+        semantic_request: dict[str, Any] | None = None,
+        semantic_response: dict[str, Any] | None = None,
+        provider_request: dict[str, Any] | None = None,
+        provider_response: dict[str, Any] | None = None,
+    ) -> None:
+        from dendrite.db.models import LLMInteraction
+
+        async with self._session_factory() as session:
+            record = LLMInteraction(
+                id=generate_ulid(),
+                agent_run_id=run_id,
+                iteration_index=iteration_index,
+                model=model,
+                provider=provider,
+                semantic_request=semantic_request,
+                semantic_response=semantic_response,
+                provider_request=provider_request,
+                provider_response=provider_response,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cost_usd=usage.cost_usd,
+                duration_ms=duration_ms,
+            )
+            session.add(record)
+            await session.commit()
+
+    async def get_llm_interactions(self, run_id: str) -> list[LLMInteractionRecord]:
+        from sqlalchemy import select
+
+        from dendrite.db.models import LLMInteraction
+
+        async with self._session_factory() as session:
+            stmt = (
+                select(LLMInteraction)
+                .where(LLMInteraction.agent_run_id == run_id)
+                .order_by(LLMInteraction.iteration_index)
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            return [
+                LLMInteractionRecord(
+                    id=r.id,
+                    iteration_index=r.iteration_index,
+                    model=r.model,
+                    provider=r.provider,
+                    semantic_request=r.semantic_request,
+                    semantic_response=r.semantic_response,
+                    provider_request=r.provider_request,
+                    provider_response=r.provider_response,
+                    input_tokens=r.input_tokens,
+                    output_tokens=r.output_tokens,
+                    cost_usd=float(r.cost_usd) if r.cost_usd is not None else None,
+                    duration_ms=r.duration_ms,
+                    created_at=r.created_at,
+                )
+                for r in rows
+            ]
 
     async def finalize_run(
         self,

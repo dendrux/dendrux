@@ -16,7 +16,7 @@ databases or transports.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from dendrite.agent import Agent
@@ -57,13 +57,22 @@ class LoopObserver(Protocol):
         """
         ...
 
-    async def on_llm_call_completed(self, response: LLMResponse, iteration: int) -> None:
+    async def on_llm_call_completed(
+        self,
+        response: LLMResponse,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[Any] | None = None,
+    ) -> None:
         """Called after provider.complete() returns.
 
-        Carries token usage in response.usage. Separate from
-        on_message_appended because usage data doesn't belong in traces.
+        Carries token usage in response.usage, plus optional semantic
+        payloads (the Dendrite-normalized messages and tool defs sent
+        to the LLM). Provider-level payloads are on response itself
+        (response.provider_request, response.provider_response).
 
-        Maps to: token_usage table.
+        Maps to: llm_interactions table (primary), token_usage (legacy dual-write).
         """
         ...
 

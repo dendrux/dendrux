@@ -713,7 +713,7 @@ class TestReActLoopFinalMessagePersistence:
             async def on_message_appended(self, message: Message, iteration: int) -> None:
                 recorded_messages.append(message)
 
-            async def on_llm_call_completed(self, response, iteration: int) -> None:
+            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
                 pass
 
             async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
@@ -748,7 +748,7 @@ class TestReActLoopFinalMessagePersistence:
             async def on_message_appended(self, message: Message, iteration: int) -> None:
                 recorded_messages.append(message)
 
-            async def on_llm_call_completed(self, response, iteration: int) -> None:
+            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
                 pass
 
             async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
@@ -796,7 +796,7 @@ class TestReActLoopFinalMessagePersistence:
             async def on_message_appended(self, message: Message, iteration: int) -> None:
                 recorded_messages.append(message)
 
-            async def on_llm_call_completed(self, response, iteration: int) -> None:
+            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
                 pass
 
             async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
@@ -840,7 +840,7 @@ class TestReActLoopObserverWarnings:
             async def on_message_appended(self, message: Message, iteration: int) -> None:
                 raise RuntimeError("DB connection lost")
 
-            async def on_llm_call_completed(self, response, iteration: int) -> None:
+            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
                 pass
 
             async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
@@ -872,7 +872,7 @@ class TestReActLoopObserverWarnings:
             async def on_message_appended(self, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration):
+            async def on_llm_call_completed(self, response, iteration, **kwargs):
                 pass
 
             async def on_tool_completed(self, tool_call, tool_result, iteration):

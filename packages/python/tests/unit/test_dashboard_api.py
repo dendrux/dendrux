@@ -77,6 +77,23 @@ class _ToolCall:
 
 
 @dataclass
+class _LLMInteraction:
+    id: str = ""
+    iteration_index: int = 0
+    model: str | None = None
+    provider: str | None = None
+    semantic_request: dict[str, Any] | None = None
+    semantic_response: dict[str, Any] | None = None
+    provider_request: dict[str, Any] | None = None
+    provider_response: dict[str, Any] | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    created_at: datetime | None = None
+
+
+@dataclass
 class DashboardMockStore:
     """Mock store for dashboard API tests."""
 
@@ -84,6 +101,7 @@ class DashboardMockStore:
     _events: dict[str, list[_Event]] = field(default_factory=dict)
     _traces: dict[str, list[_Trace]] = field(default_factory=dict)
     _tool_calls: dict[str, list[_ToolCall]] = field(default_factory=dict)
+    _llm_interactions: dict[str, list[_LLMInteraction]] = field(default_factory=dict)
 
     async def get_run(self, run_id: str) -> _Run | None:
         for r in self._runs:
@@ -99,6 +117,9 @@ class DashboardMockStore:
 
     async def get_tool_calls(self, run_id: str) -> list[_ToolCall]:
         return self._tool_calls.get(run_id, [])
+
+    async def get_llm_interactions(self, run_id: str) -> list[_LLMInteraction]:
+        return self._llm_interactions.get(run_id, [])
 
     async def list_runs(
         self,
@@ -349,3 +370,60 @@ class TestRunToolCalls:
             assert tc["tool_name"] == "lookup"
             assert tc["params"] == {"ticker": "AAPL"}
             assert tc["duration_ms"] == 23
+
+
+# ------------------------------------------------------------------
+# LLM Calls endpoint (Sprint 3.5)
+# ------------------------------------------------------------------
+
+
+class TestLLMCallsEndpoint:
+    async def test_llm_calls_returns_interactions(self) -> None:
+        store = DashboardMockStore(
+            _runs=[_Run(id="r1", agent_name="Agent")],
+            _llm_interactions={
+                "r1": [
+                    _LLMInteraction(
+                        id="li_1",
+                        iteration_index=1,
+                        model="claude-sonnet-4-6",
+                        provider="Anthropic",
+                        input_tokens=100,
+                        output_tokens=50,
+                        cost_usd=0.005,
+                        semantic_request={"messages": [{"role": "user", "content": "hi"}]},
+                        semantic_response={"text": "hello"},
+                        provider_request={"model": "claude-sonnet-4-6"},
+                        provider_response={"id": "msg_123"},
+                    )
+                ]
+            },
+        )
+        app = create_dashboard_api(store)  # type: ignore[arg-type]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/runs/r1/llm-calls")
+            assert resp.status_code == 200
+            calls = resp.json()["llm_calls"]
+            assert len(calls) == 1
+            assert calls[0]["model"] == "claude-sonnet-4-6"
+            assert calls[0]["input_tokens"] == 100
+            assert calls[0]["semantic_request"]["messages"][0]["content"] == "hi"
+            assert calls[0]["provider_response"]["id"] == "msg_123"
+
+    async def test_llm_calls_404_for_missing_run(self) -> None:
+        store = DashboardMockStore()
+        app = create_dashboard_api(store)  # type: ignore[arg-type]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/runs/nonexistent/llm-calls")
+            assert resp.status_code == 404
+
+    async def test_llm_calls_empty(self) -> None:
+        store = DashboardMockStore(_runs=[_Run(id="r1", agent_name="Agent")])
+        app = create_dashboard_api(store)  # type: ignore[arg-type]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/runs/r1/llm-calls")
+            assert resp.status_code == 200
+            assert resp.json()["llm_calls"] == []

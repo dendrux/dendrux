@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from dendrite.llm.base import LLMProvider
     from dendrite.loops.base import LoopObserver
     from dendrite.strategies.base import Strategy
-    from dendrite.types import LLMResponse
+    from dendrite.types import LLMResponse, ToolDef
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +78,20 @@ async def _notify_llm(
     response: LLMResponse,
     iteration: int,
     warnings: list[str] | None = None,
+    *,
+    semantic_messages: list[Message] | None = None,
+    semantic_tools: list[ToolDef] | None = None,
 ) -> None:
     """Notify observer of an LLM call completion, swallowing exceptions."""
     if observer is None:
         return
     try:
-        await observer.on_llm_call_completed(response, iteration)
+        await observer.on_llm_call_completed(
+            response,
+            iteration,
+            semantic_messages=semantic_messages,
+            semantic_tools=semantic_tools,
+        )
     except Exception:
         logger.warning("Observer.on_llm_call_completed failed", exc_info=True)
         if warnings is not None:
@@ -174,7 +182,14 @@ class ReActLoop(Loop):
 
             # 2. Call the LLM
             response = await provider.complete(messages, tools=tools)
-            await _notify_llm(observer, response, iteration, observer_warnings)
+            await _notify_llm(
+                observer,
+                response,
+                iteration,
+                observer_warnings,
+                semantic_messages=messages,
+                semantic_tools=tools,
+            )
 
             # Accumulate usage
             total_usage.input_tokens += response.usage.input_tokens

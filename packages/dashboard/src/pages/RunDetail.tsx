@@ -78,6 +78,7 @@ export function RunDetail() {
             flex flex-col shadow-2xl z-40
           ">
             <PayloadInspector
+              runId={runId!}
               messages={data.messages_by_iteration}
               systemPrompt={data.system_prompt}
               onClose={() => {

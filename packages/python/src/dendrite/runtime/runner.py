@@ -549,9 +549,10 @@ async def _resume_core(
 
     except Exception as exc:
         if state_store is not None:
+            error_won = False
             try:
                 redacted_err = redact(str(exc)) if redact else str(exc)
-                await state_store.finalize_run(
+                error_won = await state_store.finalize_run(
                     run_id,
                     status=RunStatus.ERROR.value,
                     error=redacted_err,
@@ -560,7 +561,9 @@ async def _resume_core(
                 )
             except Exception:
                 logger.warning("Failed to persist ERROR status for run %s", run_id, exc_info=True)
-            await _emit_event(
-                state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-            )
+            # Only the CAS winner emits the error event
+            if error_won:
+                await _emit_event(
+                    state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                )
         raise

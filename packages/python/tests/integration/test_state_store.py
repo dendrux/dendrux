@@ -10,7 +10,15 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from dendrite.db.models import AgentRun, Base, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
+from dendrite.db.models import (
+    AgentRun,
+    Base,
+    LLMInteraction,
+    ReactTrace,
+    RunEvent,
+    TokenUsage,
+    ToolCallRecord,
+)
 from dendrite.db.session import get_engine, reset_engine
 from dendrite.runtime.state import SQLAlchemyStateStore
 from dendrite.types import UsageStats
@@ -723,5 +731,97 @@ class TestRunEvents:
 
             result = await session.execute(
                 select(RunEvent).where(RunEvent.agent_run_id == "run_cas_ev")
+            )
+            assert result.scalars().all() == []
+
+
+# ------------------------------------------------------------------
+# LLM Interactions (Sprint 3.5)
+# ------------------------------------------------------------------
+
+
+class TestLLMInteractions:
+    async def test_save_and_get_roundtrip(self, store) -> None:
+        """Full roundtrip: save_llm_interaction → get_llm_interactions."""
+        await store.create_run("run_llm1", "Agent")
+
+        usage = UsageStats(input_tokens=100, output_tokens=50, total_tokens=150, cost_usd=0.005)
+        await store.save_llm_interaction(
+            "run_llm1",
+            iteration_index=1,
+            usage=usage,
+            model="claude-sonnet-4-6",
+            provider="Anthropic",
+            semantic_request={"messages": [{"role": "user", "content": "hello"}]},
+            semantic_response={"text": "hi there"},
+            provider_request={"model": "claude-sonnet-4-6", "max_tokens": 1024},
+            provider_response={"id": "msg_123", "type": "message"},
+        )
+
+        records = await store.get_llm_interactions("run_llm1")
+        assert len(records) == 1
+        r = records[0]
+        assert r.iteration_index == 1
+        assert r.model == "claude-sonnet-4-6"
+        assert r.provider == "Anthropic"
+        assert r.input_tokens == 100
+        assert r.output_tokens == 50
+        assert r.cost_usd == pytest.approx(0.005)
+        assert r.semantic_request["messages"][0]["content"] == "hello"
+        assert r.semantic_response["text"] == "hi there"
+        assert r.provider_request["model"] == "claude-sonnet-4-6"
+        assert r.provider_response["id"] == "msg_123"
+
+    async def test_multiple_interactions_ordered(self, store) -> None:
+        """Multiple interactions for one run are returned in iteration order."""
+        await store.create_run("run_llm2", "Agent")
+
+        for i in [3, 1, 2]:
+            await store.save_llm_interaction(
+                "run_llm2",
+                iteration_index=i,
+                usage=UsageStats(),
+            )
+
+        records = await store.get_llm_interactions("run_llm2")
+        assert [r.iteration_index for r in records] == [1, 2, 3]
+
+    async def test_empty_interactions(self, store) -> None:
+        """No interactions returns empty list."""
+        await store.create_run("run_llm3", "Agent")
+        records = await store.get_llm_interactions("run_llm3")
+        assert records == []
+
+    async def test_nullable_payloads(self, store) -> None:
+        """All payload fields can be None."""
+        await store.create_run("run_llm4", "Agent")
+        await store.save_llm_interaction(
+            "run_llm4",
+            iteration_index=1,
+            usage=UsageStats(),
+        )
+
+        records = await store.get_llm_interactions("run_llm4")
+        r = records[0]
+        assert r.semantic_request is None
+        assert r.semantic_response is None
+        assert r.provider_request is None
+        assert r.provider_response is None
+        assert r.model is None
+        assert r.cost_usd is None
+
+    async def test_cascade_delete(self, store, session_factory) -> None:
+        """Deleting a run cascades to llm_interactions."""
+        await store.create_run("run_llm_cas", "Agent")
+        await store.save_llm_interaction("run_llm_cas", iteration_index=1, usage=UsageStats())
+
+        async with session_factory() as session:
+            from sqlalchemy import delete, select
+
+            await session.execute(delete(AgentRun).where(AgentRun.id == "run_llm_cas"))
+            await session.commit()
+
+            result = await session.execute(
+                select(LLMInteraction).where(LLMInteraction.agent_run_id == "run_llm_cas")
             )
             assert result.scalars().all() == []

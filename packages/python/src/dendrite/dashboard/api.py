@@ -188,6 +188,35 @@ def create_dashboard_api(state_store: StateStore) -> FastAPI:
             ]
         }
 
+    @app.get("/api/runs/{run_id}/llm-calls")
+    async def get_run_llm_calls(run_id: str) -> dict[str, Any]:
+        """Get LLM interaction records for payload inspection."""
+        run = await state_store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+
+        interactions = await state_store.get_llm_interactions(run_id)
+        return {
+            "llm_calls": [
+                {
+                    "id": i.id,
+                    "iteration_index": i.iteration_index,
+                    "model": i.model,
+                    "provider": i.provider,
+                    "semantic_request": i.semantic_request,
+                    "semantic_response": i.semantic_response,
+                    "provider_request": i.provider_request,
+                    "provider_response": i.provider_response,
+                    "input_tokens": i.input_tokens,
+                    "output_tokens": i.output_tokens,
+                    "cost_usd": i.cost_usd,
+                    "duration_ms": i.duration_ms,
+                    "created_at": str(i.created_at) if i.created_at else None,
+                }
+                for i in interactions
+            ]
+        }
+
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}

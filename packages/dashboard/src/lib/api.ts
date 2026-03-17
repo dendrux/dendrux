@@ -1,6 +1,6 @@
 /** API client for the Dendrite dashboard. */
 
-import type { RunDetailResponse, RunListResponse } from "./types";
+import type { LLMCallsResponse, RunDetailResponse, RunListResponse } from "./types";
 
 /**
  * Resolve the API base URL.
@@ -48,6 +48,10 @@ export async function fetchRuns(params?: {
 
 export async function fetchRunDetail(runId: string): Promise<RunDetailResponse> {
   return get<RunDetailResponse>(`/runs/${runId}`);
+}
+
+export async function fetchLLMCalls(runId: string): Promise<LLMCallsResponse> {
+  return get<LLMCallsResponse>(`/runs/${runId}/llm-calls`);
 }
 
 export async function fetchHealth(): Promise<{ status: string }> {

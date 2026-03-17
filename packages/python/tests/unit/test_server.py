@@ -463,7 +463,7 @@ class TestCompositeObserver:
             async def on_message_appended(self, message: Any, iteration: int) -> None:
                 raise RuntimeError("boom")
 
-            async def on_llm_call_completed(self, response: Any, iteration: int) -> None:
+            async def on_llm_call_completed(self, response: Any, iteration: int, **kwargs) -> None:
                 pass
 
             async def on_tool_completed(self, tc: Any, tr: Any, iteration: int) -> None:

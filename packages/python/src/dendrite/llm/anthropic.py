@@ -118,8 +118,17 @@ class AnthropicProvider(LLMProvider):
             if key in kwargs:
                 api_kwargs[key] = kwargs.pop(key)
 
+        # Capture provider request payload before the call (exclude non-serializable NOT_GIVEN)
+        captured_request = {k: v for k, v in api_kwargs.items() if v is not anthropic.NOT_GIVEN}
+
         response = await self._client.messages.create(**api_kwargs)
-        return self._normalize_response(response)
+        llm_response = self._normalize_response(response)
+
+        # Attach adapter-boundary payloads for evidence layer
+        llm_response.provider_request = captured_request
+        llm_response.provider_response = response.model_dump()
+
+        return llm_response
 
     # ------------------------------------------------------------------
     # Outbound conversions: Dendrite → Anthropic

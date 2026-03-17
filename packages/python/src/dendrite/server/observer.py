@@ -37,10 +37,22 @@ class CompositeObserver(LoopObserver):
             except Exception:
                 logger.warning("CompositeObserver: on_message_appended failed", exc_info=True)
 
-    async def on_llm_call_completed(self, response: LLMResponse, iteration: int) -> None:
+    async def on_llm_call_completed(
+        self,
+        response: LLMResponse,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: Any | None = None,
+    ) -> None:
         for obs in self._observers:
             try:
-                await obs.on_llm_call_completed(response, iteration)
+                await obs.on_llm_call_completed(
+                    response,
+                    iteration,
+                    semantic_messages=semantic_messages,
+                    semantic_tools=semantic_tools,
+                )
             except Exception:
                 logger.warning("CompositeObserver: on_llm_call_completed failed", exc_info=True)
 
@@ -85,7 +97,14 @@ class TransportObserver(LoopObserver):
             )
         )
 
-    async def on_llm_call_completed(self, response: LLMResponse, iteration: int) -> None:
+    async def on_llm_call_completed(
+        self,
+        response: LLMResponse,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: Any | None = None,
+    ) -> None:
         await self._queue.put(
             ServerEvent(
                 event="run.llm_done",

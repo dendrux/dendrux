@@ -6,27 +6,31 @@
  */
 
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import type {
   TraceMessage,
   TimelineNode,
   LLMCallNode,
+  LLMInteraction,
   ToolCallNode,
   PauseSegmentNode,
   RunStartedNode,
   ErrorNode,
   FinishNode,
 } from "@/lib/types";
+import { fetchLLMCalls } from "@/lib/api";
 import { useDashboardStore } from "@/lib/store";
 import { formatDuration, formatTokens, formatCost } from "@/lib/format";
 
 interface PayloadInspectorProps {
+  runId: string;
   messages: Record<string, TraceMessage[]>;
   systemPrompt?: string | null;
   onClose?: () => void;
 }
 
-export function PayloadInspector({ messages, systemPrompt, onClose }: PayloadInspectorProps) {
+export function PayloadInspector({ runId, messages, systemPrompt, onClose }: PayloadInspectorProps) {
   const { selectedNode, selectedIteration, clearSelection } = useDashboardStore();
   const handleClose = onClose ?? clearSelection;
 
@@ -66,6 +70,7 @@ export function PayloadInspector({ messages, systemPrompt, onClose }: PayloadIns
           >
             <NodeInspector
               node={selectedNode}
+              runId={runId}
               systemPrompt={systemPrompt}
               iterMessages={iterMessages}
             />
@@ -82,14 +87,15 @@ export function PayloadInspector({ messages, systemPrompt, onClose }: PayloadIns
 }
 
 /** Type-specific inspector. */
-function NodeInspector({ node, systemPrompt, iterMessages }: {
+function NodeInspector({ node, runId, systemPrompt, iterMessages }: {
   node: TimelineNode;
+  runId: string;
   systemPrompt?: string | null;
   iterMessages?: TraceMessage[];
 }) {
   switch (node.type) {
     case "tool_call": return <ToolCallInspector node={node as ToolCallNode} iterMessages={iterMessages} />;
-    case "llm_call": return <LLMCallInspector node={node as LLMCallNode} systemPrompt={systemPrompt} iterMessages={iterMessages} />;
+    case "llm_call": return <LLMCallInspector node={node as LLMCallNode} runId={runId} systemPrompt={systemPrompt} iterMessages={iterMessages} />;
     case "pause_segment": return <PauseInspector node={node as PauseSegmentNode} />;
     case "run_started": return <RunStartedInspector node={node as RunStartedNode} />;
     case "error": return <ErrorInspector node={node as ErrorNode} />;
@@ -102,12 +108,26 @@ function NodeInspector({ node, systemPrompt, iterMessages }: {
 // LLM Call — the most important inspector. Shows the full context.
 // -------------------------------------------------------------------
 
-function LLMCallInspector({ node, systemPrompt, iterMessages }: {
+function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
   node: LLMCallNode;
+  runId: string;
   systemPrompt?: string | null;
   iterMessages?: TraceMessage[];
 }) {
-  const [rawJson, setRawJson] = useState(false);
+  type ViewMode = "formatted" | "raw" | "evidence";
+  const [viewMode, setViewMode] = useState<ViewMode>("formatted");
+
+  // Fetch evidence layer data (llm_interactions)
+  const { data: llmCallsData } = useQuery({
+    queryKey: ["llm-calls", runId],
+    queryFn: () => fetchLLMCalls(runId),
+    staleTime: 30_000,
+  });
+
+  // Match the interaction for this iteration
+  const interaction: LLMInteraction | undefined = llmCallsData?.llm_calls?.find(
+    (c) => c.iteration_index === node.iteration
+  );
 
   // Build the raw request/response payloads
   const rawRequest = buildRawRequest(systemPrompt, iterMessages, node);
@@ -115,7 +135,7 @@ function LLMCallInspector({ node, systemPrompt, iterMessages }: {
 
   return (
     <>
-      {/* Stats + raw toggle */}
+      {/* Stats */}
       <div className="flex gap-3 p-5 border-b border-white/[0.06]">
         <StatCard label="Input" value={formatTokens(node.input_tokens)} mono />
         <StatCard label="Output" value={formatTokens(node.output_tokens)} mono />
@@ -123,23 +143,23 @@ function LLMCallInspector({ node, systemPrompt, iterMessages }: {
         {node.model && <StatCard label="Model" value={node.model} />}
       </div>
 
-      {/* Raw JSON toggle */}
+      {/* View mode selector */}
       <div className="px-5 py-3 border-b border-white/[0.06] flex items-center justify-between">
         <span className="text-xs text-text-muted">View mode</span>
-        <button
-          onClick={() => setRawJson(!rawJson)}
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors ${
-            rawJson
-              ? "bg-state-llm/15 text-state-llm border border-state-llm/30"
-              : "bg-white/5 text-text-muted border border-white/10 hover:bg-white/10"
-          }`}
-        >
-          <span className="material-symbols-outlined text-sm">code</span>
-          Raw JSON
-        </button>
+        <div className="flex gap-1.5">
+          <ViewModeButton active={viewMode === "formatted"} onClick={() => setViewMode("formatted")} icon="format_align_left" label="Formatted" />
+          <ViewModeButton active={viewMode === "raw"} onClick={() => setViewMode("raw")} icon="code" label="Raw JSON" />
+          <ViewModeButton
+            active={viewMode === "evidence"}
+            onClick={() => setViewMode("evidence")}
+            icon="policy"
+            label="Evidence"
+            badge={interaction != null}
+          />
+        </div>
       </div>
 
-      {rawJson ? (
+      {viewMode === "raw" ? (
         /* ---- RAW JSON VIEW ---- */
         <>
           <Section title="Request (sent to LLM)" icon="upload">
@@ -153,6 +173,9 @@ function LLMCallInspector({ node, systemPrompt, iterMessages }: {
             </pre>
           </Section>
         </>
+      ) : viewMode === "evidence" ? (
+        /* ---- EVIDENCE LAYER VIEW ---- */
+        <EvidenceLayerView interaction={interaction} />
       ) : (
         /* ---- FORMATTED VIEW ---- */
         <>
@@ -192,6 +215,115 @@ function LLMCallInspector({ node, systemPrompt, iterMessages }: {
           )}
         </>
       )}
+    </>
+  );
+}
+
+/** View mode toggle button. */
+function ViewModeButton({ active, onClick, icon, label, badge }: {
+  active: boolean;
+  onClick: () => void;
+  icon: string;
+  label: string;
+  badge?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`relative flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+        active
+          ? "bg-state-llm/15 text-state-llm border border-state-llm/30"
+          : "bg-white/5 text-text-muted border border-white/10 hover:bg-white/10"
+      }`}
+    >
+      <span className="material-symbols-outlined text-sm">{icon}</span>
+      {label}
+      {badge && (
+        <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-state-llm" />
+      )}
+    </button>
+  );
+}
+
+/** Evidence layer view — shows semantic + provider payloads from llm_interactions table. */
+function EvidenceLayerView({ interaction }: { interaction?: LLMInteraction }) {
+  if (!interaction) {
+    return (
+      <div className="p-8 text-center">
+        <span className="material-symbols-outlined text-3xl text-white/10 mb-3 block">policy</span>
+        <p className="text-text-muted text-sm">No evidence data for this LLM call.</p>
+        <p className="text-text-muted text-xs mt-1">Run the agent again to capture payloads.</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* Semantic Request — Dendrite's normalized view */}
+      <Collapsible title="Semantic Request (Dendrite)" icon="neurology" defaultOpen>
+        {interaction.semantic_request ? (
+          <JsonBlock data={interaction.semantic_request} />
+        ) : (
+          <Empty text="Not captured" />
+        )}
+      </Collapsible>
+
+      {/* Semantic Response — Dendrite's normalized response */}
+      <Collapsible title="Semantic Response (Dendrite)" icon="smart_toy" defaultOpen>
+        {interaction.semantic_response ? (
+          <JsonBlock data={interaction.semantic_response} />
+        ) : (
+          <Empty text="Not captured" />
+        )}
+      </Collapsible>
+
+      {/* Provider Request — exact vendor API payload */}
+      <Collapsible title="Provider Request (API)" icon="upload">
+        {interaction.provider_request ? (
+          <JsonBlock data={interaction.provider_request} />
+        ) : (
+          <Empty text="Not captured — provider adapter does not emit payloads yet" />
+        )}
+      </Collapsible>
+
+      {/* Provider Response — raw vendor response */}
+      <Collapsible title="Provider Response (API)" icon="download">
+        {interaction.provider_response ? (
+          <JsonBlock data={interaction.provider_response} />
+        ) : (
+          <Empty text="Not captured — provider adapter does not emit payloads yet" />
+        )}
+      </Collapsible>
+
+      {/* Metadata */}
+      <Section title="Interaction Metadata" icon="info">
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <div>
+            <span className="text-text-muted">ID</span>
+            <p className="font-mono text-text-secondary">{interaction.id}</p>
+          </div>
+          <div>
+            <span className="text-text-muted">Iteration</span>
+            <p className="font-mono text-text-secondary">{interaction.iteration_index}</p>
+          </div>
+          <div>
+            <span className="text-text-muted">Model</span>
+            <p className="font-mono text-text-secondary">{interaction.model ?? "—"}</p>
+          </div>
+          <div>
+            <span className="text-text-muted">Provider</span>
+            <p className="font-mono text-text-secondary">{interaction.provider ?? "—"}</p>
+          </div>
+          <div>
+            <span className="text-text-muted">Tokens</span>
+            <p className="font-mono text-text-secondary">{interaction.input_tokens} in / {interaction.output_tokens} out</p>
+          </div>
+          <div>
+            <span className="text-text-muted">Cost</span>
+            <p className="font-mono text-text-secondary">{interaction.cost_usd != null ? `$${interaction.cost_usd.toFixed(4)}` : "—"}</p>
+          </div>
+        </div>
+      </Section>
     </>
   );
 }

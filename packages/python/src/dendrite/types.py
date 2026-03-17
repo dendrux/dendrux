@@ -196,6 +196,11 @@ class LLMResponse:
     tool_calls: list[ToolCall] | None = None
     raw: Any = None  # Full provider response for debugging
     usage: UsageStats = field(default_factory=UsageStats)
+    # Adapter-boundary payloads — set by each provider, persisted as opaque JSON.
+    # provider_request: the exact kwargs sent to the vendor API (e.g. Anthropic api_kwargs).
+    # provider_response: the raw vendor response dict (e.g. response.model_dump()).
+    provider_request: dict[str, Any] | None = None
+    provider_response: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

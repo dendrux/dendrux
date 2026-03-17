@@ -1,11 +1,12 @@
-"""SQLAlchemy models — the 5 core tables.
+"""SQLAlchemy models — the 6 core tables.
 
 Tables:
-    agent_runs    — One row per run() call. The anchor for everything.
-    react_traces  — Canonical conversation history for one agent run.
-    tool_calls    — Every tool invocation with params, result, timing.
-    token_usage   — Per-LLM-call token counts and cost.
-    run_events    — Append-only state transition log for observability.
+    agent_runs       — One row per run() call. The anchor for everything.
+    react_traces     — Canonical conversation history for one agent run.
+    tool_calls       — Every tool invocation with params, result, timing.
+    token_usage      — Per-LLM-call token counts and cost (legacy, kept for backcompat).
+    llm_interactions — Per-LLM-call record with semantic + provider payloads (Sprint 3.5).
+    run_events       — Append-only state transition log for observability.
 
 Each sub-agent spawn gets its own agent_run linked via parent_run_id.
 No instance_id or delegation columns on react_traces — isolation is
@@ -98,6 +99,9 @@ class AgentRun(Base):
         back_populates="agent_run", cascade="all, delete-orphan"
     )
     token_usages: Mapped[list[TokenUsage]] = relationship(
+        back_populates="agent_run", cascade="all, delete-orphan"
+    )
+    llm_interactions: Mapped[list[LLMInteraction]] = relationship(
         back_populates="agent_run", cascade="all, delete-orphan"
     )
     run_events: Mapped[list[RunEvent]] = relationship(
@@ -213,6 +217,49 @@ class TokenUsage(Base):
     agent_run: Mapped[AgentRun] = relationship(back_populates="token_usages")
 
     __table_args__ = (Index("ix_token_usage_agent_run_id", "agent_run_id"),)
+
+
+class LLMInteraction(Base):
+    """Per-LLM-call record with full semantic and provider payloads.
+
+    The authoritative per-call record for the evidence layer. Stores both
+    Dendrite's normalized view (semantic_request/response) and the exact
+    vendor-specific wire format (provider_request/response) captured at
+    the adapter boundary.
+
+    token_usage is kept for backwards compatibility; this table supersedes it.
+    """
+
+    __tablename__ = "llm_interactions"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    agent_run_id: Mapped[str] = mapped_column(
+        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE")
+    )
+    iteration_index: Mapped[int] = mapped_column(Integer)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # Dendrite-normalized payloads
+    semantic_request: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    semantic_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    # Exact vendor API payloads (opaque JSON)
+    provider_request: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    provider_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    # Token usage
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+
+    # Relationships
+    agent_run: Mapped[AgentRun] = relationship(back_populates="llm_interactions")
+
+    __table_args__ = (Index("ix_llm_interactions_agent_run_id", "agent_run_id"),)
 
 
 class RunEvent(Base):

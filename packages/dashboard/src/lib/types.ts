@@ -120,6 +120,28 @@ export interface TraceMessage {
   created_at: string | null;
 }
 
+// -- LLM Interaction (evidence layer) --
+
+export interface LLMInteraction {
+  id: string;
+  iteration_index: number;
+  model: string | null;
+  provider: string | null;
+  semantic_request: Record<string, unknown> | null;
+  semantic_response: Record<string, unknown> | null;
+  provider_request: Record<string, unknown> | null;
+  provider_response: Record<string, unknown> | null;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number | null;
+  duration_ms: number | null;
+  created_at: string | null;
+}
+
+export interface LLMCallsResponse {
+  llm_calls: LLMInteraction[];
+}
+
 // -- API response shapes --
 
 export interface RunDetailResponse {
