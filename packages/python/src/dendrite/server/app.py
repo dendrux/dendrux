@@ -36,8 +36,8 @@ if TYPE_CHECKING:
 
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from dendrite.registry import AgentRegistry
     from dendrite.runtime.state import StateStore
-    from dendrite.server.registry import AgentRegistry
 
 logger = logging.getLogger(__name__)
 
