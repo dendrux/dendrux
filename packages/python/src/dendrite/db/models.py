@@ -83,6 +83,18 @@ class AgentRun(Base):
     # Cleared on finalize. Contains unredacted history for correct LLM resume.
     pause_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
+    # Execution lease — Sprint 4 crash-safe coordination.
+    # executor_id: who is currently executing (process/worker ID). NULL = unclaimed.
+    # lease_nonce: ULID proof of ownership, changes on every claim. Guards all writes.
+    # heartbeat_at: last time the executor confirmed it's alive.
+    # retry_count: crash/stale reclamation attempts (not model/tool errors).
+    # max_retries: give up threshold.
+    executor_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_nonce: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3)
+
     # Error details (populated on ERROR status)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
