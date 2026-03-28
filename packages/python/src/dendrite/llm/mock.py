@@ -26,10 +26,16 @@ class MockLLM(LLMProvider):
         response = await llm.complete(messages)  # returns second response
     """
 
-    def __init__(self, responses: list[LLMResponse]) -> None:
+    def __init__(self, responses: list[LLMResponse], *, model: str = "mock") -> None:
         self._responses = list(responses)
+        self._model = model
         self._call_count = 0
         self.call_history: list[dict[str, Any]] = []
+
+    @property
+    def model(self) -> str:
+        """The model identifier (default ``"mock"``)."""
+        return self._model
 
     async def complete(
         self,

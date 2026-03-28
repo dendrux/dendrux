@@ -65,18 +65,25 @@ class AnthropicProvider(LLMProvider):
 
     def __init__(
         self,
-        api_key: str,
-        model: str,
         *,
+        model: str,
+        api_key: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 3,
     ) -> None:
+        # When api_key is None, the Anthropic SDK reads ANTHROPIC_API_KEY
+        # from the environment automatically.
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key,
             timeout=httpx.Timeout(timeout, connect=10.0),
             max_retries=max_retries,
         )
         self._model = model
+
+    @property
+    def model(self) -> str:
+        """The model identifier this provider is configured to use."""
+        return self._model
 
     def __repr__(self) -> str:
         return f"AnthropicProvider(model={self._model!r})"

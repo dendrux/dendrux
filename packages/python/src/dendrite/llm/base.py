@@ -24,6 +24,11 @@ class LLMProvider(ABC):
     The complete_stream() method has a default fallback that calls complete()
     and yields the result as events. Override for real token-by-token streaming.
 
+    **Concurrency contract:** Providers must be safe for concurrent use across
+    multiple ``agent.run()`` calls. This means the underlying HTTP client (or
+    equivalent) must support concurrent requests. ``httpx.AsyncClient`` and the
+    Anthropic/OpenAI SDKs satisfy this by default via connection pooling.
+
     Usage:
         class MyProvider(LLMProvider):
             capabilities = ProviderCapabilities(supports_native_tools=True, ...)
@@ -34,6 +39,29 @@ class LLMProvider(ABC):
     """
 
     capabilities: ProviderCapabilities = ProviderCapabilities()
+
+    @property
+    @abstractmethod
+    def model(self) -> str:
+        """The model identifier this provider is configured to use.
+
+        Subclasses must override. Returned value is persisted in run records
+        and logged — a blank string is a silent bug, so we enforce this.
+        """
+        ...
+
+    async def close(self) -> None:  # noqa: B027
+        """Release any resources held by this provider.
+
+        No-op by default. Providers that hold HTTP clients or connection pools
+        should override to close them cleanly.
+        """
+
+    async def __aenter__(self) -> LLMProvider:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
 
     @abstractmethod
     async def complete(
