@@ -77,7 +77,6 @@ async def return_set() -> dict:
 
 def _make_agent(**overrides) -> Agent:
     defaults = {
-        "model": "mock",
         "prompt": "You are a calculator.",
         "tools": [add, multiply],
         "max_iterations": 10,

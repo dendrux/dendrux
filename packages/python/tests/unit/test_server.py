@@ -44,7 +44,6 @@ async def read_range(sheet: str) -> str:
 
 _test_agent = Agent(
     name="TestAgent",
-    model="mock",
     prompt="You are a test agent.",
     tools=[server_add, read_range],
 )

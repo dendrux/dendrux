@@ -32,7 +32,7 @@ class TestRun:
     async def test_simple_text_answer(self) -> None:
         """Agent answers without tools."""
         llm = MockLLM([LLMResponse(text="Hello!")])
-        agent = Agent(model="mock", prompt="Be friendly.", tools=[add])
+        agent = Agent(prompt="Be friendly.", tools=[add])
 
         result = await run(agent, provider=llm, user_input="Hi")
 
@@ -48,7 +48,7 @@ class TestRun:
                 LLMResponse(text="7"),
             ]
         )
-        agent = Agent(model="mock", prompt="Calculate.", tools=[add])
+        agent = Agent(prompt="Calculate.", tools=[add])
 
         result = await run(agent, provider=llm, user_input="3+4?")
 
@@ -59,7 +59,7 @@ class TestRun:
     async def test_uses_default_strategy_and_loop(self) -> None:
         """Defaults to NativeToolCalling and ReActLoop."""
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         result = await run(agent, provider=llm, user_input="Hi")
 
@@ -68,7 +68,7 @@ class TestRun:
     async def test_custom_strategy(self) -> None:
         """Accepts explicit strategy."""
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         result = await run(
             agent,
@@ -82,7 +82,7 @@ class TestRun:
     async def test_custom_loop(self) -> None:
         """Accepts explicit loop."""
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         result = await run(
             agent,
@@ -102,7 +102,7 @@ class TestRun:
                 LLMResponse(tool_calls=[tc]),
             ]
         )
-        agent = Agent(model="mock", prompt="Loop.", tools=[add], max_iterations=2)
+        agent = Agent(prompt="Loop.", tools=[add], max_iterations=2)
 
         result = await run(agent, provider=llm, user_input="Go")
 

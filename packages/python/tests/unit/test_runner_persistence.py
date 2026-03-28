@@ -93,7 +93,7 @@ class TestRunnerPersistence:
     async def test_creates_run_before_loop(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="hi")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="hello", state_store=store)
 
@@ -106,7 +106,7 @@ class TestRunnerPersistence:
     async def test_finalizes_on_success(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="done")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="go", state_store=store)
 
@@ -120,7 +120,7 @@ class TestRunnerPersistence:
         store = RecordingStateStore()
         tc = ToolCall(name="add", params={"a": 1, "b": 1}, provider_tool_call_id="t1")
         llm = MockLLM([LLMResponse(tool_calls=[tc])])
-        agent = Agent(model="mock", prompt="Test.", tools=[add], max_iterations=1)
+        agent = Agent(prompt="Test.", tools=[add], max_iterations=1)
 
         await run(agent, provider=llm, user_input="go", state_store=store)
 
@@ -135,7 +135,7 @@ class TestRunnerPersistence:
                 raise RuntimeError("LLM exploded")
 
         llm = ExplodingLLM([])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         with pytest.raises(RuntimeError, match="LLM exploded"):
             await run(agent, provider=llm, user_input="go", state_store=store)
@@ -152,7 +152,7 @@ class TestRunnerPersistence:
     async def test_run_id_consistent_across_create_and_finalize(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="go", state_store=store)
 
@@ -161,7 +161,7 @@ class TestRunnerPersistence:
     async def test_passes_tenant_id(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="go", state_store=store, tenant_id="t_123")
 
@@ -170,7 +170,7 @@ class TestRunnerPersistence:
     async def test_passes_metadata(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         meta = {"thread_id": "th_1", "user_id": "u_42"}
         await run(agent, provider=llm, user_input="go", state_store=store, metadata=meta)
@@ -180,7 +180,7 @@ class TestRunnerPersistence:
     async def test_passes_strategy_name(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="ok")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="go", state_store=store)
 
@@ -189,7 +189,7 @@ class TestRunnerPersistence:
     async def test_no_store_means_no_persistence(self) -> None:
         """Without state_store, run() works the same as Sprint 1."""
         llm = MockLLM([LLMResponse(text="hi")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         result = await run(agent, provider=llm, user_input="hello")
 
@@ -206,7 +206,7 @@ class TestRunnerObserverWiring:
     async def test_traces_recorded(self) -> None:
         store = RecordingStateStore()
         llm = MockLLM([LLMResponse(text="42")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="what?", state_store=store)
 
@@ -218,7 +218,7 @@ class TestRunnerObserverWiring:
         store = RecordingStateStore()
         tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t1")
         llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="3")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="1+2?", state_store=store)
 
@@ -232,7 +232,7 @@ class TestRunnerObserverWiring:
         store = RecordingStateStore()
         tc = ToolCall(name="add", params={"a": 5, "b": 3}, provider_tool_call_id="t1")
         llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="8")])
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="5+3?", state_store=store)
 
@@ -249,7 +249,7 @@ class TestRunnerObserverWiring:
                 )
             ]
         )
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="go", state_store=store)
 
@@ -271,7 +271,7 @@ class TestRunnerObserverWiring:
                 ),
             ]
         )
-        agent = Agent(model="mock", prompt="Test.", tools=[add])
+        agent = Agent(prompt="Test.", tools=[add])
 
         await run(agent, provider=llm, user_input="1+2?", state_store=store)
 

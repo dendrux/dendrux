@@ -48,7 +48,6 @@ async def read_excel_range(sheet: str, range: str) -> str:
 
 agent = Agent(
     name="SpreadsheetAnalyst",
-    model="claude-sonnet-4-6",
     prompt=(
         "You are a spreadsheet analyst. You can look up stock prices with "
         "lookup_price (runs instantly on the server) and read data from the "
@@ -160,7 +159,7 @@ def _build_default_registry() -> AgentRegistry:  # noqa: F821
             agent=agent,
             provider_factory=lambda: AnthropicProvider(
                 api_key=os.environ["ANTHROPIC_API_KEY"],
-                model=agent.model,
+                model="claude-sonnet-4-6",
             ),
         )
     )

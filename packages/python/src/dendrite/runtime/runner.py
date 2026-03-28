@@ -156,7 +156,7 @@ async def run(
             run_id,
             agent.name,
             input_data={"input": redacted_input},
-            model=agent.model,
+            model=provider.model,
             strategy=type(resolved_strategy).__name__,
             tenant_id=tenant_id,
             meta=metadata,
@@ -173,7 +173,7 @@ async def run(
         observer = PersistenceObserver(
             state_store,
             run_id,
-            model=agent.model,
+            model=provider.model,
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
             redact=redact,
@@ -458,7 +458,7 @@ async def _resume_core(
     persistence_obs = PersistenceObserver(
         state_store,
         run_id,
-        model=agent.model,
+        model=provider.model,
         provider_name=type(provider).__name__,
         target_lookup=target_lookup,
         redact=redact,

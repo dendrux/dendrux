@@ -45,7 +45,6 @@ async def ask_user(question: str) -> str:
 
 def _make_agent(**overrides) -> Agent:
     defaults = {
-        "model": "mock",
         "prompt": "You are a test agent.",
         "tools": [server_add, read_range],
         "max_iterations": 10,
