@@ -9,6 +9,9 @@ Run with:
 
 Then open http://localhost:8000
 
+For the observability dashboard, run in a separate terminal:
+    dendrite dashboard --open
+
 The developer owns run creation (POST /chat). The bridge handles
 everything after the first pause: tool result submission, SSE
 streaming, polling, and cancellation.

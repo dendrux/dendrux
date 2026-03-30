@@ -11,7 +11,21 @@ After running, inspect the data with:
     dendrite traces <run_id> --tools
 """
 
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+
 from dendrite import Agent, tool
+from dendrite.llm.anthropic import AnthropicProvider
+
+load_dotenv(Path(__file__).resolve().parents[3] / ".env")
+
+console = Console()
 
 
 @tool()
@@ -39,51 +53,36 @@ async def calculate_portfolio_value(holdings: str) -> str:
     return "Portfolio breakdown:\n" + "\n".join(breakdown) + f"\n  Total: ${total:,.2f}"
 
 
+async def main() -> None:
+    db_path = Path.home() / ".dendrite" / "dendrite.db"
+    async with Agent(
+        name="StockAnalyst",
+        provider=AnthropicProvider(model="claude-sonnet-4-6"),
+        database_url=f"sqlite+aiosqlite:///{db_path}",
+        prompt=(
+            "You are a stock analyst assistant. Use the lookup_price tool to check "
+            "stock prices and calculate_portfolio_value to compute portfolio totals. "
+            "Always look up prices before making calculations."
+        ),
+        tools=[lookup_price, calculate_portfolio_value],
+    ) as agent:
+        console.print(Panel("[bold]Persistent Agent Demo[/bold]", border_style="cyan"))
+        console.print()
+
+        result = await agent.run("What's my portfolio worth? I have 10 AAPL, 5 GOOGL, and 20 MSFT.")
+
+        console.print(f"\n[bold green]Answer:[/bold green] {result.answer}")
+        console.print(
+            f"\n[dim]Completed in {result.iteration_count} iterations, "
+            f"{result.usage.total_tokens} tokens[/dim]"
+        )
+        console.print(f"[dim]Run ID: {result.run_id}[/dim]")
+        console.print(
+            "\n[bold]Inspect persisted data with:[/bold]"
+            "\n  dendrite runs"
+            f"\n  dendrite traces {result.run_id} --tools"
+        )
+
+
 if __name__ == "__main__":
-    import asyncio
-    from pathlib import Path
-
-    from dotenv import load_dotenv
-    from rich.console import Console
-    from rich.panel import Panel
-
-    from dendrite.llm.anthropic import AnthropicProvider
-
-    # Load .env from repo root
-    load_dotenv(Path(__file__).resolve().parents[3] / ".env")
-
-    console = Console()
-
-    async def main() -> None:
-        db_path = Path.home() / ".dendrite" / "dendrite.db"
-        async with Agent(
-            name="StockAnalyst",
-            provider=AnthropicProvider(model="claude-sonnet-4-6"),
-            database_url=f"sqlite+aiosqlite:///{db_path}",
-            prompt=(
-                "You are a stock analyst assistant. Use the lookup_price tool to check "
-                "stock prices and calculate_portfolio_value to compute portfolio totals. "
-                "Always look up prices before making calculations."
-            ),
-            tools=[lookup_price, calculate_portfolio_value],
-        ) as agent:
-            console.print(Panel("[bold]Persistent Agent Demo[/bold]", border_style="cyan"))
-            console.print()
-
-            result = await agent.run(
-                "What's my portfolio worth? I have 10 AAPL, 5 GOOGL, and 20 MSFT."
-            )
-
-            console.print(f"\n[bold green]Answer:[/bold green] {result.answer}")
-            console.print(
-                f"\n[dim]Completed in {result.iteration_count} iterations, "
-                f"{result.usage.total_tokens} tokens[/dim]"
-            )
-            console.print(f"[dim]Run ID: {result.run_id}[/dim]")
-            console.print(
-                "\n[bold]Inspect persisted data with:[/bold]"
-                "\n  dendrite runs"
-                f"\n  dendrite traces {result.run_id} --tools"
-            )
-
     asyncio.run(main())
