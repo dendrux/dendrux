@@ -474,7 +474,7 @@ async def _resume_core(
     # Compose with extra observer (e.g. TransportObserver for SSE)
     observer: Any
     if extra_observer is not None:
-        from dendrite.server.observer import CompositeObserver
+        from dendrite.bridge.observer import CompositeObserver
 
         observer = CompositeObserver([persistence_obs, extra_observer])
     else:

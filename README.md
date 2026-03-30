@@ -12,7 +12,7 @@ Dendrite is a Python framework for building agents with tool calling, persistenc
 - 🤖 Run agents locally with Anthropic Claude
 - 💾 Persist runs, traces, tool calls, and token usage to SQLite or Postgres
 - 🔍 Inspect runs and traces from the CLI
-- 🌐 Host agents behind a FastAPI server with SSE streaming
+- 🌐 Mount a bridge for SSE streaming and client tool interaction
 - ⏸️ Pause for client-side tools, submit results, and resume the run
 
 ---
@@ -153,7 +153,7 @@ See `examples/01_hello_world.py` as a minimal template.
 ### 1. 🧮 Local agent run
 
 ```python
-from dendrite import Agent, tool, run
+from dendrite import Agent, tool
 from dendrite.llm.anthropic import AnthropicProvider
 
 @tool()
@@ -161,42 +161,26 @@ async def add(a: int, b: int) -> int:
     """Add two numbers together."""
     return a + b
 
-agent = Agent(
-    name="Calculator",
-    model="claude-sonnet-4-6",
+async with Agent(
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
     prompt="You are a helpful calculator.",
     tools=[add],
-)
-
-provider = AnthropicProvider(
-    api_key="sk-ant-...",
-    model=agent.model,
-)
-
-result = await run(
-    agent,
-    provider=provider,
-    user_input="What is 15 + 27?",
-)
-
-print(result.answer)
+) as agent:
+    result = await agent.run("What is 15 + 27?")
+    print(result.answer)
 ```
 
 ### 2. 💾 Persistent runs and inspection
 
 ```python
-from dendrite.db.session import get_engine
-from dendrite.runtime.state import SQLAlchemyStateStore
-
-engine = await get_engine()  # Auto-creates ./dendrite.db
-store = SQLAlchemyStateStore(engine)
-
-result = await run(
-    agent,
-    provider=provider,
-    user_input="What is 15 + 27?",
-    state_store=store,  # Every step is now persisted
-)
+async with Agent(
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
+    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
+    prompt="You are a helpful calculator.",
+    tools=[add],
+) as agent:
+    result = await agent.run("What is 15 + 27?")
+    # Every step is now persisted to the database
 ```
 
 Once persistence is enabled, inspect runs and traces anytime:
@@ -208,7 +192,7 @@ dendrite traces <run_id>
 dendrite traces <run_id> --tools
 ```
 
-### 3. ⏸️ Hosted agents with client tool pause/resume
+### 3. ⏸️ Client tool pause/resume with bridge
 
 Define a client tool with `target="client"` — the agent pauses instead of executing it:
 
@@ -222,44 +206,45 @@ async def read_excel_range(sheet: str, range: str) -> str:
     return ""
 ```
 
-Host agents over HTTP using FastAPI:
+Mount the bridge for HTTP-based pause/resume:
 
 ```python
-from dendrite.server import create_app, AgentRegistry, HostedAgentConfig
+from dendrite import Agent, bridge
 
-registry = AgentRegistry()
-registry.register(HostedAgentConfig(
-    agent=agent,
-    provider_factory=lambda: AnthropicProvider(
-        api_key="sk-ant-...",
-        model=agent.model,
-    ),
-))
-
-dendrite_app = create_app(
-    state_store=store,
-    registry=registry,
-    hmac_secret="your-secret",  # or allow_insecure_dev_mode=True
+agent = Agent(
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
+    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
+    prompt="You are a spreadsheet analyst.",
+    tools=[lookup_price, read_excel_range],
 )
 
-# Mount on your FastAPI app
-app.mount("/dendrite", dendrite_app)
+# Developer owns run creation
+@app.post("/chat")
+async def chat(request):
+    result = await agent.run(request.input)
+    return {"run_id": result.run_id, "status": result.status.value}
+
+# Bridge handles paused-run interaction
+app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
 ```
 
 **The HTTP flow:**
 
 ```
-Browser/Client              Dendrite Server              Agent Loop
-      │                           │                          │
-  1.  ├── POST /runs ──────────>  │ ── run() ─────────────>  │
-      │                           │                          ├─ LLM call
-  2.  ├── GET /events (SSE) ───>  │                          ├─ server tool ✅
-      │  <── run.step ──────────  │                          ├─ client tool → PAUSE ⏸️
-      │  <── run.paused ────────  │                          │
-      │                           │                          │  (waiting...)
-  3.  ├── POST /tool-results ──>  │ ── resume() ──────────>  │
-      │                           │                          ├─ LLM call
-  4.  │  <── run.completed ─────  │ <── RunResult ─────────  │  ✅
+Browser/Client              Your Server + Bridge           Agent
+      |                           |                          |
+  1.  |-- POST /chat ---------->  |-- agent.run() -------->  |
+      |                           |                          |-- LLM call
+      |                           |                          |-- server tool
+      |                           |                          |-- client tool -> PAUSE
+      | <-- {run_id, status} ---- |                          |
+      |                           |                          |
+  2.  |-- GET /dendrite/runs/{id}/events (SSE) ----------->  |
+      | <-- snapshot (waiting_client_tool) ---------------- |
+      |                           |                          |
+  3.  |-- POST /dendrite/runs/{id}/tool-results ---------->  |
+      | <-- 200 (accepted) ------ |-- resume_claimed() --->  |-- LLM call
+  4.  | <-- run.completed (SSE)   | <-- RunResult --------  |
 ```
 
 See the working demo: [`examples/03_client_tools/`](packages/python/examples/03_client_tools/)
@@ -374,9 +359,6 @@ Postgres always requires `dendrite db migrate` after schema changes.
 ## 📟 CLI Cheatsheet
 
 ```bash
-# Run an agent
-dendrite run examples/01_hello_world.py -i "What is 15 + 27?"
-
 # List runs
 dendrite runs
 dendrite runs --limit 50
@@ -412,18 +394,19 @@ If unset, Dendrite uses local SQLite at `./dendrite.db`. Make sure you are runni
 <details>
 <summary><strong>"I ran an agent but no traces were saved"</strong></summary>
 
-Persistence is only enabled when you pass a `state_store`:
+Persistence is enabled by passing `database_url` to the Agent:
 
 ```python
-result = await run(
-    agent,
+agent = Agent(
     provider=provider,
-    user_input="...",
-    state_store=SQLAlchemyStateStore(engine),  # Required for persistence
+    database_url="sqlite+aiosqlite:///path/to/dendrite.db",
+    prompt="...",
+    tools=[...],
 )
+result = await agent.run("...")
 ```
 
-Without `state_store`, the agent still runs but nothing is stored.
+Without `database_url` (or `state_store`), the agent still runs but nothing is stored.
 
 </details>
 
@@ -491,9 +474,9 @@ That is expected until the client submits tool results. Resume it by posting to 
 
 HMAC auth is enabled and the request is missing a valid bearer token for that specific run.
 
-For local demos, use `allow_insecure_dev_mode=True` when creating the app.
+For local demos, use `allow_insecure_dev_mode=True` when creating the bridge.
 
-For real deployments, send the token returned by `POST /runs` in the header:
+For real deployments, pass `secret=` to `bridge()` and send the token in the header:
 
 ```
 Authorization: Bearer drn_...
@@ -521,21 +504,22 @@ dendrite traces <run_id> --tools    # Trace + tool call details
 ```
 packages/python/
 ├── src/dendrite/
-│   ├── agent.py            # Agent definition
+│   ├── agent.py            # Agent — definition + runtime facade
 │   ├── tool.py             # @tool decorator + schema generation
 │   ├── types.py            # Core types (Message, ToolCall, RunResult)
+│   ├── auth.py             # Run-scoped HMAC token utilities
 │   ├── llm/                # LLM providers (Anthropic, Mock)
 │   ├── loops/              # Execution loops (ReAct)
 │   ├── strategies/         # Tool calling strategies
 │   ├── runtime/            # Runner, observer, state store
 │   ├── db/                 # SQLAlchemy models, Alembic migrations
-│   ├── server/             # FastAPI app, SSE, HMAC auth
-│   └── cli/                # CLI commands
+│   ├── bridge/             # Mountable transport (SSE, pause/resume)
+│   └── cli/                # CLI commands (runs, traces, db, dashboard)
 ├── examples/
 │   ├── 01_hello_world.py
 │   ├── 02_persistent_agent.py
 │   └── 03_client_tools/
-└── tests/                  # 351 tests, 89% coverage
+└── tests/                  # 418 tests, 87% coverage
 ```
 
 ---
@@ -548,12 +532,13 @@ packages/python/
 | Tool calling (sync + async, timeouts) | ✅ Shipped |
 | Anthropic Claude provider | ✅ Shipped |
 | SQLite + Postgres persistence | ✅ Shipped |
-| CLI (run, traces, runs, db) | ✅ Shipped |
+| CLI (traces, runs, db, dashboard) | ✅ Shipped |
 | Token usage tracking + redaction | ✅ Shipped |
 | Pause/resume for client tools | ✅ Shipped |
-| FastAPI hosting + SSE transport | ✅ Shipped |
+| Bridge transport (SSE + persist-first handoff) | ✅ Shipped |
 | Run-scoped HMAC auth | ✅ Shipped |
-| Worker pool / crash recovery | 🔜 Planned |
+| Agent API (provider, database_url, run/resume) | ✅ Shipped |
+| Token-level streaming (agent.stream()) | 🔜 Planned |
 | TypeScript client SDK | 🔜 Planned |
 | OpenAI + multi-provider support | 🔜 Planned |
 | Tool sandbox / isolation | 🔜 Planned |

@@ -1,4 +1,4 @@
-"""Server-side observers for transport and composition.
+"""Bridge observers for transport and composition.
 
 CompositeObserver fans out to multiple observers (persistence + transport).
 TransportObserver pushes events to an asyncio.Queue for SSE consumption.

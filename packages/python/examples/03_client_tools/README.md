@@ -39,24 +39,41 @@ The agent will:
 4. Type any value (e.g. `Revenue: $394B`) and click Submit
 5. The agent resumes with your data and generates a final answer
 
-## What's happening under the hood
+## Architecture
+
+The developer owns run creation (`POST /chat` calls `agent.run()`).
+The bridge handles everything after the first pause.
 
 ```
-Browser                    Server                     Agent Loop
-  │                          │                            │
-  ├─ POST /dendrite/runs ──> │ ── run() ──────────────>   │
-  │                          │                            ├─ LLM call
-  ├─ GET  /events (SSE) ──> │                            ├─ lookup_price (server)
-  │  <── run.step ────────── │                            ├─ read_excel_range → PAUSE
-  │  <── run.paused ──────── │                            │
-  │                          │                            │ (waiting)
-  ├─ POST /tool-results ──> │ ── resume() ────────────>  │
-  │                          │                            ├─ LLM call (with result)
-  │  <── run.completed ───── │ <── RunResult ────────────  │
+Browser                    Server                     Agent
+  |                          |                          |
+  |-- POST /chat ----------> |-- agent.run() ---------> |
+  |                          |                          |-- LLM call
+  |                          |                          |-- lookup_price (server)
+  |                          |                          |-- read_excel_range -> PAUSE
+  | <-- {run_id, status} --- |                          |
+  |                          |                          |
+  |-- GET /dendrite/runs/{id}/events (SSE) -----------> |
+  | <-- snapshot (status=waiting_client_tool) --------- |
+  |                          |                          |
+  |-- POST /dendrite/runs/{id}/tool-results ----------> |
+  |                          |-- submit_and_claim ----> |-- resume
+  | <-- 200 (accepted) ----- |                          |-- LLM call (with result)
+  | <-- run.completed (SSE)  | <-- RunResult ---------- |
 ```
+
+## Bridge endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /dendrite/runs/{id}` | Poll status + pending tool calls |
+| `GET /dendrite/runs/{id}/events` | SSE stream (snapshot + live events) |
+| `POST /dendrite/runs/{id}/tool-results` | Submit client tool results |
+| `POST /dendrite/runs/{id}/input` | Submit clarification answer |
+| `DELETE /dendrite/runs/{id}` | Cancel a run |
 
 ## If something looks wrong
 
-- If the agent doesn't pause, your prompt didn't trigger `read_excel_range`. Try being explicit: "read cell A1 from my spreadsheet."
+- If the agent doesn't pause, your prompt didn't trigger `read_excel_range`. Try: "read cell A1 from my spreadsheet."
 - If you see connection errors, make sure the server is running on port 8000.
-- This demo uses `allow_insecure_dev_mode=True` (no HMAC auth) — intended for local development only.
+- This demo uses `allow_insecure_dev_mode=True` (no HMAC auth) — local development only.

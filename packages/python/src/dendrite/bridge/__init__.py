@@ -42,9 +42,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from dendrite.server.auth import extract_bearer_token, generate_run_token, verify_run_token
-from dendrite.server.observer import ServerEvent, TransportObserver
-from dendrite.server.tasks import RunTaskManager
+from dendrite.auth import extract_bearer_token, generate_run_token, verify_run_token
+from dendrite.bridge.observer import ServerEvent, TransportObserver
+from dendrite.bridge.tasks import RunTaskManager
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

@@ -71,8 +71,13 @@
     if (eventSource) eventSource.close();
     eventSource = new EventSource("/dendrite/runs/" + runId + "/events");
 
-    eventSource.addEventListener("run.started", (e) => {
-      log("Run started: " + runId, "event-started");
+    eventSource.addEventListener("snapshot", (e) => {
+      const d = JSON.parse(e.data);
+      log("Snapshot: status=" + d.status + " iterations=" + d.iteration_count, "event-started");
+      // If snapshot shows paused state with pending tools, show the form
+      if (d.pending_tool_calls && d.pending_tool_calls.length > 0) {
+        handlePause(d.pending_tool_calls, d.status);
+      }
     });
 
     eventSource.addEventListener("run.step", (e) => {
@@ -87,33 +92,31 @@
       log("Tool done: " + d.tool_name + " (success=" + d.success + ")", "event-tool-done");
     });
 
-    eventSource.addEventListener("run.paused.tool_needed", (e) => {
+    eventSource.addEventListener("run.paused", (e) => {
       const d = JSON.parse(e.data);
-      pendingToolCalls = d.pending_tool_calls || [];
-      setStatus("PAUSED — waiting for client tool");
-      eventSource.close();
-
-      if (pendingToolCalls.length > 0) {
-        const tc = pendingToolCalls[0];
-        document.getElementById("tool-name").textContent = tc.tool_name;
-        document.getElementById("tool-params").textContent = JSON.stringify(tc.params);
-        document.getElementById("tool-form").style.display = "block";
-        log("PAUSED: agent needs " + tc.tool_name + "(" + JSON.stringify(tc.params) + ")", "event-paused");
+      if (d.pending_tool_calls && d.pending_tool_calls.length > 0) {
+        handlePause(d.pending_tool_calls, d.status);
+      } else {
+        setStatus("PAUSED — " + d.status);
+        log("PAUSED: " + d.status, "event-paused");
       }
     });
 
-    eventSource.addEventListener("run.paused.input_needed", (e) => {
-      const d = JSON.parse(e.data);
-      setStatus("PAUSED — agent is asking: " + (d.question || ""));
-      log("PAUSED: agent asks: " + (d.question || ""), "event-paused");
-      eventSource.close();
-    });
-
-    eventSource.addEventListener("run.completed", (e) => {
+    eventSource.addEventListener("run.completed", async (e) => {
       const d = JSON.parse(e.data);
       log("COMPLETED (status=" + d.status + ")", "event-completed");
-      setStatus("Done");
       eventSource.close();
+      // Fetch the final answer from the poll endpoint
+      try {
+        const poll = await fetch("/dendrite/runs/" + runId);
+        if (poll.ok) {
+          const run = await poll.json();
+          if (run.answer) {
+            log("Answer: " + run.answer, "event-completed");
+          }
+        }
+      } catch (err) { /* ignore fetch errors */ }
+      setStatus("Done");
       document.getElementById("start-btn").disabled = false;
     });
 
@@ -137,6 +140,20 @@
     };
   }
 
+  function handlePause(toolCalls, status) {
+    // Bridge uses {id, name} shape for pending_tool_calls
+    pendingToolCalls = toolCalls;
+    setStatus("PAUSED — waiting for client tool");
+
+    if (pendingToolCalls.length > 0) {
+      const tc = pendingToolCalls[0];
+      document.getElementById("tool-name").textContent = tc.name;
+      document.getElementById("tool-params").textContent = "(use poll endpoint for params)";
+      document.getElementById("tool-form").style.display = "block";
+      log("PAUSED: agent needs " + tc.name, "event-paused");
+    }
+  }
+
   async function startRun() {
     const input = document.getElementById("user-input").value.trim();
     if (!input) return;
@@ -146,10 +163,11 @@
     document.getElementById("start-btn").disabled = true;
     setStatus("Starting...");
 
-    const resp = await fetch("/dendrite/runs", {
+    // Developer-owned run creation endpoint (not bridge)
+    const resp = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_name: "SpreadsheetAnalyst", input: input }),
+      body: JSON.stringify({ input: input }),
     });
 
     if (!resp.ok) {
@@ -160,8 +178,20 @@
 
     const data = await resp.json();
     currentRunId = data.run_id;
-    setStatus("Running: " + currentRunId);
-    connectSSE(currentRunId);
+    log("Run started: " + currentRunId + " (status=" + data.status + ")", "event-started");
+
+    if (data.status === "waiting_client_tool") {
+      // Agent paused on first call — connect SSE to see snapshot + submit results
+      setStatus("Paused — connecting to bridge SSE...");
+      connectSSE(currentRunId);
+    } else if (data.status === "success") {
+      log("COMPLETED: " + (data.answer || ""), "event-completed");
+      setStatus("Done");
+      document.getElementById("start-btn").disabled = false;
+    } else {
+      setStatus("Status: " + data.status);
+      connectSSE(currentRunId);
+    }
   }
 
   async function submitToolResult() {
@@ -173,10 +203,11 @@
     document.getElementById("tool-form").style.display = "none";
     setStatus("Submitting tool result...");
 
+    // Bridge expects {tool_call_id, tool_name, result} shape
     const results = pendingToolCalls.map((tc) => ({
-      tool_call_id: tc.tool_call_id,
-      tool_name: tc.tool_name,
-      result: resultText,
+      tool_call_id: tc.id,
+      tool_name: tc.name,
+      result: JSON.stringify(resultText),
     }));
 
     const resp = await fetch("/dendrite/runs/" + currentRunId + "/tool-results", {
@@ -192,9 +223,14 @@
     }
 
     log("Tool result submitted, resuming...", "event-tool-done");
-    setStatus("Resumed");
+    setStatus("Resumed — watching SSE...");
     pendingToolCalls = [];
-    connectSSE(currentRunId);
+    // SSE is already connected from the initial connectSSE call.
+    // The bridge reuses the existing queue, so events flow to
+    // the same connection. If SSE was closed, reconnect.
+    if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+      connectSSE(currentRunId);
+    }
   }
 </script>
 

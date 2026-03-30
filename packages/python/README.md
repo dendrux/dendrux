@@ -22,7 +22,7 @@ pip install -e ".[anthropic,db,server]"
 ## Minimal Example
 
 ```python
-from dendrite import Agent, tool, run
+from dendrite import Agent, tool
 from dendrite.llm.anthropic import AnthropicProvider
 
 @tool()
@@ -30,15 +30,13 @@ async def add(a: int, b: int) -> int:
     """Add two numbers."""
     return a + b
 
-agent = Agent(
-    model="claude-sonnet-4-6",
+async with Agent(
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
     prompt="You are a calculator.",
     tools=[add],
-)
-
-provider = AnthropicProvider(api_key="sk-ant-...", model="claude-sonnet-4-6")
-result = await run(agent, provider=provider, user_input="What is 15 + 27?")
-print(result.answer)
+) as agent:
+    result = await agent.run("What is 15 + 27?")
+    print(result.answer)
 ```
 
 ## API Quick Reference
@@ -47,9 +45,10 @@ print(result.answer)
 
 | Import | What it does |
 |--------|-------------|
-| `from dendrite import Agent` | Define an agent (model, prompt, tools, limits) |
+| `from dendrite import Agent` | Define an agent (provider, prompt, tools, limits) |
 | `from dendrite import tool` | `@tool()` decorator — turns a function into an agent tool |
-| `from dendrite import run` | `await run(agent, provider=..., user_input=...)` — execute an agent |
+| `from dendrite import bridge` | `bridge(agent)` — mountable FastAPI app for pause/resume transport |
+| `from dendrite import run` | `await run(agent, provider=..., user_input=...)` — low-level runner |
 
 ### Providers
 
@@ -58,33 +57,21 @@ print(result.answer)
 | `from dendrite.llm.anthropic import AnthropicProvider` | Claude API provider |
 | `from dendrite.llm.mock import MockLLM` | Deterministic mock for testing |
 
-### Persistence
-
-| Import | What it does |
-|--------|-------------|
-| `from dendrite.db.session import get_engine` | Async DB engine (auto-creates SQLite) |
-| `from dendrite.runtime.state import SQLAlchemyStateStore` | State store for `run(state_store=...)` |
-
-### Server
-
-| Import | What it does |
-|--------|-------------|
-| `from dendrite.server import create_app` | Mountable FastAPI app for hosted agents |
-| `from dendrite.server import AgentRegistry` | Register agents for hosting |
-| `from dendrite.server import HostedAgentConfig` | Agent config with provider/strategy factories |
-
-### `run()` Parameters
+### `agent.run()` Parameters
 
 ```python
-result = await run(
-    agent,
-    provider=provider,          # Required: LLM provider
-    user_input="...",           # Required: user's input
-    state_store=store,          # Optional: persist traces to DB
-    tenant_id="org-123",        # Optional: multi-tenant isolation
-    metadata={"thread": "t1"},  # Optional: your linking data (stored, never read)
-    redact=my_scrubber,         # Optional: scrub all persisted strings
-)
+async with Agent(
+    provider=provider,                  # Required: LLM provider
+    prompt="...",                       # Required: system prompt
+    tools=[add],                        # Optional: tool functions
+    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
+    redact=my_scrubber,                 # Optional: scrub persisted strings
+) as agent:
+    result = await agent.run(
+        "What is 15 + 27?",
+        tenant_id="org-123",            # Optional: multi-tenant isolation
+        metadata={"thread": "t1"},      # Optional: your linking data
+    )
 ```
 
 ### `RunResult`
