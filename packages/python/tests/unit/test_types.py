@@ -208,7 +208,7 @@ class TestToolDef:
         assert td.target == ToolTarget.SERVER
         assert td.parallel is True
         assert td.priority == 0
-        assert td.timeout_seconds == 30.0
+        assert td.timeout_seconds == 120.0
 
     def test_client_tool(self) -> None:
         td = ToolDef(

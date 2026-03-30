@@ -1,4 +1,4 @@
 """Dendrite Dashboard — observability API and timeline normalization.
 
-Requires the [server] extra: pip install dendrite[server]
+Requires the [bridge] extra: pip install dendrite[bridge]
 """

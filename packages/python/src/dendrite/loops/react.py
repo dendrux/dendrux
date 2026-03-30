@@ -24,10 +24,10 @@ import inspect
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrite.loops.base import Loop
-from dendrite.tool import get_tool_def
+from dendrite.tool import DEFAULT_TOOL_TIMEOUT, get_tool_def
 from dendrite.types import (
     AgentStep,
     Clarification,
@@ -151,7 +151,7 @@ class ReActLoop(Loop):
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
         tool_defs = agent.get_tool_defs()
-        tool_lookup, target_lookup, timeout_lookup = _build_tool_lookup(agent.tools)
+        lookups = _build_tool_lookups(agent.tools)
 
         if initial_history is not None:
             # Resume from pause — use provided history, skip user message creation
@@ -161,6 +161,13 @@ class ReActLoop(Loop):
             user_msg = Message(role=Role.USER, content=user_input)
             history = [user_msg]
             await _notify_message(observer, user_msg, 0)
+
+        # Derive per-tool call counts from history (resume-safe).
+        # Counts Role.TOOL messages only — not assistant tool_call requests.
+        call_counts: dict[str, int] = {}
+        for msg in history:
+            if msg.role == Role.TOOL and msg.name is not None:
+                call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
 
         steps: list[AgentStep] = list(initial_steps) if initial_steps else []
         total_usage = UsageStats(
@@ -282,23 +289,79 @@ class ReActLoop(Loop):
                 history.append(assistant_msg)
                 await _notify_message(observer, assistant_msg, iteration, observer_warnings)
 
-                # Split tool calls into server (execute now) vs non-server (pause)
+                # Enforce max_calls_per_run before server/client split.
+                # Tools that exceed their limit get an immediate graceful result.
+                # Uses a provisional counter so duplicate tool calls within a
+                # single LLM batch are correctly counted (not just the baseline).
                 all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
+                allowed_calls: list[ToolCall] = []
+                batch_counts: dict[str, int] = {}
+                for tc in all_calls:
+                    max_calls = lookups.max_calls.get(tc.name)
+                    current = call_counts.get(tc.name, 0) + batch_counts.get(tc.name, 0)
+                    if max_calls is not None and current >= max_calls:
+                        limit_msg = (
+                            f"Tool '{tc.name}' has reached its maximum of "
+                            f"{max_calls} calls for this run."
+                        )
+                        limit_result = ToolResult(
+                            name=tc.name,
+                            call_id=tc.id,
+                            payload=json.dumps({"limit": limit_msg}),
+                            success=False,
+                            error=limit_msg,
+                        )
+                        await _notify_tool(
+                            observer, tc, limit_result, iteration, observer_warnings,
+                        )
+                        result_msg = strategy.format_tool_result(limit_result)
+                        history.append(result_msg)
+                        await _notify_message(
+                            observer, result_msg, iteration, observer_warnings,
+                        )
+                    else:
+                        batch_counts[tc.name] = batch_counts.get(tc.name, 0) + 1
+                        allowed_calls.append(tc)
+
+                # Split allowed calls into server (execute now) vs non-server (pause)
                 server_calls: list[ToolCall] = []
                 pending_calls: list[ToolCall] = []
-                for tc in all_calls:
-                    target = target_lookup.get(tc.name, ToolTarget.SERVER)
+                for tc in allowed_calls:
+                    target = lookups.target.get(tc.name, ToolTarget.SERVER)
                     if target == ToolTarget.SERVER:
                         server_calls.append(tc)
                     else:
                         pending_calls.append(tc)
 
-                # Execute server tools immediately
-                for tc in server_calls:
-                    tool_result = await _execute_tool(
-                        tc, tool_lookup, target_lookup, timeout_lookup
-                    )
-                    await _notify_tool(observer, tc, tool_result, iteration, observer_warnings)
+                # Execute server tools — parallel where safe, sequential barriers.
+                # Group contiguous parallel=True tools for concurrent execution.
+                # parallel=False tools act as barriers (run alone in order).
+                exec_groups = _build_execution_groups(server_calls, lookups.parallel)
+                # Collect (tc, result) pairs in original order for deterministic
+                # history append after all groups complete.
+                all_results: list[tuple[ToolCall, ToolResult]] = []
+                for group, is_parallel in exec_groups:
+                    if is_parallel and len(group) > 1:
+                        # Run concurrently — each notifies observer on completion
+                        pairs = await asyncio.gather(*[
+                            _execute_and_notify(
+                                tc, lookups, observer, iteration, observer_warnings,
+                            )
+                            for tc in group
+                        ])
+                        all_results.extend(pairs)
+                    else:
+                        # Sequential — single tool or parallel=False barrier
+                        for tc in group:
+                            tool_result = await _execute_tool(tc, lookups)
+                            await _notify_tool(
+                                observer, tc, tool_result, iteration, observer_warnings,
+                            )
+                            all_results.append((tc, tool_result))
+
+                # Append history in original order (deterministic for LLM)
+                for tc, tool_result in all_results:
+                    call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
                     result_msg = strategy.format_tool_result(tool_result)
                     history.append(result_msg)
                     await _notify_message(observer, result_msg, iteration, observer_warnings)
@@ -314,7 +377,7 @@ class ReActLoop(Loop):
 
                     # Build target map for pending calls
                     pending_targets = {
-                        tc.id: target_lookup.get(tc.name, ToolTarget.SERVER).value
+                        tc.id: lookups.target.get(tc.name, ToolTarget.SERVER).value
                         for tc in pending_calls
                     }
 
@@ -360,41 +423,108 @@ class ReActLoop(Loop):
         )
 
 
-def _build_tool_lookup(
-    tools: list[Callable[..., Any]],
-) -> tuple[dict[str, Callable[..., Any]], dict[str, ToolTarget], dict[str, float]]:
-    """Build name → function, name → target, and name → timeout lookups."""
-    fn_lookup: dict[str, Callable[..., Any]] = {}
-    target_lookup: dict[str, ToolTarget] = {}
-    timeout_lookup: dict[str, float] = {}
-    for fn in tools:
-        td = get_tool_def(fn)
-        if td.name in fn_lookup:
+class ToolLookups(NamedTuple):
+    """Pre-computed lookups for tool execution — built once per run."""
+
+    fn: dict[str, Callable[..., Any]]
+    target: dict[str, ToolTarget]
+    timeout: dict[str, float]
+    explicit_timeout: dict[str, bool]
+    max_calls: dict[str, int | None]
+    parallel: dict[str, bool]
+
+
+def _build_tool_lookups(tools: list[Callable[..., Any]]) -> ToolLookups:
+    """Build all tool lookups from a list of @tool-decorated functions."""
+    fn: dict[str, Callable[..., Any]] = {}
+    target: dict[str, ToolTarget] = {}
+    timeout: dict[str, float] = {}
+    explicit_timeout: dict[str, bool] = {}
+    max_calls: dict[str, int | None] = {}
+    parallel: dict[str, bool] = {}
+    for func in tools:
+        td = get_tool_def(func)
+        if td.name in fn:
             raise ValueError(
                 f"Duplicate tool name '{td.name}'. "
                 f"Each tool registered on an agent must have a unique name."
             )
-        fn_lookup[td.name] = fn
-        target_lookup[td.name] = td.target
-        timeout_lookup[td.name] = td.timeout_seconds
-    return fn_lookup, target_lookup, timeout_lookup
+        fn[td.name] = func
+        target[td.name] = td.target
+        timeout[td.name] = td.timeout_seconds
+        explicit_timeout[td.name] = td.has_explicit_timeout
+        max_calls[td.name] = td.max_calls_per_run
+        parallel[td.name] = td.parallel
+    return ToolLookups(fn, target, timeout, explicit_timeout, max_calls, parallel)
 
 
-_DEFAULT_TOOL_TIMEOUT = 30.0
+def _build_execution_groups(
+    tool_calls: list[ToolCall],
+    parallel_lookup: dict[str, bool],
+) -> list[tuple[list[ToolCall], bool]]:
+    """Group contiguous tool calls by their parallel flag.
+
+    Scans left to right, building contiguous groups of parallel=True tools.
+    A parallel=False tool is a barrier — always forms its own singleton group.
+
+    Returns list of (group, is_parallel) tuples in original order.
+    Example: [A(par), B(par), C(nonpar), D(par)] →
+             [([A,B], True), ([C], False), ([D], True)]
+    Example: [A(seq), B(seq)] →
+             [([A], False), ([B], False)]
+    """
+    if not tool_calls:
+        return []
+
+    groups: list[tuple[list[ToolCall], bool]] = []
+    current_parallel_group: list[ToolCall] = []
+
+    for tc in tool_calls:
+        is_parallel = parallel_lookup.get(tc.name, True)
+        if not is_parallel:
+            # Flush any accumulated parallel group first
+            if current_parallel_group:
+                groups.append((current_parallel_group, True))
+                current_parallel_group = []
+            # Barrier: always a singleton group
+            groups.append(([tc], False))
+        else:
+            current_parallel_group.append(tc)
+
+    # Flush remaining parallel group
+    if current_parallel_group:
+        groups.append((current_parallel_group, True))
+
+    return groups
+
+
+async def _execute_and_notify(
+    tool_call: ToolCall,
+    lookups: ToolLookups,
+    observer: LoopObserver | None,
+    iteration: int,
+    observer_warnings: list[str],
+) -> tuple[ToolCall, ToolResult]:
+    """Execute a tool and notify observer immediately on completion.
+
+    Used for parallel execution — each tool streams its SSE event
+    as soon as it finishes, without waiting for siblings.
+    """
+    result = await _execute_tool(tool_call, lookups)
+    await _notify_tool(observer, tool_call, result, iteration, observer_warnings)
+    return tool_call, result
 
 
 async def _execute_tool(
     tool_call: ToolCall,
-    tool_lookup: dict[str, Callable[..., Any]],
-    target_lookup: dict[str, ToolTarget] | None = None,
-    timeout_lookup: dict[str, float] | None = None,
+    lookups: ToolLookups,
 ) -> ToolResult:
     """Execute a server tool function and return a ToolResult.
 
     Non-server tools are filtered out by the loop before reaching this
     function. They trigger a pause instead of execution.
     """
-    fn = tool_lookup.get(tool_call.name)
+    fn = lookups.fn.get(tool_call.name)
     if fn is None:
         return ToolResult(
             name=tool_call.name,
@@ -404,9 +534,8 @@ async def _execute_tool(
             error=f"Unknown tool: {tool_call.name}",
         )
 
-    timeout_s = _DEFAULT_TOOL_TIMEOUT
-    if timeout_lookup is not None:
-        timeout_s = timeout_lookup.get(tool_call.name, _DEFAULT_TOOL_TIMEOUT)
+    timeout_s = lookups.timeout.get(tool_call.name, DEFAULT_TOOL_TIMEOUT)
+    is_explicit = lookups.explicit_timeout.get(tool_call.name, False)
 
     start = time.monotonic()
     try:
@@ -436,6 +565,13 @@ async def _execute_tool(
     except TimeoutError:
         duration_ms = int((time.monotonic() - start) * 1000)
         error_msg = f"Tool '{tool_call.name}' timed out after {timeout_s}s"
+        if is_explicit:
+            logger.warning("%s", error_msg)
+        else:
+            logger.warning(
+                "%s (default). Set an explicit timeout: @tool(timeout_seconds=N)",
+                error_msg,
+            )
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,

@@ -22,13 +22,13 @@ Dendrite is a Python framework for building agents with tool calling, persistenc
 ```bash
 git clone https://github.com/anmolgautam/dendrite.git
 cd dendrite/packages/python
-pip install -e ".[anthropic,db,server]"
+pip install -e ".[anthropic,db,bridge]"
 ```
 
 For development:
 
 ```bash
-pip install -e ".[dev,db,anthropic,server]"
+pip install -e ".[dev,db,anthropic,bridge]"
 ```
 
 <details>
@@ -38,7 +38,7 @@ pip install -e ".[dev,db,anthropic,server]"
 |-------|-------------|
 | `anthropic` | Anthropic Claude SDK |
 | `db` | SQLAlchemy, aiosqlite, Alembic |
-| `server` | FastAPI, uvicorn |
+| `bridge` | FastAPI, uvicorn (for client tool bridge) |
 | `dev` | pytest, ruff, mypy, python-dotenv |
 | `postgres` | asyncpg (for Postgres instead of SQLite) |
 
@@ -88,13 +88,20 @@ dendrite traces <run_id> --tools
 # ⏸️ Example 3: Client tool bridge — agent pauses for your input
 ANTHROPIC_API_KEY=sk-... python examples/03_client_tools/server.py
 # Open http://localhost:8000
+
+# 🔬 Example 4: Multi-agent research — orchestrator delegates to sub-agents
+cd examples/04_research_agent
+ANTHROPIC_API_KEY=sk-... FIRECRAWL_API_KEY=fc-... python main.py "quantum computing"
+# Report saved to output/
 ```
 
-For the client tool demo, use a prompt like:
+For the client tool demo (example 3), use a prompt like:
 
 > *"Look up the AAPL stock price, then read cell A1 from my spreadsheet."*
 
 The agent will call the server tool immediately, pause for the client tool, wait for your input in the browser, then resume and finish.
+
+For the research agent (example 4), each sub-agent is a full Dendrite Agent with its own tools and reasoning loop. See [`examples/04_research_agent/`](packages/python/examples/04_research_agent/) for details.
 
 ### 4. Build your own agent
 
@@ -260,21 +267,7 @@ When you decorate a function with `@tool()`, Dendrite extracts the function sign
 - Tool results are correlated by `call_id` — no ambiguity about which call a result belongs to
 - The strategy layer is swappable — same agent can use different strategies without changing tool code
 
-`NativeToolCalling` is the default. You can pass it explicitly or swap in a different strategy:
-
-```python
-from dendrite.strategies.native import NativeToolCalling
-
-# Default — you don't need to pass this, but you can
-result = await run(
-    agent,
-    provider=provider,
-    user_input="What is 15 + 27?",
-    strategy=NativeToolCalling(),  # explicit
-)
-```
-
-To build a custom strategy (e.g. prompt-based for providers without native tool calling), subclass `Strategy`:
+`NativeToolCalling` is the default and works automatically. For advanced use, you can build a custom strategy (e.g. prompt-based for providers without native tool calling) by subclassing `Strategy`:
 
 ```python
 from dendrite.strategies.base import Strategy
@@ -291,9 +284,6 @@ class MyCustomStrategy(Strategy):
     def format_tool_result(self, result):
         # Format tool results for the next LLM turn
         ...
-
-# Use it
-result = await run(agent, provider=provider, user_input="...", strategy=MyCustomStrategy())
 ```
 
 The strategy never calls the LLM directly — it prepares inputs and interprets outputs. The loop handles execution.
@@ -504,8 +494,9 @@ packages/python/
 ├── examples/
 │   ├── 01_hello_world.py
 │   ├── 02_persistent_agent.py
-│   └── 03_client_tools/
-└── tests/                  # 418 tests, 87% coverage
+│   ├── 03_client_tools/
+│   └── 04_research_agent/
+└── tests/                  # 449 tests, 92% coverage
 ```
 
 ---
@@ -544,7 +535,7 @@ Tests run without an API key — they use `MockLLM` for deterministic testing.
 
 ```bash
 cd packages/python
-pip install -e ".[dev,db,anthropic,server]"
+pip install -e ".[dev,db,anthropic,bridge]"
 make ci
 ```
 

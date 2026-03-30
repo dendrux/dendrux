@@ -29,14 +29,26 @@ _TYPE_MAP: dict[type, str] = {
 }
 
 
+_SENTINEL: float = object()  # type: ignore[assignment]
+
+DEFAULT_TOOL_TIMEOUT = 120.0
+
+
 def tool(
     target: ToolTarget | str = ToolTarget.SERVER,
     parallel: bool = True,
     priority: int = 0,
     max_calls_per_run: int | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float = _SENTINEL,
 ) -> Callable[..., Any]:
     """Decorator that registers a function as a Dendrite tool.
+
+    Args:
+        target: Where the tool runs — "server" (default) or "client".
+        parallel: Whether concurrent execution is allowed (default True).
+        priority: Reserved — not enforced.
+        max_calls_per_run: Maximum calls per run. None = unlimited.
+        timeout_seconds: Execution timeout in seconds. Default 120s.
 
     Usage:
         @tool(target="server")
@@ -61,6 +73,9 @@ def tool(
                 f"'human' and 'agent' are reserved for future use."
             )
 
+        explicit_timeout = timeout_seconds is not _SENTINEL
+        resolved_timeout = float(timeout_seconds) if explicit_timeout else DEFAULT_TOOL_TIMEOUT
+
         schema = _generate_schema(fn)
         tool_def = ToolDef(
             name=name,
@@ -70,12 +85,21 @@ def tool(
             parallel=parallel,
             priority=priority,
             max_calls_per_run=max_calls_per_run,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=resolved_timeout,
+            has_explicit_timeout=explicit_timeout,
         )
         setattr(fn, _TOOL_DEF_ATTR, tool_def)
         return fn
 
     return decorator
+
+
+# Fix introspection: replace the sentinel with 120.0 in the visible signature
+# so IDEs, help(), and doc generators show a clean default.
+_tool_sig = inspect.signature(tool)
+_tool_params = list(_tool_sig.parameters.values())
+_tool_params[-1] = _tool_params[-1].replace(default=DEFAULT_TOOL_TIMEOUT)
+tool.__signature__ = _tool_sig.replace(parameters=_tool_params)  # type: ignore[attr-defined]
 
 
 def get_tool_def(fn: Callable[..., Any]) -> ToolDef:

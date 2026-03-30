@@ -8,14 +8,14 @@
 
 ```bash
 cd packages/python
-pip install -e ".[anthropic,db,server]"
+pip install -e ".[anthropic,db,bridge]"
 ```
 
 | Extra | What it adds |
 |-------|-------------|
 | `anthropic` | Anthropic Claude SDK |
 | `db` | SQLAlchemy, aiosqlite, Alembic |
-| `server` | FastAPI, uvicorn |
+| `bridge` | FastAPI, uvicorn (for client tool bridge) |
 | `dev` | pytest, ruff, mypy, python-dotenv |
 | `postgres` | asyncpg |
 

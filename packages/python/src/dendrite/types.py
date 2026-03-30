@@ -147,18 +147,18 @@ class ToolDef:
     Created by the @tool decorator. Used by strategies to describe tools
     to the LLM, and by the executor to dispatch tool calls.
 
-    Note: parallel, priority, and max_calls_per_run are reserved for
-    future use — not enforced by the runtime. Tools execute sequentially.
+    Note: priority is reserved for future use — not enforced by the runtime.
     """
 
     name: str
     description: str
     parameters: dict[str, Any]  # JSON Schema for params
     target: ToolTarget = ToolTarget.SERVER
-    parallel: bool = True  # Reserved — not enforced
+    parallel: bool = True  # Governs concurrent execution scheduling
     priority: int = 0  # Reserved — not enforced
-    max_calls_per_run: int | None = None  # Reserved — not enforced
-    timeout_seconds: float = 30.0  # Enforced by ReActLoop via asyncio.wait_for
+    max_calls_per_run: int | None = None  # Enforced by ReActLoop — graceful limit
+    timeout_seconds: float = 120.0  # Enforced by ReActLoop via asyncio.wait_for
+    has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
 
 
 @dataclass(frozen=True)

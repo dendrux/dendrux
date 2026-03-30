@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+
 import pytest
 
 from dendrite.agent import Agent
@@ -9,7 +13,7 @@ from dendrite.llm.mock import MockLLM
 from dendrite.loops.base import Loop
 from dendrite.loops.react import ReActLoop
 from dendrite.strategies.native import NativeToolCalling
-from dendrite.tool import tool
+from dendrite.tool import get_tool_def, tool
 from dendrite.types import (
     AgentStep,
     Clarification,
@@ -20,6 +24,28 @@ from dendrite.types import (
     RunStatus,
     ToolCall,
 )
+
+
+@contextlib.contextmanager
+def caplog_context(level: int = logging.WARNING):
+    """Simple log capture context manager."""
+    records: list[logging.LogRecord] = []
+
+    class Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Handler()
+    handler.setLevel(level)
+    root = logging.getLogger("dendrite")
+    root.addHandler(handler)
+    old_level = root.level
+    root.setLevel(level)
+    try:
+        yield records
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
 
 # ------------------------------------------------------------------
 # Test tools
@@ -941,7 +967,7 @@ class TestReActLoopToolTimeout:
 class TestReActLoopDuplicateToolNames:
     async def test_duplicate_tool_names_raise(self) -> None:
         """A-08: Two tools with the same name should raise at loop start."""
-        from dendrite.loops.react import _build_tool_lookup
+        from dendrite.loops.react import _build_tool_lookups
         from dendrite.types import ToolDef
 
         @tool()
@@ -962,7 +988,271 @@ class TestReActLoopDuplicateToolNames:
         )
 
         with pytest.raises(ValueError, match="Duplicate tool name"):
-            _build_tool_lookup([samename, samename2])
+            _build_tool_lookups([samename, samename2])
+
+
+class TestBuildExecutionGroups:
+    """Tests for _build_execution_groups — parallel grouping logic."""
+
+    def test_empty_list(self) -> None:
+        from dendrite.loops.react import _build_execution_groups
+
+        assert _build_execution_groups([], {}) == []
+
+    def test_all_parallel(self) -> None:
+        from dendrite.loops.react import _build_execution_groups
+
+        tc_a = ToolCall(name="a", params={})
+        tc_b = ToolCall(name="b", params={})
+        tc_c = ToolCall(name="c", params={})
+        parallel_lookup = {"a": True, "b": True, "c": True}
+
+        groups = _build_execution_groups([tc_a, tc_b, tc_c], parallel_lookup)
+        assert len(groups) == 1
+        assert len(groups[0][0]) == 3
+        assert groups[0][1] is True
+
+    def test_all_sequential_forms_singleton_groups(self) -> None:
+        """parallel=False tools are barriers — each forms its own group."""
+        from dendrite.loops.react import _build_execution_groups
+
+        tc_a = ToolCall(name="a", params={})
+        tc_b = ToolCall(name="b", params={})
+        parallel_lookup = {"a": False, "b": False}
+
+        groups = _build_execution_groups([tc_a, tc_b], parallel_lookup)
+        assert len(groups) == 2
+        assert groups[0] == ([tc_a], False)
+        assert groups[1] == ([tc_b], False)
+
+    def test_mixed_groups(self) -> None:
+        """[A(par), B(par), C(nonpar), D(par), E(par)] → 3 groups."""
+        from dendrite.loops.react import _build_execution_groups
+
+        calls = [
+            ToolCall(name="a", params={}),
+            ToolCall(name="b", params={}),
+            ToolCall(name="c", params={}),
+            ToolCall(name="d", params={}),
+            ToolCall(name="e", params={}),
+        ]
+        parallel_lookup = {"a": True, "b": True, "c": False, "d": True, "e": True}
+
+        groups = _build_execution_groups(calls, parallel_lookup)
+        assert len(groups) == 3
+        assert ([tc.name for tc in groups[0][0]], groups[0][1]) == (["a", "b"], True)
+        assert ([tc.name for tc in groups[1][0]], groups[1][1]) == (["c"], False)
+        assert ([tc.name for tc in groups[2][0]], groups[2][1]) == (["d", "e"], True)
+
+    def test_barrier_in_middle(self) -> None:
+        """[A(par), B(nonpar), C(par)] → A alone, B alone, C alone."""
+        from dendrite.loops.react import _build_execution_groups
+
+        calls = [
+            ToolCall(name="a", params={}),
+            ToolCall(name="b", params={}),
+            ToolCall(name="c", params={}),
+        ]
+        parallel_lookup = {"a": True, "b": False, "c": True}
+
+        groups = _build_execution_groups(calls, parallel_lookup)
+        assert len(groups) == 3
+
+    def test_defaults_to_parallel(self) -> None:
+        """Unknown tools default to parallel=True."""
+        from dendrite.loops.react import _build_execution_groups
+
+        tc_a = ToolCall(name="a", params={})
+        tc_b = ToolCall(name="b", params={})
+
+        groups = _build_execution_groups([tc_a, tc_b], {})
+        assert len(groups) == 1
+        assert groups[0][1] is True
+
+
+class TestMaxCallsPerRun:
+    """Tests for max_calls_per_run enforcement."""
+
+    async def test_max_calls_enforced(self) -> None:
+        """Tool returns graceful limit message after max calls reached."""
+        call_count = 0
+
+        @tool(max_calls_per_run=2)
+        async def limited_tool(x: str) -> str:
+            """A tool with a call limit."""
+            nonlocal call_count
+            call_count += 1
+            return f"result-{call_count}"
+
+        tc1 = ToolCall(name="limited_tool", params={"x": "a"})
+        tc2 = ToolCall(name="limited_tool", params={"x": "b"})
+        tc3 = ToolCall(name="limited_tool", params={"x": "c"})
+
+        responses = [
+            LLMResponse(text="call 1", tool_calls=[tc1]),
+            LLMResponse(text="call 2", tool_calls=[tc2]),
+            LLMResponse(text="call 3", tool_calls=[tc3]),  # Should be rejected
+            LLMResponse(text="All done"),
+        ]
+        mock = MockLLM(responses=responses)
+
+        agent = Agent(provider=mock, prompt="test", tools=[limited_tool])
+        result = await agent.run("test")
+
+        # Tool was only actually called twice
+        assert call_count == 2
+        assert result.status == RunStatus.SUCCESS
+
+    async def test_max_calls_enforced_within_single_batch(self) -> None:
+        """Two calls to the same tool in one LLM response — only first allowed."""
+        call_count = 0
+
+        @tool(max_calls_per_run=1)
+        async def once_only(x: str) -> str:
+            """Only callable once per run."""
+            nonlocal call_count
+            call_count += 1
+            return f"result-{call_count}"
+
+        tc1 = ToolCall(name="once_only", params={"x": "a"})
+        tc2 = ToolCall(name="once_only", params={"x": "b"})
+
+        # LLM returns both calls in a single response
+        responses = [
+            LLMResponse(text="calling twice", tool_calls=[tc1, tc2]),
+            LLMResponse(text="All done"),
+        ]
+        mock = MockLLM(responses=responses)
+
+        agent = Agent(provider=mock, prompt="test", tools=[once_only])
+        result = await agent.run("test")
+
+        # Only the first call should have executed
+        assert call_count == 1
+        assert result.status == RunStatus.SUCCESS
+
+    async def test_no_limit_when_none(self) -> None:
+        """Without max_calls_per_run, tool can be called unlimited times."""
+        call_count = 0
+
+        @tool()
+        async def unlimited(x: str) -> str:
+            """No limit."""
+            nonlocal call_count
+            call_count += 1
+            return f"result-{call_count}"
+
+        tc1 = ToolCall(name="unlimited", params={"x": "a"})
+        tc2 = ToolCall(name="unlimited", params={"x": "b"})
+        tc3 = ToolCall(name="unlimited", params={"x": "c"})
+
+        responses = [
+            LLMResponse(tool_calls=[tc1]),
+            LLMResponse(tool_calls=[tc2]),
+            LLMResponse(tool_calls=[tc3]),
+            LLMResponse(text="done"),
+        ]
+        mock = MockLLM(responses=responses)
+
+        agent = Agent(provider=mock, prompt="test", tools=[unlimited])
+        result = await agent.run("test")
+
+        assert call_count == 3
+        assert result.status == RunStatus.SUCCESS
+
+
+class TestTimeoutWarning:
+    """Tests for timeout warning messages."""
+
+    async def test_default_timeout_warning_includes_hint(self) -> None:
+        """Timeout on default-timeout tool includes '(default)' and hint."""
+
+        @tool()
+        async def slow_tool(x: str) -> str:
+            """Slow."""
+            await asyncio.sleep(10)
+            return x
+
+        # Override to very short timeout for test
+        td = get_tool_def(slow_tool)
+        object.__setattr__(td, "timeout_seconds", 0.01)
+        object.__setattr__(td, "has_explicit_timeout", False)
+
+        tc = ToolCall(name="slow_tool", params={"x": "a"})
+        responses = [
+            LLMResponse(text="calling", tool_calls=[tc]),
+            LLMResponse(text="done"),
+        ]
+        mock = MockLLM(responses=responses)
+        agent = Agent(provider=mock, prompt="test", tools=[slow_tool])
+
+        with caplog_context(logging.WARNING) as logs:
+            await agent.run("test")
+
+        timeout_warnings = [r for r in logs if "timed out" in r.message]
+        assert len(timeout_warnings) == 1
+        assert "(default)" in timeout_warnings[0].message
+        assert "@tool(timeout_seconds=N)" in timeout_warnings[0].message
+
+    async def test_explicit_timeout_warning_no_hint(self) -> None:
+        """Timeout on explicit-timeout tool does NOT include '(default)' hint."""
+
+        @tool(timeout_seconds=0.01)
+        async def slow_explicit(x: str) -> str:
+            """Slow with explicit timeout."""
+            await asyncio.sleep(10)
+            return x
+
+        tc = ToolCall(name="slow_explicit", params={"x": "a"})
+        responses = [
+            LLMResponse(text="calling", tool_calls=[tc]),
+            LLMResponse(text="done"),
+        ]
+        mock = MockLLM(responses=responses)
+        agent = Agent(provider=mock, prompt="test", tools=[slow_explicit])
+
+        with caplog_context(logging.WARNING) as logs:
+            await agent.run("test")
+
+        timeout_warnings = [r for r in logs if "timed out" in r.message]
+        assert len(timeout_warnings) == 1
+        assert "(default)" not in timeout_warnings[0].message
+
+
+class TestToolSentinel:
+    """Tests for timeout_seconds sentinel detection."""
+
+    def test_default_timeout(self) -> None:
+        @tool()
+        async def no_timeout(x: str) -> str:
+            """No explicit timeout."""
+            return x
+
+        td = get_tool_def(no_timeout)
+        assert td.timeout_seconds == 120.0
+        assert td.has_explicit_timeout is False
+
+    def test_explicit_timeout(self) -> None:
+        @tool(timeout_seconds=60)
+        async def with_timeout(x: str) -> str:
+            """Explicit timeout."""
+            return x
+
+        td = get_tool_def(with_timeout)
+        assert td.timeout_seconds == 60.0
+        assert td.has_explicit_timeout is True
+
+    def test_explicit_default_value(self) -> None:
+        """Even passing 120 explicitly should be marked as explicit."""
+        @tool(timeout_seconds=120)
+        async def same_as_default(x: str) -> str:
+            """Same as default but explicit."""
+            return x
+
+        td = get_tool_def(same_as_default)
+        assert td.timeout_seconds == 120.0
+        assert td.has_explicit_timeout is True
+
 
 
 # Need to import UsageStats for the usage test

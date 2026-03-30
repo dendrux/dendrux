@@ -6,7 +6,7 @@ Demonstrates Dendrite's core differentiator — an agent that **pauses** when it
 
 ```bash
 cd packages/python
-pip install -e ".[dev,db,anthropic,server]"
+pip install -e ".[dev,db,anthropic,bridge]"
 ```
 
 Set your API key:
