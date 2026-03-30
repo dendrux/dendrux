@@ -613,6 +613,142 @@ class TestPauseResume:
 
 
 # ------------------------------------------------------------------
+# submit_and_claim (G2: persist-first handoff)
+# ------------------------------------------------------------------
+
+
+class TestSubmitAndClaim:
+    """submit_and_claim atomically saves submitted data + claims the run."""
+
+    _PAUSE_DATA = {
+        "agent_name": "Agent",
+        "pending_tool_calls": [
+            {"name": "read", "params": {}, "id": "tc1", "provider_tool_call_id": None}
+        ],
+        "pending_targets": {"tc1": "client"},
+        "history": [{"role": "user", "content": "hello"}],
+        "steps": [],
+        "iteration": 2,
+        "trace_order_offset": 3,
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            "cost_usd": None,
+        },
+    }
+
+    async def test_submit_and_claim_succeeds(self, store) -> None:
+        """First caller wins: saves submitted data + transitions to running."""
+        await store.create_run("run_sac1", "Agent")
+        await store.pause_run(
+            "run_sac1", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
+        )
+
+        won = await store.submit_and_claim(
+            "run_sac1",
+            expected_status="waiting_client_tool",
+            submitted_data={
+                "submitted_tool_results": [
+                    {"name": "read", "call_id": "tc1", "payload": '"data"', "success": True}
+                ]
+            },
+        )
+        assert won is True
+
+        # Status transitioned to running
+        record = await store.get_run("run_sac1")
+        assert record is not None
+        assert record.status == "running"
+
+        # Submitted data merged into pause_data
+        pause = await store.get_pause_state("run_sac1")
+        assert pause is not None
+        assert "submitted_tool_results" in pause
+        assert pause["submitted_tool_results"][0]["call_id"] == "tc1"
+        # Original data preserved
+        assert pause["agent_name"] == "Agent"
+
+    async def test_second_caller_loses(self, store) -> None:
+        """Second submit_and_claim returns False — first writer wins."""
+        await store.create_run("run_sac2", "Agent")
+        await store.pause_run(
+            "run_sac2", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
+        )
+
+        won1 = await store.submit_and_claim(
+            "run_sac2",
+            expected_status="waiting_client_tool",
+            submitted_data={"submitted_tool_results": [{"call_id": "tc1"}]},
+        )
+        assert won1 is True
+
+        won2 = await store.submit_and_claim(
+            "run_sac2",
+            expected_status="waiting_client_tool",
+            submitted_data={"submitted_tool_results": [{"call_id": "tc1"}]},
+        )
+        assert won2 is False
+
+    async def test_wrong_status_returns_false(self, store) -> None:
+        """submit_and_claim fails if run is not in expected status."""
+        await store.create_run("run_sac3", "Agent")
+        await store.pause_run(
+            "run_sac3", status="waiting_client_tool", pause_data=dict(self._PAUSE_DATA)
+        )
+
+        won = await store.submit_and_claim(
+            "run_sac3",
+            expected_status="waiting_human_input",  # wrong status
+            submitted_data={"submitted_user_input": "yes"},
+        )
+        assert won is False
+
+        # Status unchanged
+        record = await store.get_run("run_sac3")
+        assert record is not None
+        assert record.status == "waiting_client_tool"
+
+    async def test_nonexistent_run_returns_false(self, store) -> None:
+        """submit_and_claim returns False for a run that doesn't exist."""
+        won = await store.submit_and_claim(
+            "nonexistent",
+            expected_status="waiting_client_tool",
+            submitted_data={"submitted_tool_results": []},
+        )
+        assert won is False
+
+    async def test_no_pause_data_returns_false(self, store) -> None:
+        """submit_and_claim returns False when run has no pause_data."""
+        await store.create_run("run_sac5", "Agent")
+        # Running, no pause_data
+        won = await store.submit_and_claim(
+            "run_sac5",
+            expected_status="running",
+            submitted_data={"submitted_tool_results": []},
+        )
+        assert won is False
+
+    async def test_submit_input(self, store) -> None:
+        """submit_and_claim works for clarification input too."""
+        await store.create_run("run_sac6", "Agent")
+        await store.pause_run(
+            "run_sac6", status="waiting_human_input", pause_data=dict(self._PAUSE_DATA)
+        )
+
+        won = await store.submit_and_claim(
+            "run_sac6",
+            expected_status="waiting_human_input",
+            submitted_data={"submitted_user_input": "yes, proceed"},
+        )
+        assert won is True
+
+        pause = await store.get_pause_state("run_sac6")
+        assert pause is not None
+        assert pause["submitted_user_input"] == "yes, proceed"
+
+
+# ------------------------------------------------------------------
 # Run Events (Dashboard Phase 0)
 # ------------------------------------------------------------------
 

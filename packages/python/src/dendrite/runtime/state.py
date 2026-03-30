@@ -214,6 +214,35 @@ class StateStore(Protocol):
 
     async def claim_paused_run(self, run_id: str, *, expected_status: str) -> bool: ...
 
+    async def submit_and_claim(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        submitted_data: dict[str, Any],
+    ) -> bool:
+        """Atomically save submitted data to pause_data and claim the run.
+
+        Merges *submitted_data* into the existing pause_data blob and
+        transitions the run from *expected_status* to RUNNING in a single
+        conditional UPDATE.  First-writer-wins: returns True if this call
+        won the race, False if the status had already changed.
+
+        Used by the bridge for persist-first handoff: the bridge spawns a
+        resume task, the task calls this method, and signals back to the
+        HTTP handler whether it won.
+
+        Args:
+            run_id: The paused run's ID.
+            expected_status: Guard value (e.g. "waiting_client_tool").
+            submitted_data: Keys to merge into pause_data
+                (e.g. ``{"submitted_tool_results": [...]}``)
+
+        Returns:
+            True if saved + claimed, False if another caller already won.
+        """
+        ...
+
     async def get_run(self, run_id: str) -> RunRecord | None: ...
 
     async def get_traces(self, run_id: str) -> list[TraceRecord]: ...
@@ -569,6 +598,63 @@ class SQLAlchemyStateStore:
             result = await session.execute(stmt)
             await session.commit()
             return bool(result.rowcount and result.rowcount > 0)
+
+    async def submit_and_claim(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        submitted_data: dict[str, Any],
+    ) -> bool:
+        """Atomically save submitted data and claim the run.
+
+        Implementation:
+          1. Read pause_data + status in a session.
+          2. Merge submitted_data into pause_data (Python-side).
+          3. Conditional UPDATE: set merged blob + status='running'
+             WHERE status still equals *expected_status*.
+
+        The CAS on the status column is the concurrency boundary.
+        On SQLite, writes are serialized (single-writer lock) so the
+        second writer's UPDATE sees the first writer's committed status
+        change and matches 0 rows.  On Postgres, the UPDATE takes a
+        row-level lock achieving the same effect.
+        """
+        from sqlalchemy import func, select, update
+
+        from dendrite.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            # 1. Read current pause_data
+            stmt = select(AgentRun.pause_data, AgentRun.status).where(AgentRun.id == run_id)
+            result = await session.execute(stmt)
+            row = result.one_or_none()
+            if row is None:
+                return False
+
+            current_pause_data, current_status = row
+            if current_status != expected_status:
+                return False
+            if current_pause_data is None:
+                return False
+
+            # 2. Merge submitted_data into pause_data
+            merged = dict(current_pause_data)
+            merged.update(submitted_data)
+
+            # 3. Conditional UPDATE — CAS on status column
+            update_stmt = (
+                update(AgentRun)
+                .where(AgentRun.id == run_id, AgentRun.status == expected_status)
+                .values(
+                    pause_data=merged,
+                    status="running",
+                    updated_at=func.now(),
+                )
+            )
+            update_result = await session.execute(update_stmt)
+            await session.commit()
+            return bool(update_result.rowcount and update_result.rowcount > 0)
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         from sqlalchemy import select

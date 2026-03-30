@@ -305,6 +305,7 @@ class Agent:
         *,
         tool_results: list[ToolResult] | None = None,
         user_input: str | None = None,
+        observer: Any | None = None,
     ) -> RunResult:
         """Resume a paused run.
 
@@ -316,6 +317,8 @@ class Agent:
             run_id: The paused run's ID.
             tool_results: Results for pending tool calls (for client tool runs).
             user_input: Clarification answer (for human-in-the-loop runs).
+            observer: Optional additional loop observer (e.g. TransportObserver
+                for SSE streaming). Composed with PersistenceObserver internally.
 
         Returns:
             RunResult with updated status.
@@ -353,6 +356,7 @@ class Agent:
                 agent=self,
                 provider=self._provider,
                 redact=self._redact,
+                extra_observer=observer,
             )
         # user_input path (guarded by validation above)
         return await resume_with_input(
@@ -362,6 +366,7 @@ class Agent:
             agent=self,
             provider=self._provider,
             redact=self._redact,
+            extra_observer=observer,
         )
 
     # ------------------------------------------------------------------

@@ -374,12 +374,15 @@ async def _resume_core(
     tool_results: list[ToolResult] | None = None,
     user_input: str | None = None,
     extra_observer: Any | None = None,
+    _skip_claim: bool = False,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
     Args:
         extra_observer: Optional additional LoopObserver (e.g. TransportObserver)
             to compose with the PersistenceObserver for SSE streaming during resume.
+        _skip_claim: Internal flag — skip the atomic claim step when the caller
+            has already claimed via submit_and_claim(). Used by resume_claimed().
     """
     from dendrite.runtime.observer import PersistenceObserver
     from dendrite.tool import get_tool_def
@@ -406,12 +409,14 @@ async def _resume_core(
 
     # 3. Atomic claim — transition WAITING → RUNNING
     #    Done after validation so a bad request doesn't leave the run stuck.
-    claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
-    if not claimed:
-        raise ValueError(
-            f"Run '{run_id}' is not in status '{expected_status}' — "
-            f"cannot resume. It may have been claimed by another caller."
-        )
+    #    Skipped when caller already claimed via submit_and_claim().
+    if not _skip_claim:
+        claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
+        if not claimed:
+            raise ValueError(
+                f"Run '{run_id}' is not in status '{expected_status}' — "
+                f"cannot resume. It may have been claimed by another caller."
+            )
 
     # 4. Initialize sequencer from DB max (continues across pause boundaries)
     existing_events = await state_store.get_run_events(run_id)
@@ -548,22 +553,126 @@ async def _resume_core(
         return result
 
     except Exception as exc:
-        if state_store is not None:
-            error_won = False
-            try:
-                redacted_err = redact(str(exc)) if redact else str(exc)
-                error_won = await state_store.finalize_run(
-                    run_id,
-                    status=RunStatus.ERROR.value,
-                    error=redacted_err,
-                    total_usage=None,
-                    expected_current_status="running",
-                )
-            except Exception:
-                logger.warning("Failed to persist ERROR status for run %s", run_id, exc_info=True)
-            # Only the CAS winner emits the error event
-            if error_won:
-                await _emit_event(
-                    state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-                )
+        error_won = False
+        try:
+            redacted_err = redact(str(exc)) if redact else str(exc)
+            error_won = await state_store.finalize_run(
+                run_id,
+                status=RunStatus.ERROR.value,
+                error=redacted_err,
+                total_usage=None,
+                expected_current_status="running",
+            )
+        except Exception:
+            logger.warning("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+        # Only the CAS winner emits the error event
+        if error_won:
+            await _emit_event(
+                state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+            )
         raise
+
+
+async def resume_claimed(
+    run_id: str,
+    *,
+    state_store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    redact: Callable[[str], str] | None = None,
+    extra_observer: Any | None = None,
+) -> RunResult:
+    """Resume a run that was already claimed via submit_and_claim().
+
+    Internal helper for the bridge's persist-first handoff. NOT a public API.
+
+    The bridge's background task calls submit_and_claim() to atomically save
+    submitted data and transition WAITING → RUNNING. Once that succeeds, it
+    calls this helper to actually re-enter the loop.
+
+    Validates before proceeding:
+      - pause_data exists (run was paused)
+      - submitted_tool_results or submitted_user_input present in blob
+      - for tool results: call_ids match pending_tool_calls
+
+    Args:
+        run_id: The run ID (already in RUNNING status after submit_and_claim).
+        state_store: Persistence backend.
+        agent: Agent definition.
+        provider: LLM provider.
+        redact: Optional redaction policy.
+        extra_observer: Optional TransportObserver for SSE streaming.
+
+    Returns:
+        RunResult from the resumed loop.
+
+    Raises:
+        ValueError: If pause_data is missing, no submitted data found,
+            or submitted call_ids don't match pending tool calls.
+    """
+    from dendrite.types import ToolResult as ToolResultType
+
+    # 1. Load pause_data (submit_and_claim merged submitted data into it)
+    raw_pause = await state_store.get_pause_state(run_id)
+    if raw_pause is None:
+        raise ValueError(
+            f"Run '{run_id}' has no pause state after claim — "
+            "this indicates a bug in submit_and_claim."
+        )
+
+    # 2. Detect submission type and extract data
+    submitted_results = raw_pause.get("submitted_tool_results")
+    submitted_input = raw_pause.get("submitted_user_input")
+
+    if submitted_results is not None:
+        # 3a. Convert dicts to typed ToolResult objects
+        tool_results = [
+            ToolResultType(
+                name=r["name"],
+                call_id=r["call_id"],
+                payload=r["payload"],
+                success=r.get("success", True),
+                error=r.get("error"),
+                duration_ms=r.get("duration_ms", 0),
+            )
+            for r in submitted_results
+        ]
+
+        # 3b. Validate call_ids match pending tool calls
+        pending_ids = {tc["id"] for tc in raw_pause.get("pending_tool_calls", [])}
+        provided_ids = {tr.call_id for tr in tool_results}
+        if provided_ids != pending_ids:
+            raise ValueError(
+                f"Submitted tool result call_ids {provided_ids} do not match "
+                f"pending tool call_ids {pending_ids}."
+            )
+
+        return await _resume_core(
+            run_id,
+            state_store=state_store,
+            agent=agent,
+            provider=provider,
+            redact=redact,
+            expected_status="running",
+            tool_results=tool_results,
+            extra_observer=extra_observer,
+            _skip_claim=True,
+        )
+
+    if submitted_input is not None:
+        return await _resume_core(
+            run_id,
+            state_store=state_store,
+            agent=agent,
+            provider=provider,
+            redact=redact,
+            expected_status="running",
+            user_input=submitted_input,
+            extra_observer=extra_observer,
+            _skip_claim=True,
+        )
+
+    raise ValueError(
+        f"Run '{run_id}' has pause_data but no submitted_tool_results "
+        "or submitted_user_input — nothing to resume with."
+    )
