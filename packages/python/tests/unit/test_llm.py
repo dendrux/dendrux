@@ -2,9 +2,9 @@
 
 import pytest
 
-from dendrite.llm.base import LLMProvider
-from dendrite.llm.mock import MockLLM
-from dendrite.types import (
+from dendrux.llm.base import LLMProvider
+from dendrux.llm.mock import MockLLM
+from dendrux.types import (
     LLMResponse,
     Message,
     Role,

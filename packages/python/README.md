@@ -1,6 +1,6 @@
-# dendrite
+# dendrux
 
-> Python SDK for Dendrite — the framework for building agents with tools, persistence, and observability.
+> Python SDK for Dendrux — the framework for building agents with tools, persistence, and observability.
 
 **Version:** 0.1.0a1
 
@@ -16,8 +16,8 @@ pip install -e ".[openai,db]"          # Just OpenAI + SQLite
 
 ```python
 import asyncio
-from dendrite import Agent, tool
-from dendrite.llm.anthropic import AnthropicProvider
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
 
 @tool()
 async def add(a: int, b: int) -> int:
@@ -40,22 +40,22 @@ asyncio.run(main())
 
 | Provider | Import | Use case |
 |----------|--------|----------|
-| Anthropic | `from dendrite.llm.anthropic import AnthropicProvider` | Claude models |
-| OpenAI | `from dendrite.llm.openai import OpenAIProvider` | GPT models + vLLM, SGLang, Groq, Ollama |
-| OpenAI Responses | `from dendrite.llm.openai_responses import OpenAIResponsesProvider` | GPT + built-in tools (web search) |
-| Mock | `from dendrite.llm.mock import MockLLM` | Deterministic testing |
+| Anthropic | `from dendrux.llm.anthropic import AnthropicProvider` | Claude models |
+| OpenAI | `from dendrux.llm.openai import OpenAIProvider` | GPT models + vLLM, SGLang, Groq, Ollama |
+| OpenAI Responses | `from dendrux.llm.openai_responses import OpenAIResponsesProvider` | GPT + built-in tools (web search) |
+| Mock | `from dendrux.llm.mock import MockLLM` | Deterministic testing |
 
 ## API Quick Reference
 
 ```python
 from pathlib import Path
-from dendrite.observers.console import ConsoleObserver
+from dendrux.observers.console import ConsoleObserver
 
 async with Agent(
     provider=provider,                  # Required: LLM provider
     prompt="...",                        # Required: system prompt
     tools=[add],                         # Optional: tool functions
-    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
+    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrux' / 'dendrux.db'}",
     redact=my_scrubber,                  # Optional: scrub persisted strings
 ) as agent:
     result = await agent.run(

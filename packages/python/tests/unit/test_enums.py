@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dendrite.db.enums import AgentRunStatus
+from dendrux.db.enums import AgentRunStatus
 
 
 class TestAgentRunStatus:

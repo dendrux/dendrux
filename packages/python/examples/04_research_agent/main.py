@@ -1,4 +1,4 @@
-"""Research Agent — multi-agent composition with Dendrite.
+"""Research Agent — multi-agent composition with Dendrux.
 
 Demonstrates the agent-as-tool pattern: an orchestrator agent delegates
 to specialist sub-agents (search, scrape) that each have their own
@@ -28,8 +28,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from dendrite import Agent, tool
-from dendrite.llm.anthropic import AnthropicProvider
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
 
 from agents.search_agent import run_search
 from agents.scrape_agent import run_scrape

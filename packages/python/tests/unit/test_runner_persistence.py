@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from dendrite import Agent, run, tool
-from dendrite.llm.mock import MockLLM
-from dendrite.types import (
+from dendrux import Agent, run, tool
+from dendrux.llm.mock import MockLLM
+from dendrux.types import (
     LLMResponse,
     RunStatus,
     ToolCall,

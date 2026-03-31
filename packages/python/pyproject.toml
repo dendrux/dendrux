@@ -1,12 +1,12 @@
 [project]
-name = "dendrite"
+name = "dendrux"
 version = "0.1.0a1"
 description = "The runtime for agents that act in the real world."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [
-    { name = "Dendrite Contributors" },
+    { name = "Dendrux Contributors" },
 ]
 keywords = ["agents", "llm", "ai", "tools", "runtime"]
 classifiers = [
@@ -33,7 +33,7 @@ openai = ["openai>=1.50,<3.0"]
 bridge = ["fastapi>=0.135,<1.0", "uvicorn[standard]"]
 db = ["sqlalchemy[asyncio]>=2.0,<3.0", "aiosqlite>=0.19,<1.0", "alembic>=1.13,<2.0"]
 postgres = ["asyncpg>=0.29,<1.0"]
-all = ["dendrite[anthropic,openai,bridge,db,postgres]"]
+all = ["dendrux[anthropic,openai,bridge,db,postgres]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -45,28 +45,28 @@ dev = [
 ]
 
 [project.scripts]
-dendrite = "dendrite.cli.main:app"
+dendrux = "dendrux.cli.main:app"
 
 [project.urls]
-Homepage = "https://github.com/dendrite-agent/dendrite"
-Repository = "https://github.com/dendrite-agent/dendrite"
+Homepage = "https://github.com/dendrux/dendrux"
+Repository = "https://github.com/dendrux/dendrux"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dendrite"]
+packages = ["src/dendrux"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"src/dendrite/dashboard/static" = "dendrite/dashboard/static"
+"src/dendrux/dashboard/static" = "dendrux/dashboard/static"
 
 # --- Tool configs ---
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["src/dendrite/db/migrations"]
+extend-exclude = ["src/dendrux/db/migrations"]
 
 [tool.ruff.lint]
 select = [
@@ -81,7 +81,7 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["dendrite"]
+known-first-party = ["dendrux"]
 
 [tool.mypy]
 strict = true
@@ -111,7 +111,7 @@ module = "alembic.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "dendrite.db.migrations.*"
+module = "dendrux.db.migrations.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
@@ -124,6 +124,6 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 omit = [
-    "src/dendrite/cli/*",
-    "src/dendrite/db/migrations/*",
+    "src/dendrux/cli/*",
+    "src/dendrux/db/migrations/*",
 ]

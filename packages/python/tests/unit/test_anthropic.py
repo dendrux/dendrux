@@ -14,8 +14,8 @@ from anthropic.types import (
     Usage,
 )
 
-from dendrite.llm.anthropic import AnthropicProvider
-from dendrite.types import (
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.types import (
     Message,
     Role,
     ToolCall,
@@ -234,7 +234,7 @@ class TestConvertMessages:
             provider._convert_messages(messages)
 
     def test_duplicate_call_id_raises(self, provider: AnthropicProvider) -> None:
-        """Duplicate Dendrite call_ids in the conversation must fail."""
+        """Duplicate Dendrux call_ids in the conversation must fail."""
         shared_id = "01SHARED"
         # Create two ToolCalls with the same id (bypass frozen by using object.__setattr__)
         tc1 = ToolCall.__new__(ToolCall)
@@ -254,7 +254,7 @@ class TestConvertMessages:
             Message(role=Role.TOOL, content="3", name="add", call_id=shared_id),
             Message(role=Role.ASSISTANT, content="", tool_calls=[tc2]),
         ]
-        with pytest.raises(ValueError, match="Duplicate Dendrite call_id"):
+        with pytest.raises(ValueError, match="Duplicate Dendrux call_id"):
             provider._convert_messages(messages)
 
 
@@ -340,7 +340,7 @@ class TestNormalizeResponse:
         assert tc.name == "search"
         assert tc.params == {"q": "test"}
         assert tc.provider_tool_call_id == "toolu_abc123"
-        assert tc.id is not None  # Dendrite ULID auto-generated
+        assert tc.id is not None  # Dendrux ULID auto-generated
 
     def test_mixed_text_and_tool_use(self, provider: AnthropicProvider) -> None:
         response = _make_anthropic_response(

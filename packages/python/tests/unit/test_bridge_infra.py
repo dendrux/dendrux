@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from dendrite.bridge.observer import CompositeObserver, ServerEvent, TransportObserver
-from dendrite.bridge.tasks import RunTaskManager
-from dendrite.types import Message, Role, ToolCall, ToolResult
+from dendrux.bridge.observer import CompositeObserver, ServerEvent, TransportObserver
+from dendrux.bridge.tasks import RunTaskManager
+from dendrux.types import Message, Role, ToolCall, ToolResult
 
 
 class TestTransportObserver:

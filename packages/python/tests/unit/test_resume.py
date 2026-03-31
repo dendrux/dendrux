@@ -7,11 +7,11 @@ from typing import Any
 
 import pytest
 
-from dendrite.agent import Agent
-from dendrite.llm.mock import MockLLM
-from dendrite.runtime.runner import resume, resume_with_input, run
-from dendrite.tool import tool
-from dendrite.types import (
+from dendrux.agent import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.runtime.runner import resume, resume_with_input, run
+from dendrux.tool import tool
+from dendrux.types import (
     LLMResponse,
     Message,
     PauseState,
@@ -493,9 +493,9 @@ class TestResumeWithInput:
         Exercises the real loop → runner → state store → resume path
         without manually constructing PauseState.
         """
-        from dendrite.strategies.base import Strategy
-        from dendrite.types import AgentStep
-        from dendrite.types import Clarification as Clar
+        from dendrux.strategies.base import Strategy
+        from dendrux.types import AgentStep
+        from dendrux.types import Clarification as Clar
 
         class ClarifyStrategy(Strategy):
             """Always returns Clarification."""

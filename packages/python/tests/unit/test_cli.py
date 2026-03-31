@@ -6,7 +6,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from dendrite.cli.main import _resolve_db_url, app
+from dendrux.cli.main import _resolve_db_url, app
 
 runner = CliRunner()
 
@@ -36,14 +36,14 @@ class TestResolveDbUrl:
         assert Path(path_part).is_absolute()
 
     def test_bare_absolute_path(self) -> None:
-        result = _resolve_db_url("/tmp/dendrite.db")
+        result = _resolve_db_url("/tmp/dendrux.db")
         assert result.startswith("sqlite+aiosqlite:///")
-        assert "/tmp/dendrite.db" in result
+        assert "/tmp/dendrux.db" in result
 
     def test_bare_filename(self) -> None:
-        result = _resolve_db_url("dendrite.db")
+        result = _resolve_db_url("dendrux.db")
         assert result.startswith("sqlite+aiosqlite:///")
-        assert result.endswith("dendrite.db")
+        assert result.endswith("dendrux.db")
         path_part = result.split("///", 1)[1]
         assert Path(path_part).is_absolute()
 
@@ -73,7 +73,7 @@ class TestDashboardCommand:
         """
         import inspect
 
-        from dendrite.cli.main import dashboard
+        from dendrux.cli.main import dashboard
 
         source = inspect.getsource(dashboard)
         assert "_resolve_db_url" in source

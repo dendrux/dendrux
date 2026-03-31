@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dendrite import Agent, run, tool
-from dendrite.llm.mock import MockLLM
-from dendrite.loops.react import ReActLoop
-from dendrite.strategies.native import NativeToolCalling
-from dendrite.types import (
+from dendrux import Agent, run, tool
+from dendrux.llm.mock import MockLLM
+from dendrux.loops.react import ReActLoop
+from dendrux.strategies.native import NativeToolCalling
+from dendrux.types import (
     LLMResponse,
     RunStatus,
     ToolCall,
@@ -109,9 +109,9 @@ class TestRun:
         assert result.status == RunStatus.MAX_ITERATIONS
 
     async def test_imports_from_top_level(self) -> None:
-        """Agent, run, and tool are importable from dendrite."""
-        import dendrite
+        """Agent, run, and tool are importable from dendrux."""
+        import dendrux
 
-        assert hasattr(dendrite, "Agent")
-        assert hasattr(dendrite, "run")
-        assert hasattr(dendrite, "tool")
+        assert hasattr(dendrux, "Agent")
+        assert hasattr(dendrux, "run")
+        assert hasattr(dendrux, "tool")

@@ -1,6 +1,6 @@
 """Verify package imports and version."""
 
-from dendrite import __version__
+from dendrux import __version__
 
 
 def test_version_exists() -> None:

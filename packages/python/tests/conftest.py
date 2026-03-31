@@ -1,1 +1,1 @@
-"""Shared test fixtures for Dendrite tests."""
+"""Shared test fixtures for Dendrux tests."""

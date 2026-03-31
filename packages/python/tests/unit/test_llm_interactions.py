@@ -12,8 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from dendrite.runtime.observer import PersistenceObserver
-from dendrite.types import (
+from dendrux.runtime.observer import PersistenceObserver
+from dendrux.types import (
     LLMResponse,
     Message,
     Role,
@@ -254,7 +254,7 @@ class TestResumeCoreCAsBugFix:
         # Reading the source to confirm the fix is in place.
         import inspect
 
-        from dendrite.runtime import runner
+        from dendrux.runtime import runner
 
         source = inspect.getsource(runner._resume_core)
 

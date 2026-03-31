@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import anthropic
 
-from dendrite.llm.base import LLMProvider
-from dendrite.llm.mock import MockLLM
-from dendrite.types import LLMResponse
+from dendrux.llm.base import LLMProvider
+from dendrux.llm.mock import MockLLM
+from dendrux.types import LLMResponse
 
 # ------------------------------------------------------------------
 # Base class contract
@@ -89,14 +89,14 @@ class TestMockLLMContract:
 
 class TestAnthropicProviderContract:
     def test_model_property_returns_configured_model(self) -> None:
-        from dendrite.llm.anthropic import AnthropicProvider
+        from dendrux.llm.anthropic import AnthropicProvider
 
         provider = AnthropicProvider(api_key="sk-test", model="claude-sonnet-4-6")
         assert provider.model == "claude-sonnet-4-6"
 
     def test_constructs_without_explicit_api_key(self) -> None:
         """AnthropicProvider passes api_key=None to SDK, letting it read env."""
-        from dendrite.llm.anthropic import AnthropicProvider
+        from dendrux.llm.anthropic import AnthropicProvider
 
         with patch.object(anthropic, "AsyncAnthropic", return_value=MagicMock()) as mock_cls:
             AnthropicProvider(model="claude-sonnet-4-6")
@@ -105,7 +105,7 @@ class TestAnthropicProviderContract:
 
     def test_explicit_api_key_forwarded_to_sdk(self) -> None:
         """When api_key is provided, it's passed through to the SDK."""
-        from dendrite.llm.anthropic import AnthropicProvider
+        from dendrux.llm.anthropic import AnthropicProvider
 
         with patch.object(anthropic, "AsyncAnthropic", return_value=MagicMock()) as mock_cls:
             AnthropicProvider(model="claude-sonnet-4-6", api_key="sk-explicit")
@@ -113,7 +113,7 @@ class TestAnthropicProviderContract:
             assert mock_cls.call_args.kwargs["api_key"] == "sk-explicit"
 
     async def test_close_closes_client(self) -> None:
-        from dendrite.llm.anthropic import AnthropicProvider
+        from dendrux.llm.anthropic import AnthropicProvider
 
         provider = AnthropicProvider(api_key="sk-test", model="test")
         with patch.object(provider._client, "close", new_callable=AsyncMock) as mock_close:
@@ -121,7 +121,7 @@ class TestAnthropicProviderContract:
             mock_close.assert_awaited_once()
 
     async def test_context_manager_closes_on_exit(self) -> None:
-        from dendrite.llm.anthropic import AnthropicProvider
+        from dendrux.llm.anthropic import AnthropicProvider
 
         provider = AnthropicProvider(api_key="sk-test", model="test")
         with patch.object(provider._client, "close", new_callable=AsyncMock) as mock_close:

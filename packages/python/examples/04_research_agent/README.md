@@ -12,7 +12,7 @@ Orchestrator (ResearchOrchestrator)
   +-- save_report(filename)     --> writes .md to output/
 ```
 
-Each sub-agent is a full Dendrite `Agent` — it gets its own system prompt, makes its own LLM calls, and reasons independently. The orchestrator sees them as regular tools.
+Each sub-agent is a full Dendrux `Agent` — it gets its own system prompt, makes its own LLM calls, and reasons independently. The orchestrator sees them as regular tools.
 
 ## Setup
 
@@ -47,7 +47,7 @@ The orchestrator will:
 
 ## Token Budget
 
-Sub-agent calls are expensive (each one does its own LLM reasoning loop), so call counts are capped using Dendrite's built-in `max_calls_per_run`:
+Sub-agent calls are expensive (each one does its own LLM reasoning loop), so call counts are capped using Dendrux's built-in `max_calls_per_run`:
 
 ```python
 @tool(max_calls_per_run=3, timeout_seconds=120)
@@ -58,15 +58,15 @@ async def research_topic(query: str) -> str:
 - **3** search calls (`research_topic`)
 - **2** deep reads (`deep_read`)
 
-When a tool hits its limit, Dendrite returns a graceful message to the LLM — no crash, the agent adapts and moves to synthesis.
+When a tool hits its limit, Dendrux returns a graceful message to the LLM — no crash, the agent adapts and moves to synthesis.
 
 ## Inspect
 
 With persistence enabled, inspect any run after it completes:
 
 ```bash
-dendrite runs
-dendrite traces <run_id> --tools
+dendrux runs
+dendrux traces <run_id> --tools
 ```
 
 ## Files

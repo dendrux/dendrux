@@ -17,13 +17,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrite.agent import Agent
-from dendrite.bridge import bridge
-from dendrite.db.models import Base
-from dendrite.llm.mock import MockLLM
-from dendrite.runtime.state import SQLAlchemyStateStore
-from dendrite.tool import tool
-from dendrite.types import LLMResponse, RunStatus, ToolCall
+from dendrux.agent import Agent
+from dendrux.bridge import bridge
+from dendrux.db.models import Base
+from dendrux.llm.mock import MockLLM
+from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.tool import tool
+from dendrux.types import LLMResponse, RunStatus, ToolCall
 
 # ------------------------------------------------------------------
 # Test tools
@@ -113,7 +113,7 @@ class TestBridgeEndToEnd:
         from fastapi import FastAPI
 
         app = FastAPI()
-        app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+        app.mount("/dendrux", bridge(agent, allow_insecure_dev_mode=True))
 
         # 3. POST tool results via HTTP
         async with AsyncClient(
@@ -121,7 +121,7 @@ class TestBridgeEndToEnd:
             base_url="http://test",
         ) as client:
             resp = await client.post(
-                f"/dendrite/runs/{run_id}/tool-results",
+                f"/dendrux/runs/{run_id}/tool-results",
                 json={
                     "tool_results": [
                         {
@@ -141,7 +141,7 @@ class TestBridgeEndToEnd:
 
             # 4. Poll for final result (background resume is async)
             for _ in range(20):
-                poll_resp = await client.get(f"/dendrite/runs/{run_id}")
+                poll_resp = await client.get(f"/dendrux/runs/{run_id}")
                 assert poll_resp.status_code == 200
                 poll_body = poll_resp.json()
                 if poll_body["status"] != "running":
@@ -164,14 +164,14 @@ class TestBridgeEndToEnd:
         from fastapi import FastAPI
 
         app = FastAPI()
-        app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+        app.mount("/dendrux", bridge(agent, allow_insecure_dev_mode=True))
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
             resp = await client.post(
-                "/dendrite/runs/nonexistent/tool-results",
+                "/dendrux/runs/nonexistent/tool-results",
                 json={
                     "tool_results": [
                         {
@@ -197,13 +197,13 @@ class TestBridgeEndToEnd:
         from fastapi import FastAPI
 
         app = FastAPI()
-        app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+        app.mount("/dendrux", bridge(agent, allow_insecure_dev_mode=True))
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            resp = await client.get("/dendrite/runs/nonexistent")
+            resp = await client.get("/dendrux/runs/nonexistent")
             assert resp.status_code == 404
 
     async def test_cancel_paused_run(self, db_store) -> None:
@@ -228,17 +228,17 @@ class TestBridgeEndToEnd:
         from fastapi import FastAPI
 
         app = FastAPI()
-        app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+        app.mount("/dendrux", bridge(agent, allow_insecure_dev_mode=True))
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            resp = await client.delete(f"/dendrite/runs/{run_id}")
+            resp = await client.delete(f"/dendrux/runs/{run_id}")
             assert resp.status_code == 200
             body = resp.json()
             assert body["cancelled"] is True
 
             # Verify status is cancelled
-            poll = await client.get(f"/dendrite/runs/{run_id}")
+            poll = await client.get(f"/dendrux/runs/{run_id}")
             assert poll.json()["status"] == "cancelled"

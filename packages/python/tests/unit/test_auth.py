@@ -1,8 +1,8 @@
-"""Tests for dendrite.auth — HMAC token generation and verification."""
+"""Tests for dendrux.auth — HMAC token generation and verification."""
 
 from __future__ import annotations
 
-from dendrite.auth import (
+from dendrux.auth import (
     _build_message,
     extract_bearer_token,
     generate_run_token,

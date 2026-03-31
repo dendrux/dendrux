@@ -8,7 +8,7 @@ from typing import Any
 
 from httpx import ASGITransport, AsyncClient
 
-from dendrite.dashboard.api import create_dashboard_api
+from dendrux.dashboard.api import create_dashboard_api
 
 # ------------------------------------------------------------------
 # Mock store for API tests

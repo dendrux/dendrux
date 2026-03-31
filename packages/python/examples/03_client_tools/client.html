@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dendrite — Client Tool Bridge Demo</title>
+<title>Dendrux — Client Tool Bridge Demo</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 2rem; max-width: 720px; margin: 0 auto; }
@@ -32,7 +32,7 @@
 </head>
 <body>
 
-<h1>Dendrite Client Tool Bridge</h1>
+<h1>Dendrux Client Tool Bridge</h1>
 <p class="subtitle">Agent pauses for client-side tools, you provide the result, agent resumes.</p>
 
 <div id="input-section">
@@ -69,7 +69,7 @@
 
   function connectSSE(runId) {
     if (eventSource) eventSource.close();
-    eventSource = new EventSource("/dendrite/runs/" + runId + "/events");
+    eventSource = new EventSource("/dendrux/runs/" + runId + "/events");
 
     eventSource.addEventListener("snapshot", (e) => {
       const d = JSON.parse(e.data);
@@ -108,7 +108,7 @@
       eventSource.close();
       // Fetch the final answer from the poll endpoint
       try {
-        const poll = await fetch("/dendrite/runs/" + runId);
+        const poll = await fetch("/dendrux/runs/" + runId);
         if (poll.ok) {
           const run = await poll.json();
           if (run.answer) {
@@ -210,7 +210,7 @@
       result: JSON.stringify(resultText),
     }));
 
-    const resp = await fetch("/dendrite/runs/" + currentRunId + "/tool-results", {
+    const resp = await fetch("/dendrux/runs/" + currentRunId + "/tool-results", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tool_results: results }),

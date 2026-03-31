@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from dendrite.dashboard.normalizer import (
+from dendrux.dashboard.normalizer import (
     CancelledNode,
     ErrorNode,
     FinishNode,

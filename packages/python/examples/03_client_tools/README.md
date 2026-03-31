@@ -1,6 +1,6 @@
 # Example 03: Client Tool Bridge
 
-Demonstrates Dendrite's core differentiator — an agent that **pauses** when it needs a client-side tool, waits for the user to provide the result, then **resumes** reasoning.
+Demonstrates Dendrux's core differentiator — an agent that **pauses** when it needs a client-side tool, waits for the user to provide the result, then **resumes** reasoning.
 
 ## Setup
 
@@ -53,10 +53,10 @@ Browser                    Server                     Agent
   |                          |                          |-- read_excel_range -> PAUSE
   | <-- {run_id, status} --- |                          |
   |                          |                          |
-  |-- GET /dendrite/runs/{id}/events (SSE) -----------> |
+  |-- GET /dendrux/runs/{id}/events (SSE) -----------> |
   | <-- snapshot (status=waiting_client_tool) --------- |
   |                          |                          |
-  |-- POST /dendrite/runs/{id}/tool-results ----------> |
+  |-- POST /dendrux/runs/{id}/tool-results ----------> |
   |                          |-- submit_and_claim ----> |-- resume
   | <-- 200 (accepted) ----- |                          |-- LLM call (with result)
   | <-- run.completed (SSE)  | <-- RunResult ---------- |
@@ -66,11 +66,11 @@ Browser                    Server                     Agent
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /dendrite/runs/{id}` | Poll status + pending tool calls |
-| `GET /dendrite/runs/{id}/events` | SSE stream (snapshot + live events) |
-| `POST /dendrite/runs/{id}/tool-results` | Submit client tool results |
-| `POST /dendrite/runs/{id}/input` | Submit clarification answer |
-| `DELETE /dendrite/runs/{id}` | Cancel a run |
+| `GET /dendrux/runs/{id}` | Poll status + pending tool calls |
+| `GET /dendrux/runs/{id}/events` | SSE stream (snapshot + live events) |
+| `POST /dendrux/runs/{id}/tool-results` | Submit client tool results |
+| `POST /dendrux/runs/{id}/input` | Submit clarification answer |
+| `DELETE /dendrux/runs/{id}` | Cancel a run |
 
 ## If something looks wrong
 

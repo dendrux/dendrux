@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from dendrite import tool
+from dendrux import tool
 from firecrawl import Firecrawl
 
 

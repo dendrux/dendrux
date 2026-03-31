@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from dendrite.strategies.base import Strategy
-from dendrite.strategies.native import NativeToolCalling
-from dendrite.types import (
+from dendrux.strategies.base import Strategy
+from dendrux.strategies.native import NativeToolCalling
+from dendrux.types import (
     Finish,
     LLMResponse,
     Message,

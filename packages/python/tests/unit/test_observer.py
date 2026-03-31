@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from dendrite.runtime.observer import PersistenceObserver
-from dendrite.types import (
+from dendrux.runtime.observer import PersistenceObserver
+from dendrux.types import (
     LLMResponse,
     Message,
     Role,

@@ -8,13 +8,13 @@ import logging
 
 import pytest
 
-from dendrite.agent import Agent
-from dendrite.llm.mock import MockLLM
-from dendrite.loops.base import Loop
-from dendrite.loops.react import ReActLoop
-from dendrite.strategies.native import NativeToolCalling
-from dendrite.tool import get_tool_def, tool
-from dendrite.types import (
+from dendrux.agent import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.loops.base import Loop
+from dendrux.loops.react import ReActLoop
+from dendrux.strategies.native import NativeToolCalling
+from dendrux.tool import get_tool_def, tool
+from dendrux.types import (
     AgentStep,
     Clarification,
     Finish,
@@ -37,7 +37,7 @@ def caplog_context(level: int = logging.WARNING):
 
     handler = Handler()
     handler.setLevel(level)
-    root = logging.getLogger("dendrite")
+    root = logging.getLogger("dendrux")
     root.addHandler(handler)
     old_level = root.level
     root.setLevel(level)
@@ -511,7 +511,7 @@ class TestReActLoopUsage:
 class TestReActLoopClarification:
     async def test_clarification_returns_waiting_human_input(self) -> None:
         """Clarification action returns WAITING_HUMAN_INPUT status with the question as answer."""
-        from dendrite.strategies.base import Strategy
+        from dendrux.strategies.base import Strategy
 
         class ClarifyStrategy(Strategy):
             """Strategy that always returns a Clarification on the first call."""
@@ -736,7 +736,7 @@ class TestReActLoopCostAccumulation:
 class TestReActLoopFinalMessagePersistence:
     async def test_finish_notifies_observer_with_assistant_message(self) -> None:
         """F-01: The final assistant message must be notified to the observer on Finish."""
-        from dendrite.loops.base import LoopObserver
+        from dendrux.loops.base import LoopObserver
 
         recorded_messages: list[Message] = []
 
@@ -770,8 +770,8 @@ class TestReActLoopFinalMessagePersistence:
 
     async def test_clarification_notifies_observer_with_assistant_message(self) -> None:
         """F-03: The assistant message must be notified on Clarification too."""
-        from dendrite.loops.base import LoopObserver
-        from dendrite.strategies.base import Strategy
+        from dendrux.loops.base import LoopObserver
+        from dendrux.strategies.base import Strategy
 
         recorded_messages: list[Message] = []
 
@@ -819,7 +819,7 @@ class TestReActLoopFinalMessagePersistence:
 
     async def test_tool_call_then_finish_persists_all_messages(self) -> None:
         """Complete flow: tool call + finish should persist all messages including final."""
-        from dendrite.loops.base import LoopObserver
+        from dendrux.loops.base import LoopObserver
 
         recorded_messages: list[Message] = []
 
@@ -865,7 +865,7 @@ class TestReActLoopFinalMessagePersistence:
 class TestReActLoopObserverWarnings:
     async def test_observer_failure_surfaces_in_meta(self) -> None:
         """F-04: Observer exceptions should be captured in RunResult.meta, not silently lost."""
-        from dendrite.loops.base import LoopObserver
+        from dendrux.loops.base import LoopObserver
 
         class FailingObserver(LoopObserver):
             async def on_message_appended(self, message: Message, iteration: int) -> None:
@@ -897,7 +897,7 @@ class TestReActLoopObserverWarnings:
 
     async def test_no_warnings_when_observer_healthy(self) -> None:
         """No observer_warnings key when everything works fine."""
-        from dendrite.loops.base import LoopObserver
+        from dendrux.loops.base import LoopObserver
 
         class HealthyObserver(LoopObserver):
             async def on_message_appended(self, message, iteration):
@@ -967,8 +967,8 @@ class TestReActLoopToolTimeout:
 class TestReActLoopDuplicateToolNames:
     async def test_duplicate_tool_names_raise(self) -> None:
         """A-08: Two tools with the same name should raise at loop start."""
-        from dendrite.loops.react import _build_tool_lookups
-        from dendrite.types import ToolDef
+        from dendrux.loops.react import _build_tool_lookups
+        from dendrux.types import ToolDef
 
         @tool()
         async def samename(x: int) -> int:
@@ -995,12 +995,12 @@ class TestBuildExecutionGroups:
     """Tests for _build_execution_groups — parallel grouping logic."""
 
     def test_empty_list(self) -> None:
-        from dendrite.loops.react import _build_execution_groups
+        from dendrux.loops.react import _build_execution_groups
 
         assert _build_execution_groups([], {}) == []
 
     def test_all_parallel(self) -> None:
-        from dendrite.loops.react import _build_execution_groups
+        from dendrux.loops.react import _build_execution_groups
 
         tc_a = ToolCall(name="a", params={})
         tc_b = ToolCall(name="b", params={})
@@ -1014,7 +1014,7 @@ class TestBuildExecutionGroups:
 
     def test_all_sequential_forms_singleton_groups(self) -> None:
         """parallel=False tools are barriers — each forms its own group."""
-        from dendrite.loops.react import _build_execution_groups
+        from dendrux.loops.react import _build_execution_groups
 
         tc_a = ToolCall(name="a", params={})
         tc_b = ToolCall(name="b", params={})
@@ -1027,7 +1027,7 @@ class TestBuildExecutionGroups:
 
     def test_mixed_groups(self) -> None:
         """[A(par), B(par), C(nonpar), D(par), E(par)] → 3 groups."""
-        from dendrite.loops.react import _build_execution_groups
+        from dendrux.loops.react import _build_execution_groups
 
         calls = [
             ToolCall(name="a", params={}),
@@ -1046,7 +1046,7 @@ class TestBuildExecutionGroups:
 
     def test_barrier_in_middle(self) -> None:
         """[A(par), B(nonpar), C(par)] → A alone, B alone, C alone."""
-        from dendrite.loops.react import _build_execution_groups
+        from dendrux.loops.react import _build_execution_groups
 
         calls = [
             ToolCall(name="a", params={}),
@@ -1060,7 +1060,7 @@ class TestBuildExecutionGroups:
 
     def test_defaults_to_parallel(self) -> None:
         """Unknown tools default to parallel=True."""
-        from dendrite.loops.react import _build_execution_groups
+        from dendrux.loops.react import _build_execution_groups
 
         tc_a = ToolCall(name="a", params={})
         tc_b = ToolCall(name="b", params={})
@@ -1256,4 +1256,4 @@ class TestToolSentinel:
 
 
 # Need to import UsageStats for the usage test
-from dendrite.types import UsageStats  # noqa: E402
+from dendrux.types import UsageStats  # noqa: E402

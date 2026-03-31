@@ -1,4 +1,4 @@
-"""Hello World — minimal Dendrite agent with a tool.
+"""Hello World — minimal Dendrux agent with a tool.
 
 Run with:
     ANTHROPIC_API_KEY=sk-... python examples/01_hello_world.py
@@ -11,10 +11,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from dendrite import Agent, tool
-from dendrite.llm.anthropic import AnthropicProvider
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
 
-# Load .env from repo root (three levels up: examples/ → python/ → packages/ → dendrite/)
+# Load .env from repo root (three levels up: examples/ → python/ → packages/ → dendrux/)
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
 

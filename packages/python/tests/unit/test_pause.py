@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dendrite.agent import Agent
-from dendrite.llm.mock import MockLLM
-from dendrite.loops.react import ReActLoop
-from dendrite.strategies.native import NativeToolCalling
-from dendrite.tool import tool
-from dendrite.types import (
+from dendrux.agent import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.loops.react import ReActLoop
+from dendrux.strategies.native import NativeToolCalling
+from dendrux.tool import tool
+from dendrux.types import (
     AgentStep,
     Clarification,
     Finish,
@@ -175,7 +175,7 @@ class TestPauseBehavior:
 
     async def test_clarification_produces_pause_state(self) -> None:
         """Clarification action builds a PauseState for resume_with_input."""
-        from dendrite.strategies.base import Strategy
+        from dendrux.strategies.base import Strategy
 
         class ClarifyStrategy(Strategy):
             """Strategy that always returns Clarification."""

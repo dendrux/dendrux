@@ -4,8 +4,8 @@ from typing import Optional
 
 import pytest
 
-from dendrite.tool import get_tool_def, is_tool, tool
-from dendrite.types import ToolTarget
+from dendrux.tool import get_tool_def, is_tool, tool
+from dendrux.types import ToolTarget
 
 
 class TestToolDecorator:
@@ -111,7 +111,7 @@ class TestToolDecorator:
         def add(a: int, b: int) -> int:
             return a + b
 
-        with pytest.raises(ValueError, match="not a Dendrite tool"):
+        with pytest.raises(ValueError, match="not a Dendrux tool"):
             get_tool_def(add)
 
 

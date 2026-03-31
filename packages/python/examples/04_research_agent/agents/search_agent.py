@@ -6,8 +6,8 @@ a structured summary of findings.
 
 from __future__ import annotations
 
-from dendrite import Agent
-from dendrite.llm.anthropic import AnthropicProvider
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
 
 from tools.firecrawl_tools import firecrawl_search
 

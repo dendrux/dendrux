@@ -1,6 +1,6 @@
 """Client Tool Bridge — agent with server + client tools.
 
-Demonstrates Dendrite's core differentiator: an agent that pauses when
+Demonstrates Dendrux's core differentiator: an agent that pauses when
 it needs a client-side tool (Excel, browser, mobile), waits for the
 client to execute it, then resumes reasoning.
 
@@ -10,7 +10,7 @@ Run with:
 Then open http://localhost:8000
 
 For the observability dashboard, run in a separate terminal:
-    dendrite dashboard --open
+    dendrux dashboard --open
 
 The developer owns run creation (POST /chat). The bridge handles
 everything after the first pause: tool result submission, SSE
@@ -19,7 +19,7 @@ streaming, polling, and cancellation.
 
 from __future__ import annotations
 
-from dendrite import Agent, bridge, tool
+from dendrux import Agent, bridge, tool
 
 
 # -- Server tool: executes on the server, no pause --
@@ -58,11 +58,11 @@ def create_demo_app() -> FastAPI:  # noqa: F821
     from fastapi import FastAPI
     from fastapi.responses import FileResponse, JSONResponse
 
-    from dendrite.llm.anthropic import AnthropicProvider
+    from dendrux.llm.anthropic import AnthropicProvider
 
     load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
-    db_path = Path.home() / ".dendrite" / "dendrite.db"
+    db_path = Path.home() / ".dendrux" / "dendrux.db"
     db_url = f"sqlite+aiosqlite:///{db_path}"
 
     agent = Agent(
@@ -82,7 +82,7 @@ def create_demo_app() -> FastAPI:  # noqa: F821
         tools=[lookup_price, read_excel_range],
     )
 
-    app = FastAPI(title="Dendrite Client Tools Demo")
+    app = FastAPI(title="Dendrux Client Tools Demo")
 
     # Serve the HTML client at /
     client_html = Path(__file__).parent / "client.html"
@@ -111,7 +111,7 @@ def create_demo_app() -> FastAPI:  # noqa: F821
         )
 
     # Mount the bridge — handles paused-run interaction (tool results, SSE, cancel)
-    app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+    app.mount("/dendrux", bridge(agent, allow_insecure_dev_mode=True))
 
     return app
 

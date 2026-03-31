@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dendrite.agent import Agent
-from dendrite.llm.mock import MockLLM
-from dendrite.tool import tool
-from dendrite.types import ToolTarget
+from dendrux.agent import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.tool import tool
+from dendrux.types import ToolTarget
 
 
 @tool(target="server")
@@ -334,10 +334,10 @@ class TestAgentPrivateEngine:
             await agent.close()
 
     async def test_env_var_fallback_uses_shared_engine(self):
-        """DENDRITE_DATABASE_URL env var path uses the global get_engine(), not private."""
+        """DENDRUX_DATABASE_URL env var path uses the global get_engine(), not private."""
         with (
-            patch("dendrite.agent.os.environ.get", return_value="sqlite+aiosqlite:///env.db"),
-            patch("dendrite.db.session.get_engine", new_callable=AsyncMock) as mock_get,
+            patch("dendrux.agent.os.environ.get", return_value="sqlite+aiosqlite:///env.db"),
+            patch("dendrux.db.session.get_engine", new_callable=AsyncMock) as mock_get,
         ):
             from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -394,7 +394,7 @@ class TestAgentValidation:
             )
 
     def test_max_iterations_exceeds_ceiling_raises(self):
-        from dendrite.agent import MAX_ITERATIONS_CEILING
+        from dendrux.agent import MAX_ITERATIONS_CEILING
 
         with pytest.raises(ValueError, match="cannot exceed"):
             Agent(
@@ -404,7 +404,7 @@ class TestAgentValidation:
             )
 
     def test_max_iterations_at_ceiling_is_valid(self):
-        from dendrite.agent import MAX_ITERATIONS_CEILING
+        from dendrux.agent import MAX_ITERATIONS_CEILING
 
         agent = Agent(
             provider=_mock_provider(),

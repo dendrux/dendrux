@@ -10,8 +10,8 @@ import pytest
 
 openai = pytest.importorskip("openai", reason="openai extra not installed")
 
-from dendrite.llm.openai import OpenAIProvider  # noqa: E402
-from dendrite.types import Message, Role, ToolCall, ToolDef  # noqa: E402
+from dendrux.llm.openai import OpenAIProvider  # noqa: E402
+from dendrux.types import Message, Role, ToolCall, ToolDef  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -115,8 +115,8 @@ class TestConvertMessages:
         assert result[1]["tool_call_id"] == "call_abc"
         assert result[1]["content"] == "3"
 
-    def test_tool_result_uses_dendrite_id_when_no_provider_id(self, provider: OpenAIProvider) -> None:
-        """Falls back to Dendrite ULID when provider_tool_call_id is None."""
+    def test_tool_result_uses_dendrux_id_when_no_provider_id(self, provider: OpenAIProvider) -> None:
+        """Falls back to Dendrux ULID when provider_tool_call_id is None."""
         tc = ToolCall(name="add", params={})  # No provider_tool_call_id
         msgs = [
             Message(role=Role.ASSISTANT, content="", tool_calls=[tc]),
@@ -370,13 +370,13 @@ class TestEdgeCases:
             provider._normalize_response(response)
 
     def test_duplicate_call_id_raises(self, provider: OpenAIProvider) -> None:
-        """Duplicate Dendrite call_id should raise, not silently overwrite."""
+        """Duplicate Dendrux call_id should raise, not silently overwrite."""
         tc = ToolCall(name="add", params={}, provider_tool_call_id="call_1")
         msgs = [
             Message(role=Role.ASSISTANT, content="", tool_calls=[tc]),
             Message(role=Role.ASSISTANT, content="", tool_calls=[tc]),  # Same call_id
         ]
-        with pytest.raises(ValueError, match="Duplicate Dendrite call_id"):
+        with pytest.raises(ValueError, match="Duplicate Dendrux call_id"):
             provider._convert_messages(msgs)
 
     def test_assistant_tool_calls_no_text(self, provider: OpenAIProvider) -> None:

@@ -1,14 +1,14 @@
 """Persistent Agent — run with SQLite state persistence.
 
-Demonstrates Dendrite's built-in persistence layer: agent runs, traces,
+Demonstrates Dendrux's built-in persistence layer: agent runs, traces,
 tool calls, and token usage are all stored in a local SQLite database.
 
 Run with:
     ANTHROPIC_API_KEY=sk-... python examples/02_persistent_agent.py
 
 After running, inspect the data with:
-    dendrite runs
-    dendrite traces <run_id> --tools
+    dendrux runs
+    dendrux traces <run_id> --tools
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 
-from dendrite import Agent, tool
-from dendrite.llm.anthropic import AnthropicProvider
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
@@ -54,7 +54,7 @@ async def calculate_portfolio_value(holdings: str) -> str:
 
 
 async def main() -> None:
-    db_path = Path.home() / ".dendrite" / "dendrite.db"
+    db_path = Path.home() / ".dendrux" / "dendrux.db"
     async with Agent(
         name="StockAnalyst",
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
@@ -79,8 +79,8 @@ async def main() -> None:
         console.print(f"[dim]Run ID: {result.run_id}[/dim]")
         console.print(
             "\n[bold]Inspect persisted data with:[/bold]"
-            "\n  dendrite runs"
-            f"\n  dendrite traces {result.run_id} --tools"
+            "\n  dendrux runs"
+            f"\n  dendrux traces {result.run_id} --tools"
         )
 
 

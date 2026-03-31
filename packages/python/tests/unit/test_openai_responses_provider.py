@@ -11,8 +11,8 @@ import pytest
 
 openai = pytest.importorskip("openai", reason="openai extra not installed")
 
-from dendrite.llm.openai_responses import OpenAIResponsesProvider  # noqa: E402
-from dendrite.types import Message, Role, ToolCall, ToolDef  # noqa: E402
+from dendrux.llm.openai_responses import OpenAIResponsesProvider  # noqa: E402
+from dendrux.types import Message, Role, ToolCall, ToolDef  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ class TestConvertMessages:
             Message(role=Role.ASSISTANT, content="", tool_calls=[tc]),
             Message(role=Role.ASSISTANT, content="", tool_calls=[tc]),
         ]
-        with pytest.raises(ValueError, match="Duplicate Dendrite call_id"):
+        with pytest.raises(ValueError, match="Duplicate Dendrux call_id"):
             provider._convert_messages(msgs)
 
     def test_tool_result_missing_call_raises(self, provider: OpenAIResponsesProvider) -> None:
@@ -175,7 +175,7 @@ class TestConvertMessages:
 # Tool building tests
 # ---------------------------------------------------------------------------
 class TestBuildTools:
-    def test_dendrite_tools_only(self, provider: OpenAIResponsesProvider) -> None:
+    def test_dendrux_tools_only(self, provider: OpenAIResponsesProvider) -> None:
         tools = [
             ToolDef(name="add", description="Add", parameters={"type": "object", "properties": {}}),
         ]

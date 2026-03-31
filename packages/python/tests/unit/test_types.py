@@ -2,7 +2,7 @@
 
 import pytest
 
-from dendrite.types import (
+from dendrux.types import (
     Action,
     AgentStep,
     Clarification,
@@ -121,7 +121,7 @@ class TestToolCall:
         tc = ToolCall(name="get_metadata")
         assert tc.params == {}
 
-    def test_tool_call_has_dendrite_id(self) -> None:
+    def test_tool_call_has_dendrux_id(self) -> None:
         tc = ToolCall(name="add", params={"a": 1})
         assert tc.id is not None
         assert len(tc.id) > 0

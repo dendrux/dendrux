@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from dendrite.agent import Agent
-from dendrite.llm.mock import MockLLM
-from dendrite.tool import tool
+from dendrux.agent import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.tool import tool
 
 
 @tool(target="server")
@@ -32,7 +32,7 @@ def _mock_provider(model: str = "claude-sonnet-4-6") -> MockLLM:
 
 class TestBridgeFactory:
     def test_bridge_returns_fastapi_app(self):
-        from dendrite.bridge import bridge
+        from dendrux.bridge import bridge
 
         agent = Agent(
             provider=_mock_provider(),
@@ -47,7 +47,7 @@ class TestBridgeFactory:
         assert isinstance(app, FastAPI)
 
     def test_bridge_requires_auth_or_dev_mode(self):
-        from dendrite.bridge import bridge
+        from dendrux.bridge import bridge
 
         agent = Agent(
             provider=_mock_provider(),
@@ -58,7 +58,7 @@ class TestBridgeFactory:
             bridge(agent)
 
     def test_bridge_requires_provider(self):
-        from dendrite.bridge import bridge
+        from dendrux.bridge import bridge
 
         agent = Agent(
             prompt="Test.",
@@ -68,7 +68,7 @@ class TestBridgeFactory:
             bridge(agent, allow_insecure_dev_mode=True)
 
     def test_bridge_requires_persistence(self):
-        from dendrite.bridge import bridge
+        from dendrux.bridge import bridge
 
         agent = Agent(
             provider=_mock_provider(),
@@ -78,7 +78,7 @@ class TestBridgeFactory:
             bridge(agent, allow_insecure_dev_mode=True)
 
     def test_bridge_with_secret(self):
-        from dendrite.bridge import bridge
+        from dendrux.bridge import bridge
 
         agent = Agent(
             provider=_mock_provider(),

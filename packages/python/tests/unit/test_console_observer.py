@@ -6,12 +6,12 @@ from typing import Any
 
 import pytest
 
-from dendrite.agent import Agent
-from dendrite.llm.mock import MockLLM
-from dendrite.observers.composite import CompositeObserver
-from dendrite.observers.console import ConsoleObserver
-from dendrite.tool import tool
-from dendrite.types import LLMResponse, Message, Role, ToolCall, ToolResult
+from dendrux.agent import Agent
+from dendrux.llm.mock import MockLLM
+from dendrux.observers.composite import CompositeObserver
+from dendrux.observers.console import ConsoleObserver
+from dendrux.tool import tool
+from dendrux.types import LLMResponse, Message, Role, ToolCall, ToolResult
 
 
 class RecordingObserver:

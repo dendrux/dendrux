@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from dendrite.db.models import (
+from dendrux.db.models import (
     AgentRun,
     Base,
     LLMInteraction,
@@ -19,9 +19,9 @@ from dendrite.db.models import (
     TokenUsage,
     ToolCallRecord,
 )
-from dendrite.db.session import get_engine, reset_engine
-from dendrite.runtime.state import SQLAlchemyStateStore
-from dendrite.types import UsageStats
+from dendrux.db.session import get_engine, reset_engine
+from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.types import UsageStats
 
 # ------------------------------------------------------------------
 # Fixtures
