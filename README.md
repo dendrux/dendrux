@@ -1,503 +1,400 @@
 # 🌿 Dendrite
 
-> *The runtime for agents that act in the real world.*
+The Python framework for building agents that use tools, persist state, and pause for human input.
 
-Dendrite is a Python framework for building agents with tool calling, persistence, and full observability. Its core differentiator is the **client tool bridge**: an agent can pause when it needs a client-side tool like Excel, a browser, or a mobile app, wait for the client to execute it, then resume reasoning.
-
----
-
-## ✨ What You Can Do Today
-
-- 🛠️ Define agents with plain Python tools
-- 🤖 Run agents locally with Anthropic Claude
-- 💾 Persist runs, traces, tool calls, and token usage to SQLite or Postgres
-- 🔍 Inspect runs and traces from the CLI
-- 🌐 Mount a bridge for SSE streaming and client tool interaction
-- ⏸️ Pause for client-side tools, submit results, and resume the run
-
----
+> 🧪 **Research project** — built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). This is an actively developed research repo, not a production-hardened library. APIs may change. Use it to learn, experiment, and build — but evaluate carefully before depending on it in production.
 
 ## 📦 Install
 
 ```bash
-git clone https://github.com/anmolgautam/dendrite.git
-cd dendrite/packages/python
-pip install -e ".[anthropic,db,bridge]"
+pip install -e ".[all]"          # everything (Anthropic + OpenAI + DB + bridge)
+pip install -e ".[anthropic,db]" # just Anthropic + SQLite
+pip install -e ".[openai,db]"    # just OpenAI + SQLite
 ```
 
-For development:
-
-```bash
-pip install -e ".[dev,db,anthropic,bridge]"
-```
-
-<details>
-<summary>📋 Install extras</summary>
-
-| Extra | What it adds |
-|-------|-------------|
-| `anthropic` | Anthropic Claude SDK |
-| `db` | SQLAlchemy, aiosqlite, Alembic |
-| `bridge` | FastAPI, uvicorn (for client tool bridge) |
-| `dev` | pytest, ruff, mypy, python-dotenv |
-| `postgres` | asyncpg (for Postgres instead of SQLite) |
-
-</details>
-
----
-
-## 🚀 After Installing
-
-> All commands below assume you are in `packages/python/`. The `dendrite` CLI, examples, and `make` targets all run from this directory.
-
-### 1. Verify the install
-
-```bash
-dendrite --version
-```
-
-You should see `0.1.0a1`. You're good to go! 🎉
-
-### 2. Set your API key
-
-```bash
-cp ../../.env.example ../../.env
-```
-
-Edit `.env` and add your Anthropic API key:
-
-```
-ANTHROPIC_API_KEY=sk-ant-your-key-here
-```
-
-### 3. Try the examples
-
-Run them in order — each one builds on the previous:
-
-```bash
-# 🧮 Example 1: Minimal agent with one tool
-ANTHROPIC_API_KEY=sk-... python examples/01_hello_world.py
-
-# 💾 Example 2: Agent with persistence — traces saved to SQLite
-ANTHROPIC_API_KEY=sk-... python examples/02_persistent_agent.py
-
-# 🔍 Inspect what happened
-dendrite runs
-dendrite traces <run_id> --tools
-
-# ⏸️ Example 3: Client tool bridge — agent pauses for your input
-ANTHROPIC_API_KEY=sk-... python examples/03_client_tools/server.py
-# Open http://localhost:8000
-
-# 🔬 Example 4: Multi-agent research — orchestrator delegates to sub-agents
-cd examples/04_research_agent
-ANTHROPIC_API_KEY=sk-... FIRECRAWL_API_KEY=fc-... python main.py "quantum computing"
-# Report saved to output/
-```
-
-For the client tool demo (example 3), use a prompt like:
-
-> *"Look up the AAPL stock price, then read cell A1 from my spreadsheet."*
-
-The agent will call the server tool immediately, pause for the client tool, wait for your input in the browser, then resume and finish.
-
-For the research agent (example 4), each sub-agent is a full Dendrite Agent with its own tools and reasoning loop. See [`examples/04_research_agent/`](packages/python/examples/04_research_agent/) for details.
-
-### 4. Build your own agent
-
-Create a Python file with three things — tools, an agent, and a run call:
+## 🚀 Quick Start
 
 ```python
 import asyncio
 from dendrite import Agent, tool
 from dendrite.llm.anthropic import AnthropicProvider
 
-# 1. Define tools — plain async functions
 @tool()
-async def my_tool(input: str) -> str:
-    """Describe what this tool does — the LLM reads this."""
-    return f"Result for {input}"
+async def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
 
-# 2. Create agent with provider and run it
 async def main():
     async with Agent(
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
-        prompt="You are a helpful assistant. Use my_tool when needed.",
-        tools=[my_tool],
+        prompt="You are a calculator.",
+        tools=[add],
     ) as agent:
-        result = await agent.run("Do the thing")
+        result = await agent.run("What is 15 + 27?")
         print(result.answer)
 
 asyncio.run(main())
 ```
 
-Run it with:
-
 ```bash
 ANTHROPIC_API_KEY=sk-... python my_agent.py
 ```
 
-See `examples/01_hello_world.py` as a minimal template.
+That's it. Tools are plain Python functions. The agent calls them, reasons about results, and returns an answer.
 
 ---
 
-## 🧩 Three Ways To Use Dendrite
+## 🤖 Provider Choices
 
-### 1. 🧮 Local agent run
+Dendrite works with multiple LLM providers. Swap one import — everything else stays the same.
 
-```python
-from dendrite import Agent, tool
-from dendrite.llm.anthropic import AnthropicProvider
-
-@tool()
-async def add(a: int, b: int) -> int:
-    """Add two numbers together."""
-    return a + b
-
-async with Agent(
-    provider=AnthropicProvider(model="claude-sonnet-4-6"),
-    prompt="You are a helpful calculator.",
-    tools=[add],
-) as agent:
-    result = await agent.run("What is 15 + 27?")
-    print(result.answer)
-```
-
-### 2. 💾 Persistent runs and inspection
-
-```python
-async with Agent(
-    provider=AnthropicProvider(model="claude-sonnet-4-6"),
-    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
-    prompt="You are a helpful calculator.",
-    tools=[add],
-) as agent:
-    result = await agent.run("What is 15 + 27?")
-    # Every step is now persisted to the database
-```
-
-Once persistence is enabled, inspect runs and traces anytime:
+### Anthropic (Claude)
 
 ```bash
-dendrite runs
-dendrite runs --status success
-dendrite traces <run_id>
-dendrite traces <run_id> --tools
+pip install -e ".[anthropic,db]"
 ```
 
-### 3. ⏸️ Client tool pause/resume with bridge
-
-Define a client tool with `target="client"` — the agent pauses instead of executing it:
-
 ```python
-@tool(target="client")
-async def read_excel_range(sheet: str, range: str) -> str:
-    """Read cells from the user's spreadsheet.
+from dendrite.llm.anthropic import AnthropicProvider
 
-    Runs on the client — agent pauses until the result is submitted.
-    """
-    return ""
+provider = AnthropicProvider(model="claude-sonnet-4-6")
+# Uses ANTHROPIC_API_KEY from environment
 ```
 
-Mount the bridge for HTTP-based pause/resume *(experimental)*:
+### OpenAI (Chat Completions)
+
+Works with OpenAI and any compatible API — vLLM, SGLang, Groq, Together, Ollama.
+
+```bash
+pip install -e ".[openai,db]"
+```
 
 ```python
-from dendrite import Agent, bridge
+from dendrite.llm.openai import OpenAIProvider
 
-agent = Agent(
-    provider=AnthropicProvider(model="claude-sonnet-4-6"),
-    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
-    prompt="You are a spreadsheet analyst.",
-    tools=[lookup_price, read_excel_range],
+# OpenAI
+provider = OpenAIProvider(model="gpt-4o")
+
+# vLLM / SGLang (local)
+provider = OpenAIProvider(model="llama-3-70b", base_url="http://localhost:8000/v1")
+
+# Groq
+provider = OpenAIProvider(model="llama-3.3-70b", base_url="https://api.groq.com/openai/v1")
+```
+
+### OpenAI (Responses API)
+
+Use this when you need OpenAI's built-in tools (web search) alongside your own tools.
+
+```python
+from dendrite.llm.openai_responses import OpenAIResponsesProvider
+
+provider = OpenAIResponsesProvider(
+    model="gpt-4o",
+    builtin_tools=["web_search_preview"],
+)
+```
+
+> **Note:** Reasoning models (o-series, GPT-5) with multi-turn tool calling have a [known limitation](packages/python/src/dendrite/llm/openai_responses.py) — reasoning items are not preserved between turns. Use OpenAIProvider (Chat Completions) for reasoning model tool loops.
+
+---
+
+## ⚙️ Configuration
+
+### Environment Variables
+
+Create a `.env` file in your project root:
+
+```bash
+# Required — pick one (or both)
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+
+# Optional — database location (default: ~/.dendrite/dendrite.db)
+DENDRITE_DATABASE_URL=sqlite+aiosqlite:///path/to/dendrite.db
+```
+
+Load it in your code:
+
+```python
+from dotenv import load_dotenv
+load_dotenv()
+```
+
+### Provider Settings
+
+All providers accept these at construction. Per-call kwargs override defaults.
+
+```python
+provider = AnthropicProvider(
+    model="claude-sonnet-4-6",
+    max_tokens=8_000,        # default 16K
+    temperature=0.7,          # default: model decides
+    timeout=300,              # HTTP timeout in seconds (default 120)
+    max_retries=3,            # auto-retry on transient errors (default 3)
 )
 
-# Developer owns run creation
-@app.post("/chat")
-async def chat(request):
-    result = await agent.run(request.input)
-    return {"run_id": result.run_id, "status": result.status.value}
-
-# Bridge handles paused-run interaction
-app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+provider = OpenAIProvider(
+    model="gpt-4o",
+    max_tokens=8_000,
+    temperature=0.7,
+    reasoning_effort="medium",  # for o-series / GPT-5
+    timeout=300,
+    base_url="http://...",      # for vLLM/SGLang/Groq (optional)
+)
 ```
 
-**The HTTP flow:**
-
-```
-Browser/Client              Your Server + Bridge           Agent
-      |                           |                          |
-  1.  |-- POST /chat ---------->  |-- agent.run() -------->  |
-      |                           |                          |-- LLM call
-      |                           |                          |-- server tool
-      |                           |                          |-- client tool -> PAUSE
-      | <-- {run_id, status} ---- |                          |
-      |                           |                          |
-  2.  |-- GET /dendrite/runs/{id}/events (SSE) ----------->  |
-      | <-- snapshot (waiting_client_tool) ---------------- |
-      |                           |                          |
-  3.  |-- POST /dendrite/runs/{id}/tool-results ---------->  |
-      | <-- 200 (accepted) ------ |-- resume_claimed() --->  |-- LLM call
-  4.  | <-- run.completed (SSE)   | <-- RunResult --------  |
-```
-
-See the working demo: [`examples/03_client_tools/`](packages/python/examples/03_client_tools/)
-
----
-
-## 🔧 How Tool Calling Works
-
-Dendrite uses **native tool calling** — no prompt engineering, no XML parsing, no regex hacks.
-
-When you decorate a function with `@tool()`, Dendrite extracts the function signature and docstring into a JSON schema. This schema is passed directly to the LLM provider's native tool API (Anthropic's `tool_use` blocks, OpenAI's `function_calling`). The provider returns structured tool call objects, not text that needs parsing.
-
-```
-@tool() decorator          NativeToolCalling strategy         Anthropic API
-      │                              │                              │
-      ├─ extract signature ──>       │                              │
-      ├─ generate JSON schema ──>    ├─ pass schemas to provider ─> ├─ tools parameter
-      │                              │                              │
-      │                              │  <── tool_use blocks ──────  ├─ Claude responds
-      │                              ├─ normalize to ToolCall ──>   │
-      │                              ├─ format result as TOOL msg ─>│
-```
-
-**What this means:**
-- Tool definitions go to the API as structured schemas, not injected into the system prompt
-- Tool calls come back as typed objects, not parsed from free text
-- Tool results are correlated by `call_id` — no ambiguity about which call a result belongs to
-- The strategy layer is swappable — same agent can use different strategies without changing tool code
-
-`NativeToolCalling` is the default and works automatically. For advanced use, you can build a custom strategy (e.g. prompt-based for providers without native tool calling) by subclassing `Strategy`:
+You can also override per call:
 
 ```python
-from dendrite.strategies.base import Strategy
-
-class MyCustomStrategy(Strategy):
-    def build_messages(self, *, system_prompt, history, tool_defs):
-        # Control what messages and tool schemas go to the LLM
-        ...
-
-    def parse_response(self, response):
-        # Interpret the LLM response into an AgentStep
-        ...
-
-    def format_tool_result(self, result):
-        # Format tool results for the next LLM turn
-        ...
+result = await agent.run("be creative", temperature=1.0, max_tokens=2000)
 ```
 
-The strategy never calls the LLM directly — it prepares inputs and interprets outputs. The loop handles execution.
+### Database
 
----
+Dendrite persists runs, traces, tool calls, and token usage when you provide a `database_url`.
 
-## 💾 Persistence and Database
+**SQLite (zero config):**
 
-Dendrite supports SQLite and Postgres.
+```python
+from pathlib import Path
 
-### SQLite (default — zero config)
-
-SQLite is the default. It auto-creates tables on first use. No migrations needed.
-
-If `DENDRITE_DATABASE_URL` is not set, Dendrite uses:
-
+agent = Agent(
+    provider=provider,
+    database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
+    prompt="...",
+    tools=[...],
+)
 ```
-sqlite+aiosqlite:///./dendrite.db
-```
 
-### Postgres
+Tables are auto-created on first use. No migrations needed.
 
-For Postgres, set `DENDRITE_DATABASE_URL` and run Alembic migrations before using persistence:
+**Postgres:**
 
 ```bash
 export DENDRITE_DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/dendrite
 dendrite db migrate
-dendrite db status
 ```
 
-> **Note:** `dendrite db migrate` runs `alembic upgrade head`. The CLI resolves Alembic config automatically and works from any directory.
+**Environment variable:** Set `DENDRITE_DATABASE_URL` once and skip passing `database_url` to every agent. The CLI and dashboard also use this env var automatically.
 
-### ⚠️ Schema changes after pulling new code
-
-SQLite auto-create only works on a **fresh** database. If you pull code that adds new columns to an existing `dendrite.db`:
-
-```bash
-# Option 1: Delete and recreate (local dev)
-rm dendrite.db
-
-# Option 2: Run migrations (preserves data)
-dendrite db migrate
-```
-
-Postgres always requires `dendrite db migrate` after schema changes.
+**No database:** Omit `database_url` — the agent runs fine, just no persistence.
 
 ---
 
-## 📟 CLI Cheatsheet
+## ✨ Features
 
-```bash
-# List runs
-dendrite runs
-dendrite runs --limit 50
-dendrite runs --status success
-dendrite runs --tenant tenant_123
+### 📟 Terminal Output (ConsoleObserver)
 
-# Inspect traces
-dendrite traces <run_id>
-dendrite traces <run_id> --tools
+See what your agent is doing in real time:
 
-# Database
-dendrite db migrate
-dendrite db status
+```python
+from dendrite.observers.console import ConsoleObserver
+
+result = await agent.run("do the thing", observer=ConsoleObserver())
 ```
 
----
+Shows iterations, tool calls with params, success/failure, token counts, and a summary panel. Opt-in — your agent code doesn't change.
 
-## 🐛 Common Debugging
+### 🔒 Tool Constraints
 
-<details>
-<summary><strong>"No runs found"</strong></summary>
+Control how often tools can be called and how long they can run:
 
-You are probably looking at the wrong database. Check:
-
-```bash
-echo $DENDRITE_DATABASE_URL
+```python
+@tool(max_calls_per_run=3, timeout_seconds=120)
+async def search(query: str) -> str:
+    """Search the web. Limited to 3 calls per run."""
+    ...
 ```
 
-If unset, Dendrite uses local SQLite at `./dendrite.db`. Make sure you are running CLI commands from the same directory where the agent ran.
+When a tool hits its limit, Dendrite returns a graceful message to the LLM — no crash, the agent adapts. If a tool times out, you get a warning with a hint to increase the timeout.
 
-</details>
+### ⚡ Parallel Tool Execution
 
-<details>
-<summary><strong>"I ran an agent but no traces were saved"</strong></summary>
+When the LLM returns multiple tool calls in one response, Dendrite executes them concurrently:
 
-Persistence is enabled by passing `database_url` to the Agent:
+```python
+@tool(parallel=True)    # default — runs concurrently with other parallel tools
+async def fast_lookup(id: str) -> str: ...
+
+@tool(parallel=False)   # barrier — runs alone, in order
+async def write_to_db(data: str) -> str: ...
+```
+
+### ⏸️ Client Tool Pause/Resume
+
+Define tools that run on the client (browser, mobile, Excel). The agent pauses and waits:
+
+```python
+@tool(target="client")
+async def read_excel_range(sheet: str, range: str) -> str:
+    """Read cells from the user's spreadsheet."""
+    return ""
+```
+
+Mount the bridge for HTTP-based interaction:
+
+```python
+from dendrite import bridge
+
+app.mount("/dendrite", bridge(agent, allow_insecure_dev_mode=True))
+```
+
+The bridge handles SSE streaming, tool result submission, polling, and cancellation. See [`examples/03_client_tools/`](packages/python/examples/03_client_tools/) for a working demo.
+
+### 🔔 Custom Observers
+
+Build your own observer in 10 lines — Slack, Telegram, webhooks, anything:
+
+```python
+class SlackObserver:
+    async def on_message_appended(self, message, iteration):
+        pass
+
+    async def on_llm_call_completed(self, response, iteration, **kwargs):
+        pass
+
+    async def on_tool_completed(self, tool_call, tool_result, iteration):
+        status = "ok" if tool_result.success else "failed"
+        await post_to_slack(f"Tool {tool_call.name} {status}")
+```
+
+Compose multiple observers:
+
+```python
+from dendrite.observers.composite import CompositeObserver
+
+result = await agent.run(
+    "do the thing",
+    observer=CompositeObserver([ConsoleObserver(), SlackObserver()]),
+)
+```
+
+### 🔐 Persistence + Redaction
+
+Scrub sensitive data before it's stored:
 
 ```python
 agent = Agent(
     provider=provider,
-    database_url="sqlite+aiosqlite:///path/to/dendrite.db",
-    prompt="...",
-    tools=[...],
+    database_url="sqlite+aiosqlite:///...",
+    redact=lambda text: text.replace("sk-ant-", "[REDACTED]"),
+    ...
 )
-result = await agent.run("...")
 ```
 
-Without `database_url` (or `state_store`), the agent still runs but nothing is stored.
+### 🧩 Multi-Agent Composition
 
-</details>
+Use agents as tools inside other agents:
 
-<details>
-<summary><strong>"Postgres tables are missing"</strong></summary>
-
-You likely skipped migrations:
-
-```bash
-dendrite db migrate
-dendrite db status
+```python
+@tool(max_calls_per_run=3, timeout_seconds=120)
+async def research(query: str) -> str:
+    """Delegate to a specialist research agent."""
+    async with Agent(
+        provider=OpenAIProvider(model="gpt-4o"),
+        prompt="You are a research specialist...",
+        tools=[web_search],
+    ) as sub_agent:
+        result = await sub_agent.run(query)
+        return result.answer
 ```
 
-SQLite auto-creates tables. Postgres does not.
-
-</details>
-
-<details>
-<summary><strong>"SQLite errors after pulling new code"</strong></summary>
-
-If a new column was added and you have an existing `dendrite.db`:
-
-```bash
-# Delete and recreate (simplest for local dev)
-rm dendrite.db
-
-# Or run migrations to update in place
-dendrite db migrate
-```
-
-</details>
-
-<details>
-<summary><strong>"The client tool demo does not pause"</strong></summary>
-
-Your prompt probably did not trigger the client tool. Use an explicit prompt like:
-
-> *"Look up the AAPL stock price, then read cell A1 from my spreadsheet."*
-
-The pause only happens when the model chooses a tool with `target="client"`.
-
-</details>
-
-<details>
-<summary><strong>"My hosted run is stuck in waiting_client_tool"</strong></summary>
-
-That is expected until the client submits tool results. Resume it by posting to `POST /runs/{run_id}/tool-results`:
-
-```json
-{
-  "tool_results": [
-    {
-      "tool_call_id": "...",
-      "tool_name": "read_excel_range",
-      "result": "Revenue: $394B"
-    }
-  ]
-}
-```
-
-</details>
-
-<details>
-<summary><strong>"I get 401 on run endpoints"</strong></summary>
-
-HMAC auth is enabled and the request is missing a valid bearer token for that specific run.
-
-For local demos, use `allow_insecure_dev_mode=True` when creating the bridge.
-
-For real deployments, pass `secret=` to `bridge()` and send the token in the header:
-
-```
-Authorization: Bearer drn_...
-```
-
-</details>
-
-<details>
-<summary><strong>"How do I inspect what actually happened?"</strong></summary>
-
-```bash
-dendrite runs                       # List all runs with status
-dendrite traces <run_id>            # Full conversation trace
-dendrite traces <run_id> --tools    # Trace + tool call details
-```
-
-`dendrite traces --tools` is the fastest way to see both the conversation and tool execution records.
-
-</details>
+See [`examples/04_research_agent/`](packages/python/examples/04_research_agent/) for a full multi-agent example.
 
 ---
 
-## 🗂️ Project Structure
+## 📂 Examples
 
+| Example | What it shows |
+|---------|--------------|
+| [`01_hello_world.py`](packages/python/examples/01_hello_world.py) | Minimal agent with one tool |
+| [`02_persistent_agent.py`](packages/python/examples/02_persistent_agent.py) | SQLite persistence + CLI inspection |
+| [`03_client_tools/`](packages/python/examples/03_client_tools/) | Client tool pause/resume with bridge |
+| [`04_research_agent/`](packages/python/examples/04_research_agent/) | Multi-agent composition with Firecrawl |
+
+---
+
+## 🖥️ CLI and Dashboard
+
+### 📟 CLI
+
+```bash
+dendrite runs                    # List all runs
+dendrite runs --status success   # Filter by status
+dendrite traces <run_id>         # Full conversation trace
+dendrite traces <run_id> --tools # With tool call details
+dendrite db migrate              # Run Alembic migrations (Postgres)
+dendrite db status               # Check migration status
 ```
-packages/python/
-├── src/dendrite/
-│   ├── agent.py            # Agent — definition + runtime facade
-│   ├── tool.py             # @tool decorator + schema generation
-│   ├── types.py            # Core types (Message, ToolCall, RunResult)
-│   ├── auth.py             # Run-scoped HMAC token utilities
-│   ├── llm/                # LLM providers (Anthropic, Mock)
-│   ├── loops/              # Execution loops (ReAct)
-│   ├── strategies/         # Tool calling strategies
-│   ├── runtime/            # Runner, observer, state store
-│   ├── db/                 # SQLAlchemy models, Alembic migrations
-│   ├── bridge/             # Mountable transport (SSE, pause/resume)
-│   └── cli/                # CLI commands (runs, traces, db, dashboard)
-├── examples/
-│   ├── 01_hello_world.py
-│   ├── 02_persistent_agent.py
-│   ├── 03_client_tools/
-│   └── 04_research_agent/
-└── tests/                  # 449 tests, 92% coverage
+
+### 📊 Dashboard
+
+```bash
+dendrite dashboard               # Launch at http://localhost:8001
+dendrite dashboard --db ./my.db  # Point at a specific database
+dendrite dashboard --port 9000   # Custom port
 ```
+
+The dashboard shows runs, timelines, tool calls, token usage, and LLM payloads. All data is read-only.
+
+---
+
+## 🐛 Troubleshooting
+
+<details>
+<summary><strong>LLM request timed out</strong></summary>
+
+The default HTTP timeout is 120s. For large outputs (reports, long reasoning), increase it:
+
+```python
+provider = AnthropicProvider(model="claude-sonnet-4-6", timeout=300)
+```
+
+</details>
+
+<details>
+<summary><strong>Tool timed out (default)</strong></summary>
+
+Default tool timeout is 120s. For slow tools (sub-agents, API calls), set it explicitly:
+
+```python
+@tool(timeout_seconds=300)
+async def slow_tool(query: str) -> str: ...
+```
+
+The warning message tells you exactly which tool and suggests the fix.
+
+</details>
+
+<details>
+<summary><strong>No runs found / wrong database</strong></summary>
+
+The CLI reads from `DENDRITE_DATABASE_URL` or `~/.dendrite/dendrite.db` by default. If your agent writes to a different path:
+
+```bash
+dendrite dashboard --db ./path/to/your.db
+```
+
+</details>
+
+<details>
+<summary><strong>Traces not saved</strong></summary>
+
+Persistence requires `database_url` on the Agent. Without it, the agent runs but nothing is stored:
+
+```python
+agent = Agent(provider=provider, database_url="sqlite+aiosqlite:///...", ...)
+```
+
+</details>
+
+<details>
+<summary><strong>Agent context manager</strong></summary>
+
+Always use `async with Agent(...) as agent:` — this ensures the HTTP client and database connections are closed cleanly. Without it, connections may leak.
+
+</details>
 
 ---
 
@@ -505,33 +402,20 @@ packages/python/
 
 | Feature | Status |
 |---------|--------|
-| Agent loop + ReAct reasoning | ✅ Shipped |
-| Tool calling (sync + async, timeouts) | ✅ Shipped |
-| Anthropic Claude provider | ✅ Shipped |
-| OpenAI Chat Completions provider | ✅ Shipped |
-| OpenAI Responses API provider | ⚠️ Shipped (reasoning model tool loops limited) |
-| Compatible API support (vLLM, SGLang, Groq, Ollama) | ✅ Shipped (via OpenAIProvider base_url) |
-| SQLite + Postgres persistence | ✅ Shipped |
-| CLI (traces, runs, db, dashboard) | ✅ Shipped |
-| Token usage tracking + redaction | ✅ Shipped |
-| Pause/resume for client tools | ✅ Shipped |
-| Bridge transport (SSE + persist-first handoff) | ⚠️ Experimental |
-| Run-scoped HMAC auth | ✅ Shipped |
-| Agent API (provider, database_url, run/resume) | ✅ Shipped |
-| Parallel tool execution + max_calls_per_run | ✅ Shipped |
-| Token-level streaming (agent.stream()) | 🔜 Planned |
-| TypeScript client SDK | 🔜 Planned |
-| Gemini provider | 🔜 Planned |
-| Tool sandbox / isolation | 🔜 Planned |
-
----
-
-## ⚙️ Requirements
-
-- Python 3.11+
-- An Anthropic API key (for running agents with Claude)
-
-Tests run without an API key — they use `MockLLM` for deterministic testing.
+| Agent loop + ReAct reasoning | Shipped |
+| Tool calling (sync + async, parallel, timeouts, max_calls) | Shipped |
+| Anthropic Claude provider | Shipped |
+| OpenAI Chat Completions provider | Shipped |
+| OpenAI Responses API provider | Shipped (reasoning model tool loops limited) |
+| Compatible APIs (vLLM, SGLang, Groq, Ollama) | Shipped |
+| SQLite + Postgres persistence | Shipped |
+| CLI + Dashboard | Shipped |
+| Observer system (console, composite, custom) | Shipped |
+| Client tool pause/resume | Shipped |
+| Bridge transport (SSE) | Experimental |
+| Token-level streaming | Planned |
+| Gemini provider | Planned |
+| TypeScript client SDK | Planned |
 
 ---
 
@@ -539,23 +423,39 @@ Tests run without an API key — they use `MockLLM` for deterministic testing.
 
 ```bash
 cd packages/python
-pip install -e ".[dev,db,anthropic,bridge]"
-make ci
+pip install -e ".[dev,db,anthropic,openai,bridge]"
+make ci    # lint + typecheck + tests
 ```
 
 | Command | What it does |
 |---------|-------------|
-| `make ci` | Lint + typecheck + tests — **run before every commit** |
+| `make ci` | Lint + typecheck + tests |
 | `make test` | Tests only |
-| `make format` | Auto-fix formatting and lint |
+| `make format` | Auto-fix formatting |
 | `make lint` | Check without fixing |
 | `make typecheck` | mypy strict mode |
 
+<details>
+<summary>Install extras</summary>
+
+| Extra | What it adds |
+|-------|-------------|
+| `anthropic` | Anthropic Claude SDK |
+| `openai` | OpenAI SDK |
+| `db` | SQLAlchemy, aiosqlite, Alembic |
+| `bridge` | FastAPI, uvicorn |
+| `postgres` | asyncpg |
+| `dev` | pytest, ruff, mypy |
+
+</details>
+
 ---
 
-## 🤖 Built with Claude Code
+## 🤖 How This Was Built
 
-Dendrite is built through AI pair programming using [Claude Code](https://claude.ai/code). Every commit is co-authored, every design decision discussed before implementation. We use a 5-layer doc architecture to keep the LLM aligned across conversations — vision docs describe the destination, the status map describes reality.
+Dendrite is built through AI pair programming using [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). Every commit is co-authored, every design decision discussed before implementation. The architecture, tests, and documentation were developed collaboratively between a human developer and AI assistants.
+
+This is a research project exploring what's possible when AI tools build AI infrastructure. The code is real, tested, and functional — but it reflects the pace and priorities of research, not the hardening of a production release.
 
 ---
 

@@ -1,27 +1,21 @@
 # dendrite
 
-> Python SDK for Dendrite — the runtime for agents that act in the real world.
+> Python SDK for Dendrite — the framework for building agents with tools, persistence, and observability.
 
 **Version:** 0.1.0a1
 
 ## Install
 
 ```bash
-cd packages/python
-pip install -e ".[anthropic,db,bridge]"
+pip install -e ".[all]"                # Everything
+pip install -e ".[anthropic,db]"       # Just Anthropic + SQLite
+pip install -e ".[openai,db]"          # Just OpenAI + SQLite
 ```
 
-| Extra | What it adds |
-|-------|-------------|
-| `anthropic` | Anthropic Claude SDK |
-| `db` | SQLAlchemy, aiosqlite, Alembic |
-| `bridge` | FastAPI, uvicorn (for client tool bridge) |
-| `dev` | pytest, ruff, mypy, python-dotenv |
-| `postgres` | asyncpg |
-
-## Minimal Example
+## Quick Example
 
 ```python
+import asyncio
 from dendrite import Agent, tool
 from dendrite.llm.anthropic import AnthropicProvider
 
@@ -30,73 +24,70 @@ async def add(a: int, b: int) -> int:
     """Add two numbers."""
     return a + b
 
-async with Agent(
-    provider=AnthropicProvider(model="claude-sonnet-4-6"),
-    prompt="You are a calculator.",
-    tools=[add],
-) as agent:
-    result = await agent.run("What is 15 + 27?")
-    print(result.answer)
+async def main():
+    async with Agent(
+        provider=AnthropicProvider(model="claude-sonnet-4-6"),
+        prompt="You are a calculator.",
+        tools=[add],
+    ) as agent:
+        result = await agent.run("What is 15 + 27?")
+        print(result.answer)
+
+asyncio.run(main())
 ```
+
+## Providers
+
+| Provider | Import | Use case |
+|----------|--------|----------|
+| Anthropic | `from dendrite.llm.anthropic import AnthropicProvider` | Claude models |
+| OpenAI | `from dendrite.llm.openai import OpenAIProvider` | GPT models + vLLM, SGLang, Groq, Ollama |
+| OpenAI Responses | `from dendrite.llm.openai_responses import OpenAIResponsesProvider` | GPT + built-in tools (web search) |
+| Mock | `from dendrite.llm.mock import MockLLM` | Deterministic testing |
 
 ## API Quick Reference
 
-### Core
-
-| Import | What it does |
-|--------|-------------|
-| `from dendrite import Agent` | Define an agent (provider, prompt, tools, limits) |
-| `from dendrite import tool` | `@tool()` decorator — turns a function into an agent tool |
-| `from dendrite import bridge` | `bridge(agent)` — mountable FastAPI app for pause/resume transport |
-| `from dendrite import run` | `await run(agent, provider=..., user_input=...)` — low-level runner |
-
-### Providers
-
-| Import | What it does |
-|--------|-------------|
-| `from dendrite.llm.anthropic import AnthropicProvider` | Claude API provider |
-| `from dendrite.llm.mock import MockLLM` | Deterministic mock for testing |
-
-### `agent.run()` Parameters
-
 ```python
+from pathlib import Path
+from dendrite.observers.console import ConsoleObserver
+
 async with Agent(
     provider=provider,                  # Required: LLM provider
-    prompt="...",                       # Required: system prompt
-    tools=[add],                        # Optional: tool functions
+    prompt="...",                        # Required: system prompt
+    tools=[add],                         # Optional: tool functions
     database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrite' / 'dendrite.db'}",
-    redact=my_scrubber,                 # Optional: scrub persisted strings
+    redact=my_scrubber,                  # Optional: scrub persisted strings
 ) as agent:
     result = await agent.run(
         "What is 15 + 27?",
-        tenant_id="org-123",            # Optional: multi-tenant isolation
-        metadata={"thread": "t1"},      # Optional: your linking data
+        observer=ConsoleObserver(),      # Optional: terminal output
+        tenant_id="org-123",             # Optional: multi-tenant isolation
+        metadata={"thread": "t1"},       # Optional: your linking data
     )
 ```
 
-### `RunResult`
+### RunResult
 
 ```python
 result.answer          # str | None — the agent's final answer
-result.status          # RunStatus — SUCCESS, ERROR, MAX_ITERATIONS, WAITING_CLIENT_TOOL
+result.status          # RunStatus — SUCCESS, ERROR, MAX_ITERATIONS, WAITING_CLIENT_TOOL, CANCELLED
 result.steps           # list[AgentStep] — full reasoning chain
 result.iteration_count # int — how many loop iterations ran
-result.usage           # UsageStats — input_tokens, output_tokens, total_tokens, cost_usd
+result.usage           # UsageStats — input_tokens, output_tokens, total_tokens
 result.run_id          # str — unique run identifier (ULID)
+result.error           # str | None — error message if status is ERROR
 ```
 
-## Alpha Limitations
+### Tool Options
 
-- **No tool sandbox** — tools run in-process with full host privileges. Only run tools you trust.
-- **Opt-in trace redaction** — pass `redact=` to `run()` to scrub persisted content. Not enabled by default.
-- **Anthropic-only** — other LLM providers planned for a future sprint.
+```python
+@tool()                                  # Basic server tool
+@tool(target="client")                   # Client-side — agent pauses
+@tool(max_calls_per_run=3)               # Limit calls per run
+@tool(timeout_seconds=120)               # Custom timeout (default 120s)
+@tool(parallel=False)                    # Run alone, not concurrently
+```
 
 ## Full Documentation
 
-See the [main README](../../README.md) for:
-
-- Quick start guide with all three examples
-- Hosted agent setup with client tool pause/resume
-- Database and migration guide (SQLite + Postgres)
-- CLI cheatsheet
-- Common debugging
+See the [main README](../../README.md) for provider setup, configuration, database guide, CLI, dashboard, observer system, and examples.
