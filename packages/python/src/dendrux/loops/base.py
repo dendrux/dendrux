@@ -19,6 +19,8 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.strategies.base import Strategy
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
         AgentStep,
         LLMResponse,
         Message,
+        RunEvent,
         RunResult,
         ToolCall,
         ToolResult,
@@ -116,6 +119,7 @@ class Loop(ABC):
         initial_steps: list[AgentStep] | None = None,
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
+        provider_kwargs: dict[str, Any] | None = None,
     ) -> RunResult:
         """Execute the agent loop until completion.
 
@@ -135,7 +139,64 @@ class Loop(ABC):
             iteration_offset: Iteration number to resume from. The loop
                 starts counting from iteration_offset + 1.
             initial_usage: Cumulative token usage from before a pause.
+            provider_kwargs: Extra kwargs forwarded to provider.complete()
+                (e.g. temperature, max_tokens). Passed through by the runner.
 
         Returns:
             RunResult with status, answer, steps, and usage.
         """
+
+    async def run_stream(
+        self,
+        *,
+        agent: Agent,
+        provider: LLMProvider,
+        strategy: Strategy,
+        user_input: str,
+        run_id: str | None = None,
+        observer: LoopObserver | None = None,
+        initial_history: list[Message] | None = None,
+        initial_steps: list[AgentStep] | None = None,
+        iteration_offset: int = 0,
+        initial_usage: UsageStats | None = None,
+        provider_kwargs: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        """Stream agent execution as RunEvents.
+
+        Default implementation calls run() and yields the result as a
+        single RUN_COMPLETED event. Override for real token-by-token streaming.
+
+        The runner owns lifecycle events (RUN_STARTED, RUN_ERROR, cancellation).
+        The loop yields execution outcomes (RUN_COMPLETED, RUN_PAUSED) and
+        intermediate events (TEXT_DELTA, TOOL_USE_*, TOOL_RESULT).
+
+        Args:
+            Same as run().
+
+        Yields:
+            RunEvent objects. Terminal event is RUN_COMPLETED or RUN_PAUSED.
+        """
+        from dendrux.types import RunEvent as _RunEvent
+        from dendrux.types import RunEventType as _RunEventType
+
+        result = await self.run(
+            agent=agent,
+            provider=provider,
+            strategy=strategy,
+            user_input=user_input,
+            run_id=run_id,
+            observer=observer,
+            initial_history=initial_history,
+            initial_steps=initial_steps,
+            iteration_offset=iteration_offset,
+            initial_usage=initial_usage,
+            provider_kwargs=provider_kwargs,
+        )
+
+        # Determine terminal event type from run status
+        from dendrux.types import RunStatus as _RunStatus
+
+        if result.status in (_RunStatus.WAITING_CLIENT_TOOL, _RunStatus.WAITING_HUMAN_INPUT):
+            yield _RunEvent(type=_RunEventType.RUN_PAUSED, run_result=result)
+        else:
+            yield _RunEvent(type=_RunEventType.RUN_COMPLETED, run_result=result)

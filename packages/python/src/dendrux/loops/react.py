@@ -35,8 +35,11 @@ from dendrux.types import (
     Message,
     PauseState,
     Role,
+    RunEvent,
+    RunEventType,
     RunResult,
     RunStatus,
+    StreamEventType,
     ToolCall,
     ToolResult,
     ToolTarget,
@@ -45,7 +48,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
@@ -118,6 +121,219 @@ async def _notify_tool(
             warnings.append(f"on_tool_completed failed at iteration {iteration}")
 
 
+class _ToolCallOutcome(NamedTuple):
+    """Result of processing tool calls in a single iteration."""
+
+    # All (tool_call, tool_result) pairs — limits + executed, in order
+    all_results: list[tuple[ToolCall, ToolResult]]
+    # Non-server tools that need pause (empty if all were server tools)
+    pending_calls: list[ToolCall]
+
+
+def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
+    """Add per-call usage to running total. Mutates total in place."""
+    total.input_tokens += step_usage.input_tokens
+    total.output_tokens += step_usage.output_tokens
+    total.total_tokens += step_usage.total_tokens
+    if step_usage.cost_usd is not None:
+        if total.cost_usd is None:
+            total.cost_usd = 0.0
+        total.cost_usd += step_usage.cost_usd
+
+
+async def _append_assistant(
+    response: LLMResponse,
+    history: list[Message],
+    observer: LoopObserver | None,
+    iteration: int,
+    warnings: list[str],
+) -> Message:
+    """Create assistant message from LLM response, append to history, notify observer."""
+    msg = Message(
+        role=Role.ASSISTANT,
+        content=response.text or "",
+        tool_calls=response.tool_calls,
+    )
+    history.append(msg)
+    await _notify_message(observer, msg, iteration, warnings)
+    return msg
+
+
+def _snapshot_usage(usage: UsageStats) -> UsageStats:
+    """Create an independent copy of usage stats for pause state."""
+    return UsageStats(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+        cost_usd=usage.cost_usd,
+    )
+
+
+def _build_pause(
+    *,
+    agent_name: str,
+    pending_calls: list[ToolCall],
+    target_lookup: dict[str, ToolTarget],
+    history: list[Message],
+    steps: list[AgentStep],
+    iteration: int,
+    usage: UsageStats,
+) -> PauseState:
+    """Build PauseState for client tool or clarification pause."""
+    pending_targets = {
+        tc.id: target_lookup.get(tc.name, ToolTarget.SERVER).value
+        for tc in pending_calls
+    } if pending_calls else {}
+
+    return PauseState(
+        agent_name=agent_name,
+        pending_tool_calls=pending_calls,
+        pending_targets=pending_targets,
+        history=list(history),
+        steps=list(steps),
+        iteration=iteration,
+        trace_order_offset=len(history),
+        usage=_snapshot_usage(usage),
+    )
+
+
+class _LoopState(NamedTuple):
+    """Mutable iteration state — initialized once, shared across iterations."""
+
+    history: list[Message]
+    call_counts: dict[str, int]
+    steps: list[AgentStep]
+    usage: UsageStats
+    warnings: list[str]
+
+
+async def _init_loop_state(
+    *,
+    user_input: str,
+    observer: LoopObserver | None,
+    initial_history: list[Message] | None,
+    initial_steps: list[AgentStep] | None,
+    initial_usage: UsageStats | None,
+) -> _LoopState:
+    """Initialize mutable loop state — shared between run() and run_stream()."""
+    if initial_history is not None:
+        history = list(initial_history)
+    else:
+        user_msg = Message(role=Role.USER, content=user_input)
+        history = [user_msg]
+        await _notify_message(observer, user_msg, 0)
+
+    call_counts: dict[str, int] = {}
+    for msg in history:
+        if msg.role == Role.TOOL and msg.name is not None:
+            call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
+
+    steps: list[AgentStep] = list(initial_steps) if initial_steps else []
+    usage = UsageStats(
+        input_tokens=initial_usage.input_tokens if initial_usage else 0,
+        output_tokens=initial_usage.output_tokens if initial_usage else 0,
+        total_tokens=initial_usage.total_tokens if initial_usage else 0,
+        cost_usd=initial_usage.cost_usd if initial_usage else None,
+    )
+
+    return _LoopState(
+        history=history,
+        call_counts=call_counts,
+        steps=steps,
+        usage=usage,
+        warnings=[],
+    )
+
+
+async def _process_tool_calls(
+    *,
+    step: AgentStep,
+    call_counts: dict[str, int],
+    lookups: ToolLookups,
+    strategy: Strategy,
+    observer: LoopObserver | None,
+    iteration: int,
+    history: list[Message],
+    warnings: list[str],
+) -> _ToolCallOutcome:
+    """Execute tool calls: enforce limits, run server tools, update history.
+
+    Returns a _ToolCallOutcome with all results and any pending (non-server)
+    calls. Both run() and run_stream() call this — the caller decides
+    whether to yield events from the results.
+
+    Side effects: mutates call_counts, appends to history, notifies observer.
+    """
+    all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
+    all_results: list[tuple[ToolCall, ToolResult]] = []
+
+    # --- Phase 1: Enforce max_calls_per_run ---
+    # Uses a provisional counter so duplicate tool calls within a
+    # single LLM batch are correctly counted (not just the baseline).
+    allowed_calls: list[ToolCall] = []
+    batch_counts: dict[str, int] = {}
+    for tc in all_calls:
+        max_calls = lookups.max_calls.get(tc.name)
+        current = call_counts.get(tc.name, 0) + batch_counts.get(tc.name, 0)
+        if max_calls is not None and current >= max_calls:
+            limit_msg = (
+                f"Tool '{tc.name}' has reached its maximum of "
+                f"{max_calls} calls for this run."
+            )
+            limit_result = ToolResult(
+                name=tc.name,
+                call_id=tc.id,
+                payload=json.dumps({"limit": limit_msg}),
+                success=False,
+                error=limit_msg,
+            )
+            await _notify_tool(observer, tc, limit_result, iteration, warnings)
+            result_msg = strategy.format_tool_result(limit_result)
+            history.append(result_msg)
+            await _notify_message(observer, result_msg, iteration, warnings)
+            all_results.append((tc, limit_result))
+        else:
+            batch_counts[tc.name] = batch_counts.get(tc.name, 0) + 1
+            allowed_calls.append(tc)
+
+    # --- Phase 2: Split into server (execute now) vs non-server (pause) ---
+    server_calls: list[ToolCall] = []
+    pending_calls: list[ToolCall] = []
+    for tc in allowed_calls:
+        target = lookups.target.get(tc.name, ToolTarget.SERVER)
+        if target == ToolTarget.SERVER:
+            server_calls.append(tc)
+        else:
+            pending_calls.append(tc)
+
+    # --- Phase 3: Execute server tools ---
+    # Parallel where safe, sequential barriers.
+    exec_groups = _build_execution_groups(server_calls, lookups.parallel)
+    executed: list[tuple[ToolCall, ToolResult]] = []
+    for group, is_parallel in exec_groups:
+        if is_parallel and len(group) > 1:
+            pairs = await asyncio.gather(*[
+                _execute_and_notify(tc, lookups, observer, iteration, warnings)
+                for tc in group
+            ])
+            executed.extend(pairs)
+        else:
+            for tc in group:
+                tool_result = await _execute_tool(tc, lookups)
+                await _notify_tool(observer, tc, tool_result, iteration, warnings)
+                executed.append((tc, tool_result))
+
+    # --- Phase 4: Append history in original order (deterministic for LLM) ---
+    for tc, tool_result in executed:
+        call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
+        result_msg = strategy.format_tool_result(tool_result)
+        history.append(result_msg)
+        await _notify_message(observer, result_msg, iteration, warnings)
+        all_results.append((tc, tool_result))
+
+    return _ToolCallOutcome(all_results=all_results, pending_calls=pending_calls)
+
+
 class ReActLoop(Loop):
     """Think → act → observe → repeat.
 
@@ -147,279 +363,255 @@ class ReActLoop(Loop):
         initial_steps: list[AgentStep] | None = None,
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
+        provider_kwargs: dict[str, Any] | None = None,
     ) -> RunResult:
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
+        _pkw = provider_kwargs or {}
         tool_defs = agent.get_tool_defs()
         lookups = _build_tool_lookups(agent.tools)
-
-        if initial_history is not None:
-            # Resume from pause — use provided history, skip user message creation
-            history = list(initial_history)
-        else:
-            # Fresh run — create initial user message
-            user_msg = Message(role=Role.USER, content=user_input)
-            history = [user_msg]
-            await _notify_message(observer, user_msg, 0)
-
-        # Derive per-tool call counts from history (resume-safe).
-        # Counts Role.TOOL messages only — not assistant tool_call requests.
-        call_counts: dict[str, int] = {}
-        for msg in history:
-            if msg.role == Role.TOOL and msg.name is not None:
-                call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
-
-        steps: list[AgentStep] = list(initial_steps) if initial_steps else []
-        total_usage = UsageStats(
-            input_tokens=initial_usage.input_tokens if initial_usage else 0,
-            output_tokens=initial_usage.output_tokens if initial_usage else 0,
-            total_tokens=initial_usage.total_tokens if initial_usage else 0,
-            cost_usd=initial_usage.cost_usd if initial_usage else None,
+        state = await _init_loop_state(
+            user_input=user_input, observer=observer,
+            initial_history=initial_history, initial_steps=initial_steps,
+            initial_usage=initial_usage,
         )
-
-        observer_warnings: list[str] = []
+        history, call_counts, steps = state.history, state.call_counts, state.steps
+        total_usage, observer_warnings = state.usage, state.warnings
 
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
-            # 1. Build messages via strategy
             messages, tools = strategy.build_messages(
-                system_prompt=agent.prompt,
-                history=history,
-                tool_defs=tool_defs,
+                system_prompt=agent.prompt, history=history, tool_defs=tool_defs,
             )
 
-            # 2. Call the LLM
+            # LLM call — batch
             t0 = time.monotonic()
-            response = await provider.complete(messages, tools=tools)
+            response = await provider.complete(messages, tools=tools, **_pkw)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
             await _notify_llm(
-                observer,
-                response,
-                iteration,
-                observer_warnings,
-                semantic_messages=messages,
-                semantic_tools=tools,
-                duration_ms=llm_duration_ms,
+                observer, response, iteration, observer_warnings,
+                semantic_messages=messages, semantic_tools=tools, duration_ms=llm_duration_ms,
             )
+            _accumulate_usage(total_usage, response.usage)
 
-            # Accumulate usage
-            total_usage.input_tokens += response.usage.input_tokens
-            total_usage.output_tokens += response.usage.output_tokens
-            total_usage.total_tokens += response.usage.total_tokens
-            if response.usage.cost_usd is not None:
-                if total_usage.cost_usd is None:
-                    total_usage.cost_usd = 0.0
-                total_usage.cost_usd += response.usage.cost_usd
-
-            # 3. Parse response into AgentStep
             step = strategy.parse_response(response)
             steps.append(step)
 
-            # 4. Check action type
             if isinstance(step.action, Finish):
-                # Persist the final assistant message before returning
-                assistant_msg = Message(
-                    role=Role.ASSISTANT,
-                    content=response.text or "",
-                    tool_calls=response.tool_calls,
-                )
-                history.append(assistant_msg)
-                await _notify_message(observer, assistant_msg, iteration, observer_warnings)
-
-                meta = {}
-                if observer_warnings:
-                    meta["observer_warnings"] = observer_warnings
+                await _append_assistant(response, history, observer, iteration, observer_warnings)
+                meta = {"observer_warnings": observer_warnings} if observer_warnings else {}
                 return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.SUCCESS,
-                    answer=step.action.answer,
-                    steps=steps,
-                    iteration_count=iteration,
-                    usage=total_usage,
-                    meta=meta,
+                    run_id=resolved_run_id, status=RunStatus.SUCCESS,
+                    answer=step.action.answer, steps=steps,
+                    iteration_count=iteration, usage=total_usage, meta=meta,
                 )
 
             if isinstance(step.action, Clarification):
-                # Persist the assistant message before returning
-                assistant_msg = Message(
-                    role=Role.ASSISTANT,
-                    content=response.text or "",
-                    tool_calls=response.tool_calls,
+                await _append_assistant(response, history, observer, iteration, observer_warnings)
+                pause = _build_pause(
+                    agent_name=agent.name, pending_calls=[], target_lookup=lookups.target,
+                    history=history, steps=steps, iteration=iteration, usage=total_usage,
                 )
-                history.append(assistant_msg)
-                await _notify_message(observer, assistant_msg, iteration, observer_warnings)
-
-                # Build PauseState for resume via resume_with_input()
-                clarification_pause = PauseState(
-                    agent_name=agent.name,
-                    pending_tool_calls=[],  # No tool calls — resume is a user message
-                    history=list(history),
-                    steps=list(steps),
-                    iteration=iteration,
-                    trace_order_offset=len(history),
-                    usage=UsageStats(
-                        input_tokens=total_usage.input_tokens,
-                        output_tokens=total_usage.output_tokens,
-                        total_tokens=total_usage.total_tokens,
-                        cost_usd=total_usage.cost_usd,
-                    ),
-                )
-
-                clarification_meta: dict[str, Any] = {"pause_state": clarification_pause}
+                meta: dict[str, Any] = {"pause_state": pause}
                 if observer_warnings:
-                    clarification_meta["observer_warnings"] = observer_warnings
+                    meta["observer_warnings"] = observer_warnings
                 return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.WAITING_HUMAN_INPUT,
-                    answer=step.action.question,
-                    steps=steps,
-                    iteration_count=iteration,
-                    usage=total_usage,
-                    meta=clarification_meta,
+                    run_id=resolved_run_id, status=RunStatus.WAITING_HUMAN_INPUT,
+                    answer=step.action.question, steps=steps,
+                    iteration_count=iteration, usage=total_usage, meta=meta,
                 )
 
             if isinstance(step.action, ToolCall):
-                # Append assistant message with all tool_calls to history
-                assistant_msg = Message(
-                    role=Role.ASSISTANT,
-                    content=response.text or "",
-                    tool_calls=response.tool_calls,
+                await _append_assistant(response, history, observer, iteration, observer_warnings)
+                outcome = await _process_tool_calls(
+                    step=step, call_counts=call_counts, lookups=lookups,
+                    strategy=strategy, observer=observer, iteration=iteration,
+                    history=history, warnings=observer_warnings,
                 )
-                history.append(assistant_msg)
-                await _notify_message(observer, assistant_msg, iteration, observer_warnings)
+                if outcome.pending_calls:
+                    pause = _build_pause(
+                        agent_name=agent.name, pending_calls=outcome.pending_calls,
+                        target_lookup=lookups.target, history=history, steps=steps,
+                        iteration=iteration, usage=total_usage,
+                    )
+                    meta = {"pause_state": pause}
+                    if observer_warnings:
+                        meta["observer_warnings"] = observer_warnings
+                    return RunResult(
+                        run_id=resolved_run_id, status=RunStatus.WAITING_CLIENT_TOOL,
+                        steps=steps, iteration_count=iteration,
+                        usage=total_usage, meta=meta,
+                    )
 
-                # Enforce max_calls_per_run before server/client split.
-                # Tools that exceed their limit get an immediate graceful result.
-                # Uses a provisional counter so duplicate tool calls within a
-                # single LLM batch are correctly counted (not just the baseline).
-                all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
-                allowed_calls: list[ToolCall] = []
-                batch_counts: dict[str, int] = {}
-                for tc in all_calls:
-                    max_calls = lookups.max_calls.get(tc.name)
-                    current = call_counts.get(tc.name, 0) + batch_counts.get(tc.name, 0)
-                    if max_calls is not None and current >= max_calls:
-                        limit_msg = (
-                            f"Tool '{tc.name}' has reached its maximum of "
-                            f"{max_calls} calls for this run."
+        meta = {"observer_warnings": observer_warnings} if observer_warnings else {}
+        return RunResult(
+            run_id=resolved_run_id, status=RunStatus.MAX_ITERATIONS,
+            steps=steps, iteration_count=agent.max_iterations,
+            usage=total_usage, meta=meta,
+        )
+
+    async def run_stream(
+        self,
+        *,
+        agent: Agent,
+        provider: LLMProvider,
+        strategy: Strategy,
+        user_input: str,
+        run_id: str | None = None,
+        observer: LoopObserver | None = None,
+        initial_history: list[Message] | None = None,
+        initial_steps: list[AgentStep] | None = None,
+        iteration_offset: int = 0,
+        initial_usage: UsageStats | None = None,
+        provider_kwargs: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[RunEvent, None]:
+        """Stream the ReAct loop as RunEvents.
+
+        Same iteration logic as run() — shared helpers ensure consistency.
+        Swaps provider.complete() for complete_stream(), forwarding text
+        deltas live and yielding TOOL_RESULT events after execution.
+        Terminal event is RUN_COMPLETED or RUN_PAUSED.
+        """
+        resolved_run_id = run_id or generate_ulid()
+        _pkw = provider_kwargs or {}
+        tool_defs = agent.get_tool_defs()
+        lookups = _build_tool_lookups(agent.tools)
+        state = await _init_loop_state(
+            user_input=user_input, observer=observer,
+            initial_history=initial_history, initial_steps=initial_steps,
+            initial_usage=initial_usage,
+        )
+        history, call_counts, steps = state.history, state.call_counts, state.steps
+        total_usage, observer_warnings = state.usage, state.warnings
+
+        start_iteration = iteration_offset + 1
+        end_iteration = agent.max_iterations + 1
+        for iteration in range(start_iteration, end_iteration):
+            messages, tools = strategy.build_messages(
+                system_prompt=agent.prompt, history=history, tool_defs=tool_defs,
+            )
+
+            # LLM call — streaming
+            t0 = time.monotonic()
+            llm_response: LLMResponse | None = None
+            provider_stream = provider.complete_stream(messages, tools=tools, **_pkw)
+            try:
+                async for event in provider_stream:
+                    if event.type == StreamEventType.TEXT_DELTA:
+                        yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                    elif event.type == StreamEventType.TOOL_USE_START:
+                        yield RunEvent(
+                            type=RunEventType.TOOL_USE_START,
+                            tool_name=event.tool_name, tool_call_id=event.tool_call_id,
                         )
-                        limit_result = ToolResult(
-                            name=tc.name,
-                            call_id=tc.id,
-                            payload=json.dumps({"limit": limit_msg}),
-                            success=False,
-                            error=limit_msg,
+                    elif event.type == StreamEventType.TOOL_USE_END:
+                        yield RunEvent(
+                            type=RunEventType.TOOL_USE_END, tool_call=event.tool_call,
+                            tool_name=event.tool_name, tool_call_id=event.tool_call_id,
                         )
-                        await _notify_tool(
-                            observer, tc, limit_result, iteration, observer_warnings,
-                        )
-                        result_msg = strategy.format_tool_result(limit_result)
-                        history.append(result_msg)
-                        await _notify_message(
-                            observer, result_msg, iteration, observer_warnings,
-                        )
-                    else:
-                        batch_counts[tc.name] = batch_counts.get(tc.name, 0) + 1
-                        allowed_calls.append(tc)
+                    elif event.type == StreamEventType.DONE:
+                        llm_response = event.raw
+            finally:
+                await provider_stream.aclose()
 
-                # Split allowed calls into server (execute now) vs non-server (pause)
-                server_calls: list[ToolCall] = []
-                pending_calls: list[ToolCall] = []
-                for tc in allowed_calls:
-                    target = lookups.target.get(tc.name, ToolTarget.SERVER)
-                    if target == ToolTarget.SERVER:
-                        server_calls.append(tc)
-                    else:
-                        pending_calls.append(tc)
+            llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
-                # Execute server tools — parallel where safe, sequential barriers.
-                # Group contiguous parallel=True tools for concurrent execution.
-                # parallel=False tools act as barriers (run alone in order).
-                exec_groups = _build_execution_groups(server_calls, lookups.parallel)
-                # Collect (tc, result) pairs in original order for deterministic
-                # history append after all groups complete.
-                all_results: list[tuple[ToolCall, ToolResult]] = []
-                for group, is_parallel in exec_groups:
-                    if is_parallel and len(group) > 1:
-                        # Run concurrently — each notifies observer on completion
-                        pairs = await asyncio.gather(*[
-                            _execute_and_notify(
-                                tc, lookups, observer, iteration, observer_warnings,
-                            )
-                            for tc in group
-                        ])
-                        all_results.extend(pairs)
-                    else:
-                        # Sequential — single tool or parallel=False barrier
-                        for tc in group:
-                            tool_result = await _execute_tool(tc, lookups)
-                            await _notify_tool(
-                                observer, tc, tool_result, iteration, observer_warnings,
-                            )
-                            all_results.append((tc, tool_result))
+            if llm_response is None:
+                raise RuntimeError(
+                    f"Provider stream ended without DONE event at iteration {iteration}. "
+                    f"complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
+                )
 
-                # Append history in original order (deterministic for LLM)
-                for tc, tool_result in all_results:
-                    call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
-                    result_msg = strategy.format_tool_result(tool_result)
-                    history.append(result_msg)
-                    await _notify_message(observer, result_msg, iteration, observer_warnings)
+            await _notify_llm(
+                observer, llm_response, iteration, observer_warnings,
+                semantic_messages=messages, semantic_tools=tools, duration_ms=llm_duration_ms,
+            )
+            _accumulate_usage(total_usage, llm_response.usage)
 
-                # If non-server tools remain, pause the loop
-                if pending_calls:
-                    # Approximate trace offset from history length. This can
-                    # diverge from the actual DB trace count if observer
-                    # notifications were swallowed (see _notify_message).
-                    # Group 2's resume() must load the real max order_index
-                    # from the DB, not trust this value blindly.
-                    trace_offset = len(history)
+            step = strategy.parse_response(llm_response)
+            steps.append(step)
 
-                    # Build target map for pending calls
-                    pending_targets = {
-                        tc.id: lookups.target.get(tc.name, ToolTarget.SERVER).value
-                        for tc in pending_calls
-                    }
+            if isinstance(step.action, Finish):
+                await _append_assistant(
+                    llm_response, history, observer, iteration, observer_warnings,
+                )
+                meta: dict[str, Any] = (
+                    {"observer_warnings": observer_warnings} if observer_warnings else {}
+                )
+                yield RunEvent(
+                    type=RunEventType.RUN_COMPLETED,
+                    run_result=RunResult(
+                        run_id=resolved_run_id, status=RunStatus.SUCCESS,
+                        answer=step.action.answer, steps=steps,
+                        iteration_count=iteration, usage=total_usage, meta=meta,
+                    ),
+                )
+                return
 
-                    pause_state = PauseState(
-                        agent_name=agent.name,
-                        pending_tool_calls=pending_calls,
-                        pending_targets=pending_targets,
-                        history=list(history),
-                        steps=list(steps),
-                        iteration=iteration,
-                        trace_order_offset=trace_offset,
-                        usage=UsageStats(
-                            input_tokens=total_usage.input_tokens,
-                            output_tokens=total_usage.output_tokens,
-                            total_tokens=total_usage.total_tokens,
-                            cost_usd=total_usage.cost_usd,
+            if isinstance(step.action, Clarification):
+                await _append_assistant(
+                    llm_response, history, observer, iteration, observer_warnings,
+                )
+                pause = _build_pause(
+                    agent_name=agent.name, pending_calls=[], target_lookup=lookups.target,
+                    history=history, steps=steps, iteration=iteration, usage=total_usage,
+                )
+                meta = {"pause_state": pause}
+                if observer_warnings:
+                    meta["observer_warnings"] = observer_warnings
+                yield RunEvent(
+                    type=RunEventType.RUN_PAUSED,
+                    run_result=RunResult(
+                        run_id=resolved_run_id, status=RunStatus.WAITING_HUMAN_INPUT,
+                        answer=step.action.question, steps=steps,
+                        iteration_count=iteration, usage=total_usage, meta=meta,
+                    ),
+                )
+                return
+
+            if isinstance(step.action, ToolCall):
+                await _append_assistant(
+                    llm_response, history, observer, iteration, observer_warnings,
+                )
+                outcome = await _process_tool_calls(
+                    step=step, call_counts=call_counts, lookups=lookups,
+                    strategy=strategy, observer=observer, iteration=iteration,
+                    history=history, warnings=observer_warnings,
+                )
+                # Yield TOOL_RESULT for each executed/limited tool
+                for tc, tool_result in outcome.all_results:
+                    yield RunEvent(
+                        type=RunEventType.TOOL_RESULT,
+                        tool_call=tc, tool_result=tool_result,
+                    )
+                if outcome.pending_calls:
+                    pause = _build_pause(
+                        agent_name=agent.name, pending_calls=outcome.pending_calls,
+                        target_lookup=lookups.target, history=history, steps=steps,
+                        iteration=iteration, usage=total_usage,
+                    )
+                    meta = {"pause_state": pause}
+                    if observer_warnings:
+                        meta["observer_warnings"] = observer_warnings
+                    yield RunEvent(
+                        type=RunEventType.RUN_PAUSED,
+                        run_result=RunResult(
+                            run_id=resolved_run_id, status=RunStatus.WAITING_CLIENT_TOOL,
+                            steps=steps, iteration_count=iteration,
+                            usage=total_usage, meta=meta,
                         ),
                     )
+                    return
 
-                    pause_meta: dict[str, Any] = {"pause_state": pause_state}
-                    if observer_warnings:
-                        pause_meta["observer_warnings"] = observer_warnings
-                    return RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.WAITING_CLIENT_TOOL,
-                        steps=steps,
-                        iteration_count=iteration,
-                        usage=total_usage,
-                        meta=pause_meta,
-                    )
-
-        # Max iterations reached
-        meta = {}
-        if observer_warnings:
-            meta["observer_warnings"] = observer_warnings
-        return RunResult(
-            run_id=resolved_run_id,
-            status=RunStatus.MAX_ITERATIONS,
-            steps=steps,
-            iteration_count=agent.max_iterations,
-            usage=total_usage,
-            meta=meta,
+        meta = {"observer_warnings": observer_warnings} if observer_warnings else {}
+        yield RunEvent(
+            type=RunEventType.RUN_COMPLETED,
+            run_result=RunResult(
+                run_id=resolved_run_id, status=RunStatus.MAX_ITERATIONS,
+                steps=steps, iteration_count=agent.max_iterations,
+                usage=total_usage, meta=meta,
+            ),
         )
 
 

@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from dendrux.llm.base import LLMProvider
     from dendrux.runtime.state import StateStore
-    from dendrux.types import RunResult, ToolDef, ToolResult
+    from dendrux.types import RunResult, RunStream, ToolDef, ToolResult
 
 # Safety limit to prevent runaway LLM costs. Can be overridden per-agent
 # once the worker/config layer ships (Sprint 6).
@@ -304,6 +304,7 @@ class Agent:
             metadata=metadata,
             redact=self._redact,
             extra_observer=observer,
+            **kwargs,
         )
 
     async def resume(
@@ -374,6 +375,69 @@ class Agent:
             provider=self._provider,
             redact=self._redact,
             extra_observer=observer,
+        )
+
+    def stream(
+        self,
+        user_input: str,
+        *,
+        tenant_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        observer: Any | None = None,
+        **kwargs: Any,
+    ) -> RunStream:
+        """Stream an agent run as RunEvents.
+
+        Same parameters as run(). Returns a RunStream immediately —
+        no ``await`` needed. The run_id is available before iteration.
+        Async setup (DB row, observers) runs lazily on first iteration.
+
+        Usage:
+            # Full event stream
+            async for event in agent.stream("analyze revenue"):
+                print(event.type, event.text or "")
+
+            # Just the text
+            async for chunk in agent.stream("analyze revenue").text():
+                print(chunk, end="")
+
+            # With explicit cleanup (recommended)
+            async with agent.stream("analyze revenue") as stream:
+                async for event in stream:
+                    ...
+
+        After any terminal event (RUN_COMPLETED, RUN_PAUSED, RUN_ERROR),
+        the stream ends. If the consumer breaks early, the run is
+        cancelled via CAS-guarded cleanup.
+
+        Args:
+            user_input: The user's input to process.
+            tenant_id: Optional tenant ID for multi-tenant isolation.
+            metadata: Optional developer linking data (thread_id, user_id, etc.).
+            observer: Optional observer for lifecycle events.
+            **kwargs: Forwarded to the LLM provider (temperature, max_tokens, etc.).
+
+        Returns:
+            RunStream — async iterable of RunEvent objects.
+
+        Raises:
+            ValueError: If no provider is configured.
+        """
+        if self._provider is None:
+            raise ValueError("Agent requires a provider. Pass provider= to the constructor.")
+
+        from dendrux.runtime.runner import run_stream as runner_run_stream
+
+        return runner_run_stream(
+            self,
+            provider=self._provider,
+            user_input=user_input,
+            state_store_resolver=self._resolve_state_store,
+            tenant_id=tenant_id,
+            metadata=metadata,
+            redact=self._redact,
+            extra_observer=observer,
+            **kwargs,
         )
 
     # ------------------------------------------------------------------

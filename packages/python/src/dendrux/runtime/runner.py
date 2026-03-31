@@ -22,17 +22,17 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.loops.react import ReActLoop
 from dendrux.strategies.native import NativeToolCalling
-from dendrux.types import PauseState, RunStatus, generate_ulid
+from dendrux.types import PauseState, RunEventType, RunStatus, generate_ulid
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import RunResult, ToolResult
+    from dendrux.types import RunEvent, RunResult, RunStream, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,11 @@ async def run(
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or ReActLoop()
 
+    # Extract provider kwargs (temperature, max_tokens, etc.)
+    # before they get consumed. kwargs dict is forwarded to the loop
+    # which forwards to provider.complete().
+    provider_kwargs = dict(kwargs) if kwargs else {}
+
     # Runner owns run_id — single source of truth
     run_id = generate_ulid()
     observer = None
@@ -207,6 +212,7 @@ async def run(
             user_input=user_input,
             run_id=run_id,
             observer=composed_observer,
+            provider_kwargs=provider_kwargs or None,
         )
 
         if state_store is not None:
@@ -285,6 +291,251 @@ async def run(
                     state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
                 )
         raise
+
+
+def run_stream(
+    agent: Agent,
+    *,
+    provider: LLMProvider,
+    user_input: str,
+    strategy: Strategy | None = None,
+    loop: Loop | None = None,
+    state_store: StateStore | None = None,
+    state_store_resolver: Callable[[], Any] | None = None,
+    tenant_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    redact: Callable[[str], str] | None = None,
+    extra_observer: Any | None = None,
+    **kwargs: Any,
+) -> RunStream:
+    """Stream an agent run as RunEvents, returning a RunStream.
+
+    Synchronous — returns immediately with run_id available. All async
+    setup (DB row, observers) runs lazily on first iteration.
+
+    Accepts either an already-resolved ``state_store`` or an async
+    ``state_store_resolver`` callable. The resolver is called once in
+    the generator preamble.
+
+    Error semantics: exceptions are caught, persisted, and yielded as
+    RUN_ERROR events. No exception is raised to the consumer.
+
+    Lifecycle ownership:
+      - Runner emits RUN_STARTED, RUN_ERROR, and handles cancellation cleanup.
+      - Loop yields execution outcomes (RUN_COMPLETED, RUN_PAUSED) and
+        intermediate events (TEXT_DELTA, TOOL_USE_*, TOOL_RESULT).
+      - Runner persists loop outcomes before forwarding them.
+    """
+    from dendrux.types import RunEvent, RunResult
+    from dendrux.types import RunStream as _RunStream
+
+    resolved_strategy = strategy or NativeToolCalling()
+    resolved_loop = loop or ReActLoop()
+    provider_kwargs = dict(kwargs) if kwargs else {}
+
+    run_id = generate_ulid()
+
+    # Shared mutable state — generator populates on first iteration,
+    # cleanup reads if the consumer abandons after setup.
+    _shared: dict[str, Any] = {"state_store": state_store, "sequencer": EventSequencer()}
+
+    async def _generate() -> AsyncGenerator[RunEvent, None]:
+        """Inner generator — lazy async setup, then loop stream with lifecycle.
+
+        The entire body is wrapped in try/except so that setup failures
+        (state_store_resolver, create_run, observer init) are also caught
+        and yielded as RUN_ERROR — honoring the "no exception to consumer" contract.
+        """
+        # store is captured in the closure for the error handler.
+        # Starts as the pre-provided value (often None for the lazy path).
+        store = state_store
+        sequencer = _shared["sequencer"]
+
+        try:
+            # 1. Resolve state store lazily (may create DB engine)
+            if store is None and state_store_resolver is not None:
+                store = await state_store_resolver()
+            _shared["state_store"] = store
+
+            observer = None
+
+            if store is not None:
+                redacted_input = redact(user_input) if redact else user_input
+                await store.create_run(
+                    run_id,
+                    agent.name,
+                    input_data={"input": redacted_input},
+                    model=provider.model,
+                    strategy=type(resolved_strategy).__name__,
+                    tenant_id=tenant_id,
+                    meta=metadata,
+                )
+
+                from dendrux.runtime.observer import PersistenceObserver
+                from dendrux.tool import get_tool_def
+
+                target_lookup = {}
+                for fn in agent.tools:
+                    td = get_tool_def(fn)
+                    target_lookup[td.name] = td.target
+                observer = PersistenceObserver(
+                    store,
+                    run_id,
+                    model=provider.model,
+                    provider_name=type(provider).__name__,
+                    target_lookup=target_lookup,
+                    redact=redact,
+                    event_sequencer=sequencer,
+                )
+
+            composed_observer = observer
+            if extra_observer is not None:
+                from dendrux.observers.composite import CompositeObserver
+
+                if observer is not None:
+                    composed_observer = CompositeObserver([observer, extra_observer])
+                else:
+                    composed_observer = extra_observer
+
+            # 2. Emit lifecycle start
+            await _emit_event(
+                store,
+                run_id,
+                "run.started",
+                sequencer,
+                {"agent_name": agent.name, "system_prompt": agent.prompt},
+            )
+
+            yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
+
+            # 3. Stream the loop
+            async for event in resolved_loop.run_stream(
+                agent=agent,
+                provider=provider,
+                strategy=resolved_strategy,
+                user_input=user_input,
+                run_id=run_id,
+                observer=composed_observer,
+                provider_kwargs=provider_kwargs or None,
+            ):
+                # Persist loop outcomes before forwarding
+                if event.type == RunEventType.RUN_COMPLETED and event.run_result:
+                    if store is not None:
+                        result = event.run_result
+                        redacted_answer = (
+                            redact(result.answer) if redact and result.answer else result.answer
+                        )
+                        finalize_won = await store.finalize_run(
+                            run_id,
+                            status=result.status.value,
+                            answer=redacted_answer,
+                            iteration_count=result.iteration_count,
+                            total_usage=result.usage,
+                            expected_current_status="running",
+                        )
+                        if finalize_won:
+                            await _emit_event(
+                                store,
+                                run_id,
+                                "run.completed",
+                                sequencer,
+                                {"status": result.status.value},
+                            )
+                    yield event
+
+                elif event.type == RunEventType.RUN_PAUSED and event.run_result:
+                    if store is not None:
+                        result = event.run_result
+                        pause_state_obj: PauseState = result.meta["pause_state"]
+                        await store.pause_run(
+                            run_id,
+                            status=result.status.value,
+                            pause_data=pause_state_obj.to_dict(),
+                            iteration_count=result.iteration_count,
+                        )
+                        await _emit_event(
+                            store,
+                            run_id,
+                            "run.paused",
+                            sequencer,
+                            {
+                                "status": result.status.value,
+                                "pending_tool_calls": [
+                                    {
+                                        "id": tc.id,
+                                        "name": tc.name,
+                                        "target": pause_state_obj.pending_targets.get(tc.id),
+                                    }
+                                    for tc in pause_state_obj.pending_tool_calls
+                                ],
+                            },
+                        )
+                    yield event
+
+                else:
+                    # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
+                    yield event
+
+        except Exception as exc:
+            # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
+            # Covers both setup failures and loop execution errors.
+            if store is not None:
+                error_won = False
+                try:
+                    redacted_err = redact(str(exc)) if redact else str(exc)
+                    error_won = await store.finalize_run(
+                        run_id,
+                        status=RunStatus.ERROR.value,
+                        error=redacted_err,
+                        total_usage=None,
+                        expected_current_status="running",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist ERROR status for run %s", run_id, exc_info=True
+                    )
+                if error_won:
+                    await _emit_event(
+                        store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                    )
+
+            yield RunEvent(
+                type=RunEventType.RUN_ERROR,
+                run_result=RunResult(
+                    run_id=run_id,
+                    status=RunStatus.ERROR,
+                    error=str(exc),
+                ),
+                error=str(exc),
+            )
+
+    async def _cleanup() -> None:
+        """CAS-guarded cancellation — only if run is still RUNNING.
+
+        Uses the shared state dict to access the state store resolved
+        by the generator. If the generator never started, state_store
+        is None (or the pre-provided value) and cleanup is a no-op for
+        the lazy case.
+        """
+        store = _shared.get("state_store")
+        sequencer = _shared.get("sequencer")
+        if store is not None:
+            try:
+                cancel_won = await store.finalize_run(
+                    run_id,
+                    status=RunStatus.CANCELLED.value,
+                    expected_current_status="running",
+                )
+                if cancel_won and sequencer:
+                    await _emit_event(
+                        store, run_id, "run.cancelled", sequencer, {}
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to cancel run %s during stream cleanup", run_id, exc_info=True
+                )
+
+    return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
 
 
 async def resume(

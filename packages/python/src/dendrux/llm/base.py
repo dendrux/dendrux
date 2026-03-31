@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from dendrux.types import ProviderCapabilities, StreamEvent, StreamEventType
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from dendrux.types import LLMResponse, Message, ToolDef
 
@@ -87,7 +87,7 @@ class LLMProvider(ABC):
         messages: list[Message],
         tools: list[ToolDef] | None = None,
         **kwargs: Any,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events.
 
         Default implementation calls complete() and yields the result as a

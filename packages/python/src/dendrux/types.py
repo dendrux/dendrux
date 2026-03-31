@@ -12,11 +12,17 @@ Data flow:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, Callable, Coroutine
 
 from ulid import ULID
+
+logger = logging.getLogger(__name__)
 
 
 def generate_ulid() -> str:
@@ -486,3 +492,165 @@ class StreamEvent:
     tool_name: str | None = None
     tool_call_id: str | None = None
     raw: Any = None
+
+
+# ------------------------------------------------------------------
+# Run-level streaming types
+# ------------------------------------------------------------------
+
+
+class RunEventType(StrEnum):
+    """Types of events emitted during agent.stream().
+
+    These span the full multi-turn run, not just one LLM call.
+
+    Lifecycle events (runner-owned):
+        RUN_STARTED: First event. Carries run_id for correlation.
+        RUN_COMPLETED: Terminal. Run finished (success or max_iterations).
+        RUN_PAUSED: Terminal. Run paused for client tool or human input.
+        RUN_ERROR: Terminal. Run failed. No exception is raised to the consumer.
+
+    LLM output events (translated from provider StreamEvent):
+        TEXT_DELTA: Incremental text token from the LLM.
+        TOOL_USE_START: A tool call block has begun (name known, args pending).
+        TOOL_USE_END: A tool call is fully assembled.
+
+    Execution events (loop-owned):
+        TOOL_RESULT: A tool has been executed and its result is available.
+    """
+
+    # Lifecycle (runner-owned)
+    RUN_STARTED = "run_started"
+    RUN_COMPLETED = "run_completed"
+    RUN_PAUSED = "run_paused"
+    RUN_ERROR = "run_error"
+
+    # LLM output (translated from provider StreamEvent)
+    TEXT_DELTA = "text_delta"
+    TOOL_USE_START = "tool_use_start"
+    TOOL_USE_END = "tool_use_end"
+
+    # Execution (loop-owned)
+    TOOL_RESULT = "tool_result"
+
+
+# Terminal event types — after any of these, the stream ends.
+_TERMINAL_RUN_EVENTS = frozenset(
+    {RunEventType.RUN_COMPLETED, RunEventType.RUN_PAUSED, RunEventType.RUN_ERROR}
+)
+
+
+@dataclass(frozen=True)
+class RunEvent:
+    """A single event from agent.stream().
+
+    Carries data relevant to its type:
+        RUN_STARTED:   run_id
+        TEXT_DELTA:     text
+        TOOL_USE_START: tool_name, tool_call_id
+        TOOL_USE_END:   tool_call, tool_name, tool_call_id
+        TOOL_RESULT:    tool_call, tool_result
+        RUN_COMPLETED:  run_result
+        RUN_PAUSED:     run_result (pause state in run_result.meta)
+        RUN_ERROR:      run_result, error
+    """
+
+    type: RunEventType
+    text: str | None = None
+    tool_call: ToolCall | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    tool_result: ToolResult | None = None
+    run_result: RunResult | None = None
+    run_id: str | None = None
+    error: str | None = None
+
+
+class RunStream:
+    """Async iterable of RunEvents with lifecycle management.
+
+    Single-use: iterating twice raises RuntimeError.
+
+    Cleanup: ``__aiter__`` returns an async generator wrapper whose
+    ``finally`` block runs CAS-guarded cancellation if no terminal event
+    was received. The cleanup fires reliably in these cases:
+
+      - The generator is exhausted normally (all events consumed).
+      - The consumer calls ``await stream.aclose()`` explicitly.
+      - The consumer uses ``async with stream:`` — **recommended**
+        for deterministic immediate cleanup on break or exception.
+
+    After ``async for ...: break`` without ``async with``, cleanup
+    depends on asyncio's async generator finalization hooks, which
+    schedule cleanup when the wrapper is garbage-collected. This is
+    **not immediate** and not guaranteed before the event loop ends.
+    For production use, prefer ``async with``::
+
+        async with agent.stream("task") as stream:
+            async for event in stream:
+                if done:
+                    break  # __aexit__ guarantees immediate cleanup
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        generator: AsyncGenerator[RunEvent, None],
+        cleanup: Callable[[], Coroutine[Any, Any, None]],
+    ) -> None:
+        self.run_id = run_id
+        self._gen = generator
+        self._cleanup = cleanup
+        self._terminated = False
+        self._started = False
+        self._closed = False
+
+    def __aiter__(self) -> AsyncGenerator[RunEvent, None]:
+        if self._started:
+            raise RuntimeError("RunStream is single-use; cannot iterate twice")
+        self._started = True
+        return self._wrap()
+
+    async def _wrap(self) -> AsyncGenerator[RunEvent, None]:
+        """Async generator wrapper — cleanup runs in the finally block.
+
+        Fires reliably on exhaustion and explicit ``aclose()``.
+        After ``break`` without ``async with``, depends on asyncio's
+        async gen finalization hooks (non-deterministic timing).
+        """
+        try:
+            async for event in self._gen:
+                if event.type in _TERMINAL_RUN_EVENTS:
+                    self._terminated = True
+                yield event
+        finally:
+            await self._finalize()
+
+    async def __aenter__(self) -> RunStream:
+        """Enter async context — for deterministic immediate cleanup."""
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the stream. Idempotent — safe to call multiple times."""
+        await self._finalize()
+
+    async def _finalize(self) -> None:
+        """Run cleanup exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        if not self._terminated:
+            try:
+                await self._cleanup()
+            except Exception:
+                logger.warning("RunStream cleanup failed", exc_info=True)
+        await self._gen.aclose()
+
+    async def text(self) -> AsyncGenerator[str, None]:
+        """Convenience filter — yields only text deltas as plain strings."""
+        async for event in self:
+            if event.type == RunEventType.TEXT_DELTA and event.text:
+                yield event.text

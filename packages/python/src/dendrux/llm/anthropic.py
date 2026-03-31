@@ -28,7 +28,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from dendrux.types import Message, ToolDef
 
@@ -185,7 +185,7 @@ class AnthropicProvider(LLMProvider):
         messages: list[Message],
         tools: list[ToolDef] | None = None,
         **kwargs: Any,
-    ) -> AsyncIterator[StreamEvent]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events, token by token.
 
         Text deltas are yielded immediately as they arrive.
