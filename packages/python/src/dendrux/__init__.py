@@ -1,6 +1,6 @@
 """Dendrux — The runtime for agents that act in the real world."""
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 from dendrux.agent import Agent
 from dendrux.bridge import bridge

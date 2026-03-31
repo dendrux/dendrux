@@ -90,4 +90,4 @@ result.error           # str | None — error message if status is ERROR
 
 ## Full Documentation
 
-See the [main README](../../README.md) for provider setup, configuration, database guide, CLI, dashboard, observer system, and examples.
+See the [full documentation on GitHub](https://github.com/dendrux/dendrux) for provider setup, configuration, database guide, CLI, dashboard, observer system, and examples.
