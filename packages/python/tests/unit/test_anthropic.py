@@ -893,3 +893,27 @@ class TestCompleteStream:
                 [Message(role=Role.USER, content="Hi")]
             ):
                 pass
+
+    async def test_malformed_tool_json_falls_back_to_empty_params(
+        self, provider: AnthropicProvider
+    ) -> None:
+        """Malformed JSON in tool call fragments falls back to empty params."""
+        final_msg = _make_anthropic_response(
+            [ToolUseBlock(type="tool_use", id="t1", name="broken", input={})],
+            stop_reason="tool_use",
+        )
+        # Send broken JSON fragments that won't parse
+        events = self._tool_events("broken", "t1", ['{"a": ', "INVALID"])
+        fake_stream = _FakeStream(events, final_msg)
+
+        provider._client.messages.stream = MagicMock(return_value=fake_stream)
+
+        collected = []
+        async for event in provider.complete_stream(
+            [Message(role=Role.USER, content="Hi")]
+        ):
+            collected.append(event)
+
+        tool_end = [e for e in collected if e.type == StreamEventType.TOOL_USE_END][0]
+        assert tool_end.tool_call.params == {}
+        assert tool_end.tool_call.name == "broken"
