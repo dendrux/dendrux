@@ -25,7 +25,7 @@ export function RunHeader({ summary }: RunHeaderProps) {
             <span className="material-symbols-outlined text-white text-xl">account_tree</span>
           </div>
           <h1 className="text-base sm:text-lg font-bold tracking-tight text-text-primary whitespace-nowrap">
-            Dendrite <span className="text-text-muted font-light">Run</span>
+            Dendrux <span className="text-text-muted font-light">Run</span>
           </h1>
         </button>
 

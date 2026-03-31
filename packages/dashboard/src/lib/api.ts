@@ -1,11 +1,11 @@
-/** API client for the Dendrite dashboard. */
+/** API client for the Dendrux dashboard. */
 
 import type { LLMCallsResponse, RunDetailResponse, RunListResponse } from "./types";
 
 /**
  * Resolve the API base URL.
  *
- * When served standalone (`dendrite dashboard`), the page is at `/` and API at `/api`.
+ * When served standalone (`dendrux dashboard`), the page is at `/` and API at `/api`.
  * When mounted as a sub-app (e.g. `/dashboard`), the page is at `/dashboard/`
  * and API at `/dashboard/api`.
  *

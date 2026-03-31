@@ -143,7 +143,7 @@ function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
       {/* Semantic / Provider toggle — same interaction, two views */}
       <div className="px-5 py-3 border-b border-white/[0.06] flex items-center justify-between">
         <span className="text-xs text-text-muted">
-          {viewMode === "semantic" ? "Dendrite semantics" : "Vendor wire format"}
+          {viewMode === "semantic" ? "Dendrux semantics" : "Vendor wire format"}
         </span>
         <div className="flex gap-1.5">
           <ToggleButton active={viewMode === "semantic"} onClick={() => setViewMode("semantic")} icon="neurology" label="Semantic" />
@@ -178,7 +178,7 @@ function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
           </div>
         )
       ) : (
-        /* ---- SEMANTIC VIEW — Dendrite's normalized payloads ---- */
+        /* ---- SEMANTIC VIEW — Dendrux's normalized payloads ---- */
         <>
           {/* Persisted semantic request (full-fidelity from llm_interactions) */}
           {interaction?.semantic_request ? (

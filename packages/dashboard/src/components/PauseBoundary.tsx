@@ -1,5 +1,5 @@
 /**
- * PauseBoundary — the signature Dendrite component.
+ * PauseBoundary — the signature Dendrux component.
  *
  * Centered. Dramatic. The flow line stops, the segment breathes,
  * the duration is the largest number on the page.

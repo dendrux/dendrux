@@ -38,7 +38,7 @@ export function RunsList() {
           </div>
           <div>
             <h1 className="text-lg font-bold tracking-tight text-text-primary">
-              Dendrite <span className="text-text-muted font-light">Dashboard</span>
+              Dendrux <span className="text-text-muted font-light">Dashboard</span>
             </h1>
           </div>
         </div>
