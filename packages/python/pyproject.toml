@@ -95,6 +95,10 @@ module = "anthropic.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "openai.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "sqlalchemy.*"
 ignore_missing_imports = true
 

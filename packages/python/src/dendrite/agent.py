@@ -265,6 +265,8 @@ class Agent:
         *,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        observer: Any | None = None,
+        **kwargs: Any,
     ) -> RunResult:
         """Start a new agent run.
 
@@ -275,6 +277,10 @@ class Agent:
             user_input: The user's input to process.
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
+            observer: Optional observer for lifecycle events (e.g. ConsoleObserver
+                for terminal output, custom observers for Slack/Telegram/etc.).
+                Composed with PersistenceObserver internally if persistence is enabled.
+            **kwargs: Forwarded to the LLM provider (temperature, max_tokens, etc.).
 
         Returns:
             RunResult with status, answer, steps, and usage stats.
@@ -297,6 +303,7 @@ class Agent:
             tenant_id=tenant_id,
             metadata=metadata,
             redact=self._redact,
+            extra_observer=observer,
         )
 
     async def resume(

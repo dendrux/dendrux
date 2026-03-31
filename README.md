@@ -508,6 +508,9 @@ packages/python/
 | Agent loop + ReAct reasoning | ✅ Shipped |
 | Tool calling (sync + async, timeouts) | ✅ Shipped |
 | Anthropic Claude provider | ✅ Shipped |
+| OpenAI Chat Completions provider | ✅ Shipped |
+| OpenAI Responses API provider | ⚠️ Shipped (reasoning model tool loops limited) |
+| Compatible API support (vLLM, SGLang, Groq, Ollama) | ✅ Shipped (via OpenAIProvider base_url) |
 | SQLite + Postgres persistence | ✅ Shipped |
 | CLI (traces, runs, db, dashboard) | ✅ Shipped |
 | Token usage tracking + redaction | ✅ Shipped |
@@ -515,9 +518,10 @@ packages/python/
 | Bridge transport (SSE + persist-first handoff) | ⚠️ Experimental |
 | Run-scoped HMAC auth | ✅ Shipped |
 | Agent API (provider, database_url, run/resume) | ✅ Shipped |
+| Parallel tool execution + max_calls_per_run | ✅ Shipped |
 | Token-level streaming (agent.stream()) | 🔜 Planned |
 | TypeScript client SDK | 🔜 Planned |
-| OpenAI + multi-provider support | 🔜 Planned |
+| Gemini provider | 🔜 Planned |
 | Tool sandbox / isolation | 🔜 Planned |
 
 ---

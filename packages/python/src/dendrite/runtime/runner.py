@@ -95,6 +95,7 @@ async def run(
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     redact: Callable[[str], str] | None = None,
+    extra_observer: Any | None = None,
     **kwargs: Any,
 ) -> RunResult:
     """Run an agent to completion.
@@ -180,6 +181,16 @@ async def run(
             event_sequencer=sequencer,
         )
 
+    # Compose with extra observer (e.g. ConsoleObserver, TransportObserver)
+    composed_observer = observer
+    if extra_observer is not None:
+        from dendrite.observers.composite import CompositeObserver
+
+        if observer is not None:
+            composed_observer = CompositeObserver([observer, extra_observer])
+        else:
+            composed_observer = extra_observer
+
     await _emit_event(
         state_store,
         run_id,
@@ -195,7 +206,7 @@ async def run(
             strategy=resolved_strategy,
             user_input=user_input,
             run_id=run_id,
-            observer=observer,
+            observer=composed_observer,
         )
 
         if state_store is not None:
@@ -482,7 +493,7 @@ async def _resume_core(
     # Compose with extra observer (e.g. TransportObserver for SSE)
     observer: Any
     if extra_observer is not None:
-        from dendrite.bridge.observer import CompositeObserver
+        from dendrite.observers.composite import CompositeObserver
 
         observer = CompositeObserver([persistence_obs, extra_observer])
     else:

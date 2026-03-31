@@ -1,0 +1,384 @@
+"""OpenAI Responses API provider.
+
+Thin adapter between Dendrite's universal types and the OpenAI Responses API.
+Use this provider when you need OpenAI's built-in tools (web_search,
+code_interpreter, file_search) alongside custom Dendrite tools.
+
+For standard function calling without built-in tools, use OpenAIProvider
+(Chat Completions) instead — it works with any OpenAI-compatible API.
+
+No business logic, no agent loop awareness. Just shape translation.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING, Any
+
+import httpx
+import openai
+
+from dendrite.llm.base import LLMProvider
+from dendrite.types import (
+    LLMResponse,
+    ProviderCapabilities,
+    Role,
+    ToolCall,
+    UsageStats,
+)
+
+if TYPE_CHECKING:
+    from dendrite.types import Message, ToolDef
+
+# Responses-API kwargs that complete() will forward.
+_SUPPORTED_KWARGS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "max_output_tokens",
+        "model",
+        "tool_choice",
+    }
+)
+
+# Built-in tool types supported via builtin_tools parameter.
+# Only web_search_preview works with a bare {"type": "..."} dict.
+# code_interpreter and file_search require additional config (container,
+# vector_store_ids) — pass them directly via complete() kwargs when needed.
+_BUILTIN_TOOL_TYPES = frozenset({"web_search_preview"})
+
+
+class OpenAIResponsesProvider(LLMProvider):
+    """OpenAI Responses API provider.
+
+    Use this when you need OpenAI's built-in tools (web search)
+    alongside custom Dendrite function tools.
+
+    For standard function calling without built-in tools, use
+    OpenAIProvider (Chat Completions) instead.
+
+    Limitation — reasoning models with tool calling:
+        Reasoning models (o-series, GPT-5) may return internal reasoning
+        items alongside function calls. Dendrite's Message type does not
+        preserve these items between turns, so multi-turn tool calling
+        with reasoning models may lose context. For reasoning models
+        without tool calling, or for non-reasoning models with tools,
+        this provider works correctly. This will be fixed when Dendrite
+        adds first-class thinking/reasoning support.
+
+    Usage:
+        # With built-in web search + custom tools
+        provider = OpenAIResponsesProvider(
+            model="gpt-4o",
+            builtin_tools=["web_search_preview"],
+        )
+
+        # With reasoning effort (o-series / GPT-5)
+        provider = OpenAIResponsesProvider(
+            model="gpt-5",
+            reasoning_effort="medium",
+        )
+    """
+
+    capabilities = ProviderCapabilities(
+        supports_native_tools=True,
+        supports_tool_call_ids=True,
+        supports_streaming=False,
+        supports_streaming_tool_deltas=False,
+        supports_thinking=False,
+        supports_multimodal=False,
+        supports_system_prompt=True,
+        supports_parallel_tool_calls=True,
+        max_context_tokens=200_000,
+    )
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None = None,
+        builtin_tools: list[str] | None = None,
+        max_output_tokens: int = 16_000,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+    ) -> None:
+        """Create an OpenAI Responses API provider.
+
+        Args:
+            model: Model identifier (e.g. "gpt-4o", "gpt-5").
+            api_key: API key. Defaults to OPENAI_API_KEY env var.
+            builtin_tools: OpenAI built-in tools to enable (e.g. "web_search_preview").
+            max_output_tokens: Maximum output tokens per call. Override per-call.
+            temperature: Sampling temperature. None = model default.
+            reasoning_effort: Reasoning depth ("low", "medium", "high").
+            timeout: HTTP request timeout in seconds.
+            max_retries: Number of automatic retries on transient errors.
+        """
+        for t in builtin_tools or []:
+            if t not in _BUILTIN_TOOL_TYPES:
+                raise ValueError(
+                    f"Unknown built-in tool '{t}'. "
+                    f"Supported: {', '.join(sorted(_BUILTIN_TOOL_TYPES))}"
+                )
+
+        self._client = openai.AsyncOpenAI(
+            api_key=api_key,
+            timeout=httpx.Timeout(timeout, connect=10.0),
+            max_retries=max_retries,
+        )
+        self._model = model
+        self._builtin_tools = builtin_tools or []
+        self._max_output_tokens = max_output_tokens
+        self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
+        self._timeout = timeout
+
+    @property
+    def model(self) -> str:
+        """The model identifier this provider is configured to use."""
+        return self._model
+
+    def __repr__(self) -> str:
+        parts = [f"model={self._model!r}"]
+        if self._builtin_tools:
+            parts.append(f"builtin_tools={self._builtin_tools!r}")
+        return f"OpenAIResponsesProvider({', '.join(parts)})"
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client and release connections."""
+        await self._client.close()
+
+    async def __aenter__(self) -> OpenAIResponsesProvider:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDef] | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Send messages to the model via the Responses API.
+
+        kwargs override constructor defaults (e.g. model, max_output_tokens).
+        Only supported kwargs are forwarded; unknown keys are ignored.
+        """
+        instructions, input_items = self._convert_messages(messages)
+        api_tools = self._build_tools(tools)
+
+        max_output_tokens = kwargs.pop(
+            "max_output_tokens", kwargs.pop("max_tokens", self._max_output_tokens),
+        )
+
+        api_kwargs: dict[str, Any] = {
+            "model": kwargs.pop("model", self._model),
+            "input": input_items,
+            "max_output_tokens": max_output_tokens,
+        }
+
+        # Only pass instructions if non-empty
+        if instructions:
+            api_kwargs["instructions"] = instructions
+
+        # Only pass tools if non-empty
+        if api_tools:
+            api_kwargs["tools"] = api_tools
+
+        # Apply constructor defaults for optional params (per-call kwargs override)
+        for attr, key in [
+            (self._temperature, "temperature"),
+        ]:
+            if key in kwargs:
+                api_kwargs[key] = kwargs.pop(key)
+            elif attr is not None:
+                api_kwargs[key] = attr
+
+        # Handle reasoning_effort — Responses API uses nested reasoning object
+        reasoning_effort = kwargs.pop("reasoning_effort", self._reasoning_effort)
+        if reasoning_effort is not None:
+            api_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+        # Forward remaining supported kwargs
+        already_handled = {
+            "model", "max_output_tokens", "max_tokens", "temperature",
+        }
+        for key in _SUPPORTED_KWARGS - already_handled:
+            if key in kwargs:
+                api_kwargs[key] = kwargs.pop(key)
+
+        # Capture provider request payload
+        captured_request = dict(api_kwargs)
+
+        try:
+            response = await self._client.responses.create(**api_kwargs)
+        except openai.APITimeoutError:
+            raise TimeoutError(
+                f"LLM request timed out after {self._timeout}s. "
+                f"The model may need more time for large outputs. "
+                f"Increase timeout: OpenAIResponsesProvider(model=..., timeout=300)"
+            ) from None
+
+        llm_response = self._normalize_response(response)
+
+        # Attach adapter-boundary payloads for evidence layer
+        llm_response.provider_request = captured_request
+        llm_response.provider_response = response.model_dump()
+
+        return llm_response
+
+    # ------------------------------------------------------------------
+    # Outbound conversions: Dendrite → OpenAI Responses API
+    # ------------------------------------------------------------------
+
+    def _convert_messages(self, messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:
+        """Convert Dendrite messages to Responses API input format.
+
+        Returns (instructions, input_items) where:
+          - SYSTEM messages → joined into instructions string
+          - USER → {role: "user", content: ...}
+          - ASSISTANT → {role: "assistant", content: ...}
+          - ASSISTANT with tool_calls → function_call items
+          - TOOL → function_call_output items
+        """
+        instructions_parts: list[str] = []
+        input_items: list[dict[str, Any]] = []
+
+        # Build provider ID index: Dendrite call_id → ToolCall
+        call_index: dict[str, ToolCall] = {}
+        for msg in messages:
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.id in call_index:
+                        raise ValueError(
+                            f"Duplicate Dendrite call_id '{tc.id}' in conversation "
+                            f"history. Tool calls must have unique IDs."
+                        )
+                    call_index[tc.id] = tc
+
+        for msg in messages:
+            if msg.role == Role.SYSTEM:
+                instructions_parts.append(msg.content)
+
+            elif msg.role == Role.USER:
+                input_items.append({"role": "user", "content": msg.content})
+
+            elif msg.role == Role.ASSISTANT:
+                if msg.tool_calls:
+                    # Emit text content if present
+                    if msg.content:
+                        input_items.append({"role": "assistant", "content": msg.content})
+                    # Emit function_call items
+                    for tc in msg.tool_calls:
+                        input_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": tc.provider_tool_call_id or tc.id,
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.params),
+                            }
+                        )
+                else:
+                    input_items.append({"role": "assistant", "content": msg.content})
+
+            elif msg.role == Role.TOOL:
+                if msg.call_id is None:
+                    raise ValueError(
+                        "TOOL message missing call_id — this violates Message.__post_init__"
+                    )
+                original_call = call_index.get(msg.call_id)
+                if original_call is None:
+                    raise ValueError(
+                        f"TOOL message references call_id '{msg.call_id}' "
+                        f"but no matching ToolCall found in conversation history."
+                    )
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": original_call.provider_tool_call_id or original_call.id,
+                        "output": msg.content,
+                    }
+                )
+
+        instructions = "\n\n".join(instructions_parts)
+        return instructions, input_items
+
+    def _build_tools(self, dendrite_tools: list[ToolDef] | None) -> list[dict[str, Any]]:
+        """Build the tools array: built-in tools + Dendrite function tools."""
+        api_tools: list[dict[str, Any]] = []
+
+        # Add built-in tools (web_search, code_interpreter, etc.)
+        for builtin in self._builtin_tools:
+            api_tools.append({"type": builtin})
+
+        # Add Dendrite function tools (flatter format than Chat Completions)
+        if dendrite_tools:
+            for td in dendrite_tools:
+                api_tools.append(
+                    {
+                        "type": "function",
+                        "name": td.name,
+                        "description": td.description,
+                        "parameters": td.parameters,
+                    }
+                )
+
+        return api_tools
+
+    # ------------------------------------------------------------------
+    # Inbound conversions: OpenAI Responses → Dendrite
+    # ------------------------------------------------------------------
+
+    def _normalize_response(self, response: Any) -> LLMResponse:
+        """Convert Responses API response to Dendrite LLMResponse.
+
+        The response.output is a list of items. We extract:
+          - output_text items → text
+          - function_call items → ToolCall list
+          - Built-in tool outputs (web_search results, etc.) are consumed
+            by the model internally — they don't appear as ToolCalls.
+        """
+        text = response.output_text if hasattr(response, "output_text") else None
+
+        # Extract function calls from output items
+        tool_calls: list[ToolCall] = []
+        for item in response.output:
+            if getattr(item, "type", None) == "function_call":
+                if item.arguments:
+                    try:
+                        params = json.loads(item.arguments)
+                    except json.JSONDecodeError as e:
+                        raise ValueError(
+                            f"Tool call '{item.name}' (call_id={item.call_id}) returned "
+                            f"invalid JSON arguments: {item.arguments!r}"
+                        ) from e
+                    if not isinstance(params, dict):
+                        params = {}
+                else:
+                    params = {}
+                tool_calls.append(
+                    ToolCall(
+                        name=item.name,
+                        params=params,
+                        provider_tool_call_id=item.call_id,
+                    )
+                )
+
+        # Extract usage
+        usage = UsageStats()
+        if hasattr(response, "usage") and response.usage:
+            usage = UsageStats(
+                input_tokens=getattr(response.usage, "input_tokens", 0),
+                output_tokens=getattr(response.usage, "output_tokens", 0),
+                total_tokens=getattr(response.usage, "total_tokens", 0),
+            )
+
+        return LLMResponse(
+            text=text if text else None,
+            tool_calls=tool_calls if tool_calls else None,
+            raw=response,
+            usage=usage,
+        )
