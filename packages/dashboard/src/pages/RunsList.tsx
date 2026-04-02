@@ -27,15 +27,22 @@ function buildTreeOrder(runs: RunListItem[]): RunListItem[] {
     }
   }
 
+  // Recursively insert descendants after each parent
+  function insertWithDescendants(run: RunListItem, result: RunListItem[]) {
+    result.push(run);
+    const children = childrenOf.get(run.run_id);
+    if (children) {
+      for (const child of children) {
+        insertWithDescendants(child, result);
+      }
+    }
+  }
+
   const result: RunListItem[] = [];
   for (const run of runs) {
     // Root: no parent, or parent outside current page
     if (!run.parent_run_id || !runIds.has(run.parent_run_id)) {
-      result.push(run);
-      const children = childrenOf.get(run.run_id);
-      if (children) {
-        result.push(...children);
-      }
+      insertWithDescendants(run, result);
     }
   }
 

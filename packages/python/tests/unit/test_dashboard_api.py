@@ -205,6 +205,34 @@ class TestListRuns:
             resp = await client.get("/api/runs")
             assert resp.json()["runs"][0]["pause_count"] == 2
 
+    async def test_list_runs_includes_delegation_fields(self) -> None:
+        """API returns parent_run_id and delegation_level for each run."""
+        store = DashboardMockStore(
+            _runs=[
+                _Run(id="parent", agent_name="Orchestrator", status="success"),
+                _Run(
+                    id="child",
+                    agent_name="Worker",
+                    status="success",
+                    parent_run_id="parent",
+                    delegation_level=1,
+                ),
+            ],
+        )
+        app = create_dashboard_api(store)  # type: ignore[arg-type]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/runs")
+            runs = resp.json()["runs"]
+
+            parent = next(r for r in runs if r["run_id"] == "parent")
+            assert parent["parent_run_id"] is None
+            assert parent["delegation_level"] == 0
+
+            child = next(r for r in runs if r["run_id"] == "child")
+            assert child["parent_run_id"] == "parent"
+            assert child["delegation_level"] == 1
+
     async def test_filter_by_status(self) -> None:
         store = DashboardMockStore(
             _runs=[
