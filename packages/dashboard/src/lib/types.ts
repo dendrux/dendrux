@@ -160,6 +160,8 @@ export interface RunListItem {
   total_output_tokens: number;
   total_cost_usd: number | null;
   model: string | null;
+  parent_run_id: string | null;
+  delegation_level: number;
   pause_count: number;
   created_at: string | null;
   updated_at: string | null;

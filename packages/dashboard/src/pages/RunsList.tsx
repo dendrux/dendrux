@@ -6,6 +6,41 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchRuns } from "@/lib/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { formatTokens, formatCost, formatRelativeTime } from "@/lib/format";
+import type { RunListItem } from "@/lib/types";
+
+/**
+ * Build a tree-ordered list from flat runs.
+ *
+ * Roots (no parent) come first in their original order. After each root,
+ * its direct children are inserted (same order as the API returned them).
+ * Runs whose parent is outside the current page are treated as roots.
+ */
+function buildTreeOrder(runs: RunListItem[]): RunListItem[] {
+  const runIds = new Set(runs.map((r) => r.run_id));
+  const childrenOf = new Map<string, RunListItem[]>();
+
+  for (const run of runs) {
+    if (run.parent_run_id && runIds.has(run.parent_run_id)) {
+      const siblings = childrenOf.get(run.parent_run_id) ?? [];
+      siblings.push(run);
+      childrenOf.set(run.parent_run_id, siblings);
+    }
+  }
+
+  const result: RunListItem[] = [];
+  for (const run of runs) {
+    // Root: no parent, or parent outside current page
+    if (!run.parent_run_id || !runIds.has(run.parent_run_id)) {
+      result.push(run);
+      const children = childrenOf.get(run.run_id);
+      if (children) {
+        result.push(...children);
+      }
+    }
+  }
+
+  return result;
+}
 
 export function RunsList() {
   const navigate = useNavigate();
@@ -23,7 +58,8 @@ export function RunsList() {
     refetchInterval: 10_000,
   });
 
-  const runs = data?.runs ?? [];
+  const rawRuns = data?.runs ?? [];
+  const runs = buildTreeOrder(rawRuns);
   const pausedRuns = runs.filter(
     (r) => r.status === "waiting_client_tool" || r.status === "waiting_human_input"
   );
@@ -109,40 +145,60 @@ export function RunsList() {
               </tr>
             </thead>
             <tbody>
-              {runs.map((run) => (
-                <tr
-                  key={run.run_id}
-                  onClick={() => navigate(`/runs/${run.run_id}`)}
-                  className="border-b border-border-soft/50 hover:bg-surface cursor-pointer transition-colors duration-100"
-                >
-                  <td className="px-4 sm:px-6 py-3">
-                    <div className="text-sm text-text-primary font-medium">{run.agent_name}</div>
-                    <div className="text-[10px] text-text-muted font-mono mt-0.5">{run.run_id}</div>
-                  </td>
-                  <td className="px-3 py-3">
-                    <StatusBadge status={run.status} />
-                  </td>
-                  <td className="px-3 py-3 text-right text-xs text-text-secondary font-mono">
-                    {run.iteration_count}
-                  </td>
-                  <td className="px-3 py-3 text-right text-xs text-text-secondary font-mono">
-                    {formatTokens(run.total_input_tokens + run.total_output_tokens)}
-                  </td>
-                  <td className="px-3 py-3 text-right text-xs text-text-secondary font-mono">
-                    {formatCost(run.total_cost_usd)}
-                  </td>
-                  <td className="px-3 py-3 text-right text-xs font-mono">
-                    {run.pause_count > 0 ? (
-                      <span className="text-state-paused">{run.pause_count}</span>
-                    ) : (
-                      <span className="text-text-muted">0</span>
-                    )}
-                  </td>
-                  <td className="px-4 sm:px-6 py-3 text-right text-xs text-text-muted">
-                    {formatRelativeTime(run.created_at)}
-                  </td>
-                </tr>
-              ))}
+              {runs.map((run) => {
+                const isChild = run.delegation_level > 0 && run.parent_run_id;
+
+                return (
+                  <tr
+                    key={run.run_id}
+                    onClick={() => navigate(`/runs/${run.run_id}`)}
+                    className="border-b border-border-soft/50 hover:bg-surface cursor-pointer transition-colors duration-100"
+                  >
+                    <td className="px-4 sm:px-6 py-3">
+                      <div className="flex items-center gap-1.5">
+                        {isChild && (
+                          <span className="text-text-muted text-xs select-none" style={{ paddingLeft: `${(run.delegation_level - 1) * 16}px` }}>
+                            └
+                          </span>
+                        )}
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-text-primary font-medium">{run.agent_name}</span>
+                            {isChild && (
+                              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/[0.04] text-text-muted border border-white/[0.06]">
+                                L{run.delegation_level}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-text-muted font-mono mt-0.5">{run.run_id}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-3 py-3">
+                      <StatusBadge status={run.status} />
+                    </td>
+                    <td className="px-3 py-3 text-right text-xs text-text-secondary font-mono">
+                      {run.iteration_count}
+                    </td>
+                    <td className="px-3 py-3 text-right text-xs text-text-secondary font-mono">
+                      {formatTokens(run.total_input_tokens + run.total_output_tokens)}
+                    </td>
+                    <td className="px-3 py-3 text-right text-xs text-text-secondary font-mono">
+                      {formatCost(run.total_cost_usd)}
+                    </td>
+                    <td className="px-3 py-3 text-right text-xs font-mono">
+                      {run.pause_count > 0 ? (
+                        <span className="text-state-paused">{run.pause_count}</span>
+                      ) : (
+                        <span className="text-text-muted">0</span>
+                      )}
+                    </td>
+                    <td className="px-4 sm:px-6 py-3 text-right text-xs text-text-muted">
+                      {formatRelativeTime(run.created_at)}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

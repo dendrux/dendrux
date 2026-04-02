@@ -109,6 +109,8 @@ def create_dashboard_api(state_store: StateStore) -> FastAPI:
                     "total_output_tokens": r.total_output_tokens,
                     "total_cost_usd": r.total_cost_usd,
                     "model": r.model,
+                    "parent_run_id": r.parent_run_id,
+                    "delegation_level": r.delegation_level,
                     "pause_count": pause_count,
                     "created_at": _utc_iso(r.created_at),
                     "updated_at": _utc_iso(r.updated_at),
