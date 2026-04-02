@@ -10,13 +10,18 @@ No business logic, no agent loop awareness. Just shape translation.
 
 from __future__ import annotations
 
-import json
-import logging
 from typing import TYPE_CHECKING, Any
 
 import anthropic
 import httpx
 
+from dendrux.llm._helpers import (
+    build_call_index,
+    connection_error,
+    parse_tool_json_lossy,
+    resolve_tool_message_call,
+    timeout_error,
+)
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -32,8 +37,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from dendrux.types import Message, ToolDef
-
-logger = logging.getLogger(__name__)
 
 # Anthropic-specific kwargs that complete() will forward to the API.
 # Anything not in this set is silently ignored to prevent leaking
@@ -170,16 +173,9 @@ class AnthropicProvider(LLMProvider):
         try:
             response = await self._client.messages.create(**api_kwargs)
         except anthropic.APITimeoutError:
-            raise TimeoutError(
-                f"LLM request timed out after {self._timeout}s. "
-                f"The model may need more time for large outputs. "
-                f"Increase timeout: AnthropicProvider(model=..., timeout=300)"
-            ) from None
+            raise timeout_error("AnthropicProvider", self._timeout) from None
         except anthropic.APIConnectionError as exc:
-            raise ConnectionError(
-                f"Connection to Anthropic API failed. "
-                f"Model: {self._model}. Original error: {exc}"
-            ) from exc
+            raise connection_error("Anthropic API", self._model, exc) from exc
 
         llm_response = self._normalize_response(response)
 
@@ -244,22 +240,13 @@ class AnthropicProvider(LLMProvider):
                     elif event.type == "content_block_stop":
                         if _current_tool_name is not None:
                             raw_json = "".join(_current_tool_json_parts)
-                            try:
-                                params = json.loads(raw_json) if raw_json else {}
-                            except json.JSONDecodeError:
-                                logger.warning(
-                                    "Malformed tool call JSON in stream — "
-                                    "provider=%s model=%s tool=%s call_id=%s "
-                                    "raw_len=%d",
-                                    "anthropic",
-                                    self._model,
-                                    _current_tool_name,
-                                    _current_tool_id,
-                                    len(raw_json),
-                                )
-                                params = {}
-                            if not isinstance(params, dict):
-                                params = {}
+                            params = parse_tool_json_lossy(
+                                raw_json,
+                                provider="anthropic",
+                                model=self._model,
+                                tool_name=_current_tool_name,
+                                call_id=_current_tool_id or "",
+                            )
                             tc = ToolCall(
                                 name=_current_tool_name,
                                 params=params,
@@ -280,16 +267,9 @@ class AnthropicProvider(LLMProvider):
                 final_message = await stream.get_final_message()
 
         except anthropic.APITimeoutError:
-            raise TimeoutError(
-                f"LLM request timed out after {self._timeout}s. "
-                f"The model may need more time for large outputs. "
-                f"Increase timeout: AnthropicProvider(model=..., timeout=300)"
-            ) from None
+            raise timeout_error("AnthropicProvider", self._timeout) from None
         except anthropic.APIConnectionError as exc:
-            raise ConnectionError(
-                f"Connection to Anthropic API lost during streaming. "
-                f"Model: {self._model}. Original error: {exc}"
-            ) from exc
+            raise connection_error("Anthropic API", self._model, exc, streaming=True) from exc
 
         usage = UsageStats(
             input_tokens=final_message.usage.input_tokens,
@@ -326,20 +306,7 @@ class AnthropicProvider(LLMProvider):
         """
         system_parts: list[str] = []
         api_messages: list[dict[str, Any]] = []
-
-        # Build provider ID index: Dendrux call_id → ToolCall.
-        # Used to resolve provider_tool_call_id for tool_result blocks.
-        call_index: dict[str, ToolCall] = {}
-        for msg in messages:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc.id in call_index:
-                        err = (
-                            f"Duplicate Dendrux call_id '{tc.id}' in conversation "
-                            f"history. Tool calls must have unique IDs."
-                        )
-                        raise ValueError(err)
-                    call_index[tc.id] = tc
+        call_index = build_call_index(messages)
 
         for msg in messages:
             if msg.role == Role.SYSTEM:
@@ -368,17 +335,7 @@ class AnthropicProvider(LLMProvider):
                     api_messages.append({"role": "assistant", "content": msg.content})
 
             elif msg.role == Role.TOOL:
-                if msg.call_id is None:
-                    raise ValueError(
-                        "TOOL message missing call_id — this violates Message.__post_init__"
-                    )
-                original_call = call_index.get(msg.call_id)
-
-                if original_call is None:
-                    raise ValueError(
-                        f"TOOL message references call_id '{msg.call_id}' "
-                        f"but no matching ToolCall found in conversation history."
-                    )
+                original_call = resolve_tool_message_call(msg, call_index)
 
                 if original_call.provider_tool_call_id:
                     # Native tool correlation path — emit tool_result block

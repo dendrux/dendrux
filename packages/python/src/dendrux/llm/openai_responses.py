@@ -19,6 +19,14 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import openai
 
+from dendrux.llm._helpers import (
+    build_call_index,
+    connection_error,
+    parse_tool_json_lossy,
+    parse_tool_json_strict,
+    resolve_tool_message_call,
+    timeout_error,
+)
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -240,16 +248,9 @@ class OpenAIResponsesProvider(LLMProvider):
         try:
             response = await self._client.responses.create(**api_kwargs)
         except openai.APITimeoutError:
-            raise TimeoutError(
-                f"LLM request timed out after {self._timeout}s. "
-                f"The model may need more time for large outputs. "
-                f"Increase timeout: OpenAIResponsesProvider(model=..., timeout=300)"
-            ) from None
+            raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
-            raise ConnectionError(
-                f"Connection to OpenAI Responses API failed. "
-                f"Model: {self._model}. Original error: {exc}"
-            ) from exc
+            raise connection_error("OpenAI Responses API", self._model, exc) from exc
 
         llm_response = self._normalize_response(response)
 
@@ -287,15 +288,10 @@ class OpenAIResponsesProvider(LLMProvider):
                 f"Original error: {exc.message}"
             ) from exc
         except openai.APITimeoutError:
-            raise TimeoutError(
-                f"LLM request timed out after {self._timeout}s. "
-                f"The model may need more time for large outputs. "
-                f"Increase timeout: OpenAIResponsesProvider(model=..., timeout=300)"
-            ) from None
+            raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
-            raise ConnectionError(
-                f"Connection to OpenAI Responses API failed during streaming. "
-                f"Model: {self._model}. Original error: {exc}"
+            raise connection_error(
+                "OpenAI Responses API", self._model, exc, streaming=True,
             ) from exc
 
         # Accumulators for building the final LLMResponse
@@ -341,22 +337,6 @@ class OpenAIResponsesProvider(LLMProvider):
             elif event_type == "response.function_call_arguments.done":
                 item_id = event.item_id
                 raw_args = event.arguments
-                try:
-                    params = json.loads(raw_args) if raw_args else {}
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Malformed tool call JSON in stream — "
-                        "provider=%s model=%s item_id=%s raw_len=%d",
-                        "openai_responses",
-                        self._model,
-                        item_id,
-                        len(raw_args) if raw_args else 0,
-                    )
-                    params = {}
-
-                if not isinstance(params, dict):
-                    params = {}
-
                 name, call_id = _active_calls.pop(
                     item_id, ("unknown", item_id)
                 )
@@ -368,9 +348,16 @@ class OpenAIResponsesProvider(LLMProvider):
                         self._model,
                         item_id,
                     )
+                params = parse_tool_json_lossy(
+                    raw_args or "",
+                    provider="openai_responses",
+                    model=self._model,
+                    tool_name=name,
+                    call_id=call_id,
+                )
                 tc = ToolCall(
                     name=name,
-                    params=params if isinstance(params, dict) else {},
+                    params=params,
                     provider_tool_call_id=call_id,
                 )
                 tool_calls.append(tc)
@@ -433,18 +420,7 @@ class OpenAIResponsesProvider(LLMProvider):
         """
         instructions_parts: list[str] = []
         input_items: list[dict[str, Any]] = []
-
-        # Build provider ID index: Dendrux call_id → ToolCall
-        call_index: dict[str, ToolCall] = {}
-        for msg in messages:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc.id in call_index:
-                        raise ValueError(
-                            f"Duplicate Dendrux call_id '{tc.id}' in conversation "
-                            f"history. Tool calls must have unique IDs."
-                        )
-                    call_index[tc.id] = tc
+        call_index = build_call_index(messages)
 
         for msg in messages:
             if msg.role == Role.SYSTEM:
@@ -472,16 +448,7 @@ class OpenAIResponsesProvider(LLMProvider):
                     input_items.append({"role": "assistant", "content": msg.content})
 
             elif msg.role == Role.TOOL:
-                if msg.call_id is None:
-                    raise ValueError(
-                        "TOOL message missing call_id — this violates Message.__post_init__"
-                    )
-                original_call = call_index.get(msg.call_id)
-                if original_call is None:
-                    raise ValueError(
-                        f"TOOL message references call_id '{msg.call_id}' "
-                        f"but no matching ToolCall found in conversation history."
-                    )
+                original_call = resolve_tool_message_call(msg, call_index)
                 input_items.append(
                     {
                         "type": "function_call_output",
@@ -534,18 +501,11 @@ class OpenAIResponsesProvider(LLMProvider):
         tool_calls: list[ToolCall] = []
         for item in response.output:
             if getattr(item, "type", None) == "function_call":
-                if item.arguments:
-                    try:
-                        params = json.loads(item.arguments)
-                    except json.JSONDecodeError as e:
-                        raise ValueError(
-                            f"Tool call '{item.name}' (call_id={item.call_id}) returned "
-                            f"invalid JSON arguments: {item.arguments!r}"
-                        ) from e
-                    if not isinstance(params, dict):
-                        params = {}
-                else:
-                    params = {}
+                params = parse_tool_json_strict(
+                    item.arguments or "",
+                    tool_name=item.name,
+                    call_id=item.call_id,
+                )
                 tool_calls.append(
                     ToolCall(
                         name=item.name,
