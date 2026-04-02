@@ -175,7 +175,10 @@ class TestRunnerPersistence:
         meta = {"thread_id": "th_1", "user_id": "u_42"}
         await run(agent, provider=llm, user_input="go", state_store=store, metadata=meta)
 
-        assert store.created_runs[0]["meta"] == meta
+        persisted_meta = store.created_runs[0]["meta"]
+        assert persisted_meta["thread_id"] == "th_1"
+        assert persisted_meta["user_id"] == "u_42"
+        assert persisted_meta["dendrux.loop"] == "ReActLoop"
 
     async def test_passes_strategy_name(self) -> None:
         store = RecordingStateStore()

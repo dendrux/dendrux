@@ -2,5 +2,6 @@
 
 from dendrux.loops.base import Loop
 from dendrux.loops.react import ReActLoop
+from dendrux.loops.single import SingleCall
 
-__all__ = ["Loop", "ReActLoop"]
+__all__ = ["Loop", "ReActLoop", "SingleCall"]

@@ -141,7 +141,7 @@ async def run(
         print(result.answer)
     """
     resolved_strategy = strategy or NativeToolCalling()
-    resolved_loop = loop or ReActLoop()
+    resolved_loop = loop or agent.loop or ReActLoop()
 
     # Extract provider kwargs (temperature, max_tokens, etc.)
     # before they get consumed. kwargs dict is forwarded to the loop
@@ -158,6 +158,9 @@ async def run(
         # Create the run record before the loop starts
         # Apply redaction to user input before persistence
         redacted_input = redact(user_input) if redact else user_input
+        # Merge loop type into developer metadata for dashboard/debugging
+        run_meta = dict(metadata) if metadata else {}
+        run_meta["dendrux.loop"] = type(resolved_loop).__name__
         await state_store.create_run(
             run_id,
             agent.name,
@@ -165,7 +168,7 @@ async def run(
             model=provider.model,
             strategy=type(resolved_strategy).__name__,
             tenant_id=tenant_id,
-            meta=metadata,
+            meta=run_meta,
         )
 
         # Create persistence observer with shared sequencer
@@ -330,7 +333,7 @@ def run_stream(
     from dendrux.types import RunStream as _RunStream
 
     resolved_strategy = strategy or NativeToolCalling()
-    resolved_loop = loop or ReActLoop()
+    resolved_loop = loop or agent.loop or ReActLoop()
     provider_kwargs = dict(kwargs) if kwargs else {}
 
     run_id = generate_ulid()
@@ -361,6 +364,8 @@ def run_stream(
 
             if store is not None:
                 redacted_input = redact(user_input) if redact else user_input
+                run_meta = dict(metadata) if metadata else {}
+                run_meta["dendrux.loop"] = type(resolved_loop).__name__
                 await store.create_run(
                     run_id,
                     agent.name,
@@ -368,7 +373,7 @@ def run_stream(
                     model=provider.model,
                     strategy=type(resolved_strategy).__name__,
                     tenant_id=tenant_id,
-                    meta=metadata,
+                    meta=run_meta,
                 )
 
                 from dendrux.runtime.observer import PersistenceObserver
@@ -687,7 +692,7 @@ async def _prepare_resume(
     from dendrux.types import Message, Role
 
     resolved_strategy = strategy or NativeToolCalling()
-    resolved_loop = loop or ReActLoop()
+    resolved_loop = loop or agent.loop or ReActLoop()
 
     # 1. Initialize sequencer from DB max (continues across pause boundaries)
     existing_events = await state_store.get_run_events(run_id)

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from dendrux.llm.base import LLMProvider
+    from dendrux.loops.base import Loop
     from dendrux.runtime.state import StateStore
     from dendrux.types import RunResult, RunStream, ToolDef, ToolResult
 
@@ -83,6 +84,7 @@ class Agent:
         prompt: str = _UNSET,
         tools: list[Callable[..., Any]] = _UNSET,
         max_iterations: int = _UNSET,
+        loop: Loop | None = None,
         provider: LLMProvider = _UNSET,
         database_url: str | None = None,
         database_options: dict[str, Any] | None = None,
@@ -113,6 +115,9 @@ class Agent:
             self.tools = list(self.__class__.tools)
         if max_iterations is not _UNSET:
             self.max_iterations = max_iterations
+
+        # --- Loop ---
+        self._loop: Loop | None = loop
 
         # --- Provider ---
         self._provider: LLMProvider | None = provider if provider is not _UNSET else None
@@ -146,6 +151,11 @@ class Agent:
         return self._provider.model
 
     @property
+    def loop(self) -> Loop | None:
+        """The execution loop, or None (runner defaults to ReActLoop)."""
+        return self._loop
+
+    @property
     def provider(self) -> LLMProvider | None:
         """The LLM provider, or None if not configured."""
         return self._provider
@@ -160,6 +170,17 @@ class Agent:
             raise ValueError(
                 f"Agent '{self.name}' requires a prompt. "
                 f"Set prompt as a class attribute or pass it to the constructor."
+            )
+
+        # SingleCall cannot have tools
+        from dendrux.loops.single import SingleCall
+
+        if isinstance(self._loop, SingleCall) and self.tools:
+            tool_names = [getattr(fn, "__name__", str(fn)) for fn in self.tools]
+            raise ValueError(
+                f"Agent '{self.name}' uses SingleCall loop but has {len(self.tools)} "
+                f"tool(s): {tool_names}. SingleCall agents must have zero tools. "
+                f"Either remove the tools or use ReActLoop."
             )
 
         for fn in self.tools:

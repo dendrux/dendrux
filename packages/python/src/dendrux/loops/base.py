@@ -99,10 +99,9 @@ class LoopObserver(Protocol):
 class Loop(ABC):
     """Base class for agent execution loops.
 
-    Subclasses implement the iteration pattern:
-        ReActLoop      — think → act → observe → repeat
-        SingleShot     — one LLM call, no tools (planned)
-        PlanAndExecute — plan upfront, then execute steps (planned)
+    Built-in implementations:
+        ReActLoop  — think → act → observe → repeat (requires tools)
+        SingleCall — one LLM call, no tools, no iteration
     """
 
     @abstractmethod

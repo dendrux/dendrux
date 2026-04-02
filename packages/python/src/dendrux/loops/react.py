@@ -26,6 +26,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from dendrux.loops._helpers import notify_llm, notify_message, notify_tool
 from dendrux.loops.base import Loop
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT, get_tool_def
 from dendrux.types import (
@@ -54,71 +55,14 @@ if TYPE_CHECKING:
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopObserver
     from dendrux.strategies.base import Strategy
-    from dendrux.types import LLMResponse, ToolDef
+    from dendrux.types import LLMResponse
 
 logger = logging.getLogger(__name__)
 
 
-async def _notify_message(
-    observer: LoopObserver | None,
-    message: Message,
-    iteration: int,
-    warnings: list[str] | None = None,
-) -> None:
-    """Notify observer of a message append, swallowing exceptions."""
-    if observer is None:
-        return
-    try:
-        await observer.on_message_appended(message, iteration)
-    except Exception:
-        logger.warning("Observer.on_message_appended failed", exc_info=True)
-        if warnings is not None:
-            warnings.append(f"on_message_appended failed at iteration {iteration}")
-
-
-async def _notify_llm(
-    observer: LoopObserver | None,
-    response: LLMResponse,
-    iteration: int,
-    warnings: list[str] | None = None,
-    *,
-    semantic_messages: list[Message] | None = None,
-    semantic_tools: list[ToolDef] | None = None,
-    duration_ms: int | None = None,
-) -> None:
-    """Notify observer of an LLM call completion, swallowing exceptions."""
-    if observer is None:
-        return
-    try:
-        await observer.on_llm_call_completed(
-            response,
-            iteration,
-            semantic_messages=semantic_messages,
-            semantic_tools=semantic_tools,
-            duration_ms=duration_ms,
-        )
-    except Exception:
-        logger.warning("Observer.on_llm_call_completed failed", exc_info=True)
-        if warnings is not None:
-            warnings.append(f"on_llm_call_completed failed at iteration {iteration}")
-
-
-async def _notify_tool(
-    observer: LoopObserver | None,
-    tool_call: ToolCall,
-    tool_result: ToolResult,
-    iteration: int,
-    warnings: list[str] | None = None,
-) -> None:
-    """Notify observer of a tool completion, swallowing exceptions."""
-    if observer is None:
-        return
-    try:
-        await observer.on_tool_completed(tool_call, tool_result, iteration)
-    except Exception:
-        logger.warning("Observer.on_tool_completed failed", exc_info=True)
-        if warnings is not None:
-            warnings.append(f"on_tool_completed failed at iteration {iteration}")
+_notify_message = notify_message
+_notify_llm = notify_llm
+_notify_tool = notify_tool
 
 
 class _ToolCallOutcome(NamedTuple):

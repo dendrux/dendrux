@@ -3,6 +3,7 @@
 __version__ = "0.1.0a3"
 
 from dendrux.agent import Agent
+from dendrux.loops.single import SingleCall
 from dendrux.runtime.runner import run
 from dendrux.tool import tool
 
@@ -26,4 +27,4 @@ except ImportError as _err:
     else:
         raise
 
-__all__ = ["Agent", "bridge", "run", "tool"]
+__all__ = ["Agent", "SingleCall", "bridge", "run", "tool"]
