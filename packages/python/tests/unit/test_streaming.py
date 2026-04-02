@@ -543,6 +543,16 @@ class _FakeEvent:
         self.data = None
 
 
+class _FakeRunRecord:
+    """Minimal run record for delegation context reconstruction in resume."""
+
+    def __init__(self, run_id: str, delegation_level: int = 0) -> None:
+        self.id = run_id
+        self.agent_name = "Agent"
+        self.status = "running"
+        self.delegation_level = delegation_level
+
+
 class ResumeStateStore:
     """Minimal fake StateStore for resume_stream tests."""
 
@@ -571,6 +581,9 @@ class ResumeStateStore:
             return False
         self._status[run_id] = "running"
         return True
+
+    async def get_run(self, run_id: str) -> Any:
+        return _FakeRunRecord(run_id)
 
     async def get_run_events(self, run_id: str) -> list[Any]:
         return [

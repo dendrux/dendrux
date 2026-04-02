@@ -287,6 +287,17 @@ class SQLAlchemyStateStore:
             engine, class_=AsyncSession, expire_on_commit=False
         )
 
+    @property
+    def store_identity(self) -> str:
+        """Comparable identity for this store — the database URL.
+
+        Two stores pointing at the same database have the same identity,
+        even if they are different Python objects wrapping different engine
+        instances. Used by delegation context to determine safe parent-child
+        linking.
+        """
+        return str(self._engine.url)
+
     async def create_run(
         self,
         run_id: str,

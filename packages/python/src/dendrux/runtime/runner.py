@@ -21,6 +21,14 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from dendrux.loops.react import ReActLoop
+from dendrux.runtime.context import (
+    DelegationContext,
+    get_delegation_context,
+    get_store_identity,
+    reset_delegation_context,
+    resolve_parent_link,
+    set_delegation_context,
+)
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import PauseState, RunEventType, RunStatus, generate_ulid
 
@@ -154,6 +162,10 @@ async def run(
     # Shared sequence counter for run_events — monotonic across runner + observer
     sequencer = EventSequencer()
 
+    # --- Delegation context ---
+    parent_ctx = get_delegation_context()
+    parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
+
     if state_store is not None:
         # Create the run record before the loop starts
         # Apply redaction to user input before persistence
@@ -167,6 +179,8 @@ async def run(
             input_data={"input": redacted_input},
             model=provider.model,
             strategy=type(resolved_strategy).__name__,
+            parent_run_id=parent_run_id,
+            delegation_level=delegation_level,
             tenant_id=tenant_id,
             meta=run_meta,
         )
@@ -206,6 +220,16 @@ async def run(
         sequencer,
         {"agent_name": agent.name, "system_prompt": agent.prompt},
     )
+
+    # Set delegation context for the duration of this run so nested
+    # agent.run() calls inside tools inherit the parent link.
+    this_ctx = DelegationContext(
+        run_id=run_id,
+        delegation_level=delegation_level,
+        persisted=state_store is not None,
+        store_identity=get_store_identity(state_store),
+    )
+    ctx_token = set_delegation_context(this_ctx)
 
     try:
         result = await resolved_loop.run(
@@ -295,6 +319,9 @@ async def run(
                 )
         raise
 
+    finally:
+        reset_delegation_context(ctx_token)
+
 
 def run_stream(
     agent: Agent,
@@ -353,12 +380,17 @@ def run_stream(
         # Starts as the pre-provided value (often None for the lazy path).
         store = state_store
         sequencer = _shared["sequencer"]
+        ctx_token = None
 
         try:
             # 1. Resolve state store lazily (may create DB engine)
             if store is None and state_store_resolver is not None:
                 store = await state_store_resolver()
             _shared["state_store"] = store
+
+            # --- Delegation context ---
+            parent_ctx = get_delegation_context()
+            parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
 
             observer = None
 
@@ -372,6 +404,8 @@ def run_stream(
                     input_data={"input": redacted_input},
                     model=provider.model,
                     strategy=type(resolved_strategy).__name__,
+                    parent_run_id=parent_run_id,
+                    delegation_level=delegation_level,
                     tenant_id=tenant_id,
                     meta=run_meta,
                 )
@@ -402,7 +436,16 @@ def run_stream(
                 else:
                     composed_observer = extra_observer
 
-            # 2. Emit lifecycle start
+            # 2. Set delegation context for the generator lifetime
+            this_ctx = DelegationContext(
+                run_id=run_id,
+                delegation_level=delegation_level,
+                persisted=store is not None,
+                store_identity=get_store_identity(store),
+            )
+            ctx_token = set_delegation_context(this_ctx)
+
+            # 3. Emit lifecycle start
             await _emit_event(
                 store,
                 run_id,
@@ -513,6 +556,10 @@ def run_stream(
                 ),
                 error=str(exc),
             )
+
+        finally:
+            if ctx_token is not None:
+                reset_delegation_context(ctx_token)
 
     async def _cleanup() -> None:
         """CAS-guarded cancellation — only if run is still RUNNING.
@@ -844,7 +891,19 @@ async def _resume_core(
         extra_observer=extra_observer,
     )
 
-    # 9. Re-enter loop (batch)
+    # 9. Set delegation context — resumed run is the active parent for any
+    #    nested agent.run() calls spawned during this resume cycle.
+    run_record = await state_store.get_run(run_id)
+    resume_delegation_level = run_record.delegation_level if run_record else 0
+    resume_ctx = DelegationContext(
+        run_id=run_id,
+        delegation_level=resume_delegation_level,
+        persisted=True,
+        store_identity=get_store_identity(state_store),
+    )
+    ctx_token = set_delegation_context(resume_ctx)
+
+    # 10. Re-enter loop (batch)
     try:
         result = await ctx.resolved_loop.run(
             agent=agent,
@@ -923,6 +982,9 @@ async def _resume_core(
             )
         raise
 
+    finally:
+        reset_delegation_context(ctx_token)
+
 
 def resume_stream(
     run_id: str,
@@ -953,6 +1015,7 @@ def resume_stream(
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
+        ctx_token = None
 
         try:
             # 1. Resolve state store
@@ -1018,10 +1081,21 @@ def resume_stream(
             )
             _shared["sequencer"] = ctx.sequencer
 
-            # 6. Emit RUN_RESUMED as first event
+            # 6. Set delegation context for the generator lifetime
+            run_record = await store.get_run(run_id)
+            resume_level = run_record.delegation_level if run_record else 0
+            resume_ctx = DelegationContext(
+                run_id=run_id,
+                delegation_level=resume_level,
+                persisted=True,
+                store_identity=get_store_identity(store),
+            )
+            ctx_token = set_delegation_context(resume_ctx)
+
+            # 7. Emit RUN_RESUMED as first event
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
 
-            # 7. Stream the loop
+            # 8. Stream the loop
             async for event in ctx.resolved_loop.run_stream(
                 agent=agent,
                 provider=provider,
@@ -1119,6 +1193,10 @@ def resume_stream(
                 ),
                 error=str(exc),
             )
+
+        finally:
+            if ctx_token is not None:
+                reset_delegation_context(ctx_token)
 
     async def _cleanup() -> None:
         """CAS-guarded cancellation for abandoned resume streams."""
