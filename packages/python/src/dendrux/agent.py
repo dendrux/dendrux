@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
+from dendrux._sentinel import _UnsetType
 from dendrux.tool import get_tool_def, is_tool
 
 if TYPE_CHECKING:
@@ -42,13 +43,12 @@ if TYPE_CHECKING:
 # once the worker/config layer ships (Sprint 6).
 MAX_ITERATIONS_CEILING = 200
 
-# Sentinel to detect "not provided" vs explicitly set to a value
-_UNSET: Any = object()
+_UNSET = _UnsetType()
 
 
-def _validate_max_delegation_depth(value: Any) -> None:
+def _validate_max_delegation_depth(value: int | None | _UnsetType) -> None:
     """Validate max_delegation_depth — shared between constructor and _validate()."""
-    if value is _UNSET:
+    if isinstance(value, _UnsetType):
         return
     if value is not None and (not isinstance(value, int) or value < 0):
         raise ValueError(
@@ -75,7 +75,7 @@ class Agent:
     prompt: str = ""
     tools: list[Callable[..., Any]] = []
     max_iterations: int = 10
-    max_delegation_depth: int | None = _UNSET
+    max_delegation_depth: int | None | _UnsetType = _UNSET
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -89,16 +89,50 @@ class Agent:
             # Remove so the base class property takes over
             delattr(cls, "model")
 
+    @overload
     def __init__(
         self,
         *,
-        name: str = _UNSET,
-        prompt: str = _UNSET,
-        tools: list[Callable[..., Any]] = _UNSET,
-        max_iterations: int = _UNSET,
-        max_delegation_depth: int | None = _UNSET,
+        provider: LLMProvider,
+        prompt: str,
+        name: str = ...,
+        tools: list[Callable[..., Any]] = ...,
+        max_iterations: int = ...,
+        max_delegation_depth: int | None = ...,
+        loop: Loop | None = ...,
+        database_url: str | None = ...,
+        database_options: dict[str, Any] | None = ...,
+        state_store: StateStore | None = ...,
+        redact: Callable[[str], str] | None = ...,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        *,
+        provider: LLMProvider | None = ...,
+        name: str = ...,
+        prompt: str = ...,
+        tools: list[Callable[..., Any]] = ...,
+        max_iterations: int = ...,
+        max_delegation_depth: int | None = ...,
+        loop: Loop | None = ...,
+        database_url: str | None = ...,
+        database_options: dict[str, Any] | None = ...,
+        state_store: StateStore | None = ...,
+        redact: Callable[[str], str] | None = ...,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        *,
+        name: str | _UnsetType = _UNSET,
+        prompt: str | _UnsetType = _UNSET,
+        tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
+        max_iterations: int | _UnsetType = _UNSET,
+        max_delegation_depth: int | None | _UnsetType = _UNSET,
         loop: Loop | None = None,
-        provider: LLMProvider = _UNSET,
+        provider: LLMProvider | None | _UnsetType = _UNSET,
         database_url: str | None = None,
         database_options: dict[str, Any] | None = None,
         state_store: StateStore | None = None,
@@ -115,20 +149,20 @@ class Agent:
             )
 
         # --- Identity ---
-        if name is not _UNSET:
+        if not isinstance(name, _UnsetType):
             self.name = name
         elif not self.name:
             self.name = type(self).__name__
 
-        if prompt is not _UNSET:
+        if not isinstance(prompt, _UnsetType):
             self.prompt = prompt
-        if tools is not _UNSET:
+        if not isinstance(tools, _UnsetType):
             self.tools = list(tools)
         else:
             self.tools = list(self.__class__.tools)
-        if max_iterations is not _UNSET:
+        if not isinstance(max_iterations, _UnsetType):
             self.max_iterations = max_iterations
-        if max_delegation_depth is not _UNSET:
+        if not isinstance(max_delegation_depth, _UnsetType):
             _validate_max_delegation_depth(max_delegation_depth)
             self.max_delegation_depth = max_delegation_depth
 
@@ -136,7 +170,7 @@ class Agent:
         self._loop: Loop | None = loop
 
         # --- Provider ---
-        self._provider: LLMProvider | None = provider if provider is not _UNSET else None
+        self._provider: LLMProvider | None = None if isinstance(provider, _UnsetType) else provider
 
         # --- Persistence ---
         if database_url is not None and state_store is not None:
@@ -186,7 +220,9 @@ class Agent:
             raise ValueError("Agent requires a provider. Pass provider= to the constructor.")
         return self._provider
 
-    def _resolve_run_max_delegation_depth(self, requested: Any) -> Any:
+    def _resolve_run_max_delegation_depth(
+        self, requested: int | None | _UnsetType
+    ) -> int | None | _UnsetType:
         """Resolve max_delegation_depth for a run/stream call.
 
         Returns the value to pass to the runner, or _UNSET if the runner
@@ -194,9 +230,9 @@ class Agent:
 
         Precedence: explicit run kwarg → agent default → _UNSET (runner decides).
         """
-        if requested is not _UNSET:
+        if not isinstance(requested, _UnsetType):
             return requested
-        if self.max_delegation_depth is not _UNSET:
+        if not isinstance(self.max_delegation_depth, _UnsetType):
             return self.max_delegation_depth
         return _UNSET
 
@@ -323,6 +359,29 @@ class Agent:
     # Runtime methods
     # ------------------------------------------------------------------
 
+    @overload
+    async def run(
+        self,
+        user_input: str,
+        *,
+        tenant_id: str | None = ...,
+        metadata: dict[str, Any] | None = ...,
+        observer: LoopObserver | None = ...,
+        max_delegation_depth: int | None,
+        **kwargs: Any,
+    ) -> RunResult: ...
+
+    @overload
+    async def run(
+        self,
+        user_input: str,
+        *,
+        tenant_id: str | None = ...,
+        metadata: dict[str, Any] | None = ...,
+        observer: LoopObserver | None = ...,
+        **kwargs: Any,
+    ) -> RunResult: ...
+
     async def run(
         self,
         user_input: str,
@@ -330,7 +389,7 @@ class Agent:
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         observer: LoopObserver | None = None,
-        max_delegation_depth: int | None = _UNSET,
+        max_delegation_depth: int | None | _UnsetType = _UNSET,
         **kwargs: Any,
     ) -> RunResult:
         """Start a new agent run.
@@ -367,7 +426,7 @@ class Agent:
 
         run_kwargs: dict[str, Any] = {}
         resolved_depth = self._resolve_run_max_delegation_depth(max_delegation_depth)
-        if resolved_depth is not _UNSET:
+        if not isinstance(resolved_depth, _UnsetType):
             run_kwargs["max_delegation_depth"] = resolved_depth
 
         return await runner_run(
@@ -452,6 +511,29 @@ class Agent:
             extra_observer=observer,
         )
 
+    @overload
+    def stream(
+        self,
+        user_input: str,
+        *,
+        tenant_id: str | None = ...,
+        metadata: dict[str, Any] | None = ...,
+        observer: LoopObserver | None = ...,
+        max_delegation_depth: int | None,
+        **kwargs: Any,
+    ) -> RunStream: ...
+
+    @overload
+    def stream(
+        self,
+        user_input: str,
+        *,
+        tenant_id: str | None = ...,
+        metadata: dict[str, Any] | None = ...,
+        observer: LoopObserver | None = ...,
+        **kwargs: Any,
+    ) -> RunStream: ...
+
     def stream(
         self,
         user_input: str,
@@ -459,7 +541,7 @@ class Agent:
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         observer: LoopObserver | None = None,
-        max_delegation_depth: int | None = _UNSET,
+        max_delegation_depth: int | None | _UnsetType = _UNSET,
         **kwargs: Any,
     ) -> RunStream:
         """Stream an agent run as RunEvents.
@@ -508,7 +590,7 @@ class Agent:
 
         stream_kwargs: dict[str, Any] = {}
         resolved_depth = self._resolve_run_max_delegation_depth(max_delegation_depth)
-        if resolved_depth is not _UNSET:
+        if not isinstance(resolved_depth, _UnsetType):
             stream_kwargs["max_delegation_depth"] = resolved_depth
 
         return runner_run_stream(

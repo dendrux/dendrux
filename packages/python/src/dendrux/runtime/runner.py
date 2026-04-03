@@ -18,8 +18,9 @@ Sprint 2 adds optional state_store for persistence. When provided:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
+from dendrux._sentinel import _UnsetType
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime.context import (
     DelegationContext,
@@ -92,11 +93,11 @@ async def _emit_event(
         logger.warning("Failed to record event %s for run %s", event_type, run_id, exc_info=True)
 
 
-_UNSET_DEPTH: Any = object()
+_UNSET_DEPTH = _UnsetType()
 
 
 def _resolve_max_delegation_depth(
-    requested: Any,
+    requested: int | None | _UnsetType,
     parent_ctx: DelegationContext | None,
 ) -> int | None:
     """Resolve effective max_delegation_depth from explicit value + parent context.
@@ -113,7 +114,7 @@ def _resolve_max_delegation_depth(
     """
     # --- Validation ---
     if (
-        requested is not _UNSET_DEPTH
+        not isinstance(requested, _UnsetType)
         and requested is not None
         and (not isinstance(requested, int) or requested < 0)
     ):
@@ -123,7 +124,7 @@ def _resolve_max_delegation_depth(
         )
 
     # --- Resolution ---
-    if requested is not _UNSET_DEPTH:
+    if not isinstance(requested, _UnsetType):
         effective = requested
     elif parent_ctx is not None:
         effective = parent_ctx.max_delegation_depth
@@ -136,7 +137,7 @@ def _resolve_max_delegation_depth(
         if effective is None or (isinstance(effective, int) and effective > parent_limit):
             # Warn only on explicit loosen attempts, deduplicated per parent run.
             if (
-                requested is not _UNSET_DEPTH
+                not isinstance(requested, _UnsetType)
                 and "depth_clamped" not in parent_ctx.warned_mismatches
             ):
                 logger.warning(
@@ -151,6 +152,41 @@ def _resolve_max_delegation_depth(
     return effective
 
 
+@overload
+async def run(
+    agent: Agent,
+    *,
+    provider: LLMProvider,
+    user_input: str,
+    strategy: Strategy | None = ...,
+    loop: Loop | None = ...,
+    state_store: StateStore | None = ...,
+    tenant_id: str | None = ...,
+    metadata: dict[str, Any] | None = ...,
+    redact: Callable[[str], str] | None = ...,
+    extra_observer: LoopObserver | None = ...,
+    max_delegation_depth: int | None,
+    **kwargs: Any,
+) -> RunResult: ...
+
+
+@overload
+async def run(
+    agent: Agent,
+    *,
+    provider: LLMProvider,
+    user_input: str,
+    strategy: Strategy | None = ...,
+    loop: Loop | None = ...,
+    state_store: StateStore | None = ...,
+    tenant_id: str | None = ...,
+    metadata: dict[str, Any] | None = ...,
+    redact: Callable[[str], str] | None = ...,
+    extra_observer: LoopObserver | None = ...,
+    **kwargs: Any,
+) -> RunResult: ...
+
+
 async def run(
     agent: Agent,
     *,
@@ -163,7 +199,7 @@ async def run(
     metadata: dict[str, Any] | None = None,
     redact: Callable[[str], str] | None = None,
     extra_observer: LoopObserver | None = None,
-    max_delegation_depth: int | None = _UNSET_DEPTH,
+    max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     **kwargs: Any,
 ) -> RunResult:
     """Run an agent to completion.
@@ -389,6 +425,43 @@ async def run(
         reset_delegation_context(ctx_token)
 
 
+@overload
+def run_stream(
+    agent: Agent,
+    *,
+    provider: LLMProvider,
+    user_input: str,
+    strategy: Strategy | None = ...,
+    loop: Loop | None = ...,
+    state_store: StateStore | None = ...,
+    state_store_resolver: Callable[[], Any] | None = ...,
+    tenant_id: str | None = ...,
+    metadata: dict[str, Any] | None = ...,
+    redact: Callable[[str], str] | None = ...,
+    extra_observer: LoopObserver | None = ...,
+    max_delegation_depth: int | None,
+    **kwargs: Any,
+) -> RunStream: ...
+
+
+@overload
+def run_stream(
+    agent: Agent,
+    *,
+    provider: LLMProvider,
+    user_input: str,
+    strategy: Strategy | None = ...,
+    loop: Loop | None = ...,
+    state_store: StateStore | None = ...,
+    state_store_resolver: Callable[[], Any] | None = ...,
+    tenant_id: str | None = ...,
+    metadata: dict[str, Any] | None = ...,
+    redact: Callable[[str], str] | None = ...,
+    extra_observer: LoopObserver | None = ...,
+    **kwargs: Any,
+) -> RunStream: ...
+
+
 def run_stream(
     agent: Agent,
     *,
@@ -402,7 +475,7 @@ def run_stream(
     metadata: dict[str, Any] | None = None,
     redact: Callable[[str], str] | None = None,
     extra_observer: LoopObserver | None = None,
-    max_delegation_depth: int | None = _UNSET_DEPTH,
+    max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     **kwargs: Any,
 ) -> RunStream:
     """Stream an agent run as RunEvents, returning a RunStream.
@@ -428,7 +501,7 @@ def run_stream(
     # because parent_ctx requires async state_store resolution first.
     # But validation of the raw input can fail fast here.
     if (
-        max_delegation_depth is not _UNSET_DEPTH
+        not isinstance(max_delegation_depth, _UnsetType)
         and max_delegation_depth is not None
         and (not isinstance(max_delegation_depth, int) or max_delegation_depth < 0)
     ):

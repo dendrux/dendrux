@@ -16,9 +16,9 @@ from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.table import Table
 
+from dendrux.loops.base import LoopObserver
 from dendrux.types import Message, Role, ToolCall, ToolResult
 
 if TYPE_CHECKING:
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 _console = Console()
 
 
-class ConsoleObserver:
+class ConsoleObserver(LoopObserver):
     """Rich terminal observer for agent runs.
 
     Args:
@@ -78,16 +78,15 @@ class ConsoleObserver:
                     )
                 )
 
-        elif message.role == Role.ASSISTANT:
-            if message.tool_calls:
-                for tc in message.tool_calls:
-                    self._tool_starts[tc.id] = time.monotonic()
-                    params_str = ""
-                    if self._show_params and tc.params:
-                        params_str = f" [dim]{_format_params(tc.params)}[/dim]"
-                    _console.print(
-                        f"  [yellow]  calling[/yellow] [bold]{tc.name}[/bold]{params_str}"
-                    )
+        elif message.role == Role.ASSISTANT and message.tool_calls:
+            for tc in message.tool_calls:
+                self._tool_starts[tc.id] = time.monotonic()
+                params_str = ""
+                if self._show_params and tc.params:
+                    params_str = f" [dim]{_format_params(tc.params)}[/dim]"
+                _console.print(
+                    f"  [yellow]  calling[/yellow] [bold]{tc.name}[/bold]{params_str}"
+                )
 
     async def on_llm_call_completed(
         self,
