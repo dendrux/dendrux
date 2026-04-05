@@ -77,7 +77,46 @@ async def _emit_event(
     data: dict[str, Any] | None = None,
     correlation_id: str | None = None,
 ) -> None:
-    """Record a durable run-level event. Failures are logged, never fatal."""
+    """Record a durable run-level lifecycle event. Fail-closed with retry.
+
+    Runner lifecycle events (run.started, run.paused, run.completed,
+    run.error, run.resumed, run.cancelled) are authoritative truth —
+    they get the same retry/propagate contract as PersistenceRecorder's
+    fail-closed writes.
+    """
+    if state_store is None:
+        return
+    seq = sequencer.next() if sequencer else 0
+
+    from dendrux.runtime.persistence import _retry_critical
+
+    async def _write() -> None:
+        await state_store.save_run_event(
+            run_id,
+            event_type=event_type,
+            sequence_index=seq,
+            correlation_id=correlation_id,
+            data=data,
+        )
+
+    await _retry_critical(_write, label=f"emit_{event_type}", run_id=run_id)
+
+
+async def _emit_event_safe(
+    state_store: StateStore | None,
+    run_id: str,
+    event_type: str,
+    sequencer: EventSequencer | None = None,
+    data: dict[str, Any] | None = None,
+    correlation_id: str | None = None,
+) -> None:
+    """Best-effort lifecycle event — for use inside streaming error handlers.
+
+    In streaming generators, the error handler itself must not raise
+    (the stream contract promises no exception escapes). This variant
+    logs and swallows persistence failures instead of propagating.
+    Used ONLY in the ``except`` block of streaming generators.
+    """
     if state_store is None:
         return
     seq = sequencer.next() if sequencer else 0
@@ -90,7 +129,9 @@ async def _emit_event(
             data=data,
         )
     except Exception:
-        logger.warning("Failed to record event %s for run %s", event_type, run_id, exc_info=True)
+        logger.warning(
+            "Failed to record %s for run %s (in error handler)", event_type, run_id, exc_info=True
+        )
 
 
 _UNSET_DEPTH = _UnsetType()
@@ -688,7 +729,7 @@ def run_stream(
                         "Failed to persist ERROR status for run %s", run_id, exc_info=True
                     )
                 if error_won:
-                    await _emit_event(
+                    await _emit_event_safe(
                         store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
                     )
 
@@ -1350,7 +1391,7 @@ def resume_stream(
                         "Failed to persist ERROR status for run %s", run_id, exc_info=True
                     )
                 if error_won:
-                    await _emit_event(
+                    await _emit_event_safe(
                         store, run_id, "run.error", sequencer,
                         {"error": str(exc)[:500]},
                     )
