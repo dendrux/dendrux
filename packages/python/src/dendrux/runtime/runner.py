@@ -96,7 +96,7 @@ async def _emit_event(
         return
     seq = sequencer.next() if sequencer else 0
 
-    from dendrux.runtime.persistence import _retry_critical
+    from dendrux.runtime.durability import retry_critical
 
     async def _write() -> None:
         await state_store.save_run_event(
@@ -107,7 +107,7 @@ async def _emit_event(
             data=data,
         )
 
-    await _retry_critical(_write, label=f"emit_{event_type}", run_id=run_id)
+    await retry_critical(_write, label=f"emit_{event_type}", run_id=run_id)
 
 
 async def _emit_event_safe(

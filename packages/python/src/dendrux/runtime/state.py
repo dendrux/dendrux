@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import (
     CreateRunResult,
     IdempotencyConflictError,
@@ -462,44 +463,47 @@ class SQLAlchemyStateStore:
             if existing is not None:
                 return existing
 
-        # Insert fresh row
-        async with self._session_factory() as session:
-            run = AgentRun(
-                id=run_id,
-                agent_name=agent_name,
-                status=AgentRunStatus.RUNNING,
-                input_data=input_data,
-                model=model,
-                strategy=strategy,
-                parent_run_id=parent_run_id,
-                delegation_level=delegation_level,
-                tenant_id=tenant_id,
-                meta=meta,
-                last_progress_at=_dt.datetime.now(_dt.UTC),
-                idempotency_key=idempotency_key,
-                idempotency_fingerprint=idempotency_fingerprint,
-                retry_of_run_id=retry_of_run_id,
-            )
-            session.add(run)
-            try:
-                await session.commit()
-            except IntegrityError as exc:
-                await session.rollback()
-                # Only resolve via idempotency if this is the idempotency
-                # unique constraint, not an arbitrary integrity error
-                if idempotency_key is not None and "idempotency_key" in str(exc):
-                    existing = await self._check_idempotency(
-                        idempotency_key, idempotency_fingerprint or ""
-                    )
-                    if existing is not None:
-                        return existing
-                raise
+        async def _attempt() -> CreateRunResult:
+            async with self._session_factory() as session:
+                run = AgentRun(
+                    id=run_id,
+                    agent_name=agent_name,
+                    status=AgentRunStatus.RUNNING,
+                    input_data=input_data,
+                    model=model,
+                    strategy=strategy,
+                    parent_run_id=parent_run_id,
+                    delegation_level=delegation_level,
+                    tenant_id=tenant_id,
+                    meta=meta,
+                    last_progress_at=_dt.datetime.now(_dt.UTC),
+                    idempotency_key=idempotency_key,
+                    idempotency_fingerprint=idempotency_fingerprint,
+                    retry_of_run_id=retry_of_run_id,
+                )
+                session.add(run)
+                try:
+                    await session.commit()
+                except IntegrityError as exc:
+                    await session.rollback()
+                    # Only resolve via idempotency if this is the idempotency
+                    # unique constraint, not an arbitrary integrity error.
+                    # IntegrityError is NOT transient — don't let retry_transient_db see it.
+                    if idempotency_key is not None and "idempotency_key" in str(exc):
+                        existing = await self._check_idempotency(
+                            idempotency_key, idempotency_fingerprint or ""
+                        )
+                        if existing is not None:
+                            return existing
+                    raise
 
-        return CreateRunResult(
-            run_id=run_id,
-            outcome="created",
-            status=RunStatus.RUNNING,
-        )
+            return CreateRunResult(
+                run_id=run_id,
+                outcome="created",
+                status=RunStatus.RUNNING,
+            )
+
+        return await retry_transient_db(_attempt, label="create_run", run_id=run_id)
 
     async def _check_idempotency(
         self,
@@ -743,40 +747,45 @@ class SQLAlchemyStateStore:
 
         from dendrux.db.models import AgentRun
 
-        async with self._session_factory() as session:
-            values: dict[str, Any] = {
-                "status": status,
-                "updated_at": func.now(),
-            }
-            if iteration_count is not None:
-                values["iteration_count"] = iteration_count
-            if answer is not None:
-                values["output_data"] = {"answer": answer}
-            if error is not None:
-                values["error"] = error
-            if total_usage is not None:
-                values["total_input_tokens"] = total_usage.input_tokens
-                values["total_output_tokens"] = total_usage.output_tokens
-                values["total_cost_usd"] = total_usage.cost_usd
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                values: dict[str, Any] = {
+                    "status": status,
+                    "updated_at": func.now(),
+                }
+                if iteration_count is not None:
+                    values["iteration_count"] = iteration_count
+                if answer is not None:
+                    values["output_data"] = {"answer": answer}
+                if error is not None:
+                    values["error"] = error
+                if total_usage is not None:
+                    values["total_input_tokens"] = total_usage.input_tokens
+                    values["total_output_tokens"] = total_usage.output_tokens
+                    values["total_cost_usd"] = total_usage.cost_usd
 
-            # Clear pause_data on finalize (D1: execution state cleaned up)
-            values["pause_data"] = None
+                # Clear pause_data on finalize (D1: execution state cleaned up)
+                values["pause_data"] = None
 
-            # Conditional finalize: only update if status is still 'running'
-            # (or expected_status if provided). Prevents cancel/finalize races.
-            if expected_current_status is not None:
-                stmt = (
-                    update(AgentRun)
-                    .where(AgentRun.id == run_id, AgentRun.status == expected_current_status)
-                    .values(**values)
+                # Conditional finalize: only update if status is still 'running'
+                # (or expected_status if provided). Prevents cancel/finalize races.
+                if expected_current_status is not None:
+                    stmt = (
+                        update(AgentRun)
+                        .where(AgentRun.id == run_id, AgentRun.status == expected_current_status)
+                        .values(**values)
+                    )
+                else:
+                    stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
+                result = await session.execute(stmt)
+                await session.commit()
+                return (
+                    bool(result.rowcount and result.rowcount > 0)
+                    if expected_current_status
+                    else True
                 )
-            else:
-                stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
-            result = await session.execute(stmt)
-            await session.commit()
-            return (
-                bool(result.rowcount and result.rowcount > 0) if expected_current_status else True
-            )
+
+        return await retry_transient_db(_attempt, label="finalize_run", run_id=run_id)
 
     async def pause_run(
         self,
@@ -791,17 +800,20 @@ class SQLAlchemyStateStore:
 
         from dendrux.db.models import AgentRun
 
-        async with self._session_factory() as session:
-            values: dict[str, Any] = {
-                "status": status,
-                "pause_data": pause_data,
-                "updated_at": func.now(),
-            }
-            if iteration_count is not None:
-                values["iteration_count"] = iteration_count
-            stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
-            await session.execute(stmt)
-            await session.commit()
+        async def _attempt() -> None:
+            async with self._session_factory() as session:
+                values: dict[str, Any] = {
+                    "status": status,
+                    "pause_data": pause_data,
+                    "updated_at": func.now(),
+                }
+                if iteration_count is not None:
+                    values["iteration_count"] = iteration_count
+                stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
+                await session.execute(stmt)
+                await session.commit()
+
+        await retry_transient_db(_attempt, label="pause_run", run_id=run_id)
 
     async def get_pause_state(self, run_id: str) -> dict[str, Any] | None:
         """Retrieve pause_data for a run. Returns None if no run or no pause data."""
@@ -829,15 +841,18 @@ class SQLAlchemyStateStore:
 
         from dendrux.db.models import AgentRun
 
-        async with self._session_factory() as session:
-            stmt = (
-                update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                .values(status="running", updated_at=func.now())
-            )
-            result = await session.execute(stmt)
-            await session.commit()
-            return bool(result.rowcount and result.rowcount > 0)
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                stmt = (
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id, AgentRun.status == expected_status)
+                    .values(status="running", updated_at=func.now())
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                return bool(result.rowcount and result.rowcount > 0)
+
+        return await retry_transient_db(_attempt, label="claim_paused_run", run_id=run_id)
 
     async def submit_and_claim(
         self,
@@ -864,37 +879,40 @@ class SQLAlchemyStateStore:
 
         from dendrux.db.models import AgentRun
 
-        async with self._session_factory() as session:
-            # 1. Read current pause_data
-            stmt = select(AgentRun.pause_data, AgentRun.status).where(AgentRun.id == run_id)
-            result = await session.execute(stmt)
-            row = result.one_or_none()
-            if row is None:
-                return False
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                # 1. Read current pause_data
+                stmt = select(AgentRun.pause_data, AgentRun.status).where(AgentRun.id == run_id)
+                result = await session.execute(stmt)
+                row = result.one_or_none()
+                if row is None:
+                    return False
 
-            current_pause_data, current_status = row
-            if current_status != expected_status:
-                return False
-            if current_pause_data is None:
-                return False
+                current_pause_data, current_status = row
+                if current_status != expected_status:
+                    return False
+                if current_pause_data is None:
+                    return False
 
-            # 2. Merge submitted_data into pause_data
-            merged = dict(current_pause_data)
-            merged.update(submitted_data)
+                # 2. Merge submitted_data into pause_data
+                merged = dict(current_pause_data)
+                merged.update(submitted_data)
 
-            # 3. Conditional UPDATE — CAS on status column
-            update_stmt = (
-                update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                .values(
-                    pause_data=merged,
-                    status="running",
-                    updated_at=func.now(),
+                # 3. Conditional UPDATE — CAS on status column
+                update_stmt = (
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id, AgentRun.status == expected_status)
+                    .values(
+                        pause_data=merged,
+                        status="running",
+                        updated_at=func.now(),
+                    )
                 )
-            )
-            update_result = await session.execute(update_stmt)
-            await session.commit()
-            return bool(update_result.rowcount and update_result.rowcount > 0)
+                update_result = await session.execute(update_stmt)
+                await session.commit()
+                return bool(update_result.rowcount and update_result.rowcount > 0)
+
+        return await retry_transient_db(_attempt, label="submit_and_claim", run_id=run_id)
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         from sqlalchemy import select

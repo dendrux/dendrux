@@ -10,57 +10,19 @@ Write classification:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
 from dendrux.loops.base import LoopRecorder
+from dendrux.runtime.durability import retry_critical
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Callable
 
     from dendrux.runtime.state import StateStore
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
 
 logger = logging.getLogger(__name__)
-
-# Retry config for fail-closed writes.
-# 3 retries: 100ms → 200ms → 400ms. ~700ms total max wait.
-_MAX_RETRIES = 3
-_BASE_BACKOFF_S = 0.1
-
-
-async def _retry_critical(
-    coro_fn: Callable[[], Coroutine[Any, Any, Any]],
-    *,
-    label: str,
-    run_id: str,
-) -> None:
-    """Retry a fail-closed write with exponential backoff.
-
-    On exhaustion, the last exception propagates — the run stops.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            await coro_fn()
-            return
-        except Exception as exc:
-            last_exc = exc
-            if attempt < _MAX_RETRIES:
-                wait = _BASE_BACKOFF_S * (2**attempt)
-                logger.warning(
-                    "Persistence retry %d/%d for %s (run %s): %s — retrying in %.1fs",
-                    attempt + 1,
-                    _MAX_RETRIES,
-                    label,
-                    run_id,
-                    exc,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-    # Exhausted retries — propagate
-    raise last_exc  # type: ignore[misc]
 
 
 def _identity(s: str) -> str:
@@ -177,7 +139,7 @@ class PersistenceRecorder(LoopRecorder):
                 data=data,
             )
 
-        await _retry_critical(_write, label="save_run_event", run_id=self._run_id)
+        await retry_critical(_write, label="save_run_event", run_id=self._run_id)
 
     async def on_message_appended(self, message: Message, iteration: int) -> None:
         """Persist a message to react_traces. FAIL-CLOSED."""
@@ -213,7 +175,7 @@ class PersistenceRecorder(LoopRecorder):
                 meta=meta,
             )
 
-        await _retry_critical(_write, label="save_trace", run_id=self._run_id)
+        await retry_critical(_write, label="save_trace", run_id=self._run_id)
         self._order_index += 1
 
     async def on_llm_call_completed(
@@ -351,7 +313,7 @@ class PersistenceRecorder(LoopRecorder):
                 error_message=redacted_error,
             )
 
-        await _retry_critical(_write_tool, label="save_tool_call", run_id=self._run_id)
+        await retry_critical(_write_tool, label="save_tool_call", run_id=self._run_id)
 
         # FAIL-CLOSED: run event (lifecycle audit trail)
         await self._emit_event(
