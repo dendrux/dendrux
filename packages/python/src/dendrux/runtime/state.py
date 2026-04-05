@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from dendrux.types import UsageStats, generate_ulid
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -49,6 +49,8 @@ class RunRecord:
     total_output_tokens: int = 0
     total_cost_usd: float | None = None
     meta: dict[str, Any] | None = None
+    last_progress_at: datetime | None = None
+    failure_reason: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -157,6 +159,25 @@ class RunEventRecord:
     correlation_id: str | None = None
     data: dict[str, Any] | None = None
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SweptRun:
+    """A run that was swept by the stale-run maintenance API."""
+
+    run_id: str
+    agent_name: str
+    previous_status: str
+    failure_reason: str
+    last_progress_at: datetime | None
+    swept_at: datetime
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    """Result of a sweep operation."""
+
+    stale_running: list[SweptRun]
 
 
 @dataclass
@@ -337,6 +358,20 @@ class StateStore(Protocol):
         status: str | None = None,
     ) -> list[RunRecord]: ...
 
+    async def touch_progress(self, run_id: str) -> None:
+        """Update last_progress_at to now. Called on forward progress."""
+        ...
+
+    async def sweep_stale_runs(
+        self,
+        older_than: timedelta,
+    ) -> list[SweptRun]:
+        """Find RUNNING rows older than threshold and mark them ERROR.
+
+        Returns list of swept runs with classification.
+        """
+        ...
+
     async def get_delegation_info(self, run_id: str) -> DelegationInfo | None:
         """Get full delegation context for a run.
 
@@ -385,6 +420,8 @@ class SQLAlchemyStateStore:
         tenant_id: str | None = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
+        import datetime as _dt
+
         from dendrux.db.enums import AgentRunStatus
         from dendrux.db.models import AgentRun
 
@@ -400,6 +437,7 @@ class SQLAlchemyStateStore:
                 delegation_level=delegation_level,
                 tenant_id=tenant_id,
                 meta=meta,
+                last_progress_at=_dt.datetime.now(_dt.UTC),
             )
             session.add(run)
             await session.commit()
@@ -869,6 +907,144 @@ class SQLAlchemyStateStore:
             ]
 
     # ------------------------------------------------------------------
+    # Progress tracking & stale-run sweep
+    # ------------------------------------------------------------------
+
+    async def touch_progress(self, run_id: str) -> None:
+        """Update last_progress_at to now. Lightweight single-column UPDATE."""
+        import datetime as _dt
+
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            stmt = (
+                update(AgentRun)
+                .where(AgentRun.id == run_id)
+                .values(last_progress_at=_dt.datetime.now(_dt.UTC))
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def sweep_stale_runs(
+        self,
+        older_than: timedelta,
+    ) -> list[SweptRun]:
+        """Find RUNNING rows older than threshold and mark them ERROR.
+
+        Detection uses last_progress_at (or created_at if last_progress_at
+        is NULL — run never got far enough to record progress).
+
+        Classification is best-effort: absence of a run.started event
+        does NOT strictly prove 'never started' because that event is
+        emitted through a helper that swallows failures. Useful heuristic
+        for operator triage, not authoritative.
+        """
+        import datetime as _dt
+
+        from sqlalchemy import func, select, update
+
+        from dendrux.db.models import AgentRun, RunEvent
+
+        now = _dt.datetime.now(_dt.UTC)
+        cutoff = now - older_than
+        swept: list[SweptRun] = []
+
+        async with self._session_factory() as session:
+            # Find stale RUNNING rows
+            stmt = select(AgentRun).where(
+                AgentRun.status == "running",
+                # Stale if last_progress_at < cutoff, or if NULL then fall
+                # back to created_at < cutoff
+                func.coalesce(AgentRun.last_progress_at, AgentRun.created_at) < cutoff,
+            )
+            result = await session.execute(stmt)
+            stale_rows = result.scalars().all()
+
+            if not stale_rows:
+                return []
+
+            # Collect run IDs for batch event lookup
+            stale_ids = [r.id for r in stale_rows]
+
+            # Check which runs have a run.started event (for classification)
+            started_stmt = (
+                select(RunEvent.agent_run_id)
+                .where(
+                    RunEvent.agent_run_id.in_(stale_ids),
+                    RunEvent.event_type == "run.started",
+                )
+            )
+            started_result = await session.execute(started_stmt)
+            started_run_ids = {row[0] for row in started_result.all()}
+
+            # Get max sequence_index per run for event ordering
+            seq_stmt = (
+                select(
+                    RunEvent.agent_run_id,
+                    func.max(RunEvent.sequence_index).label("max_seq"),
+                )
+                .where(RunEvent.agent_run_id.in_(stale_ids))
+                .group_by(RunEvent.agent_run_id)
+            )
+            seq_result = await session.execute(seq_stmt)
+            max_seqs: dict[str, int] = {
+                row[0]: row[1] for row in seq_result.all()
+            }
+
+            # Process each stale run
+            for row in stale_rows:
+                classification = (
+                    "stale_running" if row.id in started_run_ids
+                    else "never_started"
+                )
+
+                # Mark as ERROR with failure_reason
+                update_stmt = (
+                    update(AgentRun)
+                    .where(AgentRun.id == row.id, AgentRun.status == "running")
+                    .values(
+                        status="error",
+                        failure_reason=classification,
+                        error=f"Run swept as {classification}",
+                        updated_at=func.now(),
+                    )
+                )
+                update_result = await session.execute(update_stmt)
+
+                # CAS guard: skip if status already changed (race)
+                if not (update_result.rowcount and update_result.rowcount > 0):
+                    continue
+
+                # Emit run.interrupted event
+                next_seq = max_seqs.get(row.id, -1) + 1
+                event = RunEvent(
+                    id=generate_ulid(),
+                    agent_run_id=row.id,
+                    event_type="run.interrupted",
+                    sequence_index=next_seq,
+                    iteration_index=row.iteration_count or 0,
+                    data={"failure_reason": classification},
+                )
+                session.add(event)
+
+                # Commit per-run so partial progress is durable.
+                # If run N+1 fails, runs 0..N are already committed.
+                await session.commit()
+
+                swept.append(SweptRun(
+                    run_id=row.id,
+                    agent_name=row.agent_name,
+                    previous_status="running",
+                    failure_reason=classification,
+                    last_progress_at=row.last_progress_at,
+                    swept_at=now,
+                ))
+
+        return swept
+
+    # ------------------------------------------------------------------
     # Delegation queries
     # ------------------------------------------------------------------
 
@@ -1106,6 +1282,8 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         total_output_tokens=row.total_output_tokens,
         total_cost_usd=float(row.total_cost_usd) if row.total_cost_usd is not None else None,
         meta=row.meta,
+        last_progress_at=row.last_progress_at,
+        failure_reason=row.failure_reason,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

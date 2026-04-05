@@ -86,6 +86,12 @@ class AgentRun(Base):
     # Error details (populated on ERROR status)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Sweep / recovery columns
+    last_progress_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

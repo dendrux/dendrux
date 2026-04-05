@@ -276,6 +276,14 @@ class PersistenceObserver(LoopObserver):
             },
         )
 
+        # Touch forward-progress signal for stale-run detection
+        try:
+            await self._store.touch_progress(self._run_id)
+        except Exception:
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=True
+            )
+
     async def on_tool_completed(
         self, tool_call: ToolCall, tool_result: ToolResult, iteration: int
     ) -> None:
@@ -318,3 +326,11 @@ class PersistenceObserver(LoopObserver):
             },
             correlation_id=tool_call.id,
         )
+
+        # Touch forward-progress signal for stale-run detection
+        try:
+            await self._store.touch_progress(self._run_id)
+        except Exception:
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=True
+            )
