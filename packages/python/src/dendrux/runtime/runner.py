@@ -543,6 +543,269 @@ async def _build_cached_result(state_store: StateStore, run_id: str) -> RunResul
     )
 
 
+async def retry(
+    original_run_id: str,
+    *,
+    agent: Agent,
+    provider: LLMProvider,
+    state_store: StateStore,
+    strategy: Strategy | None = None,
+    loop: Loop | None = None,
+    tenant_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    redact: Callable[[str], str] | None = None,
+    extra_notifier: LoopNotifier | None = None,
+    **kwargs: Any,
+) -> RunResult:
+    """Retry a terminal run with approximate prior context.
+
+    Creates a fresh run seeded with the original run's conversation history
+    from persisted traces. The LLM sees the prior conversation and can
+    continue from context. This is NOT resume (no pause_data, no exact
+    state reconstruction) — it's a new run with approximate context.
+
+    Works for any terminal run (error, cancelled, max_iterations, success).
+    Source run must have been executed with a retry-capable loop (not
+    SingleCall). The retry agent can differ from the original — different
+    model, different tools — the only requirement is that the source run
+    has persisted traces to seed from.
+
+    Args:
+        original_run_id: The terminal run to retry from.
+        agent: Agent definition for the retry run. Can differ from the
+            original agent (different model, tools, prompt).
+        provider: LLM provider for the retry run.
+        state_store: Persistence backend (required — retry needs traces).
+        strategy: Communication strategy. Defaults to NativeToolCalling.
+        loop: Execution loop for the retry. Defaults to ReActLoop.
+        tenant_id: Optional tenant ID.
+        metadata: Optional developer metadata for the retry run.
+        redact: Optional string scrubber.
+        extra_notifier: Optional notifier.
+        **kwargs: Forwarded to the LLM provider.
+
+    Returns:
+        RunResult from the retry run.
+
+    Raises:
+        ValueError: If the source run is not terminal, if the source
+            run was SingleCall, or if no traces exist.
+    """
+    from dendrux.types import Message, Role
+
+    # 1. Validate source run is terminal
+    source_run = await state_store.get_run(original_run_id)
+    if source_run is None:
+        raise ValueError(f"Run '{original_run_id}' not found.")
+
+    terminal_statuses = {"success", "error", "cancelled", "max_iterations"}
+    if source_run.status not in terminal_statuses:
+        raise ValueError(
+            f"Run '{original_run_id}' is in status '{source_run.status}' — "
+            f"only terminal runs (error, cancelled, max_iterations, success) can be retried."
+        )
+
+    # 2. Validate source run was not SingleCall (no iterative history to seed)
+    source_loop = (source_run.meta or {}).get("dendrux.loop", "")
+    if source_loop == "SingleCall":
+        raise ValueError(
+            "SingleCall runs cannot be retried with context — "
+            "they have no iterative history to seed. Call agent.run() instead."
+        )
+
+    resolved_loop = loop or agent.loop or ReActLoop()
+
+    # 3. Read traces and reconstruct approximate history
+    traces = await state_store.get_traces(original_run_id)
+    initial_history: list[Message] = []
+    for trace in sorted(traces, key=lambda t: t.order_index):
+        try:
+            role = Role(trace.role)
+        except ValueError:
+            continue  # skip unknown roles
+
+        meta = trace.meta or {}
+        msg_kwargs: dict[str, Any] = {"role": role, "content": trace.content}
+
+        # Reconstruct TOOL message fields from trace meta
+        if role == Role.TOOL:
+            msg_kwargs["name"] = meta.get("tool_name", "unknown")
+            msg_kwargs["call_id"] = meta.get("call_id", generate_ulid())
+
+        # Reconstruct ASSISTANT tool_calls from trace meta
+        if role == Role.ASSISTANT and "tool_calls" in meta:
+            from dendrux.types import ToolCall
+
+            msg_kwargs["tool_calls"] = [
+                ToolCall(
+                    name=tc["name"],
+                    params=tc.get("params"),
+                    id=tc.get("id", generate_ulid()),
+                    provider_tool_call_id=tc.get("provider_tool_call_id"),
+                )
+                for tc in meta["tool_calls"]
+            ]
+
+        initial_history.append(Message(**msg_kwargs))
+
+    if not initial_history:
+        raise ValueError(
+            f"Run '{original_run_id}' has no persisted traces. Cannot retry without prior context."
+        )
+
+    # 4. Extract the original user input from the first USER message
+    user_input = next(
+        (m.content for m in initial_history if m.role == Role.USER),
+        "Continue from previous attempt.",
+    )
+
+    # 5. Create the retry run
+    resolved_strategy = strategy or NativeToolCalling()
+    provider_kwargs = dict(kwargs) if kwargs else {}
+
+    run_id = generate_ulid()
+    sequencer = EventSequencer()
+
+    parent_ctx = get_delegation_context()
+    parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
+    effective_max_depth = _resolve_max_delegation_depth(_UNSET_DEPTH, parent_ctx)
+
+    redacted_input = redact(user_input) if redact else user_input
+    run_meta = dict(metadata) if metadata else {}
+    run_meta["dendrux.loop"] = type(resolved_loop).__name__
+    run_meta["dendrux.retry_of"] = original_run_id
+
+    create_result = await state_store.create_run(
+        run_id,
+        agent.name,
+        input_data={"input": redacted_input},
+        model=provider.model,
+        strategy=type(resolved_strategy).__name__,
+        parent_run_id=parent_run_id,
+        delegation_level=delegation_level,
+        tenant_id=tenant_id,
+        meta=run_meta,
+        retry_of_run_id=original_run_id,
+    )
+    run_id = create_result.run_id
+
+    # Create persistence recorder
+    from dendrux.runtime.persistence import PersistenceRecorder
+    from dendrux.tool import get_tool_def
+
+    target_lookup = {}
+    for fn in agent.tools:
+        td = get_tool_def(fn)
+        target_lookup[td.name] = td.target
+    recorder = PersistenceRecorder(
+        state_store,
+        run_id,
+        model=provider.model,
+        provider_name=type(provider).__name__,
+        target_lookup=target_lookup,
+        redact=redact,
+        event_sequencer=sequencer,
+    )
+
+    await _emit_event(
+        state_store,
+        run_id,
+        "run.started",
+        sequencer,
+        {"agent_name": agent.name, "retry_of": original_run_id},
+    )
+
+    this_ctx = DelegationContext(
+        run_id=run_id,
+        delegation_level=delegation_level,
+        persisted=True,
+        store_identity=get_store_identity(state_store),
+        max_delegation_depth=effective_max_depth,
+    )
+    ctx_token = set_delegation_context(this_ctx)
+
+    try:
+        result = await resolved_loop.run(
+            agent=agent,
+            provider=provider,
+            strategy=resolved_strategy,
+            user_input=user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=extra_notifier,
+            initial_history=initial_history,
+            provider_kwargs=provider_kwargs or None,
+        )
+
+        if result.status in (RunStatus.WAITING_CLIENT_TOOL, RunStatus.WAITING_HUMAN_INPUT):
+            pause_state: PauseState = result.meta["pause_state"]
+            await state_store.pause_run(
+                run_id,
+                status=result.status.value,
+                pause_data=pause_state.to_dict(),
+                iteration_count=result.iteration_count,
+            )
+            await _emit_event(
+                state_store,
+                run_id,
+                "run.paused",
+                sequencer,
+                {
+                    "status": result.status.value,
+                    "pending_tool_calls": [
+                        {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "target": pause_state.pending_targets.get(tc.id),
+                        }
+                        for tc in pause_state.pending_tool_calls
+                    ],
+                },
+            )
+        else:
+            redacted_answer = redact(result.answer) if redact and result.answer else result.answer
+            finalize_won = await state_store.finalize_run(
+                run_id,
+                status=result.status.value,
+                answer=redacted_answer,
+                iteration_count=result.iteration_count,
+                total_usage=result.usage,
+                expected_current_status="running",
+            )
+            if finalize_won:
+                await _emit_event(
+                    state_store,
+                    run_id,
+                    "run.completed",
+                    sequencer,
+                    {"status": result.status.value},
+                )
+
+        return result
+
+    except Exception as exc:
+        error_won = False
+        try:
+            redacted_err = redact(str(exc)) if redact else str(exc)
+            error_won = await state_store.finalize_run(
+                run_id,
+                status=RunStatus.ERROR.value,
+                error=redacted_err,
+                total_usage=None,
+                expected_current_status="running",
+            )
+        except Exception:
+            logger.error("Failed to persist ERROR status for retry run %s", run_id, exc_info=True)
+        if error_won:
+            await _emit_event(
+                state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+            )
+        raise
+
+    finally:
+        reset_delegation_context(ctx_token)
+
+
 @overload
 def run_stream(
     agent: Agent,

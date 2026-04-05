@@ -71,6 +71,11 @@ class AgentRun(Base):
     )
     delegation_level: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Retry lineage — separate from delegation tree
+    retry_of_run_id: Mapped[str | None] = mapped_column(
+        String(26), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+
     # Aggregate token usage (rolled up from token_usage table)
     total_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -117,9 +122,10 @@ class AgentRun(Base):
     )
     child_runs: Mapped[list[AgentRun]] = relationship(
         back_populates="parent_run",
+        foreign_keys=[parent_run_id],
     )
     parent_run: Mapped[AgentRun | None] = relationship(
-        back_populates="child_runs", remote_side=[id]
+        back_populates="child_runs", remote_side=[id], foreign_keys=[parent_run_id]
     )
 
     __table_args__ = (

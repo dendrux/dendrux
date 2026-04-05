@@ -57,6 +57,7 @@ class RunRecord:
     meta: dict[str, Any] | None = None
     last_progress_at: datetime | None = None
     failure_reason: str | None = None
+    retry_of_run_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -227,6 +228,7 @@ class StateStore(Protocol):
         meta: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
+        retry_of_run_id: str | None = None,
     ) -> CreateRunResult: ...
 
     async def save_trace(
@@ -445,6 +447,7 @@ class SQLAlchemyStateStore:
         meta: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
+        retry_of_run_id: str | None = None,
     ) -> CreateRunResult:
         import datetime as _dt
 
@@ -475,6 +478,7 @@ class SQLAlchemyStateStore:
                 last_progress_at=_dt.datetime.now(_dt.UTC),
                 idempotency_key=idempotency_key,
                 idempotency_fingerprint=idempotency_fingerprint,
+                retry_of_run_id=retry_of_run_id,
             )
             session.add(run)
             try:
@@ -1483,6 +1487,7 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         meta=row.meta,
         last_progress_at=row.last_progress_at,
         failure_reason=row.failure_reason,
+        retry_of_run_id=row.retry_of_run_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

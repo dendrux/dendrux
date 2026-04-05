@@ -461,6 +461,64 @@ class Agent:
             **kwargs,
         )
 
+    async def retry(
+        self,
+        run_id: str,
+        *,
+        tenant_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        notifier: LoopNotifier | None = None,
+        **kwargs: Any,
+    ) -> RunResult:
+        """Retry a terminal run with approximate prior context.
+
+        Creates a fresh run seeded with the original run's conversation
+        history from persisted traces. The LLM sees the prior conversation
+        and can continue from context. This is NOT resume — it's a new
+        run with approximate context, fresh counters, fresh usage.
+
+        Works for any terminal run (error, cancelled, max_iterations,
+        success). Source run must have used a retry-capable loop (not
+        SingleCall). The retry agent can differ from the original.
+
+        Args:
+            run_id: The terminal run to retry from.
+            tenant_id: Optional tenant ID for the retry run.
+            metadata: Optional developer metadata for the retry run.
+            notifier: Optional notifier for lifecycle events.
+            **kwargs: Forwarded to the LLM provider.
+
+        Returns:
+            RunResult from the retry run.
+
+        Raises:
+            ValueError: If no provider/persistence configured, if the
+                source run is not terminal, or if the source run was
+                SingleCall.
+        """
+        provider = self._require_provider()
+        store = await self._resolve_state_store()
+
+        if store is None:
+            raise ValueError(
+                "retry() requires persistence (database_url, state_store, "
+                "or DENDRUX_DATABASE_URL). Retry reads traces from the original run."
+            )
+
+        from dendrux.runtime.runner import retry as runner_retry
+
+        return await runner_retry(
+            run_id,
+            agent=self,
+            provider=provider,
+            state_store=store,
+            tenant_id=tenant_id,
+            metadata=metadata,
+            redact=self._redact,
+            extra_notifier=notifier,
+            **kwargs,
+        )
+
     async def resume(
         self,
         run_id: str,
