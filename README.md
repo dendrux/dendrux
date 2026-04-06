@@ -142,7 +142,7 @@ async def write_to_db(data: str) -> str: ...
 
 **Delegation depth guards**: nested agent calls are tracked automatically. Runaway recursion is caught and stopped.
 
-### 📊 Explain Everything
+### 🔍 Explain Everything
 
 Two event seams, separated by design:
 
