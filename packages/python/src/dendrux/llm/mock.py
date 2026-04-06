@@ -41,6 +41,8 @@ class MockLLM(LLMProvider):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Return the next predetermined response.
@@ -59,6 +61,7 @@ class MockLLM(LLMProvider):
             {
                 "messages": list(messages),
                 "tools": list(tools) if tools else tools,
+                "output_schema": output_schema,
                 "kwargs": kwargs,
             }
         )

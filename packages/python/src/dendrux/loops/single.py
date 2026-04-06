@@ -33,6 +33,8 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from pydantic import BaseModel
+
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
@@ -79,6 +81,7 @@ class SingleCall(Loop):
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
+        output_type: type[BaseModel] | None = None,
     ) -> RunResult:
         """Execute a single LLM call and return the result."""
         is_resume = (
@@ -110,15 +113,26 @@ class SingleCall(Loop):
         )
 
         t0 = time.monotonic()
-        response = await provider.complete(messages, tools=None, **_pkw)
-        llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
-        if response.tool_calls:
-            raise RuntimeError(
-                f"SingleCall received unexpected tool_calls from provider "
-                f"({len(response.tool_calls)} calls). SingleCall agents must "
-                f"have zero tools — the provider should not produce tool calls."
+        # Structured output path: use the structured helper
+        validated_output: Any = None
+        if output_type is not None:
+            from dendrux.llm.structured import structured_complete
+
+            response, validated_output = await structured_complete(
+                provider, messages, output_type, **_pkw
             )
+        else:
+            response = await provider.complete(messages, tools=None, **_pkw)
+
+            if response.tool_calls:
+                raise RuntimeError(
+                    f"SingleCall received unexpected tool_calls from provider "
+                    f"({len(response.tool_calls)} calls). SingleCall agents must "
+                    f"have zero tools — the provider should not produce tool calls."
+                )
+
+        llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
         await record_llm(
             recorder,
@@ -153,6 +167,7 @@ class SingleCall(Loop):
             run_id=resolved_run_id,
             status=RunStatus.SUCCESS,
             answer=response.text,
+            output=validated_output,
             steps=[],
             iteration_count=1,
             usage=usage,
@@ -173,13 +188,23 @@ class SingleCall(Loop):
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
+        output_type: type[BaseModel] | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream a single LLM call as RunEvents.
 
         Yields TEXT_DELTA events live. The terminal RunResult.answer
         is built from the final DONE event's LLMResponse, not from
         concatenated deltas.
+
+        Structured output (output_type) is not supported in streaming
+        mode in this version. Use agent.run() for structured output.
         """
+        if output_type is not None:
+            raise NotImplementedError(
+                "Structured output streaming is not supported in this version. "
+                "Use agent.run() for structured output, or agent.stream() without output_type."
+            )
+
         is_resume = (
             initial_history is not None
             or initial_steps

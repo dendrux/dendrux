@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from pydantic import BaseModel
+
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.strategies.base import Strategy
@@ -155,6 +157,7 @@ class Loop(ABC):
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
+        output_type: type[BaseModel] | None = None,
     ) -> RunResult:
         """Execute the agent loop until completion.
 
@@ -197,6 +200,7 @@ class Loop(ABC):
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
+        output_type: type[BaseModel] | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream agent execution as RunEvents.
 
@@ -229,6 +233,7 @@ class Loop(ABC):
             iteration_offset=iteration_offset,
             initial_usage=initial_usage,
             provider_kwargs=provider_kwargs,
+            output_type=output_type,
         )
 
         # Determine terminal event type from run status

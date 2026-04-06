@@ -113,6 +113,7 @@ class OpenAIProvider(LLMProvider):
         supports_multimodal=False,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
+        supports_structured_output=True,
         max_context_tokens=128_000,
     )
 
@@ -225,18 +226,48 @@ class OpenAIProvider(LLMProvider):
         captured_request = {k: v for k, v in api_kwargs.items() if v is not openai.NOT_GIVEN}
         return api_kwargs, captured_request
 
+    def _inject_structured_output(
+        self,
+        api_kwargs: dict[str, Any],
+        captured_request: dict[str, Any],
+        output_schema: dict[str, Any],
+    ) -> None:
+        """Inject response_format for structured output and update evidence."""
+        from dendrux.llm._schema import normalize_for_openai_strict
+
+        strict_schema = normalize_for_openai_strict(output_schema)
+        schema_name = output_schema.get("title", "structured_output")
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": strict_schema,
+            },
+        }
+        api_kwargs["response_format"] = response_format
+        captured_request["response_format"] = response_format
+
     async def complete(
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to the model and return a normalized response.
 
         kwargs override constructor defaults (e.g. model, max_tokens, temperature).
         Only supported kwargs are forwarded; unknown keys are ignored.
+
+        When output_schema is provided, sets response_format to json_schema
+        with strict mode. The response is a JSON string in message.content.
         """
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+
+        if output_schema is not None:
+            self._inject_structured_output(api_kwargs, captured_request, output_schema)
 
         try:
             response = await self._client.chat.completions.create(**api_kwargs)
@@ -257,6 +288,8 @@ class OpenAIProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events, token by token.
@@ -271,6 +304,9 @@ class OpenAIProvider(LLMProvider):
         with some OpenAI-compatible backends).
         """
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+
+        if output_schema is not None:
+            self._inject_structured_output(api_kwargs, captured_request, output_schema)
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
 

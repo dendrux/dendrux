@@ -32,6 +32,7 @@ from dendrux.tool import get_tool_def, is_tool
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from dendrux.llm.base import LLMProvider
@@ -99,6 +100,7 @@ class Agent:
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
+        output_type: type[BaseModel] | None = ...,
         database_url: str | None = ...,
         database_options: dict[str, Any] | None = ...,
         state_store: StateStore | None = ...,
@@ -116,6 +118,7 @@ class Agent:
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
+        output_type: type[BaseModel] | None = ...,
         database_url: str | None = ...,
         database_options: dict[str, Any] | None = ...,
         state_store: StateStore | None = ...,
@@ -131,6 +134,7 @@ class Agent:
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         loop: Loop | None = None,
+        output_type: type[BaseModel] | None = None,
         provider: LLMProvider | None | _UnsetType = _UNSET,
         database_url: str | None = None,
         database_options: dict[str, Any] | None = None,
@@ -167,6 +171,7 @@ class Agent:
 
         # --- Loop ---
         self._loop: Loop | None = loop
+        self._output_type: type[BaseModel] | None = output_type
 
         # --- Provider ---
         self._provider: LLMProvider | None = None if isinstance(provider, _UnsetType) else provider
@@ -203,6 +208,11 @@ class Agent:
     def loop(self) -> Loop | None:
         """The execution loop, or None (runner defaults to ReActLoop)."""
         return self._loop
+
+    @property
+    def output_type(self) -> type[BaseModel] | None:
+        """The default output type for structured output, or None."""
+        return self._output_type
 
     @property
     def provider(self) -> LLMProvider | None:
@@ -259,6 +269,15 @@ class Agent:
                 f"Agent '{self.name}' uses SingleCall loop but has {len(self.tools)} "
                 f"tool(s): {tool_names}. SingleCall agents must have zero tools. "
                 f"Either remove the tools or use ReActLoop."
+            )
+
+        # output_type requires SingleCall in v1
+        if self._output_type is not None and not isinstance(self._loop, SingleCall):
+            raise ValueError(
+                f"Agent '{self.name}' has output_type={self._output_type.__name__} "
+                f"but does not use SingleCall loop. Structured output is only "
+                f"supported with SingleCall in this version. Either set "
+                f"loop=SingleCall() or remove output_type."
             )
 
         for fn in self.tools:
@@ -368,6 +387,7 @@ class Agent:
         notifier: LoopNotifier | None = ...,
         max_delegation_depth: int | None,
         idempotency_key: str | None = ...,
+        output_type: type[BaseModel] | None = ...,
         **kwargs: Any,
     ) -> RunResult: ...
 
@@ -380,6 +400,7 @@ class Agent:
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
         idempotency_key: str | None = ...,
+        output_type: type[BaseModel] | None = ...,
         **kwargs: Any,
     ) -> RunResult: ...
 
@@ -392,6 +413,7 @@ class Agent:
         notifier: LoopNotifier | None = None,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         idempotency_key: str | None = None,
+        output_type: type[BaseModel] | None | _UnsetType = _UNSET,
         **kwargs: Any,
     ) -> RunResult:
         """Start a new agent run.
@@ -432,6 +454,28 @@ class Agent:
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
+        # Resolve output_type: run-level overrides agent default
+        resolved_output_type = (
+            self._output_type if isinstance(output_type, _UnsetType) else output_type
+        )
+
+        # Validate output_type + loop compatibility at call time
+        if resolved_output_type is not None:
+            from dendrux.loops.single import SingleCall
+
+            effective_loop = self._loop
+            if effective_loop is None:
+                # Runner will default to ReActLoop — that's not SingleCall
+                raise ValueError(
+                    f"output_type={resolved_output_type.__name__} requires SingleCall loop. "
+                    f"Set loop=SingleCall() on the Agent or remove output_type."
+                )
+            if not isinstance(effective_loop, SingleCall):
+                raise ValueError(
+                    f"output_type={resolved_output_type.__name__} is only supported with "
+                    f"SingleCall loop, not {type(effective_loop).__name__}."
+                )
+
         store = await self._resolve_state_store()
 
         if idempotency_key is not None and store is None:
@@ -457,6 +501,7 @@ class Agent:
             redact=self._redact,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
+            output_type=resolved_output_type,
             **run_kwargs,
             **kwargs,
         )
@@ -662,6 +707,13 @@ class Agent:
         """
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
+
+        if self._output_type is not None:
+            raise NotImplementedError(
+                "Structured output streaming is not supported in this version. "
+                "Use agent.run() for structured output, or create a separate "
+                "Agent without output_type for streaming."
+            )
 
         from dendrux.runtime.runner import run_stream as runner_run_stream
 

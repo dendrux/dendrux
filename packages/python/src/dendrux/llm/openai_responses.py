@@ -104,6 +104,7 @@ class OpenAIResponsesProvider(LLMProvider):
         supports_multimodal=False,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
+        supports_structured_output=True,
         max_context_tokens=200_000,
     )
 
@@ -232,18 +233,48 @@ class OpenAIResponsesProvider(LLMProvider):
         captured_request = dict(api_kwargs)
         return api_kwargs, captured_request
 
+    def _inject_structured_output(
+        self,
+        api_kwargs: dict[str, Any],
+        captured_request: dict[str, Any],
+        output_schema: dict[str, Any],
+    ) -> None:
+        """Inject text.format for structured output and update evidence."""
+        from dendrux.llm._schema import normalize_for_openai_strict
+
+        strict_schema = normalize_for_openai_strict(output_schema)
+        schema_name = output_schema.get("title", "structured_output")
+        text_format = {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "strict": True,
+                "schema": strict_schema,
+            },
+        }
+        api_kwargs["text"] = text_format
+        captured_request["text"] = text_format
+
     async def complete(
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to the model via the Responses API.
 
         kwargs override constructor defaults (e.g. model, max_output_tokens).
         Only supported kwargs are forwarded; unknown keys are ignored.
+
+        When output_schema is provided, sets text.format to json_schema
+        with strict mode.
         """
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+
+        if output_schema is not None:
+            self._inject_structured_output(api_kwargs, captured_request, output_schema)
 
         try:
             response = await self._client.responses.create(**api_kwargs)
@@ -264,6 +295,8 @@ class OpenAIResponsesProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events via the Responses API.
@@ -277,6 +310,9 @@ class OpenAIResponsesProvider(LLMProvider):
         Raises NotImplementedError if the endpoint rejects streaming.
         """
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+
+        if output_schema is not None:
+            self._inject_structured_output(api_kwargs, captured_request, output_schema)
         api_kwargs["stream"] = True
 
         try:

@@ -58,6 +58,8 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
+    from pydantic import BaseModel
+
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
@@ -334,6 +336,7 @@ class ReActLoop(Loop):
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
+        output_type: type[BaseModel] | None = None,
     ) -> RunResult:
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
@@ -504,6 +507,7 @@ class ReActLoop(Loop):
         iteration_offset: int = 0,
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
+        output_type: type[BaseModel] | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 

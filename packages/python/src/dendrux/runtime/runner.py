@@ -214,6 +214,7 @@ async def run(
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
     idempotency_key: str | None = ...,
+    output_type: type | None = ...,
     **kwargs: Any,
 ) -> RunResult: ...
 
@@ -232,6 +233,7 @@ async def run(
     redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     idempotency_key: str | None = ...,
+    output_type: type | None = ...,
     **kwargs: Any,
 ) -> RunResult: ...
 
@@ -250,6 +252,7 @@ async def run(
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     idempotency_key: str | None = None,
+    output_type: type | None = None,
     **kwargs: Any,
 ) -> RunResult:
     """Run an agent to completion.
@@ -326,11 +329,20 @@ async def run(
         run_meta["dendrux.loop"] = type(resolved_loop).__name__
         if effective_max_depth is not None:
             run_meta["dendrux.max_delegation_depth"] = effective_max_depth
+        if output_type is not None:
+            run_meta["dendrux.output_type"] = f"{output_type.__module__}.{output_type.__qualname__}"
 
         # Compute idempotency fingerprint if key is provided
         idem_fingerprint: str | None = None
         if idempotency_key is not None:
-            idem_fingerprint = compute_idempotency_fingerprint(agent.name, user_input)
+            output_type_name = (
+                f"{output_type.__module__}.{output_type.__qualname__}"
+                if output_type is not None
+                else None
+            )
+            idem_fingerprint = compute_idempotency_fingerprint(
+                agent.name, user_input, output_type_name=output_type_name
+            )
 
         create_result = await state_store.create_run(
             run_id,
@@ -348,7 +360,7 @@ async def run(
 
         # Handle idempotency outcomes
         if create_result.outcome == "existing_terminal":
-            return await _build_cached_result(state_store, create_result.run_id)
+            return await _build_cached_result(state_store, create_result.run_id, output_type)
         if create_result.outcome == "existing_active":
             raise RunAlreadyActiveError(create_result.run_id, create_result.status)
 
@@ -402,6 +414,7 @@ async def run(
             recorder=recorder,
             notifier=extra_notifier,
             provider_kwargs=provider_kwargs or None,
+            output_type=output_type,
         )
 
         if state_store is not None:
@@ -509,7 +522,11 @@ async def _raise_resume_claim_failure(
     )
 
 
-async def _build_cached_result(state_store: StateStore, run_id: str) -> RunResult:
+async def _build_cached_result(
+    state_store: StateStore,
+    run_id: str,
+    output_type: type | None = None,
+) -> RunResult:
     """Rebuild a summary RunResult from persisted DB state for idempotent dedup.
 
     This is a *summary*, not a faithful replay of the original RunResult:
@@ -517,6 +534,10 @@ async def _build_cached_result(state_store: StateStore, run_id: str) -> RunResul
     - meta is empty (developer meta is on the run row, not in RunResult.meta)
     - usage is reconstructed from aggregate columns (total_input_tokens, etc.),
       which may be zero for errored runs where finalize_run got total_usage=None
+
+    When output_type is provided, re-validates the persisted answer against
+    the schema to populate result.output. This ensures the idempotent path
+    returns the same typed result as a fresh run.
 
     The contract is: "return the cached final outcome" — status, answer, error,
     iteration count, and aggregate usage. Not "return the identical object."
@@ -527,10 +548,28 @@ async def _build_cached_result(state_store: StateStore, run_id: str) -> RunResul
     if run is None:
         raise RuntimeError(f"Idempotent run {run_id} not found in database")
 
+    # Rebuild typed output from persisted answer if output_type was requested
+    output = None
+    if output_type is not None and run.answer:
+        from pydantic import ValidationError
+
+        try:
+            output = output_type.model_validate_json(run.answer)
+        except (ValidationError, Exception):
+            # If the persisted answer doesn't validate (schema evolved,
+            # corruption, etc.), return None rather than crashing the
+            # dedup path. The caller still gets answer as raw text.
+            logger.warning(
+                "Cached run %s answer failed validation against %s",
+                run_id,
+                output_type.__name__,
+            )
+
     return RunResult(
         run_id=run.id,
         status=RunStatus(run.status),
         answer=run.answer,
+        output=output,
         steps=[],
         iteration_count=run.iteration_count,
         usage=UsageStats(
@@ -821,6 +860,7 @@ def run_stream(
     redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
+    output_type: type | None = ...,
     **kwargs: Any,
 ) -> RunStream: ...
 
@@ -839,6 +879,7 @@ def run_stream(
     metadata: dict[str, Any] | None = ...,
     redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
+    output_type: type | None = ...,
     **kwargs: Any,
 ) -> RunStream: ...
 
@@ -857,6 +898,7 @@ def run_stream(
     redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
+    output_type: type | None = None,
     **kwargs: Any,
 ) -> RunStream:
     """Stream an agent run as RunEvents, returning a RunStream.
@@ -936,6 +978,10 @@ def run_stream(
                 run_meta["dendrux.loop"] = type(resolved_loop).__name__
                 if eff_max_depth is not None:
                     run_meta["dendrux.max_delegation_depth"] = eff_max_depth
+                if output_type is not None:
+                    run_meta["dendrux.output_type"] = (
+                        f"{output_type.__module__}.{output_type.__qualname__}"
+                    )
                 await store.create_run(
                     run_id,
                     agent.name,
@@ -996,6 +1042,7 @@ def run_stream(
                 recorder=recorder,
                 notifier=extra_notifier,
                 provider_kwargs=provider_kwargs or None,
+                output_type=output_type,
             ):
                 # Persist loop outcomes before forwarding
                 if event.type == RunEventType.RUN_COMPLETED and event.run_result:

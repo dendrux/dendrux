@@ -12,6 +12,7 @@ from dendrux.types import (
     CreateRunResult,
     IdempotencyConflictError,
     RunAlreadyActiveError,
+    StructuredOutputValidationError,
 )
 
 # bridge() requires FastAPI (pip install dendrux[bridge]).
@@ -40,6 +41,7 @@ __all__ = [
     "IdempotencyConflictError",
     "RunAlreadyActiveError",
     "SingleCall",
+    "StructuredOutputValidationError",
     "bridge",
     "run",
     "sweep",

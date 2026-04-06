@@ -68,6 +68,8 @@ class LLMProvider(ABC):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to the LLM and return a complete response.
@@ -76,6 +78,11 @@ class LLMProvider(ABC):
             messages: Conversation history in Dendrux's universal format.
             tools: Tool definitions the LLM can call. Provider converts these
                    to its native format internally.
+            output_schema: JSON Schema for structured output. When provided,
+                the provider uses its native mechanism to constrain the
+                response to this schema (Anthropic: tool-use trick, OpenAI:
+                response_format). The structured data is normalized into
+                LLMResponse.text as a JSON string.
             **kwargs: Provider-specific options (temperature, max_tokens, etc.).
 
         Returns:
@@ -86,6 +93,8 @@ class LLMProvider(ABC):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events.
@@ -101,7 +110,7 @@ class LLMProvider(ABC):
         Yields:
             StreamEvent objects as they arrive from the LLM.
         """
-        response = await self.complete(messages, tools, **kwargs)
+        response = await self.complete(messages, tools, output_schema=output_schema, **kwargs)
         if response.text:
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=response.text)
         if response.tool_calls:

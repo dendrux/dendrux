@@ -10,6 +10,7 @@ No business logic, no agent loop awareness. Just shape translation.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 import anthropic
@@ -72,6 +73,7 @@ class AnthropicProvider(LLMProvider):
         supports_multimodal=False,  # Not implemented yet
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
+        supports_structured_output=True,
         max_context_tokens=200_000,
     )
 
@@ -161,14 +163,36 @@ class AnthropicProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to Claude and return a normalized response.
 
         kwargs override constructor defaults (e.g. model, max_tokens).
         Only Anthropic-supported kwargs are forwarded; unknown keys are ignored.
+
+        When output_schema is provided, injects a synthetic tool with the
+        schema and forces tool_choice. The tool_use response is extracted
+        and normalized into LLMResponse.text as a JSON string, with
+        tool_calls set to None (preserving the SingleCall invariant).
         """
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+
+        # Structured output: inject synthetic tool + forced tool_choice
+        is_structured = output_schema is not None
+        if is_structured:
+            api_kwargs["tools"] = [
+                {
+                    "name": "structured_output",
+                    "description": "Return your response in this exact format.",
+                    "input_schema": output_schema,
+                }
+            ]
+            api_kwargs["tool_choice"] = {"type": "tool", "name": "structured_output"}
+            # Update captured_request so evidence reflects the actual API call
+            captured_request["tools"] = api_kwargs["tools"]
+            captured_request["tool_choice"] = api_kwargs["tool_choice"]
 
         try:
             response = await self._client.messages.create(**api_kwargs)
@@ -177,7 +201,10 @@ class AnthropicProvider(LLMProvider):
         except anthropic.APIConnectionError as exc:
             raise connection_error("Anthropic API", self._model, exc) from exc
 
-        llm_response = self._normalize_response(response)
+        if is_structured:
+            llm_response = self._normalize_structured_response(response)
+        else:
+            llm_response = self._normalize_response(response)
 
         # Attach adapter-boundary payloads for evidence layer
         llm_response.provider_request = captured_request
@@ -189,6 +216,8 @@ class AnthropicProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[ToolDef] | None = None,
+        *,
+        output_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events, token by token.
@@ -398,6 +427,38 @@ class AnthropicProvider(LLMProvider):
     # ------------------------------------------------------------------
     # Inbound conversions: Anthropic → Dendrux
     # ------------------------------------------------------------------
+
+    def _normalize_structured_response(self, response: anthropic.types.Message) -> LLMResponse:
+        """Extract structured output from a forced tool_use response.
+
+        The synthetic "structured_output" tool's input is the structured
+        data. We serialize it to JSON and put it in LLMResponse.text,
+        with tool_calls=None so SingleCall's invariant is preserved.
+        """
+        structured_data: dict[str, Any] | None = None
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "structured_output":
+                structured_data = dict(block.input) if block.input else {}
+                break
+
+        if structured_data is None:
+            raise RuntimeError(
+                "Anthropic structured output: expected a tool_use block named "
+                "'structured_output' but none was found in the response."
+            )
+
+        usage = UsageStats(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+        )
+
+        return LLMResponse(
+            text=json.dumps(structured_data),
+            tool_calls=None,
+            raw=response,
+            usage=usage,
+        )
 
     def _normalize_response(self, response: anthropic.types.Message) -> LLMResponse:
         """Convert Anthropic response to Dendrux LLMResponse.

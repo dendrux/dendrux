@@ -228,6 +228,7 @@ class ProviderCapabilities:
     supports_multimodal: bool = False
     supports_system_prompt: bool = True
     supports_parallel_tool_calls: bool = False
+    supports_structured_output: bool = False
     max_context_tokens: int | None = None
 
 
@@ -255,6 +256,7 @@ class RunResult:
     run_id: str
     status: RunStatus
     answer: str | None = None
+    output: Any = None
     steps: list[AgentStep] = field(default_factory=list)
     iteration_count: int = 0
     usage: UsageStats = field(default_factory=UsageStats)
@@ -704,16 +706,39 @@ class IdempotencyConflictError(RuntimeError):
         )
 
 
-def compute_idempotency_fingerprint(agent_name: str, user_input: str) -> str:
+class StructuredOutputValidationError(RuntimeError):
+    """Raised when the LLM response fails validation against the requested output_type.
+
+    Carries the raw response text and the validation error for debugging.
+    """
+
+    def __init__(self, raw_response: str, output_type_name: str, validation_error: str) -> None:
+        self.raw_response = raw_response
+        self.output_type_name = output_type_name
+        self.validation_error = validation_error
+        super().__init__(
+            f"Structured output validation failed for {output_type_name}. "
+            f"Validation error: {validation_error}\n"
+            f"Raw response: {raw_response[:500]}"
+        )
+
+
+def compute_idempotency_fingerprint(
+    agent_name: str,
+    user_input: str,
+    output_type_name: str | None = None,
+) -> str:
     """Deterministic SHA-256 fingerprint for idempotency conflict detection.
 
-    Includes agent_name + user_input (request identity). Does NOT include
-    provider kwargs (temperature, max_tokens) — those are execution tuning,
-    not request identity.
+    Includes agent_name + user_input + output_type (request identity).
+    Does NOT include provider kwargs (temperature, max_tokens) — those
+    are execution tuning, not request identity.
+
+    output_type changes the return shape contract, so two calls with
+    different output_types must be treated as different requests.
     """
-    payload = json.dumps(
-        {"agent_name": agent_name, "user_input": user_input},
-        sort_keys=True,
-        ensure_ascii=True,
-    )
+    data: dict[str, Any] = {"agent_name": agent_name, "user_input": user_input}
+    if output_type_name is not None:
+        data["output_type"] = output_type_name
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
