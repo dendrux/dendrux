@@ -6,7 +6,7 @@ The async Python runtime for agents that survive failure, persist everything, an
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-> `v0.1.0a4` — core API stabilizing, actively developed.
+> `v0.1.0a4` - core API stabilizing, actively developed.
 
 ---
 
@@ -89,9 +89,9 @@ Dendrux is built around five design commitments:
 
 Runs crash. Processes die. Dendrux handles it.
 
-**Durable persistence** — every trace, tool call, and lifecycle event is written through a durability layer with retry and exponential backoff. Transient DB failures (connection drops, lock timeouts, SQLite busy) are retried automatically. Logical errors propagate immediately. LLM interactions and token usage are persisted best-effort.
+**Durable persistence**: every trace, tool call, and lifecycle event is written through a durability layer with retry and exponential backoff. Transient DB failures (connection drops, lock timeouts, SQLite busy) are retried automatically. Logical errors propagate immediately. LLM interactions and token usage are persisted best-effort.
 
-**Sweep stale runs** — call `sweep()` at app startup to detect runs that were RUNNING when the process died or WAITING when no one came back. They're marked ERROR with structured failure reasons.
+**Sweep stale runs**: call `sweep()` at app startup to detect runs that were RUNNING when the process died or WAITING when no one came back. They're marked ERROR with structured failure reasons.
 
 ```python
 from dendrux import sweep
@@ -104,13 +104,13 @@ results = await sweep(
 )
 ```
 
-**Retry terminal runs** — a failed, cancelled, or timed-out run can be retried with prior context from persisted traces. If redaction is configured, the retried run sees scrubbed content. Same agent or a different one — different model, different tools.
+**Retry terminal runs**: a failed, cancelled, or timed-out run can be retried with prior context from persisted traces. If redaction is configured, the retried run sees scrubbed content. Same agent or a different one, different model, different tools.
 
 ```python
 result = await agent.retry("01JR...")
 ```
 
-**Idempotency** — pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`.
+**Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`.
 
 ```python
 result = await agent.run(
@@ -121,7 +121,7 @@ result = await agent.run(
 
 ### 🛡️ Control Execution
 
-**Tool constraints** — control how often tools run and how long they take. When a limit is hit, the agent gets a graceful message and adapts. No crash.
+**Tool constraints**: control how often tools run and how long they take. When a limit is hit, the agent gets a graceful message and adapts. No crash.
 
 ```python
 @tool(max_calls_per_run=3, timeout_seconds=120)
@@ -130,7 +130,7 @@ async def search(query: str) -> str:
     ...
 ```
 
-**Parallel execution** — when the LLM returns multiple tool calls, Dendrux executes them concurrently by default. Mark tools `parallel=False` for sequential execution.
+**Parallel execution**: when the LLM returns multiple tool calls, Dendrux executes them concurrently by default. Mark tools `parallel=False` for sequential execution.
 
 ```python
 @tool(parallel=True)     # runs concurrently (default)
@@ -140,14 +140,14 @@ async def fast_lookup(id: str) -> str: ...
 async def write_to_db(data: str) -> str: ...
 ```
 
-**Delegation depth guards** — nested agent calls are tracked automatically. Runaway recursion is caught and stopped.
+**Delegation depth guards**: nested agent calls are tracked automatically. Runaway recursion is caught and stopped.
 
 ### 📊 Explain Everything
 
 Two event seams, separated by design:
 
-- **Recorder** (internal) — authoritative persistence. Fail-closed with durability retry. If a trace can't be written, the run stops.
-- **Notifier** (external) — best-effort UI notifications. Exceptions swallowed. Never kills a run.
+- **Recorder** (internal): authoritative persistence. Fail-closed with durability retry. If a trace can't be written, the run stops.
+- **Notifier** (external): best-effort UI notifications. Exceptions swallowed. Never kills a run.
 
 ```python
 from dendrux.notifiers.console import ConsoleNotifier
@@ -157,7 +157,7 @@ result = await agent.run("do the thing", notifier=ConsoleNotifier())
 
 Every run persists: traces with full message content, tool calls with parameters and results, LLM interactions with request/response payloads, token usage, timing, delegation links, and lifecycle events.
 
-**Redaction** — scrub sensitive data before it's stored:
+**Redaction**: scrub sensitive data before it's stored:
 
 ```python
 agent = Agent(
@@ -170,7 +170,7 @@ agent = Agent(
 
 ### 🌳 Coordinate Agents
 
-Use agents as tools inside other agents. Parent-child relationships are tracked automatically via `contextvars` — zero developer code.
+Use agents as tools inside other agents. Parent-child relationships are tracked automatically via `contextvars`. Zero developer code.
 
 ```python
 @tool(max_calls_per_run=3, timeout_seconds=120)
@@ -189,7 +189,7 @@ The state store links parent and child runs. The dashboard shows the full delega
 
 ### ⏸️ Pause for the Real World
 
-**Client-tool bridge** — define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
+**Client-tool bridge**: define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
 
 ```python
 @tool(target="client")
@@ -205,7 +205,7 @@ The bridge handles SSE streaming, tool result submission, polling, and cancellat
 
 ### 🔀 Streaming
 
-Stream events as they happen — token-by-token text, tool calls, lifecycle events:
+Stream events as they happen: token-by-token text, tool calls, lifecycle events:
 
 ```python
 # Full event stream
@@ -235,14 +235,14 @@ Works with all providers. If the consumer breaks early, the run is cancelled cle
 The loop never touches provider-specific APIs. The strategy never calls the LLM. Each layer has one job.
 
 **Persistence flows through two separated paths:**
-- **Evidence** (right): Recorder → StateStore — fail-closed, durable retry
-- **Display** (left): Notifier → Console / custom — best-effort, exceptions swallowed
+- **Evidence** (right): Recorder → StateStore. Fail-closed, durable retry.
+- **Display** (left): Notifier → Console / custom. Best-effort, exceptions swallowed.
 
 ---
 
 ## Providers
 
-Swap one import — everything else stays the same.
+Swap one import. Everything else stays the same.
 
 **Anthropic (Claude)**
 ```python
@@ -250,14 +250,14 @@ from dendrux.llm.anthropic import AnthropicProvider
 provider = AnthropicProvider(model="claude-sonnet-4-6")
 ```
 
-**OpenAI (Chat Completions)** — also works with vLLM, SGLang, Groq, Together, Ollama
+**OpenAI (Chat Completions)**, also works with vLLM, SGLang, Groq, Together, Ollama
 ```python
 from dendrux.llm.openai import OpenAIProvider
 provider = OpenAIProvider(model="gpt-4o")
 provider = OpenAIProvider(model="llama-3-70b", base_url="http://localhost:8000/v1")
 ```
 
-**OpenAI (Responses API)** — for built-in tools like web search alongside your own
+**OpenAI (Responses API)**, for built-in tools like web search alongside your own
 ```python
 from dendrux.llm.openai_responses import OpenAIResponsesProvider
 provider = OpenAIResponsesProvider(model="gpt-4o", builtin_tools=["web_search_preview"])
@@ -265,7 +265,7 @@ provider = OpenAIResponsesProvider(model="gpt-4o", builtin_tools=["web_search_pr
 
 All providers accept `max_tokens`, `temperature`, `timeout`, and `max_retries` at construction or per-call.
 
-> **Note:** Reasoning models (o-series, GPT-5) with multi-turn tool calling have a [known limitation](packages/python/src/dendrux/llm/openai_responses.py) — reasoning items are not preserved between turns. Use OpenAIProvider (Chat Completions) for reasoning model tool loops.
+> **Note:** Reasoning models (o-series, GPT-5) with multi-turn tool calling have a [known limitation](packages/python/src/dendrux/llm/openai_responses.py). Reasoning items are not preserved between turns. Use OpenAIProvider (Chat Completions) for reasoning model tool loops.
 
 ---
 
@@ -286,7 +286,7 @@ Postgres supported via Alembic migrations: `dendrux db migrate`
 
 Set `DENDRUX_DATABASE_URL` once to skip passing `database_url` to every agent.
 
-Omit `database_url` entirely for ephemeral runs — no persistence, no overhead.
+Omit `database_url` entirely for ephemeral runs. No persistence, no overhead.
 
 ---
 
@@ -346,7 +346,7 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 ## Status
 
-Dendrux is in active development (`v0.1.0a4`). The core API is stabilizing — `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `sweep` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.1.0a4`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `sweep` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
