@@ -451,13 +451,13 @@ class TestAgentResume:
         with pytest.raises(ValueError, match="Cannot provide both"):
             await agent.resume("run-123", tool_results=[], user_input="test")
 
-    async def test_resume_with_no_args_raises(self):
+    async def test_resume_no_arg_requires_persistence(self):
+        """No-arg resume (approval approve) still requires persistence."""
         agent = Agent(
             provider=_mock_provider(),
             prompt="Hello.",
-            database_url="sqlite:///test.db",
         )
-        with pytest.raises(ValueError, match="requires either tool_results or user_input"):
+        with pytest.raises(ValueError, match="requires persistence"):
             await agent.resume("run-123")
 
 

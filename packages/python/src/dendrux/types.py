@@ -192,6 +192,39 @@ class UsageStats:
     cost_usd: float | None = None
 
 
+@dataclass(frozen=True)
+class Budget:
+    """Token budget for advisory spend tracking.
+
+    Non-blocking in v1 — fires governance events (budget.threshold,
+    budget.exceeded) but does not pause or stop the run. Developers
+    observe events and take action in their own integration.
+
+    Args:
+        max_tokens: Advisory token cap (must be > 0). Events fire when
+            usage crosses warn_at fractions and when usage reaches
+            this value.
+        warn_at: Fractions of max_tokens at which budget.threshold
+            events fire. Each fraction must be in (0, 1) exclusive.
+            Each fraction fires exactly once per run.
+            Default: (0.5, 0.75, 0.9).
+
+    Raises:
+        ValueError: If max_tokens <= 0 or any warn_at fraction is
+            outside (0, 1) exclusive.
+    """
+
+    max_tokens: int
+    warn_at: tuple[float, ...] = (0.5, 0.75, 0.9)
+
+    def __post_init__(self) -> None:
+        if self.max_tokens <= 0:
+            raise ValueError(f"Budget max_tokens must be > 0, got {self.max_tokens}.")
+        for f in self.warn_at:
+            if not (0 < f < 1):
+                raise ValueError(f"Budget warn_at fractions must be in (0, 1) exclusive, got {f}.")
+
+
 @dataclass
 class LLMResponse:
     """Normalized response from any LLM provider.
@@ -233,16 +266,13 @@ class ProviderCapabilities:
 
 
 class RunStatus(StrEnum):
-    """Status of an agent run.
-
-    WAITING_APPROVAL is reserved for future use — not implemented.
-    """
+    """Status of an agent run."""
 
     PENDING = "pending"
     RUNNING = "running"
     WAITING_CLIENT_TOOL = "waiting_client_tool"
     WAITING_HUMAN_INPUT = "waiting_human_input"
-    WAITING_APPROVAL = "waiting_approval"  # Reserved — not yet implemented
+    WAITING_APPROVAL = "waiting_approval"
     SUCCESS = "success"
     ERROR = "error"
     CANCELLED = "cancelled"

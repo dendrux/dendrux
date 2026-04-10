@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
     from dendrux.runtime.state import StateStore
-    from dendrux.types import RunResult, RunStream, ToolDef, ToolResult
+    from dendrux.types import Budget, RunResult, RunStream, ToolDef, ToolResult
 
 # Safety limit to prevent runaway LLM costs. Can be overridden per-agent
 # once the worker/config layer ships (Sprint 6).
@@ -106,6 +106,8 @@ class Agent:
         state_store: StateStore | None = ...,
         redact: Callable[[str], str] | None = ...,
         deny: list[str] | None = ...,
+        require_approval: list[str] | None = ...,
+        budget: Budget | None = ...,
     ) -> None: ...
 
     @overload
@@ -125,6 +127,8 @@ class Agent:
         state_store: StateStore | None = ...,
         redact: Callable[[str], str] | None = ...,
         deny: list[str] | None = ...,
+        require_approval: list[str] | None = ...,
+        budget: Budget | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -143,6 +147,8 @@ class Agent:
         state_store: StateStore | None = None,
         redact: Callable[[str], str] | None = None,
         deny: list[str] | None = None,
+        require_approval: list[str] | None = None,
+        budget: Budget | None = None,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -192,6 +198,10 @@ class Agent:
         self._state_store = state_store
         self._redact = redact
         self._deny: frozenset[str] = frozenset(deny) if deny else frozenset()
+        self._require_approval: frozenset[str] = (
+            frozenset(require_approval) if require_approval else frozenset()
+        )
+        self._budget: Budget | None = budget
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
 
@@ -222,6 +232,16 @@ class Agent:
     def deny(self) -> frozenset[str]:
         """Tool names denied by policy. Empty frozenset if none."""
         return self._deny
+
+    @property
+    def require_approval(self) -> frozenset[str]:
+        """Tool names requiring human approval. Empty frozenset if none."""
+        return self._require_approval
+
+    @property
+    def budget(self) -> Budget | None:
+        """Advisory token budget, or None."""
+        return self._budget
 
     @property
     def provider(self) -> LLMProvider | None:
@@ -306,6 +326,11 @@ class Agent:
                 f"{MAX_ITERATIONS_CEILING}, got {self.max_iterations}."
             )
 
+        # --- Shared tool name set for deny/require_approval validation ---
+        known_tools: frozenset[str] = frozenset()
+        if self.tools and (self._deny or self._require_approval):
+            known_tools = frozenset(str(getattr(fn, "__name__", fn)) for fn in self.tools)
+
         # --- deny= validation ---
         if self._deny:
             # deny requires tools
@@ -320,14 +345,58 @@ class Agent:
                 )
 
             # every name in deny must exist in tools
-            known_tools: frozenset[str] = frozenset(
-                str(getattr(fn, "__name__", fn)) for fn in self.tools
-            )
             unknown = self._deny - known_tools
             if unknown:
                 raise ValueError(
                     f"Agent '{self.name}' deny contains unknown tool(s): "
                     f"{sorted(unknown)}. Available tools: {sorted(known_tools)}."
+                )
+
+        # --- require_approval= validation ---
+        if self._require_approval:
+            # require_approval requires tools
+            if not self.tools:
+                raise ValueError(
+                    f"Agent '{self.name}' has require_approval="
+                    f"{sorted(self._require_approval)} but no tools."
+                )
+
+            # require_approval + SingleCall is not supported
+            if isinstance(self._loop, SingleCall):
+                raise ValueError(
+                    f"Agent '{self.name}' has require_approval="
+                    f"{sorted(self._require_approval)} but uses SingleCall loop. "
+                    f"require_approval is not supported with SingleCall."
+                )
+
+            # every name in require_approval must exist in tools
+            unknown_approval = self._require_approval - known_tools
+            if unknown_approval:
+                raise ValueError(
+                    f"Agent '{self.name}' require_approval contains unknown tool(s): "
+                    f"{sorted(unknown_approval)}. Available tools: {sorted(known_tools)}."
+                )
+
+            # require_approval tools must be server tools
+            from dendrux.tool import get_tool_def as _get_tool_def
+            from dendrux.types import ToolTarget as _ToolTarget
+
+            for fn in self.tools:
+                td = _get_tool_def(fn)
+                if td.name in self._require_approval and td.target != _ToolTarget.SERVER:
+                    raise ValueError(
+                        f"Agent '{self.name}' require_approval contains "
+                        f"'{td.name}' which has target={td.target.value}. "
+                        f"require_approval only supports server tools."
+                    )
+
+            # deny and require_approval must not overlap
+            overlap = self._deny & self._require_approval
+            if overlap:
+                raise ValueError(
+                    f"Agent '{self.name}' has tools in both deny and "
+                    f"require_approval: {sorted(overlap)}. "
+                    f"A tool cannot be both denied and require approval."
                 )
 
     # ------------------------------------------------------------------
@@ -629,11 +698,6 @@ class Agent:
         provider = self._require_provider()
         if tool_results is not None and user_input is not None:
             raise ValueError("Cannot provide both tool_results and user_input to resume().")
-        if tool_results is None and user_input is None:
-            raise ValueError(
-                "resume() requires either tool_results or user_input. "
-                "No-arg resume (bridge path) is not yet supported."
-            )
 
         store = await self._resolve_state_store()
         if store is None:
@@ -655,10 +719,21 @@ class Agent:
                 redact=self._redact,
                 extra_notifier=notifier,
             )
-        # user_input path (guarded by validation above)
-        return await resume_with_input(
+        if user_input is not None:
+            return await resume_with_input(
+                run_id,
+                user_input,
+                state_store=store,
+                agent=self,
+                provider=provider,
+                redact=self._redact,
+                extra_notifier=notifier,
+            )
+        # No-arg resume — approve path. Runner validates status is
+        # WAITING_APPROVAL and executes pending tools.
+        return await runner_resume(
             run_id,
-            user_input,  # type: ignore[arg-type]
+            None,
             state_store=store,
             agent=self,
             provider=provider,
@@ -806,8 +881,6 @@ class Agent:
         provider = self._require_provider()
         if tool_results is not None and user_input is not None:
             raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
-        if tool_results is None and user_input is None:
-            raise ValueError("resume_stream() requires either tool_results or user_input.")
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
 

@@ -256,6 +256,7 @@ def bridge(
                 if result.status in (
                     RunStatus.WAITING_CLIENT_TOOL,
                     RunStatus.WAITING_HUMAN_INPUT,
+                    RunStatus.WAITING_APPROVAL,
                 ):
                     # Re-paused — not terminal. Client stays connected.
                     pause_state = result.meta.get("pause_state")

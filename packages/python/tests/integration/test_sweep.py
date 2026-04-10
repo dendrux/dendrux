@@ -451,8 +451,8 @@ class TestSweepAbandonedRuns:
         run = await store.get_run(rid)
         assert run.status == "waiting_client_tool"
 
-    async def test_waiting_approval_not_swept(self, store):
-        """WAITING_APPROVAL is not swept in v1 (reserved, not implemented)."""
+    async def test_waiting_approval_swept(self, store):
+        """WAITING_APPROVAL is swept like other waiting statuses."""
         old_time = dt.datetime.now(dt.UTC) - timedelta(hours=3)
         await _create_run(store, status="waiting_approval", last_progress_at=old_time)
 
@@ -463,7 +463,8 @@ class TestSweepAbandonedRuns:
             await session.commit()
 
         swept = await store.sweep_abandoned_runs(older_than=timedelta(hours=2))
-        assert len(swept) == 0
+        assert len(swept) == 1
+        assert swept[0].previous_status == "waiting_approval"
 
     async def test_running_not_swept_by_abandonment(self, store):
         """RUNNING rows are not touched by abandonment sweep."""

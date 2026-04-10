@@ -54,9 +54,10 @@ async def sweep(
             no forward progress beyond this duration are swept. If None,
             no stale-running sweep is performed.
         abandoned_waiting: Threshold for abandoned WAITING detection.
-            WAITING_CLIENT_TOOL and WAITING_HUMAN_INPUT runs with no
-            state change beyond this duration are swept. If None, no
-            abandoned-waiting sweep is performed.
+            WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, and
+            WAITING_APPROVAL runs with no state change beyond this
+            duration are swept. If None, no abandoned-waiting sweep
+            is performed.
 
     Returns:
         SweepResult with lists of swept runs by category.

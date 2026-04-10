@@ -40,6 +40,7 @@ from dendrux.loops.base import Loop
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT, get_tool_def
 from dendrux.types import (
     AgentStep,
+    Budget,
     Clarification,
     Finish,
     Message,
@@ -80,6 +81,9 @@ _notify_llm = notify_llm
 _notify_tool = notify_tool
 _notify_governance = notify_governance
 
+# Sentinel value in fired_thresholds to track that budget.exceeded has fired.
+_BUDGET_EXCEEDED_SENTINEL = -1.0
+
 
 class _ToolCallOutcome(NamedTuple):
     """Result of processing tool calls in a single iteration."""
@@ -88,6 +92,8 @@ class _ToolCallOutcome(NamedTuple):
     all_results: list[tuple[ToolCall, ToolResult]]
     # Non-server tools that need pause (empty if all were server tools)
     pending_calls: list[ToolCall]
+    # True if pending_calls are awaiting approval (vs client tool pause)
+    pending_approval: bool = False
 
 
 def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
@@ -99,6 +105,74 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
         if total.cost_usd is None:
             total.cost_usd = 0.0
         total.cost_usd += step_usage.cost_usd
+
+
+async def _check_budget(
+    budget: Budget | None,
+    total_usage: UsageStats,
+    fired_thresholds: list[float],
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    iteration: int,
+    warnings: list[str],
+) -> None:
+    """Check budget thresholds and exceeded after usage accumulation.
+
+    Advisory only — fires governance events but does not pause or stop.
+    Each threshold and exceeded fires exactly once per run.
+    """
+    if budget is None:
+        return
+
+    used = total_usage.total_tokens
+    max_t = budget.max_tokens
+    fraction = used / max_t
+
+    # Threshold events — fire once per fraction when first crossed
+    for threshold in budget.warn_at:
+        if fraction >= threshold and threshold not in fired_thresholds:
+            fired_thresholds.append(threshold)
+            event_data = {
+                "fraction": threshold,
+                "used": used,
+                "max": max_t,
+                "reason": "threshold_crossed",
+            }
+            await _record_governance(
+                recorder,
+                "budget.threshold",
+                iteration,
+                event_data,
+            )
+            await _notify_governance(
+                notifier,
+                "budget.threshold",
+                iteration,
+                event_data,
+                warnings=warnings,
+            )
+
+    # Exceeded event — fire once when usage first reaches max
+    if used >= max_t and _BUDGET_EXCEEDED_SENTINEL not in fired_thresholds:
+        fired_thresholds.append(_BUDGET_EXCEEDED_SENTINEL)
+        event_data = {
+            "used": used,
+            "max": max_t,
+            "reason": "budget_exceeded",
+        }
+        await _record_governance(
+            recorder,
+            "budget.exceeded",
+            iteration,
+            event_data,
+        )
+        await _notify_governance(
+            notifier,
+            "budget.exceeded",
+            iteration,
+            event_data,
+            warnings=warnings,
+        )
 
 
 async def _append_assistant(
@@ -222,6 +296,7 @@ async def _process_tool_calls(
     history: list[Message],
     warnings: list[str],
     deny: frozenset[str] | None = None,
+    require_approval: frozenset[str] | None = None,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -272,6 +347,38 @@ async def _process_tool_calls(
             all_results.append((tc, deny_result))
         else:
             non_denied.append(tc)
+
+    # --- Phase 0.5: Approval check (governance) ---
+    approval_set = require_approval or frozenset()
+    if approval_set and any(tc.name in approval_set for tc in non_denied):
+        # Any tool in the batch needs approval → entire remaining batch pauses.
+        for tc in non_denied:
+            if tc.name in approval_set:
+                event_data = {
+                    "tool_name": tc.name,
+                    "call_id": tc.id,
+                    "reason": "requires_approval",
+                }
+                await _record_governance(
+                    recorder,
+                    "approval.requested",
+                    iteration,
+                    event_data,
+                    correlation_id=tc.id,
+                )
+                await _notify_governance(
+                    notifier,
+                    "approval.requested",
+                    iteration,
+                    event_data,
+                    correlation_id=tc.id,
+                    warnings=warnings,
+                )
+        return _ToolCallOutcome(
+            all_results=all_results,
+            pending_calls=non_denied,
+            pending_approval=True,
+        )
 
     # --- Phase 1: Enforce max_calls_per_run ---
     allowed_calls: list[ToolCall] = []
@@ -397,6 +504,7 @@ class ReActLoop(Loop):
         )
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
+        budget_fired: list[float] = []
 
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
@@ -429,6 +537,15 @@ class ReActLoop(Loop):
                 duration_ms=llm_duration_ms,
             )
             _accumulate_usage(total_usage, response.usage)
+            await _check_budget(
+                agent.budget,
+                total_usage,
+                budget_fired,
+                recorder,
+                notifier,
+                iteration,
+                notifier_warnings,
+            )
 
             step = strategy.parse_response(response)
             steps.append(step)
@@ -504,8 +621,14 @@ class ReActLoop(Loop):
                     history=history,
                     warnings=notifier_warnings,
                     deny=agent.deny,
+                    require_approval=agent.require_approval,
                 )
                 if outcome.pending_calls:
+                    pause_status = (
+                        RunStatus.WAITING_APPROVAL
+                        if outcome.pending_approval
+                        else RunStatus.WAITING_CLIENT_TOOL
+                    )
                     pause = _build_pause(
                         agent_name=agent.name,
                         pending_calls=outcome.pending_calls,
@@ -520,7 +643,7 @@ class ReActLoop(Loop):
                         meta["notifier_warnings"] = notifier_warnings
                     return RunResult(
                         run_id=resolved_run_id,
-                        status=RunStatus.WAITING_CLIENT_TOOL,
+                        status=pause_status,
                         steps=steps,
                         iteration_count=iteration,
                         usage=total_usage,
@@ -575,6 +698,7 @@ class ReActLoop(Loop):
         )
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
+        budget_fired: list[float] = []
 
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
@@ -637,6 +761,15 @@ class ReActLoop(Loop):
                 duration_ms=llm_duration_ms,
             )
             _accumulate_usage(total_usage, llm_response.usage)
+            await _check_budget(
+                agent.budget,
+                total_usage,
+                budget_fired,
+                recorder,
+                notifier,
+                iteration,
+                notifier_warnings,
+            )
 
             step = strategy.parse_response(llm_response)
             steps.append(step)
@@ -722,6 +855,7 @@ class ReActLoop(Loop):
                     history=history,
                     warnings=notifier_warnings,
                     deny=agent.deny,
+                    require_approval=agent.require_approval,
                 )
                 for tc, tool_result in outcome.all_results:
                     yield RunEvent(
@@ -730,6 +864,11 @@ class ReActLoop(Loop):
                         tool_result=tool_result,
                     )
                 if outcome.pending_calls:
+                    pause_status = (
+                        RunStatus.WAITING_APPROVAL
+                        if outcome.pending_approval
+                        else RunStatus.WAITING_CLIENT_TOOL
+                    )
                     pause = _build_pause(
                         agent_name=agent.name,
                         pending_calls=outcome.pending_calls,
@@ -746,7 +885,7 @@ class ReActLoop(Loop):
                         type=RunEventType.RUN_PAUSED,
                         run_result=RunResult(
                             run_id=resolved_run_id,
-                            status=RunStatus.WAITING_CLIENT_TOOL,
+                            status=pause_status,
                             steps=steps,
                             iteration_count=iteration,
                             usage=total_usage,

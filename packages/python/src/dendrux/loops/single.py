@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.loops._helpers import notify_llm, notify_message, record_llm, record_message
 from dendrux.loops.base import Loop
+from dendrux.loops.react import _check_budget
 from dendrux.types import (
     Message,
     Role,
@@ -163,6 +164,16 @@ class SingleCall(Loop):
             cost_usd=response.usage.cost_usd,
         )
 
+        await _check_budget(
+            agent.budget,
+            usage,
+            [],
+            recorder,
+            notifier,
+            1,
+            [],
+        )
+
         return RunResult(
             run_id=resolved_run_id,
             status=RunStatus.SUCCESS,
@@ -293,6 +304,16 @@ class SingleCall(Loop):
             output_tokens=llm_response.usage.output_tokens,
             total_tokens=llm_response.usage.total_tokens,
             cost_usd=llm_response.usage.cost_usd,
+        )
+
+        await _check_budget(
+            agent.budget,
+            usage,
+            [],
+            recorder,
+            notifier,
+            1,
+            [],
         )
 
         yield RunEvent(

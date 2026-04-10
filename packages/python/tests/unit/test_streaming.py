@@ -875,9 +875,8 @@ class TestResumeStream:
                 user_input="hi",
             )
 
-        # Neither arg
-        with pytest.raises(ValueError, match="requires either"):
-            agent.resume_stream("run1")
+        # No-arg resume_stream is now valid (approval-approve path).
+        # It doesn't raise synchronously — errors surface during iteration.
 
     async def test_agent_resume_stream_returns_run_stream(self) -> None:
         """agent.resume_stream() returns RunStream with run_id."""

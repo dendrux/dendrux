@@ -1186,6 +1186,7 @@ class SQLAlchemyStateStore:
         waiting_statuses = [
             AgentRunStatus.WAITING_CLIENT_TOOL,
             AgentRunStatus.WAITING_HUMAN_INPUT,
+            AgentRunStatus.WAITING_APPROVAL,
         ]
 
         swept: list[SweptRun] = []

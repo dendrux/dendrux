@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import Message, RunEvent, RunResult, RunStream, ToolResult
+    from dendrux.types import Message, RunEvent, RunResult, RunStream, ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -418,7 +418,11 @@ async def run(
         )
 
         if state_store is not None:
-            if result.status in (RunStatus.WAITING_CLIENT_TOOL, RunStatus.WAITING_HUMAN_INPUT):
+            if result.status in (
+                RunStatus.WAITING_CLIENT_TOOL,
+                RunStatus.WAITING_HUMAN_INPUT,
+                RunStatus.WAITING_APPROVAL,
+            ):
                 # Pause — persist state for resume
                 pause_state: PauseState = result.meta["pause_state"]
                 await state_store.pause_run(
@@ -776,7 +780,11 @@ async def retry(
             provider_kwargs=provider_kwargs or None,
         )
 
-        if result.status in (RunStatus.WAITING_CLIENT_TOOL, RunStatus.WAITING_HUMAN_INPUT):
+        if result.status in (
+            RunStatus.WAITING_CLIENT_TOOL,
+            RunStatus.WAITING_HUMAN_INPUT,
+            RunStatus.WAITING_APPROVAL,
+        ):
             pause_state: PauseState = result.meta["pause_state"]
             await state_store.pause_run(
                 run_id,
@@ -1164,7 +1172,7 @@ def run_stream(
 
 async def resume(
     run_id: str,
-    tool_results: list[ToolResult],
+    tool_results: list[ToolResult] | None,
     *,
     state_store: StateStore,
     agent: Agent,
@@ -1174,14 +1182,18 @@ async def resume(
     redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunResult:
-    """Resume a paused run by providing client tool results.
+    """Resume a paused run.
 
-    Only works on runs with status WAITING_CLIENT_TOOL. Uses an atomic
-    claim to prevent double-resume races.
+    Three shapes:
+      - tool_results provided → client-tool results or approval rejection
+      - No args (tool_results=None) → approval approve
+
+    Uses an atomic claim to prevent double-resume races.
 
     Args:
         run_id: The paused run's ID.
-        tool_results: Results for the pending tool calls. Each must have
+        tool_results: Results for the pending tool calls, or None for
+            approval-approve (no-arg resume). Each result must have
             a call_id matching one of the pending_tool_calls.
         state_store: Persistence backend (required for resume).
         agent: Agent definition (must match the paused run's agent).
@@ -1191,6 +1203,14 @@ async def resume(
         redact: Redaction policy for persistence.
         extra_notifier: Optional additional notifier for SSE streaming.
     """
+    if tool_results is None:
+        # No-arg = approval-approve. Status gate in _resume_core.
+        expected = RunStatus.WAITING_APPROVAL.value
+    else:
+        # Tool results — try WAITING_CLIENT_TOOL first.
+        # _resume_core will fall back to WAITING_APPROVAL on claim failure.
+        expected = RunStatus.WAITING_CLIENT_TOOL.value
+
     return await _resume_core(
         run_id,
         state_store=state_store,
@@ -1199,7 +1219,7 @@ async def resume(
         strategy=strategy,
         loop=loop,
         redact=redact,
-        expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
+        expected_status=expected,
         tool_results=tool_results,
         extra_notifier=extra_notifier,
     )
@@ -1402,6 +1422,49 @@ async def _prepare_resume(
     )
 
 
+async def _execute_approved_tools(
+    agent: Agent,
+    pause_state: PauseState,
+    recorder: LoopRecorder,
+    notifier: LoopNotifier | None,
+    *,
+    history: list[Message] | None = None,
+) -> list[tuple[ToolCall, ToolResult]]:
+    """Execute pending tools after approval. Returns (ToolCall, ToolResult) pairs.
+
+    Shared by _resume_core (batch) and resume_stream (streaming).
+    Records tool completions and appends tool messages to ``history``
+    (the live ctx.history list, not pause_state.history which is a snapshot).
+    Caller is responsible for governance events and loop re-entry.
+    """
+    from dendrux.loops._helpers import notify_message as _ntfy_msg
+    from dendrux.loops._helpers import notify_tool as _ntfy_tool
+    from dendrux.loops.react import _build_tool_lookups, _execute_tool
+    from dendrux.types import Message, Role
+
+    target_history = history if history is not None else pause_state.history
+    lookups = _build_tool_lookups(agent.tools)
+    results: list[tuple[ToolCall, ToolResult]] = []
+
+    for tc in pause_state.pending_tool_calls:
+        tr = await _execute_tool(tc, lookups)
+        await recorder.on_tool_completed(tc, tr, pause_state.iteration)
+        await _ntfy_tool(notifier, tc, tr, pause_state.iteration)
+        result_msg = Message(
+            role=Role.TOOL,
+            content=tr.payload,
+            name=tr.name,
+            call_id=tr.call_id,
+            meta={"is_error": True} if not tr.success else {},
+        )
+        target_history.append(result_msg)
+        await recorder.on_message_appended(result_msg, pause_state.iteration)
+        await _ntfy_msg(notifier, result_msg, pause_state.iteration)
+        results.append((tc, tr))
+
+    return results
+
+
 async def _resume_core(
     run_id: str,
     *,
@@ -1454,6 +1517,16 @@ async def _resume_core(
     # 3. Atomic claim — transition WAITING → RUNNING
     if not _skip_claim:
         claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
+        # Fallback: tool_results might be for approval-reject (WAITING_APPROVAL)
+        if (
+            not claimed
+            and tool_results is not None
+            and expected_status != RunStatus.WAITING_APPROVAL.value
+        ):
+            alt = RunStatus.WAITING_APPROVAL.value
+            claimed = await state_store.claim_paused_run(run_id, expected_status=alt)
+            if claimed:
+                expected_status = alt
         if not claimed:
             await _raise_resume_claim_failure(state_store, run_id, expected_status)
 
@@ -1495,6 +1568,73 @@ async def _resume_core(
 
     # 10. Re-enter loop (batch)
     try:
+        # Approval-approve: execute pending tools before loop re-entry.
+        # Runs inside try/except so failures properly finalize as ERROR.
+        _is_approval_approve = (
+            tool_results is None
+            and user_input is None
+            and expected_status == RunStatus.WAITING_APPROVAL.value
+        )
+        if _is_approval_approve:
+            from dendrux.loops._helpers import (
+                notify_governance as _ntfy_gov,
+            )
+            from dendrux.loops._helpers import (
+                record_governance as _rec_gov,
+            )
+
+            await _execute_approved_tools(
+                agent,
+                pause_state,
+                ctx.recorder,
+                ctx.notifier,
+                history=ctx.history,
+            )
+
+            _decided_data: dict[str, Any] = {
+                "decision": "approved",
+                "run_id": run_id,
+            }
+            await _rec_gov(
+                ctx.recorder,
+                "approval.decided",
+                pause_state.iteration,
+                _decided_data,
+            )
+            await _ntfy_gov(
+                ctx.notifier,
+                "approval.decided",
+                pause_state.iteration,
+                _decided_data,
+            )
+
+        # Approval-reject: tool results already in history from _prepare_resume.
+        # Emit governance event only.
+        if tool_results is not None and expected_status == RunStatus.WAITING_APPROVAL.value:
+            from dendrux.loops._helpers import (
+                notify_governance as _ntfy_gov_r,
+            )
+            from dendrux.loops._helpers import (
+                record_governance as _rec_gov_r,
+            )
+
+            _rejected_data: dict[str, Any] = {
+                "decision": "rejected",
+                "run_id": run_id,
+            }
+            await _rec_gov_r(
+                ctx.recorder,
+                "approval.decided",
+                pause_state.iteration,
+                _rejected_data,
+            )
+            await _ntfy_gov_r(
+                ctx.notifier,
+                "approval.decided",
+                pause_state.iteration,
+                _rejected_data,
+            )
+
         result = await ctx.resolved_loop.run(
             agent=agent,
             provider=provider,
@@ -1510,7 +1650,11 @@ async def _resume_core(
         )
 
         # 10. Finalize or pause again
-        if result.status in (RunStatus.WAITING_CLIENT_TOOL, RunStatus.WAITING_HUMAN_INPUT):
+        if result.status in (
+            RunStatus.WAITING_CLIENT_TOOL,
+            RunStatus.WAITING_HUMAN_INPUT,
+            RunStatus.WAITING_APPROVAL,
+        ):
             new_pause: PauseState = result.meta["pause_state"]
             await state_store.pause_run(
                 run_id,
@@ -1650,10 +1794,23 @@ def resume_stream(
             # 4. Determine expected status and claim
             if tool_results is not None:
                 expected = RunStatus.WAITING_CLIENT_TOOL.value
-            else:
+            elif user_input is not None:
                 expected = RunStatus.WAITING_HUMAN_INPUT.value
+            else:
+                # No-arg = approval-approve
+                expected = RunStatus.WAITING_APPROVAL.value
 
             claimed = await store.claim_paused_run(run_id, expected_status=expected)
+            # Fallback: tool_results might be for approval-reject
+            if (
+                not claimed
+                and tool_results is not None
+                and expected != RunStatus.WAITING_APPROVAL.value
+            ):
+                alt = RunStatus.WAITING_APPROVAL.value
+                claimed = await store.claim_paused_run(run_id, expected_status=alt)
+                if claimed:
+                    expected = alt
             if not claimed:
                 await _raise_resume_claim_failure(store, run_id, expected)
 
@@ -1691,10 +1848,79 @@ def resume_stream(
             )
             ctx_token = set_delegation_context(resume_ctx)
 
-            # 7. Emit RUN_RESUMED as first event
+            # 7. Emit RUN_RESUMED as first event (contract guarantee)
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
 
-            # 8. Stream the loop
+            # 8. Approval-execute (inside try/except for proper error handling)
+            _is_approval_approve = (
+                tool_results is None
+                and user_input is None
+                and expected == RunStatus.WAITING_APPROVAL.value
+            )
+            if _is_approval_approve:
+                for tc, tr in await _execute_approved_tools(
+                    agent,
+                    pause_state,
+                    ctx.recorder,
+                    ctx.notifier,
+                    history=ctx.history,
+                ):
+                    yield RunEvent(
+                        type=RunEventType.TOOL_RESULT,
+                        tool_call=tc,
+                        tool_result=tr,
+                    )
+
+                from dendrux.loops._helpers import (
+                    notify_governance as _ntfy_gov_s,
+                )
+                from dendrux.loops._helpers import (
+                    record_governance as _rec_gov_s,
+                )
+
+                _decided_data_s: dict[str, Any] = {
+                    "decision": "approved",
+                    "run_id": run_id,
+                }
+                await _rec_gov_s(
+                    ctx.recorder,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _decided_data_s,
+                )
+                await _ntfy_gov_s(
+                    ctx.notifier,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _decided_data_s,
+                )
+
+            if tool_results is not None and expected == RunStatus.WAITING_APPROVAL.value:
+                from dendrux.loops._helpers import (
+                    notify_governance as _ntfy_gov_r,
+                )
+                from dendrux.loops._helpers import (
+                    record_governance as _rec_gov_r,
+                )
+
+                _rejected_data_s: dict[str, Any] = {
+                    "decision": "rejected",
+                    "run_id": run_id,
+                }
+                await _rec_gov_r(
+                    ctx.recorder,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _rejected_data_s,
+                )
+                await _ntfy_gov_r(
+                    ctx.notifier,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _rejected_data_s,
+                )
+
+            # 9. Stream the loop
             async for event in ctx.resolved_loop.run_stream(
                 agent=agent,
                 provider=provider,
@@ -1932,7 +2158,14 @@ async def resume_claimed(
             _skip_claim=True,
         )
 
+    # No submitted data found. This likely means the run was paused for
+    # approval (WAITING_APPROVAL) and resumed through the bridge, which
+    # is not supported. Approval runs must use agent.resume() directly.
     raise ValueError(
         f"Run '{run_id}' has pause_data but no submitted_tool_results "
-        "or submitted_user_input — nothing to resume with."
+        "or submitted_user_input — nothing to resume with. "
+        "If this run is paused for approval (WAITING_APPROVAL), use "
+        "agent.resume(run_id) to approve or "
+        "agent.resume(run_id, tool_results=[...]) to reject. "
+        "Bridge-based approval is not supported."
     )

@@ -139,12 +139,30 @@ class ConsoleNotifier(LoopNotifier):
         correlation_id: str | None = None,
     ) -> None:
         """Called when a governance action fires."""
-        tool_name = data.get("tool_name", "")
-        reason = data.get("reason", event_type)
-        _console.print(
-            f"  [bright_magenta]  policy[/bright_magenta] [bold]{tool_name}[/bold]"
-            f" [dim]{reason}[/dim]"
-        )
+        if event_type == "budget.threshold":
+            frac = data.get("fraction", 0)
+            used = data.get("used", 0)
+            max_t = data.get("max", 0)
+            _console.print(
+                f"  [bright_yellow]  budget[/bright_yellow] "
+                f"[bold]{frac:.0%}[/bold] used "
+                f"[dim]({used:,} / {max_t:,} tokens)[/dim]"
+            )
+        elif event_type == "budget.exceeded":
+            used = data.get("used", 0)
+            max_t = data.get("max", 0)
+            _console.print(
+                f"  [bright_red]  budget[/bright_red] "
+                f"[bold]exceeded[/bold] "
+                f"[dim]({used:,} / {max_t:,} tokens)[/dim]"
+            )
+        else:
+            tool_name = data.get("tool_name", "")
+            reason = data.get("reason", event_type)
+            _console.print(
+                f"  [bright_magenta]  policy[/bright_magenta] [bold]{tool_name}[/bold]"
+                f" [dim]{reason}[/dim]"
+            )
 
     def print_summary(self, result: RunResult) -> None:
         """Print a final summary panel. Call after agent.run() completes."""
