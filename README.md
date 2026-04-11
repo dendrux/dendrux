@@ -6,7 +6,7 @@ The async Python runtime for agents that survive failure, persist everything, an
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-> `v0.1.0a4` - core API stabilizing, actively developed.
+> `v0.1.0a5` - core API stabilizing, actively developed.
 
 ---
 
@@ -417,7 +417,7 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 ## Status
 
-Dendrux is in active development (`v0.1.0a4`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `sweep` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `sweep` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
