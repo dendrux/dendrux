@@ -108,6 +108,22 @@ module = "alembic.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "fastapi.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "uvicorn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "dendrux.bridge.*"
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = "dendrux.dashboard.*"
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
 module = "dendrux.db.migrations.*"
 ignore_errors = true
 
