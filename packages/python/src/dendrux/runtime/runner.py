@@ -562,7 +562,7 @@ async def _build_cached_result(
         from pydantic import ValidationError
 
         try:
-            output = output_type.model_validate_json(run.answer)
+            output = output_type.model_validate_json(run.answer)  # type: ignore[attr-defined]
         except (ValidationError, Exception):
             # If the persisted answer doesn't validate (schema evolved,
             # corruption, etc.), return None rather than crashing the

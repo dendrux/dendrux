@@ -64,7 +64,6 @@ async def main() -> None:
         require_approval=["refund"],
         database_url=DB_URL,
     ) as agent:
-
         notifier = ConsoleNotifier()
 
         # Start the run — will pause when LLM calls refund

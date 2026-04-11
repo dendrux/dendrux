@@ -48,7 +48,6 @@ async def main() -> None:
         tools=[search, summarize],
         budget=Budget(max_tokens=2000),  # Low cap — triggers warnings fast
     ) as agent:
-
         notifier = ConsoleNotifier()
         result = await agent.run(
             "Research the history of artificial intelligence and summarize your findings",
@@ -58,7 +57,7 @@ async def main() -> None:
 
         print(f"\nAnswer: {result.answer[:200]}...")
         print(f"\nTotal tokens used: {result.usage.total_tokens}")
-        print(f"Budget cap: 2,000 (advisory — run completed normally)")
+        print("Budget cap: 2,000 (advisory - run completed normally)")
 
 
 if __name__ == "__main__":

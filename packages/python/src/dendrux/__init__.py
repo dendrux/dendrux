@@ -26,7 +26,7 @@ except ImportError as _err:
     if "fastapi" in str(_err).lower() or "uvicorn" in str(_err).lower():
         _missing_err = _err
 
-        def bridge(*args, **kwargs):  # type: ignore[misc]
+        def bridge(*args, **kwargs):  # type: ignore[misc,no-untyped-def]
             """Stub — raises when bridge extras are not installed."""
             raise ImportError(
                 "bridge requires optional dependencies. Install with: pip install 'dendrux[bridge]'"

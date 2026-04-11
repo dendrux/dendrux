@@ -793,7 +793,7 @@ class ReActLoop(Loop):
                     iteration,
                     notifier_warnings,
                 )
-                meta: dict[str, Any] = (
+                meta: dict[str, Any] = (  # type: ignore[no-redef]
                     {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                 )
                 if g_engine is not None:
@@ -826,7 +826,7 @@ class ReActLoop(Loop):
                     iteration=iteration,
                     usage=total_usage,
                 )
-                meta = {"pause_state": pause}
+                meta = {"pause_state": pause}  # type: ignore[dict-item]
                 if notifier_warnings:
                     meta["notifier_warnings"] = notifier_warnings
                 if g_engine is not None:
@@ -879,7 +879,7 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         usage=total_usage,
                     )
-                    meta = {"pause_state": pause}
+                    meta = {"pause_state": pause}  # type: ignore[dict-item]
                     if notifier_warnings:
                         meta["notifier_warnings"] = notifier_warnings
                     if g_engine is not None:

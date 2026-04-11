@@ -179,7 +179,7 @@ class GuardrailEngine:
         through unchanged — the caller emits a warning event.
         """
         result = _deanonymize_value(params, self._pii_mapping)
-        return result  # type: ignore[return-value]
+        return result  # type: ignore[no-any-return]
 
     def get_pii_mapping(self) -> dict[str, str]:
         """Return the current pii_mapping for persistence."""

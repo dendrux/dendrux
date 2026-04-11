@@ -55,7 +55,6 @@ async def main() -> None:
         tools=[search, refund, delete_account],
         deny=["delete_account"],
     ) as agent:
-
         # --- Batch mode ---
         print("=" * 60)
         print("BATCH MODE")
@@ -74,9 +73,7 @@ async def main() -> None:
         print("STREAMING MODE")
         print("=" * 60 + "\n")
 
-        async with agent.stream(
-            "Delete user 99's account and search for their records"
-        ) as stream:
+        async with agent.stream("Delete user 99's account and search for their records") as stream:
             async for event in stream:
                 if event.type == RunEventType.TEXT_DELTA:
                     print(event.text, end="", flush=True)

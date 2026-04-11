@@ -58,7 +58,6 @@ async def demo_pii_redaction() -> None:
             ),
         ],
     ) as agent:
-
         notifier = ConsoleNotifier()
         result = await agent.run(
             "Look up customer John and send them a hello email",
@@ -80,7 +79,6 @@ async def demo_secret_block() -> None:
         tools=[lookup_customer],
         guardrails=[SecretDetection()],
     ) as agent:
-
         notifier = ConsoleNotifier()
         result = await agent.run(
             "Store this config: aws_key=AKIAIOSFODNN7EXAMPLE",
@@ -105,7 +103,6 @@ async def demo_warn_mode() -> None:
         tools=[],
         guardrails=[PII(action="warn")],
     ) as agent:
-
         notifier = ConsoleNotifier()
         result = await agent.run(
             "Summarize: Contact jane@example.com or call +1-555-123-4567",
