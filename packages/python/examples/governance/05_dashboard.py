@@ -18,10 +18,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from dendrux import Agent, tool
-from dendrux.guardrails import PII, SecretDetection
+from dendrux.guardrails import PII
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.notifiers.console import ConsoleNotifier
-from dendrux.types import Budget, RunStatus, ToolResult
+from dendrux.types import Budget, RunStatus
 
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
