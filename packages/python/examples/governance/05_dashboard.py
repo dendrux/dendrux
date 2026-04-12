@@ -63,6 +63,7 @@ async def main() -> None:
         budget=Budget(max_tokens=3000),
         guardrails=[PII()],
         database_url=DB_URL,
+        name="GovernanceAgent",
     ) as agent:
         notifier = ConsoleNotifier()
 

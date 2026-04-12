@@ -1080,3 +1080,64 @@ class TestDelegationBlock:
             ss = resp.json()["delegation"]["subtree_summary"]
             assert ss["subtree_cost_usd"] is None
             assert ss["unknown_cost_count"] == 1
+
+
+# ------------------------------------------------------------------
+# Auth token tests
+# ------------------------------------------------------------------
+
+
+class TestDashboardAuth:
+    """Tests for the --auth-token middleware."""
+
+    async def test_no_token_configured_allows_all(self) -> None:
+        """Without auth_token, all API requests succeed."""
+        store = DashboardMockStore()
+        app = create_dashboard_api(store, auth_token=None)  # type: ignore[arg-type]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/runs")
+            assert resp.status_code == 200
+
+    async def test_missing_token_returns_401(self) -> None:
+        """Request without auth header returns 401 when token is set."""
+        store = DashboardMockStore()
+        app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/runs")
+            assert resp.status_code == 401
+            assert "auth token" in resp.json()["detail"].lower()
+
+    async def test_wrong_token_returns_401(self) -> None:
+        """Request with wrong token returns 401."""
+        store = DashboardMockStore()
+        app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/api/runs",
+                headers={"Authorization": "Bearer wrong"},
+            )
+            assert resp.status_code == 401
+
+    async def test_correct_token_returns_200(self) -> None:
+        """Request with correct token succeeds."""
+        store = DashboardMockStore()
+        app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/api/runs",
+                headers={"Authorization": "Bearer secret123"},
+            )
+            assert resp.status_code == 200
+
+    async def test_static_files_bypass_auth(self) -> None:
+        """Static file requests don't require auth."""
+        store = DashboardMockStore()
+        app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/")
+            assert resp.status_code == 200

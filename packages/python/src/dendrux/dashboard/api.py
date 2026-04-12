@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -83,22 +83,51 @@ def _delegation_to_dict(info: DelegationInfo) -> dict[str, Any]:
     }
 
 
-def create_dashboard_api(state_store: StateStore) -> FastAPI:
+def create_dashboard_api(
+    state_store: StateStore,
+    auth_token: str | None = None,
+) -> FastAPI:
     """Create the read-only dashboard API.
 
     Args:
         state_store: The same StateStore used by the runtime.
             Reads from the same DB — no separate connection needed.
+        auth_token: Optional Bearer token for API access. When set,
+            all API requests must include ``Authorization: Bearer <token>``.
+            Static files (HTML/CSS/JS) are served without auth.
     """
     app = FastAPI(title="Dendrux Dashboard API", version="0.1.0a1")
 
     # Allow dashboard frontend (served on same or different port) to call the API
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Local dev tool — no restriction needed
+        allow_origins=["*"],
         allow_methods=["GET"],
-        allow_headers=["*"],
+        allow_headers=["*", "Authorization"],
     )
+
+    if auth_token is not None:
+        import hmac
+
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.responses import JSONResponse
+
+        _expected = f"Bearer {auth_token}"
+
+        class _AuthMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+                # Static files and CORS preflight served without auth
+                if not request.url.path.startswith("/api/") or request.method == "OPTIONS":
+                    return await call_next(request)
+                header = request.headers.get("authorization", "")
+                if not hmac.compare_digest(header, _expected):
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid or missing auth token."},
+                    )
+                return await call_next(request)
+
+        app.add_middleware(_AuthMiddleware)
 
     @app.get("/api/runs")
     async def list_runs(

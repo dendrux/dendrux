@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MAX_RECURSION_DEPTH = 50
+
 
 class GuardrailEngine:
     """Per-run guardrail orchestrator.
@@ -214,22 +216,22 @@ def _deoverlap(findings: list[Finding]) -> list[Finding]:
     return result
 
 
-def _deanonymize_value(value: Any, mapping: dict[str, str]) -> Any:
+def _deanonymize_value(value: Any, mapping: dict[str, str], _depth: int = 0) -> Any:
     """Recursively replace placeholder strings with real values."""
+    if _depth > _MAX_RECURSION_DEPTH:
+        return value
     if isinstance(value, str):
-        # Check if the entire string is a placeholder
         if value in mapping:
             return mapping[value]
-        # Check for placeholders embedded in text
         result = value
         for placeholder, real_value in mapping.items():
             if placeholder in result:
                 result = result.replace(placeholder, real_value)
         return result
     if isinstance(value, dict):
-        return {k: _deanonymize_value(v, mapping) for k, v in value.items()}
+        return {k: _deanonymize_value(v, mapping, _depth + 1) for k, v in value.items()}
     if isinstance(value, list):
-        return [_deanonymize_value(item, mapping) for item in value]
+        return [_deanonymize_value(item, mapping, _depth + 1) for item in value]
     return value
 
 
@@ -274,11 +276,14 @@ async def _scan_value_recursive(
     key: str,
     guardrails: list[Guardrail],
     engine: GuardrailEngine,
+    _depth: int = 0,
 ) -> tuple[Any, list[Finding], str | None, bool]:
     """Scan a single value recursively.
 
     Returns (new_value, findings, block_error, changed).
     """
+    if _depth > _MAX_RECURSION_DEPTH:
+        return value, [], None, False
     if isinstance(value, str):
         new_val, findings, block = await _scan_leaf(value, key, guardrails, engine)
         return new_val, findings, block, new_val != value
@@ -291,6 +296,7 @@ async def _scan_value_recursive(
                 k,
                 guardrails,
                 engine,
+                _depth + 1,
             )
             all_findings.extend(findings)
             if block is not None:
@@ -308,6 +314,7 @@ async def _scan_value_recursive(
                 key,
                 guardrails,
                 engine,
+                _depth + 1,
             )
             all_findings.extend(findings)
             if block is not None:

@@ -66,8 +66,16 @@ def main(
 @app.command()
 def dashboard(
     port: int = typer.Option(8001, "--port", "-p", help="Port to serve on."),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="Host to bind to. Default localhost only."
+    ),
     db: str | None = typer.Option(None, "--db", help="Database URL or SQLite file path."),
     open_browser: bool = typer.Option(False, "--open", help="Open browser on start."),
+    auth_token: str | None = typer.Option(
+        None,
+        "--auth-token",
+        help="Bearer token for API access. When set, all API requests require auth.",
+    ),
 ) -> None:
     """Launch the Dendrux observability dashboard.
 
@@ -96,7 +104,7 @@ def dashboard(
         db_url = _resolve_db_url(db)
         engine = await get_engine(url=db_url)
         store = SQLAlchemyStateStore(engine)
-        api = create_dashboard_api(store)
+        api = create_dashboard_api(store, auth_token=auth_token)
 
         from dendrux.db.session import get_database_url
 
@@ -113,7 +121,7 @@ def dashboard(
 
             webbrowser.open(f"http://localhost:{port}")
 
-        config = uvicorn.Config(api, host="0.0.0.0", port=port, log_level="warning")
+        config = uvicorn.Config(api, host=host, port=port, log_level="warning")
         server = uvicorn.Server(config)
         await server.serve()
 

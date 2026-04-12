@@ -23,8 +23,37 @@ function getApiBase(): string {
 
 const BASE = getApiBase();
 
+/**
+ * Get the auth token from sessionStorage.
+ * If a 401 is received, prompt the user for a token.
+ */
+function getAuthToken(): string | null {
+  return sessionStorage.getItem("dendrux_auth_token");
+}
+
+function setAuthToken(token: string): void {
+  sessionStorage.setItem("dendrux_auth_token", token);
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`);
+  const headers: Record<string, string> = {};
+  const token = getAuthToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  let res = await fetch(`${BASE}${path}`, { headers });
+
+  // If 401, prompt for token and retry once
+  if (res.status === 401) {
+    const input = prompt("Dashboard auth token required:");
+    if (input) {
+      setAuthToken(input);
+      headers["Authorization"] = `Bearer ${input}`;
+      res = await fetch(`${BASE}${path}`, { headers });
+    }
+  }
+
   if (!res.ok) {
     throw new Error(`API error: ${res.status} ${res.statusText}`);
   }
