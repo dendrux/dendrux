@@ -9,7 +9,9 @@ from dendrux.runtime.runner import run
 from dendrux.runtime.sweep import sweep
 from dendrux.tool import tool
 from dendrux.types import (
+    Budget,
     CreateRunResult,
+    GovernanceEventType,
     IdempotencyConflictError,
     RunAlreadyActiveError,
     StructuredOutputValidationError,
@@ -36,8 +38,10 @@ except ImportError as _err:
 
 __all__ = [
     "Agent",
+    "Budget",
     "CreateRunResult",
     "DelegationDepthExceededError",
+    "GovernanceEventType",
     "IdempotencyConflictError",
     "RunAlreadyActiveError",
     "SingleCall",

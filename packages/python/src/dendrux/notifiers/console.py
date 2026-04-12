@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from dendrux.loops.base import LoopNotifier
+from dendrux.types import GovernanceEventType as _GovType
 from dendrux.types import Message, Role, ToolCall, ToolResult
 
 if TYPE_CHECKING:
@@ -139,7 +140,7 @@ class ConsoleNotifier(LoopNotifier):
         correlation_id: str | None = None,
     ) -> None:
         """Called when a governance action fires."""
-        if event_type == "budget.threshold":
+        if event_type == _GovType.BUDGET_THRESHOLD:
             frac = data.get("fraction", 0)
             used = data.get("used", 0)
             max_t = data.get("max", 0)
@@ -148,7 +149,7 @@ class ConsoleNotifier(LoopNotifier):
                 f"[bold]{frac:.0%}[/bold] used "
                 f"[dim]({used:,} / {max_t:,} tokens)[/dim]"
             )
-        elif event_type == "budget.exceeded":
+        elif event_type == _GovType.BUDGET_EXCEEDED:
             used = data.get("used", 0)
             max_t = data.get("max", 0)
             _console.print(
@@ -156,7 +157,7 @@ class ConsoleNotifier(LoopNotifier):
                 f"[bold]exceeded[/bold] "
                 f"[dim]({used:,} / {max_t:,} tokens)[/dim]"
             )
-        elif event_type == "guardrail.detected":
+        elif event_type == _GovType.GUARDRAIL_DETECTED:
             direction = data.get("direction", "")
             count = data.get("findings_count", 0)
             entities = data.get("entities", [])
@@ -165,7 +166,7 @@ class ConsoleNotifier(LoopNotifier):
                 f"[bold]{count} finding(s)[/bold] "
                 f"[dim]{direction} ({', '.join(entities)})[/dim]"
             )
-        elif event_type == "guardrail.redacted":
+        elif event_type == _GovType.GUARDRAIL_REDACTED:
             direction = data.get("direction", "")
             entities = data.get("entities", [])
             _console.print(
@@ -173,7 +174,7 @@ class ConsoleNotifier(LoopNotifier):
                 f"[bold]redacted[/bold] "
                 f"[dim]{direction} ({', '.join(entities)})[/dim]"
             )
-        elif event_type == "guardrail.blocked":
+        elif event_type == _GovType.GUARDRAIL_BLOCKED:
             error = data.get("error", "blocked")
             _console.print(
                 f"  [bright_red]  guard[/bright_red]  [bold]blocked[/bold] [dim]{error}[/dim]"

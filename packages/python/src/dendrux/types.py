@@ -279,6 +279,37 @@ class RunStatus(StrEnum):
     MAX_ITERATIONS = "max_iterations"
 
 
+class GovernanceEventType(StrEnum):
+    """Governance event types emitted via on_governance_event().
+
+    Use these instead of raw strings for autocomplete and typo prevention:
+
+        from dendrux.types import GovernanceEventType
+
+        if event_type == GovernanceEventType.POLICY_DENIED:
+            ...
+
+    StrEnum — compares equal to the string value, so existing code
+    using raw strings continues to work without changes.
+    """
+
+    # Wave 1: Tool deny
+    POLICY_DENIED = "policy.denied"
+
+    # Wave 2: Approval (HITL)
+    APPROVAL_REQUESTED = "approval.requested"
+    APPROVAL_DECIDED = "approval.decided"
+
+    # Wave 3: Budget
+    BUDGET_THRESHOLD = "budget.threshold"
+    BUDGET_EXCEEDED = "budget.exceeded"
+
+    # Wave 4: Guardrails
+    GUARDRAIL_DETECTED = "guardrail.detected"
+    GUARDRAIL_REDACTED = "guardrail.redacted"
+    GUARDRAIL_BLOCKED = "guardrail.blocked"
+
+
 @dataclass
 class RunResult:
     """The final output of an agent run."""

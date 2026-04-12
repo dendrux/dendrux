@@ -25,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from dendrux.types import GovernanceEventType as _GovType
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -163,14 +165,14 @@ class GovernanceEventNode:
 
 # Severity + title mapping for governance events
 GOVERNANCE_EVENT_META: dict[str, tuple[str, str]] = {
-    "policy.denied": ("warning", "Tool denied"),
-    "approval.requested": ("pause", "Approval requested"),
-    "approval.decided": ("info", "Approval decided"),
-    "budget.threshold": ("warning", "Budget threshold"),
-    "budget.exceeded": ("warning", "Budget exceeded"),
-    "guardrail.detected": ("info", "Guardrail detected"),
-    "guardrail.redacted": ("info", "Guardrail redacted"),
-    "guardrail.blocked": ("error", "Guardrail blocked"),
+    _GovType.POLICY_DENIED: ("warning", "Tool denied"),
+    _GovType.APPROVAL_REQUESTED: ("pause", "Approval requested"),
+    _GovType.APPROVAL_DECIDED: ("info", "Approval decided"),
+    _GovType.BUDGET_THRESHOLD: ("warning", "Budget threshold"),
+    _GovType.BUDGET_EXCEEDED: ("warning", "Budget exceeded"),
+    _GovType.GUARDRAIL_DETECTED: ("info", "Guardrail detected"),
+    _GovType.GUARDRAIL_REDACTED: ("info", "Guardrail redacted"),
+    _GovType.GUARDRAIL_BLOCKED: ("error", "Guardrail blocked"),
 }
 
 _GOVERNANCE_EVENT_TYPES = frozenset(GOVERNANCE_EVENT_META)
