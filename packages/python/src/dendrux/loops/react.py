@@ -532,7 +532,7 @@ class ReActLoop(Loop):
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
             messages, tools = strategy.build_messages(
-                system_prompt=agent.prompt,
+                system_prompt=agent.get_system_prompt(),
                 history=history,
                 tool_defs=tool_defs,
             )
@@ -950,7 +950,7 @@ class ReActLoop(Loop):
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
             messages, tools = strategy.build_messages(
-                system_prompt=agent.prompt,
+                system_prompt=agent.get_system_prompt(),
                 history=history,
                 tool_defs=tool_defs,
             )

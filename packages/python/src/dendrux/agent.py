@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import warnings
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import Loop, LoopNotifier
     from dendrux.mcp._server import MCPServer
     from dendrux.runtime.state import StateStore
+    from dendrux.skills._loader import Skill
     from dendrux.tools import ToolLookups
     from dendrux.types import Budget, RunResult, RunStream, ToolDef, ToolResult
 
@@ -117,6 +119,9 @@ class Agent:
         require_approval: list[str] | None = ...,
         budget: Budget | None = ...,
         guardrails: list[Guardrail] | None = ...,
+        skills_dir: str | Path | None = ...,
+        skills: list[Skill] | None = ...,
+        deny_skills: list[str] | None = ...,
     ) -> None: ...
 
     @overload
@@ -140,6 +145,9 @@ class Agent:
         require_approval: list[str] | None = ...,
         budget: Budget | None = ...,
         guardrails: list[Guardrail] | None = ...,
+        skills_dir: str | Path | None = ...,
+        skills: list[Skill] | None = ...,
+        deny_skills: list[str] | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -162,6 +170,9 @@ class Agent:
         require_approval: list[str] | None = None,
         budget: Budget | None = None,
         guardrails: list[Guardrail] | None = None,
+        skills_dir: str | Path | None = None,
+        skills: list[Skill] | None = None,
+        deny_skills: list[str] | None = None,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -240,6 +251,30 @@ class Agent:
         self._discovered_tool_defs: list[ToolDef] | None = None
         self._mcp_executors: dict[str, Callable[..., Any]] | None = None
         self._discovery_lock = asyncio.Lock()
+
+        # --- Skills ---
+        if skills_dir is not None and not isinstance(skills_dir, (str, Path)):
+            raise ValueError(
+                f"Agent '{self.name}' skills_dir must be a string or Path, "
+                f"got {type(skills_dir).__name__}."
+            )
+        self._skills_dir: Path | None = Path(skills_dir) if skills_dir is not None else None
+
+        self._explicit_skills: list[Skill] | None = None
+        if skills is not None:
+            from dendrux.skills._loader import Skill as _Skill
+
+            for i, s in enumerate(skills):
+                if not isinstance(s, _Skill):
+                    raise ValueError(
+                        f"Agent '{self.name}' skills[{i}] is {type(s).__name__}, "
+                        f"not a Skill instance. Use Skill.from_dir(path)."
+                    )
+            self._explicit_skills = list(skills)
+
+        self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
+        self._loaded_skills: list[Skill] | None = None
+        self._denied_skill_names: list[str] | None = None
 
         self._validate()
 
@@ -353,6 +388,12 @@ class Agent:
                 f"SingleCall agents cannot have tool_sources."
             )
 
+        if isinstance(self._loop, SingleCall) and (self._skills_dir or self._explicit_skills):
+            raise ValueError(
+                f"Agent '{self.name}' uses SingleCall loop but has skills. "
+                f"SingleCall agents cannot have skills (use_skill requires tool calling)."
+            )
+
         # output_type requires SingleCall in v1
         if self._output_type is not None and not isinstance(self._loop, SingleCall):
             raise ValueError(
@@ -368,6 +409,17 @@ class Agent:
                     f"Agent '{self.name}' has a non-tool in its tools list: "
                     f"'{getattr(fn, '__name__', fn)}'. Decorate it with @tool()."
                 )
+
+        # Reserve 'use_skill' name when skills are configured
+        has_skills = bool(self._skills_dir or self._explicit_skills)
+        if has_skills:
+            for fn in self.tools:
+                if getattr(fn, "__name__", None) == "use_skill":
+                    raise ValueError(
+                        f"Agent '{self.name}' has a tool named 'use_skill' but also "
+                        f"has skills configured. 'use_skill' is reserved as the "
+                        f"skill activation tool when skills are present."
+                    )
 
         if self.max_iterations < 1:
             raise ValueError(
@@ -1050,6 +1102,13 @@ class Agent:
                     tool_defs = await source._discover()
                     opened_sources.append(source)
                     for td in tool_defs:
+                        # Collision check against reserved name
+                        if td.name == "use_skill" and (self._skills_dir or self._explicit_skills):
+                            raise ValueError(
+                                f"MCP tool '{td.name}' from source "
+                                f"'{td.meta.get('source_name')}' collides with "
+                                f"the reserved 'use_skill' meta-tool."
+                            )
                         # Collision check against local tools
                         if td.name in local_defs:
                             raise ValueError(
@@ -1090,30 +1149,187 @@ class Agent:
             self._mcp_executors = executors
 
     async def get_tool_lookups(self) -> ToolLookups:
-        """Build ToolLookups for local + MCP tools.
+        """Build ToolLookups for local + MCP + use_skill tools.
 
-        Calls _ensure_discovered() internally — callers never need to
-        remember to call it first. Safe to call multiple times (discovery
-        is cached after first call).
+        Calls _ensure_discovered() and _ensure_skills_loaded() internally.
+        Safe to call multiple times (discovery/loading is cached).
         """
         await self._ensure_discovered()
+        self._ensure_skills_loaded()
         from dendrux.tools import build_tool_lookups
+        from dendrux.types import ToolTarget as _ToolTarget
 
-        return build_tool_lookups(
+        lookups = build_tool_lookups(
             self.tools,
             mcp_executors=self._mcp_executors,
             mcp_tool_defs=self._discovered_tool_defs,
         )
 
+        # Inject use_skill meta-tool if skills are loaded
+        if self._loaded_skills:
+            td = self._get_use_skill_tool_def()
+            lookups.fn[td.name] = self._execute_use_skill
+            lookups.target[td.name] = _ToolTarget.SERVER
+            lookups.timeout[td.name] = td.timeout_seconds
+            lookups.explicit_timeout[td.name] = td.has_explicit_timeout
+            lookups.max_calls[td.name] = td.max_calls_per_run
+            lookups.parallel[td.name] = td.parallel
+
+        return lookups
+
     def get_all_tool_defs(self) -> list[ToolDef]:
-        """Local + discovered MCP tool defs. Discovery must have run first."""
+        """Local + discovered MCP + use_skill tool defs."""
+        self._ensure_skills_loaded()
         local = [get_tool_def(fn) for fn in self.tools]
         discovered = self._discovered_tool_defs or []
-        return local + discovered
+        all_defs = local + discovered
+        if self._loaded_skills:
+            all_defs.append(self._get_use_skill_tool_def())
+        return all_defs
+
+    # ------------------------------------------------------------------
+    # Skills
+    # ------------------------------------------------------------------
+
+    def _ensure_skills_loaded(self) -> None:
+        """Lazy skill loading — scans skills_dir and merges explicit skills.
+
+        Called at run start. Cached after first call. Cleared by refresh().
+        Filters out deny_skills matches.
+        """
+        if self._loaded_skills is not None:
+            return  # already loaded
+
+        from dendrux.skills._loader import Skill as _Skill
+
+        all_skills: list[Skill] = []
+
+        # Scan skills_dir
+        if self._skills_dir is not None:
+            all_skills.extend(_Skill.scan_dir(self._skills_dir))
+
+        # Add explicit skills
+        if self._explicit_skills:
+            all_skills.extend(self._explicit_skills)
+
+        # Check for duplicate names
+        seen: set[str] = set()
+        for s in all_skills:
+            if s.name in seen:
+                raise ValueError(
+                    f"Agent '{self.name}' has duplicate skill name '{s.name}'. "
+                    f"Each skill must have a unique name."
+                )
+            seen.add(s.name)
+
+        # Apply deny_skills filter
+        loaded: list[Skill] = []
+        denied: list[str] = []
+        for s in all_skills:
+            if s.name in self._deny_skills:
+                denied.append(s.name)
+            else:
+                loaded.append(s)
+
+        self._loaded_skills = loaded
+        self._denied_skill_names = denied
+
+    def get_system_prompt(self) -> str:
+        """Compose system prompt with skill catalog.
+
+        Progressive disclosure: includes only skill names and descriptions,
+        NOT full bodies. The LLM activates skills by calling the use_skill
+        tool, which returns the full instructions.
+
+        Used by loops, runner events, and LLM semantic evidence.
+        Single source of truth for the complete system prompt.
+        """
+        self._ensure_skills_loaded()
+        if not self._loaded_skills:
+            return self.prompt
+
+        parts = [
+            self.prompt,
+            "\n\n## Available Skills",
+            "\nYou have access to the following skills. To use a skill, "
+            "call the `use_skill` tool with the skill name. The skill's "
+            "detailed instructions will be returned to you.\n",
+        ]
+        for skill in self._loaded_skills:
+            parts.append(f"- **{skill.name}**: {skill.description}")
+
+        return "\n".join(parts)
+
+    async def _execute_use_skill(self, name: str) -> str:
+        """Execute the use_skill meta-tool — returns skill body.
+
+        Called by the loop when the LLM calls use_skill(name=...).
+        Returns the full Markdown instructions for the skill.
+        """
+        if not self._loaded_skills:
+            return f"Skill '{name}' not found. No skills are available."
+
+        for skill in self._loaded_skills:
+            if skill.name == name:
+                return skill.body
+
+        available = ", ".join(s.name for s in self._loaded_skills)
+        return f"Skill '{name}' not found. Available skills: {available}"
+
+    def _get_use_skill_tool_def(self) -> ToolDef:
+        """Create the ToolDef for the auto-injected use_skill tool."""
+        from dendrux.types import ToolDef as _ToolDef
+
+        return _ToolDef(
+            name="use_skill",
+            description=(
+                "Activate a skill to get detailed instructions for a task. "
+                "Call this with the skill name before performing a skill-related task."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the skill to activate.",
+                    }
+                },
+                "required": ["name"],
+            },
+            meta={"dendrux.internal": True},
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    async def refresh(self) -> None:
+        """Re-discover all dynamic capabilities.
+
+        Clears MCP discovery cache and skill cache. Next run()
+        re-discovers MCP tools and re-scans skills.
+
+        IMPORTANT: Call only when all runs are terminal (success, error,
+        cancelled). Paused runs are still active. Calling refresh()
+        with active or paused runs closes MCP sessions under active
+        executors and invalidates the frozen skill context.
+        """
+        # Close MCP sessions
+        for source in self._tool_sources:
+            try:
+                await source.close()
+            except Exception:
+                _agent_logger.warning(
+                    "Failed to close MCP source '%s' during refresh",
+                    source.name,
+                    exc_info=True,
+                )
+
+        # Clear all caches
+        self._discovered_tool_defs = None
+        self._mcp_executors = None
+        self._loaded_skills = None
+        self._denied_skill_names = None
 
     async def close(self) -> None:
         """Close MCP sources, provider, and agent-owned engine.
@@ -1127,10 +1343,11 @@ class Agent:
                 await source.close()
             except Exception:
                 _agent_logger.warning("Failed to close MCP source '%s'", source.name, exc_info=True)
-        # Clear discovery caches so stale executors bound to closed
-        # sessions are not reused. Next get_tool_lookups() re-discovers.
+        # Clear all caches so stale executors/skills are not reused.
         self._discovered_tool_defs = None
         self._mcp_executors = None
+        self._loaded_skills = None
+        self._denied_skill_names = None
         if self._provider is not None:
             await self._provider.close()
         if self._private_engine is not None:
@@ -1151,10 +1368,15 @@ class Agent:
     def get_tool_defs(self) -> list[ToolDef]:
         """Get ToolDef for each LOCAL tool registered on this agent.
 
+        Includes the auto-injected use_skill tool when skills are loaded.
         Does NOT include MCP tools. Use get_all_tool_defs() for the
-        full set (local + discovered).
+        full set (local + discovered + use_skill).
         """
-        return [get_tool_def(fn) for fn in self.tools]
+        self._ensure_skills_loaded()
+        defs = [get_tool_def(fn) for fn in self.tools]
+        if self._loaded_skills:
+            defs.append(self._get_use_skill_tool_def())
+        return defs
 
     def __repr__(self) -> str:
         return (

@@ -54,6 +54,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
+    """Reject SingleCall + skills even when loop is overridden at run time."""
+    from dendrux.loops.single import SingleCall
+
+    if isinstance(resolved_loop, SingleCall) and (agent._skills_dir or agent._explicit_skills):
+        raise ValueError(
+            f"Agent '{agent.name}' has skills but is being run with SingleCall loop. "
+            f"SingleCall cannot use skills (use_skill requires tool calling)."
+        )
+
+
 class EventSequencer:
     """Monotonic sequence counter for run_events within a single run.
 
@@ -311,6 +322,7 @@ async def run(
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
+    _validate_loop_skill_compat(agent, resolved_loop)
     provider_kwargs = dict(kwargs) if kwargs else {}
 
     run_id = generate_ulid()
@@ -319,6 +331,10 @@ async def run(
 
     # --- Delegation context ---
     parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
+
+    # Resolve system prompt BEFORE create_run() so skill loading
+    # failures don't leave a DB row stuck in running.
+    _system_prompt = agent.get_system_prompt()
 
     if state_store is not None:
         # Create the run record before the loop starts
@@ -390,7 +406,7 @@ async def run(
         run_id,
         "run.started",
         sequencer,
-        {"agent_name": agent.name, "system_prompt": agent.prompt},
+        {"agent_name": agent.name, "system_prompt": _system_prompt},
     )
 
     # Set delegation context for the duration of this run so nested
@@ -661,6 +677,7 @@ async def retry(
         )
 
     resolved_loop = loop or agent.loop or ReActLoop()
+    _validate_loop_skill_compat(agent, resolved_loop)
 
     # 3. Read traces and reconstruct approximate history
     traces = await state_store.get_traces(original_run_id)
@@ -717,6 +734,8 @@ async def retry(
     parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
     effective_max_depth = _resolve_max_delegation_depth(_UNSET_DEPTH, parent_ctx)
 
+    _system_prompt = agent.get_system_prompt()
+
     redacted_input = redact(user_input) if redact else user_input
     run_meta = dict(metadata) if metadata else {}
     run_meta["dendrux.loop"] = type(resolved_loop).__name__
@@ -759,7 +778,7 @@ async def retry(
         run_id,
         "run.started",
         sequencer,
-        {"agent_name": agent.name, "retry_of": original_run_id},
+        {"agent_name": agent.name, "system_prompt": _system_prompt, "retry_of": original_run_id},
     )
 
     this_ctx = DelegationContext(
@@ -950,6 +969,7 @@ def run_stream(
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
+    _validate_loop_skill_compat(agent, resolved_loop)
     provider_kwargs = dict(kwargs) if kwargs else {}
 
     run_id = generate_ulid()
@@ -981,6 +1001,10 @@ def run_stream(
             parent_ctx = get_delegation_context()
             parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
             eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
+
+            # Resolve system prompt BEFORE create_run() so skill loading
+            # failures don't leave a DB row stuck in running.
+            _system_prompt = agent.get_system_prompt()
 
             recorder: LoopRecorder | None = None
 
@@ -1039,7 +1063,7 @@ def run_stream(
                 run_id,
                 "run.started",
                 sequencer,
-                {"agent_name": agent.name, "system_prompt": agent.prompt},
+                {"agent_name": agent.name, "system_prompt": _system_prompt},
             )
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
@@ -1343,6 +1367,7 @@ async def _prepare_resume(
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
+    _validate_loop_skill_compat(agent, resolved_loop)
 
     # 1. Initialize sequencer from DB max (continues across pause boundaries)
     existing_events = await state_store.get_run_events(run_id)
