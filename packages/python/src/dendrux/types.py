@@ -310,6 +310,13 @@ class GovernanceEventType(StrEnum):
     GUARDRAIL_REDACTED = "guardrail.redacted"
     GUARDRAIL_BLOCKED = "guardrail.blocked"
 
+    # Init events: Skills + MCP
+    SKILL_REGISTERED = "skill.registered"
+    SKILL_DENIED = "skill.denied"
+    SKILL_INVOKED = "skill.invoked"
+    MCP_CONNECTED = "mcp.connected"
+    MCP_ERROR = "mcp.error"
+
 
 @dataclass
 class RunResult:

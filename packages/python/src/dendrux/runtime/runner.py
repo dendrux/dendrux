@@ -32,6 +32,7 @@ from dendrux.runtime.context import (
 )
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
+    GovernanceEventType,
     PauseState,
     RunAlreadyActiveError,
     RunEventType,
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
-    """Reject SingleCall + skills even when loop is overridden at run time."""
+    """Reject SingleCall + skills/tool_sources when loop is overridden at run time."""
     from dendrux.loops.single import SingleCall
 
     if isinstance(resolved_loop, SingleCall) and (agent._skills_dir or agent._explicit_skills):
@@ -63,6 +64,94 @@ def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
             f"Agent '{agent.name}' has skills but is being run with SingleCall loop. "
             f"SingleCall cannot use skills (use_skill requires tool calling)."
         )
+    if isinstance(resolved_loop, SingleCall) and agent._tool_sources:
+        raise ValueError(
+            f"Agent '{agent.name}' has MCP tool_sources but is being run with "
+            f"SingleCall loop. SingleCall does not support MCP tool discovery."
+        )
+
+
+class _MCPDiscoveryError(Exception):
+    """Wrapper raised only when MCP discovery fails inside _emit_init_events.
+
+    Lets callers distinguish MCP discovery failures from skill emission
+    failures so mcp.error is emitted only for actual discovery problems.
+    """
+
+
+async def _emit_init_governance_event(
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    event_type: str,
+    data: dict[str, Any],
+) -> None:
+    """Emit a single init governance event to recorder + notifier."""
+    from dendrux.loops._helpers import notify_governance, record_governance
+
+    await record_governance(recorder, event_type, 0, data)
+    await notify_governance(notifier, event_type, 0, data)
+
+
+async def _emit_init_events(
+    agent: Agent,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+) -> None:
+    """Emit skill and MCP init governance events.
+
+    Called inside the runner try block after run.started and delegation
+    context is set.
+
+    Skills: reads agent._loaded_skills / agent._denied_skill_names
+    (populated by get_system_prompt()).
+
+    MCP: if agent._tool_sources is non-empty, forces discovery via
+    get_tool_lookups(), then groups discovered tools by source_name.
+    Discovery failures are wrapped in _MCPDiscoveryError so callers
+    can distinguish them from skill emission failures.
+    """
+    # Skill events
+    if agent._loaded_skills:
+        for skill in agent._loaded_skills:
+            await _emit_init_governance_event(
+                recorder,
+                notifier,
+                GovernanceEventType.SKILL_REGISTERED,
+                {"skill_name": skill.name, "description": skill.description},
+            )
+    if agent._denied_skill_names:
+        for name in agent._denied_skill_names:
+            await _emit_init_governance_event(
+                recorder,
+                notifier,
+                GovernanceEventType.SKILL_DENIED,
+                {"skill_name": name, "reason": "denied_by_policy"},
+            )
+
+    # MCP events — only when tool_sources exist
+    if agent._tool_sources:
+        try:
+            await agent.get_tool_lookups()  # force discovery
+        except Exception as exc:
+            raise _MCPDiscoveryError(str(exc)) from exc
+
+        # Initialize from all sources so zero-tool sources still get events
+        source_tools: dict[str, list[str]] = {src.name: [] for src in agent._tool_sources}
+        for td in agent._discovered_tool_defs or []:
+            src = td.meta.get("source_name", "unknown")
+            source_tools.setdefault(src, []).append(td.name)
+
+        for source_name, tool_names in source_tools.items():
+            await _emit_init_governance_event(
+                recorder,
+                notifier,
+                GovernanceEventType.MCP_CONNECTED,
+                {
+                    "source_name": source_name,
+                    "tool_count": len(tool_names),
+                    "tool_names": tool_names,
+                },
+            )
 
 
 class EventSequencer:
@@ -421,6 +510,24 @@ async def run(
     ctx_token = set_delegation_context(this_ctx)
 
     try:
+        # Emit init governance events (skills + MCP) inside the try block
+        # so discovery failures flow through the error cleanup path.
+        # _MCPDiscoveryError is caught here, mcp.error emitted, then the
+        # original cause is re-raised for the outer except Exception.
+        try:
+            await _emit_init_events(agent, recorder, extra_notifier)
+        except _MCPDiscoveryError as mcp_exc:
+            try:
+                await _emit_init_governance_event(
+                    recorder,
+                    extra_notifier,
+                    GovernanceEventType.MCP_ERROR,
+                    {"error": str(mcp_exc)[:500]},
+                )
+            except Exception:
+                logger.warning("Failed to emit mcp.error event", exc_info=True)
+            raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+
         result = await resolved_loop.run(
             agent=agent,
             provider=provider,
@@ -791,6 +898,20 @@ async def retry(
     ctx_token = set_delegation_context(this_ctx)
 
     try:
+        try:
+            await _emit_init_events(agent, recorder, extra_notifier)
+        except _MCPDiscoveryError as mcp_exc:
+            try:
+                await _emit_init_governance_event(
+                    recorder,
+                    extra_notifier,
+                    GovernanceEventType.MCP_ERROR,
+                    {"error": str(mcp_exc)[:500]},
+                )
+            except Exception:
+                logger.warning("Failed to emit mcp.error event", exc_info=True)
+            raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+
         result = await resolved_loop.run(
             agent=agent,
             provider=provider,
@@ -1067,6 +1188,21 @@ def run_stream(
             )
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
+
+            # Emit init governance events (skills + MCP)
+            try:
+                await _emit_init_events(agent, recorder, extra_notifier)
+            except _MCPDiscoveryError as mcp_exc:
+                try:
+                    await _emit_init_governance_event(
+                        recorder,
+                        extra_notifier,
+                        GovernanceEventType.MCP_ERROR,
+                        {"error": str(mcp_exc)[:500]},
+                    )
+                except Exception:
+                    logger.warning("Failed to emit mcp.error event", exc_info=True)
+                raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
             # 3. Stream the loop
             async for event in resolved_loop.run_stream(

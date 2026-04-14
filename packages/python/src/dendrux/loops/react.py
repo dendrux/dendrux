@@ -45,6 +45,7 @@ from dendrux.types import (
     Budget,
     Clarification,
     Finish,
+    GovernanceEventType,
     LLMResponse,
     Message,
     PauseState,
@@ -468,6 +469,23 @@ async def _process_tool_calls(
         await _record_message(recorder, result_msg, iteration)
         await _notify_message(notifier, result_msg, iteration, warnings)
         all_results.append((tc, tool_result))
+
+        # Emit skill.invoked governance event when LLM activates a skill
+        if tc.name == "use_skill" and tool_result.success:
+            skill_name = (tc.params or {}).get("name", "")
+            await _record_governance(
+                recorder,
+                GovernanceEventType.SKILL_INVOKED,
+                iteration,
+                {"skill_name": skill_name},
+            )
+            await _notify_governance(
+                notifier,
+                GovernanceEventType.SKILL_INVOKED,
+                iteration,
+                {"skill_name": skill_name},
+                warnings=warnings,
+            )
 
     return _ToolCallOutcome(all_results=all_results, pending_calls=pending_calls)
 

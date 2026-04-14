@@ -179,6 +179,36 @@ class ConsoleNotifier(LoopNotifier):
             _console.print(
                 f"  [bright_red]  guard[/bright_red]  [bold]blocked[/bold] [dim]{error}[/dim]"
             )
+        elif event_type == _GovType.SKILL_REGISTERED:
+            skill_name = data.get("skill_name", "")
+            _console.print(
+                f"  [bright_green]  skill[/bright_green]  "
+                f"[bold]{skill_name}[/bold] [dim]registered[/dim]"
+            )
+        elif event_type == _GovType.SKILL_DENIED:
+            skill_name = data.get("skill_name", "")
+            _console.print(
+                f"  [bright_yellow]  skill[/bright_yellow]  "
+                f"[bold]{skill_name}[/bold] [dim]denied[/dim]"
+            )
+        elif event_type == _GovType.SKILL_INVOKED:
+            skill_name = data.get("skill_name", "")
+            _console.print(
+                f"  [bright_cyan]  skill[/bright_cyan]  "
+                f"[bold]{skill_name}[/bold] [dim]invoked[/dim]"
+            )
+        elif event_type == _GovType.MCP_CONNECTED:
+            source = data.get("source_name", "")
+            count = data.get("tool_count", 0)
+            _console.print(
+                f"  [bright_green]  mcp[/bright_green]    "
+                f"[bold]{source}[/bold] [dim]{count} tool(s)[/dim]"
+            )
+        elif event_type == _GovType.MCP_ERROR:
+            error = data.get("error", "unknown")
+            _console.print(
+                f"  [bright_red]  mcp[/bright_red]    [bold]error[/bold] [dim]{error}[/dim]"
+            )
         else:
             tool_name = data.get("tool_name", "")
             reason = data.get("reason", event_type)

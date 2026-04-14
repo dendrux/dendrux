@@ -173,6 +173,12 @@ GOVERNANCE_EVENT_META: dict[str, tuple[str, str]] = {
     _GovType.GUARDRAIL_DETECTED: ("info", "Guardrail detected"),
     _GovType.GUARDRAIL_REDACTED: ("info", "Guardrail redacted"),
     _GovType.GUARDRAIL_BLOCKED: ("error", "Guardrail blocked"),
+    # Init events: Skills + MCP
+    _GovType.SKILL_REGISTERED: ("info", "Skill registered"),
+    _GovType.SKILL_DENIED: ("warning", "Skill denied"),
+    _GovType.SKILL_INVOKED: ("info", "Skill invoked"),
+    _GovType.MCP_CONNECTED: ("info", "MCP connected"),
+    _GovType.MCP_ERROR: ("error", "MCP error"),
 }
 
 _GOVERNANCE_EVENT_TYPES = frozenset(GOVERNANCE_EVENT_META)
