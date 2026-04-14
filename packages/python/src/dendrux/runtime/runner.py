@@ -1443,11 +1443,11 @@ async def _execute_approved_tools(
     """
     from dendrux.loops._helpers import notify_message as _ntfy_msg
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
-    from dendrux.loops.react import _build_tool_lookups, _execute_tool
+    from dendrux.loops.react import _execute_tool
     from dendrux.types import Message, Role
 
     target_history = history if history is not None else pause_state.history
-    lookups = _build_tool_lookups(agent.tools)
+    lookups = await agent.get_tool_lookups()
     results: list[tuple[ToolCall, ToolResult]] = []
 
     for tc in pause_state.pending_tool_calls:

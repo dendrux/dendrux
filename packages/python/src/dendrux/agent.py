@@ -22,6 +22,8 @@ Two creation styles:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import warnings
 from typing import TYPE_CHECKING, Any, overload
@@ -38,8 +40,12 @@ if TYPE_CHECKING:
     from dendrux.guardrails._protocol import Guardrail
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
+    from dendrux.mcp._server import MCPServer
     from dendrux.runtime.state import StateStore
+    from dendrux.tools import ToolLookups
     from dendrux.types import Budget, RunResult, RunStream, ToolDef, ToolResult
+
+_agent_logger = logging.getLogger(__name__)
 
 # Safety limit to prevent runaway LLM costs. Can be overridden per-agent
 # once the worker/config layer ships (Sprint 6).
@@ -98,6 +104,7 @@ class Agent:
         prompt: str,
         name: str = ...,
         tools: list[Callable[..., Any]] = ...,
+        tool_sources: list[MCPServer] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
@@ -120,6 +127,7 @@ class Agent:
         name: str = ...,
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
+        tool_sources: list[MCPServer] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
@@ -140,6 +148,7 @@ class Agent:
         name: str | _UnsetType = _UNSET,
         prompt: str | _UnsetType = _UNSET,
         tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
+        tool_sources: list[MCPServer] | None = None,
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         loop: Loop | None = None,
@@ -209,6 +218,28 @@ class Agent:
         self._guardrails: list[Guardrail] | None = guardrails if guardrails else None
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
+
+        # --- MCP tool sources ---
+        self._tool_sources: list[MCPServer] = list(tool_sources) if tool_sources else []
+        if self._tool_sources:
+            from dendrux.mcp._server import MCPServer as _MCPServer
+
+            seen_names: set[str] = set()
+            for i, src in enumerate(self._tool_sources):
+                if not isinstance(src, _MCPServer):
+                    raise ValueError(
+                        f"Agent '{self.name}' tool_sources[{i}] is {type(src).__name__}, "
+                        f"not an MCPServer instance. Use MCPServer(name, url=... | command=[...])."
+                    )
+                if src.name in seen_names:
+                    raise ValueError(
+                        f"Agent '{self.name}' has duplicate tool_sources name '{src.name}'. "
+                        f"Each MCP source must have a unique name."
+                    )
+                seen_names.add(src.name)
+        self._discovered_tool_defs: list[ToolDef] | None = None
+        self._mcp_executors: dict[str, Callable[..., Any]] | None = None
+        self._discovery_lock = asyncio.Lock()
 
         self._validate()
 
@@ -289,7 +320,12 @@ class Agent:
     # ------------------------------------------------------------------
 
     def _validate(self) -> None:
-        """Validate agent configuration at creation time."""
+        """Validate agent configuration at creation time.
+
+        Governance name validation (deny/require_approval names exist in
+        tools) is deferred to discovery time when tool_sources are present,
+        because MCP tool names aren't known until the server is connected.
+        """
         if not self.prompt:
             raise ValueError(
                 f"Agent '{self.name}' requires a prompt. "
@@ -299,7 +335,7 @@ class Agent:
         # Validate max_delegation_depth (catches subclass defaults like -1)
         _validate_max_delegation_depth(self.max_delegation_depth)
 
-        # SingleCall cannot have tools
+        # SingleCall cannot have tools or tool_sources
         from dendrux.loops.single import SingleCall
 
         if isinstance(self._loop, SingleCall) and self.tools:
@@ -308,6 +344,13 @@ class Agent:
                 f"Agent '{self.name}' uses SingleCall loop but has {len(self.tools)} "
                 f"tool(s): {tool_names}. SingleCall agents must have zero tools. "
                 f"Either remove the tools or use ReActLoop."
+            )
+
+        if isinstance(self._loop, SingleCall) and self._tool_sources:
+            raise ValueError(
+                f"Agent '{self.name}' uses SingleCall loop but has "
+                f"{len(self._tool_sources)} tool_source(s). "
+                f"SingleCall agents cannot have tool_sources."
             )
 
         # output_type requires SingleCall in v1
@@ -336,6 +379,8 @@ class Agent:
                 f"{MAX_ITERATIONS_CEILING}, got {self.max_iterations}."
             )
 
+        has_mcp = bool(self._tool_sources)
+
         # --- Shared tool name set for deny/require_approval validation ---
         known_tools: frozenset[str] = frozenset()
         if self.tools and (self._deny or self._require_approval):
@@ -343,8 +388,8 @@ class Agent:
 
         # --- deny= validation ---
         if self._deny:
-            # deny requires tools
-            if not self.tools:
+            # deny requires tools or tool_sources
+            if not self.tools and not has_mcp:
                 raise ValueError(f"Agent '{self.name}' has deny={sorted(self._deny)} but no tools.")
 
             # deny + SingleCall is not supported
@@ -354,18 +399,21 @@ class Agent:
                     f"SingleCall loop. deny is not supported with SingleCall."
                 )
 
-            # every name in deny must exist in tools
-            unknown = self._deny - known_tools
-            if unknown:
-                raise ValueError(
-                    f"Agent '{self.name}' deny contains unknown tool(s): "
-                    f"{sorted(unknown)}. Available tools: {sorted(known_tools)}."
-                )
+            # Name existence check — skip if tool_sources present (names
+            # may refer to MCP tools not yet discovered). Validated at
+            # discovery time in _validate_governance_names().
+            if not has_mcp:
+                unknown = self._deny - known_tools
+                if unknown:
+                    raise ValueError(
+                        f"Agent '{self.name}' deny contains unknown tool(s): "
+                        f"{sorted(unknown)}. Available tools: {sorted(known_tools)}."
+                    )
 
         # --- require_approval= validation ---
         if self._require_approval:
-            # require_approval requires tools
-            if not self.tools:
+            # require_approval requires tools or tool_sources
+            if not self.tools and not has_mcp:
                 raise ValueError(
                     f"Agent '{self.name}' has require_approval="
                     f"{sorted(self._require_approval)} but no tools."
@@ -379,26 +427,32 @@ class Agent:
                     f"require_approval is not supported with SingleCall."
                 )
 
-            # every name in require_approval must exist in tools
-            unknown_approval = self._require_approval - known_tools
-            if unknown_approval:
-                raise ValueError(
-                    f"Agent '{self.name}' require_approval contains unknown tool(s): "
-                    f"{sorted(unknown_approval)}. Available tools: {sorted(known_tools)}."
-                )
-
-            # require_approval tools must be server tools
-            from dendrux.tool import get_tool_def as _get_tool_def
-            from dendrux.types import ToolTarget as _ToolTarget
-
-            for fn in self.tools:
-                td = _get_tool_def(fn)
-                if td.name in self._require_approval and td.target != _ToolTarget.SERVER:
+            # Name existence check — skip if tool_sources present (names
+            # may refer to MCP tools not yet discovered). Full check at
+            # discovery time in _validate_governance_names().
+            if not has_mcp:
+                unknown_approval = self._require_approval - known_tools
+                if unknown_approval:
                     raise ValueError(
-                        f"Agent '{self.name}' require_approval contains "
-                        f"'{td.name}' which has target={td.target.value}. "
-                        f"require_approval only supports server tools."
+                        f"Agent '{self.name}' require_approval contains unknown tool(s): "
+                        f"{sorted(unknown_approval)}. Available tools: {sorted(known_tools)}."
                     )
+
+            # Target check on LOCAL tools — always runs, even with
+            # tool_sources. Catches client-tool approval errors early
+            # without waiting for MCP discovery.
+            if self.tools:
+                from dendrux.tool import get_tool_def as _get_tool_def
+                from dendrux.types import ToolTarget as _ToolTarget
+
+                for fn in self.tools:
+                    td = _get_tool_def(fn)
+                    if td.name in self._require_approval and td.target != _ToolTarget.SERVER:
+                        raise ValueError(
+                            f"Agent '{self.name}' require_approval contains "
+                            f"'{td.name}' which has target={td.target.value}. "
+                            f"require_approval only supports server tools."
+                        )
 
             # deny and require_approval must not overlap
             overlap = self._deny & self._require_approval
@@ -408,6 +462,44 @@ class Agent:
                     f"require_approval: {sorted(overlap)}. "
                     f"A tool cannot be both denied and require approval."
                 )
+
+    def _validate_governance_names(self, all_tool_defs: dict[str, ToolDef]) -> None:
+        """Validate deny/require_approval names against full tool set.
+
+        Called at discovery time after MCP tools are discovered. This is
+        the deferred half of governance validation — catches typos in
+        deny/require_approval that refer to MCP tool names AND enforces
+        the require_approval server-tools-only invariant on the merged set.
+        """
+        from dendrux.types import ToolTarget as _ToolTarget
+
+        all_names = frozenset(all_tool_defs.keys())
+
+        if self._deny:
+            unknown = self._deny - all_names
+            if unknown:
+                raise ValueError(
+                    f"Agent '{self.name}' deny contains unknown tool(s): "
+                    f"{sorted(unknown)}. Available tools: {sorted(all_names)}."
+                )
+
+        if self._require_approval:
+            unknown_approval = self._require_approval - all_names
+            if unknown_approval:
+                raise ValueError(
+                    f"Agent '{self.name}' require_approval contains unknown tool(s): "
+                    f"{sorted(unknown_approval)}. Available tools: {sorted(all_names)}."
+                )
+
+            # require_approval tools must be server tools (including MCP + local)
+            for name in self._require_approval:
+                td = all_tool_defs.get(name)
+                if td is not None and td.target != _ToolTarget.SERVER:
+                    raise ValueError(
+                        f"Agent '{self.name}' require_approval contains "
+                        f"'{name}' which has target={td.target.value}. "
+                        f"require_approval only supports server tools."
+                    )
 
     # ------------------------------------------------------------------
     # Persistence (lazy init)
@@ -919,16 +1011,126 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    # MCP discovery
+    # ------------------------------------------------------------------
+
+    async def _ensure_discovered(self) -> None:
+        """Lazy MCP tool discovery — called internally by get_tool_lookups().
+
+        Uses asyncio.Lock with double-check pattern: fast path (already
+        discovered) skips the lock. Lock protects one-time discovery
+        against concurrent agent.run() calls.
+
+        On any failure (connection, discovery, governance validation),
+        all successfully opened sources are closed and caches stay unset
+        so the next call retries.
+        """
+        if self._discovered_tool_defs is not None:
+            return  # fast path
+
+        if not self._tool_sources:
+            # No MCP sources — set empty cache so fast path works
+            self._discovered_tool_defs = []
+            self._mcp_executors = {}
+            return
+
+        async with self._discovery_lock:
+            if self._discovered_tool_defs is not None:
+                return  # lost race, another caller finished
+
+            discovered_defs: list[ToolDef] = []
+            executors: dict[str, Callable[..., Any]] = {}
+            opened_sources: list[MCPServer] = []
+
+            # Hoist local tool info — computed once, not per-tool
+            local_defs = {get_tool_def(fn).name: get_tool_def(fn) for fn in self.tools}
+
+            try:
+                for source in self._tool_sources:
+                    tool_defs = await source._discover()
+                    opened_sources.append(source)
+                    for td in tool_defs:
+                        # Collision check against local tools
+                        if td.name in local_defs:
+                            raise ValueError(
+                                f"MCP tool '{td.name}' from source "
+                                f"'{td.meta.get('source_name')}' collides with "
+                                f"a local tool of the same name."
+                            )
+                        # Collision check against other MCP tools
+                        if td.name in executors:
+                            raise ValueError(
+                                f"MCP tool '{td.name}' collides with a tool from "
+                                f"another MCP source."
+                            )
+                        discovered_defs.append(td)
+                        executors[td.name] = source._create_executor(td.meta["mcp_tool_name"])
+
+                # Build merged name→ToolDef map for full governance validation
+                all_tool_defs = dict(local_defs)
+                for td in discovered_defs:
+                    all_tool_defs[td.name] = td
+                self._validate_governance_names(all_tool_defs)
+
+            except BaseException:
+                # Multi-source cleanup: close all opened sources
+                for src in opened_sources:
+                    try:
+                        await src.close()
+                    except Exception:
+                        _agent_logger.warning(
+                            "Failed to close MCP source '%s' during cleanup",
+                            src.name,
+                            exc_info=True,
+                        )
+                raise
+
+            # Only commit cache after ALL sources discovered + validated
+            self._discovered_tool_defs = discovered_defs
+            self._mcp_executors = executors
+
+    async def get_tool_lookups(self) -> ToolLookups:
+        """Build ToolLookups for local + MCP tools.
+
+        Calls _ensure_discovered() internally — callers never need to
+        remember to call it first. Safe to call multiple times (discovery
+        is cached after first call).
+        """
+        await self._ensure_discovered()
+        from dendrux.tools import build_tool_lookups
+
+        return build_tool_lookups(
+            self.tools,
+            mcp_executors=self._mcp_executors,
+            mcp_tool_defs=self._discovered_tool_defs,
+        )
+
+    def get_all_tool_defs(self) -> list[ToolDef]:
+        """Local + discovered MCP tool defs. Discovery must have run first."""
+        local = [get_tool_def(fn) for fn in self.tools]
+        discovered = self._discovered_tool_defs or []
+        return local + discovered
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close the provider and dispose agent-owned engine.
+        """Close MCP sources, provider, and agent-owned engine.
 
         Only disposes the private engine created from an explicit database_url.
         The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
         owned by this agent and is left untouched.
         """
+        for source in self._tool_sources:
+            try:
+                await source.close()
+            except Exception:
+                _agent_logger.warning("Failed to close MCP source '%s'", source.name, exc_info=True)
+        # Clear discovery caches so stale executors bound to closed
+        # sessions are not reused. Next get_tool_lookups() re-discovers.
+        self._discovered_tool_defs = None
+        self._mcp_executors = None
         if self._provider is not None:
             await self._provider.close()
         if self._private_engine is not None:
@@ -947,7 +1149,11 @@ class Agent:
     # ------------------------------------------------------------------
 
     def get_tool_defs(self) -> list[ToolDef]:
-        """Get ToolDef for each tool registered on this agent."""
+        """Get ToolDef for each LOCAL tool registered on this agent.
+
+        Does NOT include MCP tools. Use get_all_tool_defs() for the
+        full set (local + discovered).
+        """
         return [get_tool_def(fn) for fn in self.tools]
 
     def __repr__(self) -> str:

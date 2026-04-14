@@ -38,7 +38,8 @@ from dendrux.loops._helpers import (
     record_tool,
 )
 from dendrux.loops.base import Loop
-from dendrux.tool import DEFAULT_TOOL_TIMEOUT, get_tool_def
+from dendrux.tool import DEFAULT_TOOL_TIMEOUT
+from dendrux.tools._lookups import ToolLookups, build_tool_lookups
 from dendrux.types import (
     AgentStep,
     Budget,
@@ -61,7 +62,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator
 
     from pydantic import BaseModel
 
@@ -508,8 +509,8 @@ class ReActLoop(Loop):
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
-        tool_defs = agent.get_tool_defs()
-        lookups = _build_tool_lookups(agent.tools)
+        lookups = await agent.get_tool_lookups()
+        tool_defs = agent.get_all_tool_defs()
         state = await _init_loop_state(
             user_input=user_input,
             recorder=recorder,
@@ -931,8 +932,8 @@ class ReActLoop(Loop):
         """
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
-        tool_defs = agent.get_tool_defs()
-        lookups = _build_tool_lookups(agent.tools)
+        lookups = await agent.get_tool_lookups()
+        tool_defs = agent.get_all_tool_defs()
         state = await _init_loop_state(
             user_input=user_input,
             recorder=recorder,
@@ -1154,39 +1155,8 @@ class ReActLoop(Loop):
         )
 
 
-class ToolLookups(NamedTuple):
-    """Pre-computed lookups for tool execution — built once per run."""
-
-    fn: dict[str, Callable[..., Any]]
-    target: dict[str, ToolTarget]
-    timeout: dict[str, float]
-    explicit_timeout: dict[str, bool]
-    max_calls: dict[str, int | None]
-    parallel: dict[str, bool]
-
-
-def _build_tool_lookups(tools: list[Callable[..., Any]]) -> ToolLookups:
-    """Build all tool lookups from a list of @tool-decorated functions."""
-    fn: dict[str, Callable[..., Any]] = {}
-    target: dict[str, ToolTarget] = {}
-    timeout: dict[str, float] = {}
-    explicit_timeout: dict[str, bool] = {}
-    max_calls: dict[str, int | None] = {}
-    parallel: dict[str, bool] = {}
-    for func in tools:
-        td = get_tool_def(func)
-        if td.name in fn:
-            raise ValueError(
-                f"Duplicate tool name '{td.name}'. "
-                f"Each tool registered on an agent must have a unique name."
-            )
-        fn[td.name] = func
-        target[td.name] = td.target
-        timeout[td.name] = td.timeout_seconds
-        explicit_timeout[td.name] = td.has_explicit_timeout
-        max_calls[td.name] = td.max_calls_per_run
-        parallel[td.name] = td.parallel
-    return ToolLookups(fn, target, timeout, explicit_timeout, max_calls, parallel)
+# Backwards compatibility alias for runner.py's existing import.
+_build_tool_lookups = build_tool_lookups
 
 
 def _build_execution_groups(

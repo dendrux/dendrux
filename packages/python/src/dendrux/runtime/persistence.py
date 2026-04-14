@@ -201,6 +201,7 @@ class PersistenceRecorder(LoopRecorder):
                         "description": t.description,
                         "parameters": t.parameters,
                         "target": getattr(t, "target", "server"),
+                        "meta": t.meta or None,
                     }
                     for t in semantic_tools
                 ]

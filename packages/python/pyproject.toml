@@ -33,7 +33,8 @@ openai = ["openai>=1.50,<3.0"]
 bridge = ["fastapi>=0.135,<1.0", "uvicorn[standard]"]
 db = ["sqlalchemy[asyncio]>=2.0,<3.0", "aiosqlite>=0.19,<1.0", "alembic>=1.13,<2.0"]
 postgres = ["asyncpg>=0.29,<1.0"]
-all = ["dendrux[anthropic,openai,bridge,db,postgres]"]
+mcp = ["mcp>=1.8,<2"]
+all = ["dendrux[anthropic,openai,bridge,db,postgres,mcp]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

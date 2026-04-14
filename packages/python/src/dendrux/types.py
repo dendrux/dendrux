@@ -164,6 +164,7 @@ class ToolDef:
     max_calls_per_run: int | None = None  # Enforced by ReActLoop — graceful limit
     timeout_seconds: float = 120.0  # Enforced by ReActLoop via asyncio.wait_for
     has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
+    meta: dict[str, Any] = field(default_factory=dict)  # MCP source info, annotations, etc.
 
 
 @dataclass(frozen=True)
