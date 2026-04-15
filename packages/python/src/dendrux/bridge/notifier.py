@@ -1,11 +1,11 @@
 """Bridge notifiers for transport and composition.
 
-TransportNotifier pushes events to an asyncio.Queue for SSE consumption.
+TransportNotifier pushes events via an offer callable. The bridge
+owns all enqueue policy (truncation, backpressure, overflow).
 """
 
 from __future__ import annotations
 
-import asyncio  # noqa: TC003 — used at runtime in Queue type hints
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -27,27 +27,30 @@ class ServerEvent:
 
 
 class TransportNotifier(LoopNotifier):
-    """Pushes loop events onto an asyncio.Queue for SSE streaming.
+    """Pushes loop events via an offer callable for SSE streaming.
+
+    The notifier does not know about queues, backpressure, or overflow.
+    All enqueue policy lives in the bridge.
 
     Args:
-        queue: The asyncio.Queue to push events to.
+        offer: Synchronous callable that accepts a ServerEvent.
         redact: Optional redaction function applied to message content.
     """
 
     def __init__(
         self,
-        queue: asyncio.Queue[ServerEvent],
+        offer: Callable[[ServerEvent], None],
         *,
         redact: Callable[[str], str] | None = None,
     ) -> None:
-        self._queue = queue
+        self._offer = offer
         self._redact = redact
 
     async def on_message_appended(self, message: Message, iteration: int) -> None:
         content = message.content[:500]
         if self._redact:
             content = self._redact(content)
-        await self._queue.put(
+        self._offer(
             ServerEvent(
                 event="run.step",
                 data={
@@ -67,7 +70,7 @@ class TransportNotifier(LoopNotifier):
         semantic_tools: list[ToolDef] | None = None,
         duration_ms: int | None = None,
     ) -> None:
-        await self._queue.put(
+        self._offer(
             ServerEvent(
                 event="run.llm_done",
                 data={
@@ -81,7 +84,7 @@ class TransportNotifier(LoopNotifier):
     async def on_tool_completed(
         self, tool_call: ToolCall, tool_result: ToolResult, iteration: int
     ) -> None:
-        await self._queue.put(
+        self._offer(
             ServerEvent(
                 event="run.tool_done",
                 data={
@@ -99,7 +102,7 @@ class TransportNotifier(LoopNotifier):
         data: dict[str, Any],
         correlation_id: str | None = None,
     ) -> None:
-        await self._queue.put(
+        self._offer(
             ServerEvent(
                 event="run.governance",
                 data={

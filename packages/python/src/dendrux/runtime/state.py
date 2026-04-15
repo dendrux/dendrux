@@ -364,7 +364,13 @@ class StateStore(Protocol):
         data: dict[str, Any] | None = None,
     ) -> None: ...
 
-    async def get_run_events(self, run_id: str) -> list[RunEventRecord]: ...
+    async def get_run_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence_index: int | None = None,
+        limit: int | None = None,
+    ) -> list[RunEventRecord]: ...
 
     async def list_runs(
         self,
@@ -1037,7 +1043,13 @@ class SQLAlchemyStateStore:
             session.add(record)
             await session.commit()
 
-    async def get_run_events(self, run_id: str) -> list[RunEventRecord]:
+    async def get_run_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence_index: int | None = None,
+        limit: int | None = None,
+    ) -> list[RunEventRecord]:
         from sqlalchemy import select
 
         from dendrux.db.models import RunEvent
@@ -1048,6 +1060,15 @@ class SQLAlchemyStateStore:
                 .where(RunEvent.agent_run_id == run_id)
                 .order_by(RunEvent.sequence_index)
             )
+
+            if after_sequence_index is not None:
+                stmt = stmt.where(RunEvent.sequence_index > after_sequence_index)
+
+            if limit is not None:
+                # Clamp to 1..1000
+                clamped = max(1, min(limit, 1000))
+                stmt = stmt.limit(clamped)
+
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [

@@ -12,10 +12,15 @@ from dendrux.bridge.tasks import RunTaskManager
 from dendrux.types import Message, Role, ToolCall, ToolResult
 
 
+def _queue_offer(queue: asyncio.Queue[ServerEvent]) -> Any:
+    """Create an offer callable that wraps a queue for testing."""
+    return queue.put_nowait
+
+
 class TestTransportNotifier:
     async def test_queues_events(self) -> None:
         queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
-        obs = TransportNotifier(queue)
+        obs = TransportNotifier(_queue_offer(queue))
 
         msg = Message(role=Role.USER, content="hello")
         await obs.on_message_appended(msg, iteration=0)
@@ -29,7 +34,7 @@ class TestTransportNotifier:
         """H-006: TransportNotifier redacts message content when redact is set."""
         queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
         redact = lambda text: text.replace("secret-key-123", "[REDACTED]")  # noqa: E731
-        obs = TransportNotifier(queue, redact=redact)
+        obs = TransportNotifier(_queue_offer(queue), redact=redact)
 
         msg = Message(role=Role.ASSISTANT, content="The API key is secret-key-123")
         await obs.on_message_appended(msg, iteration=0)
@@ -41,7 +46,7 @@ class TestTransportNotifier:
     async def test_no_redaction_when_none(self) -> None:
         """Without redact, content passes through unchanged."""
         queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
-        obs = TransportNotifier(queue)
+        obs = TransportNotifier(_queue_offer(queue))
 
         msg = Message(role=Role.ASSISTANT, content="The API key is secret-key-123")
         await obs.on_message_appended(msg, iteration=0)
@@ -51,7 +56,7 @@ class TestTransportNotifier:
 
     async def test_tool_completion_event(self) -> None:
         queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
-        obs = TransportNotifier(queue)
+        obs = TransportNotifier(_queue_offer(queue))
 
         tc = ToolCall(name="add", params={"a": 1})
         tr = ToolResult(name="add", call_id=tc.id, payload="3", success=True)
@@ -67,7 +72,12 @@ class TestCompositeNotifier:
     async def test_fans_out_to_all(self) -> None:
         q1: asyncio.Queue[ServerEvent] = asyncio.Queue()
         q2: asyncio.Queue[ServerEvent] = asyncio.Queue()
-        obs = CompositeNotifier([TransportNotifier(q1), TransportNotifier(q2)])
+        obs = CompositeNotifier(
+            [
+                TransportNotifier(_queue_offer(q1)),
+                TransportNotifier(_queue_offer(q2)),
+            ]
+        )
 
         msg = Message(role=Role.USER, content="hi")
         await obs.on_message_appended(msg, iteration=0)
@@ -93,7 +103,7 @@ class TestCompositeNotifier:
                 pass
 
         queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
-        obs = CompositeNotifier([FailingNotifier(), TransportNotifier(queue)])  # type: ignore[list-item]
+        obs = CompositeNotifier([FailingNotifier(), TransportNotifier(_queue_offer(queue))])  # type: ignore[list-item]
 
         msg = Message(role=Role.USER, content="hi")
         await obs.on_message_appended(msg, iteration=0)

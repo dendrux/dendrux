@@ -51,6 +51,7 @@ from pydantic import BaseModel
 from dendrux.auth import extract_bearer_token, generate_run_token, verify_run_token
 from dendrux.bridge.notifier import ServerEvent, TransportNotifier
 from dendrux.bridge.tasks import RunTaskManager
+from dendrux.bridge.transport import MAX_CONNECTIONS_TOTAL, MAX_QUEUE_SIZE, _offer_sse_event
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -146,6 +147,8 @@ def bridge(
     app = FastAPI(title="Dendrux Bridge")
     task_manager = RunTaskManager()
     sse_queues: dict[str, asyncio.Queue[ServerEvent]] = {}
+    sse_overflow: dict[str, bool] = {}
+    _active_sse: set[str] = set()  # run_ids with an active SSE connection
 
     # ------------------------------------------------------------------
     # Auth-header stripping middleware
@@ -218,14 +221,22 @@ def bridge(
         ack: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
         # Reuse existing SSE queue if a client is already connected,
-        # otherwise create a new one. Must happen BEFORE task starts
+        # otherwise create a new bounded one. Must happen BEFORE task starts
         # (ordering guarantee for snapshot→live transition).
         if run_id not in sse_queues:
-            sse_queues[run_id] = asyncio.Queue()
-        queue = sse_queues[run_id]
+            sse_queues[run_id] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+
+        def _offer(event: ServerEvent) -> None:
+            # Look up queue by run_id at offer time (not captured at closure
+            # creation). If SSE client disconnected and popped the queue,
+            # the event is dropped silently (fail-open).
+            current_queue = sse_queues.get(run_id)
+            if current_queue is None:
+                return
+            _offer_sse_event(run_id, event, current_queue, sse_overflow)
 
         async def _resume_task() -> None:
-            transport_notifier = TransportNotifier(queue, redact=agent._redact)
+            transport_notifier = TransportNotifier(_offer, redact=agent._redact)
             try:
                 won = await store.submit_and_claim(
                     run_id,
@@ -265,7 +276,7 @@ def bridge(
                         pending = [
                             {"id": tc.id, "name": tc.name} for tc in pause_state.pending_tool_calls
                         ]
-                    await queue.put(
+                    _offer(
                         ServerEvent(
                             event="run.paused",
                             data={
@@ -281,7 +292,7 @@ def bridge(
                         event="run.completed",
                         data={"status": result.status.value, "run_id": run_id},
                     )
-                    await queue.put(terminal)
+                    _offer(terminal)
                     task_manager.buffer_terminal_event(
                         run_id, {"event": terminal.event, "data": terminal.data}
                     )
@@ -298,7 +309,7 @@ def bridge(
                         event="run.error",
                         data={"run_id": run_id, "error": str(exc)[:500]},
                     )
-                    await queue.put(error_event)
+                    _offer(error_event)
                     task_manager.buffer_terminal_event(
                         run_id, {"event": error_event.event, "data": error_event.data}
                     )
@@ -396,10 +407,26 @@ def bridge(
         _require_auth(request, run_id)
         store = await _get_store()
 
+        # One SSE connection per run — reject before global cap
+        # (more precise 409 wins over generic 503)
+        if run_id in _active_sse:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run '{run_id}' already has an active SSE connection.",
+            )
+
+        # Global SSE connection cap
+        if len(_active_sse) >= MAX_CONNECTIONS_TOTAL:
+            raise HTTPException(
+                status_code=503,
+                detail="Too many active SSE connections. Try again later.",
+            )
+
         # Ensure queue exists (may already exist from tool-results/input)
         if run_id not in sse_queues:
-            sse_queues[run_id] = asyncio.Queue()
+            sse_queues[run_id] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
         queue = sse_queues[run_id]
+        _active_sse.add(run_id)
 
         def _sse(event: str, data: Any) -> str:
             """Format a Server-Sent Event."""
@@ -442,6 +469,17 @@ def bridge(
 
                 # 3. Stream live events from queue
                 while True:
+                    # Check overflow before blocking on queue.get()
+                    if sse_overflow.get(run_id):
+                        yield _sse(
+                            "transport.overflow",
+                            {
+                                "reason": "queue_full",
+                                "detail": "Event queue overflowed. Reconnect to recover.",
+                            },
+                        )
+                        return
+
                     try:
                         event = await asyncio.wait_for(
                             queue.get(),
@@ -458,10 +496,22 @@ def bridge(
                         ):
                             return
                     except TimeoutError:
+                        # Check overflow after timeout/ping cycle too
+                        if sse_overflow.get(run_id):
+                            yield _sse(
+                                "transport.overflow",
+                                {
+                                    "reason": "queue_full",
+                                    "detail": "Event queue overflowed. Reconnect to recover.",
+                                },
+                            )
+                            return
                         yield _sse("ping", {})
 
             finally:
+                _active_sse.discard(run_id)
                 sse_queues.pop(run_id, None)
+                sse_overflow.pop(run_id, None)
 
         return StreamingResponse(
             _generate(),
@@ -554,7 +604,7 @@ def bridge(
         )
         queue = sse_queues.get(run_id)
         if queue:
-            await queue.put(cancel_event)
+            _offer_sse_event(run_id, cancel_event, queue, sse_overflow)
         task_manager.buffer_terminal_event(
             run_id, {"event": cancel_event.event, "data": cancel_event.data}
         )
