@@ -52,12 +52,14 @@ def _build_usage_with_cache(usage: Any) -> UsageStats:
     Reads cached_tokens from usage.input_tokens_details when present.
     Normalizes input_tokens to mean fresh-only by subtracting cached
     from input_tokens (Responses uses input_tokens, not prompt_tokens).
+    Clamps to zero so a misbehaving vendor reporting cached > input does
+    not propagate negative counts downstream.
     """
     raw_input = getattr(usage, "input_tokens", 0) or 0
     output_tokens = getattr(usage, "output_tokens", 0) or 0
     details = getattr(usage, "input_tokens_details", None)
     cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
-    fresh_input = raw_input - (cache_read or 0)
+    fresh_input = max(0, raw_input - (cache_read or 0))
     return UsageStats(
         input_tokens=fresh_input,
         output_tokens=output_tokens,

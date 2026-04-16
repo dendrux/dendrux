@@ -239,7 +239,6 @@ class AnthropicProvider(LLMProvider):
         and normalized into LLMResponse.text as a JSON string, with
         tool_calls set to None (preserving the SingleCall invariant).
         """
-        del run_id, cache_key_prefix  # Anthropic caching is byte-based
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
 
         # Structured output: inject synthetic tool + forced tool_choice
@@ -297,7 +296,6 @@ class AnthropicProvider(LLMProvider):
         At stream end, yields a DONE event carrying the full LLMResponse
         (with usage stats and provider payloads) for the loop to consume.
         """
-        del run_id, cache_key_prefix  # Anthropic caching is byte-based
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
 
         # Accumulators for building the final LLMResponse

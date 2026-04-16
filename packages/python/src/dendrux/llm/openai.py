@@ -47,19 +47,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1/"
+
+
 def _build_usage_with_cache(usage: Any) -> UsageStats:
     """Build UsageStats from an OpenAI Chat Completions usage object.
 
     Reads cached_tokens from usage.prompt_tokens_details when present
     (compatible backends may omit it). Normalizes input_tokens to mean
     fresh-only by subtracting cached from prompt_tokens, so cross-provider
-    semantics match Anthropic's native behavior.
+    semantics match Anthropic's native behavior. Clamps to zero so a
+    misbehaving vendor that reports cached > prompt does not propagate
+    negative counts into the rollup or budget guardrails.
     """
     prompt_tokens = usage.prompt_tokens or 0
     completion_tokens = usage.completion_tokens or 0
     details = getattr(usage, "prompt_tokens_details", None)
     cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
-    fresh_input = prompt_tokens - (cache_read or 0)
+    fresh_input = max(0, prompt_tokens - (cache_read or 0))
     return UsageStats(
         input_tokens=fresh_input,
         output_tokens=completion_tokens,
@@ -260,12 +265,15 @@ class OpenAIProvider(LLMProvider):
             if key in kwargs:
                 api_kwargs[key] = kwargs.pop(key)
 
-        # Cache routing — derive key from prefix or run_id
-        cache_key_source = cache_key_prefix or run_id
-        if cache_key_source:
-            api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
-        if self._prompt_cache_retention is not None:
-            api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
+        # Cache routing — derive key from prefix or run_id.
+        # Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.) since some
+        # compatible backends reject unknown OpenAI-specific request fields.
+        if str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL:
+            cache_key_source = cache_key_prefix or run_id
+            if cache_key_source:
+                api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
+            if self._prompt_cache_retention is not None:
+                api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
 
         captured_request = {k: v for k, v in api_kwargs.items() if v is not openai.NOT_GIVEN}
         return api_kwargs, captured_request

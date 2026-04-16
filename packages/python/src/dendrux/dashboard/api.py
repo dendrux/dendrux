@@ -183,6 +183,8 @@ def create_dashboard_api(
                     "total_input_tokens": r.total_input_tokens,
                     "total_output_tokens": r.total_output_tokens,
                     "total_cost_usd": r.total_cost_usd,
+                    "total_cache_read_tokens": r.total_cache_read_tokens,
+                    "total_cache_creation_tokens": r.total_cache_creation_tokens,
                     "model": r.model,
                     "parent_run_id": r.parent_run_id,
                     "delegation_level": r.delegation_level,
@@ -309,6 +311,8 @@ def create_dashboard_api(
                     "output_tokens": i.output_tokens,
                     "cost_usd": i.cost_usd,
                     "duration_ms": i.duration_ms,
+                    "cache_read_input_tokens": i.cache_read_input_tokens,
+                    "cache_creation_input_tokens": i.cache_creation_input_tokens,
                     "created_at": _utc_iso(i.created_at),
                 }
                 for i in interactions

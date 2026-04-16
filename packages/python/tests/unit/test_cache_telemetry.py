@@ -375,3 +375,194 @@ class TestOpenAIResponsesCachePopulation:
         result = await responses_provider.complete([Message(role=Role.USER, content="hi")])
         assert result.usage.cache_read_input_tokens is None
         assert result.usage.input_tokens == 200
+
+
+# ---------------------------------------------------------------------------
+# Negative-input clamp — guard against vendor bugs that report
+# cached_tokens > prompt_tokens.
+# ---------------------------------------------------------------------------
+
+
+class TestNegativeInputClamp:
+    async def test_openai_chat_clamps_negative_to_zero(
+        self, openai_provider: OpenAIProvider
+    ) -> None:
+        """If a vendor reports cached > prompt we must not propagate a
+        negative input_tokens into the DB or budget guardrails."""
+        completion = _FakeChatCompletion(
+            usage=_FakeOpenAIUsage(
+                prompt_tokens=100,
+                completion_tokens=25,
+                total_tokens=125,
+                prompt_tokens_details=_FakeCachedDetails(cached_tokens=200),
+            )
+        )
+        openai_provider._client.chat.completions.create = AsyncMock(return_value=completion)
+        result = await openai_provider.complete([Message(role=Role.USER, content="hi")])
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_read_input_tokens == 200
+        assert result.usage.total_tokens == 25  # fresh (0) + output (25)
+
+    async def test_openai_responses_clamps_negative_to_zero(
+        self, responses_provider: OpenAIResponsesProvider
+    ) -> None:
+        response = _FakeResponsesResponse(
+            usage=_FakeResponsesUsage(
+                input_tokens=50,
+                output_tokens=10,
+                total_tokens=60,
+                input_tokens_details=_FakeInputCachedDetails(cached_tokens=500),
+            )
+        )
+        responses_provider._client.responses.create = AsyncMock(return_value=response)
+        result = await responses_provider.complete([Message(role=Role.USER, content="hi")])
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_read_input_tokens == 500
+
+
+# ---------------------------------------------------------------------------
+# PauseState serialization round-trip for cache fields
+# ---------------------------------------------------------------------------
+
+
+class TestUsageSerializationCacheFields:
+    """_usage_to_dict / _usage_from_dict round-trip cache fields so that
+    a run paused mid-flight and resumed later does not lose pre-pause
+    cache totals. This is the long-running / human-approval case the
+    whole cache telemetry feature is meant to support."""
+
+    def test_usage_round_trip_preserves_cache_read(self) -> None:
+        from dendrux.types import _usage_from_dict, _usage_to_dict
+
+        before = UsageStats(
+            input_tokens=500,
+            output_tokens=50,
+            total_tokens=550,
+            cache_read_input_tokens=3000,
+            cache_creation_input_tokens=400,
+        )
+        after = _usage_from_dict(_usage_to_dict(before))
+        assert after.cache_read_input_tokens == 3000
+        assert after.cache_creation_input_tokens == 400
+
+    def test_usage_round_trip_preserves_none_sentinel(self) -> None:
+        from dendrux.types import _usage_from_dict, _usage_to_dict
+
+        before = UsageStats(input_tokens=200, output_tokens=30)
+        after = _usage_from_dict(_usage_to_dict(before))
+        assert after.cache_read_input_tokens is None
+        assert after.cache_creation_input_tokens is None
+
+    def test_usage_round_trip_preserves_zero(self) -> None:
+        from dendrux.types import _usage_from_dict, _usage_to_dict
+
+        before = UsageStats(
+            input_tokens=200,
+            output_tokens=30,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        )
+        after = _usage_from_dict(_usage_to_dict(before))
+        assert after.cache_read_input_tokens == 0
+        assert after.cache_creation_input_tokens == 0
+
+    async def test_init_loop_state_copies_cache_fields_from_initial_usage(self) -> None:
+        """Resume path: _init_loop_state must carry pre-pause cache totals
+        into the fresh running total so finalize rollup doesn't undercount."""
+        from dendrux.loops.react import _init_loop_state
+
+        initial = UsageStats(
+            input_tokens=500,
+            output_tokens=50,
+            total_tokens=550,
+            cache_read_input_tokens=3000,
+            cache_creation_input_tokens=400,
+        )
+        state = await _init_loop_state(
+            user_input="ignored",
+            recorder=None,
+            notifier=None,
+            initial_history=[],
+            initial_steps=[],
+            initial_usage=initial,
+        )
+        assert state.usage.cache_read_input_tokens == 3000
+        assert state.usage.cache_creation_input_tokens == 400
+
+    async def test_init_loop_state_without_initial_usage_has_none_cache(self) -> None:
+        from dendrux.loops.react import _init_loop_state
+
+        state = await _init_loop_state(
+            user_input="hello",
+            recorder=None,
+            notifier=None,
+            initial_history=None,
+            initial_steps=None,
+            initial_usage=None,
+        )
+        assert state.usage.cache_read_input_tokens is None
+        assert state.usage.cache_creation_input_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# Streaming-path cache telemetry (I1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeStreamUsageChunk:
+    """A final-chunk-of-stream with a usage payload shape matching OpenAI."""
+
+    usage: _FakeOpenAIUsage
+    choices: list = field(default_factory=list)
+
+
+class _FakeStream:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = chunks
+
+    def __aiter__(self) -> _FakeStream:
+        self._iter = iter(self._chunks)
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class TestStreamingCacheTelemetry:
+    """The streaming path must populate UsageStats cache fields and apply
+    the same fresh-only normalization as the batch path."""
+
+    async def test_openai_chat_stream_populates_cache_read(
+        self, openai_provider: OpenAIProvider
+    ) -> None:
+        from dendrux.types import StreamEventType
+
+        final_chunk = _FakeStreamUsageChunk(
+            usage=_FakeOpenAIUsage(
+                prompt_tokens=1500,
+                completion_tokens=50,
+                total_tokens=1550,
+                prompt_tokens_details=_FakeCachedDetails(cached_tokens=1000),
+            )
+        )
+        stream = _FakeStream([final_chunk])
+
+        async def fake_create(**_kwargs: Any) -> _FakeStream:
+            return stream
+
+        openai_provider._client.chat.completions.create = fake_create
+
+        done_events = []
+        async for event in openai_provider.complete_stream([Message(role=Role.USER, content="hi")]):
+            if event.type == StreamEventType.DONE:
+                done_events.append(event)
+
+        assert len(done_events) == 1
+        done = done_events[0].raw
+        assert done.usage.cache_read_input_tokens == 1000
+        # Normalization: fresh input = prompt - cached
+        assert done.usage.input_tokens == 500

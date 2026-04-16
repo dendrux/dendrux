@@ -17,10 +17,23 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def build_cache_key_prefix(agent: Agent) -> str | None:
+    """Stable cache-pool identifier per agent + model.
+
+    OpenAI providers use this to scope ``prompt_cache_key`` so all runs of
+    the same agent share a cache pool. Returns ``None`` when the agent has
+    no name; the provider then falls back to ``run_id``.
+    """
+    if not agent.name:
+        return None
+    return f"{agent.name}:{agent.model}"
 
 
 # ------------------------------------------------------------------

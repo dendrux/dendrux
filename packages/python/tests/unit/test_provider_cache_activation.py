@@ -377,3 +377,203 @@ class TestAnthropicAcceptsButIgnoresCacheArgs:
             cache_key_prefix="agent:model",
         )
         assert result.text == "ok"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible backend gating — prompt_cache_key must NOT leak
+# to vLLM/Groq/Together/Ollama/etc. Some strict backends reject unknown
+# OpenAI-specific request fields with HTTP 400.
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIChatBackendGating:
+    async def test_custom_base_url_skips_prompt_cache_key(self) -> None:
+        provider = OpenAIProvider(
+            model="llama-3.3-70b",
+            api_key="test",
+            base_url="https://api.groq.com/openai/v1",
+        )
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeChatCompletion:
+            captured.update(kwargs)
+            return _FakeChatCompletion()
+
+        provider._client.chat.completions.create = capture
+        await provider.complete(
+            [Message(role=Role.USER, content="hi")],
+            cache_key_prefix="myagent:llama",
+            run_id="r1",
+        )
+        assert "prompt_cache_key" not in captured
+        assert "prompt_cache_retention" not in captured
+
+    async def test_custom_base_url_skips_prompt_cache_retention(self) -> None:
+        provider = OpenAIProvider(
+            model="llama-3.3-70b",
+            api_key="test",
+            base_url="http://localhost:8000/v1",
+            prompt_cache_retention="24h",
+        )
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeChatCompletion:
+            captured.update(kwargs)
+            return _FakeChatCompletion()
+
+        provider._client.chat.completions.create = capture
+        await provider.complete(
+            [Message(role=Role.USER, content="hi")],
+            run_id="r1",
+        )
+        assert "prompt_cache_retention" not in captured
+
+    async def test_default_base_url_still_passes_prompt_cache_key(self) -> None:
+        """Default OpenAI base_url must keep the existing behaviour."""
+        provider = OpenAIProvider(model="gpt-4o", api_key="test")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeChatCompletion:
+            captured.update(kwargs)
+            return _FakeChatCompletion()
+
+        provider._client.chat.completions.create = capture
+        await provider.complete(
+            [Message(role=Role.USER, content="hi")],
+            cache_key_prefix="myagent:gpt-4o",
+            run_id="r1",
+        )
+        assert captured.get("prompt_cache_key") == "dendrux:myagent:gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# Rolling marker: cache_control must only attach to the newest breakpoint,
+# not leak onto earlier message blocks.
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicMarkerDoesNotLeak:
+    def test_earlier_message_blocks_have_no_cache_control_on_iter_two(self) -> None:
+        provider = AnthropicProvider(api_key="sk-test", model="claude-opus-4-6")
+        iter2_messages = [
+            Message(role=Role.USER, content="first"),
+            Message(role=Role.ASSISTANT, content="second"),
+            Message(role=Role.USER, content="third"),
+        ]
+        api_kwargs, _ = provider._build_api_kwargs(iter2_messages, tools=None, kwargs={})
+
+        all_msgs = api_kwargs["messages"]
+        # Everything but the last message must be cache_control-free
+        for m in all_msgs[:-1]:
+            content = m["content"]
+            if isinstance(content, list):
+                for block in content:
+                    assert "cache_control" not in block, (
+                        "Stale cache_control leaked onto an earlier block"
+                    )
+            else:
+                assert isinstance(content, str)
+
+    def test_cache_control_only_on_final_block_of_last_message(self) -> None:
+        """Assistant message with both text and tool_use — the marker
+        should land on the terminal block only, not earlier blocks."""
+        from dendrux.types import ToolCall
+
+        provider = AnthropicProvider(api_key="sk-test", model="claude-opus-4-6")
+        tc = ToolCall(name="search", params={"q": "x"}, provider_tool_call_id="t1")
+        messages = [
+            Message(role=Role.USER, content="find x"),
+            Message(role=Role.ASSISTANT, content="let me search", tool_calls=[tc]),
+        ]
+        api_kwargs, _ = provider._build_api_kwargs(messages, tools=None, kwargs={})
+        last_content = api_kwargs["messages"][-1]["content"]
+        assert isinstance(last_content, list)
+        assert "cache_control" not in last_content[0]  # text block untouched
+        assert last_content[-1].get("cache_control") == {"type": "ephemeral"}
+
+
+# ---------------------------------------------------------------------------
+# cache_control on tool_result blocks — the dominant shape for iterations
+# N ≥ 2 of a React loop (last user message carries tool results).
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicCacheControlOnToolResult:
+    def test_marker_lands_on_tool_result_block(self) -> None:
+        """Last message is a user with a tool_result content block —
+        the rolling marker must attach to that tool_result (valid per
+        Anthropic's docs: cache_control supports tool_result blocks)."""
+        from dendrux.types import ToolCall
+
+        provider = AnthropicProvider(api_key="sk-test", model="claude-opus-4-6")
+        tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="toolu_1")
+        messages = [
+            Message(role=Role.USER, content="add 1+2"),
+            Message(role=Role.ASSISTANT, content="", tool_calls=[tc]),
+            Message(
+                role=Role.TOOL,
+                content='{"result": 3}',
+                name="add",
+                call_id=tc.id,
+            ),
+        ]
+        api_kwargs, _ = provider._build_api_kwargs(messages, tools=None, kwargs={})
+        last = api_kwargs["messages"][-1]
+        assert last["role"] == "user"
+        assert isinstance(last["content"], list)
+        assert last["content"][-1]["type"] == "tool_result"
+        assert last["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+# ---------------------------------------------------------------------------
+# Streaming path carries cache_key_prefix + prompt_cache_key (I1 follow-up).
+# ---------------------------------------------------------------------------
+
+
+class _EmptyStream:
+    def __init__(self) -> None:
+        self._done = False
+
+    def __aiter__(self) -> _EmptyStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        raise StopAsyncIteration
+
+
+class TestOpenAIStreamForwardsCacheKey:
+    async def test_complete_stream_passes_prompt_cache_key(self) -> None:
+        provider = OpenAIProvider(model="gpt-4o", api_key="test")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _EmptyStream:
+            captured.update(kwargs)
+            return _EmptyStream()
+
+        provider._client.chat.completions.create = capture
+        async for _ in provider.complete_stream(
+            [Message(role=Role.USER, content="hi")],
+            cache_key_prefix="agent:model",
+        ):
+            pass
+        assert captured.get("prompt_cache_key") == "dendrux:agent:model"
+
+    async def test_complete_stream_skips_on_custom_base_url(self) -> None:
+        provider = OpenAIProvider(
+            model="llama-3.3-70b",
+            api_key="test",
+            base_url="http://localhost:8000/v1",
+        )
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _EmptyStream:
+            captured.update(kwargs)
+            return _EmptyStream()
+
+        provider._client.chat.completions.create = capture
+        async for _ in provider.complete_stream(
+            [Message(role=Role.USER, content="hi")],
+            cache_key_prefix="agent:model",
+        ):
+            pass
+        assert "prompt_cache_key" not in captured

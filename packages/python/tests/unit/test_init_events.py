@@ -626,6 +626,8 @@ class TestNormalizerInitEvents:
             total_input_tokens: int = 0
             total_output_tokens: int = 0
             total_cost_usd: float | None = None
+            total_cache_read_tokens: int = 0
+            total_cache_creation_tokens: int = 0
             meta: dict[str, Any] | None = None
             created_at: datetime | None = None
             updated_at: datetime | None = None

@@ -53,6 +53,8 @@ class _Run:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_cost_usd: float | None = None
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
     meta: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -553,6 +555,113 @@ class TestNormalizeTimeline:
         assert result.nodes[0].sequence_index == 0
         assert result.nodes[1].sequence_index == 1
         assert result.nodes[2].sequence_index == 2
+
+
+class TestCacheTelemetryInTimeline:
+    """Cache fields flow from llm.completed event into LLMCallNode and
+    serialization, plus aggregate cache totals reach RunSummary."""
+
+    async def test_llm_call_node_carries_cache_fields(self) -> None:
+        store = NormalizerMockStore(
+            _run=_Run(
+                id="r_cache",
+                agent_name="A",
+                status="success",
+                total_cache_read_tokens=900,
+                total_cache_creation_tokens=200,
+                created_at=_T0,
+            ),
+            _events=[
+                _Event(
+                    id="e0",
+                    event_type="run.started",
+                    sequence_index=0,
+                    data={"agent_name": "A"},
+                    created_at=_T0,
+                ),
+                _Event(
+                    id="e1",
+                    event_type="llm.completed",
+                    sequence_index=1,
+                    iteration_index=1,
+                    data={
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cache_read_input_tokens": 900,
+                        "cache_creation_input_tokens": 200,
+                        "model": "claude-opus-4-6",
+                    },
+                    created_at=_T0 + timedelta(seconds=1),
+                ),
+            ],
+        )
+
+        result = await normalize_timeline("r_cache", store)
+        assert result is not None
+        node = result.nodes[1]
+        assert isinstance(node, LLMCallNode)
+        assert node.cache_read_input_tokens == 900
+        assert node.cache_creation_input_tokens == 200
+
+        # Aggregates flow to summary
+        assert result.summary.total_cache_read_tokens == 900
+        assert result.summary.total_cache_creation_tokens == 200
+
+    async def test_llm_call_node_omits_cache_when_event_omits(self) -> None:
+        """Older runs (pre-cache-telemetry) and providers that don't report
+        leave cache fields as None on the node."""
+        store = NormalizerMockStore(
+            _run=_Run(id="r_old", agent_name="A", status="success", created_at=_T0),
+            _events=[
+                _Event(
+                    id="e0",
+                    event_type="llm.completed",
+                    sequence_index=0,
+                    iteration_index=1,
+                    data={"input_tokens": 100, "output_tokens": 50},
+                    created_at=_T0,
+                ),
+            ],
+        )
+        result = await normalize_timeline("r_old", store)
+        assert result is not None
+        node = result.nodes[0]
+        assert isinstance(node, LLMCallNode)
+        assert node.cache_read_input_tokens is None
+        assert node.cache_creation_input_tokens is None
+
+    async def test_serialized_node_includes_cache_fields(self) -> None:
+        store = NormalizerMockStore(
+            _run=_Run(
+                id="r_ser",
+                agent_name="A",
+                status="success",
+                total_cache_read_tokens=300,
+                created_at=_T0,
+            ),
+            _events=[
+                _Event(
+                    id="e0",
+                    event_type="llm.completed",
+                    sequence_index=0,
+                    iteration_index=1,
+                    data={
+                        "input_tokens": 50,
+                        "output_tokens": 10,
+                        "cache_read_input_tokens": 300,
+                        "cache_creation_input_tokens": 0,
+                    },
+                    created_at=_T0,
+                ),
+            ],
+        )
+        result = await normalize_timeline("r_ser", store)
+        assert result is not None
+        d = timeline_to_dict(result)
+        node_dict = d["nodes"][0]
+        assert node_dict["cache_read_input_tokens"] == 300
+        assert node_dict["cache_creation_input_tokens"] == 0
+        assert d["summary"]["total_cache_read_tokens"] == 300
 
 
 class TestTimelineToDict:

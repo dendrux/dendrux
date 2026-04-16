@@ -20,6 +20,9 @@ export interface LLMCallNode {
   has_tool_calls: boolean;
   timestamp: string | null;
   assistant_text: string | null;
+  // null when the provider didn't report cache stats; 0 means reported zero.
+  cache_read_input_tokens: number | null;
+  cache_creation_input_tokens: number | null;
 }
 
 export interface ToolCallNode {
@@ -118,6 +121,8 @@ export interface RunSummary {
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd: number | null;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -147,6 +152,8 @@ export interface LLMInteraction {
   output_tokens: number;
   cost_usd: number | null;
   duration_ms: number | null;
+  cache_read_input_tokens: number | null;
+  cache_creation_input_tokens: number | null;
   created_at: string | null;
 }
 
@@ -208,6 +215,8 @@ export interface RunListItem {
   total_input_tokens: number;
   total_output_tokens: number;
   total_cost_usd: number | null;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
   model: string | null;
   parent_run_id: string | null;
   delegation_level: number;

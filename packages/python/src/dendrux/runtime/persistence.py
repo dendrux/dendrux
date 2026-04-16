@@ -226,6 +226,8 @@ class PersistenceRecorder(LoopRecorder):
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
                 "cost_usd": response.usage.cost_usd,
+                "cache_read_input_tokens": response.usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
             }
 
         # BEST-EFFORT: llm_interactions (full forensics)

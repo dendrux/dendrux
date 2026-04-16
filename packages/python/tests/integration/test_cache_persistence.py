@@ -208,3 +208,57 @@ class TestUsageAccumulation:
         _accumulate_usage(total, UsageStats(input_tokens=80, output_tokens=15))
         assert total.cache_read_input_tokens is None
         assert total.cache_creation_input_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# semantic_response.usage in llm_interactions must carry cache fields too.
+# DB columns and llm.completed events have them; the JSON usage view must
+# match so dashboards inspecting the semantic payload don't see a different
+# story than the columns.
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticResponseUsageCacheFields:
+    async def test_semantic_response_usage_includes_cache_fields(
+        self, store: SQLAlchemyStateStore, session_factory
+    ) -> None:
+        from dendrux.runtime.persistence import PersistenceRecorder
+        from dendrux.types import LLMResponse
+
+        await store.create_run("r_sem", "Agent", input_data={"x": 1})
+
+        recorder = PersistenceRecorder(
+            state_store=store,
+            run_id="r_sem",
+            model="claude-sonnet-4-6",
+            provider_name="anthropic",
+        )
+
+        response = LLMResponse(
+            text="ok",
+            tool_calls=None,
+            usage=UsageStats(
+                input_tokens=500,
+                output_tokens=50,
+                total_tokens=550,
+                cache_read_input_tokens=900,
+                cache_creation_input_tokens=300,
+            ),
+        )
+
+        await recorder.on_llm_call_completed(response, iteration=0)
+
+        async with session_factory() as session:
+            from dendrux.db.models import LLMInteraction
+
+            row = (
+                await session.execute(
+                    select(LLMInteraction).where(LLMInteraction.agent_run_id == "r_sem")
+                )
+            ).scalar_one()
+            usage_payload = row.semantic_response["usage"]
+            assert usage_payload["cache_read_input_tokens"] == 900
+            assert usage_payload["cache_creation_input_tokens"] == 300
+            # Sanity: typed columns also carry them
+            assert row.cache_read_input_tokens == 900
+            assert row.cache_creation_input_tokens == 300

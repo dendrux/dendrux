@@ -67,6 +67,54 @@ class TestTransportNotifier:
         assert event.data["tool_name"] == "add"
         assert event.data["success"] is True
 
+    async def test_llm_done_event_includes_cache_fields(self) -> None:
+        """Live bridge stream must carry cache_read / cache_creation so
+        dashboards can render cache efficiency without re-fetching DB rows."""
+        from dendrux.types import LLMResponse, UsageStats
+
+        queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
+        obs = TransportNotifier(_queue_offer(queue))
+
+        response = LLMResponse(
+            text="ok",
+            tool_calls=None,
+            usage=UsageStats(
+                input_tokens=500,
+                output_tokens=50,
+                total_tokens=550,
+                cache_read_input_tokens=900,
+                cache_creation_input_tokens=200,
+            ),
+        )
+        await obs.on_llm_call_completed(response, iteration=2)
+
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event.event == "run.llm_done"
+        assert event.data["cache_read_input_tokens"] == 900
+        assert event.data["cache_creation_input_tokens"] == 200
+        # And the existing fields are still present
+        assert event.data["input_tokens"] == 500
+        assert event.data["output_tokens"] == 50
+
+    async def test_llm_done_event_passes_through_none_cache(self) -> None:
+        """When provider didn't report cache, the event carries None
+        rather than dropping the field — keeps the shape consistent."""
+        from dendrux.types import LLMResponse, UsageStats
+
+        queue: asyncio.Queue[ServerEvent] = asyncio.Queue()
+        obs = TransportNotifier(_queue_offer(queue))
+
+        response = LLMResponse(
+            text="ok",
+            tool_calls=None,
+            usage=UsageStats(input_tokens=200, output_tokens=30, total_tokens=230),
+        )
+        await obs.on_llm_call_completed(response, iteration=0)
+
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event.data["cache_read_input_tokens"] is None
+        assert event.data["cache_creation_input_tokens"] is None
+
 
 class TestCompositeNotifier:
     async def test_fans_out_to_all(self) -> None:

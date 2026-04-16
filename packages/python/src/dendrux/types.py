@@ -534,6 +534,8 @@ def _usage_to_dict(u: UsageStats) -> dict[str, Any]:
         "output_tokens": u.output_tokens,
         "total_tokens": u.total_tokens,
         "cost_usd": u.cost_usd,
+        "cache_read_input_tokens": u.cache_read_input_tokens,
+        "cache_creation_input_tokens": u.cache_creation_input_tokens,
     }
 
 
@@ -543,6 +545,8 @@ def _usage_from_dict(d: dict[str, Any]) -> UsageStats:
         output_tokens=d.get("output_tokens", 0),
         total_tokens=d.get("total_tokens", 0),
         cost_usd=d.get("cost_usd"),
+        cache_read_input_tokens=d.get("cache_read_input_tokens"),
+        cache_creation_input_tokens=d.get("cache_creation_input_tokens"),
     )
 
 

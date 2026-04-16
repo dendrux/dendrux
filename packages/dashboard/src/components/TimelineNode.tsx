@@ -49,6 +49,7 @@ function RunStartedContent({ node }: { node: RunStartedNode }) {
 }
 
 function LLMCallContent({ node }: { node: LLMCallNode }) {
+  const cacheRead = node.cache_read_input_tokens ?? 0;
   return (
     <div>
       <h3 className="text-lg font-bold text-text-primary">
@@ -59,6 +60,12 @@ function LLMCallContent({ node }: { node: LLMCallNode }) {
           <span className="material-symbols-outlined text-sm">toll</span>
           {formatTokens(node.input_tokens + node.output_tokens)} tokens
         </span>
+        {cacheRead > 0 && (
+          <span className="flex items-center gap-1" title="Tokens read from prompt cache">
+            <span className="material-symbols-outlined text-sm">bolt</span>
+            {formatTokens(cacheRead)} cached
+          </span>
+        )}
         {node.cost_usd != null && (
           <span className="flex items-center gap-1">
             <span className="material-symbols-outlined text-sm">payments</span>

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.loops._helpers import (
+    build_cache_key_prefix,
     notify_governance,
     notify_llm,
     notify_message,
@@ -97,18 +98,6 @@ class _ToolCallOutcome(NamedTuple):
     pending_calls: list[ToolCall]
     # True if pending_calls are awaiting approval (vs client tool pause)
     pending_approval: bool = False
-
-
-def _build_cache_key_prefix(agent: Agent) -> str | None:
-    """Stable cache-pool identifier per agent + model.
-
-    OpenAI providers use this to scope ``prompt_cache_key`` so all runs of
-    the same agent share a cache pool. Returns None when the agent has no
-    name — provider falls back to run_id in that case.
-    """
-    if not agent.name:
-        return None
-    return f"{agent.name}:{agent.model}"
 
 
 def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
@@ -301,6 +290,10 @@ async def _init_loop_state(
         output_tokens=initial_usage.output_tokens if initial_usage else 0,
         total_tokens=initial_usage.total_tokens if initial_usage else 0,
         cost_usd=initial_usage.cost_usd if initial_usage else None,
+        cache_read_input_tokens=(initial_usage.cache_read_input_tokens if initial_usage else None),
+        cache_creation_input_tokens=(
+            initial_usage.cache_creation_input_tokens if initial_usage else None
+        ),
     )
 
     return _LoopState(
@@ -552,7 +545,7 @@ class ReActLoop(Loop):
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
-        cache_key_prefix = _build_cache_key_prefix(agent)
+        cache_key_prefix = build_cache_key_prefix(agent)
         lookups = await agent.get_tool_lookups()
         tool_defs = agent.get_all_tool_defs()
         state = await _init_loop_state(
@@ -982,7 +975,7 @@ class ReActLoop(Loop):
         """
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
-        cache_key_prefix = _build_cache_key_prefix(agent)
+        cache_key_prefix = build_cache_key_prefix(agent)
         lookups = await agent.get_tool_lookups()
         tool_defs = agent.get_all_tool_defs()
         state = await _init_loop_state(

@@ -51,6 +51,8 @@ class _Run:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_cost_usd: float | None = None
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
     meta: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -96,6 +98,8 @@ class _LLMInteraction:
     output_tokens: int = 0
     cost_usd: float | None = None
     duration_ms: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
     created_at: datetime | None = None
 
 

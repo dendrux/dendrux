@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.loops._helpers import (
+    build_cache_key_prefix,
     notify_governance,
     notify_llm,
     notify_message,
@@ -118,9 +119,7 @@ class SingleCall(Loop):
 
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
-        from dendrux.loops.react import _build_cache_key_prefix
-
-        cache_key_prefix = _build_cache_key_prefix(agent)
+        cache_key_prefix = build_cache_key_prefix(agent)
 
         user_msg = Message(role=Role.USER, content=user_input)
         history = [user_msg]
@@ -465,9 +464,7 @@ class SingleCall(Loop):
 
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
-        from dendrux.loops.react import _build_cache_key_prefix
-
-        cache_key_prefix = _build_cache_key_prefix(agent)
+        cache_key_prefix = build_cache_key_prefix(agent)
 
         user_msg = Message(role=Role.USER, content=user_input)
         history = [user_msg]
