@@ -94,6 +94,41 @@ class TestConsoleNotifier:
         assistant_msg = Message(role=Role.ASSISTANT, content="", tool_calls=[tc])
         await obs.on_message_appended(assistant_msg, 1)
 
+    async def test_llm_done_accumulates_cache_totals(self) -> None:
+        """on_llm_call_completed adds cache_read / cache_creation to the
+        running totals so print_summary can report a hit ratio."""
+        from dendrux.types import UsageStats
+
+        obs = ConsoleNotifier()
+        response = LLMResponse(
+            text="ok",
+            usage=UsageStats(
+                input_tokens=500,
+                output_tokens=50,
+                total_tokens=550,
+                cache_read_input_tokens=900,
+                cache_creation_input_tokens=200,
+            ),
+        )
+        await obs.on_llm_call_completed(response, 1)
+        await obs.on_llm_call_completed(response, 2)
+        assert obs._total_cache_read == 1800
+        assert obs._total_cache_creation == 400
+
+    async def test_llm_done_handles_none_cache_fields(self) -> None:
+        """A provider that didn't report cache (older runs, compatible
+        backends) leaves totals unchanged — None is treated as 0."""
+        from dendrux.types import UsageStats
+
+        obs = ConsoleNotifier()
+        response = LLMResponse(
+            text="ok",
+            usage=UsageStats(input_tokens=200, output_tokens=30, total_tokens=230),
+        )
+        await obs.on_llm_call_completed(response, 1)
+        assert obs._total_cache_read == 0
+        assert obs._total_cache_creation == 0
+
 
 class TestAgentRunWithNotifier:
     """Test that agent.run(notifier=...) threads the notifier correctly."""

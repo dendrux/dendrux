@@ -53,6 +53,8 @@ class ConsoleNotifier(LoopNotifier):
         self._total_tokens = 0
         self._total_tools = 0
         self._total_tool_time = 0.0
+        self._total_cache_read = 0
+        self._total_cache_creation = 0
         self._run_start = 0.0
 
     async def on_message_appended(self, message: Message, iteration: int) -> None:
@@ -98,8 +100,23 @@ class ConsoleNotifier(LoopNotifier):
         self._total_tokens += tokens
         duration_str = f" in {duration_ms / 1000:.1f}s" if duration_ms else ""
 
+        cache_str = ""
+        if response.usage:
+            cache_read = response.usage.cache_read_input_tokens or 0
+            cache_create = response.usage.cache_creation_input_tokens or 0
+            self._total_cache_read += cache_read
+            self._total_cache_creation += cache_create
+            parts = []
+            if cache_read > 0:
+                parts.append(f"[bright_green]{cache_read:,} cached[/bright_green]")
+            if cache_create > 0:
+                parts.append(f"[yellow]{cache_create:,} cache-write[/yellow]")
+            if parts:
+                cache_str = " · " + " · ".join(parts)
+
         _console.print(
             f"  [dim]  llm [bright_white]{tokens:,}[/bright_white] tokens{duration_str}[/dim]"
+            f"{cache_str}"
         )
 
     async def on_tool_completed(
@@ -229,6 +246,19 @@ class ConsoleNotifier(LoopNotifier):
         table.add_row("status", f"[{status_style}]{result.status.value}[/{status_style}]")
         table.add_row("iterations", str(result.iteration_count))
         table.add_row("tokens", f"{result.usage.total_tokens:,}")
+
+        cache_read = result.usage.cache_read_input_tokens or self._total_cache_read
+        cache_create = result.usage.cache_creation_input_tokens or self._total_cache_creation
+        if cache_read or cache_create:
+            denom = (result.usage.input_tokens or 0) + (cache_read or 0)
+            ratio = (cache_read / denom) if denom else 0.0
+            table.add_row(
+                "cache read",
+                f"[bright_green]{cache_read:,}[/bright_green] [dim]({ratio:.0%} hit ratio)[/dim]",
+            )
+            if cache_create:
+                table.add_row("cache writes", f"[yellow]{cache_create:,}[/yellow]")
+
         table.add_row("tools called", str(self._total_tools))
         if total_time:
             table.add_row("total time", f"{total_time:.1f}s")
