@@ -1144,8 +1144,10 @@ class Agent:
                         )
                 raise
 
-            # Only commit cache after ALL sources discovered + validated
-            self._discovered_tool_defs = discovered_defs
+            # Only commit cache after ALL sources discovered + validated.
+            # Sort at storage so developer-visible order is alphabetical
+            # everywhere, not just at the cache-facing getters.
+            self._discovered_tool_defs = sorted(discovered_defs, key=lambda td: td.name)
             self._mcp_executors = executors
 
     async def get_tool_lookups(self) -> ToolLookups:
@@ -1178,14 +1180,17 @@ class Agent:
         return lookups
 
     def get_all_tool_defs(self) -> list[ToolDef]:
-        """Local + discovered MCP + use_skill tool defs."""
+        """Local + discovered MCP + use_skill tool defs, sorted by name.
+
+        Sorted output gives cache-stable prefixes to provider tool arrays.
+        """
         self._ensure_skills_loaded()
         local = [get_tool_def(fn) for fn in self.tools]
         discovered = self._discovered_tool_defs or []
         all_defs = local + discovered
         if self._loaded_skills:
             all_defs.append(self._get_use_skill_tool_def())
-        return all_defs
+        return sorted(all_defs, key=lambda td: td.name)
 
     # ------------------------------------------------------------------
     # Skills
@@ -1255,7 +1260,7 @@ class Agent:
             "call the `use_skill` tool with the skill name. The skill's "
             "detailed instructions will be returned to you.\n",
         ]
-        for skill in self._loaded_skills:
+        for skill in sorted(self._loaded_skills, key=lambda s: s.name):
             parts.append(f"- **{skill.name}**: {skill.description}")
 
         return "\n".join(parts)
@@ -1371,12 +1376,15 @@ class Agent:
         Includes the auto-injected use_skill tool when skills are loaded.
         Does NOT include MCP tools. Use get_all_tool_defs() for the
         full set (local + discovered + use_skill).
+
+        Output is sorted by ToolDef.name for cache-stable prefixes across
+        runs. self.tools storage preserves caller order.
         """
         self._ensure_skills_loaded()
         defs = [get_tool_def(fn) for fn in self.tools]
         if self._loaded_skills:
             defs.append(self._get_use_skill_tool_def())
-        return defs
+        return sorted(defs, key=lambda td: td.name)
 
     def __repr__(self) -> str:
         return (
