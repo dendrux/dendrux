@@ -100,7 +100,12 @@ class _ToolCallOutcome(NamedTuple):
 
 
 def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
-    """Add per-call usage to running total. Mutates total in place."""
+    """Add per-call usage to running total. Mutates total in place.
+
+    Cache fields treat None as 0 in summation so providers that don't
+    report them don't poison the rollup. Once any step reports a value,
+    the running total carries it.
+    """
     total.input_tokens += step_usage.input_tokens
     total.output_tokens += step_usage.output_tokens
     total.total_tokens += step_usage.total_tokens
@@ -108,6 +113,14 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
         if total.cost_usd is None:
             total.cost_usd = 0.0
         total.cost_usd += step_usage.cost_usd
+    if step_usage.cache_read_input_tokens is not None:
+        total.cache_read_input_tokens = (
+            total.cache_read_input_tokens or 0
+        ) + step_usage.cache_read_input_tokens
+    if step_usage.cache_creation_input_tokens is not None:
+        total.cache_creation_input_tokens = (
+            total.cache_creation_input_tokens or 0
+        ) + step_usage.cache_creation_input_tokens
 
 
 async def _check_budget(

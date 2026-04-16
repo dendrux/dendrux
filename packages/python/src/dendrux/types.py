@@ -185,12 +185,25 @@ class ToolResult:
 
 @dataclass
 class UsageStats:
-    """Token usage from an LLM call."""
+    """Token usage from an LLM call.
+
+    ``input_tokens`` always means fresh (non-cached) input tokens across
+    all providers. OpenAI variants normalize this by subtracting cached
+    from prompt_tokens; Anthropic returns it that way natively.
+
+    ``cache_read_input_tokens`` and ``cache_creation_input_tokens`` are
+    ``None`` when the provider did not report the field (e.g.
+    OpenAI-compatible backends without prompt_tokens_details), or an int
+    (possibly 0) when the provider did report it. This distinction lets
+    downstream tooling tell "didn't report" apart from "reported zero".
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)

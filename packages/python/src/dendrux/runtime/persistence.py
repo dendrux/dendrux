@@ -275,6 +275,8 @@ class PersistenceRecorder(LoopRecorder):
             {
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
+                "cache_read_input_tokens": response.usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
                 "cost_usd": response.usage.cost_usd,
                 "model": self._model,
                 "has_tool_calls": bool(response.tool_calls),

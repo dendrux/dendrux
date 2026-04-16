@@ -46,6 +46,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _build_usage_with_cache(usage: Any) -> UsageStats:
+    """Build UsageStats from an OpenAI Chat Completions usage object.
+
+    Reads cached_tokens from usage.prompt_tokens_details when present
+    (compatible backends may omit it). Normalizes input_tokens to mean
+    fresh-only by subtracting cached from prompt_tokens, so cross-provider
+    semantics match Anthropic's native behavior.
+    """
+    prompt_tokens = usage.prompt_tokens or 0
+    completion_tokens = usage.completion_tokens or 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
+    fresh_input = prompt_tokens - (cache_read or 0)
+    return UsageStats(
+        input_tokens=fresh_input,
+        output_tokens=completion_tokens,
+        total_tokens=fresh_input + completion_tokens,
+        cache_read_input_tokens=cache_read,
+        cache_creation_input_tokens=None,
+    )
+
+
 # OpenAI-specific kwargs that complete() will forward to the API.
 _SUPPORTED_KWARGS = frozenset(
     {
@@ -337,11 +360,7 @@ class OpenAIProvider(LLMProvider):
         async for chunk in stream:
             # Usage arrives in the final chunk
             if chunk.usage:
-                usage = UsageStats(
-                    input_tokens=chunk.usage.prompt_tokens or 0,
-                    output_tokens=chunk.usage.completion_tokens or 0,
-                    total_tokens=chunk.usage.total_tokens or 0,
-                )
+                usage = _build_usage_with_cache(chunk.usage)
 
             if not chunk.choices:
                 continue
@@ -563,11 +582,7 @@ class OpenAIProvider(LLMProvider):
         # Extract usage
         usage = UsageStats()
         if response.usage:
-            usage = UsageStats(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-            )
+            usage = _build_usage_with_cache(response.usage)
 
         return LLMResponse(
             text=text,

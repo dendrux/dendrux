@@ -45,6 +45,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _build_usage_with_cache(usage: Any) -> UsageStats:
+    """Build UsageStats from an OpenAI Responses API usage object.
+
+    Reads cached_tokens from usage.input_tokens_details when present.
+    Normalizes input_tokens to mean fresh-only by subtracting cached
+    from input_tokens (Responses uses input_tokens, not prompt_tokens).
+    """
+    raw_input = getattr(usage, "input_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    details = getattr(usage, "input_tokens_details", None)
+    cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
+    fresh_input = raw_input - (cache_read or 0)
+    return UsageStats(
+        input_tokens=fresh_input,
+        output_tokens=output_tokens,
+        total_tokens=fresh_input + output_tokens,
+        cache_read_input_tokens=cache_read,
+        cache_creation_input_tokens=None,
+    )
+
+
 # Responses-API kwargs that complete() will forward.
 _SUPPORTED_KWARGS = frozenset(
     {
@@ -407,11 +429,7 @@ class OpenAIResponsesProvider(LLMProvider):
             elif event_type == "response.completed":
                 _completed_response = event.response
                 if hasattr(_completed_response, "usage") and _completed_response.usage:
-                    usage = UsageStats(
-                        input_tokens=getattr(_completed_response.usage, "input_tokens", 0),
-                        output_tokens=getattr(_completed_response.usage, "output_tokens", 0),
-                        total_tokens=getattr(_completed_response.usage, "total_tokens", 0),
-                    )
+                    usage = _build_usage_with_cache(_completed_response.usage)
 
             # --- Response failed ---
             elif event_type == "response.failed":
@@ -544,11 +562,7 @@ class OpenAIResponsesProvider(LLMProvider):
         # Extract usage
         usage = UsageStats()
         if hasattr(response, "usage") and response.usage:
-            usage = UsageStats(
-                input_tokens=getattr(response.usage, "input_tokens", 0),
-                output_tokens=getattr(response.usage, "output_tokens", 0),
-                total_tokens=getattr(response.usage, "total_tokens", 0),
-            )
+            usage = _build_usage_with_cache(response.usage)
 
         return LLMResponse(
             text=text if text else None,

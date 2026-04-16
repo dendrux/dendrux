@@ -55,6 +55,8 @@ class RunRecord:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_cost_usd: float | None = None
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
     meta: dict[str, Any] | None = None
     last_progress_at: datetime | None = None
     failure_reason: str | None = None
@@ -205,6 +207,8 @@ class LLMInteractionRecord:
     output_tokens: int = 0
     cost_usd: float | None = None
     duration_ms: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
     created_at: datetime | None = None
 
 
@@ -664,6 +668,8 @@ class SQLAlchemyStateStore:
                 output_tokens=usage.output_tokens,
                 cost_usd=usage.cost_usd,
                 duration_ms=duration_ms,
+                cache_read_input_tokens=usage.cache_read_input_tokens,
+                cache_creation_input_tokens=usage.cache_creation_input_tokens,
                 meta=meta,
             )
             session.add(record)
@@ -701,6 +707,8 @@ class SQLAlchemyStateStore:
                 output_tokens=usage.output_tokens,
                 cost_usd=usage.cost_usd,
                 duration_ms=duration_ms,
+                cache_read_input_tokens=usage.cache_read_input_tokens,
+                cache_creation_input_tokens=usage.cache_creation_input_tokens,
                 guardrail_findings=guardrail_findings,
             )
             session.add(record)
@@ -733,6 +741,8 @@ class SQLAlchemyStateStore:
                     output_tokens=r.output_tokens,
                     cost_usd=float(r.cost_usd) if r.cost_usd is not None else None,
                     duration_ms=r.duration_ms,
+                    cache_read_input_tokens=r.cache_read_input_tokens,
+                    cache_creation_input_tokens=r.cache_creation_input_tokens,
                     created_at=r.created_at,
                 )
                 for r in rows
@@ -779,6 +789,11 @@ class SQLAlchemyStateStore:
                     values["total_input_tokens"] = total_usage.input_tokens
                     values["total_output_tokens"] = total_usage.output_tokens
                     values["total_cost_usd"] = total_usage.cost_usd
+                    # Cache rollup: None treated as 0 in aggregation
+                    values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
+                    values["total_cache_creation_tokens"] = (
+                        total_usage.cache_creation_input_tokens or 0
+                    )
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
 
@@ -1553,6 +1568,8 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         total_input_tokens=row.total_input_tokens,
         total_output_tokens=row.total_output_tokens,
         total_cost_usd=float(row.total_cost_usd) if row.total_cost_usd is not None else None,
+        total_cache_read_tokens=row.total_cache_read_tokens,
+        total_cache_creation_tokens=row.total_cache_creation_tokens,
         meta=row.meta,
         last_progress_at=row.last_progress_at,
         failure_reason=row.failure_reason,

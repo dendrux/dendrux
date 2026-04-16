@@ -304,6 +304,10 @@ class AnthropicProvider(LLMProvider):
             input_tokens=final_message.usage.input_tokens,
             output_tokens=final_message.usage.output_tokens,
             total_tokens=final_message.usage.input_tokens + final_message.usage.output_tokens,
+            cache_read_input_tokens=getattr(final_message.usage, "cache_read_input_tokens", None),
+            cache_creation_input_tokens=getattr(
+                final_message.usage, "cache_creation_input_tokens", None
+            ),
         )
 
         llm_response = LLMResponse(
@@ -451,6 +455,10 @@ class AnthropicProvider(LLMProvider):
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
+            cache_creation_input_tokens=getattr(
+                response.usage, "cache_creation_input_tokens", None
+            ),
         )
 
         return LLMResponse(
@@ -486,6 +494,10 @@ class AnthropicProvider(LLMProvider):
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
+            cache_creation_input_tokens=getattr(
+                response.usage, "cache_creation_input_tokens", None
+            ),
         )
 
         return LLMResponse(

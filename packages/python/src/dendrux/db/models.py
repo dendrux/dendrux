@@ -80,6 +80,8 @@ class AgentRun(Base):
     total_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
+    total_cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
     # Developer's linking data — Dendrux stores it, never reads it
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -226,6 +228,8 @@ class TokenUsage(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
@@ -270,6 +274,8 @@ class LLMInteraction(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[float | None] = mapped_column(Numeric(10, 6), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Guardrail findings — best-effort enrichment (not authoritative audit)
     guardrail_findings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

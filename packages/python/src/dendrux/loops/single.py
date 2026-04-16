@@ -379,6 +379,8 @@ class SingleCall(Loop):
             output_tokens=response.usage.output_tokens,
             total_tokens=response.usage.total_tokens,
             cost_usd=response.usage.cost_usd,
+            cache_read_input_tokens=response.usage.cache_read_input_tokens,
+            cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
         )
 
         await _check_budget(
@@ -521,6 +523,8 @@ class SingleCall(Loop):
             output_tokens=llm_response.usage.output_tokens,
             total_tokens=llm_response.usage.total_tokens,
             cost_usd=llm_response.usage.cost_usd,
+            cache_read_input_tokens=llm_response.usage.cache_read_input_tokens,
+            cache_creation_input_tokens=llm_response.usage.cache_creation_input_tokens,
         )
 
         await _check_budget(
