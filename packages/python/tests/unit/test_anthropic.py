@@ -424,10 +424,16 @@ class TestComplete:
         assert call_kwargs["model"] == "claude-sonnet-4-6"
         assert call_kwargs["max_tokens"] == 16_000
         assert len(call_kwargs["messages"]) == 1
-        assert call_kwargs["messages"][0] == {
-            "role": "user",
-            "content": "What is 6*7?",
-        }
+        # Last message gets cache_control marker for the rolling React cache;
+        # content is converted to block-form to carry the marker.
+        assert call_kwargs["messages"][0]["role"] == "user"
+        assert call_kwargs["messages"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "What is 6*7?",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
 
     async def test_tool_call_completion(self, provider: AnthropicProvider) -> None:
         mock_response = _make_anthropic_response(
@@ -478,7 +484,10 @@ class TestComplete:
             )
 
         call_kwargs = mock_create.call_args.kwargs
-        assert call_kwargs["system"] == "Be helpful"
+        # System is wrapped as a cacheable block list for prompt caching.
+        assert call_kwargs["system"] == [
+            {"type": "text", "text": "Be helpful", "cache_control": {"type": "ephemeral"}}
+        ]
         assert len(call_kwargs["messages"]) == 1
 
     async def test_kwargs_override_constructor_defaults(self, provider: AnthropicProvider) -> None:
@@ -566,7 +575,14 @@ class TestComplete:
             result = await provider.complete(messages)
 
         call_kwargs = mock_create.call_args.kwargs
-        assert call_kwargs["system"] == "You are a calculator"
+        # System wrapped as cacheable block list.
+        assert call_kwargs["system"] == [
+            {
+                "type": "text",
+                "text": "You are a calculator",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
         api_msgs = call_kwargs["messages"]
         assert len(api_msgs) == 3  # user, assistant, user(tool_result)
 

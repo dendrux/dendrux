@@ -118,6 +118,9 @@ class SingleCall(Loop):
 
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
+        from dendrux.loops.react import _build_cache_key_prefix
+
+        cache_key_prefix = _build_cache_key_prefix(agent)
 
         user_msg = Message(role=Role.USER, content=user_input)
         history = [user_msg]
@@ -217,10 +220,21 @@ class SingleCall(Loop):
             from dendrux.llm.structured import structured_complete
 
             response, validated_output = await structured_complete(
-                provider, messages, output_type, **_pkw
+                provider,
+                messages,
+                output_type,
+                run_id=resolved_run_id,
+                cache_key_prefix=cache_key_prefix,
+                **_pkw,
             )
         else:
-            response = await provider.complete(messages, tools=None, **_pkw)
+            response = await provider.complete(
+                messages,
+                tools=None,
+                run_id=resolved_run_id,
+                cache_key_prefix=cache_key_prefix,
+                **_pkw,
+            )
 
             if response.tool_calls:
                 raise RuntimeError(
@@ -451,6 +465,9 @@ class SingleCall(Loop):
 
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
+        from dendrux.loops.react import _build_cache_key_prefix
+
+        cache_key_prefix = _build_cache_key_prefix(agent)
 
         user_msg = Message(role=Role.USER, content=user_input)
         history = [user_msg]
@@ -465,7 +482,13 @@ class SingleCall(Loop):
 
         t0 = time.monotonic()
         llm_response: LLMResponse | None = None
-        provider_stream = provider.complete_stream(messages, tools=None, **_pkw)
+        provider_stream = provider.complete_stream(
+            messages,
+            tools=None,
+            run_id=resolved_run_id,
+            cache_key_prefix=cache_key_prefix,
+            **_pkw,
+        )
         try:
             async for event in provider_stream:
                 if event.type == StreamEventType.TEXT_DELTA:

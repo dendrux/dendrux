@@ -70,6 +70,8 @@ class LLMProvider(ABC):
         tools: list[ToolDef] | None = None,
         *,
         output_schema: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to the LLM and return a complete response.
@@ -83,6 +85,13 @@ class LLMProvider(ABC):
                 response to this schema (Anthropic: tool-use trick, OpenAI:
                 response_format). The structured data is normalized into
                 LLMResponse.text as a JSON string.
+            run_id: The current run's id. OpenAI providers use it as a
+                fallback ``prompt_cache_key`` when ``cache_key_prefix`` is
+                not supplied. Anthropic ignores it (caching is byte-based).
+            cache_key_prefix: Stable identifier for the cache pool, typically
+                ``f"{agent_name}:{model}"``. OpenAI providers prefer this over
+                ``run_id`` so all runs of the same agent share a pool.
+                Anthropic ignores it.
             **kwargs: Provider-specific options (temperature, max_tokens, etc.).
 
         Returns:
@@ -95,6 +104,8 @@ class LLMProvider(ABC):
         tools: list[ToolDef] | None = None,
         *,
         output_schema: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events.
@@ -105,12 +116,20 @@ class LLMProvider(ABC):
         Args:
             messages: Conversation history in Dendrux's universal format.
             tools: Tool definitions the LLM can call.
+            run_id, cache_key_prefix: See ``complete()``.
             **kwargs: Provider-specific options.
 
         Yields:
             StreamEvent objects as they arrive from the LLM.
         """
-        response = await self.complete(messages, tools, output_schema=output_schema, **kwargs)
+        response = await self.complete(
+            messages,
+            tools,
+            output_schema=output_schema,
+            run_id=run_id,
+            cache_key_prefix=cache_key_prefix,
+            **kwargs,
+        )
         if response.text:
             yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=response.text)
         if response.tool_calls:

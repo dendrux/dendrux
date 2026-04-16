@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import openai
@@ -151,6 +151,7 @@ class OpenAIProvider(LLMProvider):
         reasoning_effort: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 3,
+        prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
     ) -> None:
         """Create an OpenAI Chat Completions provider.
 
@@ -163,6 +164,10 @@ class OpenAIProvider(LLMProvider):
             reasoning_effort: Reasoning depth ("low", "medium", "high"). For o-series/GPT-5.
             timeout: HTTP request timeout in seconds.
             max_retries: Number of automatic retries on transient errors.
+            prompt_cache_retention: OpenAI prompt-cache retention. ``None``
+                (default) omits the field so OpenAI uses its in-memory default
+                (5–10 min idle, up to 1 h). Set ``"24h"`` for long-running
+                workflows on supported models. Hyphenated literal per the SDK.
         """
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
@@ -175,6 +180,7 @@ class OpenAIProvider(LLMProvider):
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
         self._timeout = timeout
+        self._prompt_cache_retention = prompt_cache_retention
 
     @property
     def model(self) -> str:
@@ -202,11 +208,19 @@ class OpenAIProvider(LLMProvider):
         messages: list[Message],
         tools: list[ToolDef] | None,
         kwargs: dict[str, Any],
+        *,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build OpenAI API kwargs from Dendrux messages and caller kwargs.
 
         Returns (api_kwargs, captured_request) where captured_request is the
         serializable subset for the evidence layer.
+
+        Cache routing: ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``)
+        takes priority; ``run_id`` is the fallback. The provider's
+        ``prompt_cache_retention`` is forwarded only when set, so vendor
+        defaults apply otherwise.
         """
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools) if tools else openai.NOT_GIVEN
@@ -246,6 +260,13 @@ class OpenAIProvider(LLMProvider):
             if key in kwargs:
                 api_kwargs[key] = kwargs.pop(key)
 
+        # Cache routing — derive key from prefix or run_id
+        cache_key_source = cache_key_prefix or run_id
+        if cache_key_source:
+            api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
+        if self._prompt_cache_retention is not None:
+            api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
+
         captured_request = {k: v for k, v in api_kwargs.items() if v is not openai.NOT_GIVEN}
         return api_kwargs, captured_request
 
@@ -277,6 +298,8 @@ class OpenAIProvider(LLMProvider):
         tools: list[ToolDef] | None = None,
         *,
         output_schema: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to the model and return a normalized response.
@@ -284,10 +307,16 @@ class OpenAIProvider(LLMProvider):
         kwargs override constructor defaults (e.g. model, max_tokens, temperature).
         Only supported kwargs are forwarded; unknown keys are ignored.
 
+        ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``) and
+        ``run_id`` together drive the ``prompt_cache_key`` sent to OpenAI —
+        prefix preferred, run_id as fallback.
+
         When output_schema is provided, sets response_format to json_schema
         with strict mode. The response is a JSON string in message.content.
         """
-        api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+        api_kwargs, captured_request = self._build_api_kwargs(
+            messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
+        )
 
         if output_schema is not None:
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
@@ -313,6 +342,8 @@ class OpenAIProvider(LLMProvider):
         tools: list[ToolDef] | None = None,
         *,
         output_schema: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events, token by token.
@@ -321,12 +352,17 @@ class OpenAIProvider(LLMProvider):
         Tool call arguments are buffered by index and flushed as complete
         TOOL_USE_END events when the terminal finish_reason arrives.
 
+        ``cache_key_prefix`` / ``run_id`` drive ``prompt_cache_key`` for
+        OpenAI cache pool routing.
+
         At stream end, yields a DONE event carrying the full LLMResponse.
 
         Raises NotImplementedError if the endpoint rejects streaming (common
         with some OpenAI-compatible backends).
         """
-        api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+        api_kwargs, captured_request = self._build_api_kwargs(
+            messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
+        )
 
         if output_schema is not None:
             self._inject_structured_output(api_kwargs, captured_request, output_schema)

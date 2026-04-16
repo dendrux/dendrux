@@ -99,6 +99,18 @@ class _ToolCallOutcome(NamedTuple):
     pending_approval: bool = False
 
 
+def _build_cache_key_prefix(agent: Agent) -> str | None:
+    """Stable cache-pool identifier per agent + model.
+
+    OpenAI providers use this to scope ``prompt_cache_key`` so all runs of
+    the same agent share a cache pool. Returns None when the agent has no
+    name — provider falls back to run_id in that case.
+    """
+    if not agent.name:
+        return None
+    return f"{agent.name}:{agent.model}"
+
+
 def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
     """Add per-call usage to running total. Mutates total in place.
 
@@ -540,6 +552,7 @@ class ReActLoop(Loop):
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
+        cache_key_prefix = _build_cache_key_prefix(agent)
         lookups = await agent.get_tool_lookups()
         tool_defs = agent.get_all_tool_defs()
         state = await _init_loop_state(
@@ -657,7 +670,13 @@ class ReActLoop(Loop):
 
             # LLM call — batch
             t0 = time.monotonic()
-            response = await provider.complete(messages, tools=tools, **_pkw)
+            response = await provider.complete(
+                messages,
+                tools=tools,
+                run_id=resolved_run_id,
+                cache_key_prefix=cache_key_prefix,
+                **_pkw,
+            )
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
             # Output guardrail — scan BEFORE recording so persisted
@@ -963,6 +982,7 @@ class ReActLoop(Loop):
         """
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
+        cache_key_prefix = _build_cache_key_prefix(agent)
         lookups = await agent.get_tool_lookups()
         tool_defs = agent.get_all_tool_defs()
         state = await _init_loop_state(
@@ -989,7 +1009,13 @@ class ReActLoop(Loop):
             # LLM call — streaming
             t0 = time.monotonic()
             llm_response: LLMResponse | None = None
-            provider_stream = provider.complete_stream(messages, tools=tools, **_pkw)
+            provider_stream = provider.complete_stream(
+                messages,
+                tools=tools,
+                run_id=resolved_run_id,
+                cache_key_prefix=cache_key_prefix,
+                **_pkw,
+            )
             try:
                 async for event in provider_stream:
                     if event.type == StreamEventType.TEXT_DELTA:

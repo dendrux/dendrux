@@ -10,8 +10,9 @@ No business logic, no agent loop awareness. Just shape translation.
 
 from __future__ import annotations
 
+import copy
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import anthropic
 import httpx
@@ -86,6 +87,7 @@ class AnthropicProvider(LLMProvider):
         temperature: float | None = None,
         timeout: float = 120.0,
         max_retries: int = 3,
+        cache_ttl: Literal["5m", "1h"] | None = None,
     ) -> None:
         """Create an Anthropic provider.
 
@@ -96,6 +98,10 @@ class AnthropicProvider(LLMProvider):
             temperature: Sampling temperature. None = model default. Override per-call.
             timeout: HTTP request timeout in seconds.
             max_retries: Number of automatic retries on transient errors.
+            cache_ttl: Anthropic prompt-cache TTL. ``None`` (default) omits the
+                field so Anthropic uses its 5-minute default. Set ``"1h"`` for
+                long-running workflows where iterations span more than 5 minutes
+                (costs 2× base input on cache creation, reads stay cheap).
         """
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key,
@@ -106,6 +112,7 @@ class AnthropicProvider(LLMProvider):
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._timeout = timeout
+        self._cache_ttl = cache_ttl
 
     @property
     def model(self) -> str:
@@ -125,6 +132,53 @@ class AnthropicProvider(LLMProvider):
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
 
+    def _cache_control_marker(self) -> dict[str, Any]:
+        """Build the cache_control marker for system + last-message breakpoints.
+
+        Includes ``ttl`` only when the provider was configured with one;
+        otherwise Anthropic applies its default 5m.
+        """
+        marker: dict[str, Any] = {"type": "ephemeral"}
+        if self._cache_ttl is not None:
+            marker["ttl"] = self._cache_ttl
+        return marker
+
+    def _apply_cache_control(
+        self,
+        system_prompt: str,
+        api_messages: list[dict[str, Any]],
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """Apply cache_control to system block and last message's last block.
+
+        The marker on the last message warms the next iteration's cache —
+        the call that writes it pays full creation; the next call reads it.
+
+        Returns ``(system, messages)`` where:
+        - ``system`` is a block list with cache_control, or ``NOT_GIVEN`` when
+          no system prompt was provided.
+        - ``messages`` is a fresh list with the last message deep-copied and
+          augmented with cache_control. The caller's input is never mutated.
+        """
+        marker = self._cache_control_marker()
+
+        if system_prompt:
+            system_blocks: Any = [{"type": "text", "text": system_prompt, "cache_control": marker}]
+        else:
+            system_blocks = anthropic.NOT_GIVEN
+
+        if not api_messages:
+            return system_blocks, api_messages
+
+        new_messages = list(api_messages)
+        last = copy.deepcopy(new_messages[-1])
+        content = last["content"]
+        if isinstance(content, str):
+            last["content"] = [{"type": "text", "text": content, "cache_control": marker}]
+        elif isinstance(content, list) and content:
+            content[-1]["cache_control"] = marker
+        new_messages[-1] = last
+        return system_blocks, new_messages
+
     def _build_api_kwargs(
         self,
         messages: list[Message],
@@ -138,12 +192,13 @@ class AnthropicProvider(LLMProvider):
         """
         system_prompt, api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools) if tools else anthropic.NOT_GIVEN
+        system_blocks, cached_messages = self._apply_cache_control(system_prompt, api_messages)
 
         api_kwargs: dict[str, Any] = {
             "model": kwargs.pop("model", self._model),
             "max_tokens": kwargs.pop("max_tokens", self._max_tokens),
-            "messages": api_messages,
-            "system": system_prompt if system_prompt else anthropic.NOT_GIVEN,
+            "messages": cached_messages,
+            "system": system_blocks,
             "tools": api_tools,
         }
 
@@ -165,6 +220,8 @@ class AnthropicProvider(LLMProvider):
         tools: list[ToolDef] | None = None,
         *,
         output_schema: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages to Claude and return a normalized response.
@@ -172,11 +229,17 @@ class AnthropicProvider(LLMProvider):
         kwargs override constructor defaults (e.g. model, max_tokens).
         Only Anthropic-supported kwargs are forwarded; unknown keys are ignored.
 
+        ``run_id`` and ``cache_key_prefix`` are accepted for protocol
+        compatibility with OpenAI providers but unused — Anthropic caching
+        is keyed by byte-stable prefix and ``cache_control`` markers, not
+        by an explicit cache key.
+
         When output_schema is provided, injects a synthetic tool with the
         schema and forces tool_choice. The tool_use response is extracted
         and normalized into LLMResponse.text as a JSON string, with
         tool_calls set to None (preserving the SingleCall invariant).
         """
+        del run_id, cache_key_prefix  # Anthropic caching is byte-based
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
 
         # Structured output: inject synthetic tool + forced tool_choice
@@ -218,6 +281,8 @@ class AnthropicProvider(LLMProvider):
         tools: list[ToolDef] | None = None,
         *,
         output_schema: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        cache_key_prefix: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream LLM response as events, token by token.
@@ -226,9 +291,13 @@ class AnthropicProvider(LLMProvider):
         Tool call arguments are accumulated internally and yielded as
         complete TOOL_USE_END events when each content block finishes.
 
+        ``run_id`` / ``cache_key_prefix`` accepted for protocol parity but
+        unused (Anthropic caching is byte-based via ``cache_control``).
+
         At stream end, yields a DONE event carrying the full LLMResponse
         (with usage stats and provider payloads) for the loop to consume.
         """
+        del run_id, cache_key_prefix  # Anthropic caching is byte-based
         api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
 
         # Accumulators for building the final LLMResponse
