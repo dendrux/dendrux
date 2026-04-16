@@ -8,16 +8,29 @@ Response types are frozen dataclasses defined in this module; runtime read
 records stay internal and are converted at the facade boundary so runtime
 internals can evolve without breaking the public contract.
 
+Notes on the public dataclasses
+-------------------------------
+The dataclasses below are ``frozen=True`` — top-level fields cannot be
+reassigned — but nested values (``dict``, ``list``) are normal mutable
+JSON objects. Mutating them mutates the in-memory copy the caller
+received, not the database. Treat them as read-only snapshots.
+
+Engine ownership
+----------------
+``RunStore.from_database_url(url)`` creates and owns an engine; call
+``await store.close()`` (or use ``async with``) to dispose it. The
+``RunStore.from_engine(engine)`` constructor leaves engine ownership
+with the caller and ``close()`` is a no-op for the engine in that case.
+
 Example
 -------
 ::
 
     from dendrux.store import RunStore
 
-    store = RunStore.from_database_url("sqlite+aiosqlite:///dendrux.db")
-
-    async for event in store.stream_events(run_id):
-        print(event.event_type, event.sequence_index)
+    async with RunStore.from_database_url("sqlite+aiosqlite:///dendrux.db") as store:
+        async for event in store.stream_events(run_id):
+            print(event.event_type, event.sequence_index)
 """
 
 from __future__ import annotations
@@ -168,22 +181,46 @@ class RunStore:
     or ``RunStore.from_engine(engine)`` when you already own a SQLAlchemy
     async engine. The primary constructor accepts any ``StateStore`` so
     alternative backends can be injected in tests.
+
+    Engine lifecycle: ``from_database_url`` creates and owns the engine;
+    ``close()`` (or ``async with``) disposes it. ``from_engine`` leaves
+    engine ownership with the caller; ``close()`` is then a no-op.
     """
 
     def __init__(self, state_store: StateStore) -> None:
         self._state = state_store
+        self._owned_engine: AsyncEngine | None = None
 
     @classmethod
     def from_engine(cls, engine: AsyncEngine) -> RunStore:
-        """Build a RunStore from an existing SQLAlchemy async engine."""
+        """Build a RunStore over an engine the caller owns and disposes."""
         return cls(SQLAlchemyStateStore(engine))
 
     @classmethod
     def from_database_url(cls, database_url: str) -> RunStore:
-        """Build a RunStore from a SQLAlchemy async database URL."""
+        """Build a RunStore from a SQLAlchemy async URL.
+
+        The engine is created and owned by this RunStore. Call
+        ``await store.close()`` or use ``async with`` to dispose it.
+        """
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        return cls.from_engine(create_async_engine(database_url))
+        engine = create_async_engine(database_url)
+        instance = cls.from_engine(engine)
+        instance._owned_engine = engine
+        return instance
+
+    async def close(self) -> None:
+        """Dispose any engine this store owns. No-op for caller-owned engines."""
+        if self._owned_engine is not None:
+            await self._owned_engine.dispose()
+            self._owned_engine = None
+
+    async def __aenter__(self) -> RunStore:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
 
     async def list_runs(
         self,
@@ -265,10 +302,10 @@ class RunStore:
     ) -> AsyncIterator[StoredEvent]:
         """Stream events as they land in the durable log.
 
-        Raises :class:`RunNotFound` before the first yield if ``run_id``
-        does not exist. The caller decides when to stop — typically by
-        breaking out of ``async for`` on a terminal ``event_type`` or by
-        calling ``aclose()`` on the returned generator.
+        Raises :class:`RunNotFoundError` before the first yield if
+        ``run_id`` does not exist. The caller decides when to stop —
+        typically by breaking out of ``async for`` on a terminal
+        ``event_type`` or by calling ``aclose()`` on the returned generator.
         """
         run = await self._state.get_run(run_id)
         if run is None:
@@ -299,11 +336,8 @@ class RunStore:
         iteration: int | None = None,
     ) -> list[LLMCall]:
         """Return LLM interactions for a run, optionally filtered by iteration."""
-        rows = await self._state.get_llm_interactions(run_id)
-        out = [_llm_to_public(r) for r in rows]
-        if iteration is not None:
-            out = [r for r in out if r.iteration == iteration]
-        return out
+        rows = await self._state.get_llm_interactions(run_id, iteration_index=iteration)
+        return [_llm_to_public(r) for r in rows]
 
     async def get_tool_invocations(
         self,
@@ -312,11 +346,8 @@ class RunStore:
         iteration: int | None = None,
     ) -> list[ToolInvocation]:
         """Return tool invocations for a run, optionally filtered by iteration."""
-        rows = await self._state.get_tool_calls(run_id)
-        out = [_tool_to_public(r) for r in rows]
-        if iteration is not None:
-            out = [r for r in out if r.iteration == iteration]
-        return out
+        rows = await self._state.get_tool_calls(run_id, iteration_index=iteration)
+        return [_tool_to_public(r) for r in rows]
 
     async def get_pauses(self, run_id: str) -> list[PausePair]:
         """Derive pause/resume cycles from ``run_events``.
@@ -326,9 +357,11 @@ class RunStore:
         ``run.paused`` at the end of the log represents an active pause
         (``resume_sequence_index`` is ``None``).
 
-        This method never reads ``AgentRun.pause_data``.
+        Filters event_type at the SQL layer (only ``run.paused`` and
+        ``run.resumed`` rows are fetched). Never reads
+        ``AgentRun.pause_data``.
         """
-        rows = await self._state.get_run_events(run_id)
+        rows = await self._state.get_run_events(run_id, event_types=["run.paused", "run.resumed"])
         return _derive_pauses(rows)
 
 

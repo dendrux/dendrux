@@ -412,6 +412,38 @@ class TestListRuns:
         runs = await store.list_runs(status=["success", "error"])
         assert {r.id for r in runs} == {"r1", "r2"}
 
+    async def test_empty_status_list_matches_none(self, store) -> None:
+        """``status=[]`` means 'match no status', not 'match any'."""
+        await store.create_run("r1", "Agent")
+        await store.create_run("r2", "Agent")
+
+        runs = await store.list_runs(status=[])
+        assert runs == []
+
+    async def test_stable_pagination_with_tied_created_at(self, store) -> None:
+        """Pagination must not duplicate or skip rows when ``created_at`` ties."""
+        import datetime as _dt
+
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        # Seed five runs with the same created_at to force ties.
+        for i in range(5):
+            await store.create_run(f"r_{i}", "Agent")
+        same = _dt.datetime(2026, 4, 17, 12, 0, 0)
+        async with store._session_factory() as session:
+            await session.execute(update(AgentRun).values(created_at=same))
+            await session.commit()
+
+        page1 = await store.list_runs(limit=2, offset=0)
+        page2 = await store.list_runs(limit=2, offset=2)
+        page3 = await store.list_runs(limit=2, offset=4)
+
+        seen = [r.id for r in page1 + page2 + page3]
+        assert sorted(seen) == sorted(f"r_{i}" for i in range(5))
+        assert len(seen) == len(set(seen)), f"duplicates across pages: {seen}"
+
     async def test_filter_by_started_after_and_before(self, store) -> None:
         """Time bounds apply inclusive-start / exclusive-end against created_at."""
         import datetime as _dt
@@ -474,6 +506,29 @@ class TestCountRuns:
         listed = await store.list_runs(limit=3, offset=0)
         assert len(listed) == 3
         assert await store.count_runs() == 12
+
+    async def test_empty_status_list_returns_zero(self, store) -> None:
+        """``status=[]`` matches no rows — count is zero."""
+        await store.create_run("r1", "Agent")
+        await store.create_run("r2", "Agent")
+        assert await store.count_runs(status=[]) == 0
+
+    async def test_count_matches_list_with_filters(self, store) -> None:
+        """Parity: same filters produce same row set on list and count."""
+        await store.create_run("r1", "Alpha")
+        await store.create_run("r2", "Alpha")
+        await store.create_run("r3", "Beta")
+        await store.finalize_run("r1", status="success")
+
+        for filters in (
+            {"agent_name": "Alpha"},
+            {"agent_name": "Alpha", "status": "success"},
+            {"status": ["success", "error"]},
+            {"agent_name": "Missing"},
+        ):
+            listed = await store.list_runs(limit=100, **filters)
+            counted = await store.count_runs(**filters)
+            assert counted == len(listed), f"parity broke for {filters}"
 
 
 # ------------------------------------------------------------------

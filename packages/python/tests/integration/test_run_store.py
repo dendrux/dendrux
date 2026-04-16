@@ -251,6 +251,16 @@ class TestStreamEvents:
         await stream.aclose()
         assert first.sequence_index == 2
 
+    async def test_wait_for_timeout_cancels_cleanly(self, store, internal_store) -> None:
+        """Cooperative cancellation via ``asyncio.wait_for`` should time out
+        and let the generator close without leaking sessions."""
+        await internal_store.create_run("r1", "Agent")
+
+        stream = store.stream_events("r1", poll_interval_s=0.5)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(stream.__anext__(), timeout=0.05)
+        await stream.aclose()
+
 
 # ------------------------------------------------------------------
 # get_llm_calls
@@ -462,3 +472,68 @@ class TestGetPauses:
         assert len(pauses) == 2
         assert pauses[0].resume_sequence_index == 1
         assert pauses[1].resume_sequence_index is None
+
+    async def test_paused_with_no_status_data(self, store, internal_store) -> None:
+        """A paused event without ``status`` in ``data`` still produces a pair."""
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.save_run_event(
+            "r1", event_type="run.paused", sequence_index=0, data={}
+        )
+
+        pauses = await store.get_pauses("r1")
+        assert len(pauses) == 1
+        assert pauses[0].reason == ""
+        assert pauses[0].pending_tool_calls == []
+
+    async def test_skips_unrelated_events(self, store, internal_store) -> None:
+        """get_pauses filters by event_type at the SQL layer; non-pause/resume
+        events do not appear in the pair derivation."""
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
+        await internal_store.save_run_event(
+            "r1",
+            event_type="run.paused",
+            sequence_index=1,
+            data={"status": "waiting_approval"},
+        )
+        await internal_store.save_run_event("r1", event_type="llm.completed", sequence_index=2)
+        await internal_store.save_run_event(
+            "r1", event_type="run.resumed", sequence_index=3, data={}
+        )
+
+        pauses = await store.get_pauses("r1")
+        assert len(pauses) == 1
+        assert pauses[0].pause_sequence_index == 1
+        assert pauses[0].resume_sequence_index == 3
+
+
+# ------------------------------------------------------------------
+# RunStore lifecycle — close() and async context manager
+# ------------------------------------------------------------------
+
+
+class TestRunStoreLifecycle:
+    async def test_from_database_url_supports_aclose(self) -> None:
+        """RunStore created via ``from_database_url`` owns its engine and
+        must be closed by the caller."""
+        s = RunStore.from_database_url("sqlite+aiosqlite:///:memory:")
+        await s.close()
+
+    async def test_async_context_manager_disposes_owned_engine(self) -> None:
+        """`async with RunStore.from_database_url(...)` disposes on exit."""
+        async with RunStore.from_database_url("sqlite+aiosqlite:///:memory:") as s:
+            assert isinstance(s, RunStore)
+        # No exception means dispose worked.
+
+    async def test_from_engine_does_not_dispose_caller_owned(self, engine) -> None:
+        """RunStore created via ``from_engine`` must not dispose the engine
+        — the caller still owns it."""
+        s = RunStore.from_engine(engine)
+        await s.close()
+
+        # Engine must still be usable after store close.
+        from dendrux.runtime.state import SQLAlchemyStateStore
+
+        check = SQLAlchemyStateStore(engine)
+        await check.create_run("after_close", "Agent")
+        assert (await check.get_run("after_close")) is not None

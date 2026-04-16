@@ -291,7 +291,12 @@ class StateStore(Protocol):
         guardrail_findings: dict[str, Any] | None = None,
     ) -> None: ...
 
-    async def get_llm_interactions(self, run_id: str) -> list[LLMInteractionRecord]: ...
+    async def get_llm_interactions(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int | None = None,
+    ) -> list[LLMInteractionRecord]: ...
 
     async def finalize_run(
         self,
@@ -355,7 +360,12 @@ class StateStore(Protocol):
 
     async def get_traces(self, run_id: str) -> list[TraceRecord]: ...
 
-    async def get_tool_calls(self, run_id: str) -> list[ToolCallReadRecord]: ...
+    async def get_tool_calls(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int | None = None,
+    ) -> list[ToolCallReadRecord]: ...
 
     async def save_run_event(
         self,
@@ -374,6 +384,7 @@ class StateStore(Protocol):
         *,
         after_sequence_index: int | None = None,
         limit: int | None = None,
+        event_types: list[str] | None = None,
     ) -> list[RunEventRecord]: ...
 
     async def list_runs(
@@ -729,7 +740,12 @@ class SQLAlchemyStateStore:
             session.add(record)
             await session.commit()
 
-    async def get_llm_interactions(self, run_id: str) -> list[LLMInteractionRecord]:
+    async def get_llm_interactions(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int | None = None,
+    ) -> list[LLMInteractionRecord]:
         from sqlalchemy import select
 
         from dendrux.db.models import LLMInteraction
@@ -740,6 +756,8 @@ class SQLAlchemyStateStore:
                 .where(LLMInteraction.agent_run_id == run_id)
                 .order_by(LLMInteraction.iteration_index)
             )
+            if iteration_index is not None:
+                stmt = stmt.where(LLMInteraction.iteration_index == iteration_index)
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [
@@ -1017,7 +1035,12 @@ class SQLAlchemyStateStore:
                 for r in rows
             ]
 
-    async def get_tool_calls(self, run_id: str) -> list[ToolCallReadRecord]:
+    async def get_tool_calls(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int | None = None,
+    ) -> list[ToolCallReadRecord]:
         from sqlalchemy import select
 
         from dendrux.db.models import ToolCallRecord
@@ -1028,6 +1051,8 @@ class SQLAlchemyStateStore:
                 .where(ToolCallRecord.agent_run_id == run_id)
                 .order_by(ToolCallRecord.created_at)
             )
+            if iteration_index is not None:
+                stmt = stmt.where(ToolCallRecord.iteration_index == iteration_index)
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [
@@ -1079,8 +1104,9 @@ class SQLAlchemyStateStore:
         *,
         after_sequence_index: int | None = None,
         limit: int | None = None,
+        event_types: list[str] | None = None,
     ) -> list[RunEventRecord]:
-        from sqlalchemy import select
+        from sqlalchemy import false, select
 
         from dendrux.db.models import RunEvent
 
@@ -1093,6 +1119,13 @@ class SQLAlchemyStateStore:
 
             if after_sequence_index is not None:
                 stmt = stmt.where(RunEvent.sequence_index > after_sequence_index)
+
+            if event_types is not None:
+                if not event_types:
+                    # Empty list = "match no event_type" — symmetric with status=[].
+                    stmt = stmt.where(false())
+                else:
+                    stmt = stmt.where(RunEvent.event_type.in_(event_types))
 
             if limit is not None:
                 # Clamp to 1..1000
@@ -1548,7 +1581,11 @@ class SQLAlchemyStateStore:
         clamped_offset = max(0, offset)
 
         async with self._session_factory() as session:
-            stmt = select(AgentRun).order_by(AgentRun.created_at.desc())
+            # Secondary sort by id keeps pagination stable when created_at
+            # ties — SQLite's DateTime is second-resolution, so concurrent
+            # runs share timestamps and offset paging would otherwise skip
+            # or duplicate rows across pages.
+            stmt = select(AgentRun).order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
             stmt = self._apply_run_filters(
                 stmt,
                 tenant_id=tenant_id,
@@ -1604,13 +1641,18 @@ class SQLAlchemyStateStore:
         started_after: datetime | None,
         started_before: datetime | None,
     ) -> Any:
+        from sqlalchemy import false
+
         from dendrux.db.models import AgentRun
 
         if tenant_id is not None:
             stmt = stmt.where(AgentRun.tenant_id == tenant_id)
         if status is not None:
             if isinstance(status, list):
-                if status:
+                if not status:
+                    # Empty list = "match no status" (vs. "no filter at all").
+                    stmt = stmt.where(false())
+                else:
                     stmt = stmt.where(AgentRun.status.in_(status))
             else:
                 stmt = stmt.where(AgentRun.status == status)
