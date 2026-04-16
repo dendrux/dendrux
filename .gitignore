@@ -50,6 +50,10 @@ htmlcov/
 *.db
 *.sqlite3
 
+# Scratch / throwaway investigation scripts
+scratch/
+**/scratch/
+
 # Dashboard (React build artifacts — keep dir via .gitkeep, ignore contents)
 node_modules/
 packages/python/src/dendrite/dashboard/static/*
