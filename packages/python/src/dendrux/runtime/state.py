@@ -382,8 +382,23 @@ class StateStore(Protocol):
         limit: int = 50,
         offset: int = 0,
         tenant_id: str | None = None,
-        status: str | None = None,
+        status: str | list[str] | None = None,
+        agent_name: str | None = None,
+        parent_run_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
     ) -> list[RunRecord]: ...
+
+    async def count_runs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        status: str | list[str] | None = None,
+        agent_name: str | None = None,
+        parent_run_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> int: ...
 
     async def touch_progress(self, run_id: str) -> None:
         """Update last_progress_at to now. Called on forward progress."""
@@ -1519,7 +1534,11 @@ class SQLAlchemyStateStore:
         limit: int = 50,
         offset: int = 0,
         tenant_id: str | None = None,
-        status: str | None = None,
+        status: str | list[str] | None = None,
+        agent_name: str | None = None,
+        parent_run_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
     ) -> list[RunRecord]:
         from sqlalchemy import select
 
@@ -1530,15 +1549,80 @@ class SQLAlchemyStateStore:
 
         async with self._session_factory() as session:
             stmt = select(AgentRun).order_by(AgentRun.created_at.desc())
-            if tenant_id is not None:
-                stmt = stmt.where(AgentRun.tenant_id == tenant_id)
-            if status is not None:
-                stmt = stmt.where(AgentRun.status == status)
+            stmt = self._apply_run_filters(
+                stmt,
+                tenant_id=tenant_id,
+                status=status,
+                agent_name=agent_name,
+                parent_run_id=parent_run_id,
+                started_after=started_after,
+                started_before=started_before,
+            )
             stmt = stmt.limit(capped_limit).offset(clamped_offset)
 
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [_run_to_record(r) for r in rows]
+
+    async def count_runs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        status: str | list[str] | None = None,
+        agent_name: str | None = None,
+        parent_run_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> int:
+        from sqlalchemy import func, select
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            stmt = select(func.count()).select_from(AgentRun)
+            stmt = self._apply_run_filters(
+                stmt,
+                tenant_id=tenant_id,
+                status=status,
+                agent_name=agent_name,
+                parent_run_id=parent_run_id,
+                started_after=started_after,
+                started_before=started_before,
+            )
+            result = await session.execute(stmt)
+            total = result.scalar_one()
+            return int(total)
+
+    @staticmethod
+    def _apply_run_filters(
+        stmt: Any,
+        *,
+        tenant_id: str | None,
+        status: str | list[str] | None,
+        agent_name: str | None,
+        parent_run_id: str | None,
+        started_after: datetime | None,
+        started_before: datetime | None,
+    ) -> Any:
+        from dendrux.db.models import AgentRun
+
+        if tenant_id is not None:
+            stmt = stmt.where(AgentRun.tenant_id == tenant_id)
+        if status is not None:
+            if isinstance(status, list):
+                if status:
+                    stmt = stmt.where(AgentRun.status.in_(status))
+            else:
+                stmt = stmt.where(AgentRun.status == status)
+        if agent_name is not None:
+            stmt = stmt.where(AgentRun.agent_name == agent_name)
+        if parent_run_id is not None:
+            stmt = stmt.where(AgentRun.parent_run_id == parent_run_id)
+        if started_after is not None:
+            stmt = stmt.where(AgentRun.created_at >= started_after)
+        if started_before is not None:
+            stmt = stmt.where(AgentRun.created_at < started_before)
+        return stmt
 
 
 def _extract_status(row: AgentRun) -> str:

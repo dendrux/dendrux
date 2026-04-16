@@ -380,6 +380,101 @@ class TestListRuns:
     async def test_empty_list(self, store) -> None:
         assert await store.list_runs() == []
 
+    async def test_filter_by_agent_name(self, store) -> None:
+        """Agent-name filtering happens in SQL, not Python."""
+        await store.create_run("r1", "Alpha")
+        await store.create_run("r2", "Beta")
+        await store.create_run("r3", "Alpha")
+
+        runs = await store.list_runs(agent_name="Alpha")
+        assert len(runs) == 2
+        assert {r.id for r in runs} == {"r1", "r3"}
+
+    async def test_filter_by_parent_run_id(self, store) -> None:
+        """Parent-run filtering returns only direct children."""
+        await store.create_run("parent", "Coord")
+        await store.create_run("child_a", "Worker", parent_run_id="parent")
+        await store.create_run("child_b", "Worker", parent_run_id="parent")
+        await store.create_run("other", "Worker")
+
+        runs = await store.list_runs(parent_run_id="parent")
+        assert {r.id for r in runs} == {"child_a", "child_b"}
+
+    async def test_filter_by_status_list(self, store) -> None:
+        """Status accepts a list; matches any of the given values."""
+        await store.create_run("r1", "Agent")
+        await store.create_run("r2", "Agent")
+        await store.create_run("r3", "Agent")
+        await store.finalize_run("r1", status="success")
+        await store.finalize_run("r2", status="error")
+        # r3 stays running
+
+        runs = await store.list_runs(status=["success", "error"])
+        assert {r.id for r in runs} == {"r1", "r2"}
+
+    async def test_filter_by_started_after_and_before(self, store) -> None:
+        """Time bounds apply inclusive-start / exclusive-end against created_at."""
+        import datetime as _dt
+
+        from dendrux.db.models import AgentRun
+
+        await store.create_run("r1", "Agent")
+        await store.create_run("r2", "Agent")
+        await store.create_run("r3", "Agent")
+
+        # Pin created_at values deterministically so we can slice a window.
+        base = _dt.datetime(2026, 4, 1, 12, 0, 0)
+        async with store._session_factory() as session:
+            from sqlalchemy import update
+
+            await session.execute(
+                update(AgentRun).where(AgentRun.id == "r1").values(created_at=base)
+            )
+            await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == "r2")
+                .values(created_at=base + _dt.timedelta(hours=1))
+            )
+            await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == "r3")
+                .values(created_at=base + _dt.timedelta(hours=2))
+            )
+            await session.commit()
+
+        window = await store.list_runs(
+            started_after=base + _dt.timedelta(minutes=30),
+            started_before=base + _dt.timedelta(hours=1, minutes=30),
+        )
+        assert [r.id for r in window] == ["r2"]
+
+
+class TestCountRuns:
+    async def test_count_matches_list_length(self, store) -> None:
+        for i in range(7):
+            await store.create_run(f"r_{i}", "Agent")
+        assert await store.count_runs() == 7
+
+    async def test_count_with_filters(self, store) -> None:
+        await store.create_run("r1", "Alpha")
+        await store.create_run("r2", "Alpha")
+        await store.create_run("r3", "Beta")
+        await store.finalize_run("r1", status="success")
+
+        assert await store.count_runs(agent_name="Alpha") == 2
+        assert await store.count_runs(status="success") == 1
+        assert await store.count_runs(agent_name="Alpha", status="success") == 1
+        assert await store.count_runs(agent_name="Missing") == 0
+
+    async def test_count_ignores_limit_offset(self, store) -> None:
+        """count_runs returns the full matching count regardless of any pagination."""
+        for i in range(12):
+            await store.create_run(f"r_{i}", "Agent")
+        # Even with a limited list, the count is the total.
+        listed = await store.list_runs(limit=3, offset=0)
+        assert len(listed) == 3
+        assert await store.count_runs() == 12
+
 
 # ------------------------------------------------------------------
 # Model relationships and cascades
