@@ -221,6 +221,10 @@ class Agent:
         self._database_options = database_options or {}
         self._state_store = state_store
         self._redact = redact
+
+        from dendrux.runtime.tasks import RunTaskManager
+
+        self._task_manager: RunTaskManager = RunTaskManager()
         self._deny: frozenset[str] = frozenset(deny) if deny else frozenset()
         self._require_approval: frozenset[str] = (
             frozenset(require_approval) if require_approval else frozenset()
@@ -838,8 +842,8 @@ class Agent:
             run_id: The paused run's ID.
             tool_results: Results for pending tool calls (for client tool runs).
             user_input: Clarification answer (for human-in-the-loop runs).
-            notifier: Optional additional loop notifier (e.g. TransportNotifier
-                for SSE streaming). Composed with PersistenceRecorder internally.
+            notifier: Optional additional loop notifier. Composed with
+                PersistenceRecorder internally.
 
         Returns:
             RunResult with updated status.
@@ -893,6 +897,307 @@ class Agent:
             provider=provider,
             redact=self._redact,
             extra_notifier=notifier,
+        )
+
+    async def submit_tool_results(
+        self,
+        run_id: str,
+        results: list[ToolResult],
+        *,
+        notifier: LoopNotifier | None = None,
+    ) -> RunResult:
+        """Submit client-side tool results and resume the paused run.
+
+        Race-safe: persist-first handoff + CAS claim in one atomic step,
+        then blocks until the run reaches the next pause or terminal
+        state.
+
+        Args:
+            run_id: A run in status ``WAITING_CLIENT_TOOL``.
+            results: One :class:`ToolResult` per pending tool call. Must
+                cover every pending call; unknown or missing ids raise
+                ``InvalidToolResultError``.
+            notifier: Optional additional notifier composed during resume.
+
+        Returns:
+            :class:`RunResult` from the resumed loop.
+
+        Raises:
+            PersistenceNotConfiguredError: Agent has no DB.
+            RunNotFoundError: ``run_id`` does not exist.
+            RunNotPausedError: run is not in a paused state.
+            PauseStatusMismatchError: run is paused, but not for client tools.
+            RunAlreadyClaimedError: a concurrent submit won the CAS.
+            RunAlreadyTerminalError: run already reached a terminal state.
+            InvalidToolResultError: results don't match pending calls.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError
+        from dendrux.runtime.runner import resume_claimed
+        from dendrux.runtime.submit import (
+            claim_or_raise,
+            serialize_tool_results,
+            validate_tool_results,
+        )
+        from dendrux.types import RunStatus
+
+        provider = self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        await validate_tool_results(store, run_id, results)
+        await claim_or_raise(
+            store,
+            run_id,
+            expected_status=RunStatus.WAITING_CLIENT_TOOL,
+            submitted_data={"submitted_tool_results": serialize_tool_results(results)},
+        )
+
+        task = self._task_manager.spawn(
+            run_id,
+            resume_claimed(
+                run_id,
+                state_store=store,
+                agent=self,
+                provider=provider,
+                redact=self._redact,
+                extra_notifier=notifier,
+            ),
+        )
+        return await task
+
+    async def submit_input(
+        self,
+        run_id: str,
+        text: str,
+        *,
+        notifier: LoopNotifier | None = None,
+    ) -> RunResult:
+        """Submit clarification input and resume the paused run.
+
+        Race-safe: persist-first + CAS claim, blocks until next pause or
+        terminal state.
+
+        Args:
+            run_id: A run in status ``WAITING_HUMAN_INPUT``.
+            text: The user's clarification answer.
+            notifier: Optional additional notifier composed during resume.
+
+        Raises:
+            PersistenceNotConfiguredError, RunNotFoundError,
+            RunNotPausedError, PauseStatusMismatchError,
+            RunAlreadyClaimedError, RunAlreadyTerminalError.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError
+        from dendrux.runtime.runner import resume_claimed
+        from dendrux.runtime.submit import claim_or_raise
+        from dendrux.types import RunStatus
+
+        provider = self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        await claim_or_raise(
+            store,
+            run_id,
+            expected_status=RunStatus.WAITING_HUMAN_INPUT,
+            submitted_data={"submitted_user_input": text},
+        )
+
+        task = self._task_manager.spawn(
+            run_id,
+            resume_claimed(
+                run_id,
+                state_store=store,
+                agent=self,
+                provider=provider,
+                redact=self._redact,
+                extra_notifier=notifier,
+            ),
+        )
+        return await task
+
+    async def submit_approval(
+        self,
+        run_id: str,
+        *,
+        approved: bool,
+        rejection_reason: str | None = None,
+        notifier: LoopNotifier | None = None,
+    ) -> RunResult:
+        """Submit an approval decision for a run awaiting human approval.
+
+        - ``approved=True``: claims and resumes; the approval-gated tool
+          executes server-side and its output is fed to the LLM.
+        - ``approved=False``: the pending batch is treated as all
+          rejected. Every pending tool call receives a synthetic failed
+          :class:`ToolResult` carrying ``rejection_reason`` (default:
+          ``"User declined to run this tool."``). The LLM decides what
+          to do next.
+
+        Per-tool approve/reject within a batch is not supported — the
+        decision applies to the whole batch. Callers needing finer-grained
+        approval can pre-split batches upstream of the agent.
+
+        Args:
+            run_id: A run in status ``WAITING_APPROVAL``.
+            approved: Approval decision.
+            rejection_reason: Optional message used as the error payload
+                on every synthetic rejection result. Ignored when
+                ``approved=True``.
+            notifier: Optional additional notifier composed during resume.
+
+        Raises:
+            PersistenceNotConfiguredError, RunNotFoundError,
+            RunNotPausedError, PauseStatusMismatchError,
+            RunAlreadyClaimedError, RunAlreadyTerminalError.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError
+        from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
+        from dendrux.runtime.submit import (
+            build_rejection_results,
+            claim_or_raise,
+            raise_for_non_paused_status,
+            serialize_tool_results,
+        )
+        from dendrux.types import PauseState, RunStatus
+
+        provider = self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        if approved:
+            await claim_or_raise(
+                store,
+                run_id,
+                expected_status=RunStatus.WAITING_APPROVAL,
+            )
+            task = self._task_manager.spawn(
+                run_id,
+                resume_approval_approved_claim(
+                    run_id,
+                    state_store=store,
+                    agent=self,
+                    provider=provider,
+                    redact=self._redact,
+                    extra_notifier=notifier,
+                ),
+            )
+            return await task
+
+        # Rejection path — fabricate one failed result per pending tool call,
+        # then submit-and-claim so the runner's resume_claimed sees them as
+        # ordinary tool results.
+        raw_pause = await store.get_pause_state(run_id)
+        if raw_pause is None:
+            await raise_for_non_paused_status(store, run_id)
+        pause_state = PauseState.from_dict(raw_pause)
+        synthetic = build_rejection_results(pause_state, rejection_reason)
+        await claim_or_raise(
+            store,
+            run_id,
+            expected_status=RunStatus.WAITING_APPROVAL,
+            submitted_data={"submitted_tool_results": serialize_tool_results(synthetic)},
+        )
+        task = self._task_manager.spawn(
+            run_id,
+            resume_claimed(
+                run_id,
+                state_store=store,
+                agent=self,
+                provider=provider,
+                redact=self._redact,
+                extra_notifier=notifier,
+            ),
+        )
+        return await task
+
+    async def cancel_run(self, run_id: str) -> RunResult:
+        """Request cancellation for ``run_id``.
+
+        Guarantees:
+
+        - **In-process submit/resume task on this Agent instance:** the
+          task spawned by :meth:`submit_tool_results`,
+          :meth:`submit_input`, or :meth:`submit_approval` is cancelled
+          synchronously and the DB row is CAS-finalized to ``CANCELLED``.
+          Deterministic.
+        - **Paused run (any process):** CAS-finalizes the DB row to
+          ``CANCELLED``. Deterministic.
+        - **Raw ``agent.run()`` in-flight on this Agent instance:**
+          **best-effort** — ``agent.run()`` is not tracked by this
+          Agent's task manager (its ``run_id`` is generated inside the
+          coroutine, not known to the caller up front). The DB row is
+          still CAS-finalized, but the in-flight coroutine keeps
+          running. If you need same-process cancellation of an initial
+          run, cancel the caller's own task via ``asyncio.Task.cancel()``
+          in addition to calling this method. Runner integration that
+          registers initial runs with the task manager is a future
+          enhancement.
+        - **Cross-process running run:** best-effort — the DB row is
+          CAS-finalized only if the run is still in a cancellable status.
+          **The other worker's in-flight LLM/tool call completes** before
+          the cancellation is observed; this method does not preempt it.
+          Cooperative cross-process cancellation is a future enhancement.
+        - **Terminal run:** no-op, returns the current persisted state.
+          Does not raise.
+
+        Returns:
+            :class:`RunResult` reflecting the persisted state after the
+            CAS attempt.
+
+        Raises:
+            PersistenceNotConfiguredError: Agent has no DB.
+            RunNotFoundError: ``run_id`` does not exist.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.types import RunResult, RunStatus, UsageStats
+
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        self._task_manager.cancel(run_id)
+
+        # TODO(perf): this walks up to 4 CAS finalize_run calls sequentially.
+        # A single ``finalize_run_if_status_in([...])`` on the StateStore
+        # would cut that to one round-trip on Postgres; keep as-is until
+        # cancel volume matters.
+        for expected in (
+            RunStatus.RUNNING.value,
+            RunStatus.WAITING_CLIENT_TOOL.value,
+            RunStatus.WAITING_HUMAN_INPUT.value,
+            RunStatus.WAITING_APPROVAL.value,
+        ):
+            won = await store.finalize_run(
+                run_id,
+                status=RunStatus.CANCELLED.value,
+                expected_current_status=expected,
+            )
+            if won:
+                break
+
+        record = await store.get_run(run_id)
+        if record is None:
+            raise RunNotFoundError(run_id)
+
+        usage = UsageStats(
+            input_tokens=record.total_input_tokens,
+            output_tokens=record.total_output_tokens,
+            total_tokens=record.total_input_tokens + record.total_output_tokens,
+            cost_usd=record.total_cost_usd,
+            cache_read_input_tokens=record.total_cache_read_tokens,
+            cache_creation_input_tokens=record.total_cache_creation_tokens,
+        )
+        return RunResult(
+            run_id=run_id,
+            status=RunStatus(record.status),
+            answer=record.answer,
+            error=record.error,
+            iteration_count=record.iteration_count,
+            usage=usage,
         )
 
     @overload

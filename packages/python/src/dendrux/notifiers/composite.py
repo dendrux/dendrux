@@ -1,7 +1,7 @@
 """Composite notifier — fans out to multiple notifiers.
 
-Lives in the core notifiers package (no bridge/transport dependency)
-so it can be used in script-mode runs without requiring FastAPI.
+Lives in the core notifiers package (no FastAPI dependency) so it
+can be used in script-mode runs without the ``http`` extra.
 """
 
 from __future__ import annotations

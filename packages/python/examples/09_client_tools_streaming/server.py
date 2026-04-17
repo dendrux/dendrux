@@ -1,7 +1,7 @@
 """Client Tool Streaming — agent with server + client tools over NDJSON.
 
 Demonstrates Dendrux streaming with client-side tool execution using
-fetch() + NDJSON instead of the bridge's SSE transport.
+fetch() + NDJSON instead of Dendrux's SSE transport.
 
 Run with:
     cd packages/python

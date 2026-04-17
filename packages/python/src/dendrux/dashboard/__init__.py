@@ -1,4 +1,4 @@
 """Dendrux Dashboard — observability API and timeline normalization.
 
-Requires the [bridge] extra: pip install dendrux[bridge]
+Requires the [http] extra: pip install dendrux[http]
 """

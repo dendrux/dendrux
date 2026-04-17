@@ -2,7 +2,7 @@
 
 Provides ops commands for inspecting agent runs, traces, and database.
 The ``dendrux run`` command was removed in Sprint 4 — developers start
-agents programmatically via ``agent.run()`` or mount the bridge.
+agents programmatically via ``agent.run()`` or mount ``make_read_router``.
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ def dashboard(
         from dendrux.dashboard.api import create_dashboard_api
     except ImportError:
         console.print(
-            "[red]Dashboard requires FastAPI + uvicorn.[/red] Run: pip install dendrux[bridge]"
+            "[red]Dashboard requires FastAPI + uvicorn.[/red] Run: pip install dendrux[http]"
         )
         raise typer.Exit(1) from None
 

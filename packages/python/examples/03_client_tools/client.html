@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dendrux — Client Tool Bridge Demo</title>
+<title>Dendrux — Client Tool Demo</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 2rem; max-width: 720px; margin: 0 auto; }
@@ -18,7 +18,6 @@
   .event { padding: 0.5rem 0.75rem; margin-bottom: 0.25rem; border-radius: 4px; font-size: 0.82rem; font-family: monospace; }
   .event-started { background: #1a2332; color: #60a5fa; }
   .event-step { background: #1a1a2e; color: #a78bfa; }
-  .event-tool-done { background: #1a2e1a; color: #86efac; }
   .event-paused { background: #2e2a1a; color: #fbbf24; }
   .event-completed { background: #1a2e1a; color: #4ade80; }
   .event-error { background: #2e1a1a; color: #f87171; }
@@ -32,7 +31,7 @@
 </head>
 <body>
 
-<h1>Dendrux Client Tool Bridge</h1>
+<h1>Dendrux Client Tool Demo</h1>
 <p class="subtitle">Agent pauses for client-side tools, you provide the result, agent resumes.</p>
 
 <div id="input-section">
@@ -43,7 +42,7 @@
 <div id="events"></div>
 <div id="tool-form">
   <h3>Tool needed: <span id="tool-name"></span></h3>
-  <div class="params">Params: <span id="tool-params"></span></div>
+  <div class="params">Call ID: <span id="tool-call-id"></span></div>
   <input id="tool-result-input" type="text" placeholder="Paste the tool result here..." />
   <button onclick="submitToolResult()">Submit Result</button>
 </div>
@@ -67,73 +66,50 @@
     document.getElementById("status").textContent = text;
   }
 
+  // Connect to the read-router SSE. The router emits a single SSE event type
+  // ("message") and puts the Dendrux event_type inside the JSON payload, so
+  // the client dispatches on payload.event_type.
   function connectSSE(runId) {
     if (eventSource) eventSource.close();
-    eventSource = new EventSource("/dendrux/runs/" + runId + "/events");
+    eventSource = new EventSource("/api/runs/" + runId + "/events/stream");
 
-    eventSource.addEventListener("snapshot", (e) => {
-      const d = JSON.parse(e.data);
-      log("Snapshot: status=" + d.status + " iterations=" + d.iteration_count, "event-started");
-      // If snapshot shows paused state with pending tools, show the form
-      if (d.pending_tool_calls && d.pending_tool_calls.length > 0) {
-        handlePause(d.pending_tool_calls, d.status);
-      }
-    });
+    eventSource.onmessage = async (e) => {
+      const env = JSON.parse(e.data);
+      const type = env.event_type;
+      const data = env.data || {};
 
-    eventSource.addEventListener("run.step", (e) => {
-      const d = JSON.parse(e.data);
-      const role = d.role || "?";
-      const content = d.content || "";
-      if (content) log("[" + role + "] " + content.substring(0, 200), "event-step");
-    });
-
-    eventSource.addEventListener("run.tool_done", (e) => {
-      const d = JSON.parse(e.data);
-      log("Tool done: " + d.tool_name + " (success=" + d.success + ")", "event-tool-done");
-    });
-
-    eventSource.addEventListener("run.paused", (e) => {
-      const d = JSON.parse(e.data);
-      if (d.pending_tool_calls && d.pending_tool_calls.length > 0) {
-        handlePause(d.pending_tool_calls, d.status);
-      } else {
-        setStatus("PAUSED — " + d.status);
-        log("PAUSED: " + d.status, "event-paused");
-      }
-    });
-
-    eventSource.addEventListener("run.completed", async (e) => {
-      const d = JSON.parse(e.data);
-      log("COMPLETED (status=" + d.status + ")", "event-completed");
-      eventSource.close();
-      // Fetch the final answer from the poll endpoint
-      try {
-        const poll = await fetch("/dendrux/runs/" + runId);
-        if (poll.ok) {
-          const run = await poll.json();
-          if (run.answer) {
-            log("Answer: " + run.answer, "event-completed");
+      if (type === "run.started") {
+        log("Run started", "event-started");
+      } else if (type === "run.paused") {
+        handlePause(data.pending_tool_calls || [], data.status);
+      } else if (type === "run.completed") {
+        log("COMPLETED", "event-completed");
+        eventSource.close();
+        try {
+          const poll = await fetch("/api/runs/" + runId);
+          if (poll.ok) {
+            const run = await poll.json();
+            if (run.answer) {
+              log("Answer: " + run.answer, "event-completed");
+            }
           }
-        }
-      } catch (err) { /* ignore fetch errors */ }
-      setStatus("Done");
-      document.getElementById("start-btn").disabled = false;
-    });
-
-    eventSource.addEventListener("run.error", (e) => {
-      const d = JSON.parse(e.data);
-      log("ERROR: " + (d.error || "unknown"), "event-error");
-      setStatus("Error");
-      eventSource.close();
-      document.getElementById("start-btn").disabled = false;
-    });
-
-    eventSource.addEventListener("run.cancelled", (e) => {
-      log("CANCELLED", "event-cancelled");
-      setStatus("Cancelled");
-      eventSource.close();
-      document.getElementById("start-btn").disabled = false;
-    });
+        } catch (_) { /* ignore */ }
+        setStatus("Done");
+        document.getElementById("start-btn").disabled = false;
+      } else if (type === "run.error") {
+        log("ERROR: " + (data.error || "unknown"), "event-error");
+        eventSource.close();
+        setStatus("Error");
+        document.getElementById("start-btn").disabled = false;
+      } else if (type === "run.cancelled") {
+        log("CANCELLED", "event-cancelled");
+        eventSource.close();
+        setStatus("Cancelled");
+        document.getElementById("start-btn").disabled = false;
+      }
+      // Other event types (run.step, run.tool_done, etc.) are ignored for
+      // this demo — add a case here if you want to render them.
+    };
 
     eventSource.onerror = () => {
       setStatus("SSE connection lost");
@@ -141,14 +117,13 @@
   }
 
   function handlePause(toolCalls, status) {
-    // Bridge uses {id, name} shape for pending_tool_calls
     pendingToolCalls = toolCalls;
     setStatus("PAUSED — waiting for client tool");
 
     if (pendingToolCalls.length > 0) {
       const tc = pendingToolCalls[0];
       document.getElementById("tool-name").textContent = tc.name;
-      document.getElementById("tool-params").textContent = "(use poll endpoint for params)";
+      document.getElementById("tool-call-id").textContent = tc.id;
       document.getElementById("tool-form").style.display = "block";
       log("PAUSED: agent needs " + tc.name, "event-paused");
     }
@@ -163,7 +138,6 @@
     document.getElementById("start-btn").disabled = true;
     setStatus("Starting...");
 
-    // Developer-owned run creation endpoint (not bridge)
     const resp = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -180,18 +154,15 @@
     currentRunId = data.run_id;
     log("Run started: " + currentRunId + " (status=" + data.status + ")", "event-started");
 
-    if (data.status === "waiting_client_tool") {
-      // Agent paused on first call — connect SSE to see snapshot + submit results
-      setStatus("Paused — connecting to bridge SSE...");
-      connectSSE(currentRunId);
-    } else if (data.status === "success") {
-      log("COMPLETED: " + (data.answer || ""), "event-completed");
+    if (data.status === "success") {
+      log("Answer: " + (data.answer || ""), "event-completed");
       setStatus("Done");
       document.getElementById("start-btn").disabled = false;
-    } else {
-      setStatus("Status: " + data.status);
-      connectSSE(currentRunId);
+      return;
     }
+
+    // Connect SSE so we see the pause (and any subsequent events) live.
+    connectSSE(currentRunId);
   }
 
   async function submitToolResult() {
@@ -203,17 +174,16 @@
     document.getElementById("tool-form").style.display = "none";
     setStatus("Submitting tool result...");
 
-    // Bridge expects {tool_call_id, tool_name, result} shape
     const results = pendingToolCalls.map((tc) => ({
       tool_call_id: tc.id,
       tool_name: tc.name,
-      result: JSON.stringify(resultText),
+      payload: JSON.stringify(resultText),
     }));
 
-    const resp = await fetch("/dendrux/runs/" + currentRunId + "/tool-results", {
+    const resp = await fetch("/runs/" + currentRunId + "/tool-results", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool_results: results }),
+      body: JSON.stringify({ results: results }),
     });
 
     if (!resp.ok) {
@@ -222,12 +192,9 @@
       return;
     }
 
-    log("Tool result submitted, resuming...", "event-tool-done");
+    log("Tool result submitted, resuming...", "event-step");
     setStatus("Resumed — watching SSE...");
     pendingToolCalls = [];
-    // SSE is already connected from the initial connectSSE call.
-    // The bridge reuses the existing queue, so events flow to
-    // the same connection. If SSE was closed, reconnect.
     if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
       connectSSE(currentRunId);
     }

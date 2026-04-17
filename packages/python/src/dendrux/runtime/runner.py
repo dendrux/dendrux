@@ -376,7 +376,7 @@ async def run(
             (trace text, tool params, result payloads, error messages).
             Receives a plain string, must return a plain string.
         extra_notifier: Optional additional LoopNotifier for best-effort
-            notifications (e.g. ConsoleNotifier, TransportNotifier for SSE).
+            notifications (e.g. ConsoleNotifier).
         max_delegation_depth: Maximum allowed delegation depth for the
             run tree. Default 10. None means unbounded. Propagated to
             all child runs via contextvar. Raises DelegationDepthExceededError
@@ -1488,7 +1488,8 @@ async def _prepare_resume(
 
     Receives an already-loaded PauseState — does NOT load pause data or
     claim the run. Those steps are owned by the caller (_resume_core for
-    direct resume, resume_stream for streaming, resume_claimed for bridge).
+    direct resume, resume_stream for streaming, resume_claimed for
+    post-submit_and_claim resume).
 
     Steps performed:
       1. Initialize sequencer from DB (continues across pause boundaries)
@@ -1648,10 +1649,9 @@ async def _resume_core(
     """Shared resume logic for tool results and clarification input.
 
     Args:
-        extra_notifier: Optional additional LoopNotifier (e.g. TransportNotifier)
-            for SSE streaming during resume. Passed separately from the
-            PersistenceRecorder — recorder handles persistence, notifier handles
-            notifications.
+        extra_notifier: Optional additional LoopNotifier. Composed with
+            PersistenceRecorder — recorder handles persistence, notifier
+            handles observation side-effects.
         _skip_claim: Internal flag — skip the atomic claim step when the caller
             has already claimed via submit_and_claim(). Used by resume_claimed().
     """
@@ -2235,11 +2235,11 @@ async def resume_claimed(
 ) -> RunResult:
     """Resume a run that was already claimed via submit_and_claim().
 
-    Internal helper for the bridge's persist-first handoff. NOT a public API.
+    Internal helper for the persist-first handoff. NOT a public API.
 
-    The bridge's background task calls submit_and_claim() to atomically save
-    submitted data and transition WAITING → RUNNING. Once that succeeds, it
-    calls this helper to actually re-enter the loop.
+    Agent submit methods call submit_and_claim() to atomically persist the
+    submitted payload and transition WAITING → RUNNING, then call this
+    helper to re-enter the loop.
 
     Validates before proceeding:
       - pause_data exists (run was paused)
@@ -2252,7 +2252,7 @@ async def resume_claimed(
         agent: Agent definition.
         provider: LLM provider.
         redact: Optional redaction policy.
-        extra_notifier: Optional TransportNotifier for SSE streaming.
+        extra_notifier: Optional additional LoopNotifier.
 
     Returns:
         RunResult from the resumed loop.
@@ -2331,14 +2331,46 @@ async def resume_claimed(
             _skip_claim=True,
         )
 
-    # No submitted data found. This likely means the run was paused for
-    # approval (WAITING_APPROVAL) and resumed through the bridge, which
-    # is not supported. Approval runs must use agent.resume() directly.
+    # No submitted data found. Approval-approve flows do not go through
+    # resume_claimed — they call resume_approval_approved_claim() below,
+    # which takes the explicit WAITING_APPROVAL path. Reaching this point
+    # implies a bug in the claim flow.
     raise ValueError(
         f"Run '{run_id}' has pause_data but no submitted_tool_results "
-        "or submitted_user_input — nothing to resume with. "
-        "If this run is paused for approval (WAITING_APPROVAL), use "
-        "agent.resume(run_id) to approve or "
-        "agent.resume(run_id, tool_results=[...]) to reject. "
-        "Bridge-based approval is not supported."
+        "or submitted_user_input — nothing to resume with."
+    )
+
+
+async def resume_approval_approved_claim(
+    run_id: str,
+    *,
+    state_store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    redact: Callable[[str], str] | None = None,
+    extra_notifier: LoopNotifier | None = None,
+) -> RunResult:
+    """Resume an approval-approved run that was already claimed.
+
+    Paired with :func:`resume_claimed`: ``resume_claimed`` handles the
+    post-claim path for tool results and user input, while this function
+    handles approval-approve (no submitted payload — just re-enter the
+    loop with the pending batch executed server-side).
+
+    The caller (e.g. :meth:`Agent.submit_approval`) must have already
+    transitioned the run to ``RUNNING`` via
+    :meth:`StateStore.claim_paused_run` with
+    ``expected_status="waiting_approval"``.
+    """
+    return await _resume_core(
+        run_id,
+        state_store=state_store,
+        agent=agent,
+        provider=provider,
+        redact=redact,
+        expected_status=RunStatus.WAITING_APPROVAL.value,
+        tool_results=None,
+        user_input=None,
+        extra_notifier=extra_notifier,
+        _skip_claim=True,
     )

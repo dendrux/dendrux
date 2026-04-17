@@ -1,4 +1,4 @@
-# Example 03: Client Tool Bridge
+# Example 03: Client-Side Tool Pause/Resume
 
 Demonstrates Dendrux's core differentiator — an agent that **pauses** when it needs a client-side tool, waits for the user to provide the result, then **resumes** reasoning.
 
@@ -6,10 +6,11 @@ Demonstrates Dendrux's core differentiator — an agent that **pauses** when it 
 
 ```bash
 cd packages/python
-pip install -e ".[dev,db,anthropic,bridge]"
+pip install -e ".[dev,db,anthropic,http]"
 ```
 
 Set your API key:
+
 ```bash
 export ANTHROPIC_API_KEY=sk-...
 ```
@@ -25,6 +26,7 @@ Open http://localhost:8000 in your browser.
 ## What to type
 
 The agent has two tools:
+
 - **lookup_price** (server-side) — instant, no pause
 - **read_excel_range** (client-side) — agent pauses and waits for you
 
@@ -33,16 +35,26 @@ To see the pause/resume flow, use a prompt that triggers both:
 > Look up the AAPL stock price, then read cell A1 from my spreadsheet.
 
 The agent will:
-1. Call `lookup_price("AAPL")` — executes instantly on the server
-2. Call `read_excel_range(sheet="Sheet1", range="A1")` — **pauses**
-3. The UI shows a form asking you to provide the result
-4. Type any value (e.g. `Revenue: $394B`) and click Submit
-5. The agent resumes with your data and generates a final answer
+
+1. Call `lookup_price("AAPL")` — executes instantly on the server.
+2. Call `read_excel_range(sheet="Sheet1", range="A1")` — **pauses**.
+3. The UI shows a form asking you to provide the result.
+4. Type any value (e.g. `Revenue: $394B`) and click Submit.
+5. The agent resumes with your data and generates a final answer.
 
 ## Architecture
 
-The developer owns run creation (`POST /chat` calls `agent.run()`).
-The bridge handles everything after the first pause.
+Dendrux ships:
+
+- `make_read_router` → mounts reads + SSE at `/api/*`.
+- `agent.submit_tool_results(...)` + `agent.cancel_run(...)` → race-safe resume methods.
+
+The developer writes:
+
+- `POST /chat` → calls `agent.run(...)`.
+- `POST /runs/{id}/tool-results` → calls `agent.submit_tool_results(...)`.
+- `DELETE /runs/{id}` → calls `agent.cancel_run(...)`.
+- `client.html` → browser UI, `EventSource` on the SSE stream, dispatches on `event_type`.
 
 ```
 Browser                    Server                     Agent
@@ -53,27 +65,30 @@ Browser                    Server                     Agent
   |                          |                          |-- read_excel_range -> PAUSE
   | <-- {run_id, status} --- |                          |
   |                          |                          |
-  |-- GET /dendrux/runs/{id}/events (SSE) -----------> |
-  | <-- snapshot (status=waiting_client_tool) --------- |
+  |-- GET /api/runs/{id}/events/stream (SSE) -------->  |
+  | <-- run.paused (with pending_tool_calls) ---------- |
   |                          |                          |
-  |-- POST /dendrux/runs/{id}/tool-results ----------> |
-  |                          |-- submit_and_claim ----> |-- resume
-  | <-- 200 (accepted) ----- |                          |-- LLM call (with result)
-  | <-- run.completed (SSE)  | <-- RunResult ---------- |
+  |-- POST /runs/{id}/tool-results ------------------>  |
+  |                          |-- agent.submit_tool_results(...) --> |
+  |                          |    (persist-first + CAS claim + resume)
+  | <-- 200 {status: success, answer: ...} ------------ |
+  | <-- run.completed (SSE)  |                          |
 ```
 
-## Bridge endpoints
+## Where each piece lives
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /dendrux/runs/{id}` | Poll status + pending tool calls |
-| `GET /dendrux/runs/{id}/events` | SSE stream (snapshot + live events) |
-| `POST /dendrux/runs/{id}/tool-results` | Submit client tool results |
-| `POST /dendrux/runs/{id}/input` | Submit clarification answer |
-| `DELETE /dendrux/runs/{id}` | Cancel a run |
+| Surface | Owner | File |
+|---|---|---|
+| `GET /api/runs/...` + SSE | Dendrux (`make_read_router`) | `dendrux/http/read_router.py` |
+| `POST /chat` | You | `server.py` |
+| `POST /runs/{id}/tool-results` | You | `server.py` |
+| `DELETE /runs/{id}` | You | `server.py` |
+| Browser UI | You | `client.html` |
+| Pause/resume orchestration | Dendrux | `agent.submit_tool_results` |
+| CAS + race-safety | Dendrux | `runtime/submit.py` |
 
 ## If something looks wrong
 
 - If the agent doesn't pause, your prompt didn't trigger `read_excel_range`. Try: "read cell A1 from my spreadsheet."
 - If you see connection errors, make sure the server is running on port 8000.
-- This demo uses `allow_insecure_dev_mode=True` (no HMAC auth) — local development only.
+- This demo uses a no-op `authorize` dependency (no auth). Real apps plug in a user-session dep there.

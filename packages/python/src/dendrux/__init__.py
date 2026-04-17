@@ -3,6 +3,15 @@
 __version__ = "0.1.0a3"
 
 from dendrux.agent import Agent
+from dendrux.errors import (
+    InvalidToolResultError,
+    PauseStatusMismatchError,
+    PersistenceNotConfiguredError,
+    RunAlreadyClaimedError,
+    RunAlreadyTerminalError,
+    RunNotFoundError,
+    RunNotPausedError,
+)
 from dendrux.loops.single import SingleCall
 from dendrux.runtime.context import DelegationDepthExceededError
 from dendrux.runtime.runner import run
@@ -17,25 +26,6 @@ from dendrux.types import (
     StructuredOutputValidationError,
 )
 
-# bridge() requires FastAPI (pip install dendrux[bridge]).
-# We must bind it at module level to shadow the subpackage name —
-# __getattr__ can't override subpackage resolution.
-# Only catch the specific missing-dependency error; real bridge bugs
-# propagate normally.
-try:
-    from dendrux.bridge import bridge
-except ImportError as _err:
-    if "fastapi" in str(_err).lower() or "uvicorn" in str(_err).lower():
-        _missing_err = _err
-
-        def bridge(*args, **kwargs):  # type: ignore[misc,no-untyped-def]
-            """Stub — raises when bridge extras are not installed."""
-            raise ImportError(
-                "bridge requires optional dependencies. Install with: pip install 'dendrux[bridge]'"
-            ) from _missing_err
-    else:
-        raise
-
 __all__ = [
     "Agent",
     "Budget",
@@ -43,10 +33,16 @@ __all__ = [
     "DelegationDepthExceededError",
     "GovernanceEventType",
     "IdempotencyConflictError",
+    "InvalidToolResultError",
+    "PauseStatusMismatchError",
+    "PersistenceNotConfiguredError",
     "RunAlreadyActiveError",
+    "RunAlreadyClaimedError",
+    "RunAlreadyTerminalError",
+    "RunNotFoundError",
+    "RunNotPausedError",
     "SingleCall",
     "StructuredOutputValidationError",
-    "bridge",
     "run",
     "sweep",
     "tool",

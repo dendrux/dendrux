@@ -65,7 +65,7 @@ agent = Agent(
 ## Install
 
 ```bash
-pip install "dendrux[all]"            # everything (Anthropic + OpenAI + DB + bridge)
+pip install "dendrux[all]"            # everything (Anthropic + OpenAI + DB + http)
 pip install "dendrux[anthropic,db]"   # just Anthropic + SQLite
 pip install "dendrux[openai,db]"      # just OpenAI + SQLite
 ```
@@ -94,7 +94,7 @@ Dendrux is built around six design commitments:
 | 3 | **Govern behavior** | Tool deny/approval, advisory budgets, PII redaction, secret detection. Four layers of runtime governance. |
 | 4 | **Explain everything** | Every LLM call, tool execution, pause, and lifecycle event is persisted as evidence. |
 | 5 | **Coordinate agents** | Parent-child delegation with automatic linking, depth guards, and lifecycle coupling. |
-| 6 | **Pause for the real world** | Client-tool bridge for spreadsheets, browsers, and desktops with domain-aware constraints. |
+| 6 | **Pause for the real world** | Client-side tool pause/resume for spreadsheets, browsers, and desktops with domain-aware constraints. |
 
 ---
 
@@ -181,7 +181,7 @@ agent = Agent(
 
 **Tool deny**: `deny=["tool_name"]` blocks tools deterministically. The model gets a synthesized error and adapts. The tool never executes.
 
-**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.resume(run_id)`, reject with `agent.resume(run_id, tool_results=[...])`.
+**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True)`, reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`.
 
 **Advisory budget**: `budget=Budget(max_tokens=N)` fires governance events at configurable thresholds (50%, 75%, 90%) and when usage exceeds the cap. Advisory only - the run continues. Developers observe and act.
 
@@ -267,7 +267,7 @@ The state store links parent and child runs. The dashboard shows the full delega
 
 ### ⏸️ Pause for the Real World
 
-**Client-tool bridge**: define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
+**Client-side tools**: define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
 
 ```python
 @tool(target="client")
@@ -275,11 +275,35 @@ async def read_excel_range(sheet: str, range: str) -> str:
     """Read cells from the user's spreadsheet."""
     return ""
 
-from dendrux import bridge
-app.mount("/dendrux", bridge(agent, allow_insecure_dev_mode=True))
+# Dendrux ships reads + SSE. You wire the writes around agent methods.
+from dendrux.http import make_read_router
+from dendrux.store import RunStore
+from dendrux.types import ToolResult
+from pydantic import BaseModel
+
+class ResultItem(BaseModel):
+    tool_call_id: str
+    tool_name: str
+    payload: str  # JSON-encoded string
+
+class ResultsBody(BaseModel):
+    results: list[ResultItem]
+
+store = RunStore.from_database_url(db_url)
+app.include_router(make_read_router(store=store, authorize=require_user), prefix="/api")
+
+@app.post("/runs/{run_id}/tool-results")
+async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
+    # Convert the app's DTO into Dendrux's ToolResult — the method expects
+    # list[ToolResult], not arbitrary Pydantic models.
+    results = [
+        ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
+        for r in body.results
+    ]
+    return await agent.submit_tool_results(run_id, results)
 ```
 
-The bridge handles SSE streaming, tool result submission, polling, and cancellation. The agent resumes exactly where it paused.
+Pause/resume orchestration, CAS-safe claim, and SSE transport are Dendrux's job. Auth, schema, error shape, and framework choice are yours.
 
 ### 🔀 Streaming
 
@@ -389,21 +413,26 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 |---------|---------------|
 | [`01_hello_world.py`](packages/python/examples/01_hello_world.py) | Minimal agent with one tool |
 | [`02_persistent_agent.py`](packages/python/examples/02_persistent_agent.py) | SQLite persistence + CLI inspection |
-| [`03_client_tools/`](packages/python/examples/03_client_tools/) | Client-tool bridge with pause/resume |
+| [`03_client_tools/`](packages/python/examples/03_client_tools/) | Client-side tool pause/resume |
 | [`04_research_agent/`](packages/python/examples/04_research_agent/) | Multi-agent delegation with Firecrawl |
 | [`05_streaming_text.py`](packages/python/examples/05_streaming_text.py) | Token-by-token streaming |
 | [`06_streaming_tools.py`](packages/python/examples/06_streaming_tools.py) | Tool calls in streaming mode |
 | [`07_streaming_openai.py`](packages/python/examples/07_streaming_openai.py) | OpenAI Chat Completions streaming |
 | [`08_streaming_openai_responses.py`](packages/python/examples/08_streaming_openai_responses.py) | OpenAI Responses API streaming |
-| [`09_client_tools_streaming/`](packages/python/examples/09_client_tools_streaming/) | Bridge + streaming combined |
+| [`09_client_tools_streaming/`](packages/python/examples/09_client_tools_streaming/) | Client-side tools over streaming NDJSON |
 | [`10_single_call.py`](packages/python/examples/10_single_call.py) | One-shot LLM call, no loop |
 | [`11_structured_output.py`](packages/python/examples/11_structured_output.py) | Typed Pydantic models from LLM |
 | [`12_structured_output_stream.py`](packages/python/examples/12_structured_output_stream.py) | Structured output in streaming mode |
+| [`13_mcp_filesystem.py`](packages/python/examples/13_mcp_filesystem.py) | Agent with an MCP tool source |
+| [`14_skills/`](packages/python/examples/14_skills/) | Filesystem-loaded skill packs |
+| [`15_cache_efficiency.py`](packages/python/examples/15_cache_efficiency.py) | Anthropic prompt-cache hit measurement |
+| [`16_cache_efficiency_openai.py`](packages/python/examples/16_cache_efficiency_openai.py) | OpenAI prompt-cache hit measurement |
 | **Governance** | |
 | [`governance/01_tool_deny.py`](packages/python/examples/governance/01_tool_deny.py) | Block tools deterministically (batch + streaming) |
 | [`governance/02_approval.py`](packages/python/examples/governance/02_approval.py) | Human-in-the-loop approval with approve/reject CLI |
 | [`governance/03_budget.py`](packages/python/examples/governance/03_budget.py) | Advisory token budget with threshold warnings |
 | [`governance/04_guardrails.py`](packages/python/examples/governance/04_guardrails.py) | PII redaction, secret detection, warn mode |
+| [`governance/05_dashboard.py`](packages/python/examples/governance/05_dashboard.py) | Dashboard pointed at a seeded run database |
 
 ```bash
 cd packages/python/examples
@@ -416,22 +445,22 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 | Metric | Value |
 |--------|-------|
-| Source code | 14,500+ lines |
-| Test code | 18,000+ lines |
-| Test functions | 898 |
-| Test-to-source ratio | 1.24 : 1 |
+| Source code | 17,600+ lines |
+| Test code | 25,200+ lines |
+| Test functions | 1,225 |
+| Test-to-source ratio | 1.43 : 1 |
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
 | CI checks | lint, format, types, tests |
-| Alembic migrations | 8 |
-| Examples | 16 runnable scripts |
+| Alembic migrations | 10 |
+| Examples | 17 runnable scripts + 4 HTTP demos |
 | Development started | March 11, 2026 |
 
 ---
 
 ## Status
 
-Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `sweep` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore`, and `make_read_router` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
@@ -447,9 +476,10 @@ Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Age
 | Governance (deny, approval, budget, guardrails) | Stabilizing |
 | Recorder/Notifier split | Stable |
 | CLI + Dashboard | Stabilizing |
-| Client-tool bridge | Experimental |
+| Client-side tool pause/resume | Stabilizing |
+| Public HTTP surface (`make_read_router`, `RunStore`) | Stabilizing |
 
-Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 898 tests, strict types, Apache 2.0.
+Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 1,225 tests, strict types, Apache 2.0.
 
 ## What Dendrux Is Not
 

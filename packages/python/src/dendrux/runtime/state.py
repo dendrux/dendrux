@@ -343,9 +343,9 @@ class StateStore(Protocol):
         conditional UPDATE.  First-writer-wins: returns True if this call
         won the race, False if the status had already changed.
 
-        Used by the bridge for persist-first handoff: the bridge spawns a
-        resume task, the task calls this method, and signals back to the
-        HTTP handler whether it won.
+        Used by the agent submit methods for persist-first handoff:
+        callers merge ``submitted_data`` here, then invoke ``resume_claimed``
+        to re-enter the loop.
 
         Args:
             run_id: The paused run's ID.

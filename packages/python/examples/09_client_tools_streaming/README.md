@@ -1,7 +1,8 @@
 # Example 09: Client Tool Streaming
 
 Demonstrates Dendrux streaming with client-side tool execution using
-`fetch()` + NDJSON — no SSE, no bridge.
+`fetch()` + NDJSON — a single-request streaming variant of the
+client-tool pattern shown in example 03.
 
 ## Why fetch() instead of SSE?
 

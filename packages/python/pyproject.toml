@@ -31,11 +31,11 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=1.50,<3.0"]
-bridge = ["fastapi>=0.135,<1.0", "uvicorn[standard]"]
+http = ["fastapi>=0.135,<1.0", "uvicorn[standard]"]
 db = ["sqlalchemy[asyncio]>=2.0,<3.0", "aiosqlite>=0.19,<1.0", "alembic>=1.13,<2.0"]
 postgres = ["asyncpg>=0.29,<1.0"]
 mcp = ["mcp>=1.8,<2"]
-all = ["dendrux[anthropic,openai,bridge,db,postgres,mcp]"]
+all = ["dendrux[anthropic,openai,http,db,postgres,mcp]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -122,11 +122,11 @@ module = "mcp.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "dendrux.bridge.*"
+module = "dendrux.dashboard.*"
 disallow_untyped_decorators = false
 
 [[tool.mypy.overrides]]
-module = "dendrux.dashboard.*"
+module = "dendrux.http.*"
 disallow_untyped_decorators = false
 
 [[tool.mypy.overrides]]
