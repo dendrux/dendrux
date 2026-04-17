@@ -520,10 +520,30 @@ class TestRunStoreLifecycle:
         await s.close()
 
     async def test_async_context_manager_disposes_owned_engine(self) -> None:
-        """`async with RunStore.from_database_url(...)` disposes on exit."""
+        """`async with RunStore.from_database_url(...)` disposes on exit
+        and clears the owned-engine reference."""
         async with RunStore.from_database_url("sqlite+aiosqlite:///:memory:") as s:
             assert isinstance(s, RunStore)
-        # No exception means dispose worked.
+            assert s._owned_engine is not None
+        # After exit, ownership cleared.
+        assert s._owned_engine is None
+
+    async def test_close_is_idempotent(self) -> None:
+        """Calling close() twice on an owned-engine store is a no-op
+        and must not raise."""
+        s = RunStore.from_database_url("sqlite+aiosqlite:///:memory:")
+        await s.close()
+        await s.close()
+
+    async def test_query_after_close_raises(self) -> None:
+        """Operations on a disposed engine surface an error rather than
+        silently returning stale or empty data."""
+        from sqlalchemy.exc import SQLAlchemyError
+
+        s = RunStore.from_database_url("sqlite+aiosqlite:///:memory:")
+        await s.close()
+        with pytest.raises(SQLAlchemyError):
+            await s.list_runs()
 
     async def test_from_engine_does_not_dispose_caller_owned(self, engine) -> None:
         """RunStore created via ``from_engine`` must not dispose the engine
