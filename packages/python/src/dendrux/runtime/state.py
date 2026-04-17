@@ -296,6 +296,8 @@ class StateStore(Protocol):
         run_id: str,
         *,
         iteration_index: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[LLMInteractionRecord]: ...
 
     async def finalize_run(
@@ -358,13 +360,21 @@ class StateStore(Protocol):
 
     async def get_run(self, run_id: str) -> RunRecord | None: ...
 
-    async def get_traces(self, run_id: str) -> list[TraceRecord]: ...
+    async def get_traces(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[TraceRecord]: ...
 
     async def get_tool_calls(
         self,
         run_id: str,
         *,
         iteration_index: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ToolCallReadRecord]: ...
 
     async def save_run_event(
@@ -745,6 +755,8 @@ class SQLAlchemyStateStore:
         run_id: str,
         *,
         iteration_index: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[LLMInteractionRecord]:
         from sqlalchemy import select
 
@@ -754,10 +766,14 @@ class SQLAlchemyStateStore:
             stmt = (
                 select(LLMInteraction)
                 .where(LLMInteraction.agent_run_id == run_id)
-                .order_by(LLMInteraction.iteration_index)
+                .order_by(LLMInteraction.iteration_index, LLMInteraction.id)
             )
             if iteration_index is not None:
                 stmt = stmt.where(LLMInteraction.iteration_index == iteration_index)
+            if limit is not None:
+                stmt = stmt.limit(max(1, min(limit, 1000)))
+            if offset:
+                stmt = stmt.offset(max(0, offset))
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [
@@ -1010,7 +1026,13 @@ class SQLAlchemyStateStore:
                 return None
             return _run_to_record(row)
 
-    async def get_traces(self, run_id: str) -> list[TraceRecord]:
+    async def get_traces(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[TraceRecord]:
         from sqlalchemy import select
 
         from dendrux.db.models import ReactTrace
@@ -1021,6 +1043,10 @@ class SQLAlchemyStateStore:
                 .where(ReactTrace.agent_run_id == run_id)
                 .order_by(ReactTrace.order_index)
             )
+            if limit is not None:
+                stmt = stmt.limit(max(1, min(limit, 1000)))
+            if offset:
+                stmt = stmt.offset(max(0, offset))
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [
@@ -1040,6 +1066,8 @@ class SQLAlchemyStateStore:
         run_id: str,
         *,
         iteration_index: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ToolCallReadRecord]:
         from sqlalchemy import select
 
@@ -1049,10 +1077,14 @@ class SQLAlchemyStateStore:
             stmt = (
                 select(ToolCallRecord)
                 .where(ToolCallRecord.agent_run_id == run_id)
-                .order_by(ToolCallRecord.created_at)
+                .order_by(ToolCallRecord.created_at, ToolCallRecord.id)
             )
             if iteration_index is not None:
                 stmt = stmt.where(ToolCallRecord.iteration_index == iteration_index)
+            if limit is not None:
+                stmt = stmt.limit(max(1, min(limit, 1000)))
+            if offset:
+                stmt = stmt.offset(max(0, offset))
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [
@@ -1600,6 +1632,27 @@ class SQLAlchemyStateStore:
             result = await session.execute(stmt)
             rows = result.scalars().all()
             return [_run_to_record(r) for r in rows]
+
+    async def count_pauses_per_run(
+        self,
+        run_ids: list[str],
+    ) -> dict[str, int]:
+        if not run_ids:
+            return {}
+
+        from sqlalchemy import func, select
+
+        from dendrux.db.models import RunEvent
+
+        async with self._session_factory() as session:
+            stmt = (
+                select(RunEvent.agent_run_id, func.count())
+                .where(RunEvent.agent_run_id.in_(run_ids))
+                .where(RunEvent.event_type == "run.paused")
+                .group_by(RunEvent.agent_run_id)
+            )
+            result = await session.execute(stmt)
+            return {row[0]: int(row[1]) for row in result.all()}
 
     async def count_runs(
         self,

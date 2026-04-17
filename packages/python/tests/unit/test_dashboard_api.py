@@ -119,30 +119,116 @@ class DashboardMockStore:
                 return r
         return None
 
-    async def get_run_events(self, run_id: str) -> list[_Event]:
-        return self._events.get(run_id, [])
+    async def get_run_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence_index: int | None = None,
+        limit: int | None = None,
+        event_types: list[str] | None = None,
+    ) -> list[_Event]:
+        events = self._events.get(run_id, [])
+        if event_types is not None:
+            if not event_types:
+                return []
+            events = [e for e in events if e.event_type in event_types]
+        if after_sequence_index is not None:
+            events = [e for e in events if e.sequence_index > after_sequence_index]
+        if limit is not None:
+            events = events[: max(1, min(limit, 1000))]
+        return events
 
-    async def get_traces(self, run_id: str) -> list[_Trace]:
-        return self._traces.get(run_id, [])
+    async def get_traces(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[_Trace]:
+        rows = self._traces.get(run_id, [])[offset:]
+        return rows if limit is None else rows[:limit]
 
-    async def get_tool_calls(self, run_id: str) -> list[_ToolCall]:
-        return self._tool_calls.get(run_id, [])
+    async def get_tool_calls(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[_ToolCall]:
+        rows = self._tool_calls.get(run_id, [])
+        if iteration_index is not None:
+            rows = [r for r in rows if r.iteration_index == iteration_index]
+        rows = rows[offset:]
+        return rows if limit is None else rows[:limit]
 
-    async def get_llm_interactions(self, run_id: str) -> list[_LLMInteraction]:
-        return self._llm_interactions.get(run_id, [])
+    async def get_llm_interactions(
+        self,
+        run_id: str,
+        *,
+        iteration_index: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[_LLMInteraction]:
+        rows = self._llm_interactions.get(run_id, [])
+        if iteration_index is not None:
+            rows = [r for r in rows if r.iteration_index == iteration_index]
+        rows = rows[offset:]
+        return rows if limit is None else rows[:limit]
 
     async def list_runs(
         self,
         *,
         limit: int = 50,
         offset: int = 0,
-        status: str | None = None,
+        status: str | list[str] | None = None,
         tenant_id: str | None = None,
+        agent_name: str | None = None,
+        parent_run_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
     ) -> list[_Run]:
         runs = list(self._runs)
-        if status:
+        if isinstance(status, list):
+            if not status:
+                return []
+            runs = [r for r in runs if r.status in status]
+        elif status is not None:
             runs = [r for r in runs if r.status == status]
-        return runs[:limit]
+        if agent_name is not None:
+            runs = [r for r in runs if r.agent_name == agent_name]
+        if tenant_id is not None:
+            runs = [r for r in runs if getattr(r, "tenant_id", None) == tenant_id]
+        if parent_run_id is not None:
+            runs = [r for r in runs if r.parent_run_id == parent_run_id]
+        return runs[offset : offset + limit]
+
+    async def count_runs(
+        self,
+        *,
+        status: str | list[str] | None = None,
+        tenant_id: str | None = None,
+        agent_name: str | None = None,
+        parent_run_id: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> int:
+        runs = await self.list_runs(
+            limit=10_000,
+            offset=0,
+            status=status,
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            parent_run_id=parent_run_id,
+            started_after=started_after,
+            started_before=started_before,
+        )
+        return len(runs)
+
+    # Note: intentionally does NOT implement count_pauses_per_run — this
+    # forces the dashboard code to exercise the fallback path via
+    # get_run_events(event_types=["run.paused"]). Custom StateStore
+    # implementations must keep working without the batch optimization.
 
     async def get_delegation_info(self, run_id: str) -> DelegationInfo | None:
         """In-memory delegation info — mirrors SQLAlchemy logic."""

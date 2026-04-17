@@ -531,6 +531,27 @@ class TestCountRuns:
             assert counted == len(listed), f"parity broke for {filters}"
 
 
+class TestCountPausesPerRun:
+    async def test_aggregates_per_run(self, store) -> None:
+        await store.create_run("r1", "Agent")
+        await store.create_run("r2", "Agent")
+        await store.create_run("r3", "Agent")
+
+        # r1: 2 pauses, r2: 1 pause, r3: 0 pauses
+        await store.save_run_event("r1", event_type="run.paused", sequence_index=0)
+        await store.save_run_event("r1", event_type="run.resumed", sequence_index=1)
+        await store.save_run_event("r1", event_type="run.paused", sequence_index=2)
+        await store.save_run_event("r2", event_type="run.paused", sequence_index=0)
+        # Non-pause events on r3 must not show up.
+        await store.save_run_event("r3", event_type="llm.completed", sequence_index=0)
+
+        counts = await store.count_pauses_per_run(["r1", "r2", "r3"])
+        assert counts == {"r1": 2, "r2": 1}  # r3 absent (0 pauses)
+
+    async def test_empty_input(self, store) -> None:
+        assert await store.count_pauses_per_run([]) == {}
+
+
 # ------------------------------------------------------------------
 # Model relationships and cascades
 # ------------------------------------------------------------------

@@ -25,6 +25,7 @@ from dendrux.store import (
     RunSummary,
     StoredEvent,
     ToolInvocation,
+    TraceEntry,
 )
 from dendrux.types import UsageStats
 
@@ -309,6 +310,19 @@ class TestGetLLMCalls:
         assert len(only) == 1
         assert only[0].iteration == 1
 
+    async def test_sql_pagination(self, store, internal_store) -> None:
+        """limit/offset push to SQL — ordered by iteration_index."""
+        await internal_store.create_run("r1", "Agent")
+        for i in range(5):
+            await internal_store.save_llm_interaction(
+                "r1",
+                iteration_index=i,
+                usage=UsageStats(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+
+        page = await store.get_llm_calls("r1", limit=2, offset=2)
+        assert [c.iteration for c in page] == [2, 3]
+
 
 # ------------------------------------------------------------------
 # get_tool_invocations
@@ -360,6 +374,62 @@ class TestGetToolInvocations:
         only = await store.get_tool_invocations("r1", iteration=1)
         assert len(only) == 1
         assert only[0].iteration == 1
+
+    async def test_sql_pagination(self, store, internal_store) -> None:
+        """limit/offset push to SQL — ordered by created_at + id."""
+        await internal_store.create_run("r1", "Agent")
+        for i in range(4):
+            await internal_store.save_tool_call(
+                "r1",
+                tool_call_id=f"tc_{i}",
+                provider_tool_call_id=None,
+                tool_name="noop",
+                target="server",
+                params={},
+                result_payload='""',
+                success=True,
+                duration_ms=1,
+                iteration_index=i,
+            )
+
+        page = await store.get_tool_invocations("r1", limit=2, offset=1)
+        assert len(page) == 2
+
+
+# ------------------------------------------------------------------
+# get_traces
+# ------------------------------------------------------------------
+
+
+class TestGetTraces:
+    async def test_returns_public_dataclass_ordered(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.save_trace("r1", "user", "hello", order_index=0)
+        await internal_store.save_trace("r1", "assistant", "hi", order_index=1)
+        await internal_store.save_trace(
+            "r1", "tool", '{"result": 42}', order_index=2, meta={"call_id": "c1"}
+        )
+
+        traces = await store.get_traces("r1")
+        assert len(traces) == 3
+        assert all(isinstance(t, TraceEntry) for t in traces)
+        assert [t.role for t in traces] == ["user", "assistant", "tool"]
+        assert [t.order_index for t in traces] == [0, 1, 2]
+        assert traces[2].meta == {"call_id": "c1"}
+
+    async def test_unknown_run_returns_empty(self, store) -> None:
+        assert await store.get_traces("missing") == []
+
+    async def test_sql_pagination(self, store, internal_store) -> None:
+        """limit/offset push to SQL — ordered by order_index."""
+        await internal_store.create_run("r1", "Agent")
+        for i in range(5):
+            await internal_store.save_trace(
+                "r1", "user" if i % 2 == 0 else "assistant", f"msg {i}", order_index=i
+            )
+
+        page = await store.get_traces("r1", limit=2, offset=1)
+        assert [t.order_index for t in page] == [1, 2]
 
 
 # ------------------------------------------------------------------

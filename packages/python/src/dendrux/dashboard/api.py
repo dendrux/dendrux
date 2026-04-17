@@ -25,6 +25,29 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import DelegationInfo, StateStore
 
 
+async def _count_pauses_per_run(state_store: StateStore, run_ids: list[str]) -> dict[str, int]:
+    """Count ``run.paused`` events per run_id.
+
+    Uses ``StateStore.count_pauses_per_run`` when the backend exposes it
+    (the default SQLAlchemy implementation does — single GROUP BY). Falls
+    back to a per-run ``get_run_events(event_types=["run.paused"])`` loop
+    for custom backends that don't implement the batch method.
+    """
+    if not run_ids:
+        return {}
+    batch = getattr(state_store, "count_pauses_per_run", None)
+    if batch is not None:
+        counts: dict[str, int] = await batch(run_ids)
+        return counts
+    result: dict[str, int] = {}
+    for rid in run_ids:
+        events = await state_store.get_run_events(rid, event_types=["run.paused"])
+        count = len(events)
+        if count:
+            result[rid] = count
+    return result
+
+
 def _utc_iso(ts: datetime | None) -> str | None:
     """Format a naive UTC datetime as ISO 8601 with Z suffix.
 
@@ -139,60 +162,51 @@ def create_dashboard_api(
     ) -> dict[str, Any]:
         """List runs with filters.
 
-        When the agent filter is used, we fetch up to 1000 rows from the
-        DB, filter in Python, then paginate the filtered results. Both
-        results and total are approximate beyond that window.
-
-        This is correct for a local dev tool. At scale, agent filtering
-        should move to a DB query parameter on StateStore.list_runs().
+        Uses SQL-side filtering through StateStore — the same query
+        surface that powers the public ``RunStore``. Pause counts are
+        rolled up in a single aggregation query (no N+1).
         """
-        if agent:
-            # Fetch a larger window to filter from, then paginate
-            all_runs = await state_store.list_runs(
-                limit=1000,
-                offset=0,
-                status=status,
-                tenant_id=tenant,
-            )
-            filtered = [r for r in all_runs if r.agent_name == agent]
-            total_filtered = len(filtered)
-            clamped_offset = max(0, offset)
-            runs = filtered[clamped_offset : clamped_offset + min(limit, 200)]
-        else:
-            runs = await state_store.list_runs(
-                limit=min(limit, 200),
-                offset=max(0, offset),
-                status=status,
-                tenant_id=tenant,
-            )
-            # Total is approximate without a COUNT query — acceptable for dev tool
-            total_filtered = len(runs)
+        capped_limit = min(max(1, limit), 200)
+        clamped_offset = max(0, offset)
 
-        items = []
-        for r in runs:
-            # Count pause events for the "Pauses" column
-            events = await state_store.get_run_events(r.id)
-            pause_count = sum(1 for e in events if e.event_type == "run.paused")
+        runs = await state_store.list_runs(
+            limit=capped_limit,
+            offset=clamped_offset,
+            status=status,
+            tenant_id=tenant,
+            agent_name=agent,
+        )
+        total_filtered = await state_store.count_runs(
+            status=status,
+            tenant_id=tenant,
+            agent_name=agent,
+        )
 
-            items.append(
-                {
-                    "run_id": r.id,
-                    "agent_name": r.agent_name,
-                    "status": r.status,
-                    "iteration_count": r.iteration_count,
-                    "total_input_tokens": r.total_input_tokens,
-                    "total_output_tokens": r.total_output_tokens,
-                    "total_cost_usd": r.total_cost_usd,
-                    "total_cache_read_tokens": r.total_cache_read_tokens,
-                    "total_cache_creation_tokens": r.total_cache_creation_tokens,
-                    "model": r.model,
-                    "parent_run_id": r.parent_run_id,
-                    "delegation_level": r.delegation_level,
-                    "pause_count": pause_count,
-                    "created_at": _utc_iso(r.created_at),
-                    "updated_at": _utc_iso(r.updated_at),
-                }
-            )
+        # Batch aggregation on the default SQLAlchemy backend; falls back
+        # to a per-run query on custom StateStore implementations that
+        # don't expose count_pauses_per_run.
+        pause_counts = await _count_pauses_per_run(state_store, [r.id for r in runs])
+
+        items = [
+            {
+                "run_id": r.id,
+                "agent_name": r.agent_name,
+                "status": r.status,
+                "iteration_count": r.iteration_count,
+                "total_input_tokens": r.total_input_tokens,
+                "total_output_tokens": r.total_output_tokens,
+                "total_cost_usd": r.total_cost_usd,
+                "total_cache_read_tokens": r.total_cache_read_tokens,
+                "total_cache_creation_tokens": r.total_cache_creation_tokens,
+                "model": r.model,
+                "parent_run_id": r.parent_run_id,
+                "delegation_level": r.delegation_level,
+                "pause_count": pause_counts.get(r.id, 0),
+                "created_at": _utc_iso(r.created_at),
+                "updated_at": _utc_iso(r.updated_at),
+            }
+            for r in runs
+        ]
 
         return {"runs": items, "total": total_filtered}
 

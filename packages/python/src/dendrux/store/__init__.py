@@ -151,6 +151,17 @@ class ToolInvocation:
 
 
 @dataclass(frozen=True, slots=True)
+class TraceEntry:
+    """One entry in the conversation trace — user / assistant / tool message."""
+
+    role: str
+    content: str
+    order_index: int
+    meta: dict[str, Any] | None
+    created_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class PausePair:
     """A pause/resume cycle derived from ``run_events``.
 
@@ -334,9 +345,17 @@ class RunStore:
         run_id: str,
         *,
         iteration: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[LLMCall]:
-        """Return LLM interactions for a run, optionally filtered by iteration."""
-        rows = await self._state.get_llm_interactions(run_id, iteration_index=iteration)
+        """Return LLM interactions for a run. ``limit``/``offset`` push
+        pagination into SQL."""
+        rows = await self._state.get_llm_interactions(
+            run_id,
+            iteration_index=iteration,
+            limit=limit,
+            offset=offset,
+        )
         return [_llm_to_public(r) for r in rows]
 
     async def get_tool_invocations(
@@ -344,10 +363,31 @@ class RunStore:
         run_id: str,
         *,
         iteration: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ToolInvocation]:
-        """Return tool invocations for a run, optionally filtered by iteration."""
-        rows = await self._state.get_tool_calls(run_id, iteration_index=iteration)
+        """Return tool invocations for a run. ``limit``/``offset`` push
+        pagination into SQL."""
+        rows = await self._state.get_tool_calls(
+            run_id,
+            iteration_index=iteration,
+            limit=limit,
+            offset=offset,
+        )
         return [_tool_to_public(r) for r in rows]
+
+    async def get_traces(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[TraceEntry]:
+        """Return the conversation trace (user / assistant / tool messages)
+        for a run, ordered by ``order_index``. ``limit``/``offset`` push
+        pagination into SQL."""
+        rows = await self._state.get_traces(run_id, limit=limit, offset=offset)
+        return [_trace_to_public(r) for r in rows]
 
     async def get_pauses(self, run_id: str) -> list[PausePair]:
         """Derive pause/resume cycles from ``run_events``.
@@ -442,6 +482,16 @@ def _llm_to_public(record: Any) -> LLMCall:
     )
 
 
+def _trace_to_public(record: Any) -> TraceEntry:
+    return TraceEntry(
+        role=record.role,
+        content=record.content,
+        order_index=record.order_index,
+        meta=record.meta,
+        created_at=record.created_at,
+    )
+
+
 def _tool_to_public(record: Any) -> ToolInvocation:
     iteration = record.iteration_index if record.iteration_index is not None else 0
     return ToolInvocation(
@@ -506,4 +556,5 @@ __all__ = [
     "RunSummary",
     "StoredEvent",
     "ToolInvocation",
+    "TraceEntry",
 ]
