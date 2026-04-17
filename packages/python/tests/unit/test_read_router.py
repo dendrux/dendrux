@@ -6,6 +6,9 @@ with a small auth dependency injected by the test.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -286,6 +289,189 @@ class TestGetEventsEndpoint:
         async with await _client(app) as http:
             resp = await http.get("/runs/missing/events")
             assert resp.status_code == 404
+
+
+# ------------------------------------------------------------------
+# GET /runs/{run_id}/events/stream — DB-backed SSE
+# ------------------------------------------------------------------
+
+
+def _parse_sse_frames(raw: str) -> list[dict[str, str]]:
+    """Parse a block of raw SSE text into a list of frame dicts.
+
+    Each frame ends with a blank line. Comment lines (``: foo``) produce
+    a frame with ``{"comment": "foo"}``. Data lines are concatenated.
+    """
+    import json as _json
+
+    frames: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    data_lines: list[str] = []
+    for line in raw.splitlines():
+        if line == "":
+            if data_lines:
+                current["data"] = "\n".join(data_lines)
+                with contextlib.suppress(_json.JSONDecodeError, KeyError):
+                    current["json"] = _json.loads(current["data"])
+            if current:
+                frames.append(current)
+            current = {}
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            frames.append({"comment": line[1:].lstrip()})
+            continue
+        field, _, value = line.partition(":")
+        value = value.lstrip()
+        if field == "data":
+            data_lines.append(value)
+        else:
+            current[field] = value
+    return frames
+
+
+class TestSseGenerator:
+    """Unit tests for the SSE generator function — decoupled from HTTP
+    transport so timing is deterministic."""
+
+    async def test_yields_existing_events(self, store, internal_store, monkeypatch) -> None:
+        import dendrux.http.read_router as _rr
+
+        monkeypatch.setattr(_rr, "_SSE_POLL_INTERVAL_S", 0.01)
+
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
+        await internal_store.save_run_event("r1", event_type="llm.completed", sequence_index=1)
+
+        gen = _rr._sse_event_generator(store, "r1", cursor=None)
+        frame1 = await gen.__anext__()
+        frame2 = await gen.__anext__()
+        await gen.aclose()
+
+        assert "id: 0" in frame1
+        assert "event: message" in frame1
+        assert '"sequence_index": 0' in frame1
+        assert '"event_type": "run.started"' in frame1
+
+        assert "id: 1" in frame2
+        assert '"sequence_index": 1' in frame2
+
+    async def test_cursor_skips_events(self, store, internal_store, monkeypatch) -> None:
+        import dendrux.http.read_router as _rr
+
+        monkeypatch.setattr(_rr, "_SSE_POLL_INTERVAL_S", 0.01)
+
+        await internal_store.create_run("r1", "Agent")
+        for i in range(3):
+            await internal_store.save_run_event("r1", event_type="tick", sequence_index=i)
+
+        gen = _rr._sse_event_generator(store, "r1", cursor=1)
+        frame = await gen.__anext__()
+        await gen.aclose()
+
+        assert '"sequence_index": 2' in frame
+        assert "id: 2" in frame
+
+    async def test_live_events_delivered(self, store, internal_store, monkeypatch) -> None:
+        import dendrux.http.read_router as _rr
+
+        monkeypatch.setattr(_rr, "_SSE_POLL_INTERVAL_S", 0.01)
+
+        await internal_store.create_run("r1", "Agent")
+
+        gen = _rr._sse_event_generator(store, "r1", cursor=None)
+
+        async def _write_later() -> None:
+            await asyncio.sleep(0.05)
+            await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=0)
+
+        write_task = asyncio.create_task(_write_later())
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+        await write_task
+        await gen.aclose()
+
+        assert '"event_type": "run.completed"' in frame
+
+    async def test_heartbeat_when_idle(self, store, internal_store, monkeypatch) -> None:
+        import dendrux.http.read_router as _rr
+
+        monkeypatch.setattr(_rr, "_SSE_HEARTBEAT_INTERVAL_S", 0.01)
+        monkeypatch.setattr(_rr, "_SSE_POLL_INTERVAL_S", 0.005)
+
+        await internal_store.create_run("r1", "Agent")
+
+        gen = _rr._sse_event_generator(store, "r1", cursor=None)
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+        await gen.aclose()
+
+        assert frame.startswith(": keepalive")
+
+    async def test_cancellation_cleans_up(self, store, internal_store) -> None:
+        """Cancelling the generator while it's waiting on a sleep must
+        close without leaving tasks or sessions behind."""
+        from dendrux.http.read_router import _sse_event_generator
+
+        await internal_store.create_run("r1", "Agent")
+
+        gen = _sse_event_generator(store, "r1", cursor=None)
+        task = asyncio.create_task(gen.__anext__())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await gen.aclose()
+
+
+class TestSseHttpEndpoint:
+    """Smoke tests over HTTP — verify the endpoint is wired. Deep
+    behavior is covered by ``TestSseGenerator`` above, which exercises
+    the generator directly without HTTP streaming quirks."""
+
+    async def test_404_before_stream_opens(self, store) -> None:
+        """Unknown run_id returns 404 without starting the stream."""
+        app = _build_app(store)
+        async with await _client(app) as http:
+            resp = await http.get("/runs/missing/events/stream")
+            assert resp.status_code == 404
+
+    async def test_auth_dep_applies(self, store, internal_store) -> None:
+        """SSE endpoint is gated by the same auth dep as other routes."""
+
+        async def deny() -> None:
+            raise HTTPException(status_code=401, detail="nope")
+
+        await internal_store.create_run("r1", "Agent")
+
+        app = _build_app(store, authorize=deny)
+        async with await _client(app) as http:
+            resp = await http.get("/runs/r1/events/stream")
+            assert resp.status_code == 401
+
+
+class TestResolveSseCursor:
+    """Direct unit tests for cursor resolution — avoids HTTP streaming
+    gymnastics in the test client."""
+
+    def test_header_int_wins(self) -> None:
+        from dendrux.http.read_router import _resolve_sse_cursor
+
+        assert _resolve_sse_cursor("42", after=100) == 42
+
+    def test_no_header_uses_after(self) -> None:
+        from dendrux.http.read_router import _resolve_sse_cursor
+
+        assert _resolve_sse_cursor(None, after=7) == 7
+
+    def test_empty_header_uses_after(self) -> None:
+        from dendrux.http.read_router import _resolve_sse_cursor
+
+        assert _resolve_sse_cursor("", after=7) == 7
+
+    def test_malformed_header_falls_back_to_after(self) -> None:
+        from dendrux.http.read_router import _resolve_sse_cursor
+
+        assert _resolve_sse_cursor("not-a-number", after=5) == 5
+        assert _resolve_sse_cursor("not-a-number", after=None) is None
 
     async def test_limit_above_max_returns_422(self, store, internal_store) -> None:
         """Query validation rejects limits beyond the cap."""

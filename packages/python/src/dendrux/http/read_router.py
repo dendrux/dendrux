@@ -7,35 +7,50 @@ liveness/readiness probes can reach it without secrets). Auth failures
 raise ``HTTPException`` from that dependency; this module does not
 interpret the dependency's return value.
 
-Endpoints in this release (PR 2):
+Endpoints:
 
     GET /health
     GET /runs
     GET /runs/{run_id}
     GET /runs/{run_id}/events
+    GET /runs/{run_id}/events/stream   (Server-Sent Events)
     GET /runs/{run_id}/llm-calls
     GET /runs/{run_id}/tool-calls
     GET /runs/{run_id}/traces
     GET /runs/{run_id}/pauses
-
-SSE streaming (``/runs/{run_id}/events/stream``) lands in PR 3.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
     from datetime import datetime
 
-    from dendrux.store import RunStore
+    from dendrux.store import RunStore, StoredEvent
 
 
 _DRILL_DOWN_LIMIT_DEFAULT = 100
 _DRILL_DOWN_LIMIT_MAX = 1000
+
+# How often the SSE endpoint emits a keepalive comment when no events
+# arrive. Overridable in tests via monkeypatch. Nginx's default
+# `proxy_read_timeout` is 60s, so anything well under that works.
+_SSE_HEARTBEAT_INTERVAL_S = 15.0
+
+# How often the SSE endpoint polls the DB for new events when the stream
+# is idle. Overridable in tests. Per concurrent SSE connection, this
+# produces ~(1 / _SSE_POLL_INTERVAL_S) DB queries per second. At default
+# 0.5s that's 2 QPS per connection. A planned Postgres LISTEN/NOTIFY
+# backend will replace polling with push notifications — until then,
+# dev should size their connection pool for expected SSE fanout.
+_SSE_POLL_INTERVAL_S = 0.5
 
 
 def make_read_router(
@@ -127,6 +142,46 @@ def make_read_router(
         next_cursor = events[-1].sequence_index if events else after
         return {"items": events, "next_cursor": next_cursor}
 
+    @auth_router.get("/runs/{run_id}/events/stream")
+    async def stream_events(
+        run_id: str,
+        request: Request,
+        after: int | None = None,
+    ) -> StreamingResponse:
+        """Server-Sent Events stream of new run events.
+
+        Reads from ``run_events`` via ``RunStore.get_events`` in a per-
+        connection polling loop. No shared queue, no fan-out manager —
+        each connection is an independent async iterator.
+
+        Cursor resolution (first match wins):
+          1. ``Last-Event-ID`` header (SSE reconnect convention)
+          2. ``?after=N`` query param
+          3. ``None`` (stream from the beginning of the log)
+
+        Emits a ``: keepalive`` comment line every
+        ``_SSE_HEARTBEAT_INTERVAL_S`` seconds of idleness so reverse
+        proxies don't close the connection.
+
+        The stream stays open until the client disconnects; terminal
+        run events (``run.succeeded``/``.failed``/``.cancelled``) are
+        emitted as normal frames and the client decides when to leave.
+        """
+        run = await store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+
+        cursor = _resolve_sse_cursor(request.headers.get("last-event-id"), after)
+
+        return StreamingResponse(
+            _sse_event_generator(store, run_id, cursor),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # disable nginx buffering
+            },
+        )
+
     @auth_router.get("/runs/{run_id}/llm-calls")
     async def get_llm_calls(
         run_id: str,
@@ -177,3 +232,74 @@ def make_read_router(
 
     router.include_router(auth_router)
     return router
+
+
+def _resolve_sse_cursor(last_event_id: str | None, after: int | None) -> int | None:
+    """Resolve an SSE cursor from the ``Last-Event-ID`` header and
+    ``?after=N`` query param.
+
+    Precedence: a valid integer in the header wins. A malformed header
+    (non-integer) falls back to ``after`` silently — SSE clients and
+    reverse proxies occasionally inject junk values on reconnect, and
+    500ing on them would break reconnection flows.
+    """
+    if last_event_id:
+        try:
+            return int(last_event_id)
+        except ValueError:
+            pass
+    return after
+
+
+async def _sse_event_generator(
+    store: RunStore,
+    run_id: str,
+    cursor: int | None,
+) -> AsyncIterator[str]:
+    """Yield SSE frames (events + heartbeat comments) until disconnect.
+
+    Uses ``store.get_events`` in a polling loop rather than
+    ``store.stream_events`` so heartbeat timing can be fused with poll
+    timing in one coroutine (no concurrent-task juggling). Each iteration
+    opens and closes its own DB session — no transaction is held across
+    ``asyncio.sleep``.
+    """
+    loop = asyncio.get_running_loop()
+    last_write = loop.time()
+    while True:
+        events = await store.get_events(run_id, after_sequence_index=cursor, limit=100)
+        if events:
+            for ev in events:
+                yield _format_sse_frame(ev)
+                cursor = ev.sequence_index
+            last_write = loop.time()
+            # Keep draining when the batch is full — more may be buffered.
+            if len(events) == 100:
+                continue
+
+        # Idle — emit heartbeat if due, then sleep before next poll.
+        if loop.time() - last_write >= _SSE_HEARTBEAT_INTERVAL_S:
+            yield ": keepalive\n\n"
+            last_write = loop.time()
+
+        await asyncio.sleep(_SSE_POLL_INTERVAL_S)
+
+
+def _format_sse_frame(event: StoredEvent) -> str:
+    """Encode a StoredEvent as one SSE frame.
+
+    Uses ``event: message`` (the SSE default) with ``event_type`` inside
+    the JSON payload so generic clients that dispatch on the SSE event
+    name don't have to pre-enroll every Dendrux event type.
+    """
+    payload = {
+        "sequence_index": event.sequence_index,
+        "iteration_index": event.iteration_index,
+        "event_type": event.event_type,
+        "correlation_id": event.correlation_id,
+        "timestamp": event.created_at.isoformat() + "Z" if event.created_at is not None else None,
+        "data": event.data,
+    }
+    return (
+        f"id: {event.sequence_index}\nevent: message\ndata: {json.dumps(payload, default=str)}\n\n"
+    )
