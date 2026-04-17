@@ -1,0 +1,1132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dendrux — Full-Stack Demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* Neutral base (zinc-ish off-black, no pure black) */
+    --bg:          #0a0a0c;
+    --surface:     #111114;
+    --surface-2:   #16161a;
+    --border:      #222228;
+    --border-soft: #1a1a1f;
+    --text:        #edeef1;
+    --text-muted:  #8e8f98;
+    --text-faint:  #5a5b64;
+
+    /* Single accent (desaturated electric blue, <80% saturation) */
+    --accent:      #3b82f6;
+    --accent-hi:   #60a5fa;
+    --accent-soft: rgba(59, 130, 246, .14);
+    --accent-ring: rgba(59, 130, 246, .22);
+
+    /* Governance taxonomy — distinct semantics, muted saturation */
+    --redact:   #34d399;           /* emerald */
+    --block:    #f87171;           /* rose-400 */
+    --warn:     #facc15;           /* amber (warn-only) */
+    --deny:     #e11d48;           /* deep rose (replaces AI purple) */
+    --budget:   #38bdf8;           /* sky */
+    --approve:  #f59e0b;           /* amber-deep */
+    --done:     #34d399;
+    --pause:    #f59e0b;
+    --danger:   #f87171;
+
+    /* Timing curve — fluid-CSS band */
+    --ease:     cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Geist', -apple-system, 'SF Pro Text', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.55;
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.005em;
+  }
+  .mono, code, kbd { font-family: 'Geist Mono', ui-monospace, 'SF Mono', Menlo, monospace; font-size: .88em; }
+
+  /* --- Header ------------------------------------------------------------ */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    backdrop-filter: blur(12px) saturate(140%);
+    -webkit-backdrop-filter: blur(12px) saturate(140%);
+    background: rgba(10, 10, 12, .7);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .header-inner {
+    max-width: 1280px; margin: 0 auto;
+    padding: 14px 24px;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand .logo {
+    font-weight: 600; font-size: 15px; letter-spacing: -.015em;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .brand .logo-mark { width: 22px; height: 22px; color: var(--accent-hi); }
+  .brand .tag {
+    font-size: 11.5px; color: var(--text-muted);
+    border: 1px solid var(--border); padding: 3px 9px; border-radius: 999px;
+    background: var(--surface);
+  }
+  .header-actions { display: flex; gap: 6px; align-items: center; }
+  .link-btn {
+    font-size: 12.5px; padding: 6px 11px;
+    color: var(--text-muted); text-decoration: none;
+    border: 1px solid transparent; border-radius: 7px;
+    display: inline-flex; align-items: center; gap: 5px;
+    transition: color .2s var(--ease), border-color .2s var(--ease), background .2s var(--ease);
+  }
+  .link-btn:hover { color: var(--text); border-color: var(--border); background: var(--surface); }
+  .link-btn svg { width: 13px; height: 13px; }
+
+  /* --- App shell — asymmetric with breathing room --------------------- */
+  .shell {
+    max-width: 1280px; margin: 0 auto;
+    padding: 32px 24px 24px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    gap: 28px;
+  }
+  @media (max-width: 960px) {
+    .shell { grid-template-columns: 1fr; padding: 16px; gap: 16px; }
+  }
+
+  /* --- Composer --------------------------------------------------------- */
+  .composer {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
+    padding: 14px;
+    display: flex; flex-direction: column; gap: 12px;
+    transition: border-color .25s var(--ease);
+  }
+  .composer:focus-within { border-color: var(--border); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > input, .row > select { font: inherit; color: inherit; }
+  select, input, button, textarea { font: inherit; }
+
+  select {
+    appearance: none; -webkit-appearance: none;
+    background: var(--surface-2);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M0 0l5 6 5-6z' fill='%238e8f98'/></svg>");
+    background-repeat: no-repeat; background-position: right 11px center;
+    border: 1px solid var(--border); border-radius: 9px;
+    padding: 9px 30px 9px 12px; color: var(--text); cursor: pointer;
+    transition: border-color .2s var(--ease);
+  }
+  select:hover { border-color: #2e2e36; }
+  input[type="text"] {
+    flex: 1; min-width: 220px;
+    background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 9px;
+    padding: 9px 12px; color: var(--text);
+    transition: border-color .2s var(--ease), box-shadow .2s var(--ease);
+  }
+  input[type="text"]::placeholder { color: var(--text-faint); }
+  input[type="text"]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
+
+  .btn {
+    font-size: 13px; font-weight: 500;
+    padding: 9px 16px; border-radius: 9px; border: 1px solid transparent;
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: background .2s var(--ease), border-color .2s var(--ease),
+                transform .15s var(--ease), box-shadow .2s var(--ease);
+  }
+  .btn:active:not(:disabled) { transform: translateY(-1px); }
+  .btn svg { width: 13px; height: 13px; }
+
+  .btn-primary { background: var(--accent); color: #fff; box-shadow: 0 1px 0 rgba(255,255,255,.08) inset; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hi); }
+  .btn-primary:disabled { background: #1f3558; color: #7a93b5; cursor: not-allowed; box-shadow: none; }
+
+  .btn-danger {
+    background: transparent; color: var(--danger);
+    border-color: rgba(248, 113, 113, .25);
+  }
+  .btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, .08); border-color: rgba(248, 113, 113, .55); }
+  .btn-danger:disabled { color: #5b2e2e; border-color: rgba(248, 113, 113, .12); cursor: not-allowed; }
+
+  .chip-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .chip-label { color: var(--text-faint); font-size: 11.5px; margin-right: 4px; letter-spacing: .01em; }
+  .chip {
+    font-size: 12px; padding: 6px 11px; border-radius: 999px;
+    background: var(--surface-2); color: var(--text-muted);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: color .2s var(--ease), border-color .2s var(--ease),
+                background .2s var(--ease), transform .15s var(--ease);
+  }
+  .chip:hover { color: var(--text); border-color: #2e2e36; background: #1b1b21; }
+  .chip:active { transform: translateY(-1px); }
+  .chip svg { width: 13px; height: 13px; opacity: .75; }
+  .chip:hover svg { opacity: 1; }
+
+  /* --- Messages & conversation ---------------------------------------- */
+  .conversation { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+  .message {
+    padding: 12px 14px;
+    border-radius: 12px;
+    line-height: 1.6;
+    font-size: 14.5px;
+    animation: slideIn .3s var(--ease);
+  }
+  .message.user {
+    background: var(--accent-soft);
+    border: 1px solid rgba(59, 130, 246, .22);
+    color: #d3e1f7;
+  }
+  .message.agent {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-left: 2px solid var(--done);
+  }
+  .message .role {
+    font-size: 10.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .12em;
+    color: var(--text-faint); margin-bottom: 6px;
+  }
+  .message .body { white-space: pre-wrap; word-wrap: break-word; }
+
+  /* Skeleton while agent works */
+  .skel {
+    margin-top: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-left: 2px solid var(--accent);
+    border-radius: 12px;
+    padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 8px;
+    animation: slideIn .3s var(--ease);
+  }
+  .skel .role {
+    font-size: 10.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .12em;
+    color: var(--accent); display: flex; align-items: center; gap: 6px;
+  }
+  .skel-line {
+    height: 8px; border-radius: 4px;
+    background: linear-gradient(90deg, #17171c 0%, #202027 50%, #17171c 100%);
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
+  }
+  .skel-line.w-80 { width: 80%; }
+  .skel-line.w-60 { width: 60%; }
+  .skel-line.w-40 { width: 40%; }
+  .breathing { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s var(--ease) infinite; }
+
+  /* --- Run divider ---------------------------------------------------- */
+  .run-divider {
+    display: flex; align-items: center; gap: 10px;
+    margin: 16px 2px 4px;
+    color: var(--text-faint); font-size: 10.5px;
+    text-transform: uppercase; letter-spacing: .12em;
+    animation: slideIn .3s var(--ease);
+  }
+  .run-divider::before, .run-divider::after {
+    content: ""; flex: 1; height: 1px; background: var(--border-soft);
+  }
+
+  /* --- Tool pause form ------------------------------------------------ */
+  .tool-form {
+    margin-top: 14px;
+    background: var(--surface);
+    border: 1px solid rgba(245, 158, 11, .35);
+    border-left: 2px solid var(--pause);
+    border-radius: 12px;
+    padding: 14px;
+    display: none;
+    animation: slideIn .3s var(--ease);
+  }
+  .tool-form.active { display: block; }
+
+  /* --- Inline approval form (mirrors tool-form structure) ------------- */
+  .approval-inline {
+    margin-top: 14px;
+    background: var(--surface);
+    border: 1px solid rgba(245, 158, 11, .35);
+    border-left: 2px solid var(--approve);
+    border-radius: 12px;
+    padding: 14px;
+    display: none;
+    animation: slideIn .3s var(--ease);
+  }
+  .approval-inline.active { display: block; }
+  .approval-inline .head {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13.5px; font-weight: 500; color: var(--approve); margin-bottom: 8px;
+  }
+  .approval-inline .head svg { width: 14px; height: 14px; }
+  .approval-inline .explain {
+    font-size: 12.5px; color: var(--text-muted); line-height: 1.6;
+    margin-bottom: 10px; max-width: 65ch;
+  }
+  .approval-inline .explain code {
+    background: var(--surface-2); padding: 1px 5px; border-radius: 4px;
+    color: var(--text); border: 1px solid var(--border-soft);
+  }
+  .approval-inline .args {
+    background: var(--surface-2); border: 1px solid var(--border-soft);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
+  }
+  .approval-inline .args-label {
+    font-size: 10.5px; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: .12em; margin-bottom: 6px;
+  }
+  .approval-inline .arg-row {
+    font-family: 'Geist Mono', ui-monospace, monospace; font-size: 12.5px;
+    display: flex; gap: 10px; align-items: baseline; padding: 2px 0;
+  }
+  .approval-inline .arg-row .k { color: var(--text-muted); min-width: 80px; flex-shrink: 0; }
+  .approval-inline .arg-row .v { color: var(--text); word-break: break-all; }
+  .approval-inline .foot { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .approval-inline .btn-approve {
+    font: inherit; font-size: 13px; font-weight: 500; padding: 9px 16px;
+    border-radius: 9px; border: 1px solid transparent;
+    background: #15803d; color: #fff; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: background .2s var(--ease), transform .15s var(--ease);
+  }
+  .approval-inline .btn-approve:hover:not(:disabled) { background: #166534; }
+  .approval-inline .btn-approve:active:not(:disabled) { transform: translateY(-1px); }
+  .approval-inline .btn-approve svg { width: 13px; height: 13px; }
+  .approval-inline .btn-reject {
+    font: inherit; font-size: 13px; font-weight: 500; padding: 9px 16px;
+    border-radius: 9px; border: 1px solid rgba(248, 113, 113, .25);
+    background: transparent; color: var(--block); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: background .2s var(--ease), border-color .2s var(--ease), transform .15s var(--ease);
+  }
+  .approval-inline .btn-reject:hover:not(:disabled) { background: rgba(248, 113, 113, .08); border-color: rgba(248, 113, 113, .55); }
+  .approval-inline .btn-reject:active:not(:disabled) { transform: translateY(-1px); }
+  .approval-inline .btn-reject svg { width: 13px; height: 13px; }
+  .approval-inline button:disabled { opacity: .45; cursor: not-allowed; }
+  .approval-inline input[type="text"] {
+    flex: 1; min-width: 200px;
+    background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 9px;
+    padding: 9px 12px; color: var(--text); font: inherit;
+    transition: border-color .2s var(--ease), box-shadow .2s var(--ease);
+  }
+  .approval-inline input[type="text"]:focus { outline: none; border-color: var(--block); box-shadow: 0 0 0 3px rgba(248, 113, 113, .18); }
+  .approval-inline .reject-row { display: none; margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .approval-inline .reject-row.active { display: flex; }
+  .tool-form .head {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13.5px; font-weight: 500; color: var(--pause); margin-bottom: 8px;
+  }
+  .tool-form .head svg { width: 14px; height: 14px; }
+  .tool-form .explain {
+    font-size: 12.5px; color: var(--text-muted); line-height: 1.6;
+    margin-bottom: 10px; max-width: 65ch;
+  }
+  .tool-form .explain code {
+    background: var(--surface-2); padding: 1px 5px; border-radius: 4px;
+    color: var(--text); border: 1px solid var(--border-soft);
+  }
+  .tool-form .args {
+    background: var(--surface-2); border: 1px solid var(--border-soft);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
+  }
+  .tool-form .args-label {
+    font-size: 10.5px; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: .12em; margin-bottom: 6px;
+  }
+  .tool-form .arg-row {
+    font-family: 'Geist Mono', ui-monospace, monospace; font-size: 12.5px;
+    display: flex; gap: 10px; align-items: baseline;
+    padding: 2px 0;
+  }
+  .tool-form .arg-row .k { color: var(--text-muted); min-width: 80px; flex-shrink: 0; }
+  .tool-form .arg-row .v { color: var(--text); word-break: break-all; }
+  .tool-form textarea {
+    width: 100%; min-height: 72px;
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 9px;
+    padding: 10px 12px; resize: vertical; margin-bottom: 10px;
+    font-family: 'Geist', system-ui, sans-serif;
+    transition: border-color .2s var(--ease), box-shadow .2s var(--ease);
+  }
+  .tool-form textarea:focus { outline: none; border-color: var(--pause); box-shadow: 0 0 0 3px rgba(245, 158, 11, .18); }
+  .tool-form .foot { display: flex; gap: 12px; align-items: center; }
+  .tool-form .foot .meta {
+    font-size: 11.5px; color: var(--text-faint);
+    display: flex; align-items: center; gap: 5px;
+  }
+  .tool-form .foot .meta code { color: var(--text-muted); background: var(--surface-2); padding: 1px 6px; border-radius: 4px; }
+
+  /* --- Timeline ------------------------------------------------------- */
+  .section { margin-top: 22px; }
+  .section-title {
+    font-size: 10.5px; font-weight: 600; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: .12em; margin-bottom: 10px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .timeline { display: flex; flex-direction: column; gap: 3px; }
+  .timeline-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 12.5px; color: var(--text-muted);
+    border-left: 2px solid transparent;
+    transition: background .2s var(--ease);
+    animation: slideIn .25s var(--ease);
+  }
+  .timeline-item:hover { background: var(--surface); }
+  .timeline-item .dot {
+    width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+    background: var(--text-faint);
+  }
+  .timeline-item .t { flex: 1; }
+  .timeline-item .ts {
+    font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10.5px;
+    color: var(--text-faint);
+  }
+  .timeline-item.start  { border-left-color: var(--accent); }
+  .timeline-item.start  .dot { background: var(--accent); }
+  .timeline-item.step   .dot { background: #8b7dd9; }
+  .timeline-item.pause  { border-left-color: var(--pause); color: var(--pause); }
+  .timeline-item.pause  .dot { background: var(--pause); }
+  .timeline-item.done   { border-left-color: var(--done); color: var(--done); }
+  .timeline-item.done   .dot { background: var(--done); }
+  .timeline-item.err    { border-left-color: var(--danger); color: var(--danger); }
+  .timeline-item.err    .dot { background: var(--danger); }
+  .timeline-item.cancel { border-left-color: #fb923c; color: #fb923c; }
+  .timeline-item.cancel .dot { background: #fb923c; }
+
+  /* --- Sidebar -------------------------------------------------------- */
+  .sidebar {
+    position: sticky; top: 80px;
+    height: fit-content;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .sidebar-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 10.5px; font-weight: 600; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: .12em;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .sidebar-head .counter {
+    font-family: 'Geist Mono', ui-monospace, monospace; font-weight: 500;
+    font-size: 10.5px; padding: 2px 7px; border-radius: 999px;
+    background: var(--surface-2); color: var(--text-muted);
+    border: 1px solid var(--border-soft);
+    letter-spacing: 0;
+  }
+  .empty {
+    padding: 18px 8px; text-align: center;
+    color: var(--text-faint); font-size: 12.5px; line-height: 1.55;
+    animation: slideIn .3s var(--ease);
+  }
+  .empty .icon {
+    display: flex; justify-content: center; margin-bottom: 8px; opacity: .6;
+  }
+  .empty .icon svg { width: 22px; height: 22px; }
+
+  /* --- Safety cards --------------------------------------------------- */
+  .card {
+    padding: 11px 13px; border-radius: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-left: 2px solid;
+    font-size: 12.5px;
+    box-shadow: 0 1px 0 rgba(0,0,0,.3);
+    animation: slideIn .3s var(--ease);
+  }
+  .card .title {
+    font-weight: 500; font-size: 13px; margin-bottom: 5px;
+    display: flex; align-items: center; gap: 7px;
+    letter-spacing: -.005em;
+  }
+  .card .title svg { width: 13px; height: 13px; flex-shrink: 0; }
+  .card .body { color: var(--text-muted); line-height: 1.55; }
+  .card .body code, .card .meta code {
+    background: var(--surface-2); padding: 1px 5px; border-radius: 4px;
+    color: var(--text); font-size: .9em; border: 1px solid var(--border-soft);
+  }
+  .card .meta {
+    margin-top: 7px; font-size: 11.5px; color: var(--text-faint);
+    line-height: 1.5;
+  }
+
+  .card.redact   { border-left-color: var(--redact); }
+  .card.redact   .title { color: var(--redact); }
+  .card.block    { border-left-color: var(--block); }
+  .card.block    .title { color: var(--block); }
+  .card.warn     { border-left-color: var(--warn); }
+  .card.warn     .title { color: var(--warn); }
+  .card.deny     { border-left-color: var(--deny); }
+  .card.deny     .title { color: var(--deny); }
+  .card.budget   { border-left-color: var(--budget); }
+  .card.budget   .title { color: var(--budget); }
+  .card.approval { border-left-color: var(--approve); }
+  .card.approval .title { color: var(--approve); }
+
+  .approval-actions { display: flex; gap: 6px; margin-top: 10px; }
+  .approval-actions button {
+    font: inherit; font-size: 11.5px; font-weight: 500; padding: 6px 11px;
+    border-radius: 7px; border: none; cursor: pointer;
+    transition: background .2s var(--ease), transform .15s var(--ease);
+  }
+  .approval-actions button:active:not(:disabled) { transform: translateY(-1px); }
+  .approval-actions .approve { background: #15803d; color: #fff; }
+  .approval-actions .approve:hover:not(:disabled) { background: #166534; }
+  .approval-actions .reject {
+    background: rgba(248, 113, 113, .14); color: var(--block);
+    border: 1px solid rgba(248, 113, 113, .25);
+  }
+  .approval-actions .reject:hover:not(:disabled) { background: rgba(248, 113, 113, .24); }
+  .approval-actions button:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* --- Footer --------------------------------------------------------- */
+  footer {
+    max-width: 1280px; margin: 0 auto; margin-top: 40px;
+    padding: 18px 24px; color: var(--text-faint); font-size: 11.5px;
+    display: flex; justify-content: space-between; align-items: center;
+    border-top: 1px solid var(--border-soft);
+  }
+  footer code {
+    background: var(--surface); padding: 3px 7px; border-radius: 5px;
+    color: var(--text-muted); border: 1px solid var(--border-soft);
+  }
+  footer a { color: var(--text-muted); text-decoration: none; transition: color .2s var(--ease); }
+  footer a:hover { color: var(--text); }
+
+  /* --- Animations ----------------------------------------------------- */
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: .55; transform: scale(.9); }
+  }
+  @keyframes shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============================ SVG ICON LIBRARY ============================ -->
+<!-- All icons use currentColor + strokeWidth 1.5 (per skill). Inline to avoid network + deps. -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none;">
+  <defs>
+    <!-- logo: branching neurons -->
+    <symbol id="i-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="4" r="2"/>
+      <circle cx="5" cy="18" r="2"/>
+      <circle cx="19" cy="18" r="2"/>
+      <path d="M12 6v6m0 0l-5 4m5-4l5 4"/>
+    </symbol>
+    <symbol id="i-arrow-out" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M7 17L17 7M7 7h10v10"/>
+    </symbol>
+    <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 12l18-9-6 18-3-9-9-0z"/>
+    </symbol>
+    <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6 6l12 12M18 6L6 18"/>
+    </symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3l8 3v6c0 4.5-3.2 8.5-8 9-4.8-.5-8-4.5-8-9V6l8-3z"/>
+    </symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 3l18 18"/>
+      <path d="M10.5 10.7a2 2 0 002.8 2.8"/>
+      <path d="M9.4 5.3A9.5 9.5 0 0112 5c5 0 9 4.5 10 7-.5 1.2-1.4 2.6-2.7 3.9"/>
+      <path d="M6.3 6.3C3.8 7.9 2.4 10 2 12c1 2.5 5 7 10 7 1.5 0 2.9-.3 4.1-.9"/>
+    </symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5" y="11" width="14" height="10" rx="2"/>
+      <path d="M8 11V8a4 4 0 018 0v3"/>
+    </symbol>
+    <symbol id="i-no-entry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="9"/>
+      <path d="M6 12h12"/>
+    </symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3l10 18H2L12 3z"/>
+      <path d="M12 10v5M12 18v.01"/>
+    </symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="9"/>
+      <path d="M5.5 5.5l13 13"/>
+    </symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M10 12V5.5a1.5 1.5 0 013 0V12"/>
+      <path d="M13 12V4.5a1.5 1.5 0 013 0V13"/>
+      <path d="M16 12V6.5a1.5 1.5 0 013 0v7c0 4-3 7-7 7h-1a6 6 0 01-5.2-3L4 15a1.6 1.6 0 012.7-1.7L8 15"/>
+      <path d="M8 15V10.5a1.5 1.5 0 013 0V14"/>
+    </symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="13" r="8"/>
+      <path d="M12 13l4-4"/>
+      <path d="M12 5v1M4 13h1M19 13h1M8 17l-.7.7M16 17l.7.7"/>
+    </symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="6" y="5" width="4" height="14"/>
+      <rect x="14" y="5" width="4" height="14"/>
+    </symbol>
+    <symbol id="i-external" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M14 3h7v7M21 3l-9 9"/>
+      <path d="M21 14v5a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h5"/>
+    </symbol>
+    <symbol id="i-github" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02.8-.22 1.65-.33 2.5-.33.85 0 1.7.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0012 2z"/>
+    </symbol>
+  </defs>
+</svg>
+
+<header>
+  <div class="header-inner">
+    <div class="brand">
+      <span class="logo">
+        <svg class="logo-mark"><use href="#i-logo"/></svg>
+        Dendrux
+      </span>
+      <span class="tag">example 17 · full-stack</span>
+    </div>
+    <div class="header-actions">
+      <a href="/dashboard" target="_blank" class="link-btn">
+        Dashboard <svg><use href="#i-arrow-out"/></svg>
+      </a>
+      <a href="https://github.com/dendrux/dendrux" target="_blank" class="link-btn">
+        <svg style="width:14px;height:14px"><use href="#i-github"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <!-- Main column -->
+  <main>
+
+    <div class="composer">
+      <div class="row">
+        <select id="provider" title="Provider">
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <input id="msg" type="text"
+               placeholder="Refund order 4421 for $50, and contact j.ramos@duskwell.shop about it" />
+        <button class="btn btn-primary" id="send" onclick="send()">
+          Send <svg><use href="#i-send"/></svg>
+        </button>
+        <button class="btn btn-danger" id="cancel" onclick="cancel()" disabled>
+          <svg><use href="#i-x"/></svg> Cancel
+        </button>
+        <button class="link-btn" onclick="resetSession()" title="Clear the conversation and start over">Reset</button>
+      </div>
+
+      <div class="chip-row">
+        <span class="chip-label">Try the guardrails</span>
+        <button class="chip" onclick="fill('Look up order 4421 and contact the customer at j.ramos@duskwell.shop.')">
+          <svg><use href="#i-lock"/></svg>PII redact
+        </button>
+        <button class="chip" onclick="fill('My AWS key AKIA8WZ2XQPLM4N6RKY7 is in the ticket, please investigate.')">
+          <svg><use href="#i-no-entry"/></svg>Secret block
+        </button>
+        <button class="chip" onclick="fill('Please follow up on TKT-041729 from last week.')">
+          <svg><use href="#i-warn"/></svg>Custom warn
+        </button>
+        <button class="chip" onclick="fill('Delete account user-99 right now.')">
+          <svg><use href="#i-ban"/></svg>Tool deny
+        </button>
+        <button class="chip" onclick="fill('Refund order 4421 for $50.')">
+          <svg><use href="#i-hand"/></svg>Approval flow
+        </button>
+      </div>
+    </div>
+
+    <div id="conversation" class="conversation"></div>
+
+    <div id="tool-form" class="tool-form">
+      <div class="head">
+        <svg><use href="#i-pause"/></svg>
+        Paused for a client-side tool
+      </div>
+      <div class="explain">
+        The agent wants to run <code id="tf-name"></code>, decorated
+        <code>@tool(target="client")</code> — it can only execute on your side
+        (browser, mobile, Excel add-in). In a real app your UI would run the
+        tool and post the result back. For this demo, type what the result
+        would be; the agent resumes with your text as the return value.
+      </div>
+      <div class="args" id="tf-args-box" style="display:none">
+        <div class="args-label">Arguments the agent chose</div>
+        <div id="tf-args"></div>
+      </div>
+      <textarea id="tf-result" placeholder='e.g. "Message delivered at 9:03am" — plain text will be JSON-encoded.'></textarea>
+      <div class="foot">
+        <button class="btn btn-primary" onclick="submitToolResult()">
+          Submit result <svg><use href="#i-send"/></svg>
+        </button>
+        <span class="meta">call_id: <code id="tf-id"></code></span>
+      </div>
+    </div>
+
+    <div id="approval-form" class="approval-inline">
+      <div class="head">
+        <svg><use href="#i-hand"/></svg>
+        Approval needed
+      </div>
+      <div class="explain">
+        The agent wants to run <code id="af-name"></code>, listed in
+        <code>require_approval=[...]</code>. Approve to execute the tool, or
+        reject to feed a failed result to the LLM so it can decide the next step.
+      </div>
+      <div class="args" id="af-args-box" style="display:none">
+        <div class="args-label">Arguments the agent chose</div>
+        <div id="af-args"></div>
+      </div>
+      <div class="foot">
+        <button class="btn-approve" onclick="decideApproval(true)">
+          Approve <svg><use href="#i-send"/></svg>
+        </button>
+        <button class="btn-reject" onclick="toggleRejectRow()">
+          <svg><use href="#i-x"/></svg> Reject
+        </button>
+        <span class="meta" style="font-size: 11.5px; color: var(--text-faint);">call_id: <code id="af-id"></code></span>
+      </div>
+      <div class="reject-row" id="af-reject-row">
+        <input type="text" id="af-reason" placeholder="Why? (optional, shown to the agent as tool error)"/>
+        <button class="btn-reject" onclick="decideApproval(false)">Submit rejection</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">
+        <span>Activity</span>
+      </div>
+      <div id="timeline" class="timeline"></div>
+    </div>
+
+  </main>
+
+  <!-- Safety sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <span>Safety &amp; Governance</span>
+      <span class="counter" id="card-count">0</span>
+    </div>
+    <div id="safety-list">
+      <div class="empty" id="empty-state">
+        <div class="icon"><svg><use href="#i-shield"/></svg></div>
+        Guardrails, denies, budget warnings, approvals, and deanonymization events appear here live.
+      </div>
+    </div>
+  </aside>
+
+</div>
+
+<footer>
+  <span>Dendrux · example 17</span>
+  <span>auth: <code>X-App-Token: dev-secret-abc</code></span>
+</footer>
+
+<script>
+  const TOKEN = "dev-secret-abc";
+  const authHeaders = () => ({ "Content-Type": "application/json", "X-App-Token": TOKEN });
+
+  let runId = null;
+  let pending = [];
+  let pendingApproval = [];
+  let es = null;
+  let cardCount = 0;
+  let runIndex = 0;
+  // Conversation history, replayed on each send so the agent sees context.
+  // Dendrux.run() is stateless per run, so the client carries memory.
+  // Store deanonymized text since that's what the user and agent reason about.
+  const history = [];  // [{role: "user" | "agent", content: string}]
+  const HISTORY_MAX_TURNS = 6;  // last N turns replayed; older ones dropped
+
+  const $ = (id) => document.getElementById(id);
+  const provider = () => $("provider").value;
+
+  const SVG = {
+    pause:    '<svg><use href="#i-pause"/></svg>',
+    lock:     '<svg><use href="#i-lock"/></svg>',
+    ban:      '<svg><use href="#i-ban"/></svg>',
+    warn:     '<svg><use href="#i-warn"/></svg>',
+    noentry:  '<svg><use href="#i-no-entry"/></svg>',
+    hand:     '<svg><use href="#i-hand"/></svg>',
+    gauge:    '<svg><use href="#i-gauge"/></svg>',
+    eye:      '<svg><use href="#i-eye-off"/></svg>',
+  };
+
+  const TITLE_ICON = {
+    redact: SVG.lock, block: SVG.noentry, warn: SVG.warn,
+    deny: SVG.ban,    budget: SVG.gauge,  approval: SVG.hand,
+  };
+
+  function fill(text) { $("msg").value = text; $("msg").focus(); }
+  function setBusy(busy) { $("send").disabled = busy; $("cancel").disabled = !busy || !runId; }
+
+  function now() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function addTimeline(text, kind) {
+    const el = document.createElement("div");
+    el.className = "timeline-item " + kind;
+    el.innerHTML = `
+      <span class="dot"></span>
+      <span class="t">${escapeHtml(text)}</span>
+      <span class="ts">${now()}</span>
+    `;
+    $("timeline").appendChild(el);
+    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function addUserMessage(text) {
+    const el = document.createElement("div");
+    el.className = "message user";
+    el.innerHTML = `<div class="role">You</div><div class="body">${escapeHtml(text)}</div>`;
+    $("conversation").appendChild(el);
+  }
+
+  function addAgentMessage(text) {
+    removeSkeleton();
+    const el = document.createElement("div");
+    el.className = "message agent";
+    el.innerHTML = `<div class="role">Agent</div><div class="body">${escapeHtml(text)}</div>`;
+    $("conversation").appendChild(el);
+    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function showSkeleton() {
+    removeSkeleton();
+    const el = document.createElement("div");
+    el.id = "skel";
+    el.className = "skel";
+    el.innerHTML = `
+      <div class="role"><span class="breathing"></span> Agent working</div>
+      <div class="skel-line w-80"></div>
+      <div class="skel-line w-60"></div>
+      <div class="skel-line w-40"></div>
+    `;
+    $("conversation").appendChild(el);
+  }
+  function removeSkeleton() {
+    const el = $("skel");
+    if (el) el.remove();
+  }
+
+  function addCard(kind, title, bodyHtml, metaHtml) {
+    const es_empty = $("empty-state");
+    if (es_empty) es_empty.remove();
+    const el = document.createElement("div");
+    el.className = "card " + kind;
+    const icon = TITLE_ICON[kind] || "";
+    el.innerHTML = `
+      <div class="title">${icon} ${title}</div>
+      <div class="body">${bodyHtml}</div>
+      ${metaHtml ? `<div class="meta">${metaHtml}</div>` : ""}
+    `;
+    $("safety-list").appendChild(el);
+    cardCount++;
+    $("card-count").textContent = cardCount;
+    el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return el;
+  }
+
+  // EventSource can't send custom headers; token passed as query param for the demo.
+  // Production should prefer signed cookies on the same origin.
+  function connectSSE() {
+    if (es) es.close();
+    es = new EventSource(`/api/dendrux/runs/${runId}/events/stream?token=${TOKEN}`);
+    es.onmessage = (e) => {
+      const env = JSON.parse(e.data);
+      dispatch(env.event_type, env.data || {});
+    };
+  }
+
+  // Central dispatcher on event_type.
+  function dispatch(type, data) {
+    switch (type) {
+      case "run.started":   addTimeline("Run started", "start"); break;
+      case "run.paused":    handlePaused(data); break;
+      case "run.completed": addTimeline("Completed", "done"); es.close(); break;
+      case "run.error":     addTimeline("Error: " + (data.error || "unknown"), "err"); removeSkeleton(); es.close(); break;
+      case "run.cancelled": addTimeline("Cancelled", "cancel"); removeSkeleton(); es.close(); break;
+
+      case "policy.denied":
+        addCard("deny", "Tool denied by policy",
+          `<code>${escapeHtml(data.tool_name || "?")}</code> will not run.`,
+          `reason: ${escapeHtml(data.reason || "denied_by_policy")}`);
+        break;
+      case "approval.requested":
+        addTimeline("Approval requested: " + (data.tool_name || ""), "pause");
+        break;
+      case "budget.threshold":
+        addCard("budget", "Budget threshold",
+          `<strong>${Math.round((data.fraction ?? 0) * 100)}%</strong> of token budget consumed.`,
+          `${data.used}/${data.max} tokens · advisory, run continues`);
+        break;
+      case "budget.exceeded":
+        addCard("budget", "Budget exceeded",
+          `Used <strong>${data.used}/${data.max}</strong> tokens.`,
+          "Advisory only — run not stopped");
+        break;
+      case "guardrail.detected":
+        addCard("warn", "Guardrail detected",
+          `${data.findings_count ?? 1} finding(s) in ${escapeHtml(data.direction || "?")} text: <code>${(data.entities || []).map(escapeHtml).join(", ")}</code>`);
+        break;
+      case "guardrail.redacted":
+        addCard("redact", "Guardrail redacted",
+          `Redacted in <strong>${escapeHtml(data.direction || "?")}</strong> path: <code>${(data.entities || []).map(escapeHtml).join(", ")}</code>`,
+          "The LLM sees <code>&lt;&lt;TYPE_N&gt;&gt;</code>. Tools receive real values (deanonymized at the call boundary).");
+        break;
+      case "guardrail.blocked":
+        addCard("block", "Guardrail blocked the run",
+          `${escapeHtml(data.error || "Sensitive content detected")}`,
+          `direction: ${escapeHtml(data.direction || "?")}`);
+        break;
+
+      default:
+        if (type.startsWith("run.step") || type.startsWith("tool.")) {
+          addTimeline(type, "step");
+        }
+    }
+  }
+
+  function handlePaused(data) {
+    removeSkeleton();
+    const status = data.status || "";
+    if (status === "waiting_approval") {
+      pendingApproval = data.pending_tool_calls || [];
+      if (pendingApproval.length) {
+        const tc = pendingApproval[0];
+        $("af-name").textContent = tc.name;
+        $("af-id").textContent = tc.id;
+        renderArgsInto(tc.params || {}, "af-args", "af-args-box");
+        $("af-reject-row").classList.remove("active");
+        $("af-reason").value = "";
+        $("approval-form").classList.add("active");
+        // Re-enable buttons (may have been disabled from a prior approval)
+        $("approval-form").querySelectorAll("button").forEach(b => b.disabled = false);
+        addTimeline("Paused for approval: " + tc.name, "pause");
+        $("approval-form").scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+      return;
+    }
+    if (status === "waiting_client_tool") {
+      pending = data.pending_tool_calls || [];
+      if (pending.length) {
+        const tc = pending[0];
+        $("tf-name").textContent = tc.name;
+        $("tf-id").textContent = tc.id;
+        renderArgsInto(tc.params || {}, "tf-args", "tf-args-box");
+        $("tool-form").classList.add("active");
+        addTimeline("Paused for client tool: " + tc.name, "pause");
+        $("tf-result").focus();
+      }
+      return;
+    }
+    addTimeline("Paused (" + status + ")", "pause");
+  }
+
+  function renderArgsInto(params, listId, boxId) {
+    const keys = Object.keys(params);
+    const box = $(boxId);
+    const target = $(listId);
+    if (!keys.length) {
+      box.style.display = "none";
+      target.innerHTML = "";
+      return;
+    }
+    box.style.display = "block";
+    target.innerHTML = keys.map(k =>
+      `<div class="arg-row"><span class="k">${escapeHtml(k)}</span><span class="v">${escapeHtml(JSON.stringify(params[k]))}</span></div>`
+    ).join("");
+  }
+
+  function toggleRejectRow() {
+    $("af-reject-row").classList.toggle("active");
+    if ($("af-reject-row").classList.contains("active")) $("af-reason").focus();
+  }
+
+  function addRunDivider(label) {
+    const el = document.createElement("div");
+    el.className = "run-divider";
+    el.innerHTML = `<span>${escapeHtml(label)}</span>`;
+    $("conversation").appendChild(el);
+    // Also visually break the timeline between runs.
+    const t = document.createElement("div");
+    t.className = "run-divider";
+    t.innerHTML = `<span>${escapeHtml(label)}</span>`;
+    $("timeline").appendChild(t);
+  }
+
+  function buildPrompt(currentInput) {
+    // Replay the last N turns before the current message so the agent has context.
+    // Dendrux Agent.run() is stateless — context lives on the client.
+    if (history.length === 0) return currentInput;
+    const recent = history.slice(-HISTORY_MAX_TURNS * 2);
+    const transcript = recent.map(m =>
+      `[${m.role === "user" ? "User" : "Agent"}]: ${m.content}`
+    ).join("\n\n");
+    return `Previous conversation:\n\n${transcript}\n\n[User]: ${currentInput}`;
+  }
+
+  async function send() {
+    const text = $("msg").value.trim();
+    if (!text) return;
+
+    runIndex++;
+    if (runIndex > 1) addRunDivider(`run ${runIndex}`);
+
+    $("tool-form").classList.remove("active");
+    $("approval-form").classList.remove("active");
+
+    addUserMessage(text);
+    history.push({ role: "user", content: text });
+    showSkeleton();
+    setBusy(true);
+
+    const prompt = buildPrompt(text);
+    const resp = await fetch("/chat", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ input: prompt, provider: provider() }),
+    });
+    if (!resp.ok) {
+      addTimeline("HTTP " + resp.status, "err");
+      removeSkeleton();
+      setBusy(false);
+      return;
+    }
+    const data = await resp.json();
+    runId = data.run_id;
+    setBusy(true);
+    connectSSE();
+    renderFinalMaybe(data);
+  }
+
+  function resetSession() {
+    if (es) es.close();
+    runId = null;
+    pending = [];
+    pendingApproval = [];
+    cardCount = 0;
+    runIndex = 0;
+    history.length = 0;
+    $("card-count").textContent = "0";
+    $("timeline").innerHTML = "";
+    $("conversation").innerHTML = "";
+    $("tool-form").classList.remove("active");
+    $("approval-form").classList.remove("active");
+    $("safety-list").innerHTML = `
+      <div class="empty" id="empty-state">
+        <div class="icon"><svg><use href="#i-shield"/></svg></div>
+        Guardrails, denies, budget warnings, approvals, and deanonymization events appear here live.
+      </div>`;
+    setBusy(false);
+    $("msg").focus();
+  }
+
+  async function submitToolResult() {
+    if (!runId || !pending.length) return;
+    const text = $("tf-result").value.trim();
+    if (!text) return;
+    $("tool-form").classList.remove("active");
+    showSkeleton();
+    const results = pending.map(tc => ({
+      tool_call_id: tc.id, tool_name: tc.name,
+      payload: JSON.stringify(text),
+    }));
+    const resp = await fetch(`/runs/${runId}/tool-results`, {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ results, provider: provider() }),
+    });
+    if (!resp.ok) { addTimeline("Submit failed: " + resp.status, "err"); removeSkeleton(); return; }
+    pending = [];
+    $("tf-result").value = "";
+    renderFinalMaybe(await resp.json());
+  }
+
+  async function decideApproval(approved) {
+    if (!runId) return;
+    $("approval-form").querySelectorAll("button").forEach(b => b.disabled = true);
+    $("approval-form").classList.remove("active");
+    showSkeleton();
+    const body = { approved, provider: provider() };
+    if (!approved) {
+      const reason = $("af-reason").value.trim();
+      body.rejection_reason = reason || "Rejected via demo UI.";
+    }
+    const resp = await fetch(`/runs/${runId}/approvals`, {
+      method: "POST", headers: authHeaders(), body: JSON.stringify(body),
+    });
+    if (!resp.ok) { addTimeline("Approval failed: " + resp.status, "err"); removeSkeleton(); return; }
+    pendingApproval = [];
+    renderFinalMaybe(await resp.json());
+  }
+
+  async function cancel() {
+    if (!runId) return;
+    await fetch(`/runs/${runId}?provider=${provider()}`, {
+      method: "DELETE", headers: authHeaders(),
+    });
+  }
+
+  function deanonymize(text, mapping) {
+    if (!text || !mapping) return text;
+    let out = text;
+    for (const [placeholder, real] of Object.entries(mapping)) {
+      out = out.split(placeholder).join(real);
+    }
+    return out;
+  }
+
+  function renderFinalMaybe(data) {
+    if (data.status === "success" && data.answer) {
+      const mapping = data.pii_mapping || {};
+      const display = deanonymize(data.answer, mapping);
+      addAgentMessage(display);
+      history.push({ role: "agent", content: display });
+      if (Object.keys(mapping).length) {
+        addCard("redact", "Deanonymized for display",
+          `LLM output contained <code>${Object.keys(mapping).map(escapeHtml).join(", ")}</code>; substituted before rendering.`,
+          "Audit: " + Object.entries(mapping).map(([k, v]) => `${escapeHtml(k)} → <code>${escapeHtml(v)}</code>`).join("; "));
+      }
+      setBusy(false);
+    } else if (data.status === "error") {
+      addTimeline("Error: " + (data.error || "unknown"), "err");
+      removeSkeleton();
+      setBusy(false);
+    } else if (data.status === "cancelled") {
+      addTimeline("Cancelled", "cancel");
+      removeSkeleton();
+      setBusy(false);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // Enter-to-send
+  $("msg").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !$("send").disabled) send();
+  });
+</script>
+</body>
+</html>

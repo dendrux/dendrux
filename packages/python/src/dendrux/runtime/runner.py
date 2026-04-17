@@ -568,6 +568,7 @@ async def run(
                                 "id": tc.id,
                                 "name": tc.name,
                                 "target": pause_state.pending_targets.get(tc.id),
+                                "params": tc.params,
                             }
                             for tc in pause_state.pending_tool_calls
                         ],
@@ -948,6 +949,7 @@ async def retry(
                             "id": tc.id,
                             "name": tc.name,
                             "target": pause_state.pending_targets.get(tc.id),
+                            "params": tc.params,
                         }
                         for tc in pause_state.pending_tool_calls
                     ],
@@ -1263,6 +1265,7 @@ def run_stream(
                                         "id": tc.id,
                                         "name": tc.name,
                                         "target": pause_state_obj.pending_targets.get(tc.id),
+                                        "params": tc.params,
                                     }
                                     for tc in pause_state_obj.pending_tool_calls
                                 ],
