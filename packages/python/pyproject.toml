@@ -1,6 +1,6 @@
 [project]
 name = "dendrux"
-version = "0.1.0a5"
+version = "0.2.0a1"
 description = "The runtime for agents that act in the real world."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -26,16 +26,25 @@ dependencies = [
     "rich>=13.0,<15.0",
     "python-ulid>=2.0,<4.0",
     "pyyaml>=6.0,<7.0",
+    # SQLAlchemy is the default (and currently only built-in) StateStore
+    # backend. Imported at module load by runtime/state.py, so it must
+    # be a hard dependency until/unless we ship a non-SQLAlchemy backend.
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "aiosqlite>=0.19,<1.0",
+    "alembic>=1.13,<2.0",
 ]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=1.50,<3.0"]
 http = ["fastapi>=0.135,<1.0", "uvicorn[standard]"]
-db = ["sqlalchemy[asyncio]>=2.0,<3.0", "aiosqlite>=0.19,<1.0", "alembic>=1.13,<2.0"]
+# `db` is kept as an empty alias for backwards compatibility with anyone
+# who already depends on `dendrux[db]`. SQLAlchemy + aiosqlite + alembic
+# are now hard dependencies.
+db = []
 postgres = ["asyncpg>=0.29,<1.0"]
 mcp = ["mcp>=1.8,<2"]
-all = ["dendrux[anthropic,openai,http,db,postgres,mcp]"]
+all = ["dendrux[anthropic,openai,http,postgres,mcp]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
