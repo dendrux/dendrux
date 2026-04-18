@@ -15,6 +15,7 @@ from dendrux.types import (
     ToolCall,
     UsageStats,
 )
+from tests._helpers.state_store_mocks import CancellationStubsMixin
 
 # ------------------------------------------------------------------
 # Test tools
@@ -33,7 +34,7 @@ async def add(a: int, b: int) -> int:
 
 
 @dataclass
-class RecordingStateStore:
+class RecordingStateStore(CancellationStubsMixin):
     """Fake StateStore that records create_run/finalize_run calls."""
 
     created_runs: list[dict[str, Any]] = field(default_factory=list)

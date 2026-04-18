@@ -597,6 +597,7 @@ class RunEventType(StrEnum):
         RUN_COMPLETED: Terminal. Run finished (success or max_iterations).
         RUN_PAUSED: Terminal. Run paused for client tool or human input.
         RUN_ERROR: Terminal. Run failed. No exception is raised to the consumer.
+        RUN_CANCELLED: Terminal. Run was cancelled cooperatively.
 
     LLM output events (translated from provider StreamEvent):
         TEXT_DELTA: Incremental text token from the LLM.
@@ -613,6 +614,7 @@ class RunEventType(StrEnum):
     RUN_COMPLETED = "run_completed"
     RUN_PAUSED = "run_paused"
     RUN_ERROR = "run_error"
+    RUN_CANCELLED = "run_cancelled"
 
     # LLM output (translated from provider StreamEvent)
     TEXT_DELTA = "text_delta"
@@ -625,7 +627,12 @@ class RunEventType(StrEnum):
 
 # Terminal event types — after any of these, the stream ends.
 _TERMINAL_RUN_EVENTS = frozenset(
-    {RunEventType.RUN_COMPLETED, RunEventType.RUN_PAUSED, RunEventType.RUN_ERROR}
+    {
+        RunEventType.RUN_COMPLETED,
+        RunEventType.RUN_PAUSED,
+        RunEventType.RUN_ERROR,
+        RunEventType.RUN_CANCELLED,
+    }
 )
 
 

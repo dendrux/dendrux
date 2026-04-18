@@ -864,9 +864,17 @@
     switch (type) {
       case "run.started":   addTimeline("Run started", "start"); break;
       case "run.paused":    handlePaused(data); break;
-      case "run.completed": addTimeline("Completed", "done"); es.close(); break;
-      case "run.error":     addTimeline("Error: " + (data.error || "unknown"), "err"); removeSkeleton(); es.close(); break;
-      case "run.cancelled": addTimeline("Cancelled", "cancel"); removeSkeleton(); es.close(); break;
+      case "run.completed": addTimeline("Completed", "done"); setBusy(false); es.close(); break;
+      case "run.error":     addTimeline("Error: " + (data.error || "unknown"), "err"); removeSkeleton(); setBusy(false); es.close(); break;
+      case "run.cancelled":
+        addTimeline("Cancelled", "cancel");
+        removeSkeleton();
+        $("tool-form").classList.remove("active");
+        $("approval-form").classList.remove("active");
+        pending = []; pendingApproval = [];
+        setBusy(false);
+        es.close();
+        break;
 
       case "policy.denied":
         addCard("deny", "Tool denied by policy",
@@ -1056,7 +1064,13 @@
       method: "POST", headers: authHeaders(),
       body: JSON.stringify({ results, provider: provider() }),
     });
-    if (!resp.ok) { addTimeline("Submit failed: " + resp.status, "err"); removeSkeleton(); return; }
+    if (!resp.ok) {
+      const detail = await resp.json().then(d => d.detail || "").catch(() => "");
+      addTimeline(`Submit failed: ${resp.status}${detail ? " — " + detail : ""}`, "err");
+      removeSkeleton();
+      setBusy(false);
+      return;
+    }
     pending = [];
     $("tf-result").value = "";
     renderFinalMaybe(await resp.json());
@@ -1075,16 +1089,51 @@
     const resp = await fetch(`/runs/${runId}/approvals`, {
       method: "POST", headers: authHeaders(), body: JSON.stringify(body),
     });
-    if (!resp.ok) { addTimeline("Approval failed: " + resp.status, "err"); removeSkeleton(); return; }
+    if (!resp.ok) {
+      const detail = await resp.json().then(d => d.detail || "").catch(() => "");
+      addTimeline(`Approval failed: ${resp.status}${detail ? " — " + detail : ""}`, "err");
+      removeSkeleton();
+      setBusy(false);
+      return;
+    }
     pendingApproval = [];
     renderFinalMaybe(await resp.json());
   }
 
   async function cancel() {
     if (!runId) return;
-    await fetch(`/runs/${runId}?provider=${provider()}`, {
-      method: "DELETE", headers: authHeaders(),
-    });
+    // Optimistic UX: lock the cancel button, hide pending forms, log intent.
+    // The runner observes cancel_requested at its next checkpoint; for paused
+    // runs the response below is already terminal, for running runs the SSE
+    // run.cancelled event arrives within the current iteration.
+    $("cancel").disabled = true;
+    $("tool-form").classList.remove("active");
+    $("approval-form").classList.remove("active");
+    addTimeline("Cancel requested", "cancel");
+
+    let resp;
+    try {
+      resp = await fetch(`/runs/${runId}?provider=${provider()}`, {
+        method: "DELETE", headers: authHeaders(),
+      });
+    } catch (err) {
+      addTimeline("Cancel failed: network error", "err");
+      setBusy(false);
+      return;
+    }
+    if (!resp.ok) {
+      addTimeline("Cancel failed: HTTP " + resp.status, "err");
+      setBusy(false);
+      return;
+    }
+    const data = await resp.json();
+    if (data.status === "cancelled") {
+      // Paused-run cancel: terminal immediately. Render the final state.
+      renderFinalMaybe(data);
+    }
+    // Running-run cancel: status is still "running" in this response —
+    // the SSE handler for run.cancelled will finish the UI cleanup
+    // when the worker observes the flag at its next checkpoint.
   }
 
   function deanonymize(text, mapping) {

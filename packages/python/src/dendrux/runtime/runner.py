@@ -242,6 +242,141 @@ async def _emit_event_safe(
         )
 
 
+_WAITING_STATUSES = (
+    RunStatus.WAITING_CLIENT_TOOL,
+    RunStatus.WAITING_HUMAN_INPUT,
+    RunStatus.WAITING_APPROVAL,
+)
+
+
+async def _persist_loop_outcome(
+    *,
+    state_store: StateStore,
+    run_id: str,
+    result: RunResult,
+    sequencer: EventSequencer,
+    redact: Callable[[str], str] | None = None,
+) -> RunResult:
+    """Persist a loop's terminal/pause result and emit the lifecycle event.
+
+    Centralizes pause-vs-finalize handling across initial run, retry,
+    resume, and their streaming variants. Implements the cooperative
+    cancellation pre-pause checkpoint: if ``cancel_requested`` was set
+    during the iteration that just returned WAITING_*, we finalize as
+    ``cancelled`` instead of pausing — otherwise the run would settle
+    in a paused state holding pause_data the user already asked us to
+    abandon.
+
+    Always returns a fresh ``RunResult``; never mutates the input.
+    ``meta['_finalize_won']`` records whether the CAS finalize won
+    (``True`` for pauses since pause is unconditional).
+    """
+    from dendrux.types import RunResult
+
+    def _wrap(*, status: RunStatus, won: bool) -> RunResult:
+        return RunResult(
+            run_id=run_id,
+            status=status,
+            answer=result.answer,
+            error=result.error,
+            steps=result.steps,
+            iteration_count=result.iteration_count,
+            usage=result.usage,
+            meta={**result.meta, "_finalize_won": won},
+        )
+
+    if result.status == RunStatus.CANCELLED:
+        won = await state_store.finalize_run_if_status_in(
+            run_id,
+            status=RunStatus.CANCELLED.value,
+            allowed_current_statuses=[s.value for s in _WAITING_STATUSES]
+            + [RunStatus.RUNNING.value],
+            iteration_count=result.iteration_count,
+            total_usage=result.usage,
+        )
+        if won:
+            await _emit_event(
+                state_store,
+                run_id,
+                "run.cancelled",
+                sequencer,
+                {"reason": "cancel_requested"},
+            )
+        return _wrap(status=RunStatus.CANCELLED, won=won)
+
+    if result.status in _WAITING_STATUSES:
+        # Pre-pause checkpoint: cancel may have arrived during the iteration
+        # that just returned WAITING_*. Finalize cancelled instead of pausing.
+        if await state_store.is_cancel_requested(run_id):
+            won = await state_store.finalize_run_if_status_in(
+                run_id,
+                status=RunStatus.CANCELLED.value,
+                allowed_current_statuses=[RunStatus.RUNNING.value],
+                iteration_count=result.iteration_count,
+                total_usage=result.usage,
+            )
+            if won:
+                await _emit_event(
+                    state_store,
+                    run_id,
+                    "run.cancelled",
+                    sequencer,
+                    {"reason": "cancel_requested"},
+                )
+            return _wrap(status=RunStatus.CANCELLED, won=won)
+
+        pause_state: PauseState = result.meta["pause_state"]
+        _run_pii = result.meta.get("pii_mapping")
+        await state_store.pause_run(
+            run_id,
+            status=result.status.value,
+            pause_data=pause_state.to_dict(),
+            iteration_count=result.iteration_count,
+            pii_mapping=_run_pii,
+        )
+        await _emit_event(
+            state_store,
+            run_id,
+            "run.paused",
+            sequencer,
+            {
+                "status": result.status.value,
+                "pending_tool_calls": [
+                    {
+                        "id": tc.id,
+                        "name": tc.name,
+                        "target": pause_state.pending_targets.get(tc.id),
+                        "params": tc.params,
+                    }
+                    for tc in pause_state.pending_tool_calls
+                ],
+            },
+        )
+        return _wrap(status=result.status, won=True)
+
+    # Terminal: success / max_iterations / error.
+    redacted_answer = redact(result.answer) if redact and result.answer else result.answer
+    _run_pii = result.meta.get("pii_mapping")
+    finalize_won = await state_store.finalize_run(
+        run_id,
+        status=result.status.value,
+        answer=redacted_answer,
+        iteration_count=result.iteration_count,
+        total_usage=result.usage,
+        expected_current_status="running",
+        pii_mapping=_run_pii,
+    )
+    if finalize_won:
+        await _emit_event(
+            state_store,
+            run_id,
+            "run.completed",
+            sequencer,
+            {"status": result.status.value},
+        )
+    return _wrap(status=result.status, won=finalize_won)
+
+
 _UNSET_DEPTH = _UnsetType()
 
 
@@ -538,68 +673,17 @@ async def run(
             notifier=extra_notifier,
             provider_kwargs=provider_kwargs or None,
             output_type=output_type,
+            state_store=state_store,
         )
 
         if state_store is not None:
-            if result.status in (
-                RunStatus.WAITING_CLIENT_TOOL,
-                RunStatus.WAITING_HUMAN_INPUT,
-                RunStatus.WAITING_APPROVAL,
-            ):
-                # Pause — persist state for resume
-                pause_state: PauseState = result.meta["pause_state"]
-                _run_pii = result.meta.get("pii_mapping")
-                await state_store.pause_run(
-                    run_id,
-                    status=result.status.value,
-                    pause_data=pause_state.to_dict(),
-                    iteration_count=result.iteration_count,
-                    pii_mapping=_run_pii,
-                )
-                await _emit_event(
-                    state_store,
-                    run_id,
-                    "run.paused",
-                    sequencer,
-                    {
-                        "status": result.status.value,
-                        "pending_tool_calls": [
-                            {
-                                "id": tc.id,
-                                "name": tc.name,
-                                "target": pause_state.pending_targets.get(tc.id),
-                                "params": tc.params,
-                            }
-                            for tc in pause_state.pending_tool_calls
-                        ],
-                    },
-                )
-            else:
-                # Finalize with success or max_iterations.
-                # Conditional: only if still running (prevents cancel race).
-                redacted_answer = (
-                    redact(result.answer) if redact and result.answer else result.answer
-                )
-                _run_pii = result.meta.get("pii_mapping")
-                finalize_won = await state_store.finalize_run(
-                    run_id,
-                    status=result.status.value,
-                    answer=redacted_answer,
-                    iteration_count=result.iteration_count,
-                    total_usage=result.usage,
-                    expected_current_status="running",
-                    pii_mapping=_run_pii,
-                )
-                # Only the CAS winner emits the terminal event — prevents
-                # duplicate run.completed when cancel races with finish.
-                if finalize_won:
-                    await _emit_event(
-                        state_store,
-                        run_id,
-                        "run.completed",
-                        sequencer,
-                        {"status": result.status.value},
-                    )
+            result = await _persist_loop_outcome(
+                state_store=state_store,
+                run_id=run_id,
+                result=result,
+                sequencer=sequencer,
+                redact=redact,
+            )
 
         return result
 
@@ -923,56 +1007,16 @@ async def retry(
             notifier=extra_notifier,
             initial_history=initial_history,
             provider_kwargs=provider_kwargs or None,
+            state_store=state_store,
         )
 
-        if result.status in (
-            RunStatus.WAITING_CLIENT_TOOL,
-            RunStatus.WAITING_HUMAN_INPUT,
-            RunStatus.WAITING_APPROVAL,
-        ):
-            pause_state: PauseState = result.meta["pause_state"]
-            await state_store.pause_run(
-                run_id,
-                status=result.status.value,
-                pause_data=pause_state.to_dict(),
-                iteration_count=result.iteration_count,
-            )
-            await _emit_event(
-                state_store,
-                run_id,
-                "run.paused",
-                sequencer,
-                {
-                    "status": result.status.value,
-                    "pending_tool_calls": [
-                        {
-                            "id": tc.id,
-                            "name": tc.name,
-                            "target": pause_state.pending_targets.get(tc.id),
-                            "params": tc.params,
-                        }
-                        for tc in pause_state.pending_tool_calls
-                    ],
-                },
-            )
-        else:
-            redacted_answer = redact(result.answer) if redact and result.answer else result.answer
-            finalize_won = await state_store.finalize_run(
-                run_id,
-                status=result.status.value,
-                answer=redacted_answer,
-                iteration_count=result.iteration_count,
-                total_usage=result.usage,
-                expected_current_status="running",
-            )
-            if finalize_won:
-                await _emit_event(
-                    state_store,
-                    run_id,
-                    "run.completed",
-                    sequencer,
-                    {"status": result.status.value},
-                )
+        result = await _persist_loop_outcome(
+            state_store=state_store,
+            run_id=run_id,
+            result=result,
+            sequencer=sequencer,
+            redact=redact,
+        )
 
         return result
 
@@ -1217,62 +1261,33 @@ def run_stream(
                 notifier=extra_notifier,
                 provider_kwargs=provider_kwargs or None,
                 output_type=output_type,
+                state_store=store,
             ):
-                # Persist loop outcomes before forwarding
-                if event.type == RunEventType.RUN_COMPLETED and event.run_result:
-                    if store is not None:
-                        result = event.run_result
-                        redacted_answer = (
-                            redact(result.answer) if redact and result.answer else result.answer
-                        )
-                        finalize_won = await store.finalize_run(
-                            run_id,
-                            status=result.status.value,
-                            answer=redacted_answer,
-                            iteration_count=result.iteration_count,
-                            total_usage=result.usage,
-                            expected_current_status="running",
-                        )
-                        if finalize_won:
-                            await _emit_event(
-                                store,
-                                run_id,
-                                "run.completed",
-                                sequencer,
-                                {"status": result.status.value},
-                            )
+                if (
+                    event.type
+                    in (
+                        RunEventType.RUN_COMPLETED,
+                        RunEventType.RUN_PAUSED,
+                        RunEventType.RUN_CANCELLED,
+                    )
+                    and event.run_result
+                    and store is not None
+                ):
+                    persisted = await _persist_loop_outcome(
+                        state_store=store,
+                        run_id=run_id,
+                        result=event.run_result,
+                        sequencer=sequencer,
+                        redact=redact,
+                    )
+                    # Pre-pause checkpoint can flip a PAUSED iteration to CANCELLED.
+                    # Re-derive the event type from the persisted status so the
+                    # consumer sees the correct terminal event.
+                    if persisted.status == RunStatus.CANCELLED:
+                        event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                    else:
+                        event = RunEvent(type=event.type, run_result=persisted)
                     yield event
-
-                elif event.type == RunEventType.RUN_PAUSED and event.run_result:
-                    if store is not None:
-                        result = event.run_result
-                        pause_state_obj: PauseState = result.meta["pause_state"]
-                        await store.pause_run(
-                            run_id,
-                            status=result.status.value,
-                            pause_data=pause_state_obj.to_dict(),
-                            iteration_count=result.iteration_count,
-                        )
-                        await _emit_event(
-                            store,
-                            run_id,
-                            "run.paused",
-                            sequencer,
-                            {
-                                "status": result.status.value,
-                                "pending_tool_calls": [
-                                    {
-                                        "id": tc.id,
-                                        "name": tc.name,
-                                        "target": pause_state_obj.pending_targets.get(tc.id),
-                                        "params": tc.params,
-                                    }
-                                    for tc in pause_state_obj.pending_tool_calls
-                                ],
-                            },
-                        )
-                    yield event
-
                 else:
                     # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
                     yield event
@@ -1819,61 +1834,16 @@ async def _resume_core(
             iteration_offset=ctx.pause_state.iteration,
             initial_usage=ctx.pause_state.usage,
             initial_pii_mapping=_saved_pii_mapping,
+            state_store=state_store,
         )
 
-        # 10. Finalize or pause again
-        if result.status in (
-            RunStatus.WAITING_CLIENT_TOOL,
-            RunStatus.WAITING_HUMAN_INPUT,
-            RunStatus.WAITING_APPROVAL,
-        ):
-            new_pause: PauseState = result.meta["pause_state"]
-            _resume_pii = result.meta.get("pii_mapping")
-            await state_store.pause_run(
-                run_id,
-                status=result.status.value,
-                pause_data=new_pause.to_dict(),
-                iteration_count=result.iteration_count,
-                pii_mapping=_resume_pii,
-            )
-            await _emit_event(
-                state_store,
-                run_id,
-                "run.paused",
-                ctx.sequencer,
-                {
-                    "status": result.status.value,
-                    "pending_tool_calls": [
-                        {
-                            "id": tc.id,
-                            "name": tc.name,
-                            "target": new_pause.pending_targets.get(tc.id),
-                        }
-                        for tc in new_pause.pending_tool_calls
-                    ],
-                },
-            )
-        else:
-            redacted_answer = redact(result.answer) if redact and result.answer else result.answer
-            _resume_pii = result.meta.get("pii_mapping")
-            finalize_won = await state_store.finalize_run(
-                run_id,
-                status=result.status.value,
-                answer=redacted_answer,
-                iteration_count=result.iteration_count,
-                total_usage=result.usage,
-                expected_current_status="running",
-                pii_mapping=_resume_pii,
-            )
-            result.meta["_finalize_won"] = finalize_won
-            if finalize_won:
-                await _emit_event(
-                    state_store,
-                    run_id,
-                    "run.completed",
-                    ctx.sequencer,
-                    {"status": result.status.value},
-                )
+        result = await _persist_loop_outcome(
+            state_store=state_store,
+            run_id=run_id,
+            result=result,
+            sequencer=ctx.sequencer,
+            redact=redact,
+        )
 
         return result
 
@@ -2109,59 +2079,29 @@ def resume_stream(
                 initial_steps=ctx.pause_state.steps,
                 iteration_offset=ctx.pause_state.iteration,
                 initial_usage=ctx.pause_state.usage,
+                state_store=store,
             ):
-                # Persist loop outcomes before forwarding
-                if event.type == RunEventType.RUN_COMPLETED and event.run_result:
-                    result = event.run_result
-                    redacted_answer = (
-                        redact(result.answer) if redact and result.answer else result.answer
+                if (
+                    event.type
+                    in (
+                        RunEventType.RUN_COMPLETED,
+                        RunEventType.RUN_PAUSED,
+                        RunEventType.RUN_CANCELLED,
                     )
-                    finalize_won = await store.finalize_run(
-                        run_id,
-                        status=result.status.value,
-                        answer=redacted_answer,
-                        iteration_count=result.iteration_count,
-                        total_usage=result.usage,
-                        expected_current_status="running",
+                    and event.run_result
+                ):
+                    persisted = await _persist_loop_outcome(
+                        state_store=store,
+                        run_id=run_id,
+                        result=event.run_result,
+                        sequencer=ctx.sequencer,
+                        redact=redact,
                     )
-                    if finalize_won:
-                        await _emit_event(
-                            store,
-                            run_id,
-                            "run.completed",
-                            ctx.sequencer,
-                            {"status": result.status.value},
-                        )
+                    if persisted.status == RunStatus.CANCELLED:
+                        event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                    else:
+                        event = RunEvent(type=event.type, run_result=persisted)
                     yield event
-
-                elif event.type == RunEventType.RUN_PAUSED and event.run_result:
-                    result = event.run_result
-                    pause_state_obj: PauseState = result.meta["pause_state"]
-                    await store.pause_run(
-                        run_id,
-                        status=result.status.value,
-                        pause_data=pause_state_obj.to_dict(),
-                        iteration_count=result.iteration_count,
-                    )
-                    await _emit_event(
-                        store,
-                        run_id,
-                        "run.paused",
-                        ctx.sequencer,
-                        {
-                            "status": result.status.value,
-                            "pending_tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "name": tc.name,
-                                    "target": pause_state_obj.pending_targets.get(tc.id),
-                                }
-                                for tc in pause_state_obj.pending_tool_calls
-                            ],
-                        },
-                    )
-                    yield event
-
                 else:
                     yield event
 

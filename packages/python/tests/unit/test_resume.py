@@ -21,6 +21,7 @@ from dendrux.types import (
     ToolResult,
     UsageStats,
 )
+from tests._helpers.state_store_mocks import CancellationStubsMixin
 
 # ------------------------------------------------------------------
 # Test tools
@@ -55,7 +56,7 @@ def _make_agent(**overrides) -> Agent:
 
 
 @dataclass
-class RecordingStateStore:
+class RecordingStateStore(CancellationStubsMixin):
     """Fake StateStore that records calls and supports pause/resume."""
 
     created_runs: list[dict[str, Any]] = field(default_factory=list)

@@ -20,6 +20,7 @@ from dendrux.runtime.context import (
 )
 from dendrux.runtime.runner import run
 from dendrux.types import LLMResponse, ToolCall
+from tests._helpers.state_store_mocks import CancellationStubsMixin
 
 # ------------------------------------------------------------------
 # Test tools
@@ -49,7 +50,7 @@ class FakeStoreWithIdentity:
 
 
 @dataclass
-class RecordingStateStore:
+class RecordingStateStore(CancellationStubsMixin):
     """Fake StateStore that records create_run calls and has a store_identity."""
 
     _identity: str = "sqlite:///test.db"

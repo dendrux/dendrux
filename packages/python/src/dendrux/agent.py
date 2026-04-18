@@ -66,6 +66,28 @@ def _validate_max_delegation_depth(value: int | None | _UnsetType) -> None:
         )
 
 
+def _record_to_run_result(record: Any) -> RunResult:
+    """Project a RunRecord onto a RunResult for cancel/no-op return paths."""
+    from dendrux.types import RunResult, RunStatus, UsageStats
+
+    usage = UsageStats(
+        input_tokens=record.total_input_tokens,
+        output_tokens=record.total_output_tokens,
+        total_tokens=record.total_input_tokens + record.total_output_tokens,
+        cost_usd=record.total_cost_usd,
+        cache_read_input_tokens=record.total_cache_read_tokens,
+        cache_creation_input_tokens=record.total_cache_creation_tokens,
+    )
+    return RunResult(
+        run_id=record.id,
+        status=RunStatus(record.status),
+        answer=record.answer,
+        error=record.error,
+        iteration_count=record.iteration_count,
+        usage=usage,
+    )
+
+
 class Agent:
     """Dendrux agent — definition and runtime facade.
 
@@ -1117,88 +1139,91 @@ class Agent:
     async def cancel_run(self, run_id: str) -> RunResult:
         """Request cancellation for ``run_id``.
 
-        Guarantees:
+        Behavior by run state:
 
+        - **Paused run (any process):** atomic CAS finalize to
+          ``CANCELLED`` in one round-trip. Deterministic.
+        - **Running run (any process, persisted):** sets
+          ``cancel_requested=True`` on the DB row. The runner observes
+          this flag at the top of the next iteration (and at the
+          pre-pause checkpoint after the current iteration's loop body
+          returns) and exits cleanly as ``CANCELLED``. The current
+          iteration's in-flight LLM/tool calls are not preempted —
+          cancellation is observed *before starting the next iteration*,
+          not mid-step.
         - **In-process submit/resume task on this Agent instance:** the
-          task spawned by :meth:`submit_tool_results`,
+          asyncio task spawned by :meth:`submit_tool_results`,
           :meth:`submit_input`, or :meth:`submit_approval` is cancelled
-          synchronously and the DB row is CAS-finalized to ``CANCELLED``.
-          Deterministic.
-        - **Paused run (any process):** CAS-finalizes the DB row to
-          ``CANCELLED``. Deterministic.
-        - **Raw ``agent.run()`` in-flight on this Agent instance:**
-          **best-effort** — ``agent.run()`` is not tracked by this
-          Agent's task manager (its ``run_id`` is generated inside the
-          coroutine, not known to the caller up front). The DB row is
-          still CAS-finalized, but the in-flight coroutine keeps
-          running. If you need same-process cancellation of an initial
-          run, cancel the caller's own task via ``asyncio.Task.cancel()``
-          in addition to calling this method. Runner integration that
-          registers initial runs with the task manager is a future
-          enhancement.
-        - **Cross-process running run:** best-effort — the DB row is
-          CAS-finalized only if the run is still in a cancellable status.
-          **The other worker's in-flight LLM/tool call completes** before
-          the cancellation is observed; this method does not preempt it.
-          Cooperative cross-process cancellation is a future enhancement.
-        - **Terminal run:** no-op, returns the current persisted state.
+          synchronously in addition to the DB-level cancel signal.
+        - **Terminal run:** no-op; returns the current persisted state.
           Does not raise.
+        - **Non-persisted runs:** unsupported. ``cancel_run`` requires a
+          configured DB. Raises ``PersistenceNotConfiguredError``.
 
         Returns:
             :class:`RunResult` reflecting the persisted state after the
-            CAS attempt.
+            cancel attempt.
 
         Raises:
             PersistenceNotConfiguredError: Agent has no DB.
             RunNotFoundError: ``run_id`` does not exist.
         """
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
-        from dendrux.types import RunResult, RunStatus, UsageStats
+        from dendrux.types import RunStatus
 
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        self._task_manager.cancel(run_id)
-
-        # TODO(perf): this walks up to 4 CAS finalize_run calls sequentially.
-        # A single ``finalize_run_if_status_in([...])`` on the StateStore
-        # would cut that to one round-trip on Postgres; keep as-is until
-        # cancel volume matters.
-        for expected in (
-            RunStatus.RUNNING.value,
-            RunStatus.WAITING_CLIENT_TOOL.value,
-            RunStatus.WAITING_HUMAN_INPUT.value,
-            RunStatus.WAITING_APPROVAL.value,
-        ):
-            won = await store.finalize_run(
-                run_id,
-                status=RunStatus.CANCELLED.value,
-                expected_current_status=expected,
-            )
-            if won:
-                break
-
+        # Preflight: distinguish missing from terminal so callers get
+        # specific errors / no-op behavior without ambiguity.
         record = await store.get_run(run_id)
         if record is None:
             raise RunNotFoundError(run_id)
 
-        usage = UsageStats(
-            input_tokens=record.total_input_tokens,
-            output_tokens=record.total_output_tokens,
-            total_tokens=record.total_input_tokens + record.total_output_tokens,
-            cost_usd=record.total_cost_usd,
-            cache_read_input_tokens=record.total_cache_read_tokens,
-            cache_creation_input_tokens=record.total_cache_creation_tokens,
+        terminal = {
+            RunStatus.SUCCESS.value,
+            RunStatus.ERROR.value,
+            RunStatus.CANCELLED.value,
+            RunStatus.MAX_ITERATIONS.value,
+        }
+        if record.status in terminal:
+            return _record_to_run_result(record)
+
+        # Set cooperative cancel flag (observed by runner checkpoints)
+        # AND attempt atomic CAS finalize over the cancellable statuses.
+        # If paused: CAS wins instantly. If running: CAS misses, runner
+        # sees the flag at its next checkpoint and finalizes itself.
+        await store.request_cancel(run_id)
+        self._task_manager.cancel(run_id)
+
+        cancel_won = await store.finalize_run_if_status_in(
+            run_id,
+            status=RunStatus.CANCELLED.value,
+            allowed_current_statuses=[
+                RunStatus.WAITING_CLIENT_TOOL.value,
+                RunStatus.WAITING_HUMAN_INPUT.value,
+                RunStatus.WAITING_APPROVAL.value,
+            ],
         )
-        return RunResult(
-            run_id=run_id,
-            status=RunStatus(record.status),
-            answer=record.answer,
-            error=record.error,
-            iteration_count=record.iteration_count,
-            usage=usage,
-        )
+        if cancel_won:
+            # Paused-run cancel: we own the terminal event.
+            # Running-run cancel: the runner emits run.cancelled when
+            # it observes the flag at a checkpoint.
+            # Sequence the event AFTER existing run.started/run.paused so
+            # SSE clients reading by after_sequence_index don't miss it.
+            from dendrux.runtime.runner import EventSequencer, _emit_event
+
+            next_seq = await store.get_next_event_sequence(run_id)
+            sequencer = EventSequencer(initial=next_seq)
+            await _emit_event(
+                store, run_id, "run.cancelled", sequencer, {"reason": "cancel_requested"}
+            )
+
+        record = await store.get_run(run_id)
+        if record is None:  # pragma: no cover — we just preflight-checked
+            raise RunNotFoundError(run_id)
+        return _record_to_run_result(record)
 
     @overload
     def stream(

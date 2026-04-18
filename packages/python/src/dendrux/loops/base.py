@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
+    from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
     from dendrux.types import (
         AgentStep,
@@ -188,6 +189,7 @@ class Loop(ABC):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         initial_pii_mapping: dict[str, str] | None = None,
+        state_store: StateStore | None = None,
     ) -> RunResult:
         """Execute the agent loop until completion.
 
@@ -231,6 +233,7 @@ class Loop(ABC):
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
+        state_store: StateStore | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream agent execution as RunEvents.
 
@@ -264,12 +267,19 @@ class Loop(ABC):
             initial_usage=initial_usage,
             provider_kwargs=provider_kwargs,
             output_type=output_type,
+            state_store=state_store,
         )
 
         # Determine terminal event type from run status
         from dendrux.types import RunStatus as _RunStatus
 
-        if result.status in (_RunStatus.WAITING_CLIENT_TOOL, _RunStatus.WAITING_HUMAN_INPUT):
+        if result.status in (
+            _RunStatus.WAITING_CLIENT_TOOL,
+            _RunStatus.WAITING_HUMAN_INPUT,
+            _RunStatus.WAITING_APPROVAL,
+        ):
             yield _RunEvent(type=_RunEventType.RUN_PAUSED, run_result=result)
+        elif result.status == _RunStatus.CANCELLED:
+            yield _RunEvent(type=_RunEventType.RUN_CANCELLED, run_result=result)
         else:
             yield _RunEvent(type=_RunEventType.RUN_COMPLETED, run_result=result)

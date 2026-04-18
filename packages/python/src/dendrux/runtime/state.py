@@ -61,6 +61,7 @@ class RunRecord:
     last_progress_at: datetime | None = None
     failure_reason: str | None = None
     retry_of_run_id: str | None = None
+    cancel_requested: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -312,6 +313,62 @@ class StateStore(Protocol):
         expected_current_status: str | None = None,
         pii_mapping: dict[str, str] | None = None,
     ) -> bool: ...
+
+    async def finalize_run_if_status_in(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        answer: str | None = None,
+        error: str | None = None,
+        iteration_count: int | None = None,
+        total_usage: UsageStats | None = None,
+        pii_mapping: dict[str, str] | None = None,
+    ) -> bool:
+        """Atomic CAS over a set of allowed current statuses.
+
+        Single SQL ``UPDATE ... WHERE status IN (...)`` — no race window.
+        Match :meth:`finalize_run` semantics: clears ``pause_data`` to
+        ``None`` and ``cancel_requested`` to ``False`` on success.
+
+        Returns:
+            True if the row was updated; False if the run's status was
+            not in ``allowed_current_statuses`` (someone else won).
+        """
+        ...
+
+    async def request_cancel(self, run_id: str) -> bool:
+        """Set the cooperative cancellation flag on a non-terminal run.
+
+        Returns True if the flag was set (or already True on a
+        non-terminal row), False if the row was missing OR already in a
+        terminal state. The "non-terminal" check is part of the same
+        atomic UPDATE so a finalize racing between the caller's
+        preflight and this call cannot leave a stale True on a
+        completed/errored/cancelled row.
+
+        Idempotent on non-terminal rows.
+        """
+        ...
+
+    async def is_cancel_requested(self, run_id: str) -> bool:
+        """Read the cooperative cancellation flag.
+
+        Returns False for missing runs.
+        """
+        ...
+
+    async def get_next_event_sequence(self, run_id: str) -> int:
+        """Return ``max(sequence_index) + 1`` for the run's events.
+
+        Used by ad-hoc emitters (e.g. ``cancel_run``) that aren't part
+        of an ongoing runner sequence but still need to append events
+        in monotonic order so SSE clients reading via
+        ``after_sequence_index`` don't miss them. Returns 0 for runs
+        with no prior events.
+        """
+        ...
 
     async def pause_run(
         self,
@@ -848,6 +905,9 @@ class SQLAlchemyStateStore:
 
                 # Clear pause_data on finalize (D1: execution state cleaned up)
                 values["pause_data"] = None
+                # Clear cooperative cancel flag — terminal state is final;
+                # a stale True here would confuse later audits.
+                values["cancel_requested"] = False
 
                 # Conditional finalize: only update if status is still 'running'
                 # (or expected_status if provided). Prevents cancel/finalize races.
@@ -868,6 +928,134 @@ class SQLAlchemyStateStore:
                 )
 
         return await retry_transient_db(_attempt, label="finalize_run", run_id=run_id)
+
+    async def finalize_run_if_status_in(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        answer: str | None = None,
+        error: str | None = None,
+        iteration_count: int | None = None,
+        total_usage: UsageStats | None = None,
+        pii_mapping: dict[str, str] | None = None,
+    ) -> bool:
+        """Atomic CAS finalize over multiple acceptable current statuses.
+
+        One SQL ``UPDATE ... WHERE status IN (...)`` — collapses what
+        used to be N sequential CAS attempts into a single round-trip.
+        Mirrors :meth:`finalize_run`'s side-effects: clears ``pause_data``
+        and ``cancel_requested``.
+        """
+        from sqlalchemy import func, update
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                values: dict[str, Any] = {
+                    "status": status,
+                    "updated_at": func.now(),
+                    "pause_data": None,
+                    "cancel_requested": False,
+                }
+                if iteration_count is not None:
+                    values["iteration_count"] = iteration_count
+                if answer is not None:
+                    values["output_data"] = {"answer": answer}
+                if error is not None:
+                    values["error"] = error
+                if total_usage is not None:
+                    values["total_input_tokens"] = total_usage.input_tokens
+                    values["total_output_tokens"] = total_usage.output_tokens
+                    values["total_cost_usd"] = total_usage.cost_usd
+                    values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
+                    values["total_cache_creation_tokens"] = (
+                        total_usage.cache_creation_input_tokens or 0
+                    )
+                if pii_mapping is not None:
+                    values["pii_mapping"] = pii_mapping
+
+                stmt = (
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_id,
+                        AgentRun.status.in_(allowed_current_statuses),
+                    )
+                    .values(**values)
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                return bool(result.rowcount and result.rowcount > 0)
+
+        return await retry_transient_db(_attempt, label="finalize_run_if_status_in", run_id=run_id)
+
+    async def request_cancel(self, run_id: str) -> bool:
+        """Set ``cancel_requested=True`` on a non-terminal run.
+
+        The terminal-status guard is part of the SQL UPDATE — no race
+        window between read and write.
+        """
+        from sqlalchemy import func, update
+
+        from dendrux.db.models import AgentRun
+
+        terminal = (
+            RunStatus.SUCCESS.value,
+            RunStatus.ERROR.value,
+            RunStatus.CANCELLED.value,
+            RunStatus.MAX_ITERATIONS.value,
+        )
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                stmt = (
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_id,
+                        AgentRun.status.notin_(terminal),
+                    )
+                    .values(cancel_requested=True, updated_at=func.now())
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                return bool(result.rowcount and result.rowcount > 0)
+
+        return await retry_transient_db(_attempt, label="request_cancel", run_id=run_id)
+
+    async def is_cancel_requested(self, run_id: str) -> bool:
+        """Read ``cancel_requested`` flag. False for missing runs."""
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                stmt = select(AgentRun.cancel_requested).where(AgentRun.id == run_id)
+                result = await session.execute(stmt)
+                row = result.first()
+                return bool(row[0]) if row is not None else False
+
+        return await retry_transient_db(_attempt, label="is_cancel_requested", run_id=run_id)
+
+    async def get_next_event_sequence(self, run_id: str) -> int:
+        """Return ``max(sequence_index) + 1`` for the run, or 0 if none."""
+        from sqlalchemy import func, select
+
+        from dendrux.db.models import RunEvent
+
+        async def _attempt() -> int:
+            async with self._session_factory() as session:
+                stmt = select(func.max(RunEvent.sequence_index)).where(
+                    RunEvent.agent_run_id == run_id
+                )
+                row = (await session.execute(stmt)).first()
+                if row is None or row[0] is None:
+                    return 0
+                return int(row[0]) + 1
+
+        return await retry_transient_db(_attempt, label="get_next_event_sequence", run_id=run_id)
 
     async def pause_run(
         self,
@@ -1753,6 +1941,7 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         last_progress_at=row.last_progress_at,
         failure_reason=row.failure_reason,
         retry_of_run_id=row.retry_of_run_id,
+        cancel_requested=bool(row.cancel_requested),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

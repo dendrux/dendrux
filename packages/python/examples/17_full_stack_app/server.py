@@ -38,6 +38,15 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.dashboard.api import create_dashboard_api
 from dendrux.db.models import Base
+from dendrux.errors import (
+    InvalidToolResultError,
+    PauseStatusMismatchError,
+    PersistenceNotConfiguredError,
+    RunAlreadyClaimedError,
+    RunAlreadyTerminalError,
+    RunNotFoundError,
+    RunNotPausedError,
+)
 from dendrux.http import make_read_router
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.store import RunStore
@@ -146,6 +155,44 @@ def create_demo_app() -> FastAPI:
         await engine.dispose()
 
     app = FastAPI(title="Dendrux — Full Stack Demo", lifespan=lifespan)
+
+    # --- Translate Dendrux exceptions to HTTP status codes -----------------
+    # Dendrux never imposes an HTTP contract; the dev maps each exception to
+    # the status code their app uses. These are the suggested mappings from
+    # ``dendrux.errors``. Adjust per your app's conventions if you'd like.
+    @app.exception_handler(RunNotFoundError)
+    async def _h_not_found(_req: Request, exc: RunNotFoundError) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(RunAlreadyTerminalError)
+    async def _h_terminal(_req: Request, exc: RunAlreadyTerminalError) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "status": exc.current_status.value},
+        )
+
+    @app.exception_handler(RunNotPausedError)
+    async def _h_not_paused(_req: Request, exc: RunNotPausedError) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "status": exc.current_status.value},
+        )
+
+    @app.exception_handler(PauseStatusMismatchError)
+    async def _h_pause_mismatch(_req: Request, exc: PauseStatusMismatchError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(RunAlreadyClaimedError)
+    async def _h_claimed(_req: Request, exc: RunAlreadyClaimedError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(InvalidToolResultError)
+    async def _h_invalid(_req: Request, exc: InvalidToolResultError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(PersistenceNotConfiguredError)
+    async def _h_no_db(_req: Request, exc: PersistenceNotConfiguredError) -> JSONResponse:
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     agents = {
         "anthropic": build_anthropic_agent(database_url=db_url),

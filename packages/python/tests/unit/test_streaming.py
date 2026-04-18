@@ -33,6 +33,7 @@ from dendrux.types import (
     ToolResult,
     UsageStats,
 )
+from tests._helpers.state_store_mocks import CancellationStubsMixin
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -565,7 +566,7 @@ class _FakeRunRecord:
         self.meta: dict[str, Any] | None = None
 
 
-class ResumeStateStore:
+class ResumeStateStore(CancellationStubsMixin):
     """Minimal fake StateStore for resume_stream tests."""
 
     def __init__(self) -> None:

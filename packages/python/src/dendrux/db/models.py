@@ -104,6 +104,12 @@ class AgentRun(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
     idempotency_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Cooperative cancellation flag — runner observes at checkpoints,
+    # cleared on terminal finalize so a stale True never lingers.
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

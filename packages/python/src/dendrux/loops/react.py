@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -541,6 +542,7 @@ class ReActLoop(Loop):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         initial_pii_mapping: dict[str, str] | None = None,
+        state_store: StateStore | None = None,
     ) -> RunResult:
         """Execute the ReAct loop, optionally resuming from a pause."""
         resolved_run_id = run_id or generate_ulid()
@@ -568,6 +570,20 @@ class ReActLoop(Loop):
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
+            # Cooperative cancellation: observe before starting next iteration.
+            # Current iteration's LLM/tools are not preempted — cancel is seen
+            # at this checkpoint or the runner's pre-pause checkpoint.
+            if state_store is not None and await state_store.is_cancel_requested(resolved_run_id):
+                meta = {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
+                return RunResult(
+                    run_id=resolved_run_id,
+                    status=RunStatus.CANCELLED,
+                    steps=steps,
+                    iteration_count=iteration - 1,
+                    usage=total_usage,
+                    meta=meta,
+                )
+
             messages, tools = strategy.build_messages(
                 system_prompt=agent.get_system_prompt(),
                 history=history,
@@ -965,6 +981,7 @@ class ReActLoop(Loop):
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
+        state_store: StateStore | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 
@@ -993,6 +1010,24 @@ class ReActLoop(Loop):
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
+            # Cooperative cancellation checkpoint (see run() for rationale).
+            if state_store is not None and await state_store.is_cancel_requested(resolved_run_id):
+                cancel_meta: dict[str, Any] = (
+                    {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
+                )
+                yield RunEvent(
+                    type=RunEventType.RUN_CANCELLED,
+                    run_result=RunResult(
+                        run_id=resolved_run_id,
+                        status=RunStatus.CANCELLED,
+                        steps=steps,
+                        iteration_count=iteration - 1,
+                        usage=total_usage,
+                        meta=cancel_meta,
+                    ),
+                )
+                return
+
             messages, tools = strategy.build_messages(
                 system_prompt=agent.get_system_prompt(),
                 history=history,

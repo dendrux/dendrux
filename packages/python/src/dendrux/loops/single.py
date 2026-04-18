@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
     from dendrux.types import AgentStep, LLMResponse
 
@@ -93,6 +94,7 @@ class SingleCall(Loop):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         initial_pii_mapping: dict[str, str] | None = None,
+        state_store: StateStore | None = None,  # noqa: ARG002 — SingleCall has no checkpoints
     ) -> RunResult:
         """Execute a single LLM call and return the result."""
         if output_type is not None and agent.guardrails:
@@ -432,6 +434,7 @@ class SingleCall(Loop):
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
+        state_store: StateStore | None = None,  # noqa: ARG002 — SingleCall has no checkpoints
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream a single LLM call as RunEvents.
 

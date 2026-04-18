@@ -138,6 +138,12 @@ async def claim_or_raise(
         # RUNNING, PENDING, or anything else non-paused.
         raise RunNotPausedError(run_id, current)
 
+    # If cancellation has been requested but the runner has not yet
+    # observed it, refuse the submit — the run is on the path to
+    # CANCELLED and resuming it would just bounce off the next checkpoint.
+    if record.cancel_requested:
+        raise RunAlreadyTerminalError(run_id, RunStatus.CANCELLED)
+
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
     if submitted_data is not None:
         won = await store.submit_and_claim(
