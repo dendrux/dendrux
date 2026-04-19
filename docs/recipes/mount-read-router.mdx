@@ -1,0 +1,286 @@
+---
+title: Mounting the read router
+description: Stand up dendrux's read-only HTTP surface — runs, events, drill-downs, and SSE — on your existing FastAPI app in five lines.
+---
+
+# Mounting the read router
+
+Dendrux ships one factory, `make_read_router`, that returns a FastAPI `APIRouter` covering every read endpoint a dashboard or monitor needs: list runs, fetch a run, page through events, stream events as SSE, drill into LLM calls, tool calls, traces, and pause/resume cycles. You mount it into your app, supply an authorize dependency, and that is the entire setup.
+
+This recipe shows the mount, the responses each endpoint returns (captured from a real run), and the patterns you will reach for when wiring this into your own app.
+
+## The mount
+
+```python
+from fastapi import FastAPI, Depends, HTTPException, Request
+from dendrux.http import make_read_router
+from dendrux.store import RunStore
+
+app = FastAPI()
+
+store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
+
+async def authorize(request: Request) -> None:
+    token = request.headers.get("authorization", "")
+    if token != f"Bearer {EXPECTED_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+
+app.include_router(
+    make_read_router(store=store, authorize=authorize),
+    prefix="/api",
+)
+```
+
+Five things to know:
+
+1. `RunStore` is the read-only facade over the dendrux database. Its lifecycle is yours to manage; use `RunStore.from_database_url(...)` for the store-owned engine path or `RunStore.from_engine(engine)` if you already have one.
+2. `authorize` is a FastAPI dependency. Raise `HTTPException` to deny; return any value (ignored) to allow. The dependency runs on every endpoint except `/health` (Kubernetes probes need an unauthenticated path).
+3. `prefix=` is yours. The factory does not impose a path.
+4. CORS, TLS, rate limiting, request logging — all yours. The router is a plain `APIRouter` with no middleware attached.
+5. The router is read-only. Write operations (submit tool results, submit input, submit approval, cancel) are wrapper routes you build on `Agent` methods. See [HTTP API surface](/docs/reference/http-api) for the full list and [Client-side tools](/docs/recipes/client-tools) for an end-to-end example.
+
+## Endpoints, captured
+
+A real calculator run (one ReAct iteration calling an `add` tool) hit through every read endpoint. Only the most useful fields shown.
+
+### `GET /api/health`
+
+Unauthenticated. Returns `{"status": "ok"}`. Use it for Kubernetes liveness and readiness probes.
+
+### `GET /api/runs?limit=5`
+
+```json
+{
+  "items": [
+    {
+      "run_id": "01KPHZHM1CMT0B8H1ETYNEH3MA",
+      "agent_name": "Agent",
+      "status": "success",
+      "created_at": "2026-04-19T04:21:25",
+      "updated_at": "2026-04-19T04:21:34",
+      "iteration_count": 2,
+      "total_input_tokens": 1252,
+      "total_output_tokens": 82,
+      "total_cache_read_tokens": 0,
+      "total_cache_creation_tokens": 0,
+      "total_cost_usd": null,
+      "model": "claude-haiku-4-5",
+      "parent_run_id": null,
+      "delegation_level": 0
+    }
+  ],
+  "total": 1,
+  "limit": 5,
+  "offset": 0
+}
+```
+
+Filters available as query params: `status` (repeatable for OR), `agent_name`, `parent_run_id`, `tenant_id`, `started_after`, `started_before`. Pagination via `limit` (1-1000, default 50) and `offset` (default 0). `total` is a separate count, so you can render pagination controls without a second request.
+
+### `GET /api/runs/{run_id}`
+
+```json
+{
+  "run_id": "01KPHZHM1CMT0B8H1ETYNEH3MA",
+  "agent_name": "Agent",
+  "status": "success",
+  "iteration_count": 2,
+  "total_input_tokens": 1252,
+  "total_output_tokens": 82,
+  "model": "claude-haiku-4-5",
+  "strategy": "NativeToolCalling",
+  "input_data": {"input": "What is 17 + 25?"},
+  "answer": "17 + 25 = **42**",
+  "error": null,
+  "failure_reason": null
+}
+```
+
+Single run detail. Same fields as the list view plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`. 404 if the id is unknown.
+
+### `GET /api/runs/{run_id}/events?after=N&limit=100`
+
+Paginated event log. `after` is an exclusive cursor (pass the last batch's `sequence_index` to continue). Empty-batch rule: `next_cursor` echoes your input `after` when the page is empty (means "nothing new yet," not "stream ended"). See [Event ordering](/docs/architecture/event-ordering) for the durable log model.
+
+```json
+{
+  "items": [
+    {
+      "sequence_index": 0,
+      "iteration_index": 0,
+      "event_type": "run.started",
+      "correlation_id": null,
+      "data": {"agent_name": "Agent", "system_prompt": "..."},
+      "created_at": "2026-04-19T04:21:25"
+    }
+  ],
+  "next_cursor": 0
+}
+```
+
+### `GET /api/runs/{run_id}/events/stream`
+
+Server-Sent Events. One frame per event in `sequence_index` order. Connection stays open until the client disconnects.
+
+Frames look like:
+
+```
+id: 5
+event: message
+data: {"sequence_index": 5, "iteration_index": 1, "event_type": "run.paused", "correlation_id": null, "timestamp": "2026-04-19T04:21:30Z", "data": {...}}
+
+```
+
+Cursor resolution (first match wins): `Last-Event-ID` header, `?after=N` query param, `None` (start from the beginning). Reconnect via `EventSource` automatically populates `Last-Event-ID` from the last frame's `id`.
+
+Heartbeat: `: keepalive\n\n` every 15s of idleness. Polling cadence: 0.5s per connection. Plan for ~2 DB QPS per open SSE connection until Postgres `LISTEN/NOTIFY` ships.
+
+Browser usage:
+
+```javascript
+const es = new EventSource(`/api/runs/${run_id}/events/stream?after=5`);
+es.addEventListener("message", (e) => {
+  const frame = JSON.parse(e.data);
+  if (frame.event_type === "run.completed") es.close();
+});
+```
+
+### `GET /api/runs/{run_id}/llm-calls`
+
+```json
+{
+  "items": [
+    {
+      "iteration": 1,
+      "provider": "AnthropicProvider",
+      "model": "claude-haiku-4-5",
+      "input_tokens": 585,
+      "output_tokens": 69,
+      "total_tokens": 654,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cost_usd": null,
+      "duration_ms": 1132,
+      "provider_request": {"model": "claude-haiku-4-5", "max_tokens": 16000, "messages": [...]},
+      "provider_response": {...}
+    }
+  ]
+}
+```
+
+`provider_request` and `provider_response` are the raw adapter-boundary JSON. Treat as opaque diagnostic blobs; do not depend on their shape across provider versions.
+
+### `GET /api/runs/{run_id}/tool-calls`
+
+```json
+{
+  "items": [
+    {
+      "iteration": 1,
+      "tool_name": "add",
+      "tool_call_id": "01KPHZHNQA0W8X8Y3JCWBRPQAZ",
+      "provider_tool_call_id": "toolu_01...",
+      "target": "server",
+      "params": {"a": 17, "b": 25},
+      "result": 42,
+      "success": true,
+      "error": null,
+      "duration_ms": 0
+    }
+  ]
+}
+```
+
+Server tools, submitted client tools, and approved-server tools all land here. Denied tools (via `deny=`) do not write a row. Approval-rejected tools write a row with `success: false` and the rejection reason in `error`. See [Access control](/docs/architecture/access-control) for the contrast.
+
+### `GET /api/runs/{run_id}/traces`
+
+Conversation messages in order. Roles: `user`, `assistant`, `tool`. Useful for replaying what the model saw.
+
+```json
+{
+  "items": [
+    {"role": "user", "content": "What is 17 + 25?", "order_index": 0, ...},
+    {"role": "assistant", "content": "", "order_index": 1, "meta": {"tool_calls": [...]}},
+    {"role": "tool", "content": "42", "order_index": 2, ...},
+    {"role": "assistant", "content": "17 + 25 = **42**", "order_index": 3, ...}
+  ]
+}
+```
+
+If a `redact=` callback is configured on the agent, `content` is the redacted text. The unredacted execution state (`pause_data`) is never exposed by this endpoint. See [PII redaction](/docs/architecture/pii-redaction) for the full redaction boundary.
+
+### `GET /api/runs/{run_id}/pauses`
+
+Pause/resume pairs derived from `run_events` (never from `pause_data`, which is execution-only state). Each item:
+
+```json
+{
+  "pause_sequence_index": 5,
+  "pause_at": "2026-04-19T04:21:30Z",
+  "resume_sequence_index": 8,
+  "resume_at": "2026-04-19T04:21:45Z",
+  "reason": "waiting_client_tool",
+  "pending_tool_calls": [{"id": "...", "name": "read_excel_range", "target": "client", "params": {...}}],
+  "submitted_results": [{"name": "read_excel_range", "call_id": "...", "payload": "[[42]]", "success": true}],
+  "user_input": null
+}
+```
+
+An unpaired pause at the end of the log (no `run.resumed` after it) represents an active pause. `resume_sequence_index` is `null` and `submitted_results` is empty.
+
+## Patterns
+
+### One store, many agents
+
+`RunStore` only needs the database. It does not care which agent classes wrote the data. One mount serves every agent in your app:
+
+```python
+store = RunStore.from_database_url(DB_URL)
+app.include_router(make_read_router(store=store, authorize=authorize), prefix="/api")
+# all your agents share this DB; the router sees every run
+```
+
+### Tenant isolation in the dependency
+
+The factory's `authorize` is a generic FastAPI dependency, so you can do whatever FastAPI does. Inject a tenant id from the request context and have your store treat the `tenant_id` query param as required:
+
+```python
+async def authorize(request: Request) -> str:
+    user = await load_user(request)
+    if not user:
+        raise HTTPException(401, "unauthorized")
+    request.state.tenant_id = user.tenant_id
+    return user.tenant_id
+```
+
+The handlers themselves only see whatever the dependency raises. Cross-tenant data leakage is prevented by always passing `tenant_id=` when you call `store.list_runs(...)` from your own routes, and by adding a check in your dependency or a middleware that rejects requests where the path's `run_id` does not belong to the caller's tenant.
+
+### Caller-owned engine
+
+If your app already has a SQLAlchemy async engine, pass it in instead:
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+engine = create_async_engine(DB_URL)
+store = RunStore.from_engine(engine)
+```
+
+`from_engine` does not own the engine; `store.close()` is a no-op for the engine. You dispose it during your app shutdown.
+
+### Running the read router and write routes together
+
+The read router only handles GETs. Pair it with your own write routes for the action surface (submit tool results, submit input, submit approval, cancel). Both share the same `Agent` and `RunStore` instances. See [Client-side tools](/docs/recipes/client-tools) and [Human-in-the-loop approval](/docs/recipes/hitl-approval) for end-to-end examples.
+
+## Notes
+
+- **The router never blocks.** All endpoints either return immediately or stream (SSE). No long-running synchronous work.
+- **404 fast.** Drill-down endpoints (`/llm-calls`, `/tool-calls`, `/traces`, `/pauses`, `/events*`) preflight `get_run` and 404 if the run does not exist, instead of silently returning empty pages.
+- **No magic transport.** SSE is a `StreamingResponse` over a polling loop, not a queue or fan-out manager. Sized to nginx defaults: heartbeat under `proxy_read_timeout`, polling tuned for ~2 QPS per connection.
+- **No middleware.** Auth, CORS, observability, rate limiting all stay in your hands. `make_read_router` returns a plain `APIRouter`.
+
+## Where this fits
+
+- Reference: [HTTP API surface](/docs/reference/http-api) for the full parameter and exception inventory.
+- Architecture: [Event ordering](/docs/architecture/event-ordering), [State persistence](/docs/architecture/state-persistence).
+- Source: `dendrux/http/read_router.py` and `dendrux/store/__init__.py`.

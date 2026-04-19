@@ -1,0 +1,125 @@
+---
+title: Access control
+description: Deny-listing tools and skills at the agent level, how the runtime enforces it before execution, and why a synthetic tool result beats an exception.
+---
+
+# Access control
+
+Access control in dendrux is the set of rules that decide whether a tool call is even allowed to execute. If a denied tool is attempted, the runtime short-circuits: it never calls the function, it emits a `policy.denied` governance event, and it hands a synthetic failure back to the model so the loop can continue. The tool's side effects never happen.
+
+Three knobs cover the common cases:
+
+| Parameter | Scope | Event emitted |
+| --- | --- | --- |
+| `deny=["tool_name"]` | Per-agent list of tools that cannot execute, even if the LLM calls them | `policy.denied` |
+| `deny_skills=["skill_name"]` | Per-agent list of [skills](/docs/architecture/skills) that cannot load | `skill.denied` |
+| MCP server auth / errors | Network-layer failures reaching an [MCP](/docs/architecture/mcp) server | `mcp.error` |
+
+The rest of this page focuses on `deny`, which is the most commonly used. The other two share the same shape: decide at the gate, emit a typed event, keep going.
+
+## A real deny in action
+
+An admin agent has two tools: `refund` and `delete_user`. `delete_user` is in the deny list. The user asks the agent to delete user 42. Captured from a live run:
+
+```text
+status: success
+delete_user actually called?  False
+final answer preview: "I'm unable to delete user 42. The delete_user action has been denied
+by policy, which means I don't have permission to permanently delete..."
+
+run_events:
+  [lifecycle] seq=0  run.started
+  [lifecycle] seq=1  llm.completed       (model emits delete_user(user_id=42))
+  [GOV]       seq=2  policy.denied       data={"tool_name": "delete_user", "call_id": "...", "reason": "denied_by_policy"}
+  [lifecycle] seq=3  llm.completed       (model sees the denial, picks a different action)
+  [lifecycle] seq=4  run.completed
+
+tool_calls table:
+  rows: 0
+```
+
+Four things to pull out of that trace:
+
+1. **The tool function never ran.** `DELETE_CALLED` is empty. No DB row landed in `tool_calls` (that table only records actual executions, not blocked attempts).
+2. **A `policy.denied` event landed on the timeline.** `seq=2`, same `correlation_id` as the LLM's tool-call id, so a reader can join the denial to the call that triggered it.
+3. **The model was told.** A synthetic tool result with `{"denied": "Tool 'delete_user' is denied by policy."}` was appended to history. The next LLM turn saw it and produced a sensible user-facing answer.
+4. **The run still succeeded.** `status=success`. Deny is not a run-killer; it is a gate that the loop routes around.
+
+## What "deny" actually does inside the loop
+
+From `dendrux/loops/react.py`, the relevant branch of the tool-dispatch phase:
+
+```python
+if tc.name in deny_set:
+    deny_msg = f"Tool '{tc.name}' is denied by policy."
+    deny_result = ToolResult(
+        name=tc.name,
+        call_id=tc.id,
+        payload=json.dumps({"denied": deny_msg}),
+        success=False,
+        error=deny_msg,
+    )
+    # No _record_tool / _notify_tool — denied tools are not executions.
+    # Only policy.denied event + synthetic message for the model.
+    await _record_governance(recorder, "policy.denied", iteration, event_data, correlation_id=tc.id)
+    await _notify_governance(notifier, "policy.denied", iteration, event_data, correlation_id=tc.id, warnings=warnings)
+    result_msg = strategy.format_tool_result(deny_result)
+    history.append(result_msg)
+    await _record_message(recorder, result_msg, iteration)
+    await _notify_message(notifier, result_msg, iteration, warnings)
+    all_results.append((tc, deny_result))
+else:
+    non_denied.append(tc)
+```
+
+Three observations about the exact code:
+
+1. **Deny runs before deanonymization.** The `deny_set` check is phase 0 of the tool-dispatch stage. Phase 0.5 is `guardrail_engine.deanonymize(tc.params)` which only runs on the `non_denied` bucket. Denied tool calls never touch their params. This also means the LLM's placeholder values are never unwrapped for a denied call, which is the right behavior.
+2. **There is no `tool.completed` event and no `tool_calls` row.** The comment in the source makes it explicit: "denied tools are not executions." Persisting a fake execution would confuse readers who query the `tool_calls` table expecting one row per side effect.
+3. **The synthetic result is a normal tool-result message.** It flows through the same `on_message_appended` path as any other tool result, so the model sees it in the right place in history. The LLM has no way to tell a denied call apart from a failed tool call, which means the existing prompt guidance for handling tool failures applies without change.
+
+## Construction-time validation
+
+The deny list is not just enforced at runtime; `Agent` validates it at construction:
+
+```python
+# From dendrux/agent.py
+if self._deny:
+    unknown = self._deny - known_tools
+    if unknown:
+        raise ValueError(
+            f"Agent '{self.name}' has deny={sorted(self._deny)} but "
+            f"{sorted(unknown)} are not in tools."
+        )
+```
+
+If you misspell a tool name in `deny`, the agent refuses to construct. This prevents a class of silent-deny bugs where a typo leaves a sensitive tool wide open because the policy name never matched.
+
+`deny` also conflicts with itself against `require_approval`: a tool that is denied cannot also be in the approval gate, and the constructor raises on overlap.
+
+## Skills and MCP: the other gates
+
+Skills and MCP connections enter the governance pipeline at different points, but they follow the same principle: fail at the boundary with a typed event, keep the run moving when it can.
+
+- `deny_skills=[...]` is the skill analogue of `deny`. A skill listed there will not be registered when the agent boots. The runner emits `skill.denied` on startup. See [Skills](/docs/architecture/skills).
+- MCP connections happen in `_emit_init_events` during agent setup. A connection that fails auth or discovery emits `mcp.error`, with the error payload in `data`. The run continues without the server's tools. See [MCP](/docs/architecture/mcp).
+
+All three layers share `run_events` as the audit surface. Querying `WHERE event_type IN ('policy.denied', 'skill.denied', 'mcp.error')` on a run returns the full access-control story in one query, in order.
+
+## Why a synthetic result instead of an exception
+
+The most obvious alternative is to raise a Python exception when a denied tool is called. The loop could catch it, mark the run failed, and stop.
+
+That design is wrong for two reasons.
+
+1. **The LLM has useful work left to do.** A model that gets a "denied" tool result can apologize, ask for a different approach, suggest an escalation path, or try a non-destructive alternative. All of that is lost if the runtime kills the run on the first denied attempt. The user's request still deserves a response.
+2. **Denial is not an error.** `status=error` is reserved for things that actually broke: a guardrail-blocked secret, an unrecoverable tool failure, a provider outage. A policy denial is a normal branch of the decision tree, and should look like one in the event log. `policy.denied` is its own event type so dashboards can aggregate access-control activity without mixing it with failure alerts.
+
+The synthetic tool result is the cheapest way to give the model enough information to keep going. The `success=False, error="denied"` shape matches what it would see from a real tool failure, and most prompts already handle that case.
+
+## Where this fits
+
+- Declared on `Agent(deny=[...], deny_skills=[...])`.
+- Enforced in `dendrux.loops.react.ReActLoop` (phase 0 of tool dispatch) and during skill registration.
+- Emits `policy.denied`, `skill.denied`, `mcp.error` events on `run_events`.
+- Sits alongside the other [governance](/docs/architecture/governance) layers: guardrails, approval, budget. Nothing about access control fights any of them.

@@ -1,0 +1,222 @@
+---
+title: Loops
+description: The pluggable strategy that drives an agent's turn cycle, with two built-ins for two different jobs.
+---
+
+# Loops
+
+A **loop** is the piece of dendrux that decides how many LLM turns to do and when to stop. It is pluggable. You pass one to the `Agent` constructor, and from then on every `agent.run(...)` call hands control to that loop to drive the think, act, observe cycle. If you do not pass one, dendrux uses `ReActLoop`.
+
+Two loops ship in the box: `ReActLoop` (the default) and `SingleCall`. They target two different shapes of work. This page covers what each one is, when to pick it, and how `iteration_count` behaves under each. Every claim below is read from the `dendrux==0.2.0a1` source.
+
+## What a loop actually does
+
+When you call `agent.run(input)`, the runner hands the request to the loop. The loop then:
+
+1. Builds a messages payload (via the strategy).
+2. Calls `provider.complete(...)`.
+3. Parses the response into an `AgentStep` (via the strategy).
+4. Decides what happens next: another turn, a tool execution, a pause, or a terminal `RunResult`.
+
+The loop never touches provider-specific APIs or prompt formatting. That belongs to the strategy. The loop is pure orchestration: it owns the question "does the agent go around again?"
+
+```python
+class Loop(ABC):
+    """Base class for agent execution loops.
+
+    Built-in implementations:
+        ReActLoop  — think → act → observe → repeat (requires tools)
+        SingleCall — one LLM call, no tools, no iteration
+    """
+```
+
+Those two lines from `dendrux/loops/base.py` are the shipping contract.
+
+## Plugging a loop in
+
+The `Agent` constructor takes a `loop=` keyword. Default is `None`, which the runner resolves to `ReActLoop`.
+
+```python
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.loops import ReActLoop, SingleCall
+
+# Default: ReActLoop (omit the keyword or pass None)
+react_agent = Agent(
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="You are a support agent.",
+    tools=[refund],
+)
+
+# Explicit ReActLoop, same behavior as the default
+react_agent = Agent(
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="You are a support agent.",
+    tools=[refund],
+    loop=ReActLoop(),
+)
+
+# SingleCall for one-turn work
+classifier = Agent(
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="Classify the input as: positive, negative, or neutral.",
+    loop=SingleCall(),
+)
+```
+
+The `Loop` instance you pass is held on the agent for the whole lifetime of the object. The same instance is used for every `run()` and `resume()`.
+
+## The two built-ins, at a glance
+
+| Property | `ReActLoop` | `SingleCall` |
+| --- | --- | --- |
+| Number of LLM turns | 1 to `max_iterations` | Exactly 1 |
+| Tools | Allowed and expected | **Forbidden at construction time** |
+| Pauses (`waiting_*`) | Yes: client tool, human input, approval | Never |
+| Structured output (`output_type`) | Not supported | Supported |
+| Resume | Supported | Rejected at runtime |
+| Iteration checkpoint for cancel | Top of every iteration | None (one shot) |
+| Final `iteration_count` on success | 1, 2, 3, ..., up to `max_iterations` | Always `1` |
+
+These rules are enforced in the `Agent._validate()` path. The relevant failure messages, straight from `dendrux/agent.py`:
+
+```python
+# Tools with SingleCall
+f"Agent '{self.name}' uses SingleCall loop but has {len(self.tools)} tools. "
+# Structured output without SingleCall
+f"but does not use SingleCall loop. Structured output is only "
+f"supported with SingleCall. Either set "
+f"loop=SingleCall() or remove output_type."
+```
+
+So the right way to read the table is: the two loops are not overlapping. Each is tuned to a specific kind of task, and the constructor refuses combinations that would not make sense.
+
+## `ReActLoop`: think, act, observe, repeat
+
+`ReActLoop` is the default. It is the loop you want for anything that might call a tool, ask a clarifying question, or need more than one LLM turn to reach an answer.
+
+The cycle inside one iteration, taken from `dendrux/loops/react.py`:
+
+1. **Build messages.** Strategy assembles system prompt, history, tool defs.
+2. **Call the LLM.** One `provider.complete()`.
+3. **Parse the response** into an `AgentStep`. The `action` is one of `Finish`, `Clarification`, or `ToolCall`.
+4. **Dispatch on action:**
+   - `Finish` → return `RunResult` with `status=success`.
+   - `Clarification` → pause with `status=waiting_human_input`.
+   - `ToolCall` → execute server tools, pause for client tools or approval, then go around.
+5. If `max_iterations` is hit without a `Finish`, return `status=max_iterations`.
+
+That last bullet is the safety cap. `Agent(max_iterations=...)` defaults to 10, with a hard ceiling validated in the constructor.
+
+### What `iteration_count` means here
+
+In `ReActLoop`, `iteration_count` is the number of LLM turns the agent made before returning. Each trip through the loop body increments it by 1. A run that calls a tool once and then answers uses 2 iterations: one to decide "call this tool," and one to read the result and produce a final answer.
+
+Here is a real run. A calculator agent with an `add` tool is asked "What is 15 + 27?" The DB rows afterward:
+
+```text
+==== ReActLoop ====
+  status: success
+  answer: "15 + 27 = **42**"
+  iteration_count: 2
+  steps_len: 2
+
+react_traces:
+  order= 0  role=user       iter=0
+  order= 1  role=assistant  iter=1
+  order= 2  role=tool       iter=1
+  order= 3  role=assistant  iter=2
+
+agent_runs.iteration_count = 2
+agent_runs.meta            = {"dendrux.loop": "ReActLoop", "dendrux.max_delegation_depth": 10}
+```
+
+Two iterations. First turn: the LLM emitted the `add` tool call (assistant row at `iter=1`, then the tool result). Second turn: it read the tool result and produced the final answer (assistant row at `iter=2`). The loop name is persisted in `meta["dendrux.loop"]` so you can filter old runs by which loop produced them.
+
+### Pauses inside an iteration
+
+When the LLM emits a tool call that runs in the browser (target `client`), or one gated by `require_approval`, `ReActLoop` does not execute the tool itself. It persists a `PauseState` and returns a paused `RunResult`:
+
+- `waiting_client_tool` → a client-side tool call is pending.
+- `waiting_approval` → a tool in `require_approval` is pending a decision.
+- `waiting_human_input` → the LLM asked a clarifying question (the `Clarification` action).
+
+`iteration_count` on a paused run is the iteration the pause happened in. On resume, the loop's `iteration_offset` is set to that value and counting picks up where it left off. See [Pause and resume](/docs/architecture/pause-resume) for the resume mechanics.
+
+## `SingleCall`: one LLM call, no tools
+
+`SingleCall` is a specialized loop for agents that do exactly one thing in one LLM turn: classification, summarization, extraction, one-shot Q&A. The source comment puts it plainly:
+
+```python
+"""SingleCall loop — one LLM call, no tools, no iteration.
+
+For agents that don't need tools or iteration: classification,
+summarization, extraction, one-turn Q&A.
+"""
+```
+
+Three constraints are enforced at construction or at run time:
+
+1. **Zero tools.** The `Agent` constructor raises `ValueError` if `tools` is non-empty and `loop=SingleCall()`. Same for `tool_sources` (MCP) and skills.
+2. **No resume.** If the runner ever passes resume-shaped parameters (`initial_history`, `initial_steps`, `iteration_offset`, `initial_usage`), `SingleCall.run()` raises `RuntimeError`. SingleCall has no waiting states to resume from.
+3. **No tool calls from the provider.** If the provider unexpectedly returns `tool_calls`, `SingleCall` raises `RuntimeError` rather than silently swallow them.
+
+### What `iteration_count` means here
+
+Always `1`. The loop writes exactly one LLM interaction, appends the assistant's response to history, and returns. From `dendrux/loops/single.py`:
+
+```python
+return RunResult(
+    run_id=resolved_run_id,
+    status=RunStatus.SUCCESS,
+    answer=response.text,
+    output=validated_output,
+    steps=[],
+    iteration_count=1,
+    usage=usage,
+)
+```
+
+Note `steps=[]`. `AgentStep` is a ReAct concept (reasoning plus action). SingleCall does not produce steps because there is no action taxonomy to classify: the LLM's text is the answer, full stop.
+
+A real SingleCall run, sentiment classifier prompted with "I love this product!":
+
+```text
+==== SingleCall ====
+  status: success
+  answer: "positive"
+  iteration_count: 1
+  steps_len: 0
+
+react_traces:
+  order= 0  role=user       iter=0
+  order= 1  role=assistant  iter=1
+
+agent_runs.iteration_count = 1
+agent_runs.meta            = {"dendrux.loop": "SingleCall", "dendrux.max_delegation_depth": 10}
+```
+
+One user row, one assistant row, and we are done. No tool iterations, no pause states.
+
+### Structured output
+
+`SingleCall` is the only loop that supports `output_type`. Pass a `pydantic.BaseModel` subclass and the run returns a validated instance on `result.output`. If you set `output_type` without `loop=SingleCall()`, the constructor raises with the error shown earlier. That pairing is strict: structured output is parsed before guardrail scanning runs, so it is only allowed where guardrails and tools are absent.
+
+## Why pluggable, not hard-coded
+
+Dendrux could have baked ReAct into the runner. It does not, for three reasons:
+
+1. **Different workloads need different shapes.** A classifier does not want a tool loop. A research agent does. Hard-coding ReAct would push classifier users into disabling features they do not want, and push future loop authors into forking.
+2. **Separation of concerns.** The runner owns lifecycle (start, pause, resume, cancel, events). The loop owns the turn cycle. The strategy owns prompt formatting. Each piece is independently testable, and each can evolve without dragging the others.
+3. **Extensibility.** `Loop` is an `abc.ABC` with two abstract methods, `run` and `run_stream`. A third party can subclass it and plug in whatever cycle they want: a plan-execute-reflect loop, a fixed-step pipeline, a voting ensemble. The runner does not care what the loop does inside, only that it returns a `RunResult` or yields `RunEvent`s.
+
+The built-ins cover the common cases. The seam exists so you are never stuck when they do not.
+
+## Picking the right loop
+
+A short decision rule:
+
+- The agent might call a tool, pause, or take multiple turns → **`ReActLoop`**.
+- The agent does one LLM call and produces a label, a summary, or a pydantic model → **`SingleCall`**.
+
+If you are not sure, use `ReActLoop`. It is the default for a reason: it is the general case, and passing `max_iterations=1` does not turn it into `SingleCall` (it still runs the tool cycle, still supports pauses). `SingleCall` is the explicit choice when you want the constraints, not just the shape.

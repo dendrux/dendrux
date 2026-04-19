@@ -1,0 +1,133 @@
+---
+title: Governance
+description: The unified pipeline of protective layers around a dendrux run, how they emit typed events, and how the recorder and notifier fan those events out.
+---
+
+# Governance
+
+"Governance" in dendrux is the name for everything that happens around the model, not inside it. When a PII pattern is detected in a message, when an approval is requested, when a tool is denied by policy, when a spend budget trips a threshold: all of it is governance. Four different concerns, one unified pipeline.
+
+The pipeline is a plain event stream. Every governance concern emits a typed event. Every typed event flows through the recorder (writes to the DB for durable audit) and the notifier (broadcasts live to any attached observer). Readers consume the same stream that was written. There is no separate "audit subsystem" sitting off to the side.
+
+This page is the map. Each concern has its own page for the details.
+
+## The four concerns
+
+| Concern | What it does | Reference |
+| --- | --- | --- |
+| [Guardrails](/docs/architecture/guardrails) | Scan every message before and after the LLM for PII, secrets, or custom patterns. Redact, block, or warn. | `dendrux.guardrails` |
+| [Approval](/docs/architecture/approval) | Pause the run before a gated tool executes. A human decides approve or deny. | `require_approval=[...]` |
+| [Access control](/docs/architecture/access-control) | Policy gate on tool calls, skill invocations, and MCP connections. Denies at the boundary before state changes. | `policy=...`, `skills=...` |
+| Budget | Track per-run spend and token usage. Raise threshold events at configurable ratios, abort at the hard cap. | `budget=Budget(...)` |
+
+Guardrails, approval, and access control are independent. You can use any one, any two, any three, or all four on the same run. The runtime applies them in a fixed order (incoming guardrail → access check → approval → tool execute → outgoing guardrail), but each layer does not know or care about the others. Their only coupling is the shared event log.
+
+## The event types
+
+Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
+
+All 13 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+
+```text
+POLICY_DENIED           = 'policy.denied'
+APPROVAL_REQUESTED      = 'approval.requested'
+APPROVAL_DECIDED        = 'approval.decided'
+BUDGET_THRESHOLD        = 'budget.threshold'
+BUDGET_EXCEEDED         = 'budget.exceeded'
+GUARDRAIL_DETECTED      = 'guardrail.detected'
+GUARDRAIL_REDACTED      = 'guardrail.redacted'
+GUARDRAIL_BLOCKED       = 'guardrail.blocked'
+SKILL_REGISTERED        = 'skill.registered'
+SKILL_DENIED            = 'skill.denied'
+SKILL_INVOKED           = 'skill.invoked'
+MCP_CONNECTED           = 'mcp.connected'
+MCP_ERROR               = 'mcp.error'
+```
+
+Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
+
+## A run that exercises two layers
+
+The scratchpad below builds an agent with PII redaction *and* an approval gate, then runs the input `"Refund order 42 for jane.doe@example.com."` Both layers fire. Real `run_events` from the run:
+
+```text
+[lifecycle] seq=0   iter=0  run.started
+[GOV]       seq=1   iter=1  guardrail.detected    data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL"]}
+[GOV]       seq=2   iter=1  guardrail.redacted    data={"direction": "incoming", "entities": ["EMAIL"]}
+[lifecycle] seq=3   iter=1  llm.completed
+[GOV]       seq=4   iter=1  approval.requested    corr=01KPGVAHED0Z5PQEVQ1BWXKS4M  data={"tool_name": "refund", ...}
+[lifecycle] seq=5   iter=0  run.paused
+[lifecycle] seq=6   iter=0  run.resumed
+[lifecycle] seq=7   iter=1  tool.completed        corr=01KPGVAHED0Z5PQEVQ1BWXKS4M
+[GOV]       seq=8   iter=1  approval.decided      data={"decision": "approved"}
+[GOV]       seq=9   iter=2  guardrail.detected    data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL"]}
+[GOV]       seq=10  iter=2  guardrail.redacted    data={"direction": "incoming", "entities": ["EMAIL"]}
+[lifecycle] seq=11  iter=2  llm.completed
+[lifecycle] seq=12  iter=0  run.completed
+```
+
+Seven governance rows, six lifecycle rows, one shared `sequence_index` running straight through. A few things worth noting:
+
+1. **Both iterations scanned.** The PII guardrail runs incoming on iteration 1 (the user's original message) *and* iteration 2 (the history replayed to the LLM after the tool result). It catches the email both times and redacts in place. That is fine, the `pii_mapping` is stable so the same replacement token is reused.
+2. **Correlation id links the approval to the tool.** `approval.requested` at `seq=4` and `tool.completed` at `seq=7` share the same `correlation_id`. A reader can join the two rows to see "this approval decision authorized this specific tool call." `approval.decided` does not carry the correlation id on this path because it is emitted by the resume endpoint, not by the runner's tool dispatcher.
+3. **Lifecycle and governance interleave cleanly.** The run was paused, resumed, and finished; the approval and guardrail events slot into the timeline with their natural iteration numbers. No sorting required.
+
+The `pii_mapping` blob on `agent_runs` after the run:
+
+```json
+{
+  "<<EMAIL_1>>": "jane.doe@example.com"
+}
+```
+
+That mapping is how redaction survives persistence. The LLM and the DB only ever see `<<EMAIL_1>>`. The original value lives only on the `agent_runs` row, only for the lifetime of the run. See [PII redaction](/docs/architecture/pii-redaction) for the lookup protocol.
+
+## How events reach the recorder and notifier
+
+A governance layer does not talk to the DB. It calls `recorder.on_governance_event(event_type, iteration, data, correlation_id=...)` and, through the loop helper, `notifier.on_governance_event(...)` in parallel.
+
+From `dendrux/loops/_helpers.py`:
+
+```python
+async def record_governance(recorder, event_type, iteration, data, correlation_id=None):
+    """Record governance event to authoritative persistence. Exceptions propagate."""
+    if recorder is None:
+        return
+    await recorder.on_governance_event(event_type, iteration, data, correlation_id=correlation_id)
+
+
+async def notify_governance(notifier, event_type, iteration, data, correlation_id=None, warnings=None):
+    """Notify notifier of a governance event, swallowing exceptions."""
+    if notifier is None:
+        return
+    try:
+        await notifier.on_governance_event(event_type, iteration, data, correlation_id=correlation_id)
+    except Exception:
+        logger.warning("Notifier.on_governance_event failed", exc_info=True)
+        if warnings is not None:
+            warnings.append(f"on_governance_event failed at iteration {iteration}")
+```
+
+Two wrappers, two failure policies. The recorder is fail-closed: if the DB write fails, the run stops. The notifier is fail-open: if a callback raises, the exception is logged as a warning and the run continues. See [Recorder](/docs/architecture/recorder) and [Notifier](/docs/architecture/notifier) for the full picture.
+
+The loop calls both wrappers in sequence at the point where a governance decision is made. A guardrail that redacts emits `guardrail.detected` and `guardrail.redacted` from inside the scan. An approval gate emits `approval.requested` when it decides to pause, and `approval.decided` when the submit endpoint resumes. The pattern is always the same: decide, emit, let the pipeline fan out.
+
+## Why one pipeline instead of four subsystems
+
+A reasonable alternative design is to give each governance concern its own audit table. A `guardrail_findings` table, an `approvals` table, a `policy_denials` table, a `budget_events` table. Each concern owns its own schema, its own query path, its own retention.
+
+Dendrux does not do that, for three reasons.
+
+1. **Ordering is important and cross-cutting.** "Did the guardrail detect the PII before or after the approval was decided?" is a question that matters. The answer requires a single ordered log, not four tables that need to be merged on timestamps. `sequence_index` is that log.
+2. **Readers want one stream.** A dashboard that wants to render "what happened on this run" reads one table. An SSE client that wants to stream live events reads one endpoint. A developer who wants to debug a suspicious decision greps one log. Four tables means four queries, four joins, four schemas to learn.
+3. **The set of concerns will grow.** MCP events and skill events were added after the original PII + approval cut. Every addition would otherwise require a new table, a new migration, a new query pattern. A typed event on a shared table needs neither. Adding a new governance concern means adding a new `event_type` constant and calling `recorder.on_governance_event(...)`; everything downstream works.
+
+The cost is a JSON `data` column on `run_events` that is typed per `event_type`, not per column. For a log that readers mostly want in order, that is the right tradeoff. Queries that need a specific event type (`WHERE event_type = 'guardrail.blocked'`) still return the relevant rows in the right order, and the JSON column gives each event type the flexibility to carry whatever payload makes sense without forcing a schema migration.
+
+## Where each concern lives
+
+- Code: `dendrux.guardrails`, `dendrux.runtime.runner` (approval and policy checks), `dendrux.types.GovernanceEventType`
+- DB: `run_events.data` (per-event payload), `agent_runs.pii_mapping` (guardrail redaction table)
+- Public API: `Agent(guardrails=[...], require_approval=[...], policy=..., budget=...)`
+
+Each of the four concerns has its own page: [Guardrails](/docs/architecture/guardrails), [Approval](/docs/architecture/approval), [Access control](/docs/architecture/access-control). Budget is currently covered inline where it appears in other pages. They all share this pipeline.

@@ -1,0 +1,87 @@
+---
+title: Event ordering
+description: How dendrux orders the events a run emits, and how clients replay them reliably after a disconnect.
+---
+
+# Event ordering
+
+Every run emits a stream of events, and every event lands in the `run_events` table with two integer columns that place it in the timeline: `sequence_index` and `iteration_index`. Those two numbers are how dendrux gives you a single ordered log per run, and how an SSE client can reconnect after a network blip without missing or double-processing an event.
+
+## The two ordering columns
+
+| Column | Scope | What it means |
+| --- | --- | --- |
+| `sequence_index` | Run | A global per-run counter. Starts at 0 on `run.started`, increments by exactly 1 for every event the run writes, and never resets, not even across pause and resume. |
+| `iteration_index` | Loop turn | The LLM iteration the event belongs to. Loop-level events (`run.started`, `run.paused`, `run.resumed`, `run.completed`) record iteration 0. Events produced inside an LLM turn (like `llm.completed`, `tool.completed`, `approval.requested`) record the turn number they came from. |
+
+The only guarantee readers need is the first one: **within a run, `sequence_index` is strictly monotonic**. Order events by it and you get the exact order the runtime observed them.
+
+## A real event timeline
+
+The timeline below is the literal `run_events` log from the quickstart run, dumped from `quickstart.db`. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
+
+<SequenceFlow>
+  <SequenceEvent seq="0" type="run.started" iter="0" note="Loop-level. Agent name and system prompt recorded." />
+  <SequenceEvent seq="1" type="llm.completed" iter="1" note="First LLM turn. 594 input tokens, 55 output, has_tool_calls=true." />
+  <SequenceEvent seq="2" type="approval.requested" iter="1" note="refund was declared require_approval. Correlated by call_id." />
+  <SequenceEvent seq="3" type="run.paused" iter="0" highlight="true" note="Runtime persists waiting_approval and exits. Client reconnect point." />
+  <SequenceEvent seq="4" type="run.resumed" iter="0" highlight="true" note="submit_approval loads the run and re-enters the loop." />
+  <SequenceEvent seq="5" type="tool.completed" iter="1" note="refund actually executes now. Same iteration as the approval request." />
+  <SequenceEvent seq="6" type="approval.decided" iter="1" note="Governance row records who decided and how." />
+  <SequenceEvent seq="7" type="llm.completed" iter="2" note="Second LLM turn. No tool calls this time." />
+  <SequenceEvent seq="8" type="run.completed" iter="0" note="Terminal event. status=success." />
+</SequenceFlow>
+
+Notice that `sequence_index` runs straight through pause and resume. `seq=3` and `seq=4` are written in two separate processes (the starter and the resumer), but they are adjacent in the log. On resume the runtime reads `max(sequence_index)` from the DB and continues counting from there, so there is no gap and no collision.
+
+`iteration_index` behaves differently: it jumps between 0, 1, and 2 depending on whether the event is loop-level or turn-scoped. That is by design. Loop-level events belong to no single LLM turn.
+
+## What a client sees on the wire
+
+The read router exposes the same log over Server-Sent Events at `GET /runs/{run_id}/events/stream`. Each row becomes one SSE frame, keyed by `sequence_index` so the browser remembers the cursor for you.
+
+```
+id: 0
+event: message
+data: {"sequence_index": 0, "iteration_index": 0, "event_type": "run.started", "correlation_id": null, "timestamp": "2026-04-18T09:10:32Z", "data": {"agent_name": "Agent", "system_prompt": "You are a support agent. When asked for a refund, call the refund tool."}}
+
+id: 1
+event: message
+data: {"sequence_index": 1, "iteration_index": 1, "event_type": "llm.completed", "correlation_id": null, "timestamp": "2026-04-18T09:10:34Z", "data": {"input_tokens": 594, "output_tokens": 55, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "cost_usd": null, "model": "claude-haiku-4-5", "has_tool_calls": true}}
+
+id: 2
+event: message
+data: {"sequence_index": 2, "iteration_index": 1, "event_type": "approval.requested", "correlation_id": "01KPFXPAT8ZF7MNGJNW2Y6S8GZ", "timestamp": "2026-04-18T09:10:34Z", "data": {"tool_name": "refund", "call_id": "01KPFXPAT8ZF7MNGJNW2Y6S8GZ", "reason": "requires_approval"}}
+```
+
+The `id:` field on each frame is the `sequence_index`. Browsers use that line to populate the `Last-Event-ID` header automatically when the connection drops and `EventSource` reconnects.
+
+## Reconnect without loss or duplicates
+
+When a client reconnects, the read router resolves the cursor in this order:
+
+1. `Last-Event-ID` header from the reconnect (precedence, with a fallback if the header is malformed).
+2. `?after=N` query string.
+3. `None`, which means replay from the start of the log.
+
+The resolved cursor is passed into `RunStore.get_events(run_id, after_sequence_index=cursor)`, which emits a SQL `WHERE sequence_index > cursor` and orders by `sequence_index`. The strict `>` is the critical piece: the event the client already saw is excluded, and every event after it is included.
+
+A client that last saw `seq=3` and reconnects gets the rest of the run, no duplicates and no gaps:
+
+```python
+events = await store.get_events(RUN_ID, after_sequence_index=3)
+print([e.sequence_index for e in events])
+# [4, 5, 6, 7, 8]
+```
+
+## Why a DB-backed cursor instead of an in-memory queue
+
+A typical event-bus design broadcasts new events through an in-process pub/sub queue. It is fast, but it does not survive process restarts, it does not work across multiple web instances, and it cannot replay events the client missed while offline.
+
+Dendrux keeps the log in the `run_events` table and polls it per connection. The tradeoff is a few extra SQL queries per second while a client is streaming, in exchange for three real properties:
+
+1. **Replay is free.** A client that reconnects after any amount of downtime gets everything it missed from the exact same code path that served the first read.
+2. **No fan-out manager.** Every connection is an independent async generator, which means adding a second server instance needs no shared state and no message bus.
+3. **Events are durable.** If the runner crashes mid-iteration, events written before the crash are still visible to readers. Nothing lives only in memory.
+
+The poll interval and a periodic `: keepalive` comment are tuned so idle connections do not get closed by reverse proxies, but the wire format is plain SSE with no dendrux-specific framing. Any client that can read `EventSource` can read this stream.

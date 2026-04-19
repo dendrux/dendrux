@@ -1,0 +1,110 @@
+---
+title: Pause and resume
+description: How a dendrux run stops cleanly, persists everything it needs, and is picked up from a different process without losing state.
+---
+
+# Pause and resume
+
+A dendrux run is not a long-lived in-memory task. When it hits a pause point, the runtime writes everything it needs to the database and returns. A different process, on a different server, can later call a `submit_*` method on the same run and the loop continues from where it left off. The session that started the run is no longer involved.
+
+This is the pattern that makes agents work across HTTP requests, queue workers, and human-in-the-loop approvals without a sticky connection.
+
+## The three pause statuses
+
+A run can be paused in exactly three ways. Each maps to a status on the `agent_runs` row and a corresponding `submit_*` method to resume.
+
+| Status | Triggered by | Resume method |
+| --- | --- | --- |
+| `waiting_client_tool` | A tool declared with `target="client"` is called. The runtime stops before executing it and expects the client to run it and submit the result. | `submit_tool_results(run_id, results=...)` |
+| `waiting_human_input` | The loop returns a `Clarification` action, signalling that the model needs free-text input from a human to continue. | `submit_input(run_id, text=...)` |
+| `waiting_approval` | A tool declared in `require_approval=[...]` is about to run. The runtime pauses to gate the call. | `submit_approval(run_id, approved=True)` |
+
+All three follow the same shape: runtime hits a pause point, persists pending metadata, writes `run.paused`, and returns. A later call to the matching `submit_*` method loads the row, atomically flips the status back to `running`, and re-enters the loop.
+
+## What gets persisted at pause
+
+The `agent_runs.pause_data` column is a JSON blob populated the moment the run pauses. Everything the runtime needs to resume is in that blob. The row below is the actual DB state after the quickstart run paused for approval, dumped directly from SQLite:
+
+```text
+id: 01KPG17P8XNWVJC1EN0M3XKCK4
+status: waiting_approval
+iteration_count: 1
+updated_at: 2026-04-18 10:12:29
+pause_data:
+  {
+    "agent_name": "Agent",
+    "pending_tool_calls": [
+      {
+        "name": "refund",
+        "params": { "order_id": 42 },
+        "id": "01KPG17QH7KAFT4JF1FD8S35V9",
+        "provider_tool_call_id": "toolu_01BdRbnjpRJPcwm1mGrxTV3r"
+      }
+    ],
+    "pending_targets": {
+      "01KPG17QH7KAFT4JF1FD8S35V9": "server"
+    }
+  }
+```
+
+Each pause status populates `pause_data` with the shape that matching `submit_*` method needs. For `waiting_approval`, that is the pending tool calls and their routing targets. For `waiting_client_tool`, it is the list of client tool invocations the runner is expecting back. For `waiting_human_input`, it is the clarification prompt and any context the loop produced.
+
+The `react_traces` table still holds the conversation up to the pause, the `llm_interactions` table still holds every turn's I/O, and `run_events` still holds the timeline. `pause_data` does not duplicate any of that. It only carries what the runner itself needs to resume.
+
+## What resume does
+
+A `submit_*` call loads the run, verifies the status is one it can resume from, saves any new input into `pause_data`, atomically flips the status to `running`, and re-enters the loop. The loop reconstructs the in-memory state from the DB rows. No information is passed between the two processes except the `run_id`.
+
+The row above after calling `submit_approval(run_id, approved=True)`:
+
+```text
+id: 01KPG17P8XNWVJC1EN0M3XKCK4
+status: success
+iteration_count: 2
+pause_data: null
+updated_at: 2026-04-18 10:12:31
+```
+
+`iteration_count` ticked from 1 to 2 (the LLM ran one more turn after the tool result was available), `pause_data` was cleared as part of the terminal transition, and `updated_at` moved forward by two seconds.
+
+## The atomic claim
+
+Two things can race at resume time: two human operators hitting Approve at once, or a retry firing twice. Dendrux settles the race with a compare-and-swap on the status column. `claim_paused_run` issues exactly this SQL:
+
+```sql
+UPDATE agent_runs
+   SET status = 'running',
+       updated_at = now()
+ WHERE id = :run_id
+   AND status = :expected_status;
+```
+
+The second concurrent caller sees a rowcount of 0 and raises `PauseStatusMismatchError`. No extra locking, no leader election, no coordination service. The status column is the concurrency boundary, and the database does the work.
+
+The same pattern appears at the other end of the run. When the loop returns a final answer, `finalize_run_if_status_in` runs:
+
+```sql
+UPDATE agent_runs
+   SET status = 'success',
+       pause_data = NULL,
+       cancel_requested = false,
+       output_data = :output,
+       updated_at = now()
+ WHERE id = :run_id
+   AND status IN ('running', 'waiting_approval', 'waiting_client_tool', 'waiting_human_input');
+```
+
+This collapses "check the status is something I can finalize, then finalize it" into a single atomic statement. A cancel request arriving during that window either wins or loses based on whose UPDATE commits first. There is no in-between state.
+
+## Why this shape
+
+The alternative to persist-and-exit is to keep the run in memory and block the coroutine. That is attractive in a single-server demo and breaks as soon as any of the following is true:
+
+1. The human who has to approve is not on the same server that started the run.
+2. The server restarts while waiting.
+3. The pause lasts longer than an HTTP request, a worker lease, or a connection timeout.
+4. The app wants to read the paused state from a dashboard or a separate API.
+
+Persist-and-exit solves all four at once. The `agent_runs` row is the handoff token, `pause_data` carries what the runner needs, `run_events` gives readers the timeline, and the CAS on the status column keeps concurrent resumers honest.
+
+The cost is one extra DB write on pause and one conditional UPDATE on resume. Those are cheap. What is expensive is the class of bugs that appears when pause state lives only in memory, and this design avoids them all.

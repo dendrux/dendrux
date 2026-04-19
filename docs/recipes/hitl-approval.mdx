@@ -1,0 +1,147 @@
+---
+title: Human-in-the-loop approval
+description: Pause a run before a sensitive tool runs, let a human approve or reject the call, then resume. End to end with both branches.
+---
+
+# Human-in-the-loop approval
+
+Some tools should not run without a human checking first: refunds, deletes, large emails, anything with real-world side effects. Dendrux's `require_approval=` declares the list, the agent pauses when the model tries to call one, and you ship the decision back via `agent.submit_approval(...)`. The pause survives process restarts because the agent run is persisted in the database.
+
+This recipe walks through the full flow on a refund tool, on both the approved and rejected branches.
+
+## The agent
+
+Declare the tool, mark it `require_approval`, and provide a `database_url`:
+
+```python
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+@tool()
+async def refund(order_id: int) -> str:
+    """Issue a refund for the given order."""
+    return f"Refunded order {order_id}"
+
+agent = Agent(
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="You are a support agent. Use the refund tool when asked.",
+    tools=[refund],
+    require_approval=["refund"],
+    database_url="sqlite+aiosqlite:///support.db",
+)
+```
+
+`require_approval=` is a list of tool names that must pause for human approval. Approval applies to the whole batch: if the LLM emits three tool calls and any one of them is in the approval set, every call in that iteration pauses. (See [Approval](/docs/architecture/approval) for why this is batch-scoped.)
+
+## Pausing
+
+Run as usual:
+
+```python
+first = await agent.run("Please refund order 42.")
+print(first.status.value)   # waiting_approval
+print(first.run_id)
+```
+
+Status comes back as `waiting_approval`. The run row in `agent_runs` is in that status, the pending tool call is recorded in `pause_data`, and a `approval.requested` event has landed in `run_events` with the tool name and `correlation_id` set to the call id.
+
+The refund function has not been invoked. You can verify this in your code or in the dashboard — `tool_calls` is empty for the run.
+
+## Approving
+
+Pull the run by id (typically from the dashboard, an alert, or a queue), and ship the decision back:
+
+```python
+result = await agent.submit_approval(first.run_id, approved=True)
+print(result.status.value)   # success
+print(result.answer)         # "I've successfully refunded order 42..."
+```
+
+`submit_approval` is race-safe: persist-first plus CAS claim plus blocking until the run reaches the next pause or terminal. The pending tool runs server-side; its result is fed back into the LLM; the LLM responds to the user.
+
+Captured event sequence (real run):
+
+```text
+seq=0  run.started
+seq=1  llm.completed         (LLM emits refund tool call)
+seq=2  approval.requested    {"tool_name": "refund", "call_id": "01KP...", "reason": "requires_approval"}
+seq=3  run.paused            {"status": "waiting_approval", "pending_tool_calls": [...]}
+seq=4  run.resumed           {"resumed_from": "waiting_approval"}
+seq=5  tool.completed        {"tool_name": "refund", "target": "server", "success": true}
+seq=6  approval.decided      {"decision": "approved", "run_id": "..."}
+seq=7  llm.completed         (LLM responds with the refund confirmation)
+seq=8  run.completed
+```
+
+The `tool_calls` table now has one row for the refund: `tool_name=refund`, `success=1`.
+
+## Rejecting
+
+Same pause, opposite decision:
+
+```python
+result = await agent.submit_approval(
+    first.run_id,
+    approved=False,
+    rejection_reason="Manager declined: amount exceeds automatic threshold.",
+)
+print(result.status.value)   # success
+```
+
+The runtime fabricates one synthetic failed `ToolResult` per pending call, each carrying `rejection_reason` (default: `"User declined to run this tool."`). The model sees those as failed tool outputs and decides what to do next — typically apologize and stop. The refund function is never invoked.
+
+The `tool_calls` table writes one row with `success=0` and `error_message=<rejection_reason>`. This is on purpose: even though the tool didn't execute, the rejection is part of the audit trail.
+
+Compare the two `tool_calls` shapes:
+
+| Branch | row written? | `success` | `error_message` | function called? |
+| --- | --- | --- | --- | --- |
+| `approved=True` | yes | 1 | null | yes |
+| `approved=False` | yes (synthetic) | 0 | `<rejection_reason>` | no |
+| denied via `deny=` | no | n/a | n/a | no |
+
+The third row is for contrast. `deny=` is a hard policy block (tool never reaches an executor at all) and writes nothing to `tool_calls`. Approval rejection writes a row because the audit needs to show *why* the refund didn't happen.
+
+## Wiring it up over HTTP
+
+Approval decisions usually arrive over HTTP from a UI. The route is a thin wrapper:
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from dendrux.errors import (
+    PauseStatusMismatchError, PersistenceNotConfiguredError,
+    RunAlreadyClaimedError, RunAlreadyTerminalError,
+    RunNotFoundError, RunNotPausedError,
+)
+
+@router.post("/runs/{run_id}/approval")
+async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
+    try:
+        result = await agent.submit_approval(
+            run_id,
+            approved=body["approved"],
+            rejection_reason=body.get("rejection_reason"),
+        )
+    except RunNotFoundError:
+        raise HTTPException(404, "run not found")
+    except (RunNotPausedError, PauseStatusMismatchError,
+            RunAlreadyClaimedError, RunAlreadyTerminalError) as e:
+        raise HTTPException(409, str(e))
+    except PersistenceNotConfiguredError:
+        raise HTTPException(500, "persistence not configured")
+    return {"status": result.status.value, "answer": result.answer}
+```
+
+See [HTTP API surface](/docs/reference/http-api) for the full set of write routes you would build alongside this one.
+
+## Notes
+
+- **Approval requires persistence.** No `database_url` (or `state_store`, or `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
+- **The agent instance does not have to be the same one that started the run.** Any agent process with the same DB and same tool definitions can serve the approval. That is what makes pause/resume crash-resilient and worker-friendly.
+- **Approval applies to the batch, not to individual calls.** If you need per-call decisions, pre-split the batch upstream of the agent or follow up with a clarification turn.
+- **Server tools only.** `require_approval` rejects client tools at construction. Approval is about human judgement before a server-side action; client-tool execution already involves the user.
+
+## Where this fits
+
+- Architecture: [Approval](/docs/architecture/approval), [Governance](/docs/architecture/governance), [Pause and resume](/docs/architecture/pause-resume).
+- Reference: [HTTP API surface](/docs/reference/http-api) for `submit_approval` and the matching errors.

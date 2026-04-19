@@ -1,0 +1,120 @@
+---
+title: Cancelling a run
+description: Stop a paused or in-flight run cleanly. The same call works for paused, running, and terminal runs, with deterministic per-state behavior.
+---
+
+# Cancelling a run
+
+`agent.cancel_run(run_id)` is the single entry point for stopping a run. It works whether the run is paused, executing in another process, or already finished. The same call has different behavior in each case, but the surface is one method and one return value: the persisted state after the cancel attempt.
+
+## The call
+
+```python
+result = await agent.cancel_run(run_id)
+print(result.status.value)   # "cancelled" if cancel won, original terminal otherwise
+```
+
+That is it. No sequencing, no polling, no separate claim step. You give it a `run_id` and it makes the right call against the DB. Persistence is required (`PersistenceNotConfiguredError` otherwise), and the run must exist (`RunNotFoundError` otherwise).
+
+## What happens, by state
+
+`cancel_run` looks at the run's current persisted status and picks one of four paths.
+
+### Paused run (`waiting_client_tool` / `waiting_human_input` / `waiting_approval`)
+
+Atomic CAS finalize to `CANCELLED` in one round-trip. Deterministic. The run row transitions, `run.cancelled` is emitted with `{"reason": "cancel_requested"}`, and the call returns. Captured trace from a refund-approval pause:
+
+```text
+STATE AT PAUSE (waiting_approval)
+  status: waiting_approval
+  cancel_requested: 0
+  pause_data: <set>
+  run_events:
+    seq=0  run.started
+    seq=1  llm.completed
+    seq=2  approval.requested
+    seq=3  run.paused
+
+STATE AFTER CANCEL
+  status: cancelled
+  cancel_requested: 1
+  pause_data: null
+  run_events:
+    seq=0  run.started
+    seq=1  llm.completed
+    seq=2  approval.requested
+    seq=3  run.paused
+    seq=4  run.cancelled
+```
+
+`pause_data` is cleared on finalize. The cancel event is sequenced after the existing paused event so an SSE client reading by `after_sequence_index` cannot miss it.
+
+### Running run (anywhere, persisted)
+
+Sets `cancel_requested=True` on the row. The runner observes the flag at two checkpoints: the top of the next iteration, and the pre-pause boundary after the current iteration's loop body returns.
+
+The current iteration's LLM and tool calls are **not preempted**. Cancellation is observed *between steps*, never mid-step. That is intentional: an LLM call you preempted has already cost money and an interrupted tool can leave external systems in a partial state. Cooperative beats preemptive when the unit of work is unbounded. See [Cancellation](/docs/architecture/cancellation) for the design tradeoffs.
+
+When the runner observes the flag, it finalizes the run as `CANCELLED` and emits `run.cancelled`. Whichever party wins the atomic CAS owns the event.
+
+### In-process submit/resume task
+
+If you hold the `Agent` instance that started the submit/resume task (the asyncio task spawned by `submit_tool_results`, `submit_input`, or `submit_approval`), `cancel_run` cancels that task synchronously in addition to setting the DB flag. The task awaits release immediately; the DB cancel signal is the durable backstop in case the cancel call comes from a different process.
+
+### Terminal run
+
+No-op. Returns the current persisted state. Does **not** raise. This is the one place where `cancel_run` diverges from the submit methods (which raise `RunAlreadyTerminalError`): cancelling something that is already done should be safe and idempotent, not an error.
+
+## Submit + cancel race
+
+If a submit method is in flight when you cancel, the runner's pre-pause checkpoint observes `cancel_requested=True` before re-pausing or running the next iteration, and finalizes as `CANCELLED`. The submit method receives the cancelled `RunResult` from the awaited task. The run does not bounce between paused and running; the cancel wins cleanly.
+
+If you call a submit method *after* `cancel_run` has set the flag (but before the runner has observed it), the submit's CAS preflight notices `cancel_requested=True` and raises `RunAlreadyTerminalError(run_id, RunStatus.CANCELLED)`. This avoids resuming a run that is on the path to cancelled.
+
+## HTTP route
+
+A minimal cancel endpoint:
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+
+@router.delete("/runs/{run_id}")
+async def cancel_route(run_id: str, _=Depends(authorize)):
+    try:
+        result = await agent.cancel_run(run_id)
+    except RunNotFoundError:
+        raise HTTPException(404, "run not found")
+    except PersistenceNotConfiguredError:
+        raise HTTPException(500, "persistence not configured")
+    return {"run_id": result.run_id, "status": result.status.value}
+```
+
+Two error mappings. No 409 path because terminal cancel is a no-op, not a conflict.
+
+## SSE stream as the cancel signal
+
+If a browser is watching a run via SSE, it should treat the `run.cancelled` frame as the end of the conversation:
+
+```javascript
+es.addEventListener("message", (e) => {
+  const frame = JSON.parse(e.data);
+  if (["run.completed", "run.cancelled", "run.error"].includes(frame.event_type)) {
+    es.close();
+    // refetch run detail; show final state
+  }
+});
+```
+
+`run.cancelled` carries `{"reason": "cancel_requested"}`. Other terminal events (`run.completed`, `run.error`) close the conversation just the same.
+
+## Notes
+
+- **Cancellation is not retroactive.** Tokens spent before the runner observes the flag have been billed. Side effects from tools that already executed are not undone. The cancel is forward-looking: stop further iterations, do not roll back.
+- **Cancellation does not require holding the agent instance that started the run.** Any process with a DB handle and the same agent class can cancel. A dashboard, a webhook, an admin script — they all work.
+- **`cancel_run` is the only sanctioned way to stop a run.** Do not delete the row, do not edit the status by hand, do not kill the asyncio task in isolation. The CAS / flag dance encodes the safety properties.
+
+## Where this fits
+
+- Architecture: [Cancellation](/docs/architecture/cancellation), [Pause and resume](/docs/architecture/pause-resume), [Event ordering](/docs/architecture/event-ordering).
+- Reference: [HTTP API surface](/docs/reference/http-api) (`cancel_run` semantics and the cancel write route).

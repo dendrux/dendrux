@@ -1,0 +1,137 @@
+---
+title: Budget
+description: Advisory per-run token caps that emit governance events at configurable thresholds without ever halting the run.
+---
+
+# Budget
+
+A `Budget` on an agent is a soft cap on total tokens spent in one run. It emits governance events when usage crosses configurable thresholds, and one more when usage reaches the max. It does **not** pause the run, kill it, or refuse the next LLM call. In v1, it is advisory: the dev watches the events and decides what to do.
+
+The reasoning is deliberate. A hard enforcement mechanism that preempts an in-flight LLM call or tool execution would leak cost (the call already happened at the provider) and leave the run in a partially-observed state. A soft mechanism that signals upcoming-or-exceeded spend gives the application agency without those bad shapes.
+
+## Declaring a budget
+
+```python
+from dendrux import Agent, Budget
+
+agent = Agent(
+    provider=...,
+    prompt="...",
+    tools=[...],
+    budget=Budget(max_tokens=500, warn_at=(0.5, 0.75, 0.9)),
+    database_url="sqlite+aiosqlite:///demo.db",
+)
+```
+
+Two parameters:
+
+| Arg | Meaning | Default |
+| --- | --- | --- |
+| `max_tokens` | Total token cap (input + output, across all LLM calls in the run). Must be positive. | Required. |
+| `warn_at` | Fractions of `max_tokens` at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
+
+"Total tokens" is `response.usage.total_tokens` summed across every LLM call on the run. Cache hits and misses all count toward the total (cache read tokens are still billed at the provider, just at a lower rate; the budget pessimistically measures gross usage).
+
+## What the events look like
+
+A real run with `Budget(max_tokens=500, warn_at=(0.5, 0.75, 0.9))` and a two-iteration ReAct query `"What is 15 + 27?"`:
+
+```text
+status: success                         (budget is advisory, run still succeeds)
+total tokens used: input=1252  output=82  total=1334
+
+run_events:
+  [lifecycle] seq=0  run.started
+  [lifecycle] seq=1  llm.completed        (first LLM call, 654 tokens total so far)
+  [BUDGET]    seq=2  budget.threshold     data={"fraction": 0.5,  "used": 654, "max": 500, "reason": "threshold_crossed"}
+  [BUDGET]    seq=3  budget.threshold     data={"fraction": 0.75, "used": 654, "max": 500, "reason": "threshold_crossed"}
+  [BUDGET]    seq=4  budget.threshold     data={"fraction": 0.9,  "used": 654, "max": 500, "reason": "threshold_crossed"}
+  [BUDGET]    seq=5  budget.exceeded      data={"used": 654, "max": 500, "reason": "budget_exceeded"}
+  [lifecycle] seq=6  tool.completed
+  [lifecycle] seq=7  llm.completed        (second LLM call, 1334 tokens total, no new events)
+  [lifecycle] seq=8  run.completed
+```
+
+Four budget events, all on the same LLM call that first blew past 90% of the cap. Three things to pull out of this trace:
+
+1. **Every fraction fired in one tick.** The first LLM call returned at 654 tokens, already past the 0.9 mark. Instead of emitting only the highest threshold, the runtime fires each threshold the usage crossed. A reader gets the full "we passed 50, 75, 90, and exceeded" story.
+2. **Each threshold fires once per run.** The second LLM call pushed total usage to 1334, more than double the cap. No new `budget.threshold` or `budget.exceeded` events were emitted. Each fraction has already been recorded; repeating them would be noise.
+3. **The run completed successfully.** `run.completed` at seq=8, status=success. Nothing about exceeding the budget changed the lifecycle.
+
+## How it is implemented
+
+From `dendrux/loops/react.py`:
+
+```python
+async def _check_budget(budget, total_usage, fired_thresholds, recorder, notifier, iteration, warnings):
+    """Check budget thresholds and exceeded after usage accumulation.
+
+    Advisory only — fires governance events but does not pause or stop.
+    Each threshold and exceeded fires exactly once per run.
+    """
+    if budget is None:
+        return
+
+    used = total_usage.total_tokens
+    max_t = budget.max_tokens
+    fraction = used / max_t
+
+    # Threshold events — fire once per fraction when first crossed
+    for threshold in budget.warn_at:
+        if fraction >= threshold and threshold not in fired_thresholds:
+            fired_thresholds.append(threshold)
+            ...
+
+    # Exceeded event — fire once when usage first reaches max
+    if used >= max_t and _BUDGET_EXCEEDED_SENTINEL not in fired_thresholds:
+        ...
+```
+
+Three design choices worth calling out:
+
+1. **Checked after each LLM call.** `_check_budget` is invoked right after `provider.complete()` returns and `total_usage` is updated. Tool calls do not cost tokens; only LLM calls do. Checking at the LLM-call boundary is the tightest cadence that catches every increment.
+2. **`fired_thresholds` is carried on the run state.** It is a list that survives pause/resume. A run that pauses for approval mid-budget does not re-fire 0.5 when it resumes.
+3. **No action coupled to the event.** The function fires the event and returns. There is no `if fraction > 1.0: raise BudgetExceededError`. That decision belongs to the application.
+
+## Applying action from the events
+
+Since the runtime does not stop the run, applications that want behavior have two places to hook in:
+
+**In-process, via a notifier.** The [notifier](/docs/architecture/notifier) receives the same callbacks synchronously. A custom notifier that raises on `budget.exceeded` would kill the run with an error (because notifier exceptions are caught, but the app can also set a flag and call `agent.cancel_run(run_id)` from outside the callback).
+
+```python
+class StopOnBudget:
+    def __init__(self, agent):
+        self.agent = agent
+
+    async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+        if event_type == "budget.exceeded":
+            await self.agent.cancel_run(data.get("run_id"))
+
+    # other callbacks are no-ops
+    async def on_message_appended(self, *a, **k): pass
+    async def on_llm_call_completed(self, *a, **k): pass
+    async def on_tool_completed(self, *a, **k): pass
+```
+
+**Out-of-process, via the read router or SSE.** The events also land on `run_events` (because [recorder](/docs/architecture/recorder) always writes), so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and take action there. The same `agent.cancel_run(run_id)` call works from any process with a DB handle.
+
+Both paths use the same signal. The budget itself stays pure.
+
+## Why advisory, not preemptive
+
+A budget that kills the run the instant usage crosses `max_tokens` looks appealing in isolation. In a real system, it creates three problems.
+
+1. **Preemption leaks cost.** By the time the runtime sees a usage number, the provider has already charged for that call. Killing the run does not refund anything; it just loses the response text in addition to the spend.
+2. **Preemption breaks atomic units.** An LLM call that emits a tool call expects the tool to execute. A tool that commits side effects expects the model to see the result. Pulling the plug mid-atom leaves the DB, tool state, and LLM history in partial-and-inconsistent shape. The event log makes that visible; the alternative (aborting) makes it worse.
+3. **Different apps want different policies.** A batch job might want "keep going regardless, I just want the spend recorded." A user-facing session might want "abort if we go past the user's quota." A multi-tenant service might want "throttle this tenant for the next hour." A preemptive budget forces one policy on all of them; an advisory budget + event stream lets each app choose.
+
+Advisory is the general case. The hard-stop case is a thin layer on top: watch for `budget.exceeded` in your notifier, call `cancel_run`, done. Going the other direction (turning a preemptive mechanism into an advisory one) is much harder.
+
+## Where this fits
+
+- Declared on `Agent(budget=Budget(max_tokens=N, warn_at=(...)))`.
+- Checked in `dendrux.loops.react._check_budget` after every LLM call.
+- Emits `budget.threshold` (once per fraction) and `budget.exceeded` (once) on `run_events`.
+- Integrates with [notifier](/docs/architecture/notifier) for live reaction, and [recorder](/docs/architecture/recorder) for durable audit.
+- Does not currently interact with [cancellation](/docs/architecture/cancellation); apps that want hard-stop behavior wire it through `agent.cancel_run(run_id)` in response to the event.

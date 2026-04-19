@@ -1,0 +1,184 @@
+---
+title: Guardrails
+description: Pattern-based content scanners that redact, block, or warn on PII, secrets, and custom rules, applied before and after every LLM turn.
+---
+
+# Guardrails
+
+Guardrails sit on the edge of every LLM turn. Before a message goes to the model, every guardrail gets a chance to scan the text, find a problem, and pick one of three actions. After the model replies, the same thing happens in the other direction. If none of them find anything, the turn continues as if they were not there.
+
+Dendrux ships two built-ins: `PII` and `SecretDetection`. Both are regex-based and both accept custom patterns. The engine that runs them is shared, and it is the same pipeline every governance concern uses, so findings land on `run_events` as `guardrail.detected`, `guardrail.redacted`, and `guardrail.blocked`. See [Governance](/docs/architecture/governance) for how that pipeline fits together.
+
+## Three actions, one protocol
+
+Every guardrail declares one of three actions at construction time. The action is the only thing that distinguishes a guardrail's behavior once a finding is detected:
+
+| Action | What the engine does when a finding is found |
+| --- | --- |
+| `redact` | Replace the finding in the text with a `<<TYPE_N>>` placeholder. Write the original value into the run's `pii_mapping` so it can be reversed on the read side. Emit `guardrail.detected` and `guardrail.redacted`. Continue. |
+| `block` | Terminate the run with `status=error`. Emit `guardrail.blocked` with the offending entity type. Nothing downstream runs. |
+| `warn` | Emit `guardrail.detected` only. The text is unchanged. The run continues as if no finding happened. |
+
+The protocol that every guardrail must implement is tiny, from `dendrux/guardrails/_protocol.py`:
+
+```python
+@runtime_checkable
+class Guardrail(Protocol):
+    """Protocol for content guardrails.
+
+    Guardrails detect findings in text. The framework applies actions:
+      - redact: replace findings with <<TYPE_N>> placeholders
+      - block: terminate the run with an error
+      - warn: log the finding, continue unchanged
+
+    scan() is async to support LLM-as-judge implementations that
+    call a local model for evaluation. Regex/Presidio scanners
+    simply don't await anything inside their async scan().
+    """
+
+    action: Literal["redact", "block", "warn"]
+
+    async def scan(self, text: str) -> list[Finding]:
+        """Detect findings in text. Framework handles the action."""
+        ...
+```
+
+Every guardrail is a `scan(text) -> list[Finding]`. The action belongs to the instance. The framework owns how the action is applied, so a third-party scanner (LLM-as-judge, Presidio, a proprietary model) only has to produce findings.
+
+## PII: redact by default
+
+```python
+from dendrux.guardrails import PII
+
+agent = Agent(
+    ...,
+    guardrails=[PII()],   # action='redact' by default
+)
+```
+
+The default `PII()` carries five patterns: EMAIL, PHONE, SSN, CREDIT_CARD, IP_ADDRESS. All regex, all applied to both incoming and outgoing messages.
+
+A real run with the input `"Send the receipt to jane.doe@example.com please."` produced these governance rows, plus the PII mapping:
+
+```text
+status: success
+pii_mapping: {"<<EMAIL_1>>": "jane.doe@example.com"}
+governance events:
+  seq=1  guardrail.detected  data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL"]}
+  seq=2  guardrail.redacted  data={"direction": "incoming", "entities": ["EMAIL"]}
+```
+
+The message the LLM actually saw had `<<EMAIL_1>>` in place of the address. The original value lives on the `agent_runs.pii_mapping` column and is never sent to the model. See [PII redaction](/docs/architecture/pii-redaction) for the reversal protocol on reads.
+
+Defaults are not locked in. `PII(include_defaults=False)` disables them entirely, and `extra_patterns=[...]` adds your own:
+
+```python
+from dendrux.guardrails import PII, Pattern
+
+agent = Agent(
+    ...,
+    guardrails=[
+        PII(
+            action="warn",
+            include_defaults=False,
+            extra_patterns=[Pattern(name="INTERNAL_ID", regex=r"ACME-\d{4}")],
+        ),
+    ],
+)
+```
+
+## SecretDetection: block by default
+
+```python
+from dendrux.guardrails import SecretDetection
+
+agent = Agent(
+    ...,
+    guardrails=[SecretDetection()],   # action='block' by default
+)
+```
+
+`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. The default action is `block`, not `redact`, because a secret that leaked into a prompt should stop the conversation rather than be silently replaced.
+
+Running the input `"Here is my key: AKIAIOSFODNN7EXAMPLE, please store it."` against the default configuration:
+
+```text
+status: error
+governance events:
+  seq=1  guardrail.blocked  data={"direction": "incoming", "error": "Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY ...
+```
+
+One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name, so a reader can see which rule fired. The run ends here; nothing downstream executes.
+
+## Custom patterns with the `warn` action
+
+Sometimes you want visibility without redaction or blocking. `action="warn"` emits the detected event and leaves the text alone:
+
+```python
+PII(
+    action="warn",
+    include_defaults=False,
+    extra_patterns=[Pattern(name="INTERNAL_ID", regex=r"ACME-\d{4}")],
+)
+```
+
+Input `"Please look up ticket ACME-4242 for me."`, captured from a real run:
+
+```text
+status: success
+pii_mapping: {}
+governance events:
+  seq=1  guardrail.detected  data={"direction": "incoming", "findings_count": 1, "entities": ["INTERNAL_ID"]}
+  seq=2  guardrail.detected  data={"direction": "outgoing", "findings_count": 1, "entities": ["INTERNAL_ID"]}
+```
+
+Two `guardrail.detected` events, one for the incoming user message and one for the outgoing assistant reply (which echoed the ticket back). No `guardrail.redacted`, no `guardrail.blocked`, an empty `pii_mapping`. The text is unchanged; the log records that it was seen.
+
+This action is the right choice when you want a signal that something matched without changing the flow. A dashboard can count `guardrail.detected` events by entity type across runs to get a usage heat-map.
+
+## Incoming and outgoing are both scanned
+
+Look closely at the `warn` run above. `seq=1` has `"direction": "incoming"`, `seq=2` has `"direction": "outgoing"`. Guardrails run at both ends of every LLM turn.
+
+The incoming scan happens before the messages list is handed to `provider.complete()`. Every message the strategy built gets scanned. If any guardrail decides to `block`, the LLM is never called.
+
+The outgoing scan happens after `provider.complete()` returns, on the assistant's response. If the assistant leaked a PII entity the user did not provide, the redact or block action still fires.
+
+A run that enters `waiting_approval` and later resumes will scan again on the next iteration (the history being replayed includes the same user message). The `pii_mapping` is stable across scans so the same replacement token is reused, and there is no double-redaction.
+
+## Multiple guardrails compose
+
+The `guardrails=[...]` list is iterated in order. Every guardrail scans the same text. Findings are aggregated. The framework applies actions in priority order: any `block` wins immediately; otherwise any `redact` runs; `warn`-only entries only emit events.
+
+```python
+agent = Agent(
+    ...,
+    guardrails=[
+        SecretDetection(),                      # block on secrets (kills the run)
+        PII(),                                  # redact PII if no secret blocked
+        PII(action="warn",
+            extra_patterns=[Pattern("INTERNAL_ID", r"ACME-\d{4}")],
+            include_defaults=False),            # warn on custom entities
+    ],
+)
+```
+
+With that configuration, a message containing an AWS key is blocked. A message with only PII has the PII redacted. A message with only an internal ticket id produces a `guardrail.detected` event but is otherwise unchanged.
+
+## Why pattern-based instead of LLM-as-judge
+
+The built-ins ship as regex scanners. That choice is deliberate for three reasons.
+
+1. **Latency matters.** A guardrail runs on every message, incoming and outgoing. An LLM-as-judge on every turn doubles token spend and adds a round-trip to the slowest link in the system. Regex runs in microseconds on the same event loop.
+2. **Determinism.** A regex's behavior is inspectable, testable, and identical on every run. A judge model's behavior drifts with model version, temperature, and prompt drift. For a security primitive, that is the wrong tradeoff.
+3. **The protocol does not prevent either.** `scan()` is async and returns a list of findings. A third-party guardrail backed by an LLM or a hosted detection service plugs into the same protocol. The framework does not care. The defaults are regex; the seam is open.
+
+The `Finding` type (`entity_type`, `start`, `end`, `score`, `text`) is the same regardless of who produced it, so the engine's action application is uniform.
+
+## Where this fits
+
+- Declared on `Agent(guardrails=[...])`, per-agent.
+- Applied by `GuardrailEngine` in `dendrux.guardrails._engine`.
+- Emits typed events on `run_events`: `guardrail.detected`, `guardrail.redacted`, `guardrail.blocked`.
+- Mapped on `agent_runs.pii_mapping` when redaction occurs.
+- See [PII redaction](/docs/architecture/pii-redaction) for the reverse-lookup side of the story.

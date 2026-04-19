@@ -1,0 +1,42 @@
+---
+title: Overview
+description: What dendrux is, what it gives you, and where to read next.
+---
+
+# Welcome to dendrux
+
+Dendrux is a Python runtime for **agents that pause and resume**.
+
+An agent built with dendrux can stop in the middle of a task to wait for a tool result from your browser, an answer from a person, or an approval, and pick up later. Even if the process that started the run has died and a different process is finishing the work, everything it needs to resume is on disk.
+
+That's the whole library. The rest of these docs explain how it does that and how you use it.
+
+## What you get out of the box
+
+- An `Agent` you can call with `await agent.run(input)`.
+- Pause and resume across processes. State lives in your database, not in memory.
+- Four governance layers (PII redaction, access control, guardrails, approval) that you turn on per agent, not per call.
+- A built-in dashboard for inspecting runs, steps, events, and pause data.
+- A FastAPI router (`make_read_router`) for read endpoints and Server-Sent Events. You write your own write endpoints; they're a few lines each.
+
+## What dendrux does *not* do
+
+- Run a server for you. You bring your own (FastAPI, anything async).
+- Manage workers, queues, schedulers, or process supervision.
+- Decide what your tools do. Tools are plain Python functions you write.
+
+Dendrux is a **library**, not a hosted platform.
+
+## Where to go next
+
+<div className="docs-cards">
+
+**[Architecture](/docs/architecture/runs)**: how dendrux works under the hood. Start here if you want to understand the model before writing code.
+
+**[Quickstart](/docs/quickstart)**: install dendrux and run your first pause/resume agent in five minutes.
+
+**[Recipes](/docs/recipes/hitl-approval)**: task-shaped guides for human-in-the-loop approval, browser-side tools, cancelling a run, and mounting the read router.
+
+</div>
+
+If you're new, the recommended order is **Architecture, then Quickstart, then Recipes**. Reading the architecture pages first is unusual for software docs, but dendrux's value is in *how* it persists and resumes. The API only makes sense once you know that model.

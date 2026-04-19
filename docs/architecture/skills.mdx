@@ -1,0 +1,136 @@
+---
+title: Skills
+description: Loading Markdown skill definitions into an agent, the progressive-disclosure `use_skill` pattern that keeps token cost down, and the governance events it emits.
+---
+
+# Skills
+
+A skill is a Markdown file that teaches an agent how to do one specific thing. A single `SKILL.md` file sits in a directory, carries YAML frontmatter with a `name` and a `description`, and a Markdown body of instructions. Agents load skills declaratively at construction time, expose them to the LLM as a catalogue, and let the LLM pull the full body on demand through a built-in `use_skill` tool.
+
+The open standard this follows is [agentskills.io](https://agentskills.io/). Dendrux's integration is a faithful implementation of the spec: one `SKILL.md` per skill, per directory, with standard frontmatter keys.
+
+## A skill on disk
+
+```text
+_skills/
+  json-formatter/
+    SKILL.md
+```
+
+`SKILL.md`:
+
+```markdown
+---
+name: json-formatter
+description: Format raw JSON strings into pretty indented output with 2-space indent.
+---
+
+# JSON Formatter
+
+When asked to format JSON, parse the input with json.loads and re-emit
+with json.dumps(obj, indent=2, sort_keys=True). Always include a trailing
+newline. If the input is not valid JSON, reply with the exact error message.
+```
+
+The frontmatter has two required keys: `name` (must match the directory name, lowercase, hyphen-allowed) and `description` (under 1024 characters). The body is plain Markdown and can be as long as you like; it is the full instructions the model will read when it decides to invoke the skill.
+
+## Attaching skills to an agent
+
+Two loading strategies, compose freely:
+
+```python
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+
+agent = Agent(
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="You are a helpful assistant.",
+    skills_dir="./_skills",                    # scan a directory
+    deny_skills=["dangerous-tool"],            # skip some of what you find
+    database_url="sqlite+aiosqlite:///demo.db",
+)
+```
+
+`skills_dir=` walks a directory and loads every subdirectory that contains a `SKILL.md`. `skills=[Skill, ...]` takes pre-built `Skill` objects if you want to load them from a non-filesystem source. You can use both; duplicate names across the two sources raise `ValueError` at construction time.
+
+`deny_skills=` is the deny-list equivalent for skills: names that get filtered out even if they would otherwise have loaded. See [Access control](/docs/architecture/access-control) for how this relates to the tool-level deny list.
+
+## Progressive disclosure: the catalogue, then the body
+
+A skill body can be hundreds of tokens. If an agent has ten skills, pre-pending all of them to every system prompt would blow the context window and charge for tokens the model may never use. Dendrux avoids that by only exposing the skill catalogue (name + description) in the system prompt. The full body is fetched via a `use_skill` tool when the LLM decides to invoke one.
+
+The system prompt for an agent with one skill loaded, pulled verbatim from a real run:
+
+```text
+You are a helpful assistant.
+
+
+## Available Skills
+
+You have access to the following skills. To use a skill, call the `use_skill` tool with the skill name. The skill's detailed instructions will be returned to you.
+
+- **json-formatter**: Format raw JSON strings into pretty indented output with 2-space indent.
+```
+
+The `use_skill` tool is auto-injected by the agent. You do not declare it. It takes a `name` argument, and its implementation returns the full body of the matching skill as a string. From the agent code:
+
+```python
+async def _execute_use_skill(self, name: str) -> str:
+    """Execute the use_skill meta-tool — returns skill body.
+
+    Called by the loop when the LLM calls use_skill(name=...).
+    Returns the full Markdown instructions for the skill.
+    """
+    ...
+    for skill in self._loaded_skills:
+        if skill.name == name:
+            return skill.body
+    ...
+```
+
+This is the progressive-disclosure pattern: only pay for the skills the model actually uses, on the turns it uses them.
+
+## The full run lifecycle
+
+A captured run with one loaded skill, one denied skill, and a prompt that triggers the loaded one (`"Please format this JSON for me: ..."`):
+
+```text
+run_events:
+  [lifecycle] seq=0  run.started
+  [SKILL]     seq=1  skill.registered  data={"skill_name": "json-formatter", "description": "..."}
+  [SKILL]     seq=2  skill.denied      data={"skill_name": "dangerous-tool", "reason": "denied_by_policy"}
+  [lifecycle] seq=3  llm.completed     (model decides to call use_skill)
+  [lifecycle] seq=4  tool.completed    data={"tool_name": "use_skill", "success": true}
+  [SKILL]     seq=5  skill.invoked     data={"skill_name": "json-formatter"}
+  [lifecycle] seq=6  llm.completed     (model formats the JSON using the fetched instructions)
+  [lifecycle] seq=7  run.completed
+
+tool_calls:
+  use_skill  params={"name": "json-formatter"}  result="# JSON Formatter\n\nWhen asked to format JSON..."
+```
+
+Three moments worth calling out:
+
+1. **`skill.registered` fires at boot, before the LLM runs.** Every loaded skill gets one event. A reader scanning a run's events sees the full set of skills the agent started with, not just the ones the model ended up invoking.
+2. **`skill.denied` fires for filtered names.** The denied skill's body is never loaded into memory, never available to `use_skill`, and never counted in the catalogue. But the attempted denial is recorded, which is the right audit shape for a negative decision.
+3. **`skill.invoked` is separate from `tool.completed`.** The same iteration produces both: `tool.completed` is the generic tool-execution event (applies to `use_skill` like any other tool), and `skill.invoked` is the governance-layer event that names which skill was pulled. This separation lets a dashboard filter skill activity (`WHERE event_type = 'skill.invoked'`) without joining through tool-call rows.
+
+## Why a tool, not a prompt injection
+
+A different design would inject the full skill body into the system prompt whenever the LLM's recent messages mention keywords from the skill description. Progressive disclosure would be emergent from keyword triggering.
+
+That design is fragile for two reasons:
+
+1. **Keyword triggering is a guess.** Which messages count? How recent is recent? What keywords? Every answer is either too loose (bodies get injected unnecessarily) or too tight (the model never gets the instructions it needs).
+2. **Invocation is not auditable.** If skills get silently injected, the audit log cannot say "the model invoked this skill." All the runtime knows is "text appeared in the prompt; hopefully the model saw it."
+
+Routing skill invocation through an explicit tool makes the decision first-class. The model makes the call; the runtime records `skill.invoked`; the body comes back as a tool result the same way any other tool result does. Every part of the runtime that already handles tool calls (notifiers, recorder, governance) handles skills without special-casing.
+
+## Where this fits
+
+- Declared on `Agent(skills_dir=..., skills=[...], deny_skills=[...])`.
+- Loaded by `dendrux.skills._loader.Skill.scan_dir` and explicit `Skill` objects.
+- Exposed to the LLM as a catalogue in `get_system_prompt()`.
+- Invoked via the auto-injected `use_skill` tool, dispatched through the normal tool pipeline.
+- Emits `skill.registered`, `skill.denied`, and `skill.invoked` events on `run_events`.
+- SingleCall rejects skills at construction. Skills require [ReActLoop](/docs/architecture/loops) (the default) because they need multi-turn iteration to pull a body and then act on it.

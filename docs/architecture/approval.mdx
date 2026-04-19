@@ -1,0 +1,145 @@
+---
+title: Approval
+description: Human-in-the-loop gating on gated tool calls, with a persist-and-resume flow that works across processes and an explicit reject path.
+---
+
+# Approval
+
+Approval is the governance layer that gates a specific tool call on an explicit human decision. The agent is declared with `require_approval=["tool_name"]`. When the LLM emits that tool call, the runtime does not execute it. Instead, the run pauses with `status=waiting_approval`, persists the pending call in `pause_data`, and returns. A later call to `submit_approval(run_id, approved=...)` either lets the call execute or synthesizes a rejection, and the loop continues.
+
+The power of this design is that the two halves of the flow do not have to share a process, a server, or a memory space. The starter can return an HTTP response while the run sits paused in the DB; a reviewer can open a separate request hours later and approve or reject. Nothing about the handoff depends on in-memory continuity.
+
+## Declaring an approval gate
+
+```python
+from dendrux import Agent, tool
+
+@tool()
+async def refund(order_id: int) -> str:
+    """Issue a refund."""
+    return f"Refunded order {order_id}"
+
+agent = Agent(
+    provider=...,
+    prompt="You are a support agent.",
+    tools=[refund],
+    require_approval=["refund"],     # refund cannot execute without submit_approval
+    database_url="sqlite+aiosqlite:///demo.db",
+)
+
+result = await agent.run("Please refund order 42.")
+# result.status is RunStatus.WAITING_APPROVAL
+# result.run_id is the handle for submit_approval later
+```
+
+The gated tool is registered normally. The runtime just remembers its name. At dispatch time, a call to a name in `require_approval` is intercepted before the tool function would run.
+
+Construction-time validation still applies: every name in `require_approval` must exist in `tools`, the overlap with `deny` is rejected, and missing tools raise `ValueError`. See [Access control](/docs/architecture/access-control) for the adjacent constructor checks.
+
+## The happy path (approved)
+
+The [Quickstart](/docs/quickstart) already walks through this, with real DB state pulled from the run. The shape at a glance:
+
+```
+seq=0  run.started
+seq=1  llm.completed         (model emits refund(order_id=42))
+seq=2  approval.requested    corr=01KPFXPAT8ZF7MNGJNW2Y6S8GZ
+seq=3  run.paused            status=waiting_approval
+         <-- starter process exits here -->
+         <-- a later process calls submit_approval(run_id, approved=True) -->
+seq=4  run.resumed
+seq=5  tool.completed        refund executed, success=True
+seq=6  approval.decided      decision=approved
+seq=7  llm.completed         (model writes the final user-facing answer)
+seq=8  run.completed
+```
+
+Five things to notice:
+
+1. The `approval.requested` event (seq=2) and the `tool.completed` event (seq=5) share the same `correlation_id`. That id is the `tool_call.id`, so a reader can join the approval decision to the specific call it authorized.
+2. The pause at seq=3 and the resume at seq=4 are adjacent in the log but written by two different processes. [Event ordering](/docs/architecture/event-ordering) explains why `sequence_index` still runs straight through.
+3. The tool function ran only once, between seq=4 and seq=5, after the approval was in hand. No speculative execution.
+4. `approval.decided` (seq=6) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "..."}`. This row is the audit record of the human's choice.
+5. The run finishes as `status=success`. Approval did not need to be terminal.
+
+## The reject path
+
+`submit_approval(run_id, approved=False, rejection_reason="...")` is the other branch. A live capture with the same `refund` agent, rejected with the reason `"Manager declined: amount exceeds automatic threshold."`:
+
+```text
+first: status=waiting_approval
+after reject: status=success
+refund function actually called? False
+final answer preview: "I attempted to process the refund for order 42, but it was declined because
+the refund amount exceeds the automatic threshold. This means that..."
+
+run_events:
+  seq=0  run.started
+  seq=1  llm.completed
+  seq=2  approval.requested
+  seq=3  run.paused
+  seq=4  run.resumed
+  seq=5  tool.completed         success=False
+  seq=6  llm.completed
+  seq=7  run.completed
+
+tool_calls:
+  refund  success=0  error="Manager declined: amount exceeds automatic threshold."
+```
+
+Three things worth calling out in the rejected trace:
+
+1. **The tool function was not called.** `REFUND_CALLED` is empty. The rejection does not invoke the function and then fail it; the function is simply skipped.
+2. **A `tool_calls` row was still written.** `success=0`, `error_message` is the rejection reason. This is deliberate: from an audit perspective, "we tried to refund this order and we declined" is part of the story. A reader scanning `tool_calls` with `WHERE success = 0 AND error_message IS NOT NULL` gets every rejected attempt grouped with actual tool failures, which is the right shape for "things that did not produce side effects."
+3. **The model gets a normal failed tool result.** `tool.completed` with `success=False` and the rejection reason as the error. The next LLM turn sees it in history the same way it would see a real tool crash, and produces a sensible user-facing answer. No special prompt handling is required.
+
+The contrast with [Access control](/docs/architecture/access-control) matters: a `deny` entry blocks at dispatch phase 0, never pauses, and never writes a `tool_calls` row. A rejected approval passes through the full pause-and-resume pipeline and writes a row for the audit. Same outcome (no side effect), different bookkeeping, because the semantics are different: policy deny is an invariant, approval reject is a decision.
+
+## Submitting the decision
+
+From `dendrux/agent.py`:
+
+```python
+async def submit_approval(
+    self,
+    run_id: str,
+    *,
+    approved: bool,
+    rejection_reason: str | None = None,
+    notifier: LoopNotifier | None = None,
+) -> RunResult:
+    """
+    - approved=True: claims and resumes; the approval-gated tool
+      executes server-side and its output is fed to the LLM.
+    - approved=False: the pending batch is treated as all rejected.
+      Every pending tool call receives a synthetic failed ToolResult
+      carrying rejection_reason (default: "User declined to run this tool.").
+      The LLM decides what to do next.
+    """
+```
+
+Three constraints that shape how callers build around this method:
+
+1. **The decision is per-batch, not per-call.** If the LLM emits two tool calls in one turn and both are gated, one `submit_approval` decides the fate of both. The source comment is explicit: "Per-tool approve/reject within a batch is not supported." If finer-grained approval is needed, the caller has to split the batch upstream (e.g., with a different prompt shape that produces one gated call at a time).
+2. **CAS-guarded.** Like every resume method, `submit_approval` uses `claim_paused_run` to flip the row from `waiting_approval` to `running` atomically. Two concurrent Approve clicks resolve deterministically: one wins and runs the tool; the other raises `PauseStatusMismatchError` and can be shown as "this request has already been decided."
+3. **Idempotent against terminal runs.** If the run has already been finalized (someone else cancelled it, for example), `submit_approval` will either raise `RunAlreadyTerminalError` or short-circuit with the current state, depending on exactly how the race unfolded.
+
+The `notifier=` kwarg lets the submit call attach its own notifier for the rest of the run. The notifier passed to the original `run()` call is not remembered across processes (the resumer is a different process), so the resumer supplies one explicitly if it wants live observability.
+
+## Why pause and resume instead of a callback
+
+A callback-style alternative would have `run()` block on an awaitable that resolves when the human decides. In a single-process toy, that works. In real deployments, it breaks fast:
+
+1. **HTTP request timeouts.** The starter process has a request in flight. Waiting an hour for a human is not compatible with a 30-second timeout.
+2. **Process restarts.** A deploy or a crash loses the in-memory awaitable. Pause-and-resume survives both: the DB is the source of truth, and any process with the DB URL can resume.
+3. **Multi-reviewer workflows.** An approval queue where a different person reviews than the one who started the run requires the decision to be submittable from a different HTTP endpoint, a different service, or a different machine. That cannot work through a Python awaitable.
+
+The pause-and-resume flow is a superset of the callback flow: anything a callback can do, a pause-and-resume flow can do (just run the submit from the same process, a millisecond later). The converse is not true.
+
+## Where this fits
+
+- Declared on `Agent(require_approval=[...], tools=[...])`.
+- Enforced in `dendrux.runtime.runner` and `dendrux.loops.react.ReActLoop` (the pause and re-dispatch logic).
+- Resolved with `agent.submit_approval(run_id, approved=...)`.
+- Emits `approval.requested` (on pause) and `approval.decided` (when approved) on `run_events`.
+- Persists the pending batch in `agent_runs.pause_data` until resume. See [Pause and resume](/docs/architecture/pause-resume) for the state-machine side.

@@ -1,0 +1,152 @@
+---
+title: Prompt cache
+description: How dendrux activates provider-side prompt caching, what the telemetry looks like, and how to read the numbers to understand what you are paying for.
+---
+
+# Prompt cache
+
+Both Anthropic and OpenAI bill cached prefix tokens at a fraction of their uncached rate. A long system prompt that stays byte-identical across calls is the cheapest thing to keep sending. Dendrux activates caching automatically and records the cache-hit rate on every run so you can see what you are saving.
+
+There is no knob to turn on. If you use the built-in `AnthropicProvider` or `OpenAIProvider`, caching is already wired. The sections below explain the wiring, so you know what you are looking at in the telemetry.
+
+## The cache-token columns
+
+Every LLM call records five token numbers. Four of them are about the prompt side:
+
+| Column | Meaning |
+| --- | --- |
+| `input_tokens` | **Fresh** (uncached) input tokens the provider billed at full rate. |
+| `cache_read_input_tokens` | Input tokens read from a pre-existing cache entry. Cheapest. |
+| `cache_creation_input_tokens` | Input tokens written into a new cache entry for later calls. Billed at a small premium on Anthropic; normal rate on OpenAI. |
+| `output_tokens` | Tokens the model generated. Always billed at full output rate. |
+
+These land on `llm_interactions` per-call and on `token_usage` per-iteration, and they are summed into `agent_runs.total_cache_read_tokens` and `total_cache_creation_tokens` on terminal. See [State persistence](/docs/architecture/state-persistence) for the full schema.
+
+## Anthropic: `cache_control` markers
+
+Anthropic's cache is byte-prefix-keyed. You tell it where to cut the prefix with a `cache_control` marker on a content block; everything up to and including that block becomes a cache entry. The first call with a given prefix writes the entry (billed as `cache_creation`), subsequent calls with the same prefix read it (billed as `cache_read`).
+
+Dendrux applies two markers automatically. From `dendrux/llm/anthropic.py`:
+
+```python
+def _apply_cache_control(self, system_prompt, api_messages):
+    """Apply cache_control to system block and last message's last block.
+
+    The marker on the last message warms the next iteration's cache —
+    the call that writes it pays full creation; the next call reads it.
+    """
+    marker = self._cache_control_marker()   # {"type": "ephemeral"} (+ ttl if set)
+
+    if system_prompt:
+        system_blocks = [{"type": "text", "text": system_prompt, "cache_control": marker}]
+    ...
+    content[-1]["cache_control"] = marker
+    ...
+```
+
+Two breakpoints per call:
+
+1. **System block.** The whole system prompt (including any loaded skill catalogue) is marked. This is the big, stable part that barely changes across calls.
+2. **Last message's last content block.** Dendrux marks the conversation-so-far up through whatever the model just saw. That marker "warms the next iteration's cache": the current call pays to write it, and the next call reads it.
+
+Default TTL is Anthropic's default (5 minutes). Configure a longer one via the provider constructor if your agents pause for approval longer than that.
+
+## A real cache trace
+
+Ran the same calculator agent twice, back-to-back, with a system prompt padded to ~7700 tokens. Captured telemetry:
+
+```text
+RUN 1       status=success  input_fresh=9   cache_read=15491   cache_creation=0
+RUN 2       status=success  input_fresh=9   cache_read=15491   cache_creation=0
+
+llm_interactions:
+  RUN 1  iter=1  fresh=3   cache_read=7706   cache_creation=0
+  RUN 1  iter=2  fresh=6   cache_read=7785   cache_creation=0
+  RUN 2  iter=1  fresh=3   cache_read=7706   cache_creation=0
+  RUN 2  iter=2  fresh=6   cache_read=7785   cache_creation=0
+```
+
+Two things to understand in that trace.
+
+**Cross-iteration cache hits within one run.** RUN 1, iteration 1 reads `cache_read=7706` because a prior invocation warmed the cache on Anthropic's side. Iteration 2 reads `cache_read=7785` (slightly more, since the breakpoint after iteration 1's response now includes that content too). The cache entry created at the end of each turn pays off immediately on the next turn.
+
+**Cross-run cache hits.** RUN 2 looks identical to RUN 1. Anthropic's cache is server-side and byte-keyed; the dendrux DB being wiped between runs has no effect on what the provider has cached. If you reuse the same agent across many runs with the same system prompt, every run after the first pays the fresh-input cost only for the user's new message, not the system prompt.
+
+Per-iteration: only 3 to 6 tokens are billed at the full input rate. Everything else comes from the cache. A 7700-token system prompt costs the same as its short variant after one warm-up.
+
+## OpenAI: `prompt_cache_key` routing
+
+OpenAI's cache is not byte-prefix-based; it is key-based. Calls that carry the same `prompt_cache_key` end up on the same cache lane on OpenAI's infrastructure, which improves the odds that a long prefix is reused.
+
+Dendrux derives the key automatically. From `dendrux/llm/openai.py`:
+
+```python
+# Cache routing — derive key from prefix or run_id.
+if str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL:
+    cache_key_source = cache_key_prefix or run_id
+    if cache_key_source:
+        api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
+    if self._prompt_cache_retention is not None:
+        api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
+```
+
+Two things to notice:
+
+1. **Only applied to the real OpenAI base URL.** Compatible providers (Groq, Together, vLLM, etc.) reject unknown OpenAI-specific fields. The check keeps dendrux portable to those endpoints without a flag.
+2. **Prefix preferred, run_id as fallback.** The runner supplies `cache_key_prefix` as `{agent_name}:{model}` by default, which means runs sharing an agent and model route to the same lane. That maximizes cross-run hit rates. When no prefix is set, `run_id` is used as a last resort; per-run lanes get no cross-run benefit but are still predictable.
+
+OpenAI's telemetry populates `cache_read_input_tokens` (from the `usage.prompt_tokens_details.cached_tokens` field on the response). `cache_creation_input_tokens` is always `None` on OpenAI responses because the provider does not separate creation from reads in its reporting; they bill creation and reads at the same rate on the same model.
+
+## Why activate caching by default
+
+A design where caching is opt-in ("pass `cache=True` to enable") is a reasonable default for frameworks that want to avoid surprise. Dendrux does the opposite: caching is always on for providers that support it, and the telemetry lets you see exactly what happened.
+
+Three reasons for the flip.
+
+1. **Caching is almost always a strict win.** The creation premium on Anthropic is small, amortized over many reads. The worst case is "you pay one creation on the first call, then savings on every subsequent call." The best case is "you reuse a prefix hundreds of times and your bill shrinks by 10x."
+2. **The telemetry is free to collect.** The provider returns cache token counts in the response. Dendrux records them on `UsageStats` regardless. There is no cost to always-on observability.
+3. **The opt-in path adds friction where no friction belongs.** "Should I turn caching on?" is not a meaningful question for most apps. The framework deciding automatically, and exposing the numbers for the 5% of cases that want to tune, keeps the common path boring and the uncommon path inspectable.
+
+The Anthropic and OpenAI strategies are different, but the user-facing shape is the same: instantiate the provider, run the agent, read the cache columns on `llm_interactions` / `agent_runs`. Nothing else to configure.
+
+## Inspecting cache efficiency
+
+Two queries that are worth keeping around.
+
+Per-run hit rate:
+
+```sql
+SELECT
+  id,
+  total_input_tokens AS fresh_input,
+  total_cache_read_tokens AS cache_read,
+  CAST(total_cache_read_tokens AS FLOAT) /
+    NULLIF(total_input_tokens + total_cache_read_tokens + total_cache_creation_tokens, 0)
+    AS hit_rate
+FROM agent_runs
+WHERE status = 'success'
+ORDER BY created_at DESC
+LIMIT 10;
+```
+
+Per-iteration breakdown on a single run:
+
+```sql
+SELECT
+  iteration_index,
+  input_tokens AS fresh,
+  cache_read_input_tokens AS cache_read,
+  cache_creation_input_tokens AS cache_creation
+FROM llm_interactions
+WHERE agent_run_id = ?
+ORDER BY iteration_index;
+```
+
+The first shows whether an agent is taking advantage of caching across runs; the second shows whether a specific run warmed and read its own cache across iterations. Both numbers come from the recorder's routine writes; you do not instrument anything.
+
+## Where this fits
+
+- Wired inside the built-in providers: `dendrux.llm.anthropic.AnthropicProvider`, `dendrux.llm.openai.OpenAIProvider`, `dendrux.llm.openai_responses.OpenAIResponsesProvider`.
+- Anthropic adds `cache_control` markers on the system block and the last message. OpenAI adds `prompt_cache_key` routing derived from the agent+model prefix.
+- Telemetry is per-call on `llm_interactions`, per-iteration on `token_usage`, and per-run totals on `agent_runs`.
+- A `ConsoleNotifier` (see [Notifier](/docs/architecture/notifier)) renders cache counts live during dev runs for quick inspection.

@@ -1,0 +1,143 @@
+---
+title: Quickstart
+description: Install dendrux and run an agent that pauses for human approval, then resumes it from a separate process.
+---
+
+# Quickstart
+
+In five minutes you'll install dendrux, build an agent that pauses to wait for a human's approval, and resume it from a different process. By the end you'll have seen the one thing dendrux does that other agent libraries don't: survive a process restart mid-run.
+
+Every snippet below was executed against `dendrux==0.2.0a1` from PyPI in a fresh conda env. The outputs are real.
+
+## 1. Install
+
+```bash
+pip install "dendrux[anthropic]"
+```
+
+That installs dendrux and its Anthropic provider. Swap `anthropic` for `openai` if you'd rather use OpenAI. SQLAlchemy and SQLite are bundled as hard dependencies, so there's no separate database setup for local dev.
+
+You'll need an API key:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+## 2. Define an agent that pauses for approval
+
+Create `agent_def.py`:
+
+```python
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool()
+async def refund(order_id: int) -> str:
+    """Issue a refund for the given order. Requires manager approval."""
+    return f"Refunded order {order_id}"
+
+
+def build_agent() -> Agent:
+    return Agent(
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. When asked for a refund, call the refund tool.",
+        tools=[refund],
+        require_approval=["refund"],
+        database_url="sqlite+aiosqlite:///./quickstart.db",
+    )
+```
+
+Three things worth noticing:
+
+1. The tool is just a Python function. No registry, no schema. Dendrux reads the type hints and docstring.
+2. `require_approval=["refund"]` tells dendrux: when the LLM tries to call `refund`, pause the run and wait for a human to approve or reject.
+3. `database_url` is what makes the run survive a process exit. Without it, the run lives only in memory.
+
+## 3. Start a run
+
+`starter.py`:
+
+```python
+import asyncio
+from agent_def import build_agent
+
+
+async def main() -> None:
+    async with build_agent() as agent:
+        result = await agent.run("Please refund order 42.")
+
+    print(f"Status:    {result.status.value}")
+    print(f"Run ID:    {result.run_id}")
+    print(f"Iteration: {result.iteration_count}")
+
+
+asyncio.run(main())
+```
+
+Run it:
+
+```bash
+python starter.py
+```
+
+Real output:
+
+```
+Status:    waiting_approval
+Run ID:    01KPFXP9M96CXNR9JYT8KJ27J0
+Iteration: 1
+```
+
+The agent called the LLM, the LLM decided to call `refund`, dendrux saw the approval policy, paused the run, and persisted everything to `quickstart.db`. The Python process exits. The database row remains.
+
+## 4. Resume from a different process
+
+`resumer.py`:
+
+```python
+import asyncio
+import sys
+from agent_def import build_agent
+
+
+async def main() -> None:
+    run_id = sys.argv[1]
+    async with build_agent() as agent:
+        result = await agent.submit_approval(run_id, approved=True)
+
+    print(f"Status:    {result.status.value}")
+    print(f"Iteration: {result.iteration_count}")
+    print(f"Answer:    {result.answer}")
+
+
+asyncio.run(main())
+```
+
+Run it with the run ID from step 3:
+
+```bash
+python resumer.py 01KPFXP9M96CXNR9JYT8KJ27J0
+```
+
+Real output:
+
+```
+Status:    success
+Iteration: 2
+Answer:    I've successfully issued a refund for order 42. The refund has been processed and is pending manager approval.
+```
+
+The agent picked up where it left off, executed the `refund` tool now that the human had approved it, made one more LLM call to summarize, and finished. The starter process never knew the answer; the resumer process never saw the original question. They communicated through `quickstart.db`.
+
+## What you just saw
+
+- A run paused mid-task and persisted itself.
+- A different OS process resumed that exact run by ID.
+- The full step history (LLM calls, tool calls, the pause itself) is on disk in `quickstart.db`.
+
+This is the foundation everything else in dendrux is built on. From here:
+
+- Read [Runs and the lifecycle](/docs/architecture/runs) to understand the state machine.
+- Read [State persistence](/docs/architecture/state-persistence) to see what's actually stored on disk.
+- Read the [HITL approval recipe](/docs/recipes/hitl-approval) to wire this into a web app.

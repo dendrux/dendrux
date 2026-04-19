@@ -1,0 +1,199 @@
+---
+title: Runs and the lifecycle
+description: The state machine every dendrux agent moves through, in plain terms.
+---
+
+# Runs and the lifecycle
+
+A **run** is one execution of an agent, from the moment you call `agent.run(input)` to the moment it produces a final answer (or pauses, fails, or is cancelled). Everything dendrux does is in service of making that run resumable, observable, and safe.
+
+This page covers the four things you need to know about runs: their identity, their status, their shape, and how they move between statuses. Every output shown below was captured from a real run against `dendrux==0.2.0a1`.
+
+## A run has an ID and an owner
+
+When you call `agent.run(...)`, dendrux assigns the run a **ULID**, a 26-character ID that's both unique and time-sortable. That ID is the only thing you need to interact with the run later: pause, resume, cancel, observe.
+
+```python
+result = await agent.run("What is 15 + 27?")
+print(result.run_id)
+```
+
+Real output:
+
+```
+01KPFX9PWP8GGJAPPF0R53Y05Y
+```
+
+Why ULID and not UUIDv4? Two reasons:
+
+1. **Time-sortable.** Sorting runs by ID is the same as sorting by creation time, so the database index that already exists for the primary key gives you "most recent runs" for free. UUIDv4 is random, so you'd need a separate index on `created_at`.
+2. **Database-friendly.** Time-sortable IDs cluster well in B-tree indexes. Newer rows go to the end of the tree, not scattered through the middle. That keeps inserts fast even at scale.
+
+The agent also assigns the run an **owner** (the agent's name). This isn't authentication. It's there so you can scope queries to "all runs from this agent." Real per-user authorization is something you add in your write routes; dendrux doesn't decide who's allowed to see what.
+
+## A run has exactly one status at a time
+
+A run is always in one of nine statuses (these come straight from the `RunStatus` enum in `dendrux.types`):
+
+| Status | What it means |
+|---|---|
+| `pending` | Created in the database but not yet started. Rarely seen in practice. |
+| `running` | The agent is actively iterating, calling the LLM, running tools. |
+| `waiting_client_tool` | Paused, expecting a tool result from elsewhere (e.g. a browser). |
+| `waiting_human_input` | Paused, expecting a free-form text input from a human. |
+| `waiting_approval` | Paused, expecting a yes/no decision from a human on a tool call. |
+| `success` | Terminal. The agent produced a final answer. |
+| `error` | Terminal. An unrecoverable error stopped the run. |
+| `cancelled` | Terminal. Someone called `cancel_run` and the runner observed the flag. |
+| `max_iterations` | Terminal. The run hit its iteration cap without finishing. |
+
+Three of those, `waiting_client_tool`, `waiting_human_input`, and `waiting_approval`, are the **paused** statuses. They differ in what kind of submission unfreezes them:
+
+- `waiting_client_tool`: `agent.submit_tool_results(run_id, [...])`
+- `waiting_human_input`: `agent.submit_input(run_id, "text")`
+- `waiting_approval`: `agent.submit_approval(run_id, approved=True)`
+
+The runtime checks the pause type before accepting a submission. Submitting an approval to a run that's waiting for tool results raises `PauseStatusMismatchError`. This isn't pedantry; it catches a whole class of bugs where the wrong submit endpoint fires and silently corrupts the run.
+
+## A run has steps, events, and pause data
+
+A run is more than its status. Three things about it are persisted.
+
+**Steps** are the chronological record of what happened: each LLM turn, each tool call, each pause and resume. When you load a run from the database, you get its full step history. This is what powers the dashboard's run-detail view, and it's what gets shipped to the LLM as conversation context on every iteration.
+
+**Events** are atomic moments emitted as the run progresses: `run.started`, `llm.completed`, `tool.completed`, `run.paused`, `run.resumed`, `run.completed`. Each event has a monotonic `sequence_index` so SSE clients can reconnect and ask "give me everything after sequence 47" without losing or duplicating events. Events drive the live dashboard and any custom UI you build.
+
+**Pause data** is the small payload attached to a run when it pauses. For `waiting_client_tool` it's the list of pending tool calls the LLM made. For `waiting_human_input` it's the question being shown to the human. For `waiting_approval` it's the action the agent wants to take. Pause data is what your write endpoint reads to know what to render to the user.
+
+Steps and events are append-only. Once written, they're never modified. Only the `status` field on the run row changes over time. This is on purpose: an audit trail you can rewrite isn't an audit trail.
+
+## How a run moves between statuses
+
+Here's the whole state machine in one picture:
+
+```
+   agent.run(input)
+        │
+        ▼
+   [pending] ──► [running] ──────── error ─────► [error]
+                     │  ▲
+                     │  │ resume
+                     │  │
+                     ├──┴───────► [waiting_client_tool]
+                     │                   │ submit_tool_results
+                     │                   │
+                     ├──────────► [waiting_human_input]
+                     │                   │ submit_input
+                     │                   │
+                     ├──────────► [waiting_approval]
+                     │                   │ submit_approval
+                     │                   │
+                     │  cancel_run observed at next checkpoint
+                     ├─────────────────────────────────► [cancelled]
+                     │
+                     │  iteration cap hit
+                     ├─────────────────────────────────► [max_iterations]
+                     │
+                     │  final answer produced
+                     ▼
+                 [success]
+```
+
+Two things to notice.
+
+**Pauses aren't errors.** A run that's `waiting_client_tool` is a successful, in-progress run that happens to be paused. Your code shouldn't treat pause statuses as failures; they're the contract between the agent and your application.
+
+**Cancellation is cooperative, not preemptive.** When you call `cancel_run`, dendrux sets a flag in the database and emits a `run.cancelled` event. The runner observes that flag at two safe checkpoints: the top of every iteration, and right before pausing. The current LLM call and any in-flight tool calls finish first. Worst case: one more iteration's worth of work happens after you call cancel. This keeps cancellation simple and avoids leaving the agent in a half-torn-down state. See [Cancellation](/docs/architecture/cancellation) for the full story.
+
+## Verified end-to-end
+
+Here's the complete vetted example. Two scripts share an agent definition; the first runs to a pause, the second resumes it.
+
+```python
+# agent_def.py
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool()
+async def refund(order_id: int) -> str:
+    """Issue a refund for the given order. Requires manager approval."""
+    return f"Refunded order {order_id}"
+
+
+def build_agent() -> Agent:
+    return Agent(
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. When asked for a refund, call the refund tool.",
+        tools=[refund],
+        require_approval=["refund"],
+        database_url="sqlite+aiosqlite:///./quickstart.db",
+    )
+```
+
+```python
+# starter.py
+import asyncio
+from agent_def import build_agent
+
+async def main():
+    async with build_agent() as agent:
+        result = await agent.run("Please refund order 42.")
+    print(result.status.value, result.run_id)
+
+asyncio.run(main())
+```
+
+Real output:
+
+```
+waiting_approval 01KPFXP9M96CXNR9JYT8KJ27J0
+```
+
+```python
+# resumer.py
+import asyncio, sys
+from agent_def import build_agent
+
+async def main():
+    async with build_agent() as agent:
+        result = await agent.submit_approval(sys.argv[1], approved=True)
+    print(result.status.value, "-", result.answer)
+
+asyncio.run(main())
+```
+
+Real output:
+
+```
+success - I've successfully issued a refund for order 42. The refund has been processed and is pending manager approval.
+```
+
+Two processes, one database, one logical run. That's the whole pause-resume model in one example.
+
+## What this means for your code
+
+You almost never write a state machine when working with dendrux. You just check `result.status` and decide what to do:
+
+```python
+result = await agent.run("...")
+match result.status:
+    case RunStatus.SUCCESS:
+        return result.answer
+    case RunStatus.WAITING_HUMAN_INPUT:
+        return render_question(result.run_id)
+    case RunStatus.WAITING_APPROVAL:
+        return render_approval_card(result.run_id)
+    case RunStatus.WAITING_CLIENT_TOOL:
+        return ship_tool_calls_to_browser(result.run_id)
+    case RunStatus.ERROR:
+        return render_error(result.error)
+```
+
+Because dendrux owns the state machine, you don't track "what step is this conversation on?" yourself. The run's status and its pause data are sufficient, and they survive a process restart, so you can put that `match` block in a request handler that may never see the run start.
+
+## What's next
+
+- [State persistence](/docs/architecture/state-persistence): the six tables on disk, what each one stores, and why.
+- [Event ordering](/docs/architecture/event-ordering): how `sequence_index` works and why timestamps alone aren't enough.
+- [Pause and resume](/docs/architecture/pause-resume): the mechanics of how a paused run unfreezes when you submit.

@@ -1,0 +1,246 @@
+---
+title: State persistence
+description: The six tables dendrux writes to, what each one stores, and why the schema is shaped the way it is.
+---
+
+# State persistence
+
+Everything dendrux knows about a run lives in your database. Not in memory, not in a queue, not in a sidecar process. **Six SQLAlchemy tables, one ULID per row.** When a run pauses, it persists. When a different process resumes it, it reads those rows.
+
+This page walks through each table with real row contents from a vetted run (`dendrux==0.2.0a1` against SQLite). Every value below was copied from a real `quickstart.db` produced by the [Quickstart](/docs/quickstart) example.
+
+## Why on-disk state
+
+In-memory agent state evaporates the moment a process crashes, gets killed, restarts, or falls behind a load balancer that routes the next request to a different worker. Dendrux's whole point is that an agent can pause for minutes or hours (waiting on a human, a slow tool, or an upstream service) and resume from anywhere. That requires the state to live somewhere durable that any process can read.
+
+A **library**, not a service. Dendrux doesn't run a server, doesn't manage workers, doesn't sweep for crashed runs. It just gives every run a row in your existing database. If your application can talk to a database, it can resume a run.
+
+## The six tables
+
+<SchemaDiagram
+  parentName="agent_runs"
+  parentSubtitle="id = ULID PK"
+  parentDescription="One row per agent.run() call. Holds status, model, totals, pause state."
+  edgeLabel="agent_run_id FK · cascade delete"
+>
+  <SchemaItem name="react_traces" description="Conversation messages, in order" />
+  <SchemaItem name="tool_calls" description="One row per tool invocation" />
+  <SchemaItem name="token_usage" description="Per-LLM-call totals (legacy)" />
+  <SchemaItem name="llm_interactions" description="Per-LLM-call, full payloads" />
+  <SchemaItem name="run_events" description="Audit log, ordered by sequence_index" />
+</SchemaDiagram>
+
+The `agent_runs` table is the anchor. Everything else cascades from it: delete a run row and all its traces, tool calls, and events go with it.
+
+All IDs are **26-character ULIDs** (time-sortable, see [Runs and the lifecycle](/docs/architecture/runs)).
+
+## `agent_runs`: the anchor
+
+One row per `agent.run()` call. Holds the run's identity, status, configuration, and roll-up totals. Real row from the quickstart example:
+
+```text
+id:                   01KPFXP9M96CXNR9JYT8KJ27J0
+tenant_id:            None
+agent_name:           Agent
+status:               success
+input_data:           {"input": "Please refund order 42."}
+output_data:          {"answer": "I've successfully issued a refund..."}
+iteration_count:      2
+model:                claude-haiku-4-5
+strategy:             NativeToolCalling
+parent_run_id:        None
+delegation_level:     0
+retry_of_run_id:      None
+total_input_tokens:   1262
+total_output_tokens:  82
+total_cost_usd:       None
+total_cache_read_tokens:     0
+total_cache_creation_tokens: 0
+meta:                 {"dendrux.loop": "ReActLoop", "dendrux.max_delegation_depth": 10}
+pause_data:           null
+pii_mapping:          None
+error:                None
+last_progress_at:     2026-04-18 09:13:35.342991
+failure_reason:       None
+idempotency_key:      None
+idempotency_fingerprint: None
+cancel_requested:     0
+created_at:           2026-04-18 09:10:32
+updated_at:           2026-04-18 09:13:35
+```
+
+A few columns deserve a closer look:
+
+- **`status`** is the *only* mutable field that changes during a run's life. Everything else is either set once at creation (`agent_name`, `input_data`, `model`) or filled in at terminal time (`output_data`, `error`).
+- **`pause_data`** is a JSON blob holding everything needed to resume: pending tool calls, conversation history, step list, current iteration. It's `null` here because the run completed; it's populated when the run is in a `waiting_*` status. Cleared on terminal finalize.
+- **`pii_mapping`** is also JSON, but unlike `pause_data` it is **not** cleared on finalize. It's part of the audit trail. See [PII redaction](/docs/architecture/pii-redaction).
+- **`cancel_requested`** is the cooperative cancellation flag. The runner reads it at safe checkpoints. See [Cancellation](/docs/architecture/cancellation).
+- **`meta`** is opaque JSON for *your* application. Dendrux stores it and ships it back; it never reads it. Use it to link a run to your user IDs, request IDs, ticket numbers, anything.
+- **`parent_run_id`** + **`delegation_level`** form the sub-agent tree. When an agent spawns a sub-agent, the child gets its own `agent_runs` row with `parent_run_id` pointing back.
+
+Three indexes exist on this table: `parent_run_id` (for the delegation tree), `status` (for "find all running runs"), and `created_at` (for "most recent first").
+
+## `react_traces`: the conversation
+
+The chronological message history shipped to the LLM on every iteration. One row per message.
+
+For the quickstart's two-iteration run, this table has 4 rows: the user's question, the assistant's tool call, the tool result, and the assistant's final answer. Here's the first row:
+
+```text
+id:           01KPFXP9MYZNYTV09FHEBYFKXF
+agent_run_id: 01KPFXP9M96CXNR9JYT8KJ27J0
+role:         user
+content:      Please refund order 42.
+order_index:  0
+meta:         {"iteration": 0}
+created_at:   2026-04-18 09:10:32
+```
+
+The `order_index` is what guarantees stable ordering. SQL timestamps aren't precise enough (two messages in the same millisecond would tie); `order_index` is monotonic per run.
+
+`role` is one of `user`, `assistant`, `tool`. There's a composite index on `(agent_run_id, order_index)` so loading a run's history is one indexed range scan.
+
+Sub-agent isolation is **structural**: a sub-agent has its own `agent_run_id`, so its traces are naturally a separate set. No `instance_id` or delegation columns are needed inside this table.
+
+## `tool_calls`: what tools ran
+
+One row per tool invocation. Captures the call identity, parameters, result, success/failure, and timing.
+
+```text
+id:                     01KPFXVTPB7M86Z2GZ5G52V4D8
+agent_run_id:           01KPFXP9M96CXNR9JYT8KJ27J0
+tool_call_id:           01KPFXPAT8ZF7MNGJNW2Y6S8GZ
+provider_tool_call_id:  toolu_01AKnswC3GgaRwf1gkZSNdbh
+tool_name:              refund
+target:                 server
+params:                 {"order_id": 42}
+result:                 "Refunded order 42"
+success:                1
+duration_ms:            0
+iteration_index:        1
+error_message:          None
+created_at:             2026-04-18 09:13:34
+```
+
+Two ID columns are not a duplicate. `tool_call_id` is dendrux's stable ULID, used everywhere internally. `provider_tool_call_id` is whatever Anthropic or OpenAI assigned (`toolu_...` here). Storing both means dendrux can round-trip tool results back to the provider on the next iteration without ever depending on the provider's ID format being parseable or stable.
+
+`target` is one of `server` (executed in your process) or `client` (shipped to the browser). When `target=client`, the runner pauses and writes a row only after the client submits the result via `submit_tool_results`.
+
+## `llm_interactions`: the authoritative LLM record
+
+One row per `provider.complete()` call. This is the table that exists for the **evidence layer**: it stores both dendrux's normalized view and the exact vendor-specific wire format.
+
+```text
+id:                01KPFXPAT8ZF7MNGJNW2Y6S8H0
+agent_run_id:      01KPFXP9M96CXNR9JYT8KJ27J0
+iteration_index:   1
+model:             claude-haiku-4-5
+provider:          AnthropicProvider
+semantic_request:  {"messages": [...], "tools": [...]}     ← dendrux-normalized
+semantic_response: {"tool_calls": [...], "usage": {...}}   ← dendrux-normalized
+provider_request:  {"model": "claude-haiku-4-5", "max_tokens": 16000, ...}  ← raw Anthropic kwargs
+provider_response: {"id": "msg_01XAzX8uRdmy8qiL242Q8kK8", ...}              ← raw Anthropic dump
+input_tokens:      594
+output_tokens:     55
+duration_ms:       1190
+cache_read_input_tokens:     0
+cache_creation_input_tokens: 0
+guardrail_findings: null
+created_at:        2026-04-18 09:10:34
+```
+
+The `semantic_*` columns let you ask "what did dendrux think it sent?" The `provider_*` columns let you ask "what actually went over the wire?" Both matter for compliance, debugging, and replay. If a provider does something unexpected, the raw response is preserved verbatim.
+
+`guardrail_findings` is best-effort enrichment from the [Guardrails engine](/docs/architecture/guardrails). It's not the authoritative audit record (governance events in `run_events` are), just a convenience attached to this row.
+
+## `token_usage`: legacy, kept for backwards compat
+
+Same shape as the token columns on `llm_interactions`, one row per LLM call. Older versions of dendrux only had this table; `llm_interactions` superseded it but `token_usage` is still written so existing dashboards keep working.
+
+```text
+id:               01KPFXPATDNPK7KX68QYKVMXDX
+agent_run_id:     01KPFXP9M96CXNR9JYT8KJ27J0
+iteration_index:  1
+model:            claude-haiku-4-5
+provider:         AnthropicProvider
+input_tokens:     594
+output_tokens:    55
+duration_ms:      None
+created_at:       2026-04-18 09:10:34
+```
+
+If you're starting fresh, query `llm_interactions` instead.
+
+## `run_events`: the ordered audit log
+
+Append-only event log for everything observable about a run: lifecycle transitions, LLM completions, tool completions, governance decisions. The dashboard and SSE stream are both built on this table.
+
+```text
+id:               01KPFXP9MXHCM94YH8EAV79YKK
+agent_run_id:     01KPFXP9M96CXNR9JYT8KJ27J0
+event_type:       run.started
+sequence_index:   0
+iteration_index:  0
+correlation_id:   None
+data:             {"agent_name": "Agent",
+                   "system_prompt": "You are a support agent..."}
+created_at:       2026-04-18 09:10:32
+```
+
+The two-iteration quickstart run produced 9 events:
+
+| seq | event_type      | iteration |
+|-----|-----------------|-----------|
+| 0   | `run.started`   | 0         |
+| 1   | `llm.completed` | 1         |
+| 2   | `run.paused`    | 1         |
+| 3   | `run.resumed`   | 2         |
+| 4   | `tool.completed`| 1         |
+| 5   | `llm.completed` | 2         |
+| 6   | `run.completed` | 2         |
+| ... | (init events)   | 0         |
+
+The **`sequence_index`** column is the canonical ordering key inside a run. Two events created in the same millisecond would tie on `created_at`, but `sequence_index` is strictly monotonic per run. The composite index `(agent_run_id, sequence_index)` makes "give me everything after sequence N" a single indexed range scan, which is what powers SSE resume. See [Event ordering](/docs/architecture/event-ordering) for the full mechanism.
+
+`correlation_id` links related events together. A `tool.completed` event carries the `tool_call_id` it corresponds to. A `run.resumed` event carries the `correlation_id` of the original `run.paused` it picks up from. This avoids ambiguity in multi-tool, multi-pause runs.
+
+`data` is JSON: the event-specific payload. **Privacy**: only observable data goes here. The unredacted execution state lives in `agent_runs.pause_data`, which the dashboard never queries.
+
+## Append-only is a feature
+
+The four child tables (`react_traces`, `tool_calls`, `llm_interactions`, `run_events`) are **insert-only**. Once a row is written, dendrux never updates it. Only `agent_runs.status` and the roll-up totals change over time.
+
+This is on purpose. An audit trail you can rewrite isn't an audit trail. If something looks wrong in the dashboard, the raw rows are the source of truth. Migrations preserve old rows; bug fixes add new columns rather than rewriting existing data.
+
+## Indexes
+
+The schema ships with four indexes that matter for typical query patterns:
+
+| Index | Purpose |
+|---|---|
+| `agent_runs(parent_run_id)` | Walk the sub-agent tree |
+| `agent_runs(status)` | Find all running / paused / failed runs |
+| `agent_runs(created_at)` | "Most recent runs" listings |
+| `react_traces(agent_run_id, order_index)` | Load a run's full conversation in order |
+| `tool_calls(agent_run_id)` | Per-run tool history |
+| `llm_interactions(agent_run_id)` | Per-run LLM call history |
+| `run_events(agent_run_id, sequence_index)` | SSE resume range scans |
+| `run_events(event_type)` | Filter "show me all `run.error` events" |
+
+You can add your own indexes if your queries need them. These are the structural ones dendrux relies on.
+
+## Database choice
+
+Dendrux uses **SQLAlchemy 2.x async**. Anything async-SQLAlchemy supports works:
+
+- **SQLite + aiosqlite**: bundled, zero-setup, perfect for local dev and small deployments.
+- **PostgreSQL + asyncpg**: recommended for production. `pip install "dendrux[postgres]"`. Schema is identical; migrations are managed by Alembic.
+- Other backends (MySQL, etc.) work in principle but aren't routinely tested.
+
+The schema doesn't use any SQLite-specific or Postgres-specific features. Switching backends is a connection string change.
+
+## What's next
+
+- [Event ordering](/docs/architecture/event-ordering): why `sequence_index` exists and how SSE resume uses it.
+- [Pause and resume](/docs/architecture/pause-resume): what `pause_data` actually contains and how `submit_*` unfreezes a run.
+- [Cancellation](/docs/architecture/cancellation): the `cancel_requested` flag and the atomic CAS that finalizes a run safely.

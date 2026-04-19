@@ -1,0 +1,115 @@
+---
+title: Cancellation
+description: How a running or paused dendrux run is cleanly cancelled from any process, without mid-step preemption or race bugs.
+---
+
+# Cancellation
+
+`agent.cancel_run(run_id)` terminates a run. It works whether the run is currently paused in the DB, running on another server, or running inside a task the current process owns. It never kills an in-flight LLM call or a tool execution mid-step. Instead, it uses two mechanisms in parallel: a cooperative flag for running runs, and an atomic CAS for paused ones. Whichever condition applies wins, and the run ends in status `cancelled`.
+
+## Two scenarios, one API
+
+There is one method on `Agent` for cancellation, and its behavior depends on what state the run is in when the call arrives:
+
+| Run state at cancel time | What happens |
+| --- | --- |
+| Paused (`waiting_approval`, `waiting_client_tool`, `waiting_human_input`) | CAS finalize from the paused status to `cancelled` in a single `UPDATE`. Wins instantly. |
+| Running (`running`) | Sets `cancel_requested = true` on the row. The runner observes the flag at its next checkpoint and finalizes itself as `cancelled`. |
+| Terminal (`success`, `error`, `cancelled`, `max_iterations`) | No-op. Returns the current persisted state. Does not raise. |
+
+The caller does not have to know which branch applies. `cancel_run` sets the cooperative flag *and* attempts the paused-state CAS in the same call. Exactly one of them succeeds.
+
+## Cancelling a paused run
+
+This is the deterministic path. The run is not doing anything, so we can immediately flip the status.
+
+The scratchpad below starts a run that pauses for approval, then calls `cancel_run` instead of `submit_approval`. The DB state before and after is pulled directly from SQLite.
+
+```text
+first.run returned: status=waiting_approval
+
+STATE AT PAUSE (waiting_approval)
+  status: waiting_approval
+  cancel_requested: 0
+  iteration_count: 1
+  pause_data: <set>
+  run_events:
+    seq=0  run.started
+    seq=1  llm.completed
+    seq=2  approval.requested
+    seq=3  run.paused
+
+cancel_run returned: status=cancelled
+
+STATE AFTER CANCEL
+  status: cancelled
+  cancel_requested: 0
+  iteration_count: 1
+  pause_data: null
+  run_events:
+    seq=0  run.started
+    seq=1  llm.completed
+    seq=2  approval.requested
+    seq=3  run.paused
+    seq=4  run.cancelled
+```
+
+Three things worth noting in that diff.
+
+1. `status` went straight from `waiting_approval` to `cancelled` without an intermediate `running` state. One SQL statement made the transition.
+2. `pause_data` was cleared to JSON null as part of the same UPDATE. There is no stale handoff data sitting on a terminal row.
+3. A `run.cancelled` event was appended at `seq=4`, continuing the existing per-run monotonic sequence. SSE clients that were streaming this run see the cancel arrive as a normal event.
+
+## Cancelling a running run
+
+When the run is actively iterating, cancel cannot finalize atomically without fighting the runner. Instead, `cancel_run` sets the `cancel_requested` flag and returns. The runner itself is responsible for seeing the flag and stopping.
+
+The runner observes the flag at exactly two checkpoints:
+
+1. **Top of each iteration.** Before building messages or calling the LLM, the loop reads `is_cancel_requested(run_id)`. If true, the loop returns with status `CANCELLED` and the runner finalizes.
+2. **Pre-pause.** If the iteration body decides to pause (a client tool needs running, approval is required, clarification is needed), the runner checks the flag one more time before writing `pause_data`. This prevents a cancel that arrived mid-iteration from settling the run into a paused state with stale `pause_data`.
+
+The current iteration's in-flight LLM call and tool executions are never preempted. A call already in the air finishes normally, its result is recorded, and the cancel is honored at the next checkpoint. That is a deliberate design choice: aborting an LLM call mid-stream leaks tokens and provider state, and aborting a tool call mid-execution leaks side effects. Waiting one iteration boundary is cheaper than cleaning up either of those.
+
+## Why the flag is race-safe
+
+A naive implementation of "is it still cancellable?" would read the status, check it is not terminal, then write `cancel_requested = true`. That introduces a window where the run can finish between the read and the write.
+
+Dendrux folds both into one SQL statement:
+
+```sql
+UPDATE agent_runs
+   SET cancel_requested = true,
+       updated_at = now()
+ WHERE id = :run_id
+   AND status NOT IN ('success', 'error', 'cancelled', 'max_iterations');
+```
+
+The terminal-status guard is part of the `WHERE` clause. If the run has already finished, rowcount is 0, and the flag is never set. If the run finishes between the SELECT-ish part of the UPDATE and the commit, the UPDATE simply does nothing, because the row's status no longer matches.
+
+The paired CAS finalize does the same trick on the other end:
+
+```sql
+UPDATE agent_runs
+   SET status = 'cancelled',
+       pause_data = NULL,
+       cancel_requested = false,
+       iteration_count = :n,
+       updated_at = now()
+ WHERE id = :run_id
+   AND status IN ('waiting_approval', 'waiting_client_tool', 'waiting_human_input');
+```
+
+If the run is running (not paused), this matches 0 rows and has no effect. The cooperative flag picks up the work. If the run is paused, this finalizes in one round-trip. The caller gets a boolean back that tells them whether this particular CAS "won" or not, and exactly one of the two paths produces the `run.cancelled` event so the timeline never has a duplicate.
+
+## Why cooperative instead of preemptive
+
+The alternative to a flag + checkpoints is to cancel the asyncio task running the loop. Python can raise `CancelledError` into the coroutine, and the runner would stop immediately.
+
+Dendrux does do this for runs it owns an in-process handle to: the `Agent._task_manager.cancel(run_id)` line in `cancel_run` preempts a locally-running `submit_*` task. But that is additive, not primary. The cooperative flag is the source of truth, for three reasons:
+
+1. **Cross-process cancel works at all.** A preemptive asyncio cancel cannot reach a run executing on another server. A flag on the DB row can.
+2. **In-flight provider calls are respected.** A `CancelledError` raised inside a model stream orphans the provider's state. The flag waits until the next natural boundary.
+3. **One code path, one contract.** The runner checks the flag in exactly two places. Anything outside those two points is guaranteed not to observe cancellation, which makes the loop's invariants easy to hold.
+
+The result is a cancel that is deterministic for paused runs, observable-within-one-iteration for running runs, and idempotent for terminal ones. One call, regardless of where the run actually lives.

@@ -1,0 +1,151 @@
+---
+title: Recorder
+description: The internal component that writes the authoritative audit trail for every run, with a two-tier durability policy.
+---
+
+# Recorder
+
+The recorder is the component that writes what actually happened during a run into the database. Every message the agent saw, every tool call it made, every lifecycle event, every governance decision: all of it lands in one place, through one object, with one durability policy. That object is `PersistenceRecorder`.
+
+The recorder is not a public extension point. You do not pass one to the `Agent` constructor, and you cannot replace it with a subclass. Dendrux owns this piece. This page exists to explain what it writes, how the fail-closed vs best-effort split works, and why the design draws that line where it does.
+
+## The four hooks
+
+The loop talks to the recorder through four protocol methods. That is all of them, and the list has been stable since the persistence layer was introduced:
+
+| Hook | Called when | Writes to |
+| --- | --- | --- |
+| `on_message_appended` | A message is appended to conversation history (user, assistant, tool result) | `react_traces` |
+| `on_llm_call_completed` | `provider.complete()` returns | `llm_interactions`, `token_usage`, `run_events` (`llm.completed`) |
+| `on_tool_completed` | A server tool or a submitted client/approval tool finishes | `tool_calls`, `run_events` (`tool.completed`) |
+| `on_governance_event` | The loop or a guardrail emits a named event like `approval.requested` or `run.paused` | `run_events` |
+
+From `dendrux/loops/base.py`:
+
+```python
+@runtime_checkable
+class LoopRecorder(Protocol):
+    """Internal persistence hooks — authoritative evidence recording.
+
+    NOT a public extension point. Used only by the framework's
+    PersistenceRecorder. Exceptions propagate — if persistence fails,
+    the run stops.
+    """
+
+    async def on_message_appended(self, message, iteration): ...
+    async def on_llm_call_completed(self, response, iteration, *, ...): ...
+    async def on_tool_completed(self, tool_call, tool_result, iteration): ...
+    async def on_governance_event(self, event_type, iteration, data, correlation_id): ...
+```
+
+`runtime_checkable` means the type system does not require inheritance. The recorder is shaped as a Protocol so the loop is decoupled from any particular storage implementation, but in practice only `PersistenceRecorder` exists in the box.
+
+## What the hooks wrote, for a real run
+
+This is the actual DB state from the [Quickstart](/docs/quickstart) run (the HITL refund flow). Each section is the tables one hook populated:
+
+```text
+react_traces (on_message_appended — FAIL-CLOSED)
+  order= 0  role=user       iter=0
+  order= 1  role=assistant  iter=1  tool_calls=['refund']
+  order= 2  role=tool       iter=1  tool_name='refund'
+  order= 3  role=assistant  iter=2
+
+tool_calls (on_tool_completed — FAIL-CLOSED)
+  refund  target=server  success=1  duration_ms=0  iter=1
+
+llm_interactions (on_llm_call_completed — BEST-EFFORT)
+  iter=1  model=claude-haiku-4-5  provider=AnthropicProvider  input=594  output=55
+  iter=2  model=claude-haiku-4-5  provider=AnthropicProvider  input=668  output=27
+
+token_usage (on_llm_call_completed — BEST-EFFORT)
+  iter=1  input=594  output=55  model=claude-haiku-4-5
+  iter=2  input=668  output=27  model=claude-haiku-4-5
+
+run_events (lifecycle + on_governance_event — FAIL-CLOSED)
+  seq=0  iter=0  run.started
+  seq=1  iter=1  llm.completed
+  seq=2  iter=1  approval.requested
+  seq=3  iter=0  run.paused
+  seq=4  iter=0  run.resumed
+  seq=5  iter=1  tool.completed
+  seq=6  iter=1  approval.decided
+  seq=7  iter=2  llm.completed
+  seq=8  iter=0  run.completed
+```
+
+Five tables, one coherent history. The `react_traces` rows are the messages the LLM saw. The `tool_calls` row is the proof the refund actually executed. The `llm_interactions` and `token_usage` rows are cost telemetry. The `run_events` rows are the timeline. Every row came from one of the four hooks, and every one carries `iteration_index` so readers can reconstruct what belonged to which turn.
+
+## Fail-closed vs best-effort
+
+Inside the recorder, writes fall into two buckets. The split is stated explicitly in `PersistenceRecorder`:
+
+```python
+"""Authoritative evidence recorder — writes loop events to StateStore.
+
+Fail-closed writes (exceptions propagate to caller):
+  - save_trace: what the agent saw and said
+  - save_tool_call: proof of side effects
+  - save_run_event: lifecycle audit trail
+
+Best-effort writes (exceptions swallowed):
+  - save_usage: cost tracking
+  - save_llm_interaction: full forensics
+  - touch_progress: operational freshness for sweep
+"""
+```
+
+Fail-closed means: if the DB write fails, the exception propagates, the retry layer gives it three chances, and if all three fail, the loop dies. The run does not silently continue with a missing row.
+
+Best-effort means: the write is wrapped in `try`/`except`, a warning is logged, and the loop keeps going.
+
+The line between the two is drawn on one principle: **can a reader tell what happened without this row?**
+
+- `react_traces`, `tool_calls`, `run_events`: yes, losing any of these creates a gap a reader cannot reconstruct. A missing trace hides what the LLM said. A missing tool_call hides a real side effect. A missing run_event breaks the timeline. Fail-closed.
+- `llm_interactions`, `token_usage`, `touch_progress`: no, these are derivable or operational. Token counts can be re-counted from providers. Interaction forensics duplicate what traces already capture semantically. `touch_progress` is a liveness hint for sweep workers, not part of the audit story. Best-effort.
+
+The two-tier approach means a transient DB hiccup on a best-effort table does not kill a run mid-conversation, while a hiccup on the authoritative tables does, by design.
+
+## How the loop actually calls the recorder
+
+The loop never touches the `StateStore` directly. It calls `recorder.on_*` and lets the recorder handle everything downstream. From `dendrux/runtime/persistence.py`, the tool hook:
+
+```python
+async def on_tool_completed(self, tool_call, tool_result, iteration):
+    params = _redact_dict(tool_call.params, self._redact) if tool_call.params else None
+    redacted_payload = self._redact(tool_result.payload)
+    target = self._target_lookup.get(tool_call.name, "server")
+
+    # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
+    async def _write_tool():
+        await self._store.save_tool_call(...)
+    await retry_critical(_write_tool, label="save_tool_call", run_id=self._run_id)
+
+    # FAIL-CLOSED: run event (lifecycle audit trail)
+    await self._emit_event("tool.completed", iteration, {...}, correlation_id=tool_call.id)
+
+    # BEST-EFFORT: touch progress for sweep
+    try:
+        await self._store.touch_progress(self._run_id)
+    except Exception:
+        logger.warning(...)
+```
+
+Three writes land from one hook. The recorder is responsible for:
+
+1. **Redaction.** A caller-supplied `redact` function runs over tool params, tool results, and message content before persistence.
+2. **Durability policy.** Which writes retry, which swallow exceptions, which propagate.
+3. **Correlation.** `run_event.correlation_id` is set to the `tool_call.id` so `approval.requested`, `tool.completed`, and `approval.decided` can be joined later as one tool-lifecycle story.
+4. **Ordering.** An `order_index` counter is maintained for `react_traces`. A shared `EventSequencer` is used for `run_events.sequence_index` (see [Event ordering](/docs/architecture/event-ordering)).
+
+The loop does not know or care about any of that. It calls the hook.
+
+## Why not let the loop write directly
+
+An earlier shape of this codebase had the loop open DB sessions inline. That shape had three problems the recorder solves:
+
+1. **Scattered durability decisions.** When the loop writes to the DB in ten places, each call site has to independently decide "do I retry? do I swallow? do I invalidate the run?" The policy drifts. Moving every write behind a recorder method centralizes that decision in one file.
+2. **Coupling to storage.** A loop that calls `session.add(ReactTrace(...))` is married to one ORM. A loop that calls `recorder.on_message_appended(msg, iter)` is not. The Protocol can in principle back a test double, an S3 log sink, or a different schema entirely. Today `PersistenceRecorder` is the only implementation, but the seam is there.
+3. **Auditability.** "What writes does this run produce?" is a question you answer by reading one class, not by grepping the loop. The two-tier durability table is a four-line docstring, not scattered comments.
+
+The recorder is deliberately not pluggable at the user level. The fail-closed contract (bad writes kill the run) is the thing that makes the audit trail trustworthy, and a user-supplied recorder that dropped rows would quietly break that guarantee. A pluggable notifier, on the other hand, is the designed extension point, and it runs alongside the recorder on the same hooks. See [Notifier](/docs/architecture/notifier) for that side of the story.

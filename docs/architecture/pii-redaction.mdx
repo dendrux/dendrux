@@ -1,0 +1,139 @@
+---
+title: PII redaction
+description: How dendrux keeps personal data out of the LLM provider API while still letting tools operate on real values, via a run-scoped bidirectional mapping.
+---
+
+# PII redaction
+
+When a PII guardrail finds an entity in a message, it does not just flag it. It replaces the entity with a placeholder like `<<EMAIL_1>>`, records the bijection in a per-run table, and keeps that table alive for the entire lifecycle of the run. The placeholder is what the LLM provider sees. The original value survives only inside the runtime, to be substituted back at the one place it is needed: the tool function that has to actually operate on the real thing.
+
+This page walks through the full round-trip with a real run, and explains where redaction takes effect versus where it does not.
+
+## The round-trip, end to end
+
+A concrete scenario: user asks the agent to `send_email` to a real address. Guardrail is a default `PII()` (action `redact`). The run succeeds. Here is exactly what happened at each layer, captured from a live execution:
+
+**1. What the tool function received at runtime**
+
+```text
+to:   'jane.doe@example.com'
+body: 'Your refund is processed.'
+```
+
+The Python function ran with the real email. Redaction did not prevent the tool from doing its job.
+
+**2. What the LLM actually saw (`llm_interactions.semantic_request`)**
+
+```text
+iter=1  role=user  content: "Please email <<EMAIL_1>> saying 'Your refund is processed.'"
+```
+
+The provider API call carried the placeholder, not the address. No 3rd-party API ever received the PII.
+
+**3. What the DB stored**
+
+```text
+agent_runs.pii_mapping:
+  {"<<EMAIL_1>>": "jane.doe@example.com"}
+
+react_traces (the authoritative transcript):
+  order=0  role=user       content="Please email jane.doe@example.com saying 'Your refund is processed.'"
+  order=1  role=assistant  tool_calls.params={'to': '<<EMAIL_1>>', 'body': '...'}
+  order=2  role=tool       content='"Sent email to jane.doe@example.com"'
+
+tool_calls (proof of side effect):
+  send_email  params={"to": "jane.doe@example.com", "body": "..."}
+```
+
+Four storage locations, three different views of the same conversation.
+
+## Where the redaction boundary actually sits
+
+The subtle part of this design: **redaction protects the provider API wire, not the database**. Four concrete statements, all true:
+
+| Location | What is stored | Why |
+| --- | --- | --- |
+| `llm_interactions.semantic_request` | Redacted (`<<EMAIL_1>>`) | This is a record of what was sent to the LLM. The scan ran before the send. |
+| `react_traces.content` (user messages) | Original value | This is the authoritative transcript. The DB owns it, and the user gave it to the agent. |
+| `react_traces.meta.tool_calls.params` | Redacted (`<<EMAIL_1>>`) | These came out of the LLM, which only saw placeholders. |
+| `tool_calls.params` | Deanonymized to real | This is a record of what the tool function actually ran with. |
+
+The table is not a contradiction. It reflects a specific threat model: the concern is about sending PII to a third-party API (Anthropic, OpenAI, etc.), not about the app's own database. The app owns the DB. The app does not own the LLM provider.
+
+If you *also* want every DB write redacted, pass a separate `redact=` callable to the `Agent` constructor:
+
+```python
+Agent(..., redact=lambda s: s.replace(REAL_EMAIL, "<redacted>"))
+```
+
+That callable runs inside `PersistenceRecorder` before any trace or tool-call write. It is independent from the guardrail engine and off by default.
+
+## The `pii_mapping` column
+
+`agent_runs.pii_mapping` is a JSON object on the run row. Placeholder to real, one entry per unique entity the guardrails have seen on this run. From the scratchpad above:
+
+```json
+{
+  "<<EMAIL_1>>": "jane.doe@example.com"
+}
+```
+
+Two invariants this mapping enforces:
+
+1. **Stable tokens.** If the same email appears in two different messages, the same `<<EMAIL_1>>` token is used both times. The guardrail engine checks the reverse index before minting a new placeholder.
+2. **Pause-safe.** On resume, the runner reads `pii_mapping` off the row and reinitializes the guardrail engine with it. A second-iteration scan picks up the same placeholder for the same email, so the LLM never sees a redaction jitter between pause and resume.
+
+From `dendrux/runtime/runner.py`:
+
+```python
+# Load pii_mapping for guardrail continuity across pause/resume
+_saved_pii_mapping = await state_store.get_pii_mapping(run_id)
+...
+initial_pii_mapping=_saved_pii_mapping,
+```
+
+## Deanonymization: the tool-params step
+
+When the LLM emits a tool call, its params carry placeholders (that is all it has ever seen). Dendrux walks the params dict recursively and substitutes back before the tool function runs. From `dendrux/guardrails/_engine.py`:
+
+```python
+def deanonymize(self, params: dict[str, Any]) -> dict[str, Any]:
+    """Replace <<PLACEHOLDER>> values with real values in tool call params.
+
+    Walks the dict recursively. Returns a new dict (does not mutate input).
+    If a placeholder is not in the mapping (corrupted by LLM), it passes
+    through unchanged — the caller emits a warning event.
+    """
+    result = _deanonymize_value(params, self._pii_mapping)
+    return result
+```
+
+Three things that make this robust in practice:
+
+1. **Recursive.** The walk descends into nested dicts and lists. A param shape like `{"recipients": [{"email": "<<EMAIL_1>>"}, ...]}` round-trips correctly.
+2. **Tolerant of model corruption.** If the LLM hallucinates a placeholder that does not exist in the mapping (e.g. `<<EMAIL_42>>` when only `<<EMAIL_1>>` was ever minted), the string passes through unchanged. The loop emits a warning rather than crashing.
+3. **Non-mutating.** Returns a new dict. Nothing the tool does to its params dict back-contaminates the LLM's view of the conversation.
+
+The tool runs with the real values. The tool result goes back through `on_message_appended` and `on_tool_completed`. Subsequent LLM turns re-scan the history and see `<<EMAIL_1>>` again wherever the email appeared.
+
+## Where this fits with the rest of the system
+
+PII redaction is not a standalone component. It is the interaction of three pieces already documented:
+
+- [Guardrails](/docs/architecture/guardrails) run the actual scan and emit `guardrail.detected` / `guardrail.redacted` events.
+- [State persistence](/docs/architecture/state-persistence) stores the `pii_mapping` column on `agent_runs` and carries it through pause/resume.
+- [Recorder](/docs/architecture/recorder) writes the trace rows with the `redact=` callable applied, optionally.
+
+The redaction behavior is emergent from how these three cooperate. There is no `PIIRedactor` class. The guardrail engine owns the forward and reverse mappings; the recorder owns the writes; the runner stitches them together.
+
+## Coming next: Microsoft Presidio
+
+The built-in scanner is regex-based (see [Guardrails](/docs/architecture/guardrails)). A first-class integration with Microsoft Presidio is on the roadmap and will land as an alternative guardrail implementation. It plugs into the same `Guardrail` protocol, so the `pii_mapping`, round-trip, and pause/resume behavior documented on this page will not change. The only difference will be the detection quality: Presidio brings named-entity recognition, context-aware patterns, and a much larger entity catalogue than the default five regex patterns. This page will be updated when the integration ships.
+
+## Why a bijection instead of a one-way hash
+
+An alternative would be to replace PII with a one-way hash (say, SHA-256 of the email) so the mapping table does not exist at all. That design does not work here for one reason: the tool function needs the real value.
+
+You cannot `send_email("sha256hex")`. You cannot look up an order by a hashed customer id. The real value has to re-enter the runtime at the tool boundary. So the mapping has to be reversible, which makes it a bijection, which makes it a table.
+
+The table is scoped to one run row. When the run is deleted, the mapping is deleted. When the run is cancelled, `pause_data` is cleared but `pii_mapping` persists on the terminal row so audit readers can still render the conversation in-context. The mapping's lifetime matches the audit trail's lifetime. That is the right boundary: as long as anyone can read the transcript, they can see the original PII; once the run is purged, both disappear together.

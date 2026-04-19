@@ -1,0 +1,194 @@
+---
+title: Client-side tools
+description: Pause an agent run when it needs a tool that has to execute on the user's machine, ship the request to the browser, then resume with the result.
+---
+
+# Client-side tools
+
+Some tools cannot run on your server. Reading a cell from the user's open Excel file, calling a desktop API, accessing browser state: these need to execute on the user's machine. Dendrux handles this by pausing the run when the LLM calls a client tool, persisting everything needed to resume, and exposing the pending call so your client can pick it up, execute it, and ship the result back. This is dendrux's headline feature; the rest of the framework is built around making this flow boring.
+
+This recipe walks through a server with one server tool (`lookup_price`) and one client tool (`read_excel_range`), plus the HTTP routes that connect them to a browser.
+
+## Declaring tools
+
+A `target="client"` tool is otherwise identical to a server tool. The body is unused: when the LLM calls it, dendrux pauses instead of invoking the function.
+
+```python
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+@tool()
+async def lookup_price(ticker: str) -> str:
+    """Look up the current stock price for a ticker symbol."""
+    prices = {"AAPL": 227.50, "GOOGL": 178.30, "MSFT": 445.20, "TSLA": 312.80}
+    price = prices.get(ticker.upper())
+    return f"{ticker.upper()}: ${price:.2f}" if price is not None else f"Unknown ticker: {ticker}"
+
+@tool(target="client")
+async def read_excel_range(sheet: str, range: str) -> str:
+    """Read a range of cells from the user's Excel spreadsheet.
+
+    Runs on the client side. The server pauses and waits for the result.
+    """
+    return ""
+
+agent = Agent(
+    name="SpreadsheetAnalyst",
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
+    prompt=(
+        "You can look up stock prices with lookup_price (server) and read "
+        "spreadsheet data with read_excel_range (client — wait for the user)."
+    ),
+    tools=[lookup_price, read_excel_range],
+    database_url="sqlite+aiosqlite:///app.db",
+)
+```
+
+The `target="client"` annotation is the contract. Anything else about the tool — name, parameter schema, docstring — is the same as a regular tool. The body is a stub because the agent never calls it.
+
+## What happens on the run
+
+```python
+result = await agent.run("Add up Q3 sales from Sheet1!A1:A12 and tell me if it beats AAPL.")
+```
+
+1. The LLM emits two tool calls in one batch: `read_excel_range(sheet="Sheet1", range="A1:A12")` and `lookup_price(ticker="AAPL")`.
+2. Dendrux runs `lookup_price` server-side; the result is recorded.
+3. Dendrux pauses on `read_excel_range`. The run row transitions to `waiting_client_tool`. The pending call's id, name, target, and params land in `pause_data`. `result.status == "waiting_client_tool"`.
+4. Your HTTP layer surfaces the pending call to the client, the client executes it, and POSTs the answer back.
+5. `agent.submit_tool_results(run_id, results)` claims the pause via CAS, feeds the result to the LLM, and the run continues until the next pause or terminal.
+
+The whole sequence is recorded in `run_events` and visible in the dashboard. See [Pause and resume](/docs/architecture/pause-resume) for the wire shape.
+
+## HTTP routes
+
+A minimal FastAPI app that mounts the read router for observation and exposes three write routes. Lifted from `examples/03_client_tools/server.py`:
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from dendrux.http import make_read_router
+from dendrux.store import RunStore
+from dendrux.types import ToolResult
+
+class StartChatIn(BaseModel):
+    input: str
+
+class ToolResultItem(BaseModel):
+    tool_call_id: str
+    tool_name: str
+    payload: str  # JSON-encoded string
+
+class SubmitToolResultsIn(BaseModel):
+    results: list[ToolResultItem]
+
+app = FastAPI()
+store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
+
+async def authorize() -> None:
+    return None  # plug your auth here
+
+app.include_router(make_read_router(store=store, authorize=authorize), prefix="/api")
+
+@app.post("/chat")
+async def start(body: StartChatIn) -> JSONResponse:
+    result = await agent.run(body.input)
+    return JSONResponse({
+        "run_id": result.run_id,
+        "status": result.status.value,
+        "answer": result.answer,
+    })
+
+@app.post("/runs/{run_id}/tool-results")
+async def submit_tool_results(run_id: str, body: SubmitToolResultsIn) -> JSONResponse:
+    results = [
+        ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
+        for r in body.results
+    ]
+    result = await agent.submit_tool_results(run_id, results)
+    return JSONResponse({
+        "run_id": result.run_id,
+        "status": result.status.value,
+        "answer": result.answer,
+    })
+
+@app.delete("/runs/{run_id}")
+async def cancel(run_id: str) -> JSONResponse:
+    result = await agent.cancel_run(run_id)
+    return JSONResponse({"run_id": result.run_id, "status": result.status.value})
+```
+
+Three routes, three agent methods. No middleware. The read router handles list/detail/events/SSE; you write the actions because every team's auth and request shape is different. See [HTTP API surface](/docs/reference/http-api) for the full reference.
+
+## The client side
+
+The browser opens an SSE connection on the run's event stream and reacts to `run.paused` events:
+
+```javascript
+async function startChat(input) {
+  const r = await fetch("/chat", {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({input}),
+  });
+  const {run_id, status, answer} = await r.json();
+  if (status === "success") return show(answer);
+  if (status === "waiting_client_tool") subscribe(run_id);
+}
+
+function subscribe(run_id) {
+  const es = new EventSource(`/api/runs/${run_id}/events/stream`);
+  es.addEventListener("message", async (e) => {
+    const frame = JSON.parse(e.data);
+    if (frame.event_type === "run.paused" && frame.data.status === "waiting_client_tool") {
+      const results = await Promise.all(
+        frame.data.pending_tool_calls.map(async (call) => ({
+          tool_call_id: call.id,
+          tool_name: call.name,
+          payload: JSON.stringify(await executeLocally(call.name, call.params)),
+        }))
+      );
+      await fetch(`/runs/${run_id}/tool-results`, {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({results}),
+      });
+    }
+    if (frame.event_type === "run.completed") {
+      es.close();
+      // refetch the run to get the final answer
+    }
+  });
+}
+
+async function executeLocally(name, params) {
+  if (name === "read_excel_range") {
+    return await Excel.run(async (ctx) => {
+      const range = ctx.workbook.worksheets.getItem(params.sheet).getRange(params.range);
+      range.load("values");
+      await ctx.sync();
+      return range.values;
+    });
+  }
+  throw new Error(`unknown client tool: ${name}`);
+}
+```
+
+`call.id` is the dendrux-owned ULID for the tool call. Use it (not the provider's id) when shipping back the result. The runtime correlates by `call_id`.
+
+`payload` is a JSON-encoded string. Encode whatever the LLM should see; dendrux passes it through as the tool message content.
+
+## Notes
+
+- **Persistence is required.** Client tools rely on the run being safely pausable across requests, processes, and crashes. No DB means no client tools.
+- **Whole batch pauses.** If the LLM emits four tool calls and any one is a client tool, the batch waits. Server tools that ran before the pause are still recorded and their results are kept; the rest of the batch sits in `pause_data` until the client returns.
+- **Submit must cover every pending call.** `submit_tool_results` raises `InvalidToolResultError` on missing or unknown ids. No partial claim. Decide what to do with a call you cannot fulfill before submitting.
+- **Cancel works at any time.** `agent.cancel_run(run_id)` on a `waiting_client_tool` run finalizes it as `CANCELLED` atomically. The client should treat a `run.cancelled` SSE frame as the end of the conversation.
+
+## Where this fits
+
+- Architecture: [Pause and resume](/docs/architecture/pause-resume), [Cancellation](/docs/architecture/cancellation).
+- Example: `examples/03_client_tools/` in the dendrux repo (this recipe is the explainer for that example).
+- Reference: [HTTP API surface](/docs/reference/http-api).
