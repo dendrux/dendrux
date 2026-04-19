@@ -17,13 +17,53 @@ pip install "dendrux[anthropic]"
 
 That installs dendrux and its Anthropic provider. Swap `anthropic` for `openai` if you'd rather use OpenAI. SQLAlchemy and SQLite are bundled as hard dependencies, so there's no separate database setup for local dev.
 
-You'll need an API key:
+## 2. Configure your API key
+
+Pick one of three patterns:
+
+**A. Environment variable (recommended for local dev).** The provider reads it automatically — no code change needed.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-## 2. Define an agent that pauses for approval
+```python
+provider = AnthropicProvider(model="claude-sonnet-4-6")  # picks up env var
+```
+
+**B. Explicit argument.** Make the source of the key visible in code. Useful when you load it from a secrets manager.
+
+```python
+import os
+provider = AnthropicProvider(
+    model="claude-sonnet-4-6",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
+```
+
+**C. `.env` file.** Common in app-style projects.
+
+```bash
+pip install python-dotenv
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+```
+
+```python
+from dotenv import load_dotenv
+load_dotenv()
+provider = AnthropicProvider(model="claude-sonnet-4-6")
+```
+
+If you forget all three, the provider fails fast at construction:
+
+```
+ValueError: AnthropicProvider needs an API key. Pass api_key='sk-...' or
+set the ANTHROPIC_API_KEY environment variable.
+```
+
+For OpenAI, the env var is `OPENAI_API_KEY` and the message points at it instead.
+
+## 3. Define an agent that pauses for approval
 
 Create `agent_def.py`:
 
@@ -52,9 +92,12 @@ Three things worth noticing:
 
 1. The tool is just a Python function. No registry, no schema. Dendrux reads the type hints and docstring.
 2. `require_approval=["refund"]` tells dendrux: when the LLM tries to call `refund`, pause the run and wait for a human to approve or reject.
-3. `database_url` is what makes the run survive a process exit. Without it, the run lives only in memory.
+3. `database_url` is what makes the run survive a process exit. Three options:
+   - **Omit it** → in-memory only. Fine for one-shot scripts and tests; the run dies with the process.
+   - **SQLite** → `sqlite+aiosqlite:///./quickstart.db` writes to a single file. Zero setup — dendrux auto-creates tables on first connect. Ideal for local dev and small single-node apps. The `.db` file is what you back up.
+   - **Postgres** → `postgresql+asyncpg://user:pass@host/db` for multi-process or production. Same code path. Run `dendrux db migrate` once to apply the schema (Alembic) before first use.
 
-## 3. Start a run
+## 4. Start a run
 
 `starter.py`:
 
@@ -91,7 +134,7 @@ Iteration: 1
 
 The agent called the LLM, the LLM decided to call `refund`, dendrux saw the approval policy, paused the run, and persisted everything to `quickstart.db`. The Python process exits. The database row remains.
 
-## 4. Resume from a different process
+## 5. Resume from a different process
 
 `resumer.py`:
 
@@ -114,7 +157,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Run it with the run ID from step 3:
+Run it with the run ID from step 4:
 
 ```bash
 python resumer.py 01KPFXP9M96CXNR9JYT8KJ27J0

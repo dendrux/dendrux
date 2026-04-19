@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 import anthropic
@@ -109,6 +110,11 @@ class AnthropicProvider(LLMProvider):
                 long-running workflows where iterations span more than 5 minutes
                 (costs 2× base input on cache creation, reads stay cheap).
         """
+        if api_key is None and not os.getenv("ANTHROPIC_API_KEY"):
+            raise ValueError(
+                "AnthropicProvider needs an API key. "
+                "Pass api_key='sk-...' or set the ANTHROPIC_API_KEY environment variable."
+            )
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key,
             http_client=make_telemetry_http_client(httpx.Timeout(timeout, connect=10.0)),

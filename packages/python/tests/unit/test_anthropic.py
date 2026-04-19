@@ -996,3 +996,20 @@ class TestBoundaryHardening:
         with pytest.raises(ConnectionError, match="Connection to Anthropic API"):
             async for _ in provider.complete_stream([Message(role=Role.USER, content="Hi")]):
                 pass  # pragma: no cover
+
+
+class TestApiKeyValidation:
+    """Fail-fast at __init__ when no api_key + no env var."""
+
+    def test_raises_when_no_api_key_and_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+            AnthropicProvider(model="claude-sonnet-4-6")
+
+    def test_accepts_explicit_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        AnthropicProvider(model="claude-sonnet-4-6", api_key="sk-test")
+
+    def test_accepts_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+        AnthropicProvider(model="claude-sonnet-4-6")

@@ -6,9 +6,13 @@ and that concrete providers (AnthropicProvider, MockLLM) satisfy the contract.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anthropic
+
+if TYPE_CHECKING:
+    import pytest
 
 from dendrux.llm.base import LLMProvider
 from dendrux.llm.mock import MockLLM
@@ -94,10 +98,11 @@ class TestAnthropicProviderContract:
         provider = AnthropicProvider(api_key="sk-test", model="claude-sonnet-4-6")
         assert provider.model == "claude-sonnet-4-6"
 
-    def test_constructs_without_explicit_api_key(self) -> None:
-        """AnthropicProvider passes api_key=None to SDK, letting it read env."""
+    def test_constructs_without_explicit_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When env var is set, no explicit api_key is required; SDK reads env."""
         from dendrux.llm.anthropic import AnthropicProvider
 
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
         with patch.object(anthropic, "AsyncAnthropic", return_value=MagicMock()) as mock_cls:
             AnthropicProvider(model="claude-sonnet-4-6")
             mock_cls.assert_called_once()

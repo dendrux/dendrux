@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -180,6 +181,13 @@ class OpenAIProvider(LLMProvider):
                 (5–10 min idle, up to 1 h). Set ``"24h"`` for long-running
                 workflows on supported models. Hyphenated literal per the SDK.
         """
+        if api_key is None and not os.getenv("OPENAI_API_KEY"):
+            raise ValueError(
+                "OpenAIProvider needs an API key. "
+                "Pass api_key='sk-...' or set the OPENAI_API_KEY environment variable. "
+                "For local OpenAI-compatible servers (vLLM, Ollama, LM Studio), "
+                "pass any non-empty placeholder, e.g. api_key='not-needed'."
+            )
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,

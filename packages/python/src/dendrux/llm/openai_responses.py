@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -173,6 +174,12 @@ class OpenAIResponsesProvider(LLMProvider):
                     f"Unknown built-in tool '{t}'. "
                     f"Supported: {', '.join(sorted(_BUILTIN_TOOL_TYPES))}"
                 )
+
+        if api_key is None and not os.getenv("OPENAI_API_KEY"):
+            raise ValueError(
+                "OpenAIResponsesProvider needs an API key. "
+                "Pass api_key='sk-...' or set the OPENAI_API_KEY environment variable."
+            )
 
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
