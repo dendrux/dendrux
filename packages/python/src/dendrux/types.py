@@ -330,6 +330,9 @@ class GovernanceEventType(StrEnum):
     MCP_CONNECTED = "mcp.connected"
     MCP_ERROR = "mcp.error"
 
+    # Provider transport: vendor-SDK retry observability
+    PROVIDER_RETRY = "provider.retry"
+
 
 @dataclass
 class RunResult:

@@ -28,6 +28,12 @@ from dendrux.llm._helpers import (
     resolve_tool_message_call,
     timeout_error,
 )
+from dendrux.llm._retry_telemetry import (
+    begin_call_attempt_tracking,
+    call_attempt_tracking,
+    end_call_attempt_tracking,
+    make_telemetry_http_client,
+)
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -177,7 +183,7 @@ class OpenAIProvider(LLMProvider):
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=httpx.Timeout(timeout, connect=10.0),
+            http_client=make_telemetry_http_client(httpx.Timeout(timeout, connect=10.0)),
             max_retries=max_retries,
         )
         self._model = model
@@ -330,7 +336,8 @@ class OpenAIProvider(LLMProvider):
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
 
         try:
-            response = await self._client.chat.completions.create(**api_kwargs)
+            with call_attempt_tracking():
+                response = await self._client.chat.completions.create(**api_kwargs)
         except openai.APITimeoutError:
             raise timeout_error("OpenAIProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
@@ -377,6 +384,7 @@ class OpenAIProvider(LLMProvider):
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
 
+        attempt_token = begin_call_attempt_tracking()
         try:
             stream = await self._client.chat.completions.create(**api_kwargs)
         except openai.BadRequestError as exc:
@@ -389,6 +397,11 @@ class OpenAIProvider(LLMProvider):
             raise timeout_error("OpenAIProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
             raise connection_error("OpenAI API", self._model, exc, streaming=True) from exc
+        finally:
+            # Counter only spans the request-establishing call. Once the
+            # stream is open the SDK no longer retries, so iteration below
+            # does not need the counter.
+            end_call_attempt_tracking(attempt_token)
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []

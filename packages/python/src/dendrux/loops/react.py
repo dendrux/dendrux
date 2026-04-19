@@ -27,6 +27,7 @@ import time
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux.guardrails._engine import GuardrailEngine
+from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._helpers import (
     build_cache_key_prefix,
     notify_governance,
@@ -679,13 +680,19 @@ class ReActLoop(Loop):
 
             # LLM call — batch
             t0 = time.monotonic()
-            response = await provider.complete(
-                messages,
-                tools=tools,
+            with telemetry_context(
                 run_id=resolved_run_id,
-                cache_key_prefix=cache_key_prefix,
-                **_pkw,
-            )
+                iteration=iteration,
+                recorder=recorder,
+                notifier=notifier,
+            ):
+                response = await provider.complete(
+                    messages,
+                    tools=tools,
+                    run_id=resolved_run_id,
+                    cache_key_prefix=cache_key_prefix,
+                    **_pkw,
+                )
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
             # Output guardrail — scan BEFORE recording so persisted
@@ -1037,6 +1044,13 @@ class ReActLoop(Loop):
             # LLM call — streaming
             t0 = time.monotonic()
             llm_response: LLMResponse | None = None
+            _stream_telemetry = telemetry_context(
+                run_id=resolved_run_id,
+                iteration=iteration,
+                recorder=recorder,
+                notifier=notifier,
+            )
+            _stream_telemetry.__enter__()
             provider_stream = provider.complete_stream(
                 messages,
                 tools=tools,
@@ -1065,6 +1079,7 @@ class ReActLoop(Loop):
                         llm_response = event.raw
             finally:
                 await provider_stream.aclose()
+                _stream_telemetry.__exit__(None, None, None)
 
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
 

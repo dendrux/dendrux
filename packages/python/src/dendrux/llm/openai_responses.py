@@ -27,6 +27,12 @@ from dendrux.llm._helpers import (
     resolve_tool_message_call,
     timeout_error,
 )
+from dendrux.llm._retry_telemetry import (
+    begin_call_attempt_tracking,
+    call_attempt_tracking,
+    end_call_attempt_tracking,
+    make_telemetry_http_client,
+)
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -170,7 +176,7 @@ class OpenAIResponsesProvider(LLMProvider):
 
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
-            timeout=httpx.Timeout(timeout, connect=10.0),
+            http_client=make_telemetry_http_client(httpx.Timeout(timeout, connect=10.0)),
             max_retries=max_retries,
         )
         self._model = model
@@ -328,7 +334,8 @@ class OpenAIResponsesProvider(LLMProvider):
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
 
         try:
-            response = await self._client.responses.create(**api_kwargs)
+            with call_attempt_tracking():
+                response = await self._client.responses.create(**api_kwargs)
         except openai.APITimeoutError:
             raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
@@ -373,6 +380,7 @@ class OpenAIResponsesProvider(LLMProvider):
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
         api_kwargs["stream"] = True
 
+        attempt_token = begin_call_attempt_tracking()
         try:
             stream = await self._client.responses.create(**api_kwargs)
         except openai.BadRequestError as exc:
@@ -390,6 +398,10 @@ class OpenAIResponsesProvider(LLMProvider):
                 exc,
                 streaming=True,
             ) from exc
+        finally:
+            # Counter only spans the request-establishing call. Once the
+            # stream is open the SDK no longer retries.
+            end_call_attempt_tracking(attempt_token)
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []

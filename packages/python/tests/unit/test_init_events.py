@@ -110,9 +110,12 @@ class TestGovernanceEventTypeEnum:
     def test_mcp_error_member(self) -> None:
         assert GovernanceEventType.MCP_ERROR == "mcp.error"
 
+    def test_provider_retry_member(self) -> None:
+        assert GovernanceEventType.PROVIDER_RETRY == "provider.retry"
+
     def test_total_member_count(self) -> None:
-        """8 original + 5 new = 13 total."""
-        assert len(GovernanceEventType) == 13
+        """8 original + 5 init + 1 transport = 14 total."""
+        assert len(GovernanceEventType) == 14
 
 
 # ------------------------------------------------------------------
