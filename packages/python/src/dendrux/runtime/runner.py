@@ -255,7 +255,6 @@ async def _persist_loop_outcome(
     run_id: str,
     result: RunResult,
     sequencer: EventSequencer,
-    redact: Callable[[str], str] | None = None,
 ) -> RunResult:
     """Persist a loop's terminal/pause result and emit the lifecycle event.
 
@@ -293,6 +292,7 @@ async def _persist_loop_outcome(
             + [RunStatus.RUNNING.value],
             iteration_count=result.iteration_count,
             total_usage=result.usage,
+            pii_mapping=result.meta.get("pii_mapping"),
         )
         if won:
             await _emit_event(
@@ -314,6 +314,7 @@ async def _persist_loop_outcome(
                 allowed_current_statuses=[RunStatus.RUNNING.value],
                 iteration_count=result.iteration_count,
                 total_usage=result.usage,
+                pii_mapping=result.meta.get("pii_mapping"),
             )
             if won:
                 await _emit_event(
@@ -355,12 +356,11 @@ async def _persist_loop_outcome(
         return _wrap(status=result.status, won=True)
 
     # Terminal: success / max_iterations / error.
-    redacted_answer = redact(result.answer) if redact and result.answer else result.answer
     _run_pii = result.meta.get("pii_mapping")
     finalize_won = await state_store.finalize_run(
         run_id,
         status=result.status.value,
-        answer=redacted_answer,
+        answer=result.answer,
         iteration_count=result.iteration_count,
         total_usage=result.usage,
         expected_current_status="running",
@@ -445,7 +445,6 @@ async def run(
     state_store: StateStore | None = ...,
     tenant_id: str | None = ...,
     metadata: dict[str, Any] | None = ...,
-    redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
     idempotency_key: str | None = ...,
@@ -465,7 +464,6 @@ async def run(
     state_store: StateStore | None = ...,
     tenant_id: str | None = ...,
     metadata: dict[str, Any] | None = ...,
-    redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     idempotency_key: str | None = ...,
     output_type: type | None = ...,
@@ -483,7 +481,6 @@ async def run(
     state_store: StateStore | None = None,
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     idempotency_key: str | None = None,
@@ -507,9 +504,6 @@ async def run(
         tenant_id: Optional tenant ID for multi-tenant isolation.
         metadata: Optional developer linking data (thread_id, user_id, etc.).
             Stored in agent_runs.meta — Dendrux stores it, never reads it.
-        redact: Optional string scrubber applied to all persisted content
-            (trace text, tool params, result payloads, error messages).
-            Receives a plain string, must return a plain string.
         extra_notifier: Optional additional LoopNotifier for best-effort
             notifications (e.g. ConsoleNotifier).
         max_delegation_depth: Maximum allowed delegation depth for the
@@ -562,8 +556,6 @@ async def run(
 
     if state_store is not None:
         # Create the run record before the loop starts
-        # Apply redaction to user input before persistence
-        redacted_input = redact(user_input) if redact else user_input
         # Merge loop type + depth limit into developer metadata
         run_meta = dict(metadata) if metadata else {}
         run_meta["dendrux.loop"] = type(resolved_loop).__name__
@@ -587,7 +579,7 @@ async def run(
         create_result = await state_store.create_run(
             run_id,
             agent.name,
-            input_data={"input": redacted_input},
+            input_data={"input": user_input},
             model=provider.model,
             strategy=type(resolved_strategy).__name__,
             parent_run_id=parent_run_id,
@@ -621,7 +613,6 @@ async def run(
             model=provider.model,
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
-            redact=redact,
             event_sequencer=sequencer,
         )
 
@@ -682,7 +673,6 @@ async def run(
                 run_id=run_id,
                 result=result,
                 sequencer=sequencer,
-                redact=redact,
             )
 
         return result
@@ -693,11 +683,10 @@ async def run(
         if state_store is not None:
             error_won = False
             try:
-                redacted_err = redact(str(exc)) if redact else str(exc)
                 error_won = await state_store.finalize_run(
                     run_id,
                     status=RunStatus.ERROR.value,
-                    error=redacted_err,
+                    error=str(exc),
                     total_usage=None,
                     expected_current_status="running",
                 )
@@ -808,7 +797,6 @@ async def retry(
     loop: Loop | None = None,
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
     **kwargs: Any,
 ) -> RunResult:
@@ -835,7 +823,6 @@ async def retry(
         loop: Execution loop for the retry. Defaults to ReActLoop.
         tenant_id: Optional tenant ID.
         metadata: Optional developer metadata for the retry run.
-        redact: Optional string scrubber.
         extra_notifier: Optional notifier.
         **kwargs: Forwarded to the LLM provider.
 
@@ -928,7 +915,6 @@ async def retry(
 
     _system_prompt = agent.get_system_prompt()
 
-    redacted_input = redact(user_input) if redact else user_input
     run_meta = dict(metadata) if metadata else {}
     run_meta["dendrux.loop"] = type(resolved_loop).__name__
     run_meta["dendrux.retry_of"] = original_run_id
@@ -936,7 +922,7 @@ async def retry(
     create_result = await state_store.create_run(
         run_id,
         agent.name,
-        input_data={"input": redacted_input},
+        input_data={"input": user_input},
         model=provider.model,
         strategy=type(resolved_strategy).__name__,
         parent_run_id=parent_run_id,
@@ -961,7 +947,6 @@ async def retry(
         model=provider.model,
         provider_name=type(provider).__name__,
         target_lookup=target_lookup,
-        redact=redact,
         event_sequencer=sequencer,
     )
 
@@ -1015,7 +1000,6 @@ async def retry(
             run_id=run_id,
             result=result,
             sequencer=sequencer,
-            redact=redact,
         )
 
         return result
@@ -1023,11 +1007,10 @@ async def retry(
     except Exception as exc:
         error_won = False
         try:
-            redacted_err = redact(str(exc)) if redact else str(exc)
             error_won = await state_store.finalize_run(
                 run_id,
                 status=RunStatus.ERROR.value,
-                error=redacted_err,
+                error=str(exc),
                 total_usage=None,
                 expected_current_status="running",
             )
@@ -1055,7 +1038,6 @@ def run_stream(
     state_store_resolver: Callable[[], Any] | None = ...,
     tenant_id: str | None = ...,
     metadata: dict[str, Any] | None = ...,
-    redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
     output_type: type | None = ...,
@@ -1075,7 +1057,6 @@ def run_stream(
     state_store_resolver: Callable[[], Any] | None = ...,
     tenant_id: str | None = ...,
     metadata: dict[str, Any] | None = ...,
-    redact: Callable[[str], str] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     output_type: type | None = ...,
     **kwargs: Any,
@@ -1093,7 +1074,6 @@ def run_stream(
     state_store_resolver: Callable[[], Any] | None = None,
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     output_type: type | None = None,
@@ -1176,7 +1156,6 @@ def run_stream(
             recorder: LoopRecorder | None = None
 
             if store is not None:
-                redacted_input = redact(user_input) if redact else user_input
                 run_meta = dict(metadata) if metadata else {}
                 run_meta["dendrux.loop"] = type(resolved_loop).__name__
                 if eff_max_depth is not None:
@@ -1188,7 +1167,7 @@ def run_stream(
                 await store.create_run(
                     run_id,
                     agent.name,
-                    input_data={"input": redacted_input},
+                    input_data={"input": user_input},
                     model=provider.model,
                     strategy=type(resolved_strategy).__name__,
                     parent_run_id=parent_run_id,
@@ -1210,7 +1189,6 @@ def run_stream(
                     model=provider.model,
                     provider_name=type(provider).__name__,
                     target_lookup=target_lookup,
-                    redact=redact,
                     event_sequencer=sequencer,
                 )
 
@@ -1278,7 +1256,6 @@ def run_stream(
                         run_id=run_id,
                         result=event.run_result,
                         sequencer=sequencer,
-                        redact=redact,
                     )
                     # Pre-pause checkpoint can flip a PAUSED iteration to CANCELLED.
                     # Re-derive the event type from the persisted status so the
@@ -1298,11 +1275,10 @@ def run_stream(
             if store is not None:
                 error_won = False
                 try:
-                    redacted_err = redact(str(exc)) if redact else str(exc)
                     error_won = await store.finalize_run(
                         run_id,
                         status=RunStatus.ERROR.value,
-                        error=redacted_err,
+                        error=str(exc),
                         total_usage=None,
                         expected_current_status="running",
                     )
@@ -1361,7 +1337,6 @@ async def resume(
     provider: LLMProvider,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunResult:
     """Resume a paused run.
@@ -1382,7 +1357,6 @@ async def resume(
         provider: LLM provider for continuing the run.
         strategy: Strategy override. Defaults to NativeToolCalling.
         loop: Loop override. Defaults to ReActLoop.
-        redact: Redaction policy for persistence.
         extra_notifier: Optional additional notifier for SSE streaming.
     """
     if tool_results is None:
@@ -1400,7 +1374,6 @@ async def resume(
         provider=provider,
         strategy=strategy,
         loop=loop,
-        redact=redact,
         expected_status=expected,
         tool_results=tool_results,
         extra_notifier=extra_notifier,
@@ -1416,7 +1389,6 @@ async def resume_with_input(
     provider: LLMProvider,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunResult:
     """Resume a paused run by providing clarification input.
@@ -1432,7 +1404,6 @@ async def resume_with_input(
         provider: LLM provider for continuing the run.
         strategy: Strategy override. Defaults to NativeToolCalling.
         loop: Loop override. Defaults to ReActLoop.
-        redact: Redaction policy for persistence.
         extra_notifier: Optional additional notifier for SSE streaming.
     """
     return await _resume_core(
@@ -1442,7 +1413,6 @@ async def resume_with_input(
         provider=provider,
         strategy=strategy,
         loop=loop,
-        redact=redact,
         expected_status=RunStatus.WAITING_HUMAN_INPUT.value,
         user_input=user_input,
         extra_notifier=extra_notifier,
@@ -1496,7 +1466,6 @@ async def _prepare_resume(
     provider: LLMProvider,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
-    redact: Callable[[str], str] | None = None,
     expected_status: str,
     tool_results: list[ToolResult] | None = None,
     user_input: str | None = None,
@@ -1536,7 +1505,7 @@ async def _prepare_resume(
             {"call_id": tr.call_id, "name": tr.name, "success": tr.success} for tr in tool_results
         ]
     elif user_input is not None:
-        resume_data["user_input"] = redact(user_input) if redact else user_input
+        resume_data["user_input"] = user_input
     await _emit_event(state_store, run_id, "run.resumed", sequencer, resume_data)
 
     # 3. Build resume history
@@ -1569,7 +1538,6 @@ async def _prepare_resume(
         model=provider.model,
         provider_name=type(provider).__name__,
         target_lookup=target_lookup,
-        redact=redact,
         initial_order_index=trace_order_offset,
         event_sequencer=sequencer,
     )
@@ -1657,7 +1625,6 @@ async def _resume_core(
     provider: LLMProvider,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
-    redact: Callable[[str], str] | None = None,
     expected_status: str,
     tool_results: list[ToolResult] | None = None,
     user_input: str | None = None,
@@ -1725,7 +1692,6 @@ async def _resume_core(
         provider=provider,
         strategy=strategy,
         loop=loop,
-        redact=redact,
         expected_status=expected_status,
         tool_results=tool_results,
         user_input=user_input,
@@ -1842,7 +1808,6 @@ async def _resume_core(
             run_id=run_id,
             result=result,
             sequencer=ctx.sequencer,
-            redact=redact,
         )
 
         return result
@@ -1850,11 +1815,10 @@ async def _resume_core(
     except Exception as exc:
         error_won = False
         try:
-            redacted_err = redact(str(exc)) if redact else str(exc)
             error_won = await state_store.finalize_run(
                 run_id,
                 status=RunStatus.ERROR.value,
-                error=redacted_err,
+                error=str(exc),
                 total_usage=None,
                 expected_current_status="running",
             )
@@ -1879,7 +1843,6 @@ def resume_stream(
     state_store_resolver: Callable[[], Any] | None = None,
     tool_results: list[ToolResult] | None = None,
     user_input: str | None = None,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
@@ -1967,7 +1930,6 @@ def resume_stream(
                 state_store=store,
                 agent=agent,
                 provider=provider,
-                redact=redact,
                 expected_status=expected,
                 tool_results=tool_results,
                 user_input=user_input,
@@ -2095,7 +2057,6 @@ def resume_stream(
                         run_id=run_id,
                         result=event.run_result,
                         sequencer=ctx.sequencer,
-                        redact=redact,
                     )
                     if persisted.status == RunStatus.CANCELLED:
                         event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
@@ -2111,11 +2072,10 @@ def resume_stream(
             if store is not None:
                 error_won = False
                 try:
-                    redacted_err = redact(str(exc)) if redact else str(exc)
                     error_won = await store.finalize_run(
                         run_id,
                         status=RunStatus.ERROR.value,
-                        error=redacted_err,
+                        error=str(exc),
                         total_usage=None,
                         expected_current_status="running",
                     )
@@ -2173,7 +2133,6 @@ async def resume_claimed(
     state_store: StateStore,
     agent: Agent,
     provider: LLMProvider,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunResult:
     """Resume a run that was already claimed via submit_and_claim().
@@ -2194,7 +2153,6 @@ async def resume_claimed(
         state_store: Persistence backend.
         agent: Agent definition.
         provider: LLM provider.
-        redact: Optional redaction policy.
         extra_notifier: Optional additional LoopNotifier.
 
     Returns:
@@ -2254,7 +2212,6 @@ async def resume_claimed(
             state_store=state_store,
             agent=agent,
             provider=provider,
-            redact=redact,
             expected_status="running",
             tool_results=tool_results,
             extra_notifier=extra_notifier,
@@ -2267,7 +2224,6 @@ async def resume_claimed(
             state_store=state_store,
             agent=agent,
             provider=provider,
-            redact=redact,
             expected_status="running",
             user_input=submitted_input,
             extra_notifier=extra_notifier,
@@ -2290,7 +2246,6 @@ async def resume_approval_approved_claim(
     state_store: StateStore,
     agent: Agent,
     provider: LLMProvider,
-    redact: Callable[[str], str] | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunResult:
     """Resume an approval-approved run that was already claimed.
@@ -2310,7 +2265,6 @@ async def resume_approval_approved_claim(
         state_store=state_store,
         agent=agent,
         provider=provider,
-        redact=redact,
         expected_status=RunStatus.WAITING_APPROVAL.value,
         tool_results=None,
         user_input=None,

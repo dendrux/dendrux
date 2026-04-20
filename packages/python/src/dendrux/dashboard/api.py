@@ -1,9 +1,13 @@
 """Read-only dashboard API — serves normalized timeline data.
 
 Mounted by the CLI's `dendrux dashboard` command. All endpoints
-are read-only and return only observable, redacted data.
+are read-only. Trace content is served raw (the DB is ground truth);
+when a PII guardrail is active, ``agent_runs.pii_mapping`` carries
+the placeholder→real bijection the LLM saw and can be applied at
+render time to produce an LLM-eye view.
 
-Never exposes pause_data or unredacted content.
+Never exposes ``pause_data`` — that column is execution state,
+cleared on finalize, and out of scope for public readers.
 """
 
 from __future__ import annotations

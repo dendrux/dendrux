@@ -52,16 +52,16 @@ The scratchpad below builds an agent with PII redaction *and* an approval gate, 
 
 ```text
 [lifecycle] seq=0   iter=0  run.started
-[GOV]       seq=1   iter=1  guardrail.detected    data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL"]}
-[GOV]       seq=2   iter=1  guardrail.redacted    data={"direction": "incoming", "entities": ["EMAIL"]}
+[GOV]       seq=1   iter=1  guardrail.detected    data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL_ADDRESS"]}
+[GOV]       seq=2   iter=1  guardrail.redacted    data={"direction": "incoming", "entities": ["EMAIL_ADDRESS"]}
 [lifecycle] seq=3   iter=1  llm.completed
 [GOV]       seq=4   iter=1  approval.requested    corr=01KPGVAHED0Z5PQEVQ1BWXKS4M  data={"tool_name": "refund", ...}
 [lifecycle] seq=5   iter=0  run.paused
 [lifecycle] seq=6   iter=0  run.resumed
 [lifecycle] seq=7   iter=1  tool.completed        corr=01KPGVAHED0Z5PQEVQ1BWXKS4M
 [GOV]       seq=8   iter=1  approval.decided      data={"decision": "approved"}
-[GOV]       seq=9   iter=2  guardrail.detected    data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL"]}
-[GOV]       seq=10  iter=2  guardrail.redacted    data={"direction": "incoming", "entities": ["EMAIL"]}
+[GOV]       seq=9   iter=2  guardrail.detected    data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL_ADDRESS"]}
+[GOV]       seq=10  iter=2  guardrail.redacted    data={"direction": "incoming", "entities": ["EMAIL_ADDRESS"]}
 [lifecycle] seq=11  iter=2  llm.completed
 [lifecycle] seq=12  iter=0  run.completed
 ```
@@ -76,11 +76,11 @@ The `pii_mapping` blob on `agent_runs` after the run:
 
 ```json
 {
-  "<<EMAIL_1>>": "jane.doe@example.com"
+  "<<EMAIL_ADDRESS_1>>": "jane.doe@example.com"
 }
 ```
 
-That mapping is how redaction survives persistence. The LLM and the DB only ever see `<<EMAIL_1>>`. The original value lives only on the `agent_runs` row, only for the lifetime of the run. See [PII redaction](/docs/architecture/pii-redaction) for the lookup protocol.
+That mapping is the audit key. Guardrails redact at the LLM boundary only — what the provider API sees. The DB stores raw values (ground truth), and the mapping lets a dashboard reconstruct the LLM-eye view from the raw traces on demand. The mapping lives on the `agent_runs` row for the lifetime of the run. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
 
 ## How events reach the recorder and notifier
 

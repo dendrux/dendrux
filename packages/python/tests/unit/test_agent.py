@@ -245,11 +245,6 @@ class TestAgentPersistence:
         )
         assert agent._database_options == {"pool_size": 5}
 
-    def test_redact_stored(self):
-        redact_fn = lambda text: text.replace("secret", "[REDACTED]")  # noqa: E731
-        agent = Agent(provider=_mock_provider(), prompt="Hello.", redact=redact_fn)
-        assert agent._redact is redact_fn
-
 
 # ------------------------------------------------------------------
 # Persistence: private engine (finding 2 + 3)

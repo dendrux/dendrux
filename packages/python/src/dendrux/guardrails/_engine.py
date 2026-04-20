@@ -43,11 +43,11 @@ class GuardrailEngine:
         pii_mapping: dict[str, str] | None = None,
     ) -> None:
         self._guardrails = list(guardrails)
-        # Forward: <<EMAIL_1>> → real value
+        # Forward: <<EMAIL_ADDRESS_1>> → real value
         self._pii_mapping: dict[str, str] = dict(pii_mapping) if pii_mapping else {}
-        # Reverse: real value → <<EMAIL_1>>
+        # Reverse: real value → <<EMAIL_ADDRESS_1>>
         self._reverse: dict[str, str] = {v: k for k, v in self._pii_mapping.items()}
-        # Counters: EMAIL → next N
+        # Counters: EMAIL_ADDRESS → next N
         self._counters: dict[str, int] = {}
         # Rebuild counters from existing mapping
         for placeholder in self._pii_mapping:
@@ -109,58 +109,40 @@ class GuardrailEngine:
         self,
         text: str,
         tool_call_params: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, list[dict[str, Any]] | None, list[Finding], str | None, bool]:
-        """Scan LLM output (response text + tool call params).
+    ) -> tuple[list[Finding], str | None]:
+        """Detection-only scan of LLM output.
+
+        DB is ground truth: the runner persists raw. Placeholders are
+        applied at the *next* scan_incoming, not here. Outgoing's job
+        is to enforce block policies and emit detection events.
 
         Returns:
-            (possibly_modified_text, possibly_modified_params, findings,
-             block_error, params_were_redacted)
+            (findings, block_error_or_none)
         """
         all_findings: list[Finding] = []
-        params_redacted = False
 
-        # Scan response text
         for guardrail in self._guardrails:
             findings = _deoverlap(await guardrail.scan(text))
-            if not findings:
-                continue
-            all_findings.extend(findings)
-
-            if guardrail.action == "block":
-                entity = findings[0].entity_type
-                return (
-                    text,
-                    tool_call_params,
-                    all_findings,
-                    (
-                        f"Guardrail '{type(guardrail).__name__}' blocked: "
-                        f"{entity} detected in LLM output"
-                    ),
-                    False,
-                )
-
-            if guardrail.action == "redact":
-                text = self._apply_redaction(text, findings)
-
-        # Scan tool call params — recursive per-leaf scanning
-        if tool_call_params:
-            for params in tool_call_params:
-                p_findings, p_block, p_changed = await _scan_params_recursive(
-                    params, self._guardrails, self
-                )
-                all_findings.extend(p_findings)
-                if p_changed:
-                    params_redacted = True
-                if p_block is not None:
+            if findings:
+                all_findings.extend(findings)
+                if guardrail.action == "block":
+                    entity = findings[0].entity_type
                     return (
-                        text,
-                        tool_call_params,
                         all_findings,
-                        p_block,
-                        False,
+                        (
+                            f"Guardrail '{type(guardrail).__name__}' blocked: "
+                            f"{entity} detected in LLM output"
+                        ),
                     )
 
-        return text, tool_call_params, all_findings, None, params_redacted
+        if tool_call_params:
+            for params in tool_call_params:
+                p_findings, p_block = await _scan_params_for_findings(params, self._guardrails)
+                all_findings.extend(p_findings)
+                if p_block is not None:
+                    return all_findings, p_block
+
+        return all_findings, None
 
     def _apply_redaction(self, text: str, findings: list[Finding]) -> str:
         """Replace findings in text with placeholders. Right-to-left to preserve offsets.
@@ -235,131 +217,89 @@ def _deanonymize_value(value: Any, mapping: dict[str, str], _depth: int = 0) -> 
     return value
 
 
-async def _scan_params_recursive(
+async def _scan_params_for_findings(
     params: dict[str, Any],
     guardrails: list[Guardrail],
-    engine: GuardrailEngine,
-) -> tuple[list[Finding], str | None, bool]:
-    """Recursively scan and redact tool call params.
+    _depth: int = 0,
+) -> tuple[list[Finding], str | None]:
+    """Recursively collect findings from params without mutating them.
 
-    For each string leaf:
-      1. Scan the raw value (catches emails, phones, AWS keys, etc.)
-      2. Scan key=value context (catches GENERIC_API_KEY, token= patterns)
-      3. Project key-context findings back to value span for redaction
-      4. De-overlap merged findings
-      5. Apply redaction against the original value
+    The runner persists raw params; redaction for the LLM happens at the
+    next scan_incoming. This walk is detection-only — needed here so
+    ``action="block"`` can abort the run before side-effecting tools fire.
 
-    Returns (all_findings, block_error_or_none, params_were_changed).
+    Returns (findings, block_error_or_none).
     """
-    all_findings: list[Finding] = []
-    changed = False
+    if _depth > _MAX_RECURSION_DEPTH:
+        return [], None
 
+    all_findings: list[Finding] = []
     for key, value in params.items():
-        new_val, leaf_findings, block, did_change = await _scan_value_recursive(
-            value,
-            key,
-            guardrails,
-            engine,
-        )
+        leaf_findings, block = await _scan_value_for_findings(value, key, guardrails, _depth + 1)
         all_findings.extend(leaf_findings)
         if block is not None:
-            return all_findings, block, changed
-        if did_change:
-            changed = True
-            params[key] = new_val
+            return all_findings, block
 
-    return all_findings, None, changed
+    return all_findings, None
 
 
-async def _scan_value_recursive(
+async def _scan_value_for_findings(
     value: Any,
     key: str,
     guardrails: list[Guardrail],
-    engine: GuardrailEngine,
     _depth: int = 0,
-) -> tuple[Any, list[Finding], str | None, bool]:
-    """Scan a single value recursively.
-
-    Returns (new_value, findings, block_error, changed).
-    """
+) -> tuple[list[Finding], str | None]:
+    """Walk a single value, collecting findings from every string leaf."""
     if _depth > _MAX_RECURSION_DEPTH:
-        return value, [], None, False
+        return [], None
+
     if isinstance(value, str):
-        new_val, findings, block = await _scan_leaf(value, key, guardrails, engine)
-        return new_val, findings, block, new_val != value
+        return await _scan_leaf_for_findings(value, key, guardrails)
+
     if isinstance(value, dict):
         all_findings: list[Finding] = []
-        changed = False
         for k, v in value.items():
-            new_v, findings, block, did_change = await _scan_value_recursive(
-                v,
-                k,
-                guardrails,
-                engine,
-                _depth + 1,
-            )
+            findings, block = await _scan_value_for_findings(v, k, guardrails, _depth + 1)
             all_findings.extend(findings)
             if block is not None:
-                return value, all_findings, block, changed
-            if did_change:
-                changed = True
-                value[k] = new_v
-        return value, all_findings, None, changed
+                return all_findings, block
+        return all_findings, None
+
     if isinstance(value, list):
         all_findings = []
-        changed = False
-        for i, item in enumerate(value):
-            new_item, findings, block, did_change = await _scan_value_recursive(
-                item,
-                key,
-                guardrails,
-                engine,
-                _depth + 1,
-            )
+        for item in value:
+            findings, block = await _scan_value_for_findings(item, key, guardrails, _depth + 1)
             all_findings.extend(findings)
             if block is not None:
-                return value, all_findings, block, changed
-            if did_change:
-                changed = True
-                value[i] = new_item
-        return value, all_findings, None, changed
-    return value, [], None, False
+                return all_findings, block
+        return all_findings, None
+
+    return [], None
 
 
-async def _scan_leaf(
+async def _scan_leaf_for_findings(
     value: str,
     key: str,
     guardrails: list[Guardrail],
-    engine: GuardrailEngine,
-) -> tuple[str, list[Finding], str | None]:
-    """Scan a single string leaf with value-only and key-context scans.
+) -> tuple[list[Finding], str | None]:
+    """Detection-only scan of a single string leaf.
 
-    Value-only catches patterns that don't need key context (emails, phones,
-    AWS access keys). Key-context catches patterns like GENERIC_API_KEY that
-    match ``api_key=<value>``. Key-context findings are projected back to
-    value-relative offsets for correct redaction.
-
-    Returns (possibly_redacted_value, findings, block_error_or_none).
+    Uses both value-only and ``key=value`` context scans so patterns like
+    GENERIC_API_KEY (which need the key name for detection) still fire.
     """
     all_findings: list[Finding] = []
-    key_prefix_len = len(key) + 1  # "key="
+    key_prefix_len = len(key) + 1
 
     for guardrail in guardrails:
-        # 1. Scan raw value
         value_findings = await guardrail.scan(value)
+        context_findings = await guardrail.scan(f"{key}={value}")
 
-        # 2. Scan key=value context for key-dependent patterns
-        context_text = f"{key}={value}"
-        context_findings = await guardrail.scan(context_text)
-
-        # 3. Project context findings to value span, keep only those
-        #    that overlap with the value portion
         projected: list[Finding] = []
         for cf in context_findings:
             val_start = max(0, cf.start - key_prefix_len)
             val_end = cf.end - key_prefix_len
             if val_end <= 0:
-                continue  # finding is entirely in the key portion
+                continue
             val_text = value[val_start:val_end]
             if not val_text:
                 continue
@@ -373,17 +313,14 @@ async def _scan_leaf(
                 )
             )
 
-        # 4. Merge and de-overlap
         merged = _deoverlap(value_findings + projected)
         if not merged:
             continue
         all_findings.extend(merged)
 
-        # 5. Apply action
         if guardrail.action == "block":
             entity = merged[0].entity_type
             return (
-                value,
                 all_findings,
                 (
                     f"Guardrail '{type(guardrail).__name__}' blocked: "
@@ -391,7 +328,4 @@ async def _scan_leaf(
                 ),
             )
 
-        if guardrail.action == "redact":
-            value = engine._apply_redaction(value, merged)
-
-    return value, all_findings, None
+    return all_findings, None

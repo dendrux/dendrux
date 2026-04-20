@@ -1,7 +1,7 @@
 """Governance: Guardrails — PII redaction and secret detection.
 
 Demonstrates:
-  - PII(action="redact") — emails/phones replaced with <<EMAIL_1>> placeholders
+  - PII(action="redact") — emails/phones replaced with <<EMAIL_ADDRESS_1>> placeholders
   - SecretDetection(action="block") — AWS keys terminate the run
   - Custom Pattern — domain-specific PII detection
   - Tools receive real values (deanonymized), LLM sees placeholders

@@ -7,7 +7,7 @@ description: Pattern-based content scanners that redact, block, or warn on PII, 
 
 Guardrails sit on the edge of every LLM turn. Before a message goes to the model, every guardrail gets a chance to scan the text, find a problem, and pick one of three actions. After the model replies, the same thing happens in the other direction. If none of them find anything, the turn continues as if they were not there.
 
-Dendrux ships two built-ins: `PII` and `SecretDetection`. Both are regex-based and both accept custom patterns. The engine that runs them is shared, and it is the same pipeline every governance concern uses, so findings land on `run_events` as `guardrail.detected`, `guardrail.redacted`, and `guardrail.blocked`. See [Governance](/docs/architecture/governance) for how that pipeline fits together.
+Dendrux ships two built-ins: `PII` and `SecretDetection`. `PII` has two backends — a default regex scanner (five canonical entities, zero dependencies) and an opt-in Microsoft Presidio scanner (~18 entities, NLP-backed). `SecretDetection` is regex-only. Both accept custom patterns. The engine that runs them is shared, and it is the same pipeline every governance concern uses, so findings land on `run_events` as `guardrail.detected`, `guardrail.redacted`, and `guardrail.blocked`. See [Governance](/docs/architecture/governance) for how that pipeline fits together.
 
 ## Three actions, one protocol
 
@@ -15,7 +15,7 @@ Every guardrail declares one of three actions at construction time. The action i
 
 | Action | What the engine does when a finding is found |
 | --- | --- |
-| `redact` | Replace the finding in the text with a `<<TYPE_N>>` placeholder. Write the original value into the run's `pii_mapping` so it can be reversed on the read side. Emit `guardrail.detected` and `guardrail.redacted`. Continue. |
+| `redact` | On the incoming path (before the LLM call) replace the finding with a `<<TYPE_N>>` placeholder and record the original in `pii_mapping`. The DB keeps raw; the LLM sees placeholders. Emit `guardrail.detected` and `guardrail.redacted`. Continue. |
 | `block` | Terminate the run with `status=error`. Emit `guardrail.blocked` with the offending entity type. Nothing downstream runs. |
 | `warn` | Emit `guardrail.detected` only. The text is unchanged. The run continues as if no finding happened. |
 
@@ -56,19 +56,19 @@ agent = Agent(
 )
 ```
 
-The default `PII()` carries five patterns: EMAIL, PHONE, SSN, CREDIT_CARD, IP_ADDRESS. All regex, all applied to both incoming and outgoing messages.
+The default `PII()` carries five patterns: `EMAIL_ADDRESS`, `PHONE_NUMBER`, `US_SSN`, `CREDIT_CARD`, `IP_ADDRESS`. All regex, applied incoming (for redaction before the LLM call) and outgoing (for block/warn policy detection). Entity names are canonical to Presidio's vocabulary so the same names appear regardless of which engine is active.
 
 A real run with the input `"Send the receipt to jane.doe@example.com please."` produced these governance rows, plus the PII mapping:
 
 ```text
 status: success
-pii_mapping: {"<<EMAIL_1>>": "jane.doe@example.com"}
+pii_mapping: {"<<EMAIL_ADDRESS_1>>": "jane.doe@example.com"}
 governance events:
-  seq=1  guardrail.detected  data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL"]}
-  seq=2  guardrail.redacted  data={"direction": "incoming", "entities": ["EMAIL"]}
+  seq=1  guardrail.detected  data={"direction": "incoming", "findings_count": 1, "entities": ["EMAIL_ADDRESS"]}
+  seq=2  guardrail.redacted  data={"direction": "incoming", "entities": ["EMAIL_ADDRESS"]}
 ```
 
-The message the LLM actually saw had `<<EMAIL_1>>` in place of the address. The original value lives on the `agent_runs.pii_mapping` column and is never sent to the model. See [PII redaction](/docs/architecture/pii-redaction) for the reversal protocol on reads.
+The message the LLM actually saw had `<<EMAIL_ADDRESS_1>>` in place of the address. The original value lives on the `agent_runs.pii_mapping` column and is never sent to the model. The DB persists raw traces so audit replay can render both views from the mapping. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
 
 Defaults are not locked in. `PII(include_defaults=False)` disables them entirely, and `extra_patterns=[...]` adds your own:
 
@@ -86,6 +86,135 @@ agent = Agent(
     ],
 )
 ```
+
+## Upgrading PII to Presidio
+
+The regex engine covers the five most common entities. Opt in to Presidio for NLP-backed detection of ~18 entities, including `PERSON`, `LOCATION`, `DATE_TIME`, `NRP`, `URL`, `IBAN_CODE`, `MEDICAL_LICENSE`, and the US-specific `US_BANK_NUMBER`, `US_DRIVER_LICENSE`, `US_ITIN`, `US_PASSPORT`.
+
+```bash
+pip install dendrux[presidio]
+python -m spacy download en_core_web_lg
+```
+
+```python
+from dendrux.guardrails import PII
+
+agent = Agent(
+    ...,
+    guardrails=[PII(engine="presidio")],
+)
+```
+
+`extra_patterns` works identically on both engines — Presidio wraps each as a `PatternRecognizer`. If the `[presidio]` extra is not installed, construction raises `ImportError: PII(engine='presidio') requires presidio. Install dendrux[presidio].`
+
+Everything else — the pipeline, the pause/resume story, the `pii_mapping` audit key, the governance events — is identical between engines.
+
+### Deployment notes
+
+Presidio's email recognizer depends on `tldextract`, which on first use downloads the public-suffix list and writes it to `~/.cache/python-tldextract/`. In a locked-down environment (read-only filesystems, sandboxed containers, CI without a writable home) the first `scan()` call will fail. Two fixes:
+
+```bash
+# Option 1: point tldextract at a writable cache directory.
+export TLDEXTRACT_CACHE=/var/cache/tldextract
+
+# Option 2: prewarm the cache at image build time.
+python -c "import tldextract; tldextract.extract('example.com')"
+```
+
+The spaCy model (`en_core_web_lg`) must also be downloaded once:
+
+```bash
+python -m spacy download en_core_web_lg
+```
+
+For production, bake both into your container image; `dendrux[presidio]` itself does not download anything at import.
+
+## Choosing regex vs Presidio
+
+The two engines trade off detection recall against predictability. Pick based on what your agent actually receives and how much noise you can tolerate on the audit log.
+
+| Dimension | `engine="regex"` (default) | `engine="presidio"` |
+| --- | --- | --- |
+| Detection method | Compiled regex, five patterns | spaCy NER + ~18 recognizers |
+| Install footprint | Zero extra deps | ~500MB (spaCy model) |
+| Cold-start latency | Microseconds | ~2s (model load) |
+| Per-scan latency | Microseconds | Milliseconds |
+| Catches `PERSON`, `LOCATION`, `DATE_TIME`? | No | Yes |
+| False positives on ordinary text? | Rare (regex is literal) | Common |
+| Behavior across versions | Deterministic forever | Depends on spaCy model version |
+
+**When regex is the right call:**
+
+- Your input is structured or templated (form fields, API payloads, fixed prompts). The patterns you care about are known — emails, phones, SSNs, credit cards, IPs.
+- You need deterministic behavior. Security audits want "the same input always produces the same findings, forever."
+- Your deployment can't absorb a 500MB spaCy model (edge, embedded, serverless with cold-start budgets).
+- You want to keep the `pii_mapping` clean of NLP noise.
+
+**When Presidio earns its keep:**
+
+- Input is free-form natural language (chat, email bodies, support tickets, meeting transcripts) where names, places, and dates show up unpredictably.
+- Detection recall matters more than precision — you'd rather over-redact than leak.
+- You want the fuller entity catalogue (`IBAN_CODE`, `MEDICAL_LICENSE`, `US_PASSPORT`, etc.) without writing regexes for each.
+
+### The false-positive reality
+
+Presidio's `PERSON` and `LOCATION` recognizers use statistical NER. They will occasionally flag things that are not PII. Here's a real finding from the Presidio example in `examples/governance/06_presidio_tool_calls.py`:
+
+```
+pii_mapping:
+  <<PERSON_1>>        -> 'process_refund'    # <- a tool name, not a person
+  <<PERSON_2>>        -> "Alice Johnson's"   # <- actual person
+  <<EMAIL_ADDRESS_1>> -> 'alice.johnson@example.com'
+  <<LOCATION_1>>      -> 'San Francisco'
+  <<DATE_TIME_1>>     -> 'March 14 2026'
+  <<PHONE_NUMBER_1>>  -> '415-555-0143'
+```
+
+Presidio's spaCy model saw `process_refund` in the system prompt and classified it as `PERSON`. That is a false positive.
+
+Why the run still succeeded:
+
+1. The LLM gets tool names from the **tool schema** (the `tools=[...]` argument to the provider API), not from prompt text. The schema is not guardrail-scanned. So the LLM knew the tool was called `process_refund` and called it correctly.
+2. Within the prompt text, the LLM saw `"call <<PERSON_1>> with..."`. It ignored the placeholder because the schema was the source of truth.
+3. The `pii_mapping` gained one extra audit entry. No data leaked.
+
+This is benign when the misclassified token is (a) not sensitive and (b) not something the LLM needs to reason about semantically in text. Those conditions fit most real prompts.
+
+### When the false positive actually bites
+
+The case that breaks is when Presidio redacts a value the LLM needs to think about as a concrete thing, not as an opaque token. Two examples:
+
+1. **Numeric reasoning.** Prompt: "If the user id is even, route to queue A." If Presidio flags the id as `US_SSN`, the LLM sees `<<US_SSN_1>>` and can't decide parity.
+2. **String matching.** Prompt: "Only process orders starting with 'ORD-'." If Presidio flags something in the id as `PERSON`, the LLM sees a placeholder instead of the prefix.
+
+These are rare but real. If your agent does text-level reasoning over values that Presidio might misclassify, either use `engine="regex"` or scope Presidio down via `extra_patterns` with `include_defaults=False`.
+
+### Hybrid pattern: Presidio for natural language, regex for the parts you know
+
+The two engines are not exclusive — they are two instances of the same `PII()` class. Stack them:
+
+```python
+from dendrux.guardrails import PII, Pattern
+
+agent = Agent(
+    ...,
+    guardrails=[
+        # Catch domain-specific IDs with literal precision.
+        PII(
+            engine="regex",
+            include_defaults=False,
+            extra_patterns=[
+                Pattern("EMPLOYEE_ID", r"EMP-\d{6}"),
+                Pattern("ORDER_ID", r"ORD-\d{8}"),
+            ],
+        ),
+        # Catch everything else with Presidio's NER.
+        PII(engine="presidio"),
+    ],
+)
+```
+
+The regex engine runs first and claims the structured tokens it knows about; Presidio runs second on whatever is left. Both engines share the same `pii_mapping` and placeholder namespace, so there is no conflict.
 
 ## SecretDetection: block by default
 
@@ -136,15 +265,17 @@ Two `guardrail.detected` events, one for the incoming user message and one for t
 
 This action is the right choice when you want a signal that something matched without changing the flow. A dashboard can count `guardrail.detected` events by entity type across runs to get a usage heat-map.
 
-## Incoming and outgoing are both scanned
+## Incoming and outgoing are both scanned — with different jobs
 
-Look closely at the `warn` run above. `seq=1` has `"direction": "incoming"`, `seq=2` has `"direction": "outgoing"`. Guardrails run at both ends of every LLM turn.
+Look closely at the `warn` run above. `seq=1` has `"direction": "incoming"`, `seq=2` has `"direction": "outgoing"`. Guardrails run at both ends of every LLM turn, but they do different work.
 
-The incoming scan happens before the messages list is handed to `provider.complete()`. Every message the strategy built gets scanned. If any guardrail decides to `block`, the LLM is never called.
+The **incoming scan** happens before the messages list is handed to `provider.complete()`. Every message the strategy built gets scanned. `redact` replaces entities with placeholders at this point; this is the only place in the system where the content going to the LLM is mutated. If any guardrail decides to `block`, the LLM is never called.
 
-The outgoing scan happens after `provider.complete()` returns, on the assistant's response. If the assistant leaked a PII entity the user did not provide, the redact or block action still fires.
+The **outgoing scan** happens after `provider.complete()` returns, on the assistant's response and any tool-call params. It is detection-only: findings are recorded, `guardrail.detected` is emitted, and a `block` action still terminates the run. It never mutates what gets persisted. The next iteration's incoming scan is where placeholders get applied for the following LLM call.
 
-A run that enters `waiting_approval` and later resumes will scan again on the next iteration (the history being replayed includes the same user message). The `pii_mapping` is stable across scans so the same replacement token is reused, and there is no double-redaction.
+This split is deliberate: the DB is ground truth. Dashboards, traces, and the developer's own systems see the raw value; only the provider API wire carries placeholders.
+
+A run that enters `waiting_approval` and later resumes will scan again on the next iteration (the history being replayed is the raw transcript). The `pii_mapping` is stable across scans so the same replacement token is reused, and there is no double-redaction.
 
 ## Multiple guardrails compose
 

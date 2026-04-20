@@ -200,11 +200,11 @@ Full conversation trace (user, assistant, tool messages) in `order_index` order.
 
 Query parameters: `limit`, `offset`.
 
-Response items: `role`, `content`, `order_index`, `meta`, `created_at`. Redaction applies to `content` when the agent has a `redact=` callback configured.
+Response items: `role`, `content`, `order_index`, `meta`, `created_at`. `content` is always the raw stored value — DB is ground truth. PII guardrails redact at the LLM-call boundary only; replay against `agent_runs.pii_mapping` to render the LLM-eye view.
 
 ### `GET /runs/{run_id}/pauses`
 
-Pause/resume cycles derived from `run_events`. Never reads `AgentRun.pause_data` (that column is execution state, potentially unredacted, and cleared on finalize).
+Pause/resume cycles derived from `run_events`. Never reads `AgentRun.pause_data` (that column is execution state — it can include a `pii_mapping` with raw values for continuity across pause/resume — and is cleared on finalize).
 
 Response items:
 
@@ -252,7 +252,7 @@ From `dendrux.types.GovernanceEventType`. All thirteen values are deliverable th
 | `budget.threshold` | Usage crossed a `warn_at` fraction | `{"fraction": float, "used": int, "max": int, "reason": "threshold_crossed"}` |
 | `budget.exceeded` | Usage reached `max_tokens` | `{"used": int, "max": int, "reason": "budget_exceeded"}` |
 | `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "outgoing", "findings_count": int, "entities": list[str]}` |
-| `guardrail.redacted` | Guardrail engine modified content | `{"direction": "incoming" \| "outgoing", "entities": list[str]}` |
+| `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
 | `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "outgoing", "error": str}` |
 | `skill.registered` | Skill loaded at run start | `{"skill_name": str, "description": str}` |
 | `skill.denied` | Skill filtered by `deny_skills=` | `{"skill_name": str, "reason": "denied_by_policy"}` |

@@ -598,6 +598,40 @@ class TestRunStoreLifecycle:
         # After exit, ownership cleared.
         assert s._owned_engine is None
 
+
+class TestGetPIIMapping:
+    """RunStore.get_pii_mapping exposes the audit key without forcing
+    callers to reach into private internals like _resolve_state_store."""
+
+    async def test_returns_mapping_for_run_with_pii(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.pause_run(
+            "r1",
+            status="waiting_client_tool",
+            pause_data={},
+            pii_mapping={
+                "<<EMAIL_ADDRESS_1>>": "alice@example.com",
+                "<<LOCATION_1>>": "San Francisco",
+            },
+        )
+
+        mapping = await store.get_pii_mapping("r1")
+        assert mapping == {
+            "<<EMAIL_ADDRESS_1>>": "alice@example.com",
+            "<<LOCATION_1>>": "San Francisco",
+        }
+
+    async def test_empty_mapping_when_no_pii(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent")
+        mapping = await store.get_pii_mapping("r1")
+        assert mapping == {}
+
+    async def test_unknown_run_returns_empty(self, store) -> None:
+        mapping = await store.get_pii_mapping("does-not-exist")
+        assert mapping == {}
+
+
+class TestOwnedEngineLifecycle:
     async def test_close_is_idempotent(self) -> None:
         """Calling close() twice on an owned-engine store is a no-op
         and must not raise."""

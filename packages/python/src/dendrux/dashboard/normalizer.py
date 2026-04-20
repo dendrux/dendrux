@@ -17,7 +17,9 @@ Design rules:
     - Pause segments contain all pending tool calls (not one per call)
     - Wait duration = resumed.created_at - paused.created_at
     - Only observable data is included (never pause_data)
-    - Redacted content only (traces/tool_calls are already redacted)
+    - Trace/tool_call content is raw — the DB is ground truth. When a
+      PII guardrail is active, agent_runs.pii_mapping is the audit key
+      consumers can apply to render an LLM-eye view on demand.
 """
 
 from __future__ import annotations

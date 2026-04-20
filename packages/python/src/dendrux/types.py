@@ -354,9 +354,11 @@ class PauseState:
     """Everything needed to resume a paused agent run.
 
     This is execution state, not observability state. It is persisted
-    unredacted in pause_data (JSON column) and cleared on finalize.
-    Redaction applies only to traces, tool_calls, and agent_runs
-    answer/error/input — never to pause_data.
+    raw in pause_data (JSON column) and cleared on finalize — the DB
+    is ground truth across traces, tool_calls, and pause_data alike.
+    Guardrail redaction (placeholders) applies only at the LLM-call
+    boundary; the bijection lives on agent_runs.pii_mapping for audit
+    replay.
     """
 
     agent_name: str

@@ -92,7 +92,7 @@ class Agent:
     """Dendrux agent — definition and runtime facade.
 
     Holds the agent's identity, capabilities, limits, and runtime config
-    (provider, persistence, redaction). Provides run() and resume() as
+    (provider, persistence, guardrails). Provides run() and resume() as
     instance methods that delegate to the runner.
 
     Attributes:
@@ -136,7 +136,6 @@ class Agent:
         database_url: str | None = ...,
         database_options: dict[str, Any] | None = ...,
         state_store: StateStore | None = ...,
-        redact: Callable[[str], str] | None = ...,
         deny: list[str] | None = ...,
         require_approval: list[str] | None = ...,
         budget: Budget | None = ...,
@@ -162,7 +161,6 @@ class Agent:
         database_url: str | None = ...,
         database_options: dict[str, Any] | None = ...,
         state_store: StateStore | None = ...,
-        redact: Callable[[str], str] | None = ...,
         deny: list[str] | None = ...,
         require_approval: list[str] | None = ...,
         budget: Budget | None = ...,
@@ -187,7 +185,6 @@ class Agent:
         database_url: str | None = None,
         database_options: dict[str, Any] | None = None,
         state_store: StateStore | None = None,
-        redact: Callable[[str], str] | None = None,
         deny: list[str] | None = None,
         require_approval: list[str] | None = None,
         budget: Budget | None = None,
@@ -242,7 +239,6 @@ class Agent:
         self._database_url = database_url
         self._database_options = database_options or {}
         self._state_store = state_store
-        self._redact = redact
 
         from dendrux.runtime.tasks import RunTaskManager
 
@@ -700,8 +696,8 @@ class Agent:
     ) -> RunResult:
         """Start a new agent run.
 
-        Delegates to runner.run() with this agent's provider, persistence,
-        and redaction config.
+        Delegates to runner.run() with this agent's provider and persistence
+        config.
 
         Args:
             user_input: The user's input to process.
@@ -780,7 +776,6 @@ class Agent:
             state_store=store,
             tenant_id=tenant_id,
             metadata=metadata,
-            redact=self._redact,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
             output_type=resolved_output_type,
@@ -841,7 +836,6 @@ class Agent:
             state_store=store,
             tenant_id=tenant_id,
             metadata=metadata,
-            redact=self._redact,
             extra_notifier=notifier,
             **kwargs,
         )
@@ -896,7 +890,6 @@ class Agent:
                 state_store=store,
                 agent=self,
                 provider=provider,
-                redact=self._redact,
                 extra_notifier=notifier,
             )
         if user_input is not None:
@@ -906,7 +899,6 @@ class Agent:
                 state_store=store,
                 agent=self,
                 provider=provider,
-                redact=self._redact,
                 extra_notifier=notifier,
             )
         # No-arg resume — approve path. Runner validates status is
@@ -917,7 +909,6 @@ class Agent:
             state_store=store,
             agent=self,
             provider=provider,
-            redact=self._redact,
             extra_notifier=notifier,
         )
 
@@ -982,7 +973,6 @@ class Agent:
                 state_store=store,
                 agent=self,
                 provider=provider,
-                redact=self._redact,
                 extra_notifier=notifier,
             ),
         )
@@ -1034,7 +1024,6 @@ class Agent:
                 state_store=store,
                 agent=self,
                 provider=provider,
-                redact=self._redact,
                 extra_notifier=notifier,
             ),
         )
@@ -1103,7 +1092,6 @@ class Agent:
                     state_store=store,
                     agent=self,
                     provider=provider,
-                    redact=self._redact,
                     extra_notifier=notifier,
                 ),
             )
@@ -1130,7 +1118,6 @@ class Agent:
                 state_store=store,
                 agent=self,
                 provider=provider,
-                redact=self._redact,
                 extra_notifier=notifier,
             ),
         )
@@ -1329,7 +1316,6 @@ class Agent:
             state_store_resolver=self._resolve_state_store,
             tenant_id=tenant_id,
             metadata=metadata,
-            redact=self._redact,
             extra_notifier=notifier,
             **stream_kwargs,
             **kwargs,
@@ -1388,7 +1374,6 @@ class Agent:
             state_store_resolver=self._resolve_state_store,
             tool_results=tool_results,
             user_input=user_input,
-            redact=self._redact,
             extra_notifier=notifier,
         )
 

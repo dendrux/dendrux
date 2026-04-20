@@ -14,7 +14,7 @@ The async Python runtime for agents that survive failure, persist everything, an
 
 Agent frameworks assume tools run on the server and finish instantly. Real agents crash mid-run, need human approval, interact with browsers and spreadsheets, and must explain what they did after the fact.
 
-Dendrux is the runtime that handles this. Tools are plain Python functions. State survives restarts. Crashed runs get swept. Failed runs retry with prior context reconstructed from persisted traces (exact when no redaction is configured; approximate if redaction scrubs sensitive content). And every LLM call, tool execution, pause, and failure is persisted as evidence.
+Dendrux is the runtime that handles this. Tools are plain Python functions. State survives restarts. Crashed runs get swept. Failed runs retry with prior context reconstructed from persisted traces (the DB stores raw values — guardrails redact at the LLM boundary only, so retries replay the original conversation). And every LLM call, tool execution, pause, and failure is persisted as evidence.
 
 ## Quick Start
 
@@ -119,7 +119,7 @@ results = await sweep(
 )
 ```
 
-**Retry terminal runs**: a failed, cancelled, or timed-out run can be retried with prior context from persisted traces. If redaction is configured, the retried run sees scrubbed content. Same agent or a different one, different model, different tools.
+**Retry terminal runs**: a failed, cancelled, or timed-out run can be retried with prior context from persisted traces. The DB stores raw values (guardrails redact at the LLM boundary only), so retry replays the full original conversation. Same agent or a different one, different model, different tools.
 
 ```python
 result = await agent.retry("01JR...")
@@ -186,11 +186,11 @@ agent = Agent(
 **Advisory budget**: `budget=Budget(max_tokens=N)` fires governance events at configurable thresholds (50%, 75%, 90%) and when usage exceeds the cap. Advisory only - the run continues. Developers observe and act.
 
 **Guardrails**: `guardrails=[PII(), SecretDetection()]` scans content crossing the LLM boundary. Three actions:
-- `redact` - PII replaced with `<<EMAIL_1>>` placeholders. Tools receive real values (deanonymized). Run-scoped mapping persisted for audit.
+- `redact` - PII replaced with `<<EMAIL_ADDRESS_1>>` placeholders. Tools receive real values (deanonymized). Run-scoped mapping persisted for audit.
 - `block` - run terminates immediately. The LLM never sees the content.
 - `warn` - findings logged, content unchanged. Shadow rollout before promoting to redact.
 
-Custom patterns via `Pattern("NAME", r"regex")`. Extensible `Guardrail` protocol for custom scanners (async `scan()` supports LLM-as-judge). Regex in v1, Presidio upgrade path preserved.
+Custom patterns via `Pattern("NAME", r"regex")`. Extensible `Guardrail` protocol for custom scanners (async `scan()` supports LLM-as-judge). Two detection engines: `PII()` uses a zero-dependency regex scanner by default, `PII(engine="presidio")` opts in to Microsoft Presidio's NLP-backed recognizers (~18 entities, install `dendrux[presidio]`).
 
 **Pipeline per iteration:**
 
@@ -200,7 +200,7 @@ Custom patterns via `Pattern("NAME", r"regex")`. Extensible `Guardrail` protocol
                         └────────┬────────┘
                                  ▼
                         ┌─────────────────┐
-                        │    LLM Call     │ model sees <<EMAIL_1>> placeholders
+                        │    LLM Call     │ model sees <<EMAIL_ADDRESS_1>> placeholders
                         └────────┬────────┘
                                  ▼
                         ┌─────────────────┐
@@ -235,16 +235,7 @@ result = await agent.run("do the thing", notifier=ConsoleNotifier())
 
 Every run persists: traces with full message content, tool calls with parameters and results, LLM interactions with request/response payloads, token usage, timing, delegation links, and lifecycle events.
 
-**Redaction**: scrub sensitive data before it's stored:
-
-```python
-agent = Agent(
-    provider=provider,
-    database_url="sqlite+aiosqlite:///...",
-    redact=lambda text: text.replace("sk-ant-", "[REDACTED]"),
-    ...
-)
-```
+**PII policy**: the DB is the authoritative execution record and stores raw values. Guardrails redact at the LLM boundary only — what the provider API sees — and the placeholder→real bijection is persisted on `agent_runs.pii_mapping` as the audit key, so dashboards can replay either view from the same rows. See [PII redaction](docs/architecture/pii-redaction.mdx).
 
 ### 🌳 Coordinate Agents
 
@@ -403,7 +394,7 @@ dendrux db migrate              # run Alembic migrations (Postgres)
 dendrux dashboard               # launch web dashboard at :8001
 ```
 
-The dashboard shows runs, timelines, tool calls, token usage, delegation trees, and LLM payloads. All data is read-only and redacted.
+The dashboard shows runs, timelines, tool calls, token usage, delegation trees, and LLM payloads. All data is read-only. Traces and tool calls are rendered raw; when a PII guardrail is active, `agent_runs.pii_mapping` carries the bijection the LLM saw and can be applied at render time to produce an LLM-eye view.
 
 ---
 

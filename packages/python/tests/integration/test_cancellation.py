@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux.agent import Agent
 from dendrux.db.models import AgentRun, Base, RunEvent
 from dendrux.errors import RunAlreadyTerminalError
+from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.tool import tool
@@ -342,6 +343,102 @@ class TestCancelRunIdempotent:
 # ---------------------------------------------------------------------------
 # Submit rejection when cancel pending
 # ---------------------------------------------------------------------------
+
+
+class TestCancelPreservesPIIMapping:
+    """Cancellation finalizes the run via finalize_run_if_status_in.
+    The pii_mapping built during the cancelled run MUST persist on
+    the terminal row — otherwise raw traces lose their audit key.
+    """
+
+    async def test_top_of_iteration_cancel_persists_pii_mapping(self, db_store) -> None:
+        """Runner's top-of-iteration checkpoint finalizes CANCELLED without
+        a prior pause_run to carry pii_mapping. The cancel path itself
+        must persist it — otherwise the audit key is lost for any run
+        cancelled mid-flight.
+        """
+
+        class _CancellingProvider:
+            model = "mock"
+
+            def __init__(self, store: SQLAlchemyStateStore) -> None:
+                self.store = store
+                self._call_count = 0
+
+            async def complete(self, messages, tools, **_):
+                self._call_count += 1
+                # First iteration: call a server tool (keeps loop alive).
+                # Flip the cancel flag so the runner's top-of-iteration
+                # checkpoint fires at iteration 2 before calling the LLM
+                # again.
+                if self._call_count == 1:
+                    async with self.store._session_factory() as session:
+                        row = (
+                            await session.execute(
+                                select(AgentRun).order_by(AgentRun.created_at.desc()).limit(1)
+                            )
+                        ).scalar_one()
+                        await self.store.request_cancel(row.id)
+                    tc = ToolCall(
+                        name="server_echo",
+                        params={"text": "hi"},
+                        provider_tool_call_id="t1",
+                    )
+                    return LLMResponse(tool_calls=[tc])
+                # Should never be reached — cancel fires at top of iter 2.
+                return LLMResponse(text="unreachable")
+
+            async def complete_stream(self, *_, **__):
+                raise NotImplementedError
+
+        provider = _CancellingProvider(db_store)
+        agent = Agent(
+            provider=provider,
+            prompt="Test agent.",
+            tools=[server_echo],
+            state_store=db_store,
+            guardrails=[PII()],
+        )
+
+        result = await agent.run("Email jane@example.com please")
+        assert result.status == RunStatus.CANCELLED
+
+        # Audit key must be on the terminal row.
+        mapping = await db_store.get_pii_mapping(result.run_id)
+        assert mapping == {"<<EMAIL_ADDRESS_1>>": "jane@example.com"}
+
+    async def test_cancel_run_from_waiting_preserves_pii_mapping(self, db_store) -> None:
+        tc = ToolCall(
+            name="client_read",
+            params={"sheet": "S1"},
+            provider_tool_call_id="t1",
+        )
+        llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        agent = Agent(
+            provider=llm,
+            prompt="Test agent.",
+            tools=[client_read],
+            state_store=db_store,
+            guardrails=[PII()],
+        )
+
+        # Run pauses at WAITING_CLIENT_TOOL after the incoming scan
+        # redacts the email. pii_mapping should be persisted at the
+        # pause boundary.
+        paused = await agent.run("Email jane@example.com please")
+        assert paused.status == RunStatus.WAITING_CLIENT_TOOL
+
+        # Pre-condition: mapping exists on paused row.
+        paused_mapping = await db_store.get_pii_mapping(paused.run_id)
+        assert paused_mapping == {"<<EMAIL_ADDRESS_1>>": "jane@example.com"}
+
+        # Cancel while paused. Finalize goes through finalize_run_if_status_in.
+        cancelled = await agent.cancel_run(paused.run_id)
+        assert cancelled.status == RunStatus.CANCELLED
+
+        # The audit key must still be on the terminal row.
+        terminal_mapping = await db_store.get_pii_mapping(paused.run_id)
+        assert terminal_mapping == {"<<EMAIL_ADDRESS_1>>": "jane@example.com"}
 
 
 class TestSubmitRejectedAfterCancel:

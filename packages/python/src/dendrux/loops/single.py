@@ -20,6 +20,7 @@ from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._helpers import (
     build_cache_key_prefix,
+    guardrail_meta,
     notify_governance,
     notify_llm,
     notify_message,
@@ -166,6 +167,7 @@ class SingleCall(Loop):
                         steps=[],
                         iteration_count=1,
                         usage=UsageStats(),
+                        meta=guardrail_meta(g_engine),
                     )
                 if cleaned != msg.content:
                     _in_was_redacted = True
@@ -253,18 +255,17 @@ class SingleCall(Loop):
 
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
-        # Output guardrail — scan BEFORE recording so persisted
-        # semantic_response never contains raw PII.
+        # Output guardrail — detection-only. Persistence stores raw
+        # (DB is ground truth); block policies abort the run, findings
+        # emit governance events. Redaction for any follow-up LLM call
+        # happens at the next scan_incoming.
         _sc_findings: dict[str, Any] = {}
         if g_engine is not None and all_in_findings:
             _sc_findings["incoming"] = [
                 {"entity_type": f.entity_type, "score": f.score} for f in all_in_findings
             ]
         if g_engine is not None and (response.text or response.tool_calls):
-            _orig_text = response.text
-            out_text, _, out_findings, out_block, _p_redacted = await g_engine.scan_outgoing(
-                response.text or ""
-            )
+            out_findings, out_block = await g_engine.scan_outgoing(response.text or "")
             if out_findings:
                 _sc_findings["outgoing"] = [
                     {"entity_type": f.entity_type, "score": f.score} for f in out_findings
@@ -285,32 +286,6 @@ class SingleCall(Loop):
                     "guardrail.detected",
                     1,
                     _out_data,
-                )
-            _text_changed = _orig_text is not None and out_text != _orig_text
-            if _text_changed:
-                from dendrux.types import LLMResponse as _LLMResp
-
-                response = _LLMResp(
-                    text=out_text,
-                    tool_calls=response.tool_calls,
-                    raw=response.raw,
-                    usage=response.usage,
-                    provider_request=response.provider_request,
-                    provider_response=response.provider_response,
-                )
-            if (_text_changed or _p_redacted) and out_findings:
-                _out_red = list({f.entity_type for f in out_findings})
-                await record_governance(
-                    recorder,
-                    "guardrail.redacted",
-                    1,
-                    {"direction": "outgoing", "entities": _out_red},
-                )
-                await notify_governance(
-                    notifier,
-                    "guardrail.redacted",
-                    1,
-                    {"direction": "outgoing", "entities": _out_red},
                 )
             if out_block is not None:
                 # Scrub response before recording — block means the
@@ -370,9 +345,10 @@ class SingleCall(Loop):
                     steps=[],
                     iteration_count=1,
                     usage=response.usage,
+                    meta=guardrail_meta(g_engine),
                 )
 
-        # Record sanitized LLM response
+        # Record the LLM response (raw — DB is ground truth).
         await record_llm(
             recorder,
             response,
@@ -423,6 +399,7 @@ class SingleCall(Loop):
             steps=[],
             iteration_count=1,
             usage=usage,
+            meta=guardrail_meta(g_engine),
         )
 
     async def run_stream(

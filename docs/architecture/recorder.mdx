@@ -112,8 +112,7 @@ The loop never touches the `StateStore` directly. It calls `recorder.on_*` and l
 
 ```python
 async def on_tool_completed(self, tool_call, tool_result, iteration):
-    params = _redact_dict(tool_call.params, self._redact) if tool_call.params else None
-    redacted_payload = self._redact(tool_result.payload)
+    params = tool_call.params if tool_call.params else None
     target = self._target_lookup.get(tool_call.name, "server")
 
     # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
@@ -133,10 +132,11 @@ async def on_tool_completed(self, tool_call, tool_result, iteration):
 
 Three writes land from one hook. The recorder is responsible for:
 
-1. **Redaction.** A caller-supplied `redact` function runs over tool params, tool results, and message content before persistence.
-2. **Durability policy.** Which writes retry, which swallow exceptions, which propagate.
-3. **Correlation.** `run_event.correlation_id` is set to the `tool_call.id` so `approval.requested`, `tool.completed`, and `approval.decided` can be joined later as one tool-lifecycle story.
-4. **Ordering.** An `order_index` counter is maintained for `react_traces`. A shared `EventSequencer` is used for `run_events.sequence_index` (see [Event ordering](/docs/architecture/event-ordering)).
+1. **Durability policy.** Which writes retry, which swallow exceptions, which propagate.
+2. **Correlation.** `run_event.correlation_id` is set to the `tool_call.id` so `approval.requested`, `tool.completed`, and `approval.decided` can be joined later as one tool-lifecycle story.
+3. **Ordering.** An `order_index` counter is maintained for `react_traces`. A shared `EventSequencer` is used for `run_events.sequence_index` (see [Event ordering](/docs/architecture/event-ordering)).
+
+The recorder writes raw values — it is the authoritative transcript, so it must match what actually happened. PII guardrails redact at the LLM-call boundary only; see [PII redaction](/docs/architecture/pii-redaction) for the boundary model.
 
 The loop does not know or care about any of that. It calls the hook.
 

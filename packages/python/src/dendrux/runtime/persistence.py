@@ -17,46 +17,10 @@ from dendrux.loops.base import LoopRecorder
 from dendrux.runtime.durability import retry_critical
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from dendrux.runtime.state import StateStore
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
 
 logger = logging.getLogger(__name__)
-
-
-def _identity(s: str) -> str:
-    return s
-
-
-def _redact_value(v: Any, redact: Callable[[str], str], _stack: set[int] | None = None) -> Any:
-    """Recursively apply a string redactor to all string values.
-
-    Uses an active recursion stack (not a global visited set) so that
-    shared sub-objects are redacted correctly on every path, while true
-    cycles are replaced with a JSON-safe placeholder.
-    """
-    if isinstance(v, str):
-        return redact(v)
-    if isinstance(v, (dict, list)):
-        obj_id = id(v)
-        if _stack is None:
-            _stack = set()
-        if obj_id in _stack:
-            return "[circular]"
-        _stack.add(obj_id)
-        try:
-            if isinstance(v, dict):
-                return {k: _redact_value(val, redact, _stack) for k, val in v.items()}
-            return [_redact_value(item, redact, _stack) for item in v]
-        finally:
-            _stack.discard(obj_id)
-    return v
-
-
-def _redact_dict(d: dict[str, Any], redact: Callable[[str], str]) -> dict[str, Any]:
-    """Recursively apply a string redactor to all string values in a dict."""
-    return {k: _redact_value(v, redact) for k, v in d.items()}
 
 
 def _serialize_message(m: Message) -> dict[str, Any]:
@@ -106,7 +70,6 @@ class PersistenceRecorder(LoopRecorder):
         model: str | None = None,
         provider_name: str | None = None,
         target_lookup: dict[str, ToolTarget] | None = None,
-        redact: Callable[[str], str] | None = None,
         initial_order_index: int = 0,
         event_sequencer: Any | None = None,
     ) -> None:
@@ -115,7 +78,6 @@ class PersistenceRecorder(LoopRecorder):
         self._model = model
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
-        self._redact = redact or _identity
         self._order_index = initial_order_index
         self._event_sequencer = event_sequencer
 
@@ -152,7 +114,7 @@ class PersistenceRecorder(LoopRecorder):
                     "id": tc.id,
                     "provider_tool_call_id": tc.provider_tool_call_id,
                     "name": tc.name,
-                    "params": _redact_dict(tc.params, self._redact) if tc.params else tc.params,
+                    "params": tc.params,
                 }
                 for tc in message.tool_calls
             ]
@@ -162,7 +124,7 @@ class PersistenceRecorder(LoopRecorder):
         if message.name:
             meta["tool_name"] = message.name
 
-        content = self._redact(message.content)
+        content = message.content
         order_idx = self._order_index
 
         # FAIL-CLOSED with retry
@@ -296,12 +258,6 @@ class PersistenceRecorder(LoopRecorder):
     ) -> None:
         """Persist tool call record + event."""
         params = tool_call.params if tool_call.params else None
-        if params is not None:
-            params = _redact_dict(params, self._redact)
-
-        redacted_payload = self._redact(tool_result.payload)
-        redacted_error = self._redact(tool_result.error) if tool_result.error else None
-
         target = self._target_lookup.get(tool_call.name, "server")
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
@@ -313,11 +269,11 @@ class PersistenceRecorder(LoopRecorder):
                 tool_name=tool_call.name,
                 target=target,
                 params=params,
-                result_payload=redacted_payload,
+                result_payload=tool_result.payload,
                 success=tool_result.success,
                 duration_ms=tool_result.duration_ms,
                 iteration_index=iteration,
-                error_message=redacted_error,
+                error_message=tool_result.error,
             )
 
         await retry_critical(_write_tool, label="save_tool_call", run_id=self._run_id)

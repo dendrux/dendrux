@@ -208,7 +208,7 @@ Conversation messages in order. Roles: `user`, `assistant`, `tool`. Useful for r
 }
 ```
 
-If a `redact=` callback is configured on the agent, `content` is the redacted text. The unredacted execution state (`pause_data`) is never exposed by this endpoint. See [PII redaction](/docs/architecture/pii-redaction) for the full redaction boundary.
+`content` is always the raw stored value — the DB is ground truth. When a PII guardrail is active, the `agent_runs.pii_mapping` column carries the placeholder → real bijection the LLM saw, which a dashboard can apply to render the LLM-eye view. Execution state (`pause_data`) is never exposed by this endpoint. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
 
 ### `GET /api/runs/{run_id}/pauses`
 

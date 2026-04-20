@@ -389,6 +389,20 @@ class RunStore:
         rows = await self._state.get_traces(run_id, limit=limit, offset=offset)
         return [_trace_to_public(r) for r in rows]
 
+    async def get_pii_mapping(self, run_id: str) -> dict[str, str]:
+        """Return the PII placeholder → real-value mapping for a run.
+
+        The mapping is the audit key that links raw traces persisted in
+        the DB to the placeholder view the LLM provider API actually saw.
+        Use it to render the LLM-eye view from raw traces in dashboards
+        or exports.
+
+        Empty dict if the run has no mapping (no PII guardrail active,
+        no entities detected, or the run does not exist).
+        """
+        mapping = await self._state.get_pii_mapping(run_id)
+        return mapping or {}
+
     async def get_pauses(self, run_id: str) -> list[PausePair]:
         """Derive pause/resume cycles from ``run_events``.
 

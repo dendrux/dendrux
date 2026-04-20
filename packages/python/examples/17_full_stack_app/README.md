@@ -49,7 +49,7 @@ Your end-to-end code: **~650 lines** across three files, every one of them in th
 | Deny | `deny=["delete_account"]` | "Delete account user-99 right now." |
 | Approval | `require_approval=["issue_refund"]` | "Refund order 4421 for $50." → approval card appears |
 | Budget | `budget=Budget(max_tokens=20_000)` | Fires `budget.warned` at 75% / 90% |
-| Guardrails — redact | `PII(action="redact")` | "Contact jane@acme.com" → email replaced with `<<EMAIL_1>>` for the LLM; `contact_customer` tool receives the real address |
+| Guardrails — redact | `PII(action="redact")` | "Contact jane@acme.com" → email replaced with `<<EMAIL_ADDRESS_1>>` for the LLM; `contact_customer` tool receives the real address |
 | Guardrails — block | `SecretDetection(action="block")` | "My AWS key AKIA..." → run terminates before the LLM is called |
 | Guardrails — warn | Custom pattern `TKT-\d{6,}` (warn) | "Follow up on TKT-041729" → audit-only, message delivered unchanged |
 
@@ -63,13 +63,13 @@ This is the unique guardrail story. When `PII(action="redact")` fires:
 User input:  "Contact the customer at jane@acme.com"
                        │
                        ▼ (guardrail.redact)
-LLM sees:    "Contact the customer at <<EMAIL_1>>"
+LLM sees:    "Contact the customer at <<EMAIL_ADDRESS_1>>"
                        │
                        ▼ (tool call arg materializes)
 contact_customer("jane@acme.com")   ← real value at the tool
                        │
                        ▼
-LLM sees:    "<<EMAIL_1>> has been contacted"
+LLM sees:    "<<EMAIL_ADDRESS_1>> has been contacted"
 ```
 
 The LLM never sees the real email. The tool does. The audit trail is in `run.pii_mapping`.

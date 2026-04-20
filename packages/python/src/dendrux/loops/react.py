@@ -30,6 +30,7 @@ from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._helpers import (
     build_cache_key_prefix,
+    guardrail_meta,
     notify_governance,
     notify_llm,
     notify_message,
@@ -575,14 +576,13 @@ class ReActLoop(Loop):
             # Current iteration's LLM/tools are not preempted — cancel is seen
             # at this checkpoint or the runner's pre-pause checkpoint.
             if state_store is not None and await state_store.is_cancel_requested(resolved_run_id):
-                meta = {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.CANCELLED,
                     steps=steps,
                     iteration_count=iteration - 1,
                     usage=total_usage,
-                    meta=meta,
+                    meta=guardrail_meta(g_engine, notifier_warnings),
                 )
 
             messages, tools = strategy.build_messages(
@@ -616,7 +616,6 @@ class ReActLoop(Loop):
                             {"direction": "incoming", "error": block_err},
                             warnings=notifier_warnings,
                         )
-                        meta = {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                         return RunResult(
                             run_id=resolved_run_id,
                             status=RunStatus.ERROR,
@@ -624,7 +623,7 @@ class ReActLoop(Loop):
                             steps=steps,
                             iteration_count=iteration,
                             usage=total_usage,
-                            meta=meta,
+                            meta=guardrail_meta(g_engine, notifier_warnings),
                         )
                     if cleaned != msg.content:
                         _in_was_redacted = True
@@ -695,64 +694,40 @@ class ReActLoop(Loop):
                 )
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
-            # Output guardrail — scan BEFORE recording so persisted
-            # semantic_response never contains raw PII.
+            # Output guardrail — detection-only. Persistence stores raw
+            # (DB is ground truth); the next scan_incoming redacts for
+            # the LLM. Outgoing enforces block/warn policies.
             if g_engine is not None and (response.text or response.tool_calls):
-                _orig_text = response.text
                 tc_params = (
                     [tc.params for tc in response.tool_calls] if response.tool_calls else None
                 )
-                out_text, _, out_findings, out_block, _p_redacted = await g_engine.scan_outgoing(
+                out_findings, out_block = await g_engine.scan_outgoing(
                     response.text or "", tc_params
                 )
                 if out_findings:
                     _all_guardrail_findings["outgoing"] = [
                         {"entity_type": f.entity_type, "score": f.score} for f in out_findings
                     ]
-                    await _record_governance(
-                        recorder,
-                        "guardrail.detected",
-                        iteration,
-                        {
-                            "direction": "outgoing",
-                            "findings_count": len(out_findings),
-                            "entities": list({f.entity_type for f in out_findings}),
-                        },
-                    )
-                    await _notify_governance(
-                        notifier,
-                        "guardrail.detected",
-                        iteration,
-                        {
-                            "direction": "outgoing",
-                            "findings_count": len(out_findings),
-                            "entities": list({f.entity_type for f in out_findings}),
-                        },
-                        warnings=notifier_warnings,
-                    )
-                _text_changed = _orig_text is not None and out_text != _orig_text
-                if _text_changed:
-                    response = LLMResponse(
-                        text=out_text,
-                        tool_calls=response.tool_calls,
-                        raw=response.raw,
-                        usage=response.usage,
-                        provider_request=response.provider_request,
-                        provider_response=response.provider_response,
-                    )
-                if (_text_changed or _p_redacted) and out_findings:
                     _out_entities = list({f.entity_type for f in out_findings})
                     await _record_governance(
                         recorder,
-                        "guardrail.redacted",
+                        "guardrail.detected",
                         iteration,
-                        {"direction": "outgoing", "entities": _out_entities},
+                        {
+                            "direction": "outgoing",
+                            "findings_count": len(out_findings),
+                            "entities": _out_entities,
+                        },
                     )
                     await _notify_governance(
                         notifier,
-                        "guardrail.redacted",
+                        "guardrail.detected",
                         iteration,
-                        {"direction": "outgoing", "entities": _out_entities},
+                        {
+                            "direction": "outgoing",
+                            "findings_count": len(out_findings),
+                            "entities": _out_entities,
+                        },
                         warnings=notifier_warnings,
                     )
                 if out_block is not None:
@@ -807,7 +782,6 @@ class ReActLoop(Loop):
                         {"direction": "outgoing", "error": out_block},
                         warnings=notifier_warnings,
                     )
-                    meta = {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                     return RunResult(
                         run_id=resolved_run_id,
                         status=RunStatus.ERROR,
@@ -815,10 +789,11 @@ class ReActLoop(Loop):
                         steps=steps,
                         iteration_count=iteration,
                         usage=total_usage,
-                        meta=meta,
+                        meta=guardrail_meta(g_engine, notifier_warnings),
                     )
 
-            # Record sanitized LLM response + accumulate usage
+            # Record the LLM response (raw — DB is ground truth)
+            # and accumulate usage.
             await _record_llm(
                 recorder,
                 response,
@@ -860,11 +835,6 @@ class ReActLoop(Loop):
                     iteration,
                     notifier_warnings,
                 )
-                meta: dict[str, Any] = (  # type: ignore[no-redef]
-                    {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
-                )
-                if g_engine is not None:
-                    meta["pii_mapping"] = g_engine.get_pii_mapping()  # type: ignore[assignment]
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.SUCCESS,
@@ -872,7 +842,7 @@ class ReActLoop(Loop):
                     steps=steps,
                     iteration_count=iteration,
                     usage=total_usage,
-                    meta=meta,
+                    meta=guardrail_meta(g_engine, notifier_warnings),
                 )
 
             if isinstance(step.action, Clarification):
@@ -893,11 +863,10 @@ class ReActLoop(Loop):
                     iteration=iteration,
                     usage=total_usage,
                 )
-                meta = {"pause_state": pause}  # type: ignore[dict-item]
-                if notifier_warnings:
-                    meta["notifier_warnings"] = notifier_warnings
-                if g_engine is not None:
-                    meta["pii_mapping"] = g_engine.get_pii_mapping()  # type: ignore[assignment]
+                meta: dict[str, Any] = {
+                    "pause_state": pause,
+                    **guardrail_meta(g_engine, notifier_warnings),
+                }
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.WAITING_HUMAN_INPUT,
@@ -946,11 +915,7 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         usage=total_usage,
                     )
-                    meta = {"pause_state": pause}  # type: ignore[dict-item]
-                    if notifier_warnings:
-                        meta["notifier_warnings"] = notifier_warnings
-                    if g_engine is not None:
-                        meta["pii_mapping"] = g_engine.get_pii_mapping()  # type: ignore[assignment]
+                    meta = {"pause_state": pause, **guardrail_meta(g_engine, notifier_warnings)}
                     return RunResult(
                         run_id=resolved_run_id,
                         status=pause_status,
@@ -960,16 +925,13 @@ class ReActLoop(Loop):
                         meta=meta,
                     )
 
-        meta = {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
-        if g_engine is not None:
-            meta["pii_mapping"] = g_engine.get_pii_mapping()  # type: ignore[assignment]
         return RunResult(
             run_id=resolved_run_id,
             status=RunStatus.MAX_ITERATIONS,
             steps=steps,
             iteration_count=agent.max_iterations,
             usage=total_usage,
-            meta=meta,
+            meta=guardrail_meta(g_engine, notifier_warnings),
         )
 
     async def run_stream(

@@ -18,10 +18,35 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from dendrux.agent import Agent
+    from dendrux.guardrails._engine import GuardrailEngine
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def guardrail_meta(
+    g_engine: GuardrailEngine | None,
+    notifier_warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build the RunResult.meta payload that must reach the runner's
+    terminal finalize call.
+
+    Two pieces travel this path:
+
+      - ``pii_mapping``: the audit key. Must appear on every terminal
+        RunResult — not just the happy path — or the runner's finalize
+        call writes ``NULL`` into ``agent_runs.pii_mapping`` and the
+        raw traces persisted during the run lose their LLM-eye view.
+      - ``notifier_warnings``: best-effort-notifier failures collected
+        during the run, surfaced to the caller on RunResult.meta.
+    """
+    meta: dict[str, Any] = {}
+    if g_engine is not None:
+        meta["pii_mapping"] = g_engine.get_pii_mapping()
+    if notifier_warnings:
+        meta["notifier_warnings"] = notifier_warnings
+    return meta
 
 
 def build_cache_key_prefix(agent: Agent) -> str | None:
