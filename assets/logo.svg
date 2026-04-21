@@ -1,0 +1,29 @@
+<svg width="96" height="96" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="logo-g" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#5cffb1" />
+      <stop offset="100%" stop-color="#15a564" />
+    </radialGradient>
+  </defs>
+  <circle cx="16" cy="16" r="3.2" fill="url(#logo-g)" />
+  <g stroke="url(#logo-g)" stroke-width="1.6" stroke-linecap="round">
+    <path d="M16 13 L16 5" />
+    <path d="M16 19 L16 27" />
+    <path d="M13 16 L5 16" />
+    <path d="M19 16 L27 16" />
+    <path d="M13.5 13.5 L8 8" />
+    <path d="M18.5 13.5 L24 8" />
+    <path d="M13.5 18.5 L8 24" />
+    <path d="M18.5 18.5 L24 24" />
+  </g>
+  <g fill="#5cffb1">
+    <circle cx="5" cy="5" r="1.1" />
+    <circle cx="27" cy="5" r="1.1" />
+    <circle cx="5" cy="27" r="1.1" />
+    <circle cx="27" cy="27" r="1.1" />
+    <circle cx="16" cy="5" r="1.1" />
+    <circle cx="16" cy="27" r="1.1" />
+    <circle cx="5" cy="16" r="1.1" />
+    <circle cx="27" cy="16" r="1.1" />
+  </g>
+</svg>

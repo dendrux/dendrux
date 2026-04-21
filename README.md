@@ -1,10 +1,26 @@
-# 🌿 Dendrux
+<p align="center">
+  <img src="https://raw.githubusercontent.com/dendrux/dendrux/main/assets/logo.svg" alt="Dendrux" width="96" height="96" />
+</p>
 
-The async Python runtime for agents that survive failure, persist everything, and bridge to the real world.
+<h1 align="center">Dendrux</h1>
 
-[![CI](https://github.com/dendrux/dendrux/actions/workflows/ci.yml/badge.svg)](https://github.com/dendrux/dendrux/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+<p align="center">
+  The async Python runtime for agents that survive failure, persist everything, and bridge to the real world.
+</p>
+
+<p align="center">
+  <a href="https://www.dendrux.dev">Website</a>
+  ·
+  <a href="https://www.dendrux.dev/docs">Docs</a>
+  ·
+  <a href="https://github.com/dendrux/dendrux">GitHub</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/dendrux/dendrux/actions/workflows/ci.yml"><img src="https://github.com/dendrux/dendrux/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
+</p>
 
 > `v0.1.0a5` - core API stabilizing, actively developed.
 
