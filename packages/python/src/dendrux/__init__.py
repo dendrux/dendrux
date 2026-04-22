@@ -1,6 +1,11 @@
 """Dendrux — The runtime for agents that act in the real world."""
 
-__version__ = "0.1.0a3"
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("dendrux")
+except PackageNotFoundError:  # editable install before metadata exists
+    __version__ = "0.0.0+dev"
 
 from dendrux.agent import Agent
 from dendrux.errors import (
