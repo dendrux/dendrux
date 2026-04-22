@@ -15,7 +15,7 @@ This page is the map. Each concern has its own page for the details.
 
 | Concern | What it does | Reference |
 | --- | --- | --- |
-| [Guardrails](/docs/architecture/guardrails) | Scan every message before and after the LLM for PII, secrets, or custom patterns. Redact, block, or warn. | `dendrux.guardrails` |
+| [Guardrails](/docs/architecture/guardrails) | Scan every message before and after the LLM. Built-in detectors for [PII](/docs/architecture/pii-redaction), secrets, and [prompt injection](/docs/recipes/prompt-injection-patterns), plus custom regex patterns. Redact, block, or warn. | `dendrux.guardrails` |
 | [Approval](/docs/architecture/approval) | Pause the run before a gated tool executes. A human decides approve or deny. | `require_approval=[...]` |
 | [Access control](/docs/architecture/access-control) | Policy gate on tool calls, skill invocations, and MCP connections. Denies at the boundary before state changes. | `policy=...`, `skills=...` |
 | Budget | Track per-run spend and token usage. Raise threshold events at configurable ratios, abort at the hard cap. | `budget=Budget(...)` |
@@ -26,7 +26,7 @@ Guardrails, approval, and access control are independent. You can use any one, a
 
 Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
 
-All 13 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+All 14 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
 
 ```text
 POLICY_DENIED           = 'policy.denied'
@@ -42,7 +42,10 @@ SKILL_DENIED            = 'skill.denied'
 SKILL_INVOKED           = 'skill.invoked'
 MCP_CONNECTED           = 'mcp.connected'
 MCP_ERROR               = 'mcp.error'
+PROVIDER_RETRY          = 'provider.retry'
 ```
+
+`guardrail.detected` and `guardrail.blocked` carry the matched entity type and snippet in their payload, so a single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
 
 Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
 

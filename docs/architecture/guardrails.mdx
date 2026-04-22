@@ -1,13 +1,13 @@
 ---
 title: Guardrails
-description: Pattern-based content scanners that redact, block, or warn on PII, secrets, and custom rules, applied before and after every LLM turn.
+description: Pattern-based content scanners that redact, block, or warn on PII, secrets, prompt injection, and custom rules, applied before and after every LLM turn.
 ---
 
 # Guardrails
 
 Guardrails sit on the edge of every LLM turn. Before a message goes to the model, every guardrail gets a chance to scan the text, find a problem, and pick one of three actions. After the model replies, the same thing happens in the other direction. If none of them find anything, the turn continues as if they were not there.
 
-Dendrux ships two built-ins: `PII` and `SecretDetection`. `PII` has two backends — a default regex scanner (five canonical entities, zero dependencies) and an opt-in Microsoft Presidio scanner (~18 entities, NLP-backed). `SecretDetection` is regex-only. Both accept custom patterns. The engine that runs them is shared, and it is the same pipeline every governance concern uses, so findings land on `run_events` as `guardrail.detected`, `guardrail.redacted`, and `guardrail.blocked`. See [Governance](/docs/architecture/governance) for how that pipeline fits together.
+Dendrux ships three built-ins: `PII`, `SecretDetection`, and `PromptInjection`. `PII` has two backends — a default regex scanner (five canonical entities, zero dependencies) and an opt-in Microsoft Presidio scanner (~18 entities, NLP-backed). `SecretDetection` ships regex detectors for AWS keys, generic API tokens, and PEM private-key headers. `PromptInjection` is regex-only with **no default patterns** — injection threats are domain-specific, so the dev supplies them; the [recipes page](/docs/recipes/prompt-injection-patterns) ships starter snippets per app type. All three accept custom `Pattern` objects. The engine that runs them is shared, and it is the same pipeline every governance concern uses, so findings land on `run_events` as `guardrail.detected`, `guardrail.redacted`, and `guardrail.blocked`. See [Governance](/docs/architecture/governance) for how that pipeline fits together.
 
 ## Three actions, one protocol
 
@@ -237,7 +237,29 @@ governance events:
   seq=1  guardrail.blocked  data={"direction": "incoming", "error": "Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY ...
 ```
 
-One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name, so a reader can see which rule fired. The run ends here; nothing downstream executes.
+One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name and the matched snippet (truncated to 80 chars, `repr()`-ed for log safety) so a reader can see which rule fired and on what.
+
+## Prompt injection — domain-specific by design
+
+`PromptInjection` is the third built-in. It targets the "ignore previous instructions" / "reveal the system prompt" / hidden-comment / ChatML-token class of attacks, and it covers two boundaries simultaneously:
+
+1. **User input + tool-result re-entry** — the engine's incoming scan walks every message handed to `provider.complete()` on each iteration. Tool result messages are part of the prompt on the next turn, so the same scan catches injection arriving via web fetches, file reads, search results, and MCP outputs.
+2. **LLM output + tool-call params** — the outgoing scan catches a model that complies with an earlier injection and tries to act on it.
+
+Unlike `PII` and `SecretDetection`, **no default patterns ship**. Injection signatures are domain-specific: a pattern that protects a customer support agent breaks a security-research agent that summarizes jailbreak papers. The dev supplies `patterns=[...]`, and `redact` is intentionally not supported (no reversible value to deanonymize):
+
+```python
+PromptInjection(
+    action="block",     # block (default) | warn — no redact
+    engine="regex",     # v1 only; classifier engine planned for v2
+    patterns=[
+        Pattern("INSTRUCTION_OVERRIDE",
+            r"(?i)\bignore\s+(?:all\s+|the\s+)?(?:previous|prior|above)\s+instructions?\b"),
+    ],
+)
+```
+
+The [recipes page](/docs/recipes/prompt-injection-patterns) ships starter patterns organized by app type (customer support, RAG/web-fetching, code-execution sandboxes), plus authoring caveats around catastrophic backtracking. Streaming (`Agent.stream()`) is the one boundary that does not support guardrails — use the non-streaming API when guardrails are required.
 
 ## Custom patterns with the `warn` action
 
@@ -286,15 +308,19 @@ agent = Agent(
     ...,
     guardrails=[
         SecretDetection(),                      # block on secrets (kills the run)
-        PII(),                                  # redact PII if no secret blocked
-        PII(action="warn",
+        PromptInjection(                        # block on injection signatures
+            patterns=[Pattern("INSTRUCTION_OVERRIDE",
+                r"(?i)\bignore\s+(?:previous|prior|above)\s+instructions?\b")],
+        ),
+        PII(),                                  # redact PII if nothing above blocked
+        PII(action="warn",                      # warn on custom entities
             extra_patterns=[Pattern("INTERNAL_ID", r"ACME-\d{4}")],
-            include_defaults=False),            # warn on custom entities
+            include_defaults=False),
     ],
 )
 ```
 
-With that configuration, a message containing an AWS key is blocked. A message with only PII has the PII redacted. A message with only an internal ticket id produces a `guardrail.detected` event but is otherwise unchanged.
+With that configuration, a message containing an AWS key is blocked first. A message containing "ignore previous instructions" is blocked next. A message with only PII has the PII redacted. A message with only an internal ticket id produces a `guardrail.detected` event but is otherwise unchanged.
 
 ## Why pattern-based instead of LLM-as-judge
 
