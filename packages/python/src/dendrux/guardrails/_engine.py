@@ -19,6 +19,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_RECURSION_DEPTH = 50
+_MAX_BLOCK_SNIPPET = 80
+
+
+def _block_message(guardrail: object, finding: Finding, *, where: str = "") -> str:
+    """Format a block error string with the matched span included.
+
+    The matched text is truncated and ``repr()``-ed so attacker-controlled
+    payloads don't smuggle control characters into logs / dashboards.
+    """
+    name = type(guardrail).__name__
+    snippet = finding.text
+    if len(snippet) > _MAX_BLOCK_SNIPPET:
+        snippet = snippet[:_MAX_BLOCK_SNIPPET] + "..."
+    suffix = f" in {where}" if where else ""
+    return f"Guardrail {name!r} blocked: {finding.entity_type} matched {snippet!r}{suffix}"
 
 
 class GuardrailEngine:
@@ -92,11 +107,10 @@ class GuardrailEngine:
             all_findings.extend(findings)
 
             if guardrail.action == "block":
-                entity = findings[0].entity_type
                 return (
                     text,
                     all_findings,
-                    (f"Guardrail '{type(guardrail).__name__}' blocked: {entity} detected"),
+                    _block_message(guardrail, findings[0]),
                 )
 
             if guardrail.action == "redact":
@@ -126,13 +140,9 @@ class GuardrailEngine:
             if findings:
                 all_findings.extend(findings)
                 if guardrail.action == "block":
-                    entity = findings[0].entity_type
                     return (
                         all_findings,
-                        (
-                            f"Guardrail '{type(guardrail).__name__}' blocked: "
-                            f"{entity} detected in LLM output"
-                        ),
+                        _block_message(guardrail, findings[0], where="LLM output"),
                     )
 
         if tool_call_params:
@@ -319,13 +329,9 @@ async def _scan_leaf_for_findings(
         all_findings.extend(merged)
 
         if guardrail.action == "block":
-            entity = merged[0].entity_type
             return (
                 all_findings,
-                (
-                    f"Guardrail '{type(guardrail).__name__}' blocked: "
-                    f"{entity} detected in tool call params"
-                ),
+                _block_message(guardrail, merged[0], where="tool call params"),
             )
 
     return all_findings, None
