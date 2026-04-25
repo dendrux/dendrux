@@ -201,9 +201,17 @@ class Loop(ABC):
             run_id: Optional runner-provided ID. If None, loop generates one.
             recorder: Internal persistence hooks (fail-closed).
             notifier: Optional notifier for best-effort notifications.
-            initial_history: Pre-existing conversation history for resume.
-                When provided, skips creating the user message and uses
-                this as the starting history.
+            initial_history: Pre-existing conversation history. Used for
+                two cases: (1) resuming a paused run with messages already
+                persisted in the DB, and (2) seeding a fresh run with chat
+                history passed by the caller (typically via
+                ``agent.run(history=...)``). In BOTH cases the loop treats
+                this list as already-known and does NOT call
+                ``record_message`` / ``notify_message`` for any of its
+                contents — the caller is responsible for recording any
+                new messages it expects to land in ``react_traces``.
+                For chatbot-style fresh runs, ``runner.run`` records the
+                new ``user_input`` itself before invoking the loop.
             initial_steps: Pre-existing AgentSteps from before a pause.
                 Merged with new steps so the final RunResult.steps spans
                 the entire run.

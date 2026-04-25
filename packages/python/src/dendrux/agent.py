@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from dendrux.chat import ChatMessage
     from dendrux.guardrails._protocol import Guardrail
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
@@ -660,6 +661,7 @@ class Agent:
         self,
         user_input: str,
         *,
+        history: list[ChatMessage] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -674,6 +676,7 @@ class Agent:
         self,
         user_input: str,
         *,
+        history: list[ChatMessage] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -686,6 +689,7 @@ class Agent:
         self,
         user_input: str,
         *,
+        history: list[ChatMessage] | None = None,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
@@ -701,6 +705,15 @@ class Agent:
 
         Args:
             user_input: The user's input to process.
+            history: Optional prior conversation turns to seed the run with —
+                for building chatbots on top of Dendrux. Each ``ChatMessage``
+                is a ``role`` (USER or ASSISTANT) plus ``content``. The dev's
+                app owns conversation storage; Dendrux only reads ``history``
+                as input for this turn and does NOT persist it to
+                ``react_traces``. Validation rules: must start with USER, end
+                with ASSISTANT, no consecutive same-role messages, no empty
+                content. Invalid history raises ``ValueError`` before any
+                run is created. ``None`` and ``[]`` mean "no prior context."
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
             notifier: Optional notifier for lifecycle events (e.g. ConsoleNotifier
@@ -714,7 +727,8 @@ class Agent:
                 returned. If still active, RunAlreadyActiveError is raised. If the
                 same key is reused with different input, IdempotencyConflictError
                 is raised. Requires persistence (database_url, state_store, or
-                DENDRUX_DATABASE_URL).
+                DENDRUX_DATABASE_URL). The hash includes ``history`` — same input
+                with different history is treated as a different request.
             **kwargs: Forwarded to the LLM provider (temperature, max_tokens, etc.).
 
         Returns:
@@ -773,6 +787,7 @@ class Agent:
             self,
             provider=provider,
             user_input=user_input,
+            history=history,
             state_store=store,
             tenant_id=tenant_id,
             metadata=metadata,
@@ -1217,6 +1232,7 @@ class Agent:
         self,
         user_input: str,
         *,
+        history: list[ChatMessage] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -1229,6 +1245,7 @@ class Agent:
         self,
         user_input: str,
         *,
+        history: list[ChatMessage] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -1239,6 +1256,7 @@ class Agent:
         self,
         user_input: str,
         *,
+        history: list[ChatMessage] | None = None,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
@@ -1271,6 +1289,15 @@ class Agent:
 
         Args:
             user_input: The user's input to process.
+            history: Optional prior conversation turns to seed the run with —
+                for building chatbots on top of Dendrux. Each ``ChatMessage``
+                is a ``role`` (USER or ASSISTANT) plus ``content``. The dev's
+                app owns conversation storage; Dendrux only reads ``history``
+                as input for this turn and does NOT persist it to
+                ``react_traces``. Validation rules: must start with USER, end
+                with ASSISTANT, no consecutive same-role messages, no empty
+                content. Invalid history raises ``ValueError`` synchronously
+                (before the stream begins).
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
             notifier: Optional notifier for lifecycle events.
@@ -1282,7 +1309,7 @@ class Agent:
             RunStream — async iterable of RunEvent objects.
 
         Raises:
-            ValueError: If no provider is configured.
+            ValueError: If no provider is configured, or if ``history`` is invalid.
         """
         _validate_max_delegation_depth(max_delegation_depth)
 
@@ -1313,6 +1340,7 @@ class Agent:
             self,
             provider=provider,
             user_input=user_input,
+            history=history,
             state_store_resolver=self._resolve_state_store,
             tenant_id=tenant_id,
             metadata=metadata,

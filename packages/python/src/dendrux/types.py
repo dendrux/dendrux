@@ -825,18 +825,25 @@ def compute_idempotency_fingerprint(
     agent_name: str,
     user_input: str,
     output_type_name: str | None = None,
+    history: list[Message] | None = None,
 ) -> str:
     """Deterministic SHA-256 fingerprint for idempotency conflict detection.
 
-    Includes agent_name + user_input + output_type (request identity).
-    Does NOT include provider kwargs (temperature, max_tokens) — those
-    are execution tuning, not request identity.
+    Includes agent_name + user_input + output_type + chat history (request
+    identity). Does NOT include provider kwargs (temperature, max_tokens) —
+    those are execution tuning, not request identity.
 
     output_type changes the return shape contract, so two calls with
     different output_types must be treated as different requests.
+
+    History is hashed as the canonical list of (role, content) pairs from
+    the normalized Message objects — different construction paths producing
+    equivalent normalized history hash identically.
     """
     data: dict[str, Any] = {"agent_name": agent_name, "user_input": user_input}
     if output_type_name is not None:
         data["output_type"] = output_type_name
+    if history:
+        data["history"] = [{"role": m.role.value, "content": m.content} for m in history]
     payload = json.dumps(data, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

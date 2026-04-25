@@ -4,4 +4,6 @@ from dendrux import __version__
 
 
 def test_version_exists() -> None:
-    assert __version__ == "0.1.0a3"
+    """The installed package must have a real version, not the dev fallback."""
+    assert __version__
+    assert __version__ != "0.0.0+dev"

@@ -107,17 +107,12 @@ class SingleCall(Loop):
                 "without output_type, or output_type without guardrails."
             )
 
-        is_resume = (
-            initial_history is not None
-            or initial_steps
-            or iteration_offset != 0
-            or initial_usage is not None
-        )
+        is_resume = initial_steps or iteration_offset != 0 or initial_usage is not None
         if is_resume:
             raise RuntimeError(
                 "SingleCall does not support resume. It never pauses "
                 "(no tools, no waiting states), so receiving resume parameters "
-                "(initial_history, initial_steps, iteration_offset, initial_usage) "
+                "(initial_steps, iteration_offset, initial_usage) "
                 "indicates a bug in the caller."
             )
 
@@ -125,10 +120,15 @@ class SingleCall(Loop):
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
 
-        user_msg = Message(role=Role.USER, content=user_input)
-        history = [user_msg]
-        await record_message(recorder, user_msg, 0)
-        await notify_message(notifier, user_msg, 0)
+        if initial_history is not None:
+            # Seeded chat history (or resume) — caller already persisted what's
+            # supposed to land in react_traces. Use as-is, do not re-record.
+            history: list[Message] = list(initial_history)
+        else:
+            user_msg = Message(role=Role.USER, content=user_input)
+            history = [user_msg]
+            await record_message(recorder, user_msg, 0)
+            await notify_message(notifier, user_msg, 0)
 
         messages, _tools = strategy.build_messages(
             system_prompt=agent.get_system_prompt(),
@@ -435,17 +435,12 @@ class SingleCall(Loop):
                 "Use agent.run() for structured output, or agent.stream() without output_type."
             )
 
-        is_resume = (
-            initial_history is not None
-            or initial_steps
-            or iteration_offset != 0
-            or initial_usage is not None
-        )
+        is_resume = initial_steps or iteration_offset != 0 or initial_usage is not None
         if is_resume:
             raise RuntimeError(
                 "SingleCall does not support resume. It never pauses "
                 "(no tools, no waiting states), so receiving resume parameters "
-                "(initial_history, initial_steps, iteration_offset, initial_usage) "
+                "(initial_steps, iteration_offset, initial_usage) "
                 "indicates a bug in the caller."
             )
 
@@ -453,10 +448,15 @@ class SingleCall(Loop):
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
 
-        user_msg = Message(role=Role.USER, content=user_input)
-        history = [user_msg]
-        await record_message(recorder, user_msg, 0)
-        await notify_message(notifier, user_msg, 0)
+        if initial_history is not None:
+            # Seeded chat history (or resume) — caller already persisted what's
+            # supposed to land in react_traces. Use as-is, do not re-record.
+            history: list[Message] = list(initial_history)
+        else:
+            user_msg = Message(role=Role.USER, content=user_input)
+            history = [user_msg]
+            await record_message(recorder, user_msg, 0)
+            await notify_message(notifier, user_msg, 0)
 
         messages, _tools = strategy.build_messages(
             system_prompt=agent.get_system_prompt(),

@@ -21,6 +21,8 @@ import logging
 from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
+from dendrux.chat import normalize_chat_history
+from dendrux.loops._helpers import notify_message, record_message
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime.context import (
     DelegationContext,
@@ -33,7 +35,9 @@ from dendrux.runtime.context import (
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
+    Message,
     PauseState,
+    Role,
     RunAlreadyActiveError,
     RunEventType,
     RunStatus,
@@ -46,11 +50,12 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
     from dendrux.agent import Agent
+    from dendrux.chat import ChatMessage
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import Message, RunEvent, RunResult, RunStream, ToolCall, ToolResult
+    from dendrux.types import RunEvent, RunResult, RunStream, ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -440,6 +445,7 @@ async def run(
     *,
     provider: LLMProvider,
     user_input: str,
+    history: list[ChatMessage] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -459,6 +465,7 @@ async def run(
     *,
     provider: LLMProvider,
     user_input: str,
+    history: list[ChatMessage] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -476,6 +483,7 @@ async def run(
     *,
     provider: LLMProvider,
     user_input: str,
+    history: list[ChatMessage] | None = None,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
@@ -541,6 +549,24 @@ async def run(
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
+
+    # Validate + normalize chat history before any side effects.
+    # Raises ValueError on bad input so no DB row is created.
+    normalized_history = normalize_chat_history(history)
+    # When chat history is provided, the loop expects initial_history to
+    # be the COMPLETE message list (loops use initial_history as-is and
+    # do not separately append user_input — same contract as resume).
+    # The runner will record the new user_input itself (after the recorder
+    # is constructed) so seeded prior turns stay out of react_traces.
+    seeded_history: list[Message] | None
+    if normalized_history:
+        seeded_history = [
+            *normalized_history,
+            Message(role=Role.USER, content=user_input),
+        ]
+    else:
+        seeded_history = None
+
     provider_kwargs = dict(kwargs) if kwargs else {}
 
     run_id = generate_ulid()
@@ -573,7 +599,10 @@ async def run(
                 else None
             )
             idem_fingerprint = compute_idempotency_fingerprint(
-                agent.name, user_input, output_type_name=output_type_name
+                agent.name,
+                user_input,
+                output_type_name=output_type_name,
+                history=normalized_history or None,
             )
 
         create_result = await state_store.create_run(
@@ -654,6 +683,19 @@ async def run(
                 logger.warning("Failed to emit mcp.error event", exc_info=True)
             raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
+        # When chat history was provided, the loop receives a complete
+        # message list as initial_history and skips its own user-message
+        # recording. The runner records the new user_input itself so it
+        # still lands in react_traces (seeded prior turns are NOT recorded
+        # — they live in the dev's chat DB).
+        if seeded_history is not None:
+            await record_message(recorder, Message(role=Role.USER, content=user_input), 0)
+            await notify_message(
+                extra_notifier,
+                Message(role=Role.USER, content=user_input),
+                0,
+            )
+
         result = await resolved_loop.run(
             agent=agent,
             provider=provider,
@@ -662,6 +704,7 @@ async def run(
             run_id=run_id,
             recorder=recorder,
             notifier=extra_notifier,
+            initial_history=seeded_history,
             provider_kwargs=provider_kwargs or None,
             output_type=output_type,
             state_store=state_store,
@@ -1032,6 +1075,7 @@ def run_stream(
     *,
     provider: LLMProvider,
     user_input: str,
+    history: list[ChatMessage] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -1051,6 +1095,7 @@ def run_stream(
     *,
     provider: LLMProvider,
     user_input: str,
+    history: list[ChatMessage] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -1068,6 +1113,7 @@ def run_stream(
     *,
     provider: LLMProvider,
     user_input: str,
+    history: list[ChatMessage] | None = None,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
@@ -1113,6 +1159,22 @@ def run_stream(
 
     from dendrux.types import RunEvent, RunResult
     from dendrux.types import RunStream as _RunStream
+
+    # Validate + normalize chat history synchronously so ValueError surfaces
+    # to the caller immediately, not as a RUN_ERROR event.
+    normalized_history = normalize_chat_history(history)
+    # When chat history is provided, build the complete starting message list
+    # (loops use initial_history as-is and do not separately append user_input).
+    # The new user_input is recorded by the runner itself inside _generate()
+    # so seeded prior turns stay out of react_traces.
+    seeded_history: list[Message] | None
+    if normalized_history:
+        seeded_history = [
+            *normalized_history,
+            Message(role=Role.USER, content=user_input),
+        ]
+    else:
+        seeded_history = None
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
@@ -1228,6 +1290,18 @@ def run_stream(
                     logger.warning("Failed to emit mcp.error event", exc_info=True)
                 raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
+            # When chat history was provided, the loop receives a complete
+            # message list as initial_history and skips its own user-message
+            # recording. Record the new user_input here so it still lands in
+            # react_traces (seeded prior turns are NOT recorded).
+            if seeded_history is not None:
+                await record_message(recorder, Message(role=Role.USER, content=user_input), 0)
+                await notify_message(
+                    extra_notifier,
+                    Message(role=Role.USER, content=user_input),
+                    0,
+                )
+
             # 3. Stream the loop
             async for event in resolved_loop.run_stream(
                 agent=agent,
@@ -1237,6 +1311,7 @@ def run_stream(
                 run_id=run_id,
                 recorder=recorder,
                 notifier=extra_notifier,
+                initial_history=seeded_history,
                 provider_kwargs=provider_kwargs or None,
                 output_type=output_type,
                 state_store=store,

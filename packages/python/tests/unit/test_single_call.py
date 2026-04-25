@@ -156,8 +156,44 @@ class TestSingleCallRun:
                 user_input="test",
             )
 
-    async def test_rejects_resume_with_initial_history(self) -> None:
-        """SingleCall must reject resume parameters."""
+    async def test_accepts_initial_history_as_chat_context(self) -> None:
+        """SingleCall now accepts initial_history (chat history seeding).
+
+        It is no longer treated as a resume signal. The full message list
+        comes from initial_history when provided, with the runner being
+        responsible for appending the new user_input to it.
+        """
+        llm = MockLLM([_response("ok")])
+        agent = _make_agent()
+
+        history = [
+            Message(role=Role.USER, content="prior question"),
+            Message(role=Role.ASSISTANT, content="prior answer"),
+            Message(role=Role.USER, content="next question"),
+        ]
+
+        result = await SingleCall().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="next question",
+            initial_history=history,
+        )
+        assert result.status == RunStatus.SUCCESS
+
+        # Provider should have seen the entire seeded history as messages.
+        sent = llm.call_history[0]["messages"]
+        user_assistant = [m for m in sent if m.role in (Role.USER, Role.ASSISTANT)]
+        assert [m.content for m in user_assistant] == [
+            "prior question",
+            "prior answer",
+            "next question",
+        ]
+
+    async def test_rejects_resume_with_initial_steps(self) -> None:
+        """SingleCall must reject initial_steps (genuine resume signal)."""
+        from dendrux.types import AgentStep, Finish
+
         llm = MockLLM([_response("ok")])
         agent = _make_agent()
 
@@ -167,7 +203,9 @@ class TestSingleCallRun:
                 provider=llm,
                 strategy=NativeToolCalling(),
                 user_input="test",
-                initial_history=[Message(role=Role.USER, content="prior")],
+                initial_steps=[
+                    AgentStep(reasoning=None, action=Finish(answer="x")),
+                ],
             )
 
     async def test_rejects_resume_with_iteration_offset(self) -> None:
@@ -199,7 +237,7 @@ class TestSingleCallRun:
             )
 
     async def test_stream_rejects_resume(self) -> None:
-        """SingleCall streaming must also reject resume parameters."""
+        """SingleCall streaming must reject genuine resume parameters."""
         llm = MockLLM([_response("ok")])
         agent = _make_agent()
 
@@ -209,9 +247,39 @@ class TestSingleCallRun:
                 provider=llm,
                 strategy=NativeToolCalling(),
                 user_input="test",
-                initial_history=[Message(role=Role.USER, content="prior")],
+                initial_usage=UsageStats(input_tokens=100, output_tokens=50, total_tokens=150),
             ):
                 pass
+
+    async def test_stream_accepts_initial_history(self) -> None:
+        """SingleCall streaming now accepts initial_history (chat seeding)."""
+        llm = MockLLM([_response("streamed answer")])
+        agent = _make_agent()
+
+        history = [
+            Message(role=Role.USER, content="prior"),
+            Message(role=Role.ASSISTANT, content="prior reply"),
+            Message(role=Role.USER, content="next"),
+        ]
+
+        events = []
+        async for ev in SingleCall().run_stream(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="next",
+            initial_history=history,
+        ):
+            events.append(ev)
+
+        # Verify provider saw the seeded history.
+        sent = llm.call_history[0]["messages"]
+        user_assistant = [m for m in sent if m.role in (Role.USER, Role.ASSISTANT)]
+        assert [m.content for m in user_assistant] == [
+            "prior",
+            "prior reply",
+            "next",
+        ]
 
     async def test_handles_none_text(self) -> None:
         """If provider returns None text, answer should be None."""
