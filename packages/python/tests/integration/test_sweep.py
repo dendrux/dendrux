@@ -1,7 +1,7 @@
-"""Integration tests for stale-run sweep — real SQLite, full lifecycle.
+"""Integration tests for stale-run sweep — full lifecycle across the backend matrix.
 
-Uses in-memory SQLite so no files are created.
-Each test gets a fresh engine and tables via the `engine` fixture.
+The ``engine`` / ``store`` / ``session_factory`` fixtures live in
+``tests/integration/conftest.py`` and parametrize across SQLite and Postgres.
 """
 
 from __future__ import annotations
@@ -11,49 +11,10 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
 
-from dendrux.db.models import AgentRun, Base
+from dendrux.db.models import AgentRun
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import generate_ulid
-
-# ------------------------------------------------------------------
-# Fixtures
-# ------------------------------------------------------------------
-
-
-@pytest.fixture
-async def engine():
-    """Create a fresh in-memory SQLite engine with all tables."""
-    from sqlalchemy import event
-
-    eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_conn, _connection_record):
-        dbapi_conn.execute("PRAGMA foreign_keys = ON")
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-def store(engine):
-    """StateStore backed by the test engine."""
-    return SQLAlchemyStateStore(engine)
-
-
-@pytest.fixture
-def session_factory(engine):
-    """Raw session factory for direct DB assertions."""
-    return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
 
 # ------------------------------------------------------------------
 # Helpers

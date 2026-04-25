@@ -17,10 +17,9 @@ import asyncio
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.agent import Agent
-from dendrux.db.models import AgentRun, Base, RunEvent
+from dendrux.db.models import AgentRun, RunEvent
 from dendrux.errors import RunAlreadyTerminalError
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
@@ -45,18 +44,9 @@ async def refund_tool(order_id: int) -> str:
 
 
 @pytest.fixture
-async def db_store():
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    store = SQLAlchemyStateStore(engine)
-    try:
-        yield store
-    finally:
-        await engine.dispose()
+def db_store(engine):
+    """StateStore over the matrix engine — alias for the conftest `store` fixture."""
+    return SQLAlchemyStateStore(engine)
 
 
 def _client_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:

@@ -31,9 +31,19 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
-    func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def _utc_now() -> datetime.datetime:
+    """Python-side default for timestamp columns. Always aware-UTC.
+
+    Used as ``default=`` (fires on INSERT) and ``onupdate=`` (fires on
+    UPDATE when the column is not in the explicit values clause). Keeps
+    write behavior identical across SQLite and Postgres — the database's
+    own ``now()`` function is never consulted.
+    """
+    return datetime.datetime.now(datetime.UTC)
 
 
 class Base(DeclarativeBase):
@@ -97,7 +107,9 @@ class AgentRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Sweep / recovery columns
-    last_progress_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_progress_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # Idempotency columns — duplicate run prevention
@@ -110,9 +122,9 @@ class AgentRun(Base):
         Boolean, nullable=False, default=False, server_default="0"
     )
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
     )
 
     # Relationships
@@ -167,9 +179,9 @@ class ReactTrace(Base):
     order_index: Mapped[int] = mapped_column(Integer)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
     )
 
     # Relationships
@@ -203,9 +215,9 @@ class ToolCallRecord(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
     )
 
     # Relationships
@@ -238,7 +250,7 @@ class TokenUsage(Base):
     cache_creation_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="token_usages")
@@ -286,7 +298,7 @@ class LLMInteraction(Base):
     # Guardrail findings — best-effort enrichment (not authoritative audit)
     guardrail_findings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="llm_interactions")
@@ -333,7 +345,7 @@ class RunEvent(Base):
     correlation_id: Mapped[str | None] = mapped_column(String(26), nullable=True)
     data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
     # Relationships
     agent_run: Mapped[AgentRun] = relationship(back_populates="run_events")

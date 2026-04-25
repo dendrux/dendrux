@@ -1,48 +1,15 @@
-"""Integration tests for agent.retry() — real SQLite, full lifecycle.
+"""Integration tests for agent.retry() across the backend matrix.
 
-Uses in-memory SQLite so no files are created.
-Each test gets a fresh engine and tables via the `engine` fixture.
+The ``engine`` / ``store`` fixtures live in
+``tests/integration/conftest.py`` and parametrize across SQLite and Postgres.
 """
 
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import event
-from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux.db.models import Base
 from dendrux.llm.mock import MockLLM
-from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import LLMResponse, RunStatus, ToolCall
-
-# ------------------------------------------------------------------
-# Fixtures
-# ------------------------------------------------------------------
-
-
-@pytest.fixture
-async def engine():
-    """Create a fresh in-memory SQLite engine with all tables."""
-    eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_conn, _connection_record):
-        dbapi_conn.execute("PRAGMA foreign_keys = ON")
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-def store(engine):
-    """StateStore backed by the test engine."""
-    return SQLAlchemyStateStore(engine)
-
 
 # ------------------------------------------------------------------
 # Tests

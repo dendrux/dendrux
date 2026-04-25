@@ -12,10 +12,11 @@ Usage:
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, overload
 
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import (
@@ -34,6 +35,50 @@ if TYPE_CHECKING:
     from dendrux.db.models import AgentRun
 
 logger = logging.getLogger(__name__)
+
+
+@overload
+def _to_aware_utc(dt: None) -> None: ...
+@overload
+def _to_aware_utc(dt: _dt.datetime) -> _dt.datetime: ...
+def _to_aware_utc(dt: _dt.datetime | None) -> _dt.datetime | None:
+    """Normalize a datetime to aware-UTC at the store/state boundary.
+
+    - ``None`` → ``None`` (passthrough for nullable columns).
+    - Aware datetime → converted to UTC (idempotent if already UTC).
+    - Naive datetime → tagged as UTC (assumes stored values are UTC).
+
+    The third case is load-bearing: SQLite + ``DateTime(timezone=True)`` does
+    not roundtrip tzinfo through SQLAlchemy, so reads come back naive even
+    when the schema asks for TIMESTAMPTZ. Tagging on read keeps the
+    invariant — every datetime returned from the store is aware-UTC —
+    independent of the backend.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_dt.UTC)
+    return dt.astimezone(_dt.UTC)
+
+
+def _require_aware_utc(name: str, value: _dt.datetime | None) -> None:
+    """Reject naive datetimes at the public-API boundary.
+
+    Counterpart to ``_to_aware_utc``. Reads tolerate naive inputs (legacy
+    SQLite storage); writes from callers do not. Naive ``started_after`` /
+    ``started_before`` filters compared against ``TIMESTAMPTZ`` columns are
+    silently broken on Postgres and silently "work" on SQLite — exactly the
+    asymmetry this sprint set out to eliminate. Fail loudly instead.
+    """
+    if value is None:
+        return
+    if value.tzinfo is None:
+        raise ValueError(
+            f"{name!s} must be a timezone-aware datetime (e.g. "
+            f"datetime.now(UTC)); got naive {value!r}. Dendrux compares "
+            f"against TIMESTAMPTZ columns and naive inputs produce "
+            f"backend-dependent results."
+        )
 
 
 @dataclass
@@ -849,7 +894,7 @@ class SQLAlchemyStateStore:
                     duration_ms=r.duration_ms,
                     cache_read_input_tokens=r.cache_read_input_tokens,
                     cache_creation_input_tokens=r.cache_creation_input_tokens,
-                    created_at=r.created_at,
+                    created_at=_to_aware_utc(r.created_at),
                 )
                 for r in rows
             ]
@@ -875,15 +920,15 @@ class SQLAlchemyStateStore:
             pii_mapping: Final guardrail PII mapping. Persists past finalize
                 (audit-first — framework never auto-clears).
         """
-        from sqlalchemy import func, update
+        from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
+                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     "status": status,
-                    "updated_at": func.now(),
                 }
                 if iteration_count is not None:
                     values["iteration_count"] = iteration_count
@@ -948,15 +993,15 @@ class SQLAlchemyStateStore:
         Mirrors :meth:`finalize_run`'s side-effects: clears ``pause_data``
         and ``cancel_requested``.
         """
-        from sqlalchemy import func, update
+        from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
+                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     "status": status,
-                    "updated_at": func.now(),
                     "pause_data": None,
                     "cancel_requested": False,
                 }
@@ -997,7 +1042,7 @@ class SQLAlchemyStateStore:
         The terminal-status guard is part of the SQL UPDATE — no race
         window between read and write.
         """
-        from sqlalchemy import func, update
+        from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
@@ -1010,13 +1055,14 @@ class SQLAlchemyStateStore:
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
+                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 stmt = (
                     update(AgentRun)
                     .where(
                         AgentRun.id == run_id,
                         AgentRun.status.notin_(terminal),
                     )
-                    .values(cancel_requested=True, updated_at=func.now())
+                    .values(cancel_requested=True)
                 )
                 result = await session.execute(stmt)
                 await session.commit()
@@ -1067,16 +1113,16 @@ class SQLAlchemyStateStore:
         pii_mapping: dict[str, str] | None = None,
     ) -> None:
         """Persist pause state and set WAITING status."""
-        from sqlalchemy import func, update
+        from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> None:
             async with self._session_factory() as session:
+                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
                     "status": status,
                     "pause_data": pause_data,
-                    "updated_at": func.now(),
                 }
                 if iteration_count is not None:
                     values["iteration_count"] = iteration_count
@@ -1124,16 +1170,17 @@ class SQLAlchemyStateStore:
         Returns False if someone else already claimed it or status didn't match.
         Uses UPDATE ... WHERE status=? for atomicity — no race window.
         """
-        from sqlalchemy import func, update
+        from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
+                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                    .values(status="running", updated_at=func.now())
+                    .values(status="running")
                 )
                 result = await session.execute(stmt)
                 await session.commit()
@@ -1162,7 +1209,7 @@ class SQLAlchemyStateStore:
         change and matches 0 rows.  On Postgres, the UPDATE takes a
         row-level lock achieving the same effect.
         """
-        from sqlalchemy import func, select, update
+        from sqlalchemy import select, update
 
         from dendrux.db.models import AgentRun
 
@@ -1185,14 +1232,14 @@ class SQLAlchemyStateStore:
                 merged = dict(current_pause_data)
                 merged.update(submitted_data)
 
-                # 3. Conditional UPDATE — CAS on status column
+                # 3. Conditional UPDATE — CAS on status column. updated_at is
+                # filled by the model's onupdate hook (Python aware-UTC).
                 update_stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
                     .values(
                         pause_data=merged,
                         status="running",
-                        updated_at=func.now(),
                     )
                 )
                 update_result = await session.execute(update_stmt)
@@ -1244,7 +1291,7 @@ class SQLAlchemyStateStore:
                     content=r.content,
                     order_index=r.order_index,
                     meta=r.meta,
-                    created_at=r.created_at,
+                    created_at=_to_aware_utc(r.created_at),
                 )
                 for r in rows
             ]
@@ -1288,7 +1335,7 @@ class SQLAlchemyStateStore:
                     duration_ms=r.duration_ms,
                     iteration_index=r.iteration_index,
                     error_message=r.error_message,
-                    created_at=r.created_at,
+                    created_at=_to_aware_utc(r.created_at),
                 )
                 for r in rows
             ]
@@ -1362,7 +1409,7 @@ class SQLAlchemyStateStore:
                     iteration_index=r.iteration_index,
                     correlation_id=r.correlation_id,
                     data=r.data,
-                    created_at=r.created_at,
+                    created_at=_to_aware_utc(r.created_at),
                 )
                 for r in rows
             ]
@@ -1453,7 +1500,8 @@ class SQLAlchemyStateStore:
             for row in stale_rows:
                 classification = "stale_running" if row.id in started_run_ids else "never_started"
 
-                # Mark as ERROR with failure_reason
+                # Mark as ERROR with failure_reason; updated_at is filled
+                # by the model's onupdate hook (Python-side aware-UTC).
                 update_stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == row.id, AgentRun.status == "running")
@@ -1461,7 +1509,6 @@ class SQLAlchemyStateStore:
                         status="error",
                         failure_reason=classification,
                         error=f"Run swept as {classification}",
-                        updated_at=func.now(),
                     )
                 )
                 update_result = await session.execute(update_stmt)
@@ -1492,8 +1539,8 @@ class SQLAlchemyStateStore:
                         agent_name=row.agent_name,
                         previous_status="running",
                         failure_reason=classification,
-                        last_progress_at=row.last_progress_at,
-                        swept_at=now,
+                        last_progress_at=_to_aware_utc(row.last_progress_at),
+                        swept_at=_to_aware_utc(now),
                     )
                 )
 
@@ -1555,14 +1602,14 @@ class SQLAlchemyStateStore:
             for row in abandoned_rows:
                 previous_status = row.status
 
-                # CAS-guarded update: only if still in the expected waiting status
+                # CAS-guarded update: only if still in the expected waiting status.
+                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 update_stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == row.id, AgentRun.status == previous_status)
                     .values(
                         status=AgentRunStatus.ERROR,
                         failure_reason="abandoned_waiting",
-                        updated_at=sa_func.now(),
                     )
                 )
                 update_result = await session.execute(update_stmt)
@@ -1592,8 +1639,8 @@ class SQLAlchemyStateStore:
                         agent_name=row.agent_name,
                         previous_status=previous_status,
                         failure_reason="abandoned_waiting",
-                        last_progress_at=row.last_progress_at,
-                        swept_at=now,
+                        last_progress_at=_to_aware_utc(row.last_progress_at),
+                        swept_at=_to_aware_utc(now),
                     )
                 )
 
@@ -1886,6 +1933,12 @@ class SQLAlchemyStateStore:
 
         from dendrux.db.models import AgentRun
 
+        # Naive datetimes here would silently break PG comparisons against
+        # TIMESTAMPTZ. Reject at the boundary so future filter additions
+        # inherit the guard automatically by routing through this helper.
+        _require_aware_utc("started_after", started_after)
+        _require_aware_utc("started_before", started_before)
+
         if tenant_id is not None:
             stmt = stmt.where(AgentRun.tenant_id == tenant_id)
         if status is not None:
@@ -1938,10 +1991,10 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         total_cache_read_tokens=row.total_cache_read_tokens,
         total_cache_creation_tokens=row.total_cache_creation_tokens,
         meta=row.meta,
-        last_progress_at=row.last_progress_at,
+        last_progress_at=_to_aware_utc(row.last_progress_at),
         failure_reason=row.failure_reason,
         retry_of_run_id=row.retry_of_run_id,
         cancel_requested=bool(row.cancel_requested),
-        created_at=row.created_at,
-        updated_at=row.updated_at,
+        created_at=_to_aware_utc(row.created_at),
+        updated_at=_to_aware_utc(row.updated_at),
     )

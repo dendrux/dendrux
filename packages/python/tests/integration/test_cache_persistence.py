@@ -1,43 +1,23 @@
-"""Integration tests for cache token persistence (PR 2).
+"""Integration tests for cache token persistence across the backend matrix.
 
 Verifies that per-call cache fields land in token_usage and llm_interactions,
 and that finalize_run rolls them up into agent_runs.total_cache_*.
+
+The ``engine`` / ``store`` / ``session_factory`` fixtures live in
+``tests/integration/conftest.py`` and parametrize across SQLite and Postgres.
 """
 
 from __future__ import annotations
 
-import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from typing import TYPE_CHECKING
 
-from dendrux.db.models import AgentRun, Base, LLMInteraction, TokenUsage
-from dendrux.runtime.state import SQLAlchemyStateStore
+from sqlalchemy import select
+
+from dendrux.db.models import AgentRun, LLMInteraction, TokenUsage
 from dendrux.types import UsageStats
 
-
-@pytest.fixture
-async def engine():
-    """Fresh in-memory SQLite engine with tables."""
-    eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-def store(engine):
-    return SQLAlchemyStateStore(engine)
-
-
-@pytest.fixture
-def session_factory(engine):
-    return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
+if TYPE_CHECKING:
+    from dendrux.runtime.state import SQLAlchemyStateStore
 
 # ---------------------------------------------------------------------------
 # Per-call persistence

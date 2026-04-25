@@ -1,18 +1,15 @@
-"""Integration tests for SQLAlchemyStateStore — real SQLite, full CRUD cycle.
+"""Integration tests for SQLAlchemyStateStore — full CRUD across the backend matrix.
 
-Uses in-memory SQLite (sqlite+aiosqlite:///:memory:) so no files are created.
-Each test gets a fresh engine and tables via the `engine` fixture.
+The ``engine`` / ``store`` / ``session_factory`` fixtures live in
+``tests/integration/conftest.py`` and parametrize across SQLite and Postgres.
 """
 
 from __future__ import annotations
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
 
 from dendrux.db.models import (
     AgentRun,
-    Base,
     LLMInteraction,
     ReactTrace,
     RunEvent,
@@ -20,46 +17,7 @@ from dendrux.db.models import (
     ToolCallRecord,
 )
 from dendrux.db.session import get_engine, reset_engine
-from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import UsageStats
-
-# ------------------------------------------------------------------
-# Fixtures
-# ------------------------------------------------------------------
-
-
-@pytest.fixture
-async def engine():
-    """Create a fresh in-memory SQLite engine with all tables and FK enforcement."""
-    from sqlalchemy import event
-
-    eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-
-    # SQLite needs PRAGMA foreign_keys = ON for CASCADE/SET NULL to work
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_conn, _connection_record):
-        dbapi_conn.execute("PRAGMA foreign_keys = ON")
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-def store(engine):
-    """Create a StateStore backed by the test engine."""
-    return SQLAlchemyStateStore(engine)
-
-
-@pytest.fixture
-def session_factory(engine):
-    """Raw session factory for direct DB assertions."""
-    return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
 
 # ------------------------------------------------------------------
 # create_run + get_run
@@ -455,7 +413,8 @@ class TestListRuns:
         await store.create_run("r3", "Agent")
 
         # Pin created_at values deterministically so we can slice a window.
-        base = _dt.datetime(2026, 4, 1, 12, 0, 0)
+        # Aware-UTC throughout — dendrux stores TIMESTAMPTZ on PG.
+        base = _dt.datetime(2026, 4, 1, 12, 0, 0, tzinfo=_dt.UTC)
         async with store._session_factory() as session:
             from sqlalchemy import update
 
@@ -1299,25 +1258,42 @@ class TestDelegationInfo:
         assert info.ancestry[1].run_id == "mid"
         assert info.ancestry_complete is True
 
-    async def test_broken_parent_chain(self, store, session_factory) -> None:
+    async def test_broken_parent_chain(self, store, session_factory, engine) -> None:
         """Parent run_id points to a missing row."""
         # Create orphan without parent first, then corrupt via raw SQL.
-        # Must disable FK temporarily — SQLite enforces FKs on UPDATE too.
+        # Bypassing FK enforcement is dialect-specific: SQLite uses a session
+        # PRAGMA, Postgres has no equivalent toggle so we drop+recreate the
+        # constraint around the UPDATE.
         await store.create_run("orphan", "Worker")
         await store.finalize_run("orphan", status="success")
 
         async with session_factory() as session:
             from sqlalchemy import text
 
-            await session.execute(text("PRAGMA foreign_keys = OFF"))
-            await session.execute(
-                text(
-                    "UPDATE agent_runs SET parent_run_id = 'ghost', "
-                    "delegation_level = 1 WHERE id = 'orphan'"
+            dialect = engine.dialect.name
+            if dialect == "sqlite":
+                await session.execute(text("PRAGMA foreign_keys = OFF"))
+                await session.execute(
+                    text(
+                        "UPDATE agent_runs SET parent_run_id = 'ghost', "
+                        "delegation_level = 1 WHERE id = 'orphan'"
+                    )
                 )
-            )
-            await session.commit()
-            await session.execute(text("PRAGMA foreign_keys = ON"))
+                await session.commit()
+                await session.execute(text("PRAGMA foreign_keys = ON"))
+            else:
+                # Postgres: temporarily disable user triggers (FK enforcement
+                # runs as a system trigger; "ALL" includes those without
+                # requiring superuser-only session_replication_role tricks).
+                await session.execute(text("ALTER TABLE agent_runs DISABLE TRIGGER ALL"))
+                await session.execute(
+                    text(
+                        "UPDATE agent_runs SET parent_run_id = 'ghost', "
+                        "delegation_level = 1 WHERE id = 'orphan'"
+                    )
+                )
+                await session.execute(text("ALTER TABLE agent_runs ENABLE TRIGGER ALL"))
+                await session.commit()
 
         info = await store.get_delegation_info("orphan")
         assert info is not None

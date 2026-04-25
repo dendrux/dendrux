@@ -11,10 +11,8 @@ import asyncio
 import contextlib
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux.agent import Agent
-from dendrux.db.models import Base
 from dendrux.errors import (
     InvalidToolResultError,
     PauseStatusMismatchError,
@@ -52,18 +50,9 @@ async def ask_user(question: str) -> str:
 
 
 @pytest.fixture
-async def db_store():
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    store = SQLAlchemyStateStore(engine)
-    try:
-        yield store
-    finally:
-        await engine.dispose()
+def db_store(engine):
+    """StateStore over the matrix engine — alias for the conftest `store` fixture."""
+    return SQLAlchemyStateStore(engine)
 
 
 def _client_tool_agent(llm: MockLLM, store: SQLAlchemyStateStore) -> Agent:
@@ -397,7 +386,15 @@ class TestConcurrentSubmits:
         failures = [r for r in (a, b) if isinstance(r, Exception)]
         assert len(successes) == 1
         assert len(failures) == 1
-        assert isinstance(failures[0], (RunAlreadyClaimedError, RunAlreadyTerminalError))
+        # Three valid race-loser signals: SQLite's single-writer lock surfaces
+        # the CAS miss as RunAlreadyClaimedError; on Postgres the loser sees
+        # the winner's status transition first and raises RunNotPausedError;
+        # if the winner finishes before the loser even attempts the claim,
+        # the loser sees a terminal status. All three mean "you lost the race."
+        assert isinstance(
+            failures[0],
+            (RunAlreadyClaimedError, RunAlreadyTerminalError, RunNotPausedError),
+        )
 
 
 # ---------------------------------------------------------------------------

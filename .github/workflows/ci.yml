@@ -15,6 +15,29 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+
+    services:
+      # Postgres backend matrix — integration tests parametrize across
+      # [sqlite, postgres] via the DENDRUX_TEST_PG_URL env var. Without
+      # this service the PG branch is skipped (locally fine, in CI not
+      # acceptable — that's how the original tz-naive bug shipped).
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dendrux
+          POSTGRES_PASSWORD: dendrux
+          POSTGRES_DB: dendrux_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dendrux"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
+
     steps:
       - uses: actions/checkout@v4
 

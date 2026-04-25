@@ -1,11 +1,14 @@
-"""Integration tests for lifecycle write durability — retry on transient DB failures.
+"""Integration tests for lifecycle write durability across the backend matrix.
 
 Verifies that the 5 wrapped lifecycle methods in SQLAlchemyStateStore
 retry on transient OperationalError and propagate logical failures
 (IntegrityError, CAS misses) immediately.
 
-Uses in-memory SQLite. Failure injection via monkey-patching
-session.execute() or session.commit() to raise OperationalError once.
+The ``engine`` / ``store`` fixtures live in
+``tests/integration/conftest.py`` and parametrize across SQLite and
+Postgres. Failure injection is done by monkey-patching
+session.execute() or session.commit() to raise OperationalError once —
+the retry policy is backend-agnostic.
 """
 
 from __future__ import annotations
@@ -13,42 +16,9 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux.db.models import Base
-from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import RunStatus
-
-# ------------------------------------------------------------------
-# Fixtures
-# ------------------------------------------------------------------
-
-
-@pytest.fixture
-async def engine():
-    """Create a fresh in-memory SQLite engine with all tables."""
-    eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_conn, _connection_record):
-        dbapi_conn.execute("PRAGMA foreign_keys = ON")
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
-
-
-@pytest.fixture
-def store(engine):
-    """StateStore backed by the test engine."""
-    return SQLAlchemyStateStore(engine)
-
 
 # ------------------------------------------------------------------
 # Failure injection helpers

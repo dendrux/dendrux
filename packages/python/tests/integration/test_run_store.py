@@ -1,9 +1,14 @@
-"""Integration tests for RunStore — the public read facade.
+"""Integration tests for RunStore — the public read facade across the backend matrix.
 
-Exercises the public contract against real SQLite. RunStore sits over
-SQLAlchemyStateStore; these tests verify that the public dataclasses,
-filters, cursors, and stream semantics are correct and that
-``get_pauses`` derives from ``run_events`` only (never ``pause_data``).
+Exercises the public contract. RunStore sits over SQLAlchemyStateStore;
+these tests verify that the public dataclasses, filters, cursors, and
+stream semantics are correct and that ``get_pauses`` derives from
+``run_events`` only (never ``pause_data``).
+
+The ``engine`` fixture lives in ``tests/integration/conftest.py`` and
+parametrizes across SQLite and Postgres. The local ``store`` fixture
+overrides the conftest one because RunStore is the surface-under-test
+here, not SQLAlchemyStateStore.
 """
 
 from __future__ import annotations
@@ -11,10 +16,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from sqlalchemy import event
-from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux.db.models import Base
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.store import (
     LLMCall,
@@ -32,23 +34,6 @@ from dendrux.types import UsageStats
 # ------------------------------------------------------------------
 # Fixtures
 # ------------------------------------------------------------------
-
-
-@pytest.fixture
-async def engine():
-    eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-
-    @event.listens_for(eng.sync_engine, "connect")
-    def _enable_fk(dbapi_conn, _connection_record):
-        dbapi_conn.execute("PRAGMA foreign_keys = ON")
-
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
 
 
 @pytest.fixture
