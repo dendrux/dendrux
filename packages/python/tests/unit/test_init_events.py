@@ -114,8 +114,13 @@ class TestGovernanceEventTypeEnum:
         assert GovernanceEventType.PROVIDER_RETRY == "provider.retry"
 
     def test_total_member_count(self) -> None:
-        """8 original + 5 init + 1 transport = 14 total."""
-        assert len(GovernanceEventType) == 14
+        """8 original + 5 init + 1 transport + 1 unmapped-placeholder = 15 total."""
+        assert len(GovernanceEventType) == 15
+
+    def test_guardrail_unmapped_placeholder_member(self) -> None:
+        assert (
+            GovernanceEventType.GUARDRAIL_UNMAPPED_PLACEHOLDER == "guardrail.unmapped_placeholder"
+        )
 
 
 # ------------------------------------------------------------------

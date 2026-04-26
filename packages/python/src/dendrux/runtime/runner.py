@@ -274,14 +274,23 @@ async def _persist_loop_outcome(
     Always returns a fresh ``RunResult``; never mutates the input.
     ``meta['_finalize_won']`` records whether the CAS finalize won
     (``True`` for pauses since pause is unconditional).
+
+    ``RunResult.answer`` returned to the caller is deanonymized using
+    ``meta['pii_mapping']`` when one is present — the dev sees real values
+    ("Nice to meet you, anmol!") instead of placeholders. The DB row keeps
+    the raw LLM output so the dashboard's audit view stays placeholder-faithful.
     """
+    from dendrux.guardrails._engine import deanonymize_text
     from dendrux.types import RunResult
+
+    pii_mapping = result.meta.get("pii_mapping") or {}
+    user_answer, unmapped_placeholders = deanonymize_text(result.answer, pii_mapping)
 
     def _wrap(*, status: RunStatus, won: bool) -> RunResult:
         return RunResult(
             run_id=run_id,
             status=status,
-            answer=result.answer,
+            answer=user_answer,
             error=result.error,
             steps=result.steps,
             iteration_count=result.iteration_count,
@@ -372,6 +381,14 @@ async def _persist_loop_outcome(
         pii_mapping=_run_pii,
     )
     if finalize_won:
+        if unmapped_placeholders:
+            await _emit_event(
+                state_store,
+                run_id,
+                "guardrail.unmapped_placeholder",
+                sequencer,
+                {"placeholders": unmapped_placeholders},
+            )
         await _emit_event(
             state_store,
             run_id,

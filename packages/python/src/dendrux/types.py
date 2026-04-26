@@ -322,6 +322,7 @@ class GovernanceEventType(StrEnum):
     GUARDRAIL_DETECTED = "guardrail.detected"
     GUARDRAIL_REDACTED = "guardrail.redacted"
     GUARDRAIL_BLOCKED = "guardrail.blocked"
+    GUARDRAIL_UNMAPPED_PLACEHOLDER = "guardrail.unmapped_placeholder"
 
     # Init events: Skills + MCP
     SKILL_REGISTERED = "skill.registered"

@@ -36,6 +36,8 @@ history.append(ChatMessage.assistant(result.answer))
 
 **Storage of the conversation is the dev's job.** Dendrux only reads `history=` as input for the next turn. Persist the chat log in your own table — this preserves the library-not-platform boundary. The chatbot example at `examples/18_chatbot.py` keeps `history` in a Python list; a real app would load it from `messages` in your DB before each turn.
 
+**With PII guardrails on, your `history` accumulates real names**, not placeholders. The runner deanonymizes `result.answer` on the way back to your code, so appending it gives a natural-language transcript. The DB row keeps the placeholder version for audit. See [PII redaction — user-facing answer](/docs/architecture/pii-redaction#deanonymization-the-user-facing-answer).
+
 ## Tagging runs with a thread_id
 
 Pass `metadata={"thread_id": "..."}` on each turn:

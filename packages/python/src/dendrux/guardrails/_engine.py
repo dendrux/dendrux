@@ -9,6 +9,7 @@ and testable in isolation.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._protocol import Finding
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_RECURSION_DEPTH = 50
 _MAX_BLOCK_SNIPPET = 80
+_PLACEHOLDER_RE = re.compile(r"<<[A-Z][A-Z_]*_\d+>>")
 
 
 def _block_message(guardrail: object, finding: Finding, *, where: str = "") -> str:
@@ -206,6 +208,27 @@ def _deoverlap(findings: list[Finding]) -> list[Finding]:
         else:
             result.append(f)
     return result
+
+
+def deanonymize_text(text: str | None, mapping: dict[str, str]) -> tuple[str | None, list[str]]:
+    """Reverse pii_mapping for user-facing text (e.g., RunResult.answer).
+
+    Returns (deanonymized_text, unmapped_placeholders). Placeholders shaped
+    like ``<<ENTITY_TYPE_N>>`` that survive substitution (LLM hallucinated
+    a placeholder we never registered) are listed in the second element so
+    the caller can emit a governance event. They pass through unchanged.
+
+    The DB-stores-raw invariant is unaffected: this is a return-path
+    transform on the value handed to the dev, not a mutation of anything
+    persisted.
+    """
+    if text is None or not mapping:
+        return text, []
+    result = _deanonymize_value(text, mapping)
+    if not isinstance(result, str):
+        return result, []
+    unmapped = sorted({p for p in _PLACEHOLDER_RE.findall(result) if p not in mapping})
+    return result, unmapped
 
 
 def _deanonymize_value(value: Any, mapping: dict[str, str], _depth: int = 0) -> Any:

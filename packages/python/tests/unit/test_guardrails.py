@@ -6,6 +6,7 @@ import pytest
 
 from dendrux.agent import Agent
 from dendrux.guardrails import PII, GuardrailEngine, Pattern, PromptInjection, SecretDetection
+from dendrux.guardrails._engine import deanonymize_text
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
@@ -711,6 +712,60 @@ class TestGuardrailEngine:
         engine = GuardrailEngine([PII()])
         await engine.scan_outgoing("jane@example.com")
         assert engine.get_pii_mapping() == {}
+
+
+# ------------------------------------------------------------------
+# deanonymize_text — return-path helper for RunResult.answer
+# ------------------------------------------------------------------
+
+
+class TestDeanonymizeText:
+    """Module-level helper that reverses pii_mapping for user-facing text.
+
+    Distinct from GuardrailEngine.deanonymize (which targets dict-shaped
+    tool params). The runner uses this on RunResult.answer.
+    """
+
+    def test_substitutes_known_placeholders(self):
+        mapping = {"<<PERSON_1>>": "Anmol Gautam"}
+        out, unmapped = deanonymize_text("Hello <<PERSON_1>>!", mapping)
+        assert out == "Hello Anmol Gautam!"
+        assert unmapped == []
+
+    def test_passes_unmapped_placeholder_through_and_reports_it(self):
+        mapping = {"<<PERSON_1>>": "Anmol"}
+        out, unmapped = deanonymize_text("Hi <<PERSON_1>> and <<PERSON_99>>", mapping)
+        assert "Anmol" in out
+        assert "<<PERSON_99>>" in out
+        assert unmapped == ["<<PERSON_99>>"]
+
+    def test_empty_mapping_is_noop(self):
+        out, unmapped = deanonymize_text("Hello world", {})
+        assert out == "Hello world"
+        assert unmapped == []
+
+    def test_none_text_returns_none(self):
+        out, unmapped = deanonymize_text(None, {"<<PERSON_1>>": "x"})
+        assert out is None
+        assert unmapped == []
+
+    def test_multiple_entities_substituted(self):
+        mapping = {
+            "<<EMAIL_ADDRESS_1>>": "jane@example.com",
+            "<<PERSON_1>>": "Jane Doe",
+        }
+        out, unmapped = deanonymize_text("Email <<EMAIL_ADDRESS_1>> for <<PERSON_1>>", mapping)
+        assert out == "Email jane@example.com for Jane Doe"
+        assert unmapped == []
+
+    def test_dedup_unmapped_placeholders(self):
+        """Each unmapped placeholder reported once even if it appears multiple times."""
+        mapping = {"<<PERSON_1>>": "Anmol"}
+        out, unmapped = deanonymize_text(
+            "<<PERSON_99>> and <<PERSON_99>> again, also <<PERSON_1>>", mapping
+        )
+        assert "Anmol" in out
+        assert unmapped == ["<<PERSON_99>>"]
 
 
 # ------------------------------------------------------------------
