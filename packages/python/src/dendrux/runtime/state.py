@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, overload
 
@@ -510,6 +511,7 @@ class StateStore(Protocol):
         parent_run_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> list[RunRecord]: ...
 
     async def count_runs(
@@ -521,6 +523,7 @@ class StateStore(Protocol):
         parent_run_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> int: ...
 
     async def touch_progress(self, run_id: str) -> None:
@@ -1839,6 +1842,7 @@ class SQLAlchemyStateStore:
         parent_run_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> list[RunRecord]:
         from sqlalchemy import select
 
@@ -1861,6 +1865,7 @@ class SQLAlchemyStateStore:
                 parent_run_id=parent_run_id,
                 started_after=started_after,
                 started_before=started_before,
+                metadata_filter=metadata_filter,
             )
             stmt = stmt.limit(capped_limit).offset(clamped_offset)
 
@@ -1898,6 +1903,7 @@ class SQLAlchemyStateStore:
         parent_run_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> int:
         from sqlalchemy import func, select
 
@@ -1913,13 +1919,14 @@ class SQLAlchemyStateStore:
                 parent_run_id=parent_run_id,
                 started_after=started_after,
                 started_before=started_before,
+                metadata_filter=metadata_filter,
             )
             result = await session.execute(stmt)
             total = result.scalar_one()
             return int(total)
 
-    @staticmethod
     def _apply_run_filters(
+        self,
         stmt: Any,
         *,
         tenant_id: str | None,
@@ -1928,6 +1935,7 @@ class SQLAlchemyStateStore:
         parent_run_id: str | None,
         started_after: datetime | None,
         started_before: datetime | None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> Any:
         from sqlalchemy import false
 
@@ -1958,6 +1966,53 @@ class SQLAlchemyStateStore:
             stmt = stmt.where(AgentRun.created_at >= started_after)
         if started_before is not None:
             stmt = stmt.where(AgentRun.created_at < started_before)
+        if metadata_filter:
+            stmt = self._apply_metadata_filter(stmt, metadata_filter)
+        return stmt
+
+    # JSON keys are limited to a conservative identifier shape so the
+    # path string we splice into the SQL (``$.<key>`` for SQLite) cannot
+    # smuggle path operators or quotes. Values are always parameter-bound,
+    # so only the key is sensitive here.
+    _METADATA_KEY_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+    def _apply_metadata_filter(self, stmt: Any, metadata_filter: dict[str, Any]) -> Any:
+        """Filter by exact-match equality on top-level ``meta`` keys.
+
+        AND across all keys. ``thread_id="abc"`` is the canonical chatbot
+        case; arbitrary scalar values (str/int/bool) work too. Nested
+        paths (``user.id``) and list-membership checks are intentionally
+        unsupported in v1 — add them when a real use case arrives.
+        """
+        from sqlalchemy import func
+
+        from dendrux.db.models import AgentRun
+
+        for key in metadata_filter:
+            if not isinstance(key, str) or not self._METADATA_KEY_RE.match(key):
+                raise ValueError(
+                    f"metadata_filter keys must match {self._METADATA_KEY_RE.pattern!r}; "
+                    f"got {key!r}. Nested paths are not supported in v1."
+                )
+
+        dialect = self._engine.dialect.name
+        if dialect == "postgresql":
+            # Cast to JSONB so we can use the ``@>`` containment operator
+            # (the underlying column is plain ``JSON`` for SQLite parity).
+            # One predicate covers all keys, and the value is bound as a
+            # JSON literal, so any JSON-serializable scalar works without
+            # per-type coercion.
+            from sqlalchemy import cast
+            from sqlalchemy.dialects.postgresql import JSONB
+
+            return stmt.where(cast(AgentRun.meta, JSONB).contains(cast(metadata_filter, JSONB)))
+
+        # SQLite (and other backends): per-key json_extract equality.
+        # json_extract returns native types, so equality works naturally
+        # for str/int/bool. The key is validated above; the value is
+        # parameter-bound by SQLAlchemy.
+        for key, value in metadata_filter.items():
+            stmt = stmt.where(func.json_extract(AgentRun.meta, f"$.{key}") == value)
         return stmt
 
 

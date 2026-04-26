@@ -272,6 +272,34 @@ store = RunStore.from_engine(engine)
 
 The read router only handles GETs. Pair it with your own write routes for the action surface (submit tool results, submit input, submit approval, cancel). Both share the same `Agent` and `RunStore` instances. See [Client-side tools](/docs/recipes/client-tools) and [Human-in-the-loop approval](/docs/recipes/hitl-approval) for end-to-end examples.
 
+### Calling RunStore directly when HTTP isn't enough
+
+`make_read_router` exposes the common read endpoints, but `RunStore` is a plain Python object — call it directly from any code in your app (admin scripts, custom routes, support tooling, background jobs) when the HTTP surface doesn't fit.
+
+The full read surface:
+
+| Method | Returns |
+| --- | --- |
+| `list_runs(...)` | Filtered, paginated `RunSummary` list |
+| `count_runs(...)` | `int` matching the same filters |
+| `get_run(run_id)` | `RunDetail` for one run |
+| `get_events(run_id, after_sequence_index=...)` | `StoredEvent` page |
+| `stream_events(run_id, ...)` | Async iterator of `StoredEvent` (the same source SSE polls) |
+| `get_llm_calls(run_id)` | `LLMCall` list (prompts, responses, usage, cache) |
+| `get_tool_invocations(run_id)` | `ToolInvocation` list (params, results, errors) |
+| `get_traces(run_id)` | `TraceEntry` list (ReAct thoughts/actions/observations) |
+| `get_pauses(run_id)` | `PausePair` list (HITL approval cycles) |
+| `get_pii_mapping(run_id)` | Redaction lineage |
+
+`list_runs` and `count_runs` accept one filter that the HTTP router does **not** expose: `metadata_filter: dict[str, Any]`. It performs exact-match equality across every key inside the run's `meta` JSON (AND across keys), dispatched per backend — `jsonb @>` containment on Postgres, repeated `json_extract` on SQLite. The canonical use is `metadata_filter={"thread_id": "..."}` for per-conversation observability in chatbots; see [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
+
+```python
+runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"})
+total = await store.count_runs(metadata_filter={"user_id": "u_123"}, status="error")
+```
+
+Filter keys are restricted to `^[A-Za-z0-9_-]+$`; nested paths and partial matches are deliberately out of scope in v1. If you want this over HTTP, wrap it in a thin route on your own app — `make_read_router` is intentionally narrow so you control which extension surfaces ship.
+
 ## Notes
 
 - **The router never blocks.** All endpoints either return immediately or stream (SSE). No long-running synchronous work.

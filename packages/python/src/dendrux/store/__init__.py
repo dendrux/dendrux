@@ -242,10 +242,19 @@ class RunStore:
         tenant_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        metadata_filter: dict[str, Any] | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[RunSummary]:
-        """List runs with SQL-side filtering and pagination."""
+        """List runs with SQL-side filtering and pagination.
+
+        ``metadata_filter`` matches runs where every given key/value pair
+        is present at the top level of the run's ``metadata`` (the dev
+        passes this to ``agent.run(..., metadata=...)``). The canonical
+        chatbot pattern is ``metadata_filter={"thread_id": "..."}``;
+        keys are restricted to ``[A-Za-z0-9_-]+``, nested paths are not
+        supported.
+        """
         records = await self._state.list_runs(
             limit=limit,
             offset=offset,
@@ -255,6 +264,7 @@ class RunStore:
             parent_run_id=parent_run_id,
             started_after=started_after,
             started_before=started_before,
+            metadata_filter=metadata_filter,
         )
         return [_run_to_summary(r) for r in records]
 
@@ -267,6 +277,7 @@ class RunStore:
         tenant_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
+        metadata_filter: dict[str, Any] | None = None,
     ) -> int:
         """Count runs matching the same filters as ``list_runs``."""
         return await self._state.count_runs(
@@ -276,6 +287,7 @@ class RunStore:
             parent_run_id=parent_run_id,
             started_after=started_after,
             started_before=started_before,
+            metadata_filter=metadata_filter,
         )
 
     async def get_run(self, run_id: str) -> RunDetail | None:

@@ -1,0 +1,123 @@
+---
+title: Chatbot threads — history and per-thread observability
+description: Pass prior turns into agent.run via history=, tag every run with a thread_id, then query all runs for one conversation through RunStore.list_runs(metadata_filter=...).
+---
+
+# Chatbot threads — history and per-thread observability
+
+A chatbot makes many `agent.run()` calls per conversation — one per user turn. Two things matter for the developer:
+
+1. The agent needs the prior turns of *this* conversation as input.
+2. The app needs to ask later: "show me every run that belonged to this conversation" — for cost rollup, audit, support, debugging.
+
+Dendrux gives you both with two existing primitives. No new types, no chatbot subclass.
+
+## Sending history into a turn
+
+```python
+from dendrux import Agent
+from dendrux.chat import ChatMessage
+from dendrux.llm.anthropic import AnthropicProvider
+
+agent = Agent(
+    name="ChatBot",
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
+    database_url="postgresql+asyncpg://...",
+    prompt="You are a friendly assistant. Reply briefly.",
+)
+
+history: list[ChatMessage] = []
+result = await agent.run(user_input="Hi", history=history)
+history.append(ChatMessage.user("Hi"))
+history.append(ChatMessage.assistant(result.answer))
+```
+
+`ChatMessage` is intentionally narrower than the internal `Message` — only `role` and `text`. Tool calls, call IDs, and runtime metadata are hidden so the dev can't accidentally inject malformed runtime state.
+
+**Storage of the conversation is the dev's job.** Dendrux only reads `history=` as input for the next turn. Persist the chat log in your own table — this preserves the library-not-platform boundary. The chatbot example at `examples/18_chatbot.py` keeps `history` in a Python list; a real app would load it from `messages` in your DB before each turn.
+
+## Tagging runs with a thread_id
+
+Pass `metadata={"thread_id": "..."}` on each turn:
+
+```python
+result = await agent.run(
+    user_input=user_text,
+    history=history,
+    metadata={"thread_id": "thread_abc", "user_id": "u_123"},
+)
+```
+
+`metadata` is an opaque JSON blob that lands on the run row. Dendrux stores it, never reads it during execution — it's purely for your dev-side queries. The recommended convention for chatbots is `thread_id`; add `user_id`, `tenant_id`, `channel`, whatever else your domain needs.
+
+`thread_id` keys are restricted to `[A-Za-z0-9_-]+` for filter-safety reasons (see below). Use ULIDs, UUIDs, or your own ID format that fits.
+
+## Querying every run in a thread
+
+`RunStore.list_runs(metadata_filter=...)` returns every run whose `metadata` contains all the given key/value pairs (AND across keys):
+
+```python
+from dendrux.store import RunStore
+
+store = RunStore.from_database_url("postgresql+asyncpg://...")
+
+runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"})
+for r in runs:
+    print(r.run_id, r.status, r.total_cost_usd, r.created_at)
+```
+
+Combines with the existing filters:
+
+```python
+# Only failed runs in this thread
+failed = await store.list_runs(
+    metadata_filter={"thread_id": "thread_abc"},
+    status="error",
+)
+
+# Total cost of one user's last 50 turns
+runs = await store.list_runs(
+    metadata_filter={"user_id": "u_123"},
+    limit=50,
+)
+total = sum(r.total_cost_usd or 0 for r in runs)
+```
+
+`count_runs` accepts the same filter — useful for paginated views ("page 1 of 12 turns in this thread").
+
+## Drilling into a single run
+
+Once you have a run from the listing, every other read API on `RunStore` is keyed by `run_id` and works exactly as it does for non-chat runs:
+
+```python
+events = await store.get_events(run.run_id)            # full event log
+llm_calls = await store.get_llm_calls(run.run_id)      # prompts, responses, usage, cache
+tool_calls = await store.get_tool_invocations(run.run_id)  # tool params + results
+traces = await store.get_traces(run.run_id)            # ReAct thoughts/actions
+pauses = await store.get_pauses(run.run_id)            # HITL approval cycles
+```
+
+The full audit/tracing surface is the same one [the read router](/docs/recipes/mount-read-router) exposes — just call it from your own code if you want a custom thread inspector instead of the generic dashboard.
+
+## Backend semantics
+
+The filter dispatches by dialect:
+
+- **Postgres**: `meta` is cast to `jsonb` and the predicate is one `@>` containment check covering all keys. Single index-friendly clause regardless of how many keys you filter on.
+- **SQLite**: per-key `json_extract(meta, '$.<key>') = ?`. Native types compare correctly; equality works for strings, numbers, and booleans.
+
+Both backends are exercised by the integration test matrix, so the dispatch is locked in.
+
+## What's intentionally not supported in v1
+
+- Nested key paths (`user.profile.id`). Top-level keys only.
+- Range queries, partial match, `IN`, `LIKE`. Exact equality only.
+- Filtering by absence (`thread_id IS NULL`). Skip the filter — runs without `thread_id` simply won't match a `thread_id=` clause.
+
+If you need any of those, file an issue with the use case. The current shape covers chatbot threads, multi-tenant scoping, and per-user rollup, which is what we've seen real apps want.
+
+## Where this fits
+
+- Recipes: [Mount the read router](/docs/recipes/mount-read-router) to expose all of this over HTTP for a frontend.
+- Architecture: [Runs](/docs/architecture/runs) explains the `meta` column and other persisted run fields.
+- Reference: [HTTP API surface](/docs/reference/http-api) for the read endpoints (HTTP exposure of `metadata_filter` is not in the read router today — wrap `RunStore.list_runs` in your own thin endpoint if you need it).

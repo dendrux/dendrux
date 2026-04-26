@@ -101,6 +101,85 @@ class TestListRuns:
 
 
 # ------------------------------------------------------------------
+# metadata_filter — chatbot thread observability + general meta filter
+# ------------------------------------------------------------------
+
+
+class TestMetadataFilter:
+    """Filter runs by exact-match values inside the ``meta`` JSON column.
+
+    The canonical use is ``thread_id`` for chatbots, but the filter is
+    general-purpose. Runs on both SQLite and Postgres via the engine
+    matrix — the dialect dispatch (jsonb @> on PG, json_extract on
+    SQLite) is the part this exercises end-to-end.
+    """
+
+    async def test_filter_by_single_key(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent", meta={"thread_id": "alpha"})
+        await internal_store.create_run("r2", "Agent", meta={"thread_id": "beta"})
+        await internal_store.create_run("r3", "Agent", meta={"thread_id": "alpha"})
+
+        runs = await store.list_runs(metadata_filter={"thread_id": "alpha"})
+        assert {r.run_id for r in runs} == {"r1", "r3"}
+
+    async def test_filter_multi_key_and(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent", meta={"thread_id": "t1", "user_id": "u1"})
+        await internal_store.create_run("r2", "Agent", meta={"thread_id": "t1", "user_id": "u2"})
+        await internal_store.create_run("r3", "Agent", meta={"thread_id": "t2", "user_id": "u1"})
+
+        runs = await store.list_runs(metadata_filter={"thread_id": "t1", "user_id": "u1"})
+        assert {r.run_id for r in runs} == {"r1"}
+
+    async def test_filter_no_match_returns_empty(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent", meta={"thread_id": "alpha"})
+
+        runs = await store.list_runs(metadata_filter={"thread_id": "missing"})
+        assert runs == []
+
+    async def test_filter_skips_runs_without_meta(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent")  # meta = None
+        await internal_store.create_run("r2", "Agent", meta={"thread_id": "alpha"})
+
+        runs = await store.list_runs(metadata_filter={"thread_id": "alpha"})
+        assert {r.run_id for r in runs} == {"r2"}
+
+    async def test_filter_combines_with_status(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent", meta={"thread_id": "alpha"})
+        await internal_store.create_run("r2", "Agent", meta={"thread_id": "alpha"})
+        await internal_store.create_run("r3", "Agent", meta={"thread_id": "beta"})
+        await internal_store.finalize_run("r1", status="success")
+        await internal_store.finalize_run("r2", status="error")
+        await internal_store.finalize_run("r3", status="success")
+
+        runs = await store.list_runs(metadata_filter={"thread_id": "alpha"}, status="success")
+        assert {r.run_id for r in runs} == {"r1"}
+
+    async def test_count_matches_list(self, store, internal_store) -> None:
+        await internal_store.create_run("r1", "Agent", meta={"thread_id": "alpha"})
+        await internal_store.create_run("r2", "Agent", meta={"thread_id": "alpha"})
+        await internal_store.create_run("r3", "Agent", meta={"thread_id": "beta"})
+
+        n = await store.count_runs(metadata_filter={"thread_id": "alpha"})
+        assert n == 2
+
+    async def test_empty_filter_dict_is_noop(self, store, internal_store) -> None:
+        """``{}`` means 'no filter', not 'match nothing'."""
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.create_run("r2", "Agent", meta={"thread_id": "alpha"})
+
+        runs = await store.list_runs(metadata_filter={})
+        assert {r.run_id for r in runs} == {"r1", "r2"}
+
+    async def test_invalid_key_rejected(self, store, internal_store) -> None:
+        """Keys with characters outside ``[A-Za-z0-9_-]`` are rejected
+        before any SQL is built — nested paths are deliberately unsupported."""
+        await internal_store.create_run("r1", "Agent", meta={"thread_id": "alpha"})
+
+        with pytest.raises(ValueError, match="metadata_filter keys"):
+            await store.list_runs(metadata_filter={"user.id": "u1"})
+
+
+# ------------------------------------------------------------------
 # count_runs
 # ------------------------------------------------------------------
 
