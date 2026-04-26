@@ -386,7 +386,10 @@ class TestSseGenerator:
             await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=0)
 
         write_task = asyncio.create_task(_write_later())
-        frame = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+        # 10s timeout (not 2s) — CI runners have asyncio scheduling jitter
+        # that occasionally pushes the poll-write race past a tight budget.
+        # The test still proves liveness; the deadline is just headroom.
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=10.0)
         await write_task
         await gen.aclose()
 
@@ -401,7 +404,7 @@ class TestSseGenerator:
         await internal_store.create_run("r1", "Agent")
 
         gen = _rr._sse_event_generator(store, "r1", cursor=None)
-        frame = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=10.0)
         await gen.aclose()
 
         assert frame.startswith(": keepalive")

@@ -20,6 +20,23 @@ The matrix exists because the original tz-naive bug shipped specifically
 because no integration test exercised Postgres — without this, the same
 class of regression can re-enter unnoticed.
 
+## Test database safety (Django-style)
+
+Tests are destructive — schema gets dropped and recreated, rows get
+``TRUNCATE``-d between tests. Pointing them at a dev or prod database
+deletes data. To prevent that, the URL handed to ``DENDRUX_TEST_PG_URL``
+is auto-rewritten so the database name always ends in ``_test``:
+
+    DENDRUX_TEST_PG_URL=postgresql+asyncpg://u:p@host:5432/dendrux
+    # ↓ auto-rewritten to ↓
+    postgresql+asyncpg://u:p@host:5432/dendrux_test
+
+The rewrite emits a one-line warning the first time it kicks in. The
+``dendrux_test`` database is created automatically on first use (via the
+maintenance ``postgres`` database on the same host); subsequent runs
+reuse it. A hard guardrail refuses to proceed if the final DB name does
+not end in ``_test`` — there is no escape hatch on purpose.
+
 To run the matrix locally:
 
     DENDRUX_TEST_PG_URL=postgresql+asyncpg://user:pw@host:5432/dbname \\
@@ -32,7 +49,10 @@ dev with no Postgres still gets a green suite).
 from __future__ import annotations
 
 import os
+import re
+import sys
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse, urlunparse
 
 import pytest
 import pytest_asyncio
@@ -50,6 +70,86 @@ if TYPE_CHECKING:
 
 
 _PG_URL_ENV = "DENDRUX_TEST_PG_URL"
+_TEST_DB_SUFFIX = "_test"
+_DB_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_REWRITE_WARNED = False
+
+
+def _rewrite_to_test_db(url: str) -> tuple[str, str, bool]:
+    """Ensure URL points at a ``*_test`` database.
+
+    Returns ``(rewritten_url, db_name, was_rewritten)``. Rewrites the URL's
+    database name by appending ``_test`` if it doesn't already end that way.
+    Validates the final name matches ``[A-Za-z0-9_]+`` so it can be safely
+    interpolated into ``CREATE DATABASE`` (asyncpg/PG don't bind-parameterize
+    DDL identifiers).
+    """
+    parsed = urlparse(url)
+    db_name = parsed.path.lstrip("/")
+    if not db_name:
+        raise pytest.UsageError(f"{_PG_URL_ENV} has no database name in path: {url!r}")
+
+    rewritten = False
+    if not db_name.endswith(_TEST_DB_SUFFIX):
+        db_name = f"{db_name}{_TEST_DB_SUFFIX}"
+        parsed = parsed._replace(path=f"/{db_name}")
+        url = urlunparse(parsed)
+        rewritten = True
+
+    if not _DB_NAME_RE.match(db_name):
+        raise pytest.UsageError(
+            f"{_PG_URL_ENV} database name {db_name!r} contains characters "
+            f"outside [A-Za-z0-9_]; refuse to interpolate into DDL."
+        )
+    if not db_name.endswith(_TEST_DB_SUFFIX):
+        # Belt + suspenders — the rewrite above guarantees this, but keep
+        # the assert so a future refactor can't regress the safety property.
+        raise pytest.UsageError(
+            f"{_PG_URL_ENV} resolved DB name {db_name!r} does not end in "
+            f"{_TEST_DB_SUFFIX!r} — refusing to run destructive tests against it."
+        )
+    return url, db_name, rewritten
+
+
+async def _ensure_test_db_exists(url: str, db_name: str) -> None:
+    """``CREATE DATABASE {db_name}`` on the maintenance DB if missing.
+
+    Connects to ``postgres`` (the standard maintenance database) on the same
+    host with AUTOCOMMIT — PG forbids ``CREATE DATABASE`` inside a transaction.
+    Idempotent: if the DB already exists, this is a no-op.
+    """
+    parsed = urlparse(url)
+    maintenance_url = urlunparse(parsed._replace(path="/postgres"))
+
+    eng = create_async_engine(maintenance_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    try:
+        async with eng.connect() as conn:
+            result = await conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": db_name},
+            )
+            if result.first() is None:
+                # db_name is validated against _DB_NAME_RE above; safe to interpolate.
+                await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+    finally:
+        await eng.dispose()
+
+
+def _resolve_pg_url() -> str | None:
+    """Read env, rewrite to ``*_test``, validate. Returns URL or None if unset."""
+    global _REWRITE_WARNED
+    raw = os.environ.get(_PG_URL_ENV)
+    if not raw:
+        return None
+    url, db_name, rewritten = _rewrite_to_test_db(raw)
+    if rewritten and not _REWRITE_WARNED:
+        sys.stderr.write(
+            f"\n[dendrux tests] {_PG_URL_ENV} rewritten to use database "
+            f"{db_name!r} (tests are destructive — never run them against a "
+            f"non-{_TEST_DB_SUFFIX} database).\n"
+        )
+        _REWRITE_WARNED = True
+    return url
 
 
 def _engine_params() -> list:
@@ -59,7 +159,7 @@ def _engine_params() -> list:
     # decided. (CI sets it via the workflow `env:` block, locally the
     # caller exports it.)
     sqlite_param = pytest.param("sqlite", id="sqlite")
-    if os.environ.get(_PG_URL_ENV):
+    if _resolve_pg_url() is not None:
         return [sqlite_param, pytest.param("postgres", id="postgres")]
     return [
         sqlite_param,
@@ -98,10 +198,15 @@ async def _pg_schema_setup() -> AsyncIterator[None]:
     # scoped ``engine`` fixture takes it as a positional dep purely to
     # establish ordering — schema must be in place before any test
     # tries to TRUNCATE it.
-    url = os.environ.get(_PG_URL_ENV)
+    url = _resolve_pg_url()
     if not url:
         yield
         return
+
+    # Auto-create the *_test database if missing — Django-style. Connects
+    # to the postgres maintenance DB on the same host. See module docstring.
+    _, db_name, _ = _rewrite_to_test_db(os.environ[_PG_URL_ENV])
+    await _ensure_test_db_exists(url, db_name)
 
     # NullPool: this engine only runs DDL once and is disposed; we don't
     # want it holding pooled connections bound to the session loop.
@@ -129,7 +234,7 @@ async def engine(request, _pg_schema_setup) -> AsyncIterator[AsyncEngine]:
     backend = request.param
 
     if backend == "postgres":
-        url = os.environ.get(_PG_URL_ENV)
+        url = _resolve_pg_url()
         if not url:
             pytest.skip(f"{_PG_URL_ENV} not set")
         # Fresh engine in this test's event loop — asyncpg connections
