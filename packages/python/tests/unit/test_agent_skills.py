@@ -380,33 +380,169 @@ class TestUseSkillTool:
 
 
 # ---------------------------------------------------------------------------
-# SingleCall + skills
+# SingleCall + skills (inlined skill mode)
 # ---------------------------------------------------------------------------
 
 
-class TestSingleCallSkills:
-    """SingleCall agents cannot have skills."""
+class TestSingleCallInlinedSkills:
+    """SingleCall delivers skills inline into the system prompt.
 
-    def test_singlecall_rejects_skills_dir(self) -> None:
+    No use_skill tool is injected (one LLM call cannot do progressive
+    disclosure). A UserWarning fires once at first prompt build with the
+    rendered character count.
+    """
+
+    def test_singlecall_skills_dir_accepted(self) -> None:
         from dendrux.loops.single import SingleCall
 
-        with pytest.raises(ValueError, match="skill"):
-            Agent(
+        skills_path, cleanup = _make_clean_skills_dir()
+        try:
+            agent = Agent(
                 prompt="Test.",
                 loop=SingleCall(),
-                skills_dir="./skills",
+                skills_dir=str(skills_path),
             )
+            assert agent._skills_dir == skills_path
+        finally:
+            shutil.rmtree(cleanup)
 
-    def test_singlecall_rejects_explicit_skills(self) -> None:
+    def test_singlecall_explicit_skills_accepted(self) -> None:
         from dendrux.loops.single import SingleCall
 
         skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
+        agent = Agent(
+            prompt="Test.",
+            loop=SingleCall(),
+            skills=[skill],
+        )
+        assert agent._explicit_skills == [skill]
 
-        with pytest.raises(ValueError, match="skill"):
+    def test_inlined_prompt_contains_skill_body(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
+        agent = Agent(
+            prompt="Base prompt.",
+            loop=SingleCall(),
+            skills=[skill],
+        )
+
+        with pytest.warns(UserWarning, match="inlined skill mode"):
+            prompt = agent.get_system_prompt()
+
+        assert "Base prompt." in prompt
+        assert "## Skills" in prompt
+        assert "### Skill: pdf-processing" in prompt
+        # Body text must be rendered verbatim, not just the description.
+        assert skill.body in prompt
+        # ReAct-mode catalogue text must NOT leak in.
+        assert "use_skill" not in prompt
+        assert "Available Skills" not in prompt
+
+    def test_inlined_prompt_skills_alphabetically_sorted(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skills_path, cleanup = _make_clean_skills_dir()
+        try:
+            agent = Agent(
+                prompt="Base.",
+                loop=SingleCall(),
+                skills_dir=str(skills_path),
+            )
+            with pytest.warns(UserWarning):
+                prompt = agent.get_system_prompt()
+            pdf_idx = prompt.index("### Skill: pdf-processing")
+            report_idx = prompt.index("### Skill: report-gen")
+            assert pdf_idx < report_idx
+        finally:
+            shutil.rmtree(cleanup)
+
+    def test_inlined_prompt_respects_deny_skills(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skills_path, cleanup = _make_clean_skills_dir()
+        try:
+            agent = Agent(
+                prompt="Base.",
+                loop=SingleCall(),
+                skills_dir=str(skills_path),
+                deny_skills=["report-gen"],
+            )
+            with pytest.warns(UserWarning):
+                prompt = agent.get_system_prompt()
+            assert "### Skill: pdf-processing" in prompt
+            assert "### Skill: report-gen" not in prompt
+        finally:
+            shutil.rmtree(cleanup)
+
+    def test_singlecall_skills_no_use_skill_tool(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
+        agent = Agent(
+            prompt="Test.",
+            loop=SingleCall(),
+            skills=[skill],
+        )
+        defs = agent.get_tool_defs()
+        assert all(td.name != "use_skill" for td in defs)
+        all_defs = agent.get_all_tool_defs()
+        assert all(td.name != "use_skill" for td in all_defs)
+
+    @pytest.mark.asyncio
+    async def test_singlecall_skills_no_use_skill_in_lookups(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
+        agent = Agent(
+            prompt="Test.",
+            loop=SingleCall(),
+            skills=[skill],
+        )
+        lookups = await agent.get_tool_lookups()
+        assert "use_skill" not in lookups.fn
+
+    def test_warning_fires_once_per_agent(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
+        agent = Agent(
+            prompt="Base.",
+            loop=SingleCall(),
+            skills=[skill],
+        )
+        import warnings
+
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            agent.get_system_prompt()
+            agent.get_system_prompt()
+            agent.get_system_prompt()
+
+        inline_warnings = [r for r in records if "inlined skill mode" in str(r.message)]
+        assert len(inline_warnings) == 1
+
+    def test_warning_includes_character_count(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        skill = Skill.from_dir(FIXTURES_DIR / "pdf-processing")
+        agent = Agent(
+            prompt="Base.",
+            loop=SingleCall(),
+            skills=[skill],
+        )
+
+        with pytest.warns(UserWarning, match=r"\d+ characters"):
+            agent.get_system_prompt()
+
+    def test_singlecall_tools_error_mentions_skills_supported(self) -> None:
+        from dendrux.loops.single import SingleCall
+
+        with pytest.raises(ValueError, match="Skills are still supported"):
             Agent(
                 prompt="Test.",
                 loop=SingleCall(),
-                skills=[skill],
+                tools=[dummy_tool],
             )
 
 
