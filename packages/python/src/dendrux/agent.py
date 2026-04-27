@@ -1491,11 +1491,16 @@ class Agent:
             self._discovered_tool_defs = sorted(discovered_defs, key=lambda td: td.name)
             self._mcp_executors = executors
 
-    async def get_tool_lookups(self) -> ToolLookups:
+    async def get_tool_lookups(self, loop: Loop | None = None) -> ToolLookups:
         """Build ToolLookups for local + MCP + use_skill tools.
 
         Calls _ensure_discovered() and _ensure_skills_loaded() internally.
         Safe to call multiple times (discovery/loading is cached).
+
+        ``loop`` is the effective loop for the current run — pass the
+        runner's ``resolved_loop`` so a runtime override
+        (``agent.run(loop=...)``) is honored. Defaults to the agent's
+        configured loop when omitted.
         """
         from dendrux.loops.single import SingleCall
 
@@ -1504,16 +1509,19 @@ class Agent:
         from dendrux.tools import build_tool_lookups
         from dendrux.types import ToolTarget as _ToolTarget
 
+        effective_loop = self._effective_loop(loop)
+
         lookups = build_tool_lookups(
             self.tools,
             mcp_executors=self._mcp_executors,
             mcp_tool_defs=self._discovered_tool_defs,
         )
 
-        # Inject use_skill meta-tool only when skills load AND the loop
-        # supports tool calls. SingleCall delivers skills inline (see
-        # get_system_prompt), so use_skill has nothing to do there.
-        if self._loaded_skills and not isinstance(self._loop, SingleCall):
+        # Inject use_skill meta-tool only when skills load AND the
+        # effective loop supports tool calls. SingleCall delivers skills
+        # inline (see get_system_prompt), so use_skill has nothing to do
+        # there.
+        if self._loaded_skills and not isinstance(effective_loop, SingleCall):
             td = self._get_use_skill_tool_def()
             lookups.fn[td.name] = self._execute_use_skill
             lookups.target[td.name] = _ToolTarget.SERVER
@@ -1524,21 +1532,33 @@ class Agent:
 
         return lookups
 
-    def get_all_tool_defs(self) -> list[ToolDef]:
+    def get_all_tool_defs(self, loop: Loop | None = None) -> list[ToolDef]:
         """Local + discovered MCP + use_skill tool defs, sorted by name.
 
         Sorted output gives cache-stable prefixes to provider tool arrays.
         ``use_skill`` is omitted on SingleCall (inlined skill mode).
+        ``loop`` overrides the agent's configured loop for delivery-mode
+        selection — see :meth:`get_tool_lookups`.
         """
         from dendrux.loops.single import SingleCall
 
         self._ensure_skills_loaded()
+        effective_loop = self._effective_loop(loop)
         local = [get_tool_def(fn) for fn in self.tools]
         discovered = self._discovered_tool_defs or []
         all_defs = local + discovered
-        if self._loaded_skills and not isinstance(self._loop, SingleCall):
+        if self._loaded_skills and not isinstance(effective_loop, SingleCall):
             all_defs.append(self._get_use_skill_tool_def())
         return sorted(all_defs, key=lambda td: td.name)
+
+    def _effective_loop(self, loop: Loop | None) -> Loop | None:
+        """Return ``loop`` if explicit, else the agent's configured loop.
+
+        Used by the prompt/tool getters so a runtime ``loop=`` override
+        controls skill delivery mode instead of silently diverging from
+        what the runner is actually executing.
+        """
+        return loop if loop is not None else self._loop
 
     # ------------------------------------------------------------------
     # Skills
@@ -1587,10 +1607,10 @@ class Agent:
         self._loaded_skills = loaded
         self._denied_skill_names = denied
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, loop: Loop | None = None) -> str:
         """Compose system prompt with skill catalog.
 
-        Two delivery modes, picked by the loop:
+        Two delivery modes, picked by the effective loop:
 
         - **ReAct (default):** progressive disclosure. Only skill names +
           descriptions are listed; the LLM pulls full bodies via the
@@ -1604,6 +1624,10 @@ class Agent:
         context; in ReAct, skills are dynamically discoverable
         capabilities.
 
+        ``loop`` overrides the agent's configured loop for delivery-mode
+        selection. The runner passes its ``resolved_loop`` so an
+        ``agent.run(loop=...)`` override stays consistent end-to-end.
+
         Used by loops, runner events, and LLM semantic evidence.
         Single source of truth for the complete system prompt.
         """
@@ -1614,8 +1638,9 @@ class Agent:
             return self.prompt
 
         sorted_skills = sorted(self._loaded_skills, key=lambda s: s.name)
+        effective_loop = self._effective_loop(loop)
 
-        if isinstance(self._loop, SingleCall):
+        if isinstance(effective_loop, SingleCall):
             # Inlined skill mode: render bodies verbatim into the prompt.
             parts = [self.prompt, "\n\n## Skills"]
             for skill in sorted_skills:
@@ -1766,12 +1791,13 @@ class Agent:
     # Introspection
     # ------------------------------------------------------------------
 
-    def get_tool_defs(self) -> list[ToolDef]:
+    def get_tool_defs(self, loop: Loop | None = None) -> list[ToolDef]:
         """Get ToolDef for each LOCAL tool registered on this agent.
 
         Includes the auto-injected use_skill tool when skills are loaded
-        AND the loop supports tool calls. SingleCall delivers skills
-        inline, so use_skill is omitted there.
+        AND the effective loop supports tool calls. SingleCall delivers
+        skills inline, so use_skill is omitted there. ``loop`` overrides
+        the agent's configured loop — see :meth:`get_tool_lookups`.
 
         Does NOT include MCP tools. Use get_all_tool_defs() for the
         full set (local + discovered + use_skill).
@@ -1782,8 +1808,9 @@ class Agent:
         from dendrux.loops.single import SingleCall
 
         self._ensure_skills_loaded()
+        effective_loop = self._effective_loop(loop)
         defs = [get_tool_def(fn) for fn in self.tools]
-        if self._loaded_skills and not isinstance(self._loop, SingleCall):
+        if self._loaded_skills and not isinstance(effective_loop, SingleCall):
             defs.append(self._get_use_skill_tool_def())
         return sorted(defs, key=lambda td: td.name)
 

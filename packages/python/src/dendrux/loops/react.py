@@ -550,8 +550,8 @@ class ReActLoop(Loop):
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
-        lookups = await agent.get_tool_lookups()
-        tool_defs = agent.get_all_tool_defs()
+        lookups = await agent.get_tool_lookups(loop=self)
+        tool_defs = agent.get_all_tool_defs(loop=self)
         state = await _init_loop_state(
             user_input=user_input,
             recorder=recorder,
@@ -586,7 +586,7 @@ class ReActLoop(Loop):
                 )
 
             messages, tools = strategy.build_messages(
-                system_prompt=agent.get_system_prompt(),
+                system_prompt=agent.get_system_prompt(loop=self),
                 history=history,
                 tool_defs=tool_defs,
             )
@@ -962,8 +962,8 @@ class ReActLoop(Loop):
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
-        lookups = await agent.get_tool_lookups()
-        tool_defs = agent.get_all_tool_defs()
+        lookups = await agent.get_tool_lookups(loop=self)
+        tool_defs = agent.get_all_tool_defs(loop=self)
         state = await _init_loop_state(
             user_input=user_input,
             recorder=recorder,
@@ -998,7 +998,7 @@ class ReActLoop(Loop):
                 return
 
             messages, tools = strategy.build_messages(
-                system_prompt=agent.get_system_prompt(),
+                system_prompt=agent.get_system_prompt(loop=self),
                 history=history,
                 tool_defs=tool_defs,
             )
