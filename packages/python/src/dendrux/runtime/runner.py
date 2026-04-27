@@ -61,14 +61,25 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
-    """Reject SingleCall + tool_sources when loop is overridden at run time.
+    """Reject SingleCall + tools/tool_sources when loop is overridden at run time.
 
     Skills are allowed on SingleCall — they're delivered inline by
-    ``Agent.get_system_prompt`` (inlined skill mode). Tool sources are
-    rejected because MCP discovery surfaces tools, and SingleCall cannot
-    invoke tools (one LLM call by definition).
+    ``Agent.get_system_prompt`` (inlined skill mode). Tools and tool
+    sources are rejected because tool execution is inherently multi-turn
+    (the LLM emits a call, the loop runs it, the LLM sees the result),
+    and SingleCall is one LLM call by definition. Mirrors the
+    construction-time checks in ``Agent._validate``.
     """
     from dendrux.loops.single import SingleCall
+
+    if isinstance(resolved_loop, SingleCall) and agent.tools:
+        tool_names = [getattr(fn, "__name__", str(fn)) for fn in agent.tools]
+        raise ValueError(
+            f"Agent '{agent.name}' has {len(agent.tools)} tool(s) {tool_names} "
+            f"but is being run with SingleCall loop. SingleCall agents cannot "
+            f"have tools — tool execution requires multi-turn iteration. "
+            f"Skills are still supported on SingleCall (delivered inline)."
+        )
 
     if isinstance(resolved_loop, SingleCall) and agent._tool_sources:
         raise ValueError(

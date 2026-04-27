@@ -464,11 +464,13 @@ class TestSingleCallToolSourcesGuard:
         from dendrux.loops.single import SingleCall
         from dendrux.runtime.runner import _validate_loop_skill_compat
 
-        agent = Agent(prompt="Test.", tools=[dummy_tool])
-        # Simulate tool_sources added (normally via constructor)
+        # No local tools — this test specifically exercises the
+        # tool_sources rejection path. The local-tools rejection has
+        # its own test in tests/unit/test_agent_skills.py.
+        agent = Agent(prompt="Test.")
         agent._tool_sources = [AsyncMock()]
 
-        with pytest.raises(ValueError, match="(?i)single.*call"):
+        with pytest.raises(ValueError, match="(?i)tool_sources"):
             _validate_loop_skill_compat(agent, SingleCall())
 
 

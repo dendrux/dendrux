@@ -648,10 +648,32 @@ class TestRunnerSkillCompatRelaxation:
         from dendrux.loops.single import SingleCall
         from dendrux.runtime.runner import _validate_loop_skill_compat
 
-        agent = Agent(prompt="Base.", tools=[dummy_tool])
+        agent = Agent(prompt="Base.")
         agent._tool_sources = [AsyncMock()]
 
         with pytest.raises(ValueError, match="(?i)tool_sources"):
+            _validate_loop_skill_compat(agent, SingleCall())
+
+    def test_runner_validation_rejects_singlecall_override_with_local_tools(self) -> None:
+        """A ReAct-built agent with local tools must not silently lose
+        them when invoked with a SingleCall loop override — SingleCall
+        passes tool_defs=[] to the strategy, so the tools would
+        disappear without notice."""
+        from dendrux.loops.single import SingleCall
+        from dendrux.runtime.runner import _validate_loop_skill_compat
+
+        agent = Agent(prompt="Base.", tools=[dummy_tool])
+
+        with pytest.raises(ValueError, match="(?i)cannot have tools"):
+            _validate_loop_skill_compat(agent, SingleCall())
+
+    def test_runner_validation_error_mentions_skills_supported(self) -> None:
+        from dendrux.loops.single import SingleCall
+        from dendrux.runtime.runner import _validate_loop_skill_compat
+
+        agent = Agent(prompt="Base.", tools=[dummy_tool])
+
+        with pytest.raises(ValueError, match="Skills are still supported"):
             _validate_loop_skill_compat(agent, SingleCall())
 
 
