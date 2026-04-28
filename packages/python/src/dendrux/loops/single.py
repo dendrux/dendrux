@@ -131,7 +131,7 @@ class SingleCall(Loop):
             await notify_message(notifier, user_msg, 0)
 
         messages, _tools = strategy.build_messages(
-            system_prompt=agent.get_system_prompt(),
+            system_prompt=agent.get_system_prompt(loop=self),
             history=history,
             tool_defs=[],
         )
@@ -459,7 +459,7 @@ class SingleCall(Loop):
             await notify_message(notifier, user_msg, 0)
 
         messages, _tools = strategy.build_messages(
-            system_prompt=agent.get_system_prompt(),
+            system_prompt=agent.get_system_prompt(loop=self),
             history=history,
             tool_defs=[],
         )

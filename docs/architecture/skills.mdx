@@ -5,7 +5,7 @@ description: Loading Markdown skill definitions into an agent, the progressive-d
 
 # Skills
 
-A skill is a Markdown file that teaches an agent how to do one specific thing. A single `SKILL.md` file sits in a directory, carries YAML frontmatter with a `name` and a `description`, and a Markdown body of instructions. Agents load skills declaratively at construction time, expose them to the LLM as a catalogue, and let the LLM pull the full body on demand through a built-in `use_skill` tool.
+A skill is a Markdown file that teaches an agent how to do one specific thing. A single `SKILL.md` file sits in a directory, carries YAML frontmatter with a `name` and a `description`, and a Markdown body of instructions. Agents load skills declaratively at construction time. Delivery to the LLM depends on the loop: ReAct exposes a catalogue and lets the LLM pull bodies via the built-in `use_skill` tool (progressive disclosure); SingleCall inlines bodies into the system prompt (see [Inlined skill mode](#inlined-skill-mode-singlecall) below).
 
 The open standard this follows is [agentskills.io](https://agentskills.io/). Dendrux's integration is a faithful implementation of the spec: one `SKILL.md` per skill, per directory, with standard frontmatter keys.
 
@@ -126,11 +126,39 @@ That design is fragile for two reasons:
 
 Routing skill invocation through an explicit tool makes the decision first-class. The model makes the call; the runtime records `skill.invoked`; the body comes back as a tool result the same way any other tool result does. Every part of the runtime that already handles tool calls (notifiers, recorder, governance) handles skills without special-casing.
 
+## Inlined skill mode (SingleCall)
+
+Progressive disclosure requires at least two LLM turns: one to call `use_skill`, one to act on the body it returns. SingleCall is allowed exactly one LLM call. The two cannot coexist.
+
+So when an agent is configured with both `loop=SingleCall()` and skills, Dendrux switches delivery: every skill body is rendered into the system prompt at construction time, sorted alphabetically. The `use_skill` tool is not injected — there's nothing for it to do, and SingleCall is by contract a zero-tool loop. The same `deny_skills` filter applies.
+
+The architectural rule:
+
+> In SingleCall, skills are static prompt context.  
+> In ReAct, skills are dynamically discoverable capabilities.
+
+A `UserWarning` fires once at the first prompt build, naming the rendered character count, so devs notice when inlined bodies start to bloat the prompt:
+
+```text
+UserWarning: Agent 'chat-participant': SingleCall + 2 skill(s) → inlined skill mode.
+Skill bodies are rendered into the system prompt at every turn (no progressive
+disclosure with one LLM call). Rendered system prompt is 1843 characters.
+Switch to ReActLoop for tool-mediated disclosure.
+```
+
+When to pick which:
+
+- **Multi-skill chatbot, dev pre-selects which skills attach per participant** — SingleCall + inlined. No round-trip cost, predictable single-call latency, the dev's skill choice acts as the disclosure decision.
+- **Agent with many skills the LLM should pick from** — ReActLoop + tool-mediated. Pay the second-call cost only when a skill is actually used.
+
+`SingleCall + tools` remains rejected. Tool execution is inherently multi-turn (LLM emits a call, loop runs it, LLM sees the result) and has no inline alternative the way skill content does.
+
+> **Bundled resources are not yet supported.** A skill today is a Markdown body only — sibling files in the skill directory are not read. When a future sprint adds bundled-script execution, those skills will require a tool layer and will not be inlinable on SingleCall.
+
 ## Where this fits
 
 - Declared on `Agent(skills_dir=..., skills=[...], deny_skills=[...])`.
 - Loaded by `dendrux.skills._loader.Skill.scan_dir` and explicit `Skill` objects.
-- Exposed to the LLM as a catalogue in `get_system_prompt()`.
-- Invoked via the auto-injected `use_skill` tool, dispatched through the normal tool pipeline.
-- Emits `skill.registered`, `skill.denied`, and `skill.invoked` events on `run_events`.
-- SingleCall rejects skills at construction. Skills require [ReActLoop](/docs/architecture/loops) (the default) because they need multi-turn iteration to pull a body and then act on it.
+- Exposed via `get_system_prompt()` — catalogue (ReAct) or full bodies (SingleCall, inlined).
+- ReAct: invoked via the auto-injected `use_skill` tool, dispatched through the normal tool pipeline.
+- Emits `skill.registered`, `skill.denied`, and `skill.invoked` events on `run_events` (the third only fires in ReAct, where the model invokes a skill mid-loop).

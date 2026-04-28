@@ -61,14 +61,26 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
-    """Reject SingleCall + skills/tool_sources when loop is overridden at run time."""
+    """Reject SingleCall + tools/tool_sources when loop is overridden at run time.
+
+    Skills are allowed on SingleCall — they're delivered inline by
+    ``Agent.get_system_prompt`` (inlined skill mode). Tools and tool
+    sources are rejected because tool execution is inherently multi-turn
+    (the LLM emits a call, the loop runs it, the LLM sees the result),
+    and SingleCall is one LLM call by definition. Mirrors the
+    construction-time checks in ``Agent._validate``.
+    """
     from dendrux.loops.single import SingleCall
 
-    if isinstance(resolved_loop, SingleCall) and (agent._skills_dir or agent._explicit_skills):
+    if isinstance(resolved_loop, SingleCall) and agent.tools:
+        tool_names = [getattr(fn, "__name__", str(fn)) for fn in agent.tools]
         raise ValueError(
-            f"Agent '{agent.name}' has skills but is being run with SingleCall loop. "
-            f"SingleCall cannot use skills (use_skill requires tool calling)."
+            f"Agent '{agent.name}' has {len(agent.tools)} tool(s) {tool_names} "
+            f"but is being run with SingleCall loop. SingleCall agents cannot "
+            f"have tools — tool execution requires multi-turn iteration. "
+            f"Skills are still supported on SingleCall (delivered inline)."
         )
+
     if isinstance(resolved_loop, SingleCall) and agent._tool_sources:
         raise ValueError(
             f"Agent '{agent.name}' has MCP tool_sources but is being run with "
@@ -101,11 +113,16 @@ async def _emit_init_events(
     agent: Agent,
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    *,
+    resolved_loop: Loop | None = None,
 ) -> None:
     """Emit skill and MCP init governance events.
 
     Called inside the runner try block after run.started and delegation
     context is set.
+
+    ``resolved_loop`` is forwarded to ``agent.get_tool_lookups()`` so
+    MCP discovery + use_skill injection respect a runtime loop override.
 
     Skills: reads agent._loaded_skills / agent._denied_skill_names
     (populated by get_system_prompt()).
@@ -136,7 +153,7 @@ async def _emit_init_events(
     # MCP events — only when tool_sources exist
     if agent._tool_sources:
         try:
-            await agent.get_tool_lookups()  # force discovery
+            await agent.get_tool_lookups(loop=resolved_loop)  # force discovery
         except Exception as exc:
             raise _MCPDiscoveryError(str(exc)) from exc
 
@@ -595,7 +612,7 @@ async def run(
 
     # Resolve system prompt BEFORE create_run() so skill loading
     # failures don't leave a DB row stuck in running.
-    _system_prompt = agent.get_system_prompt()
+    _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
     if state_store is not None:
         # Create the run record before the loop starts
@@ -687,7 +704,7 @@ async def run(
         # _MCPDiscoveryError is caught here, mcp.error emitted, then the
         # original cause is re-raised for the outer except Exception.
         try:
-            await _emit_init_events(agent, recorder, extra_notifier)
+            await _emit_init_events(agent, recorder, extra_notifier, resolved_loop=resolved_loop)
         except _MCPDiscoveryError as mcp_exc:
             try:
                 await _emit_init_governance_event(
@@ -973,7 +990,7 @@ async def retry(
     parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
     effective_max_depth = _resolve_max_delegation_depth(_UNSET_DEPTH, parent_ctx)
 
-    _system_prompt = agent.get_system_prompt()
+    _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
     run_meta = dict(metadata) if metadata else {}
     run_meta["dendrux.loop"] = type(resolved_loop).__name__
@@ -1029,7 +1046,7 @@ async def retry(
 
     try:
         try:
-            await _emit_init_events(agent, recorder, extra_notifier)
+            await _emit_init_events(agent, recorder, extra_notifier, resolved_loop=resolved_loop)
         except _MCPDiscoveryError as mcp_exc:
             try:
                 await _emit_init_governance_event(
@@ -1230,7 +1247,7 @@ def run_stream(
 
             # Resolve system prompt BEFORE create_run() so skill loading
             # failures don't leave a DB row stuck in running.
-            _system_prompt = agent.get_system_prompt()
+            _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
             recorder: LoopRecorder | None = None
 
@@ -1294,7 +1311,9 @@ def run_stream(
 
             # Emit init governance events (skills + MCP)
             try:
-                await _emit_init_events(agent, recorder, extra_notifier)
+                await _emit_init_events(
+                    agent, recorder, extra_notifier, resolved_loop=resolved_loop
+                )
             except _MCPDiscoveryError as mcp_exc:
                 try:
                     await _emit_init_governance_event(
@@ -1673,12 +1692,15 @@ async def _execute_approved_tools(
     notifier: LoopNotifier | None,
     *,
     history: list[Message] | None = None,
+    resolved_loop: Loop | None = None,
 ) -> list[tuple[ToolCall, ToolResult]]:
     """Execute pending tools after approval. Returns (ToolCall, ToolResult) pairs.
 
     Shared by _resume_core (batch) and resume_stream (streaming).
     Records tool completions and appends tool messages to ``history``
     (the live ctx.history list, not pause_state.history which is a snapshot).
+    ``resolved_loop`` is forwarded to ``agent.get_tool_lookups()`` so a
+    runtime loop override stays consistent across resume.
     Caller is responsible for governance events and loop re-entry.
     """
     from dendrux.loops._helpers import notify_message as _ntfy_msg
@@ -1687,7 +1709,7 @@ async def _execute_approved_tools(
     from dendrux.types import Message, Role
 
     target_history = history if history is not None else pause_state.history
-    lookups = await agent.get_tool_lookups()
+    lookups = await agent.get_tool_lookups(loop=resolved_loop)
     results: list[tuple[ToolCall, ToolResult]] = []
 
     for tc in pause_state.pending_tool_calls:
@@ -1833,6 +1855,7 @@ async def _resume_core(
                 ctx.recorder,
                 ctx.notifier,
                 history=ctx.history,
+                resolved_loop=ctx.resolved_loop,
             )
 
             _decided_data: dict[str, Any] = {
@@ -2064,6 +2087,7 @@ def resume_stream(
                     ctx.recorder,
                     ctx.notifier,
                     history=ctx.history,
+                    resolved_loop=ctx.resolved_loop,
                 ):
                     yield RunEvent(
                         type=RunEventType.TOOL_RESULT,
