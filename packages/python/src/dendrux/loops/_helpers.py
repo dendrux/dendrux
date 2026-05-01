@@ -156,6 +156,7 @@ async def notify_llm(
     semantic_messages: list[Message] | None = None,
     semantic_tools: list[ToolDef] | None = None,
     duration_ms: int | None = None,
+    guardrail_findings: dict[str, Any] | None = None,
 ) -> None:
     """Notify notifier of an LLM call completion, swallowing exceptions."""
     if notifier is None:
@@ -167,6 +168,7 @@ async def notify_llm(
             semantic_messages=semantic_messages,
             semantic_tools=semantic_tools,
             duration_ms=duration_ms,
+            guardrail_findings=guardrail_findings,
         )
     except Exception:
         logger.warning("Notifier.on_llm_call_completed failed", exc_info=True)

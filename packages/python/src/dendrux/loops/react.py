@@ -758,6 +758,7 @@ class ReActLoop(Loop):
                         semantic_messages=messages,
                         semantic_tools=tools,
                         duration_ms=llm_duration_ms,
+                        guardrail_findings=_all_guardrail_findings or None,
                     )
                     _accumulate_usage(total_usage, response.usage)
                     await _check_budget(
@@ -811,6 +812,7 @@ class ReActLoop(Loop):
                 semantic_messages=messages,
                 semantic_tools=tools,
                 duration_ms=llm_duration_ms,
+                guardrail_findings=_all_guardrail_findings or None,
             )
             _accumulate_usage(total_usage, response.usage)
             await _check_budget(
