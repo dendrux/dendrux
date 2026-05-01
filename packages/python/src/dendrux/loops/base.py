@@ -119,6 +119,7 @@ class LoopNotifier(Protocol):
         semantic_messages: list[Message] | None = None,
         semantic_tools: list[ToolDef] | None = None,
         duration_ms: int | None = None,
+        guardrail_findings: dict[str, Any] | None = None,
     ) -> None:
         """Called after provider.complete() returns.
 
@@ -129,6 +130,12 @@ class LoopNotifier(Protocol):
 
         Args:
             duration_ms: Wall-clock time for the provider.complete() call.
+            guardrail_findings: Detector hits from the incoming + outgoing
+                guardrail scans for this LLM call (None when no guardrails
+                or no hits). Mirrors :class:`LoopRecorder.on_llm_call_completed`
+                so notifiers (OTel, dashboards, webhooks) can attach
+                guardrail context to LLM events without joining through
+                the separate ``guardrail.*`` governance event stream.
         """
         ...
 

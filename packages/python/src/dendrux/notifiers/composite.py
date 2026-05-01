@@ -42,6 +42,7 @@ class CompositeNotifier(LoopNotifier):
         semantic_messages: list[Message] | None = None,
         semantic_tools: list[ToolDef] | None = None,
         duration_ms: int | None = None,
+        guardrail_findings: dict[str, Any] | None = None,
     ) -> None:
         for notifier in self._notifiers:
             try:
@@ -51,6 +52,7 @@ class CompositeNotifier(LoopNotifier):
                     semantic_messages=semantic_messages,
                     semantic_tools=semantic_tools,
                     duration_ms=duration_ms,
+                    guardrail_findings=guardrail_findings,
                 )
             except Exception:
                 logger.warning("CompositeNotifier: on_llm_call_completed failed", exc_info=True)

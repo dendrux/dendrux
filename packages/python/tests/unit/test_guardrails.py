@@ -1046,6 +1046,123 @@ class TestGuardrailSingleCall:
 
 
 # ------------------------------------------------------------------
+# Notifier protocol symmetry — guardrail_findings reaches both rails
+# ------------------------------------------------------------------
+
+
+class TestNotifierGuardrailFindingsSymmetry:
+    """The recorder receives ``guardrail_findings`` on every LLM call.
+    The notifier must receive the same kwarg so OTel/dashboard subscribers
+    can attach guardrail context to LLM events without joining through
+    the separate ``guardrail.*`` governance event stream.
+    """
+
+    async def test_singlecall_notifier_receives_guardrail_findings(self) -> None:
+        """SingleCall: incoming PII findings reach the notifier on the LLM event."""
+        from dendrux.loops.base import LoopNotifier
+
+        captured: dict[str, dict] = {}
+
+        class CapturingNotifier(LoopNotifier):
+            async def on_message_appended(self, message, iteration):
+                pass
+
+            async def on_llm_call_completed(
+                self,
+                response,
+                iteration,
+                *,
+                semantic_messages=None,
+                semantic_tools=None,
+                duration_ms=None,
+                guardrail_findings=None,
+            ):
+                captured["findings"] = guardrail_findings
+
+            async def on_tool_completed(self, tool_call, tool_result, iteration):
+                pass
+
+            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+                pass
+
+        llm = MockLLM([_response("Classified.")])
+        agent = Agent(
+            prompt="Classify.",
+            loop=SingleCall(),
+            guardrails=[PII()],
+        )
+
+        result = await SingleCall().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="Classify jane@example.com",
+            notifier=CapturingNotifier(),
+        )
+
+        assert result.status == RunStatus.SUCCESS
+        # Notifier must have been called with non-None guardrail_findings
+        # (the EMAIL_ADDRESS hit from the incoming scan).
+        assert "findings" in captured, "on_llm_call_completed never fired"
+        findings = captured["findings"]
+        assert findings is not None, (
+            "Notifier received guardrail_findings=None despite an incoming "
+            "PII detection. The notifier rail is missing the kwarg the "
+            "recorder rail already gets."
+        )
+        assert "incoming" in findings
+
+    async def test_react_notifier_receives_guardrail_findings(self) -> None:
+        """ReAct: same symmetry across the iterative loop."""
+        from dendrux.loops.base import LoopNotifier
+
+        captured_findings: list[dict | None] = []
+
+        class CapturingNotifier(LoopNotifier):
+            async def on_message_appended(self, message, iteration):
+                pass
+
+            async def on_llm_call_completed(
+                self,
+                response,
+                iteration,
+                *,
+                semantic_messages=None,
+                semantic_tools=None,
+                duration_ms=None,
+                guardrail_findings=None,
+            ):
+                captured_findings.append(guardrail_findings)
+
+            async def on_tool_completed(self, tool_call, tool_result, iteration):
+                pass
+
+            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+                pass
+
+        llm = MockLLM([_response("done")])
+        agent = Agent(
+            prompt="Be helpful.",
+            tools=[search],
+            guardrails=[PII()],
+        )
+
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="Lookup details for jane@example.com",
+            notifier=CapturingNotifier(),
+        )
+
+        assert result.status == RunStatus.SUCCESS
+        assert captured_findings, "on_llm_call_completed never fired"
+        # First LLM call's incoming scan finds the email — notifier must see it.
+        assert captured_findings[0] is not None
+        assert "incoming" in captured_findings[0]
+
+
+# ------------------------------------------------------------------
 # Streaming guard
 # ------------------------------------------------------------------
 

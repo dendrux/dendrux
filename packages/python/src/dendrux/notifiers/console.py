@@ -94,6 +94,7 @@ class ConsoleNotifier(LoopNotifier):
         semantic_messages: list[Message] | None = None,
         semantic_tools: list[ToolDef] | None = None,
         duration_ms: int | None = None,
+        guardrail_findings: dict[str, Any] | None = None,
     ) -> None:
         """Called after an LLM call completes."""
         tokens = response.usage.total_tokens if response.usage else 0

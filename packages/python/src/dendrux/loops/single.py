@@ -316,6 +316,7 @@ class SingleCall(Loop):
                     semantic_messages=messages,
                     semantic_tools=None,
                     duration_ms=llm_duration_ms,
+                    guardrail_findings=_sc_findings or None,
                 )
                 await _check_budget(
                     agent.budget,
@@ -365,6 +366,7 @@ class SingleCall(Loop):
             semantic_messages=messages,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
+            guardrail_findings=_sc_findings or None,
         )
 
         assistant_msg = Message(role=Role.ASSISTANT, content=response.text or "")
