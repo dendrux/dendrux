@@ -987,6 +987,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
             ),
         )
         return await task
@@ -1038,6 +1039,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
             ),
         )
         return await task
@@ -1132,6 +1134,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                pre_claim_status=RunStatus.WAITING_APPROVAL.value,
             ),
         )
         return await task

@@ -2515,6 +2515,7 @@ async def resume_claimed(
     agent: Agent,
     provider: LLMProvider,
     extra_notifier: LoopNotifier | None = None,
+    pre_claim_status: str | None = None,
 ) -> RunResult:
     """Resume a run that was already claimed via submit_and_claim().
 
@@ -2535,6 +2536,12 @@ async def resume_claimed(
         agent: Agent definition.
         provider: LLM provider.
         extra_notifier: Optional additional LoopNotifier.
+        pre_claim_status: The pause status the run was in before
+            submit_and_claim flipped it to RUNNING. Forwarded to
+            ``_resume_core`` as ``expected_status`` so downstream
+            governance gates (e.g. ``approval.decided=rejected`` for
+            ``submit_approval(approved=False)``) can fire correctly.
+            Defaults to ``"running"`` for back-compat.
 
     Returns:
         RunResult from the resumed loop.
@@ -2593,7 +2600,7 @@ async def resume_claimed(
             state_store=state_store,
             agent=agent,
             provider=provider,
-            expected_status="running",
+            expected_status=pre_claim_status or "running",
             tool_results=tool_results,
             extra_notifier=extra_notifier,
             _skip_claim=True,
@@ -2605,7 +2612,7 @@ async def resume_claimed(
             state_store=state_store,
             agent=agent,
             provider=provider,
-            expected_status="running",
+            expected_status=pre_claim_status or "running",
             user_input=submitted_input,
             extra_notifier=extra_notifier,
             _skip_claim=True,
