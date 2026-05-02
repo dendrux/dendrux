@@ -605,3 +605,68 @@ class TestStreamCleanupCancellationLifecycle:
             "resume_stream cleanup CAS lost (run already finalized) but the "
             "local notifier never saw on_run_finished."
         )
+
+
+# ---------------------------------------------------------------------------
+# Approval-rejection governance event coverage
+# ---------------------------------------------------------------------------
+
+
+class _GovEventCapturer(BaseNotifier):
+    """Captures (event_type, data) for every governance event."""
+
+    def __init__(self) -> None:
+        self.gov_events: list[tuple[str, dict[str, Any]]] = []
+
+    async def on_governance_event(
+        self, run_id, event_type, iteration, data, *, correlation_id=None
+    ) -> None:
+        self.gov_events.append((event_type, dict(data)))
+
+
+class TestSubmitApprovalRejectionGovernance:
+    """submit_approval(approved=False) must fire approval.decided=rejected.
+
+    The streaming variant (resume_stream with rejection ToolResults) already
+    fires this because it re-derives expected_status from the actual pause
+    status. The sync variant goes through resume_claimed → _resume_core
+    with expected_status="running", which historically failed the rejection
+    gate at runner.py:2002 and silently dropped the governance event.
+    """
+
+    async def test_sync_rejection_fires_approval_decided(self, db_store) -> None:
+        tc = ToolCall(name="refund", params={"order_id": 7}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="acknowledged rejection")])
+        agent = _approval_agent(llm, db_store)
+
+        paused = await agent.run("refund 7")
+        assert paused.status == RunStatus.WAITING_APPROVAL
+
+        n = _GovEventCapturer()
+        await agent.submit_approval(
+            paused.run_id,
+            approved=False,
+            rejection_reason="Manager declined.",
+            notifier=n,
+        )
+
+        decided = [(etype, data) for etype, data in n.gov_events if etype == "approval.decided"]
+        assert decided, (
+            "submit_approval(approved=False) silently skipped approval.decided. "
+            "OTel/audit consumers never see the rejection signal."
+        )
+        assert decided[0][1].get("decision") == "rejected", decided[0][1]
+
+    async def test_sync_approval_still_fires_approval_decided(self, db_store) -> None:
+        """Regression: ensure the approve path still emits approval.decided."""
+        tc = ToolCall(name="refund", params={"order_id": 7}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="processed")])
+        agent = _approval_agent(llm, db_store)
+
+        paused = await agent.run("refund 7")
+        n = _GovEventCapturer()
+        await agent.submit_approval(paused.run_id, approved=True, notifier=n)
+
+        decided = [(etype, data) for etype, data in n.gov_events if etype == "approval.decided"]
+        assert decided
+        assert decided[0][1].get("decision") == "approved"

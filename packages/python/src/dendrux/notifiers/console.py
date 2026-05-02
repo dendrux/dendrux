@@ -25,6 +25,12 @@ from dendrux.types import Message, Role, ToolCall, ToolResult
 if TYPE_CHECKING:
     from dendrux.types import LLMResponse, RunResult, ToolDef
 
+# Run statuses for which on_run_finished prints a "paused" inline marker.
+# The pause states are still terminal-from-runner-perspective, but the
+# final SUCCESS/ERROR/CANCELLED flavors get the rich print_summary panel
+# instead so we don't double-paint when callers also call print_summary.
+_PAUSE_STATUSES = {"waiting_client_tool", "waiting_human_input", "waiting_approval"}
+
 _console = Console()
 
 
@@ -57,6 +63,56 @@ class ConsoleNotifier(BaseNotifier):
         self._total_cache_creation = 0
         self._run_start = 0.0
 
+    async def on_run_started(
+        self,
+        run_id: str,
+        *,
+        agent_name: str | None = None,
+        agent_model: str | None = None,
+    ) -> None:
+        """Called once per run-or-resume entry, before any other event."""
+        # Track only the first run_started — pause/resume cycles re-fire
+        # the lifecycle pair, and we don't want to reset _run_start on each.
+        if not self._started:
+            self._started = True
+            self._run_start = time.monotonic()
+        meta = " · ".join(part for part in (agent_name, agent_model) if part is not None)
+        meta_str = f" [dim]{meta}[/dim]" if meta else ""
+        _console.print(f"\n[bright_blue]▶ run[/bright_blue] [dim]{run_id[-12:]}[/dim]{meta_str}")
+
+    async def on_run_finished(self, run_id: str, result: RunResult) -> None:
+        """Called when a run reaches a terminal state — including pause.
+
+        For pause states (the run handed control back), prints an inline
+        marker so the trace is bookended cleanly across resume cycles.
+        For final terminals (SUCCESS / ERROR / CANCELLED) we stay quiet
+        so callers using ``print_summary(result)`` don't double-paint.
+        """
+        if result.status.value in _PAUSE_STATUSES:
+            _console.print(
+                f"  [bright_yellow]‖ paused[/bright_yellow] [dim]{result.status.value}[/dim]"
+            )
+
+    async def on_run_failed(
+        self,
+        run_id: str,
+        error: BaseException,
+        *,
+        iteration: int | None = None,
+    ) -> None:
+        """Called when a run terminates with an unhandled exception."""
+        _console.print()
+        _console.print(
+            Panel(
+                f"[bold red]{type(error).__name__}[/bold red]: "
+                f"[white]{_truncate(str(error), 240)}[/white]",
+                title="[bold]run failed[/bold]",
+                border_style="red",
+                width=min(76, _console.width),
+                padding=(0, 1),
+            )
+        )
+
     async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Called when a message is appended to history."""
         if iteration != self._iteration:
@@ -64,27 +120,60 @@ class ConsoleNotifier(BaseNotifier):
             _console.print()
             _console.print(f"  [bold bright_cyan]Step {iteration}[/bold bright_cyan]")
 
-        if message.role == Role.USER and iteration == 0:
-            if not self._started:
-                self._started = True
-                self._run_start = time.monotonic()
-                _console.print()
-                _console.print(
-                    Panel(
-                        f"[white]{_truncate(message.content, 200)}[/white]",
-                        border_style="bright_blue",
-                        width=min(76, _console.width),
-                        padding=(0, 1),
-                    )
+        if message.role == Role.USER and iteration == 0 and message.content:
+            # Inline-render the user input panel once, on the first turn,
+            # the first time we see a user message. Resume turns reuse the
+            # existing history so this won't re-fire.
+            _console.print()
+            _console.print(
+                Panel(
+                    f"[white]{_truncate(message.content, 200)}[/white]",
+                    border_style="bright_blue",
+                    width=min(76, _console.width),
+                    padding=(0, 1),
                 )
+            )
 
-        elif message.role == Role.ASSISTANT and message.tool_calls:
-            for tc in message.tool_calls:
-                self._tool_starts[tc.id] = time.monotonic()
-                params_str = ""
-                if self._show_params and tc.params:
-                    params_str = f" [dim]{_format_params(tc.params)}[/dim]"
-                _console.print(f"  [yellow]  calling[/yellow] [bold]{tc.name}[/bold]{params_str}")
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None:
+        """Called when an LLM call begins. We don't print here to keep the
+        trace tight — the matching on_llm_call_completed prints duration
+        and tokens. Subclasses can override for live-latency displays."""
+        return None
+
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Called when an LLM call raises (e.g. provider error, stream cut)."""
+        duration_str = f" [dim]after {duration_ms / 1000:.1f}s[/dim]" if duration_ms else ""
+        _console.print(
+            f"  [red]  llm[/red]    [bold]{type(error).__name__}[/bold]{duration_str} "
+            f"[dim]{_truncate(str(error), 100)}[/dim]"
+        )
+
+    async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        """Called immediately before a tool dispatches.
+
+        Replaces the prior on_message_appended-based "calling" display so
+        the marker also fires on resume paths (client-tool replay,
+        approval-approved server tools), not just fresh assistant turns.
+        """
+        self._tool_starts[tool_call.id] = time.monotonic()
+        params_str = ""
+        if self._show_params and tool_call.params:
+            params_str = f" [dim]{_format_params(tool_call.params)}[/dim]"
+        _console.print(f"  [yellow]  calling[/yellow] [bold]{tool_call.name}[/bold]{params_str}")
 
     async def on_llm_call_completed(
         self,
@@ -233,6 +322,38 @@ class ConsoleNotifier(BaseNotifier):
             error = data.get("error", "unknown")
             _console.print(
                 f"  [bright_red]  mcp[/bright_red]    [bold]error[/bold] [dim]{error}[/dim]"
+            )
+        elif event_type == _GovType.POLICY_DENIED:
+            tool_name = data.get("tool_name", "")
+            reason = data.get("reason", "denied by policy")
+            _console.print(
+                f"  [bright_red]  deny[/bright_red]   [bold]{tool_name}[/bold] [dim]{reason}[/dim]"
+            )
+        elif event_type == _GovType.APPROVAL_REQUESTED:
+            tool_name = data.get("tool_name", "")
+            _console.print(
+                f"  [bright_yellow]  approve[/bright_yellow] "
+                f"[bold]{tool_name}[/bold] [dim]waiting for human sign-off[/dim]"
+            )
+        elif event_type == _GovType.APPROVAL_DECIDED:
+            tool_name = data.get("tool_name", "")
+            decision = data.get("decision", "unknown")
+            color = "bright_green" if decision == "approved" else "bright_red"
+            _console.print(
+                f"  [{color}]  approve[/{color}] [bold]{tool_name}[/bold] [dim]{decision}[/dim]"
+            )
+        elif event_type == _GovType.PROVIDER_RETRY:
+            attempt = data.get("attempt", "?")
+            reason = data.get("reason", "")
+            _console.print(
+                f"  [bright_yellow]  retry[/bright_yellow]  "
+                f"[bold]attempt {attempt}[/bold] [dim]{reason}[/dim]"
+            )
+        elif event_type == _GovType.GUARDRAIL_UNMAPPED_PLACEHOLDER:
+            placeholders = data.get("placeholders", [])
+            _console.print(
+                f"  [bright_red]  guard[/bright_red]  "
+                f"[bold]unmapped placeholder[/bold] [dim]{placeholders}[/dim]"
             )
         else:
             tool_name = data.get("tool_name", "")
