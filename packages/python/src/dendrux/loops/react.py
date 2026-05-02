@@ -1141,6 +1141,14 @@ class ReActLoop(Loop):
                             )
                         elif event.type == StreamEventType.DONE:
                             llm_response = event.raw
+                    # Validate inside the same try so a contract-violating
+                    # provider stream still pairs with on_llm_call_failed.
+                    if llm_response is None:
+                        raise RuntimeError(
+                            f"Provider stream ended without DONE event at iteration "
+                            f"{iteration}. complete_stream() must yield "
+                            f"StreamEvent(type=DONE, raw=LLMResponse)."
+                        )
                 except Exception as _stream_exc:
                     _stream_fail_ms = int((time.monotonic() - t0) * 1000)
                     await _record_llm_failed(
@@ -1164,12 +1172,6 @@ class ReActLoop(Loop):
                 _stream_telemetry.__exit__(None, None, None)
 
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
-
-            if llm_response is None:
-                raise RuntimeError(
-                    f"Provider stream ended without DONE event at iteration {iteration}. "
-                    f"complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
-                )
 
             await _record_llm(
                 recorder,

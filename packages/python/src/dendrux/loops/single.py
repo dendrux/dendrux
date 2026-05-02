@@ -578,6 +578,19 @@ class SingleCall(Loop):
                         )
                     elif event.type == StreamEventType.DONE:
                         llm_response = event.raw
+                # Validate inside the same try so contract violations still
+                # pair with on_llm_call_failed (started already fired).
+                if llm_response is None:
+                    raise RuntimeError(
+                        "Provider stream ended without DONE event. "
+                        "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
+                    )
+                if llm_response.tool_calls:
+                    raise RuntimeError(
+                        f"SingleCall received unexpected tool_calls from provider "
+                        f"({len(llm_response.tool_calls)} calls). SingleCall agents must "
+                        f"have zero tools — the provider should not produce tool calls."
+                    )
             except Exception as _stream_exc:
                 _stream_fail_ms = int((time.monotonic() - t0) * 1000)
                 await record_llm_failed(
@@ -601,19 +614,6 @@ class SingleCall(Loop):
             _stream_telemetry.__exit__(None, None, None)
 
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
-
-        if llm_response is None:
-            raise RuntimeError(
-                "Provider stream ended without DONE event. "
-                "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
-            )
-
-        if llm_response.tool_calls:
-            raise RuntimeError(
-                f"SingleCall received unexpected tool_calls from provider "
-                f"({len(llm_response.tool_calls)} calls). SingleCall agents must "
-                f"have zero tools — the provider should not produce tool calls."
-            )
 
         await record_llm(
             recorder,

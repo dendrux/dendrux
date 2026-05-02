@@ -26,7 +26,10 @@ from dendrux.loops.single import SingleCall
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     LLMResponse,
+    RunEventType,
     RunStatus,
+    StreamEvent,
+    StreamEventType,
     ToolCall,
 )
 
@@ -423,3 +426,171 @@ class TestSingleCallLifecycleHooks:
         failures = [c for c in n.calls if c[0] == "on_llm_call_failed"]
         assert len(failures) == 1
         assert failures[0][1][0] == "run-single-2"
+
+
+# ------------------------------------------------------------------
+# Streaming LLM lifecycle — protocol-violation paths
+# ------------------------------------------------------------------
+
+
+class _ProviderStream:
+    """Minimal complete_stream return — async-iterable + aclose()."""
+
+    def __init__(self, events: list[StreamEvent]) -> None:
+        self._events = events
+        self.closed = False
+
+    def __aiter__(self) -> Any:
+        return self._gen()
+
+    async def _gen(self) -> Any:
+        for e in self._events:
+            yield e
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _streaming_provider(events: list[StreamEvent]) -> Any:
+    """Build an LLMProvider whose complete_stream yields ``events``."""
+    from dendrux.llm.base import LLMProvider
+
+    class _P(LLMProvider):
+        @property
+        def model(self) -> str:
+            return "fake-stream"
+
+        async def complete(self, *args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError
+
+        def complete_stream(self, *args: Any, **kwargs: Any) -> Any:
+            return _ProviderStream(list(events))
+
+    return _P()
+
+
+class TestStreamingLLMLifecycle:
+    """Streaming provider that violates contract still pairs started/failed."""
+
+    async def test_react_stream_no_done_event_fires_llm_failed(self) -> None:
+        """Provider stream ends without DONE → llm_failed must fire so notifier
+        spans opened by on_llm_call_started can be closed."""
+        n = CapturingNotifier()
+        provider = _streaming_provider([StreamEvent(type=StreamEventType.TEXT_DELTA, text="hi")])
+        agent = Agent(prompt="Test.", tools=[add])
+
+        events: list[Any] = []
+        with pytest.raises(RuntimeError, match="ended without DONE"):
+            async for ev in ReActLoop().run_stream(
+                agent=agent,
+                provider=provider,
+                strategy=NativeToolCalling(),
+                user_input="Hi",
+                run_id="run-stream-react-1",
+                notifier=n,
+            ):
+                events.append(ev)
+
+        names = n.names()
+        assert "on_llm_call_started" in names
+        assert "on_llm_call_failed" in names, (
+            "Stream ended without DONE — llm_failed must fire to close any span "
+            "opened on llm_started. Currently the validation RuntimeError is raised "
+            "outside the try/except that emits llm_failed."
+        )
+        assert "on_llm_call_completed" not in names
+
+    async def test_single_call_stream_no_done_event_fires_llm_failed(self) -> None:
+        n = CapturingNotifier()
+        provider = _streaming_provider([StreamEvent(type=StreamEventType.TEXT_DELTA, text="hi")])
+        agent = Agent(prompt="Test.", loop=SingleCall())
+
+        events: list[Any] = []
+        with pytest.raises(RuntimeError, match="ended without DONE"):
+            async for ev in SingleCall().run_stream(
+                agent=agent,
+                provider=provider,
+                strategy=NativeToolCalling(),
+                user_input="Hi",
+                run_id="run-stream-single-1",
+                notifier=n,
+            ):
+                events.append(ev)
+
+        names = n.names()
+        assert "on_llm_call_started" in names
+        assert "on_llm_call_failed" in names
+        assert "on_llm_call_completed" not in names
+
+    async def test_single_call_stream_unexpected_tool_calls_fires_llm_failed(self) -> None:
+        """SingleCall validates llm_response.tool_calls AFTER stream close.
+        That validation RuntimeError must also pair with llm_failed."""
+        tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t1")
+        done_response = LLMResponse(text="x", tool_calls=[tc])
+        provider = _streaming_provider([StreamEvent(type=StreamEventType.DONE, raw=done_response)])
+
+        n = CapturingNotifier()
+        agent = Agent(prompt="Test.", loop=SingleCall())
+
+        events: list[Any] = []
+        with pytest.raises(RuntimeError, match="unexpected tool_calls"):
+            async for ev in SingleCall().run_stream(
+                agent=agent,
+                provider=provider,
+                strategy=NativeToolCalling(),
+                user_input="Hi",
+                run_id="run-stream-single-2",
+                notifier=n,
+            ):
+                events.append(ev)
+
+        names = n.names()
+        assert "on_llm_call_started" in names
+        assert "on_llm_call_failed" in names
+        assert "on_llm_call_completed" not in names
+
+
+# ------------------------------------------------------------------
+# Non-persisted run_stream — lifecycle hooks must still fire
+# ------------------------------------------------------------------
+
+
+class TestNonPersistedStreamLifecycle:
+    """When users stream without a state store, on_run_finished must still
+    fire so notifier-side spans (OTel root span) close cleanly."""
+
+    async def test_run_stream_without_persistence_fires_run_finished(self) -> None:
+        from dendrux.runtime.runner import run_stream as runner_run_stream
+
+        n = CapturingNotifier()
+        llm = MockLLM([LLMResponse(text="ok")])
+        agent = Agent(prompt="Test.", tools=[add])
+
+        events: list[Any] = []
+        async for ev in runner_run_stream(
+            agent,
+            provider=llm,
+            user_input="Hi",
+            extra_notifier=n,
+        ):
+            events.append(ev)
+
+        terminal_types = {
+            e.type
+            for e in events
+            if e.type
+            in (
+                RunEventType.RUN_COMPLETED,
+                RunEventType.RUN_PAUSED,
+                RunEventType.RUN_CANCELLED,
+            )
+        }
+        assert RunEventType.RUN_COMPLETED in terminal_types
+
+        names = n.names()
+        assert "on_run_started" in names
+        assert "on_run_finished" in names, (
+            "run_stream() without persistence must still emit on_run_finished — "
+            "OTel notifiers need it to close the root span. Currently the hook "
+            "is gated by `store is not None`."
+        )
