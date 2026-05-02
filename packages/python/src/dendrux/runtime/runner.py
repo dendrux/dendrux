@@ -1351,6 +1351,11 @@ def run_stream(
             await notify_run_started(
                 extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
             )
+            # Lifecycle pair is now open. Stash recorder/notifier so the
+            # cleanup callback can close it with a CANCELLED finish if the
+            # consumer abandons the stream before a terminal event.
+            _shared["recorder"] = recorder
+            _shared["notifier"] = extra_notifier
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
 
@@ -1479,15 +1484,28 @@ def run_stream(
                 reset_delegation_context(ctx_token)
 
     async def _cleanup() -> None:
-        """CAS-guarded cancellation — only if run is still RUNNING.
+        """CAS-guarded cancellation + local lifecycle close.
 
-        Uses the shared state dict to access the state store resolved
-        by the generator. If the generator never started, state_store
-        is None (or the pre-provided value) and cleanup is a no-op for
-        the lazy case.
+        Two responsibilities:
+          (1) If the run is still RUNNING in the store, finalize it as
+              CANCELLED (CAS-guarded so we don't clobber a concurrent
+              terminal status set elsewhere).
+          (2) If the lifecycle pair was opened locally (recorder/notifier
+              stashed by ``_generate`` after ``run_started`` fired), close
+              it with a ``run_finished`` event on the LOCAL notifier so
+              OTel root spans don't leak. This fires regardless of whether
+              the CAS won — if some other caller already finalized the
+              run, our local notifier still needs the close event.
+
+        Status resolution for the close event:
+          - CAS won → CANCELLED.
+          - CAS lost + store available → query store for actual status.
+          - No store → CANCELLED (best-effort fallback).
         """
         store = _shared.get("state_store")
         sequencer = _shared.get("sequencer")
+
+        cancel_won = False
         if store is not None:
             try:
                 cancel_won = await store.finalize_run(
@@ -1499,6 +1517,28 @@ def run_stream(
                     await _emit_event(store, run_id, "run.cancelled", sequencer, {})
             except Exception:
                 logger.error("Failed to cancel run %s during stream cleanup", run_id, exc_info=True)
+
+        # Close the lifecycle pair if it was opened.
+        if "notifier" in _shared:
+            cleanup_recorder = _shared.get("recorder")
+            terminal_status = RunStatus.CANCELLED
+            if store is not None and not cancel_won:
+                try:
+                    run_record = await store.get_run(run_id)
+                    if run_record is not None:
+                        terminal_status = RunStatus(run_record.status)
+                except Exception:
+                    pass  # CANCELLED is a safe fallback
+            cancelled_result = RunResult(run_id=run_id, status=terminal_status)
+            try:
+                await record_run_finished(cleanup_recorder, run_id, cancelled_result)
+                await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
+            except Exception:
+                logger.warning(
+                    "Lifecycle finish hooks failed during stream cleanup for run %s",
+                    run_id,
+                    exc_info=True,
+                )
 
     return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
 
@@ -1802,6 +1842,8 @@ async def _execute_approved_tools(
     """
     from dendrux.loops._helpers import notify_message as _ntfy_msg
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
+    from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
+    from dendrux.loops._helpers import record_tool_started as _rec_tool_started
     from dendrux.loops.react import _execute_tool
     from dendrux.types import Message, Role
 
@@ -1810,6 +1852,8 @@ async def _execute_approved_tools(
     results: list[tuple[ToolCall, ToolResult]] = []
 
     for tc in pause_state.pending_tool_calls:
+        await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
+        await _ntfy_tool_started(notifier, run_id, tc, pause_state.iteration)
         tr = await _execute_tool(tc, lookups)
         await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
         await _ntfy_tool(notifier, run_id, tc, tr, pause_state.iteration)
@@ -2208,6 +2252,11 @@ def resume_stream(
             await notify_run_started(
                 ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
             )
+            # Lifecycle pair is now open. Stash recorder/notifier so the
+            # cleanup callback can close it with a CANCELLED finish if the
+            # consumer abandons the stream before a terminal event.
+            _shared["recorder"] = ctx.recorder
+            _shared["notifier"] = ctx.notifier
 
             # 5b. Replay injected tool/user-input history. Inside the try
             #     so a recorder failure here fires on_run_failed.
@@ -2407,9 +2456,18 @@ def resume_stream(
                 reset_delegation_context(ctx_token)
 
     async def _cleanup() -> None:
-        """CAS-guarded cancellation for abandoned resume streams."""
+        """CAS-guarded cancellation + local lifecycle close.
+
+        Mirrors run_stream._cleanup. The lifecycle close fires whether or
+        not the CAS won — if some other caller already finalized the run,
+        the local notifier still needs the close event so OTel root spans
+        don't leak. Status resolution: CAS won → CANCELLED, CAS lost →
+        query store for actual status (falling back to CANCELLED).
+        """
         store = _shared.get("state_store")
         sequencer = _shared.get("sequencer")
+
+        cancel_won = False
         if store is not None:
             try:
                 cancel_won = await store.finalize_run(
@@ -2422,6 +2480,27 @@ def resume_stream(
             except Exception:
                 logger.error(
                     "Failed to cancel run %s during resume stream cleanup",
+                    run_id,
+                    exc_info=True,
+                )
+
+        if "notifier" in _shared:
+            cleanup_recorder = _shared.get("recorder")
+            terminal_status = RunStatus.CANCELLED
+            if store is not None and not cancel_won:
+                try:
+                    run_record = await store.get_run(run_id)
+                    if run_record is not None:
+                        terminal_status = RunStatus(run_record.status)
+                except Exception:
+                    pass  # CANCELLED is a safe fallback
+            cancelled_result = RunResult(run_id=run_id, status=terminal_status)
+            try:
+                await record_run_finished(cleanup_recorder, run_id, cancelled_result)
+                await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
+            except Exception:
+                logger.warning(
+                    "Lifecycle finish hooks failed during resume stream cleanup for run %s",
                     run_id,
                     exc_info=True,
                 )

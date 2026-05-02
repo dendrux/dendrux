@@ -190,6 +190,36 @@ class TestSubmitApprovalLifecycle:
         assert "on_run_finished" in names
         assert names.index("on_run_started") < names.index("on_run_finished")
 
+    async def test_fires_tool_started_for_approved_server_tool(self, db_store) -> None:
+        """Approved server-tool execution must arrive on the notifier as a
+        start/complete pair, not just complete. Otherwise OTel notifiers
+        can't open a span before tool execution begins."""
+        tc = ToolCall(name="refund", params={"order_id": 7}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="processed")])
+        agent = _approval_agent(llm, db_store)
+
+        paused = await agent.run("refund 7")
+        assert paused.status == RunStatus.WAITING_APPROVAL
+
+        n = CapturingNotifier()
+        await agent.submit_approval(paused.run_id, approved=True, notifier=n)
+
+        starts = [c for c in n.calls if c[0] == "on_tool_started" and c[1][1] == "refund"]
+        completes = [c for c in n.calls if c[0] == "on_tool_completed" and c[1][1] == "refund"]
+        assert starts, (
+            "Approved server-tool execution has no matching on_tool_started — "
+            "start/complete pairing is broken on the approval-approve path."
+        )
+        assert completes
+        # Find indices for the refund pair specifically
+        first_start = next(
+            i for i, c in enumerate(n.calls) if c[0] == "on_tool_started" and c[1][1] == "refund"
+        )
+        first_complete = next(
+            i for i, c in enumerate(n.calls) if c[0] == "on_tool_completed" and c[1][1] == "refund"
+        )
+        assert first_start < first_complete
+
 
 # ---------------------------------------------------------------------------
 # resume_stream — streaming resume path
@@ -338,3 +368,240 @@ class TestResumeLifecycleFailureBalancing:
         assert names.index("on_run_started") < names.index("on_run_failed")
         # And on_run_finished must NOT fire — the pair is started → failed
         assert "on_run_finished" not in names
+
+
+# ---------------------------------------------------------------------------
+# Stream cleanup cancellation must close the lifecycle pair
+# ---------------------------------------------------------------------------
+
+
+class _BlockingLLM:
+    """Mock provider that blocks on the first complete() call until released.
+
+    Lets a test reach RUN_STARTED on the wire, then break out of the stream
+    while the run is still in RUNNING status — exercising the cleanup path
+    that CAS-cancels the run.
+    """
+
+    def __init__(self) -> None:
+        import asyncio
+
+        self.model = "blocking-mock"
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def complete(self, *args, **kwargs):
+        self.entered.set()
+        await self.release.wait()
+        from dendrux.types import LLMResponse
+
+        return LLMResponse(text="never reached")
+
+    async def complete_stream(self, *args, **kwargs):
+        # Async-iterable + aclose. Must yield at least one event so the
+        # streaming loop awaits it; we block on `release` after entry.
+        self.entered.set()
+        await self.release.wait()
+        from dendrux.types import StreamEvent, StreamEventType
+
+        yield StreamEvent(type=StreamEventType.DONE)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class TestStreamCleanupCancellationLifecycle:
+    """When a stream consumer abandons the iteration after on_run_started
+    fires, the cleanup callback CAS-cancels the run. It must also fire
+    on_run_finished with status=CANCELLED so the lifecycle pair stays
+    balanced — otherwise OTel root spans leak on every abandoned stream.
+    """
+
+    async def test_run_stream_cleanup_fires_run_finished_cancelled(self, db_store) -> None:
+        from dendrux.types import RunEventType
+
+        provider = _BlockingLLM()
+        agent = Agent(provider=provider, prompt="Test agent.", state_store=db_store)
+
+        n = CapturingNotifier()
+        run_id: str | None = None
+        async with agent.stream("hi", notifier=n) as stream:
+            async for ev in stream:
+                if ev.type == RunEventType.RUN_STARTED:
+                    run_id = ev.run_id
+                    break  # Abandon the stream — cleanup CAS-cancels the run.
+
+        assert run_id is not None
+
+        # Release the LLM block so the now-cancelled generator can drain.
+        provider.release.set()
+
+        names = n.names()
+        assert "on_run_started" in names
+        assert "on_run_finished" in names, (
+            "Stream cleanup CAS-cancelled the run but never fired "
+            "on_run_finished — lifecycle pair is leaked, OTel root span "
+            "stays open forever."
+        )
+        # Pair order
+        assert names.index("on_run_started") < names.index("on_run_finished")
+        # Status on the cancelled finish must be CANCELLED
+        finished = next(c for c in n.calls if c[0] == "on_run_finished")
+        result = finished[1][1]
+        assert result.status == RunStatus.CANCELLED
+
+    async def test_resume_stream_cleanup_fires_run_finished_cancelled(self, db_store) -> None:
+        from dendrux.types import RunEventType
+
+        # First, get a real paused run via the normal (non-blocking) path.
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        setup_llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        setup_agent = _client_tool_agent(setup_llm, db_store)
+
+        paused = await setup_agent.run("Read")
+        assert paused.status == RunStatus.WAITING_CLIENT_TOOL
+        pause = await db_store.get_pause_state(paused.run_id)
+        call_id = pause["pending_tool_calls"][0]["id"]
+
+        # Now resume_stream with a blocking provider so we can break early
+        # while the run is still RUNNING.
+        provider = _BlockingLLM()
+        resume_agent = Agent(
+            provider=provider,
+            prompt="Test agent.",
+            tools=[read_range],
+            state_store=db_store,
+        )
+
+        n = CapturingNotifier()
+        async with resume_agent.resume_stream(
+            paused.run_id,
+            tool_results=[ToolResult(name="read_range", call_id=call_id, payload='"rows"')],
+            notifier=n,
+        ) as stream:
+            async for ev in stream:
+                if ev.type == RunEventType.RUN_RESUMED:
+                    break  # Abandon — cleanup CAS-cancels the run.
+
+        provider.release.set()
+
+        names = n.names()
+        assert "on_run_started" in names
+        assert "on_run_finished" in names, (
+            "resume_stream cleanup CAS-cancelled the run but never fired "
+            "on_run_finished — lifecycle pair is leaked on every abandoned "
+            "resume stream."
+        )
+        assert names.index("on_run_started") < names.index("on_run_finished")
+        finished = next(c for c in n.calls if c[0] == "on_run_finished")
+        result = finished[1][1]
+        assert result.status == RunStatus.CANCELLED
+
+    async def test_run_stream_no_store_cleanup_fires_run_finished(self) -> None:
+        """Non-persisted streams still emit on_run_started before yielding
+        RUN_STARTED. If the consumer abandons such a stream, cleanup must
+        still close the lifecycle pair on the local notifier — otherwise
+        OTel root spans leak even in the no-persistence path."""
+        from dendrux.types import RunEventType
+
+        provider = _BlockingLLM()
+        agent = Agent(provider=provider, prompt="Test agent.")  # NO state_store
+
+        n = CapturingNotifier()
+        async with agent.stream("hi", notifier=n) as stream:
+            async for ev in stream:
+                if ev.type == RunEventType.RUN_STARTED:
+                    break
+
+        provider.release.set()
+
+        names = n.names()
+        assert "on_run_started" in names
+        assert "on_run_finished" in names, (
+            "Non-persisted stream cleanup never closed the lifecycle pair — "
+            "OTel root span leaks because cleanup early-returned on "
+            "store is None without firing on_run_finished."
+        )
+        finished = next(c for c in n.calls if c[0] == "on_run_finished")
+        result = finished[1][1]
+        assert result.status == RunStatus.CANCELLED
+
+    async def test_run_stream_cleanup_fires_finished_when_cas_loses(self, db_store) -> None:
+        """If the run was already finalized externally before cleanup, the
+        CAS loses but the local notifier still needs an on_run_finished
+        for span hygiene."""
+        from dendrux.types import RunEventType
+
+        provider = _BlockingLLM()
+        agent = Agent(provider=provider, prompt="Test agent.", state_store=db_store)
+
+        n = CapturingNotifier()
+        run_id: str | None = None
+        async with agent.stream("hi", notifier=n) as stream:
+            async for ev in stream:
+                if ev.type == RunEventType.RUN_STARTED:
+                    run_id = ev.run_id
+                    # Externally finalize the run BEFORE cleanup runs so the
+                    # CAS-guarded cancellation in cleanup loses.
+                    await db_store.finalize_run(
+                        run_id,
+                        status=RunStatus.SUCCESS.value,
+                        expected_current_status="running",
+                    )
+                    break
+
+        provider.release.set()
+        assert run_id is not None
+
+        names = n.names()
+        assert "on_run_started" in names
+        assert "on_run_finished" in names, (
+            "Cleanup CAS lost (run already finalized elsewhere) but the "
+            "local notifier never saw on_run_finished — OTel root span "
+            "leaks on the local consumer."
+        )
+
+    async def test_resume_stream_cleanup_fires_finished_when_cas_loses(self, db_store) -> None:
+        """Same gap as run_stream but for resume_stream cleanup."""
+        from dendrux.types import RunEventType
+
+        tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
+        setup_llm = MockLLM([LLMResponse(tool_calls=[tc])])
+        setup_agent = _client_tool_agent(setup_llm, db_store)
+
+        paused = await setup_agent.run("Read")
+        pause = await db_store.get_pause_state(paused.run_id)
+        call_id = pause["pending_tool_calls"][0]["id"]
+
+        provider = _BlockingLLM()
+        resume_agent = Agent(
+            provider=provider,
+            prompt="Test agent.",
+            tools=[read_range],
+            state_store=db_store,
+        )
+
+        n = CapturingNotifier()
+        async with resume_agent.resume_stream(
+            paused.run_id,
+            tool_results=[ToolResult(name="read_range", call_id=call_id, payload='"rows"')],
+            notifier=n,
+        ) as stream:
+            async for ev in stream:
+                if ev.type == RunEventType.RUN_RESUMED:
+                    # Finalize externally so cleanup CAS loses.
+                    await db_store.finalize_run(
+                        paused.run_id,
+                        status=RunStatus.SUCCESS.value,
+                        expected_current_status="running",
+                    )
+                    break
+
+        provider.release.set()
+
+        names = n.names()
+        assert "on_run_started" in names
+        assert "on_run_finished" in names, (
+            "resume_stream cleanup CAS lost (run already finalized) but the "
+            "local notifier never saw on_run_finished."
+        )
