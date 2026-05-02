@@ -133,6 +133,7 @@ async def _on_response(response: httpx.Response) -> None:
 
         recorder = _recorder.get()
         notifier = _notifier.get()
+        run_id = _run_id.get() or ""
         if recorder is None and notifier is None:
             # Hook fired outside dendrux context (e.g. user shares the
             # provider with another framework) — nothing to write.
@@ -167,12 +168,12 @@ async def _on_response(response: httpx.Response) -> None:
 
         if recorder is not None:
             try:
-                await record_governance(recorder, "provider.retry", iteration, data)
+                await record_governance(recorder, run_id, "provider.retry", iteration, data)
             except Exception:
                 _logger.warning("provider.retry recorder write failed", exc_info=True)
         if notifier is not None:
             try:
-                await notify_governance(notifier, "provider.retry", iteration, data)
+                await notify_governance(notifier, run_id, "provider.retry", iteration, data)
             except Exception:
                 _logger.warning("provider.retry notifier broadcast failed", exc_info=True)
     except Exception:

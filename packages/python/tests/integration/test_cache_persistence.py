@@ -226,7 +226,7 @@ class TestSemanticResponseUsageCacheFields:
             ),
         )
 
-        await recorder.on_llm_call_completed(response, iteration=0)
+        await recorder.on_llm_call_completed("r_sem", response, iteration=0)
 
         async with session_factory() as session:
             from dendrux.db.models import LLMInteraction

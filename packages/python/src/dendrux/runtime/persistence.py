@@ -6,6 +6,14 @@ StateStore. The runner creates this when persistence is active.
 Write classification:
   - Fail-closed (retry with backoff, then propagate): save_trace, save_tool_call, save_run_event
   - Best-effort (exceptions swallowed): save_usage, save_llm_interaction, touch_progress
+
+Lifecycle hooks (``on_run_started``, ``on_run_finished``, ``on_run_failed``,
+``on_llm_call_started``, ``on_llm_call_failed``, ``on_tool_started``) are
+inherited as no-ops from :class:`BaseRecorder`. The runner writes the
+corresponding ``run.started`` / ``run.error`` / etc events directly via
+``_emit_event`` to avoid duplicate DB writes — this transitional state
+keeps the audit trail unchanged while still exposing the hooks on the
+LoopRecorder protocol so third-party recorders can subscribe.
 """
 
 from __future__ import annotations
@@ -13,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux.loops.base import LoopRecorder
+from dendrux.loops.base import BaseRecorder
 from dendrux.runtime.durability import retry_critical
 
 if TYPE_CHECKING:
@@ -45,7 +53,7 @@ def _serialize_message(m: Message) -> dict[str, Any]:
     return d
 
 
-class PersistenceRecorder(LoopRecorder):
+class PersistenceRecorder(BaseRecorder):
     """Authoritative evidence recorder — writes loop events to StateStore.
 
     Fail-closed writes (exceptions propagate to caller):
@@ -103,7 +111,7 @@ class PersistenceRecorder(LoopRecorder):
 
         await retry_critical(_write, label="save_run_event", run_id=self._run_id)
 
-    async def on_message_appended(self, message: Message, iteration: int) -> None:
+    async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Persist a message to react_traces. FAIL-CLOSED."""
         meta = dict(message.meta) if message.meta else {}
         meta["iteration"] = iteration
@@ -142,6 +150,7 @@ class PersistenceRecorder(LoopRecorder):
 
     async def on_llm_call_completed(
         self,
+        run_id: str,
         response: LLMResponse,
         iteration: int,
         *,
@@ -254,7 +263,11 @@ class PersistenceRecorder(LoopRecorder):
             logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
 
     async def on_tool_completed(
-        self, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
     ) -> None:
         """Persist tool call record + event."""
         params = tool_call.params if tool_call.params else None
@@ -299,9 +312,11 @@ class PersistenceRecorder(LoopRecorder):
 
     async def on_governance_event(
         self,
+        run_id: str,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
+        *,
         correlation_id: str | None = None,
     ) -> None:
         """Record a governance event. FAIL-CLOSED with retry."""

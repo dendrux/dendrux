@@ -11,7 +11,7 @@ Two rules apply everywhere: a notifier never blocks the run, and a notifier that
 
 ## Where notifier fits next to recorder
 
-Dendrux has two observers on the same four hooks: the recorder and the notifier. They look similar but they do different jobs and have opposite failure policies.
+Dendrux has two observers on the same set of hooks: the recorder and the notifier. They look similar but they do different jobs and have opposite failure policies.
 
 | Property | `LoopRecorder` | `LoopNotifier` |
 | --- | --- | --- |
@@ -23,31 +23,79 @@ Dendrux has two observers on the same four hooks: the recorder and the notifier.
 
 See [Recorder](/docs/architecture/recorder) for the other side of this pair.
 
-## The protocol
+## The hook surface
 
-From `dendrux/loops/base.py`:
+`LoopNotifier` and `LoopRecorder` share the same ten methods. The runner fires the run-level hooks; the loop fires everything else. Every hook takes `run_id` as its first positional argument so a single notifier instance can disambiguate concurrent runs without contextvars or implicit state.
+
+| Hook | Fires when | Emitted by |
+| --- | --- | --- |
+| `on_run_started` | Once at the top of a fresh run or resume | Runner |
+| `on_run_finished` | Run reaches a non-error terminal (success, paused, cancelled, max_iterations) | Runner |
+| `on_run_failed` | Run errors out via an unhandled exception | Runner |
+| `on_message_appended` | A message is appended to history (user, assistant, tool result) | Loop |
+| `on_llm_call_started` | Immediately before `provider.complete*()` | Loop |
+| `on_llm_call_completed` | After `provider.complete*()` returns successfully | Loop |
+| `on_llm_call_failed` | When `provider.complete*()` raises | Loop |
+| `on_tool_started` | Immediately before tool dispatch | Loop |
+| `on_tool_completed` | After tool execution finishes (success or failure) | Loop |
+| `on_governance_event` | Budget threshold, guardrail finding, approval request, etc. | Loop |
+
+The pairing is deliberate: every "started" hook has either a matching "completed" or "failed" hook. The two are mutually exclusive — exactly one of the pair fires per call. Tool failures arrive on `on_tool_completed` as `ToolResult(success=False)` because the loop already converts every dispatch error into a result; there is no separate `on_tool_failed`.
+
+The Protocol lives in `dendrux/loops/base.py`:
 
 ```python
 @runtime_checkable
 class LoopNotifier(Protocol):
-    """Notifier for loop events — best-effort notification hook.
+    async def on_run_started(self, run_id, *, agent_name=None, agent_model=None): ...
+    async def on_run_finished(self, run_id, result): ...
+    async def on_run_failed(self, run_id, error, *, iteration=None): ...
 
-    The loop fires these callbacks at the exact points where history mutates
-    and provider.complete() returns. Implementations decide what to do:
-    log, emit metrics, stream to SSE, print to console, etc.
+    async def on_message_appended(self, run_id, message, iteration): ...
 
-    Failure policy: notifiers should not raise. If they do, the loop logs
-    a warning and continues execution. Notification failures must not
-    kill agent runs.
-    """
+    async def on_llm_call_started(self, run_id, iteration, *, semantic_messages=None, semantic_tools=None): ...
+    async def on_llm_call_completed(self, run_id, response, iteration, *, ...): ...
+    async def on_llm_call_failed(self, run_id, iteration, error, *, duration_ms=None): ...
 
-    async def on_message_appended(self, message, iteration): ...
-    async def on_llm_call_completed(self, response, iteration, *, ...): ...
-    async def on_tool_completed(self, tool_call, tool_result, iteration): ...
-    async def on_governance_event(self, event_type, iteration, data, correlation_id): ...
+    async def on_tool_started(self, run_id, tool_call, iteration): ...
+    async def on_tool_completed(self, run_id, tool_call, tool_result, iteration): ...
+
+    async def on_governance_event(self, run_id, event_type, iteration, data, *, correlation_id=None): ...
 ```
 
-Four methods. Same shape as the recorder's protocol. A class that implements all four satisfies the `LoopNotifier` check automatically thanks to `runtime_checkable`.
+`runtime_checkable` means a class that implements all ten methods structurally satisfies `isinstance(obj, LoopNotifier)`. You do not need to inherit. But for everyday work you should — see the next section.
+
+## `BaseNotifier`: the easy way to subclass
+
+Implementing ten methods on every notifier is tedious, and it makes future protocol additions a breaking change for every existing implementation. `dendrux.loops.base.BaseNotifier` is a concrete class that ships no-op defaults for every hook. Subclass it and override only what you care about:
+
+```python
+from dendrux.loops.base import BaseNotifier
+
+class CaptureNotifier(BaseNotifier):
+    """Minimal notifier — records every callback that fires."""
+
+    def __init__(self):
+        self.log = []
+
+    async def on_run_started(self, run_id, *, agent_name=None, agent_model=None):
+        self.log.append(f"on_run_started         run={run_id} agent={agent_name!r}")
+
+    async def on_message_appended(self, run_id, message, iteration):
+        self.log.append(f"on_message_appended    iter={iteration} role={message.role.value}")
+
+    async def on_llm_call_completed(self, run_id, response, iteration, **kwargs):
+        u = response.usage
+        self.log.append(f"on_llm_call_completed  iter={iteration} input={u.input_tokens}")
+
+    async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
+        self.log.append(f"on_tool_completed      iter={iteration} tool={tool_call.name!r}")
+
+    async def on_run_finished(self, run_id, result):
+        self.log.append(f"on_run_finished        status={result.status.value}")
+```
+
+Five overrides, ten hooks supported. The other five (`on_run_failed`, `on_llm_call_started`, `on_llm_call_failed`, `on_tool_started`, `on_governance_event`) inherit no-op defaults from `BaseNotifier` — they fire, your subclass ignores them. When the protocol grows in a future release, your code keeps working without changes.
 
 ## Plugging one in
 
@@ -71,54 +119,41 @@ Per-call makes sense: a batch run wants metrics, a dev-loop invocation wants ter
 
 All `submit_*` and `resume` methods accept the same `notifier=` argument. If you pass a notifier to `run()` and a different one to `submit_approval()`, both are applied on their respective turns; nothing is carried over between calls.
 
-## A minimal custom notifier
+## What a real run looks like
 
-The simplest useful notifier records every callback it receives. Here is the full implementation:
-
-```python
-from dendrux.loops.base import LoopNotifier
-
-class CaptureNotifier(LoopNotifier):
-    """Minimal notifier that records every callback into a list."""
-
-    def __init__(self):
-        self.log = []
-
-    async def on_message_appended(self, message, iteration):
-        self.log.append(f"on_message_appended  iter={iteration} role={message.role.value}")
-
-    async def on_llm_call_completed(self, response, iteration, **kwargs):
-        u = response.usage
-        self.log.append(f"on_llm_call_completed  iter={iteration} input={u.input_tokens}")
-
-    async def on_tool_completed(self, tool_call, tool_result, iteration):
-        self.log.append(f"on_tool_completed      iter={iteration} tool={tool_call.name!r}")
-
-    async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
-        self.log.append(f"on_governance_event    iter={iteration} event={event_type!r}")
-```
-
-Running a simple ReAct query ("What is 15 + 27?" with an `add` tool) and printing `capture.log` afterwards:
+Running a two-iteration ReAct query ("What is 15 + 27?" with an `add` tool) and printing `capture.log` afterwards:
 
 ```text
-on_message_appended    iter=0 role=user       content='What is 15 + 27?'
-on_llm_call_completed  iter=1 input=585 output=69
-on_message_appended    iter=1 role=assistant  content=''
-on_tool_completed      iter=1 tool='add' success=True
-on_message_appended    iter=1 role=tool       content='42'
-on_llm_call_completed  iter=2 input=667 output=13
-on_message_appended    iter=2 role=assistant  content='15 + 27 = **42**'
-
-total callbacks received: 7
+on_run_started         run=01HXX... agent='calculator'
+on_message_appended    iter=0 role=user
+on_llm_call_completed  iter=1 input=585
+on_message_appended    iter=1 role=assistant
+on_tool_completed      iter=1 tool='add'
+on_message_appended    iter=1 role=tool
+on_llm_call_completed  iter=2 input=667
+on_message_appended    iter=2 role=assistant
+on_run_finished        status=success
 ```
 
-Seven callbacks for a two-iteration run. The ordering is deterministic: messages are announced as the loop appends them, and `on_llm_call_completed` fires between the assistant message and any tool execution it triggered. Everything a human dashboard needs to render a live transcript is here.
+Nine callbacks for a two-iteration run. `on_run_started` opens it, `on_run_finished` closes it, and the body is interleaved messages, LLM completions, and tool completions in the order the loop executed them. Everything a human dashboard or an OpenTelemetry tracer needs to render a live transcript is here.
 
-Note that the assistant message on iter=1 has empty text content because the LLM's response was a pure tool call (no prose). The `response.tool_calls` field on `on_llm_call_completed` carries that shape if you want to display it.
+## Why both started and completed
 
-## ConsoleNotifier: the built-in for terminal output
+The lifecycle pairing was added so external observers can do correct work even when calls fail.
 
-Dendrux ships two notifiers in `dendrux.notifiers`: `ConsoleNotifier` and `CompositeNotifier`. `ConsoleNotifier` uses `rich` to render the same run as a terminal panel with per-iteration steps:
+A pure completion-only surface looks tidy but breaks down under three real conditions:
+
+1. **Provider exceptions never reach completion.** `provider.complete()` can raise — network blip, rate limit, malformed schema. With only `on_llm_call_completed`, the notifier never hears about that call. With `on_llm_call_started` and `on_llm_call_failed`, the notifier opens a span on start, marks it errored on failure, and the trace tells the truth.
+2. **Span timing is wrong without start.** OpenTelemetry and similar tracers want a real start time, not "completion minus duration." The lifecycle pair gives them one.
+3. **Some observers care about prefetch state.** A dashboard that highlights "LLM call in progress" needs to know the call started before it ends.
+
+The same logic applies to runs (`on_run_started` / `on_run_finished` / `on_run_failed`) and to tools (`on_tool_started` / `on_tool_completed`). Tool failures take a slightly different shape — the loop catches them and emits `on_tool_completed` with `ToolResult(success=False)` — because the loop already wraps every dispatch in error handling and there is nothing the notifier could do that the loop has not already done. LLM failures, by contrast, propagate, so the notifier needs an explicit failed hook.
+
+## ConsoleNotifier and CompositeNotifier
+
+Dendrux ships two notifiers in `dendrux.notifiers`. Both subclass `BaseNotifier`.
+
+`ConsoleNotifier` uses `rich` to render the run as a terminal panel with per-iteration steps:
 
 ```text
 ╭──────────────────────────────────────────────────────╮
@@ -134,21 +169,21 @@ Dendrux ships two notifiers in `dendrux.notifiers`: `ConsoleNotifier` and `Compo
   Step 2
 ```
 
-Good for local dev. The class exposes three constructor options (`show_llm_text`, `max_text_length`, `show_params`) so you can tune what it prints.
+It overrides `on_message_appended`, `on_llm_call_completed`, `on_tool_completed`, and `on_governance_event`. The lifecycle hooks (`on_run_started` etc.) fire and are ignored — `ConsoleNotifier` does not yet render them, but you could subclass it to add a banner.
 
-`CompositeNotifier` is the other one, and its only job is to fan a single set of callbacks out to a list of inner notifiers. If you want both terminal output and a metrics sink, wrap them in `CompositeNotifier([console, metrics])` and pass that.
+`CompositeNotifier` fans a single set of callbacks out to a list of inner notifiers. If you want both terminal output and a metrics sink, wrap them: `CompositeNotifier([console, metrics])`. It implements every hook by forwarding to each child, swallowing per-child exceptions so one broken notifier does not prevent the others from running.
 
 ## Fail-open semantics
 
 The loop does not call your notifier directly. It calls a thin wrapper in `dendrux/loops/_helpers.py` that swallows exceptions:
 
 ```python
-async def notify_message(notifier, message, iteration, warnings=None):
+async def notify_message(notifier, run_id, message, iteration, warnings=None):
     """Notify notifier of a message append, swallowing exceptions."""
     if notifier is None:
         return
     try:
-        await notifier.on_message_appended(message, iteration)
+        await notifier.on_message_appended(run_id, message, iteration)
     except Exception:
         logger.warning("Notifier.on_message_appended failed", exc_info=True)
         if warnings is not None:
@@ -162,7 +197,7 @@ Four things to pull out of that wrapper:
 3. **The warning is logged.** You will see the traceback in your log stream at warning level, so the bug is not silent, it is just not fatal.
 4. **Warnings are collected on the run.** A text label is appended to a per-run warnings list, which surfaces on the final `RunResult.meta["notifier_warnings"]` and, when persisted by the runner, on `run_events`. The run still succeeds, and the operator can see which callback failed where.
 
-The same pattern applies to `notify_llm`, `notify_tool`, and `notify_governance`. Every notifier hook is wrapped the same way.
+Every notifier hook is wrapped the same way (`notify_run_started`, `notify_llm_started`, `notify_tool_started`, etc.).
 
 ## Why a side-channel at all
 
@@ -172,6 +207,6 @@ Yes, for three reasons.
 
 1. **Latency.** `run_events` is a DB round-trip, then an SSE poll interval, then a client render. A notifier runs in the same event loop as the LLM call, and sees the event within a coroutine await. For terminal output, live metrics, or anything that wants sub-millisecond reaction, the notifier is the right channel.
 2. **Richer payloads.** A notifier receives the full `Message`, `LLMResponse`, `ToolCall`, and `ToolResult` objects. The DB event log stores a condensed projection (token counts, tool name, iteration, a correlation id). If you want the entire prompt, the entire response, or the full tool result, you get it in-memory in the callback. Persisting all of that would bloat the DB; putting it in the notifier avoids the tradeoff.
-3. **Out-of-band destinations.** Slack, Datadog, a custom websocket, a `tqdm` progress bar: none of these are storage. They do not want SSE. A notifier lets them hook in without pretending to be a durability layer.
+3. **Out-of-band destinations.** Slack, Datadog, OpenTelemetry, a custom websocket, a `tqdm` progress bar: none of these are storage. They do not want SSE. A notifier lets them hook in without pretending to be a durability layer.
 
 The recorder is the run's canonical record. The notifier is its live broadcast. They coexist because their jobs are different, and the failure policies match those jobs: the canonical record refuses to drop rows, the live broadcast refuses to block the source.

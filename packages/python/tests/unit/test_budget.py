@@ -6,6 +6,7 @@ import pytest
 
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
+from dendrux.loops.base import BaseRecorder
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
 from dendrux.strategies.native import NativeToolCalling
@@ -133,17 +134,19 @@ class TestBudgetThresholds:
 
         governance_events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 governance_events.append({"event_type": event_type, "data": data})
 
         await ReActLoop().run(
@@ -178,17 +181,19 @@ class TestBudgetThresholds:
 
         governance_events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 governance_events.append({"event_type": event_type})
 
         await ReActLoop().run(
@@ -211,17 +216,19 @@ class TestBudgetThresholds:
 
         governance_events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 governance_events.append({"event_type": event_type, "data": data})
 
         await ReActLoop().run(
@@ -247,17 +254,19 @@ class TestBudgetThresholds:
 
         governance_events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 governance_events.append({"event_type": event_type, "data": data})
 
         result = await SingleCall().run(
@@ -354,17 +363,19 @@ class TestBudgetStreaming:
 
         governance_events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 governance_events.append({"event_type": event_type})
 
         events = []

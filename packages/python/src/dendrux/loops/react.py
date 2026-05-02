@@ -33,12 +33,18 @@ from dendrux.loops._helpers import (
     guardrail_meta,
     notify_governance,
     notify_llm,
+    notify_llm_failed,
+    notify_llm_started,
     notify_message,
     notify_tool,
+    notify_tool_started,
     record_governance,
     record_llm,
+    record_llm_failed,
+    record_llm_started,
     record_message,
     record_tool,
+    record_tool_started,
 )
 from dendrux.loops.base import Loop
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
@@ -81,11 +87,17 @@ logger = logging.getLogger(__name__)
 
 _record_message = record_message
 _record_llm = record_llm
+_record_llm_started = record_llm_started
+_record_llm_failed = record_llm_failed
 _record_tool = record_tool
+_record_tool_started = record_tool_started
 _record_governance = record_governance
 _notify_message = notify_message
 _notify_llm = notify_llm
+_notify_llm_started = notify_llm_started
+_notify_llm_failed = notify_llm_failed
 _notify_tool = notify_tool
+_notify_tool_started = notify_tool_started
 _notify_governance = notify_governance
 
 # Sentinel value in fired_thresholds to track that budget.exceeded has fired.
@@ -133,6 +145,7 @@ async def _check_budget(
     fired_thresholds: list[float],
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     iteration: int,
     warnings: list[str],
 ) -> None:
@@ -160,12 +173,14 @@ async def _check_budget(
             }
             await _record_governance(
                 recorder,
+                run_id,
                 "budget.threshold",
                 iteration,
                 event_data,
             )
             await _notify_governance(
                 notifier,
+                run_id,
                 "budget.threshold",
                 iteration,
                 event_data,
@@ -182,12 +197,14 @@ async def _check_budget(
         }
         await _record_governance(
             recorder,
+            run_id,
             "budget.exceeded",
             iteration,
             event_data,
         )
         await _notify_governance(
             notifier,
+            run_id,
             "budget.exceeded",
             iteration,
             event_data,
@@ -200,6 +217,7 @@ async def _append_assistant(
     history: list[Message],
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     iteration: int,
     warnings: list[str],
 ) -> Message:
@@ -210,8 +228,8 @@ async def _append_assistant(
         tool_calls=response.tool_calls,
     )
     history.append(msg)
-    await _record_message(recorder, msg, iteration)
-    await _notify_message(notifier, msg, iteration, warnings)
+    await _record_message(recorder, run_id, msg, iteration)
+    await _notify_message(notifier, run_id, msg, iteration, warnings)
     return msg
 
 
@@ -269,6 +287,7 @@ async def _init_loop_state(
     user_input: str,
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     initial_history: list[Message] | None,
     initial_steps: list[AgentStep] | None,
     initial_usage: UsageStats | None,
@@ -279,8 +298,8 @@ async def _init_loop_state(
     else:
         user_msg = Message(role=Role.USER, content=user_input)
         history = [user_msg]
-        await _record_message(recorder, user_msg, 0)
-        await _notify_message(notifier, user_msg, 0)
+        await _record_message(recorder, run_id, user_msg, 0)
+        await _notify_message(notifier, run_id, user_msg, 0)
 
     call_counts: dict[str, int] = {}
     for msg in history:
@@ -316,6 +335,7 @@ async def _process_tool_calls(
     strategy: Strategy,
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     iteration: int,
     history: list[Message],
     warnings: list[str],
@@ -355,10 +375,11 @@ async def _process_tool_calls(
                 "reason": "denied_by_policy",
             }
             await _record_governance(
-                recorder, "policy.denied", iteration, event_data, correlation_id=tc.id
+                recorder, run_id, "policy.denied", iteration, event_data, correlation_id=tc.id
             )
             await _notify_governance(
                 notifier,
+                run_id,
                 "policy.denied",
                 iteration,
                 event_data,
@@ -367,8 +388,8 @@ async def _process_tool_calls(
             )
             result_msg = strategy.format_tool_result(deny_result)
             history.append(result_msg)
-            await _record_message(recorder, result_msg, iteration)
-            await _notify_message(notifier, result_msg, iteration, warnings)
+            await _record_message(recorder, run_id, result_msg, iteration)
+            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
             all_results.append((tc, deny_result))
         else:
             non_denied.append(tc)
@@ -399,6 +420,7 @@ async def _process_tool_calls(
                 }
                 await _record_governance(
                     recorder,
+                    run_id,
                     "approval.requested",
                     iteration,
                     event_data,
@@ -406,6 +428,7 @@ async def _process_tool_calls(
                 )
                 await _notify_governance(
                     notifier,
+                    run_id,
                     "approval.requested",
                     iteration,
                     event_data,
@@ -435,12 +458,12 @@ async def _process_tool_calls(
                 success=False,
                 error=limit_msg,
             )
-            await _record_tool(recorder, tc, limit_result, iteration)
-            await _notify_tool(notifier, tc, limit_result, iteration, warnings)
+            await _record_tool(recorder, run_id, tc, limit_result, iteration)
+            await _notify_tool(notifier, run_id, tc, limit_result, iteration, warnings)
             result_msg = strategy.format_tool_result(limit_result)
             history.append(result_msg)
-            await _record_message(recorder, result_msg, iteration)
-            await _notify_message(notifier, result_msg, iteration, warnings)
+            await _record_message(recorder, run_id, result_msg, iteration)
+            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
             all_results.append((tc, limit_result))
         else:
             batch_counts[tc.name] = batch_counts.get(tc.name, 0) + 1
@@ -468,6 +491,7 @@ async def _process_tool_calls(
                         lookups,
                         recorder,
                         notifier,
+                        run_id,
                         iteration,
                         warnings,
                     )
@@ -477,9 +501,11 @@ async def _process_tool_calls(
             executed.extend(pairs)
         else:
             for tc in group:
+                await _record_tool_started(recorder, run_id, tc, iteration)
+                await _notify_tool_started(notifier, run_id, tc, iteration, warnings)
                 tool_result = await _execute_tool(tc, lookups)
-                await _record_tool(recorder, tc, tool_result, iteration)
-                await _notify_tool(notifier, tc, tool_result, iteration, warnings)
+                await _record_tool(recorder, run_id, tc, tool_result, iteration)
+                await _notify_tool(notifier, run_id, tc, tool_result, iteration, warnings)
                 executed.append((tc, tool_result))
 
     # --- Phase 4: Append history in original order (deterministic for LLM) ---
@@ -487,8 +513,8 @@ async def _process_tool_calls(
         call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
         result_msg = strategy.format_tool_result(tool_result)
         history.append(result_msg)
-        await _record_message(recorder, result_msg, iteration)
-        await _notify_message(notifier, result_msg, iteration, warnings)
+        await _record_message(recorder, run_id, result_msg, iteration)
+        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, tool_result))
 
         # Emit skill.invoked governance event when LLM activates a skill
@@ -496,12 +522,14 @@ async def _process_tool_calls(
             skill_name = (tc.params or {}).get("name", "")
             await _record_governance(
                 recorder,
+                run_id,
                 GovernanceEventType.SKILL_INVOKED,
                 iteration,
                 {"skill_name": skill_name},
             )
             await _notify_governance(
                 notifier,
+                run_id,
                 GovernanceEventType.SKILL_INVOKED,
                 iteration,
                 {"skill_name": skill_name},
@@ -556,6 +584,7 @@ class ReActLoop(Loop):
             user_input=user_input,
             recorder=recorder,
             notifier=notifier,
+            run_id=resolved_run_id,
             initial_history=initial_history,
             initial_steps=initial_steps,
             initial_usage=initial_usage,
@@ -605,12 +634,14 @@ class ReActLoop(Loop):
                     if block_err is not None:
                         await _record_governance(
                             recorder,
+                            resolved_run_id,
                             "guardrail.blocked",
                             iteration,
                             {"direction": "incoming", "error": block_err},
                         )
                         await _notify_governance(
                             notifier,
+                            resolved_run_id,
                             "guardrail.blocked",
                             iteration,
                             {"direction": "incoming", "error": block_err},
@@ -639,6 +670,7 @@ class ReActLoop(Loop):
                     _in_entities = list({f.entity_type for f in all_in_findings})
                     await _record_governance(
                         recorder,
+                        resolved_run_id,
                         "guardrail.detected",
                         iteration,
                         {
@@ -649,6 +681,7 @@ class ReActLoop(Loop):
                     )
                     await _notify_governance(
                         notifier,
+                        resolved_run_id,
                         "guardrail.detected",
                         iteration,
                         {
@@ -665,33 +698,69 @@ class ReActLoop(Loop):
                     _red_entities = list({f.entity_type for f in all_in_findings})
                     await _record_governance(
                         recorder,
+                        resolved_run_id,
                         "guardrail.redacted",
                         iteration,
                         {"direction": "incoming", "entities": _red_entities},
                     )
                     await _notify_governance(
                         notifier,
+                        resolved_run_id,
                         "guardrail.redacted",
                         iteration,
                         {"direction": "incoming", "entities": _red_entities},
                         warnings=notifier_warnings,
                     )
 
-            # LLM call — batch
+            # LLM call — batch (lifecycle: started → completed/failed)
+            await _record_llm_started(
+                recorder,
+                resolved_run_id,
+                iteration,
+                semantic_messages=messages,
+                semantic_tools=tools,
+            )
+            await _notify_llm_started(
+                notifier,
+                resolved_run_id,
+                iteration,
+                notifier_warnings,
+                semantic_messages=messages,
+                semantic_tools=tools,
+            )
             t0 = time.monotonic()
-            with telemetry_context(
-                run_id=resolved_run_id,
-                iteration=iteration,
-                recorder=recorder,
-                notifier=notifier,
-            ):
-                response = await provider.complete(
-                    messages,
-                    tools=tools,
+            try:
+                with telemetry_context(
                     run_id=resolved_run_id,
-                    cache_key_prefix=cache_key_prefix,
-                    **_pkw,
+                    iteration=iteration,
+                    recorder=recorder,
+                    notifier=notifier,
+                ):
+                    response = await provider.complete(
+                        messages,
+                        tools=tools,
+                        run_id=resolved_run_id,
+                        cache_key_prefix=cache_key_prefix,
+                        **_pkw,
+                    )
+            except Exception as _llm_exc:
+                _llm_fail_ms = int((time.monotonic() - t0) * 1000)
+                await _record_llm_failed(
+                    recorder,
+                    resolved_run_id,
+                    iteration,
+                    _llm_exc,
+                    duration_ms=_llm_fail_ms,
                 )
+                await _notify_llm_failed(
+                    notifier,
+                    resolved_run_id,
+                    iteration,
+                    _llm_exc,
+                    notifier_warnings,
+                    duration_ms=_llm_fail_ms,
+                )
+                raise
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
             # Output guardrail — detection-only. Persistence stores raw
@@ -711,6 +780,7 @@ class ReActLoop(Loop):
                     _out_entities = list({f.entity_type for f in out_findings})
                     await _record_governance(
                         recorder,
+                        resolved_run_id,
                         "guardrail.detected",
                         iteration,
                         {
@@ -721,6 +791,7 @@ class ReActLoop(Loop):
                     )
                     await _notify_governance(
                         notifier,
+                        resolved_run_id,
                         "guardrail.detected",
                         iteration,
                         {
@@ -743,6 +814,7 @@ class ReActLoop(Loop):
                     )
                     await _record_llm(
                         recorder,
+                        resolved_run_id,
                         _blocked_response,
                         iteration,
                         semantic_messages=messages,
@@ -752,6 +824,7 @@ class ReActLoop(Loop):
                     )
                     await _notify_llm(
                         notifier,
+                        resolved_run_id,
                         _blocked_response,
                         iteration,
                         notifier_warnings,
@@ -767,17 +840,20 @@ class ReActLoop(Loop):
                         budget_fired,
                         recorder,
                         notifier,
+                        resolved_run_id,
                         iteration,
                         notifier_warnings,
                     )
                     await _record_governance(
                         recorder,
+                        resolved_run_id,
                         "guardrail.blocked",
                         iteration,
                         {"direction": "outgoing", "error": out_block},
                     )
                     await _notify_governance(
                         notifier,
+                        resolved_run_id,
                         "guardrail.blocked",
                         iteration,
                         {"direction": "outgoing", "error": out_block},
@@ -797,6 +873,7 @@ class ReActLoop(Loop):
             # and accumulate usage.
             await _record_llm(
                 recorder,
+                resolved_run_id,
                 response,
                 iteration,
                 semantic_messages=messages,
@@ -806,6 +883,7 @@ class ReActLoop(Loop):
             )
             await _notify_llm(
                 notifier,
+                resolved_run_id,
                 response,
                 iteration,
                 notifier_warnings,
@@ -821,6 +899,7 @@ class ReActLoop(Loop):
                 budget_fired,
                 recorder,
                 notifier,
+                resolved_run_id,
                 iteration,
                 notifier_warnings,
             )
@@ -834,6 +913,7 @@ class ReActLoop(Loop):
                     history,
                     recorder,
                     notifier,
+                    resolved_run_id,
                     iteration,
                     notifier_warnings,
                 )
@@ -853,6 +933,7 @@ class ReActLoop(Loop):
                     history,
                     recorder,
                     notifier,
+                    resolved_run_id,
                     iteration,
                     notifier_warnings,
                 )
@@ -885,6 +966,7 @@ class ReActLoop(Loop):
                     history,
                     recorder,
                     notifier,
+                    resolved_run_id,
                     iteration,
                     notifier_warnings,
                 )
@@ -895,6 +977,7 @@ class ReActLoop(Loop):
                     strategy=strategy,
                     recorder=recorder,
                     notifier=notifier,
+                    run_id=resolved_run_id,
                     iteration=iteration,
                     history=history,
                     warnings=notifier_warnings,
@@ -970,6 +1053,7 @@ class ReActLoop(Loop):
             user_input=user_input,
             recorder=recorder,
             notifier=notifier,
+            run_id=resolved_run_id,
             initial_history=initial_history,
             initial_steps=initial_steps,
             initial_usage=initial_usage,
@@ -1005,7 +1089,22 @@ class ReActLoop(Loop):
                 tool_defs=tool_defs,
             )
 
-            # LLM call — streaming
+            # LLM call — streaming (lifecycle: started → completed/failed)
+            await _record_llm_started(
+                recorder,
+                resolved_run_id,
+                iteration,
+                semantic_messages=messages,
+                semantic_tools=tools,
+            )
+            await _notify_llm_started(
+                notifier,
+                resolved_run_id,
+                iteration,
+                notifier_warnings,
+                semantic_messages=messages,
+                semantic_tools=tools,
+            )
             t0 = time.monotonic()
             llm_response: LLMResponse | None = None
             _stream_telemetry = telemetry_context(
@@ -1023,24 +1122,43 @@ class ReActLoop(Loop):
                 **_pkw,
             )
             try:
-                async for event in provider_stream:
-                    if event.type == StreamEventType.TEXT_DELTA:
-                        yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
-                    elif event.type == StreamEventType.TOOL_USE_START:
-                        yield RunEvent(
-                            type=RunEventType.TOOL_USE_START,
-                            tool_name=event.tool_name,
-                            tool_call_id=event.tool_call_id,
-                        )
-                    elif event.type == StreamEventType.TOOL_USE_END:
-                        yield RunEvent(
-                            type=RunEventType.TOOL_USE_END,
-                            tool_call=event.tool_call,
-                            tool_name=event.tool_name,
-                            tool_call_id=event.tool_call_id,
-                        )
-                    elif event.type == StreamEventType.DONE:
-                        llm_response = event.raw
+                try:
+                    async for event in provider_stream:
+                        if event.type == StreamEventType.TEXT_DELTA:
+                            yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                        elif event.type == StreamEventType.TOOL_USE_START:
+                            yield RunEvent(
+                                type=RunEventType.TOOL_USE_START,
+                                tool_name=event.tool_name,
+                                tool_call_id=event.tool_call_id,
+                            )
+                        elif event.type == StreamEventType.TOOL_USE_END:
+                            yield RunEvent(
+                                type=RunEventType.TOOL_USE_END,
+                                tool_call=event.tool_call,
+                                tool_name=event.tool_name,
+                                tool_call_id=event.tool_call_id,
+                            )
+                        elif event.type == StreamEventType.DONE:
+                            llm_response = event.raw
+                except Exception as _stream_exc:
+                    _stream_fail_ms = int((time.monotonic() - t0) * 1000)
+                    await _record_llm_failed(
+                        recorder,
+                        resolved_run_id,
+                        iteration,
+                        _stream_exc,
+                        duration_ms=_stream_fail_ms,
+                    )
+                    await _notify_llm_failed(
+                        notifier,
+                        resolved_run_id,
+                        iteration,
+                        _stream_exc,
+                        notifier_warnings,
+                        duration_ms=_stream_fail_ms,
+                    )
+                    raise
             finally:
                 await provider_stream.aclose()
                 _stream_telemetry.__exit__(None, None, None)
@@ -1055,6 +1173,7 @@ class ReActLoop(Loop):
 
             await _record_llm(
                 recorder,
+                resolved_run_id,
                 llm_response,
                 iteration,
                 semantic_messages=messages,
@@ -1063,6 +1182,7 @@ class ReActLoop(Loop):
             )
             await _notify_llm(
                 notifier,
+                resolved_run_id,
                 llm_response,
                 iteration,
                 notifier_warnings,
@@ -1077,6 +1197,7 @@ class ReActLoop(Loop):
                 budget_fired,
                 recorder,
                 notifier,
+                resolved_run_id,
                 iteration,
                 notifier_warnings,
             )
@@ -1090,6 +1211,7 @@ class ReActLoop(Loop):
                     history,
                     recorder,
                     notifier,
+                    resolved_run_id,
                     iteration,
                     notifier_warnings,
                 )
@@ -1116,6 +1238,7 @@ class ReActLoop(Loop):
                     history,
                     recorder,
                     notifier,
+                    resolved_run_id,
                     iteration,
                     notifier_warnings,
                 )
@@ -1151,6 +1274,7 @@ class ReActLoop(Loop):
                     history,
                     recorder,
                     notifier,
+                    resolved_run_id,
                     iteration,
                     notifier_warnings,
                 )
@@ -1161,6 +1285,7 @@ class ReActLoop(Loop):
                     strategy=strategy,
                     recorder=recorder,
                     notifier=notifier,
+                    run_id=resolved_run_id,
                     iteration=iteration,
                     history=history,
                     warnings=notifier_warnings,
@@ -1268,6 +1393,7 @@ async def _execute_record_notify(
     lookups: ToolLookups,
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     iteration: int,
     notifier_warnings: list[str],
 ) -> tuple[ToolCall, ToolResult]:
@@ -1276,9 +1402,11 @@ async def _execute_record_notify(
     Each tool records and streams its event as soon as it finishes,
     without waiting for siblings.
     """
+    await _record_tool_started(recorder, run_id, tool_call, iteration)
+    await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
     result = await _execute_tool(tool_call, lookups)
-    await _record_tool(recorder, tool_call, result, iteration)
-    await _notify_tool(notifier, tool_call, result, iteration, notifier_warnings)
+    await _record_tool(recorder, run_id, tool_call, result, iteration)
+    await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
     return tool_call, result
 
 

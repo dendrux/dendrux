@@ -83,7 +83,7 @@ class TestOnMessageAppended:
         obs = PersistenceRecorder(store, "run_1")
 
         msg = Message(role=Role.USER, content="hello")
-        await obs.on_message_appended(msg, iteration=0)
+        await obs.on_message_appended("r1", msg, iteration=0)
 
         assert len(store.traces) == 1
         trace = store.traces[0]
@@ -97,10 +97,10 @@ class TestOnMessageAppended:
         store = MockStateStore()
         obs = PersistenceRecorder(store, "run_1")
 
-        await obs.on_message_appended(Message(role=Role.USER, content="a"), iteration=0)
-        await obs.on_message_appended(Message(role=Role.ASSISTANT, content="b"), iteration=1)
+        await obs.on_message_appended("r1", Message(role=Role.USER, content="a"), iteration=0)
+        await obs.on_message_appended("r1", Message(role=Role.ASSISTANT, content="b"), iteration=1)
         tool_msg = Message(role=Role.TOOL, content="c", call_id="c1", name="t")
-        await obs.on_message_appended(tool_msg, iteration=1)
+        await obs.on_message_appended("r1", tool_msg, iteration=1)
 
         assert [t["order_index"] for t in store.traces] == [0, 1, 2]
 
@@ -110,7 +110,7 @@ class TestOnMessageAppended:
 
         tc = ToolCall(name="add", params={"a": 1}, provider_tool_call_id="p1")
         msg = Message(role=Role.ASSISTANT, content="calling", tool_calls=[tc])
-        await obs.on_message_appended(msg, iteration=1)
+        await obs.on_message_appended("r1", msg, iteration=1)
 
         meta = store.traces[0]["meta"]
         assert "tool_calls" in meta
@@ -123,7 +123,7 @@ class TestOnMessageAppended:
         obs = PersistenceRecorder(store, "run_1")
 
         msg = Message(role=Role.TOOL, content='{"result": 42}', call_id="tc_1", name="add")
-        await obs.on_message_appended(msg, iteration=1)
+        await obs.on_message_appended("r1", msg, iteration=1)
 
         meta = store.traces[0]["meta"]
         assert meta["call_id"] == "tc_1"
@@ -134,7 +134,7 @@ class TestOnMessageAppended:
         obs = PersistenceRecorder(store, "run_1")
 
         msg = Message(role=Role.USER, content="hi", meta={"custom_key": "value"})
-        await obs.on_message_appended(msg, iteration=0)
+        await obs.on_message_appended("r1", msg, iteration=0)
 
         meta = store.traces[0]["meta"]
         assert meta["custom_key"] == "value"
@@ -155,7 +155,7 @@ class TestOnLLMCallCompleted:
             text="hi",
             usage=UsageStats(input_tokens=100, output_tokens=50, total_tokens=150),
         )
-        await obs.on_llm_call_completed(response, iteration=1)
+        await obs.on_llm_call_completed("r1", response, iteration=1)
 
         assert len(store.usages) == 1
         usage = store.usages[0]
@@ -171,7 +171,7 @@ class TestOnLLMCallCompleted:
         obs = PersistenceRecorder(store, "run_1")
 
         response = LLMResponse(text="hi")
-        await obs.on_llm_call_completed(response, iteration=0)
+        await obs.on_llm_call_completed("r1", response, iteration=0)
 
         usage = store.usages[0]
         assert usage["model"] is None
@@ -196,7 +196,7 @@ class TestOnToolCompleted:
             success=True,
             duration_ms=42,
         )
-        await obs.on_tool_completed(tc, result, iteration=1)
+        await obs.on_tool_completed("r1", tc, result, iteration=1)
 
         assert len(store.tool_calls) == 1
         record = store.tool_calls[0]
@@ -224,7 +224,7 @@ class TestOnToolCompleted:
             error="boom",
             duration_ms=5,
         )
-        await obs.on_tool_completed(tc, result, iteration=2)
+        await obs.on_tool_completed("r1", tc, result, iteration=2)
 
         record = store.tool_calls[0]
         assert record["success"] is False
@@ -236,6 +236,6 @@ class TestOnToolCompleted:
 
         tc = ToolCall(name="no_args", params={})
         result = ToolResult(name="no_args", call_id=tc.id, payload="{}", success=True)
-        await obs.on_tool_completed(tc, result, iteration=1)
+        await obs.on_tool_completed("r1", tc, result, iteration=1)
 
         assert store.tool_calls[0]["params"] is None

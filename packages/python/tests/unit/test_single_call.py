@@ -344,13 +344,13 @@ class TestSingleCallNotifier:
             notifier=notifier,
         )
 
-        # First call: user message
-        first_msg: Message = notifier.on_message_appended.call_args_list[0][0][0]
+        # First call: (run_id, user_message, iteration)
+        first_msg: Message = notifier.on_message_appended.call_args_list[0][0][1]
         assert first_msg.role == Role.USER
         assert first_msg.content == "I hate bugs"
 
-        # Second call: assistant message
-        second_msg: Message = notifier.on_message_appended.call_args_list[1][0][0]
+        # Second call: (run_id, assistant_message, iteration)
+        second_msg: Message = notifier.on_message_appended.call_args_list[1][0][1]
         assert second_msg.role == Role.ASSISTANT
         assert second_msg.content == "negative"
 

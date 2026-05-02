@@ -23,9 +23,13 @@ from dendrux.loops._helpers import (
     guardrail_meta,
     notify_governance,
     notify_llm,
+    notify_llm_failed,
+    notify_llm_started,
     notify_message,
     record_governance,
     record_llm,
+    record_llm_failed,
+    record_llm_started,
     record_message,
 )
 from dendrux.loops.base import Loop
@@ -119,6 +123,7 @@ class SingleCall(Loop):
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
+        notifier_warnings: list[str] = []
 
         if initial_history is not None:
             # Seeded chat history (or resume) — caller already persisted what's
@@ -127,8 +132,8 @@ class SingleCall(Loop):
         else:
             user_msg = Message(role=Role.USER, content=user_input)
             history = [user_msg]
-            await record_message(recorder, user_msg, 0)
-            await notify_message(notifier, user_msg, 0)
+            await record_message(recorder, resolved_run_id, user_msg, 0)
+            await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
 
         messages, _tools = strategy.build_messages(
             system_prompt=agent.get_system_prompt(loop=self),
@@ -150,15 +155,18 @@ class SingleCall(Loop):
                 if block_err is not None:
                     await record_governance(
                         recorder,
+                        resolved_run_id,
                         "guardrail.blocked",
                         1,
                         {"direction": "incoming", "error": block_err},
                     )
                     await notify_governance(
                         notifier,
+                        resolved_run_id,
                         "guardrail.blocked",
                         1,
                         {"direction": "incoming", "error": block_err},
+                        warnings=notifier_warnings,
                     )
                     return RunResult(
                         run_id=resolved_run_id,
@@ -167,7 +175,7 @@ class SingleCall(Loop):
                         steps=[],
                         iteration_count=1,
                         usage=UsageStats(),
-                        meta=guardrail_meta(g_engine),
+                        meta=guardrail_meta(g_engine, notifier_warnings),
                     )
                 if cleaned != msg.content:
                     _in_was_redacted = True
@@ -183,6 +191,7 @@ class SingleCall(Loop):
                 _in_entities = list({f.entity_type for f in all_in_findings})
                 await record_governance(
                     recorder,
+                    resolved_run_id,
                     "guardrail.detected",
                     1,
                     {
@@ -193,6 +202,7 @@ class SingleCall(Loop):
                 )
                 await notify_governance(
                     notifier,
+                    resolved_run_id,
                     "guardrail.detected",
                     1,
                     {
@@ -200,58 +210,97 @@ class SingleCall(Loop):
                         "findings_count": len(all_in_findings),
                         "entities": _in_entities,
                     },
+                    warnings=notifier_warnings,
                 )
             if _in_was_redacted:
                 _red_entities = list({f.entity_type for f in all_in_findings})
                 await record_governance(
                     recorder,
+                    resolved_run_id,
                     "guardrail.redacted",
                     1,
                     {"direction": "incoming", "entities": _red_entities},
                 )
                 await notify_governance(
                     notifier,
+                    resolved_run_id,
                     "guardrail.redacted",
                     1,
                     {"direction": "incoming", "entities": _red_entities},
+                    warnings=notifier_warnings,
                 )
 
+        # LLM call (lifecycle: started → completed/failed)
+        await record_llm_started(
+            recorder,
+            resolved_run_id,
+            1,
+            semantic_messages=messages,
+            semantic_tools=None,
+        )
+        await notify_llm_started(
+            notifier,
+            resolved_run_id,
+            1,
+            notifier_warnings,
+            semantic_messages=messages,
+            semantic_tools=None,
+        )
         t0 = time.monotonic()
 
         # Structured output path: use the structured helper
         validated_output: Any = None
-        with telemetry_context(
-            run_id=resolved_run_id,
-            iteration=1,
-            recorder=recorder,
-            notifier=notifier,
-        ):
-            if output_type is not None:
-                from dendrux.llm.structured import structured_complete
+        try:
+            with telemetry_context(
+                run_id=resolved_run_id,
+                iteration=1,
+                recorder=recorder,
+                notifier=notifier,
+            ):
+                if output_type is not None:
+                    from dendrux.llm.structured import structured_complete
 
-                response, validated_output = await structured_complete(
-                    provider,
-                    messages,
-                    output_type,
-                    run_id=resolved_run_id,
-                    cache_key_prefix=cache_key_prefix,
-                    **_pkw,
-                )
-            else:
-                response = await provider.complete(
-                    messages,
-                    tools=None,
-                    run_id=resolved_run_id,
-                    cache_key_prefix=cache_key_prefix,
-                    **_pkw,
-                )
+                    response, validated_output = await structured_complete(
+                        provider,
+                        messages,
+                        output_type,
+                        run_id=resolved_run_id,
+                        cache_key_prefix=cache_key_prefix,
+                        **_pkw,
+                    )
+                else:
+                    response = await provider.complete(
+                        messages,
+                        tools=None,
+                        run_id=resolved_run_id,
+                        cache_key_prefix=cache_key_prefix,
+                        **_pkw,
+                    )
 
-            if response.tool_calls:
-                raise RuntimeError(
-                    f"SingleCall received unexpected tool_calls from provider "
-                    f"({len(response.tool_calls)} calls). SingleCall agents must "
-                    f"have zero tools — the provider should not produce tool calls."
-                )
+                if response.tool_calls:
+                    raise RuntimeError(
+                        f"SingleCall received unexpected tool_calls from provider "
+                        f"({len(response.tool_calls)} calls). SingleCall agents must "
+                        f"have zero tools — the provider should not produce tool calls."
+                    )
+        except Exception as _llm_exc:
+            _llm_fail_ms = int((time.monotonic() - t0) * 1000)
+            await record_llm_failed(
+                recorder,
+                resolved_run_id,
+                1,
+                _llm_exc,
+                duration_ms=_llm_fail_ms,
+            )
+            await notify_llm_failed(
+                notifier,
+                resolved_run_id,
+                1,
+                _llm_exc,
+                notifier_warnings,
+                duration_ms=_llm_fail_ms,
+            )
+            raise
 
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -277,15 +326,18 @@ class SingleCall(Loop):
                 }
                 await record_governance(
                     recorder,
+                    resolved_run_id,
                     "guardrail.detected",
                     1,
                     _out_data,
                 )
                 await notify_governance(
                     notifier,
+                    resolved_run_id,
                     "guardrail.detected",
                     1,
                     _out_data,
+                    warnings=notifier_warnings,
                 )
             if out_block is not None:
                 # Scrub response before recording — block means the
@@ -302,6 +354,7 @@ class SingleCall(Loop):
                 )
                 await record_llm(
                     recorder,
+                    resolved_run_id,
                     _blocked_resp,
                     1,
                     semantic_messages=messages,
@@ -311,8 +364,10 @@ class SingleCall(Loop):
                 )
                 await notify_llm(
                     notifier,
+                    resolved_run_id,
                     _blocked_resp,
                     1,
+                    notifier_warnings,
                     semantic_messages=messages,
                     semantic_tools=None,
                     duration_ms=llm_duration_ms,
@@ -324,20 +379,24 @@ class SingleCall(Loop):
                     [],
                     recorder,
                     notifier,
+                    resolved_run_id,
                     1,
-                    [],
+                    notifier_warnings,
                 )
                 await record_governance(
                     recorder,
+                    resolved_run_id,
                     "guardrail.blocked",
                     1,
                     {"direction": "outgoing", "error": out_block},
                 )
                 await notify_governance(
                     notifier,
+                    resolved_run_id,
                     "guardrail.blocked",
                     1,
                     {"direction": "outgoing", "error": out_block},
+                    warnings=notifier_warnings,
                 )
                 return RunResult(
                     run_id=resolved_run_id,
@@ -346,12 +405,13 @@ class SingleCall(Loop):
                     steps=[],
                     iteration_count=1,
                     usage=response.usage,
-                    meta=guardrail_meta(g_engine),
+                    meta=guardrail_meta(g_engine, notifier_warnings),
                 )
 
         # Record the LLM response (raw — DB is ground truth).
         await record_llm(
             recorder,
+            resolved_run_id,
             response,
             1,
             semantic_messages=messages,
@@ -361,8 +421,10 @@ class SingleCall(Loop):
         )
         await notify_llm(
             notifier,
+            resolved_run_id,
             response,
             1,
+            notifier_warnings,
             semantic_messages=messages,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
@@ -371,8 +433,8 @@ class SingleCall(Loop):
 
         assistant_msg = Message(role=Role.ASSISTANT, content=response.text or "")
         history.append(assistant_msg)
-        await record_message(recorder, assistant_msg, 1)
-        await notify_message(notifier, assistant_msg, 1)
+        await record_message(recorder, resolved_run_id, assistant_msg, 1)
+        await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
 
         usage = UsageStats(
             input_tokens=response.usage.input_tokens,
@@ -389,8 +451,9 @@ class SingleCall(Loop):
             [],
             recorder,
             notifier,
+            resolved_run_id,
             1,
-            [],
+            notifier_warnings,
         )
 
         return RunResult(
@@ -401,7 +464,7 @@ class SingleCall(Loop):
             steps=[],
             iteration_count=1,
             usage=usage,
-            meta=guardrail_meta(g_engine),
+            meta=guardrail_meta(g_engine, notifier_warnings),
         )
 
     async def run_stream(
@@ -449,6 +512,7 @@ class SingleCall(Loop):
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
+        notifier_warnings: list[str] = []
 
         if initial_history is not None:
             # Seeded chat history (or resume) — caller already persisted what's
@@ -457,8 +521,8 @@ class SingleCall(Loop):
         else:
             user_msg = Message(role=Role.USER, content=user_input)
             history = [user_msg]
-            await record_message(recorder, user_msg, 0)
-            await notify_message(notifier, user_msg, 0)
+            await record_message(recorder, resolved_run_id, user_msg, 0)
+            await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
 
         messages, _tools = strategy.build_messages(
             system_prompt=agent.get_system_prompt(loop=self),
@@ -466,6 +530,22 @@ class SingleCall(Loop):
             tool_defs=[],
         )
 
+        # LLM call (lifecycle: started → completed/failed)
+        await record_llm_started(
+            recorder,
+            resolved_run_id,
+            1,
+            semantic_messages=messages,
+            semantic_tools=None,
+        )
+        await notify_llm_started(
+            notifier,
+            resolved_run_id,
+            1,
+            notifier_warnings,
+            semantic_messages=messages,
+            semantic_tools=None,
+        )
         t0 = time.monotonic()
         llm_response: LLMResponse | None = None
         _stream_telemetry = telemetry_context(
@@ -483,17 +563,39 @@ class SingleCall(Loop):
             **_pkw,
         )
         try:
-            async for event in provider_stream:
-                if event.type == StreamEventType.TEXT_DELTA:
-                    yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
-                elif event.type in (StreamEventType.TOOL_USE_START, StreamEventType.TOOL_USE_END):
-                    raise RuntimeError(
-                        f"SingleCall received unexpected {event.type.value} event "
-                        f"from provider stream. SingleCall agents must have zero "
-                        f"tools — the provider should not produce tool events."
-                    )
-                elif event.type == StreamEventType.DONE:
-                    llm_response = event.raw
+            try:
+                async for event in provider_stream:
+                    if event.type == StreamEventType.TEXT_DELTA:
+                        yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                    elif event.type in (
+                        StreamEventType.TOOL_USE_START,
+                        StreamEventType.TOOL_USE_END,
+                    ):
+                        raise RuntimeError(
+                            f"SingleCall received unexpected {event.type.value} event "
+                            f"from provider stream. SingleCall agents must have zero "
+                            f"tools — the provider should not produce tool events."
+                        )
+                    elif event.type == StreamEventType.DONE:
+                        llm_response = event.raw
+            except Exception as _stream_exc:
+                _stream_fail_ms = int((time.monotonic() - t0) * 1000)
+                await record_llm_failed(
+                    recorder,
+                    resolved_run_id,
+                    1,
+                    _stream_exc,
+                    duration_ms=_stream_fail_ms,
+                )
+                await notify_llm_failed(
+                    notifier,
+                    resolved_run_id,
+                    1,
+                    _stream_exc,
+                    notifier_warnings,
+                    duration_ms=_stream_fail_ms,
+                )
+                raise
         finally:
             await provider_stream.aclose()
             _stream_telemetry.__exit__(None, None, None)
@@ -515,6 +617,7 @@ class SingleCall(Loop):
 
         await record_llm(
             recorder,
+            resolved_run_id,
             llm_response,
             1,
             semantic_messages=messages,
@@ -523,8 +626,10 @@ class SingleCall(Loop):
         )
         await notify_llm(
             notifier,
+            resolved_run_id,
             llm_response,
             1,
+            notifier_warnings,
             semantic_messages=messages,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
@@ -532,8 +637,8 @@ class SingleCall(Loop):
 
         assistant_msg = Message(role=Role.ASSISTANT, content=llm_response.text or "")
         history.append(assistant_msg)
-        await record_message(recorder, assistant_msg, 1)
-        await notify_message(notifier, assistant_msg, 1)
+        await record_message(recorder, resolved_run_id, assistant_msg, 1)
+        await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
 
         usage = UsageStats(
             input_tokens=llm_response.usage.input_tokens,
@@ -550,8 +655,9 @@ class SingleCall(Loop):
             [],
             recorder,
             notifier,
+            resolved_run_id,
             1,
-            [],
+            notifier_warnings,
         )
 
         yield RunEvent(

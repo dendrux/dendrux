@@ -11,6 +11,7 @@ import pytest
 from dendrux.agent import Agent
 from dendrux.chat import ChatMessage, ChatRole
 from dendrux.llm.mock import MockLLM
+from dendrux.loops.base import BaseNotifier
 from dendrux.loops.single import SingleCall
 from dendrux.types import (
     LLMResponse,
@@ -389,19 +390,19 @@ class TestByteStableProviderInputAcrossTurns:
 # -----------------------------------------------------------------------
 
 
-class _RecordingNotifier:
+class _RecordingNotifier(BaseNotifier):
     """Test helper — captures everything the loop notifies."""
 
     def __init__(self) -> None:
         self.messages: list[tuple[Message, int]] = []
 
-    async def on_message_appended(self, message: Message, iteration: int) -> None:
+    async def on_message_appended(self, run_id, message: Message, iteration: int) -> None:
         self.messages.append((message, iteration))
 
-    async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
+    async def on_llm_call_completed(self, run_id, response, iteration: int, **kwargs) -> None:
         pass
 
-    async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
+    async def on_tool_completed(self, run_id, tool_call, tool_result, iteration: int) -> None:
         pass
 
 
