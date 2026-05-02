@@ -20,9 +20,10 @@ from dendrux.llm._retry_telemetry import (
     make_telemetry_http_client,
     telemetry_context,
 )
+from dendrux.loops.base import BaseRecorder
 
 
-class _CapturingRecorder:
+class _CapturingRecorder(BaseRecorder):
     def __init__(self) -> None:
         self.events: list[tuple[str, int, dict[str, Any], str | None]] = []
 
@@ -32,6 +33,7 @@ class _CapturingRecorder:
 
     async def on_governance_event(
         self,
+        run_id,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
@@ -187,7 +189,7 @@ async def test_recorder_failure_is_swallowed_not_propagated() -> None:
     production agent.
     """
 
-    class _BrokenRecorder:
+    class _BrokenRecorder(BaseRecorder):
         async def on_governance_event(self, *a: Any, **k: Any) -> None:
             raise RuntimeError("recorder is broken")
 

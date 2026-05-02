@@ -7,9 +7,19 @@ communication and a Provider for actual LLM calls.
 The loop never touches provider-specific APIs or prompt formatting — that's
 the strategy's job. The loop is pure orchestration.
 
-Two event seams:
+Two event seams (symmetric surface, asymmetric failure policy):
   - LoopRecorder: internal, authoritative persistence. Fail-closed.
   - LoopNotifier: external, best-effort notifications. Exceptions swallowed.
+
+Both protocols share the same hook signatures so a single emission point
+in the loop can fan out to both rails. The first positional argument of
+every hook is the ``run_id`` so shared notifier instances can disambiguate
+concurrent runs without leaning on contextvars or implicit state.
+
+Concrete no-op base classes (:class:`BaseRecorder`, :class:`BaseNotifier`)
+are provided for ergonomics — subclass and override only the hooks you
+care about. New hooks added in future protocol revisions land as no-op
+defaults so existing implementations keep working.
 """
 
 from __future__ import annotations
@@ -58,10 +68,38 @@ class LoopRecorder(Protocol):
     the durability policy.
     """
 
-    async def on_message_appended(self, message: Message, iteration: int) -> None: ...
+    async def on_run_started(
+        self,
+        run_id: str,
+        *,
+        agent_name: str | None = None,
+        agent_model: str | None = None,
+    ) -> None: ...
+
+    async def on_run_finished(self, run_id: str, result: RunResult) -> None: ...
+
+    async def on_run_failed(
+        self,
+        run_id: str,
+        error: BaseException,
+        *,
+        iteration: int | None = None,
+    ) -> None: ...
+
+    async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None: ...
+
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None: ...
 
     async def on_llm_call_completed(
         self,
+        run_id: str,
         response: LLMResponse,
         iteration: int,
         *,
@@ -71,15 +109,32 @@ class LoopRecorder(Protocol):
         guardrail_findings: dict[str, Any] | None = None,
     ) -> None: ...
 
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None: ...
+
+    async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None: ...
+
     async def on_tool_completed(
-        self, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
     ) -> None: ...
 
     async def on_governance_event(
         self,
+        run_id: str,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
+        *,
         correlation_id: str | None = None,
     ) -> None: ...
 
@@ -100,9 +155,53 @@ class LoopNotifier(Protocol):
     Failure policy: notifiers should not raise. If they do, the loop logs
     a warning and continues execution. Notification failures must not
     kill agent runs.
+
+    The runner emits the run-level hooks (started / finished / failed); the
+    loop emits everything else. Every hook carries ``run_id`` as its first
+    positional argument so shared notifier instances can disambiguate
+    concurrent runs without contextvars.
     """
 
-    async def on_message_appended(self, message: Message, iteration: int) -> None:
+    async def on_run_started(
+        self,
+        run_id: str,
+        *,
+        agent_name: str | None = None,
+        agent_model: str | None = None,
+    ) -> None:
+        """Called once at the top of a run, before any loop work begins.
+
+        Fires for fresh runs and for resumes — both transit through the
+        runner. Use this to open a root span, emit a "run started" log,
+        prime a dashboard row, etc.
+        """
+        ...
+
+    async def on_run_finished(self, run_id: str, result: RunResult) -> None:
+        """Called when a run reaches a non-error terminal state.
+
+        Includes success, paused (waiting_*), cancelled, max_iterations.
+        ``result.status`` carries the distinction. For exceptions use
+        :meth:`on_run_failed` instead.
+        """
+        ...
+
+    async def on_run_failed(
+        self,
+        run_id: str,
+        error: BaseException,
+        *,
+        iteration: int | None = None,
+    ) -> None:
+        """Called when a run errors out via an unhandled exception.
+
+        Mutually exclusive with :meth:`on_run_finished` — exactly one of
+        the two fires per run. Use this to mark spans as ERROR, page
+        on-call, etc.
+        """
+        ...
+
+    async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Called when a message is appended to the conversation history.
 
         Fires for: initial user message (iteration=0), assistant responses,
@@ -111,8 +210,26 @@ class LoopNotifier(Protocol):
         """
         ...
 
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None:
+        """Called immediately before ``provider.complete*()``.
+
+        Carries the Dendrux-normalized request the provider is about to
+        receive. Use this to start a span, log the outgoing request, etc.
+        Pairs with either :meth:`on_llm_call_completed` (success) or
+        :meth:`on_llm_call_failed` (provider exception).
+        """
+        ...
+
     async def on_llm_call_completed(
         self,
+        run_id: str,
         response: LLMResponse,
         iteration: int,
         *,
@@ -121,12 +238,12 @@ class LoopNotifier(Protocol):
         duration_ms: int | None = None,
         guardrail_findings: dict[str, Any] | None = None,
     ) -> None:
-        """Called after provider.complete() returns.
+        """Called after ``provider.complete*()`` returns successfully.
 
-        Carries token usage in response.usage, plus optional semantic
-        payloads (the Dendrux-normalized messages and tool defs sent
-        to the LLM). Provider-level payloads are on response itself
-        (response.provider_request, response.provider_response).
+        Carries token usage in ``response.usage``, plus optional semantic
+        payloads (the Dendrux-normalized messages and tool defs sent to
+        the LLM). Provider-level payloads are on response itself
+        (``response.provider_request``, ``response.provider_response``).
 
         Args:
             duration_ms: Wall-clock time for the provider.complete() call.
@@ -139,8 +256,39 @@ class LoopNotifier(Protocol):
         """
         ...
 
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Called when ``provider.complete*()`` raises.
+
+        Fires once between :meth:`on_llm_call_started` and the propagating
+        exception. Use this to mark spans as ERROR, surface provider
+        failures to ops, etc. The original exception still re-raises
+        after the notifier rail finishes.
+        """
+        ...
+
+    async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        """Called immediately before tool dispatch.
+
+        Pairs with :meth:`on_tool_completed`. Tool failures arrive on
+        completion as ``ToolResult(success=False)`` — there is no
+        separate ``on_tool_failed`` hook because the loop already
+        converts every dispatch error into a ToolResult.
+        """
+        ...
+
     async def on_tool_completed(
-        self, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
     ) -> None:
         """Called after _execute_tool() returns.
 
@@ -151,9 +299,11 @@ class LoopNotifier(Protocol):
 
     async def on_governance_event(
         self,
+        run_id: str,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
+        *,
         correlation_id: str | None = None,
     ) -> None:
         """Called when a governance action fires (deny, approval, budget, guardrail).
@@ -168,6 +318,189 @@ class LoopNotifier(Protocol):
             correlation_id: Optional join key (e.g. tool call ID for dashboard joins).
         """
         ...
+
+
+# ------------------------------------------------------------------
+# Concrete no-op bases (ergonomic subclassing)
+# ------------------------------------------------------------------
+
+
+class BaseRecorder:
+    """Concrete no-op base for :class:`LoopRecorder`.
+
+    Subclass and override only the hooks you care about. New hooks added
+    in future protocol revisions land as no-op defaults so existing
+    implementations keep working without changes.
+    """
+
+    async def on_run_started(
+        self,
+        run_id: str,
+        *,
+        agent_name: str | None = None,
+        agent_model: str | None = None,
+    ) -> None:
+        return None
+
+    async def on_run_finished(self, run_id: str, result: RunResult) -> None:
+        return None
+
+    async def on_run_failed(
+        self,
+        run_id: str,
+        error: BaseException,
+        *,
+        iteration: int | None = None,
+    ) -> None:
+        return None
+
+    async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
+        return None
+
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None:
+        return None
+
+    async def on_llm_call_completed(
+        self,
+        run_id: str,
+        response: LLMResponse,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+        duration_ms: int | None = None,
+        guardrail_findings: dict[str, Any] | None = None,
+    ) -> None:
+        return None
+
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        return None
+
+    async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        return None
+
+    async def on_tool_completed(
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
+    ) -> None:
+        return None
+
+    async def on_governance_event(
+        self,
+        run_id: str,
+        event_type: str,
+        iteration: int,
+        data: dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
+        return None
+
+
+class BaseNotifier:
+    """Concrete no-op base for :class:`LoopNotifier`.
+
+    Subclass and override only the hooks you care about. New hooks added
+    in future protocol revisions land as no-op defaults so existing
+    implementations keep working without changes.
+    """
+
+    async def on_run_started(
+        self,
+        run_id: str,
+        *,
+        agent_name: str | None = None,
+        agent_model: str | None = None,
+    ) -> None:
+        return None
+
+    async def on_run_finished(self, run_id: str, result: RunResult) -> None:
+        return None
+
+    async def on_run_failed(
+        self,
+        run_id: str,
+        error: BaseException,
+        *,
+        iteration: int | None = None,
+    ) -> None:
+        return None
+
+    async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
+        return None
+
+    async def on_llm_call_started(
+        self,
+        run_id: str,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+    ) -> None:
+        return None
+
+    async def on_llm_call_completed(
+        self,
+        run_id: str,
+        response: LLMResponse,
+        iteration: int,
+        *,
+        semantic_messages: list[Message] | None = None,
+        semantic_tools: list[ToolDef] | None = None,
+        duration_ms: int | None = None,
+        guardrail_findings: dict[str, Any] | None = None,
+    ) -> None:
+        return None
+
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        return None
+
+    async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        return None
+
+    async def on_tool_completed(
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
+    ) -> None:
+        return None
+
+    async def on_governance_event(
+        self,
+        run_id: str,
+        event_type: str,
+        iteration: int,
+        data: dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
+        return None
 
 
 class Loop(ABC):

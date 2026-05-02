@@ -9,16 +9,24 @@ The recorder is the component that writes what actually happened during a run in
 
 The recorder is not a public extension point. You do not pass one to the `Agent` constructor, and you cannot replace it with a subclass. Dendrux owns this piece. This page exists to explain what it writes, how the fail-closed vs best-effort split works, and why the design draws that line where it does.
 
-## The four hooks
+## The hook surface
 
-The loop talks to the recorder through four protocol methods. That is all of them, and the list has been stable since the persistence layer was introduced:
+The loop talks to the recorder through ten protocol methods, mirrored exactly on `LoopNotifier`. Every hook takes `run_id` as its first positional argument:
 
-| Hook | Called when | Writes to |
+| Hook | Called when | What `PersistenceRecorder` writes |
 | --- | --- | --- |
-| `on_message_appended` | A message is appended to conversation history (user, assistant, tool result) | `react_traces` |
+| `on_run_started` | Fresh run or resume opens | No-op (lifecycle event written by the runner directly) |
+| `on_run_finished` | Run reaches a non-error terminal | No-op (lifecycle event written by the runner directly) |
+| `on_run_failed` | Run errors out via an unhandled exception | No-op (lifecycle event written by the runner directly) |
+| `on_message_appended` | A message is appended to conversation history | `react_traces` |
+| `on_llm_call_started` | Immediately before `provider.complete*()` | No-op (forensics land on completion) |
 | `on_llm_call_completed` | `provider.complete()` returns | `llm_interactions`, `token_usage`, `run_events` (`llm.completed`) |
+| `on_llm_call_failed` | Provider raises | No-op today (the runner's `run.error` event already captures the abort) |
+| `on_tool_started` | Immediately before tool dispatch | No-op (forensics land on completion) |
 | `on_tool_completed` | A server tool or a submitted client/approval tool finishes | `tool_calls`, `run_events` (`tool.completed`) |
-| `on_governance_event` | The loop or a guardrail emits a named event like `approval.requested` or `run.paused` | `run_events` |
+| `on_governance_event` | A named event like `approval.requested` or `budget.threshold` | `run_events` |
+
+The lifecycle hooks (`on_run_started`, `on_run_finished`, `on_run_failed`, `on_llm_call_started`, `on_llm_call_failed`, `on_tool_started`) are present on the protocol so third-party recorders and notifiers can subscribe to them, but `PersistenceRecorder` no-ops them today. The runner already writes `run.started`, `run.completed`, `run.error`, and per-iteration timestamps directly via `_emit_event`, so emitting them again from the recorder would double-write the audit trail. A future refactor may route those writes through the recorder hooks; the protocol is shaped for that move.
 
 From `dendrux/loops/base.py`:
 
@@ -32,13 +40,19 @@ class LoopRecorder(Protocol):
     the run stops.
     """
 
-    async def on_message_appended(self, message, iteration): ...
-    async def on_llm_call_completed(self, response, iteration, *, ...): ...
-    async def on_tool_completed(self, tool_call, tool_result, iteration): ...
-    async def on_governance_event(self, event_type, iteration, data, correlation_id): ...
+    async def on_run_started(self, run_id, *, agent_name=None, agent_model=None): ...
+    async def on_run_finished(self, run_id, result): ...
+    async def on_run_failed(self, run_id, error, *, iteration=None): ...
+    async def on_message_appended(self, run_id, message, iteration): ...
+    async def on_llm_call_started(self, run_id, iteration, *, ...): ...
+    async def on_llm_call_completed(self, run_id, response, iteration, *, ...): ...
+    async def on_llm_call_failed(self, run_id, iteration, error, *, duration_ms=None): ...
+    async def on_tool_started(self, run_id, tool_call, iteration): ...
+    async def on_tool_completed(self, run_id, tool_call, tool_result, iteration): ...
+    async def on_governance_event(self, run_id, event_type, iteration, data, *, correlation_id=None): ...
 ```
 
-`runtime_checkable` means the type system does not require inheritance. The recorder is shaped as a Protocol so the loop is decoupled from any particular storage implementation, but in practice only `PersistenceRecorder` exists in the box.
+`runtime_checkable` means the type system does not require inheritance. The recorder is shaped as a Protocol so the loop is decoupled from any particular storage implementation. For ergonomics, `dendrux.loops.base.BaseRecorder` is a concrete class that ships no-op defaults for every hook — `PersistenceRecorder` subclasses it and overrides only the four methods that actually write to the DB. Future protocol additions land as no-op defaults so existing implementations keep working without changes.
 
 ## What the hooks wrote, for a real run
 

@@ -22,7 +22,16 @@ from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import normalize_chat_history
-from dendrux.loops._helpers import notify_message, record_message
+from dendrux.loops._helpers import (
+    notify_message,
+    notify_run_failed,
+    notify_run_finished,
+    notify_run_started,
+    record_message,
+    record_run_failed,
+    record_run_finished,
+    record_run_started,
+)
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime.context import (
     DelegationContext,
@@ -99,20 +108,22 @@ class _MCPDiscoveryError(Exception):
 async def _emit_init_governance_event(
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     event_type: str,
     data: dict[str, Any],
 ) -> None:
     """Emit a single init governance event to recorder + notifier."""
     from dendrux.loops._helpers import notify_governance, record_governance
 
-    await record_governance(recorder, event_type, 0, data)
-    await notify_governance(notifier, event_type, 0, data)
+    await record_governance(recorder, run_id, event_type, 0, data)
+    await notify_governance(notifier, run_id, event_type, 0, data)
 
 
 async def _emit_init_events(
     agent: Agent,
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
+    run_id: str,
     *,
     resolved_loop: Loop | None = None,
 ) -> None:
@@ -138,6 +149,7 @@ async def _emit_init_events(
             await _emit_init_governance_event(
                 recorder,
                 notifier,
+                run_id,
                 GovernanceEventType.SKILL_REGISTERED,
                 {"skill_name": skill.name, "description": skill.description},
             )
@@ -146,6 +158,7 @@ async def _emit_init_events(
             await _emit_init_governance_event(
                 recorder,
                 notifier,
+                run_id,
                 GovernanceEventType.SKILL_DENIED,
                 {"skill_name": name, "reason": "denied_by_policy"},
             )
@@ -167,6 +180,7 @@ async def _emit_init_events(
             await _emit_init_governance_event(
                 recorder,
                 notifier,
+                run_id,
                 GovernanceEventType.MCP_CONNECTED,
                 {
                     "source_name": source_name,
@@ -686,6 +700,10 @@ async def run(
         sequencer,
         {"agent_name": agent.name, "system_prompt": _system_prompt},
     )
+    await record_run_started(recorder, run_id, agent_name=agent.name, agent_model=provider.model)
+    await notify_run_started(
+        extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+    )
 
     # Set delegation context for the duration of this run so nested
     # agent.run() calls inside tools inherit the parent link.
@@ -704,12 +722,15 @@ async def run(
         # _MCPDiscoveryError is caught here, mcp.error emitted, then the
         # original cause is re-raised for the outer except Exception.
         try:
-            await _emit_init_events(agent, recorder, extra_notifier, resolved_loop=resolved_loop)
+            await _emit_init_events(
+                agent, recorder, extra_notifier, run_id, resolved_loop=resolved_loop
+            )
         except _MCPDiscoveryError as mcp_exc:
             try:
                 await _emit_init_governance_event(
                     recorder,
                     extra_notifier,
+                    run_id,
                     GovernanceEventType.MCP_ERROR,
                     {"error": str(mcp_exc)[:500]},
                 )
@@ -723,9 +744,10 @@ async def run(
         # still lands in react_traces (seeded prior turns are NOT recorded
         # — they live in the dev's chat DB).
         if seeded_history is not None:
-            await record_message(recorder, Message(role=Role.USER, content=user_input), 0)
+            await record_message(recorder, run_id, Message(role=Role.USER, content=user_input), 0)
             await notify_message(
                 extra_notifier,
+                run_id,
                 Message(role=Role.USER, content=user_input),
                 0,
             )
@@ -752,6 +774,9 @@ async def run(
                 sequencer=sequencer,
             )
 
+        await record_run_finished(recorder, run_id, result)
+        await notify_run_finished(extra_notifier, run_id, result)
+
         return result
 
     except Exception as exc:
@@ -774,6 +799,8 @@ async def run(
                 await _emit_event(
                     state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
                 )
+        await record_run_failed(recorder, run_id, exc)
+        await notify_run_failed(extra_notifier, run_id, exc)
         raise
 
     finally:
@@ -1034,6 +1061,10 @@ async def retry(
         sequencer,
         {"agent_name": agent.name, "system_prompt": _system_prompt, "retry_of": original_run_id},
     )
+    await record_run_started(recorder, run_id, agent_name=agent.name, agent_model=provider.model)
+    await notify_run_started(
+        extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+    )
 
     this_ctx = DelegationContext(
         run_id=run_id,
@@ -1046,12 +1077,15 @@ async def retry(
 
     try:
         try:
-            await _emit_init_events(agent, recorder, extra_notifier, resolved_loop=resolved_loop)
+            await _emit_init_events(
+                agent, recorder, extra_notifier, run_id, resolved_loop=resolved_loop
+            )
         except _MCPDiscoveryError as mcp_exc:
             try:
                 await _emit_init_governance_event(
                     recorder,
                     extra_notifier,
+                    run_id,
                     GovernanceEventType.MCP_ERROR,
                     {"error": str(mcp_exc)[:500]},
                 )
@@ -1079,6 +1113,9 @@ async def retry(
             sequencer=sequencer,
         )
 
+        await record_run_finished(recorder, run_id, result)
+        await notify_run_finished(extra_notifier, run_id, result)
+
         return result
 
     except Exception as exc:
@@ -1097,6 +1134,8 @@ async def retry(
             await _emit_event(
                 state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
             )
+        await record_run_failed(recorder, run_id, exc)
+        await notify_run_failed(extra_notifier, run_id, exc)
         raise
 
     finally:
@@ -1306,19 +1345,26 @@ def run_stream(
                 sequencer,
                 {"agent_name": agent.name, "system_prompt": _system_prompt},
             )
+            await record_run_started(
+                recorder, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+            await notify_run_started(
+                extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            )
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
 
             # Emit init governance events (skills + MCP)
             try:
                 await _emit_init_events(
-                    agent, recorder, extra_notifier, resolved_loop=resolved_loop
+                    agent, recorder, extra_notifier, run_id, resolved_loop=resolved_loop
                 )
             except _MCPDiscoveryError as mcp_exc:
                 try:
                     await _emit_init_governance_event(
                         recorder,
                         extra_notifier,
+                        run_id,
                         GovernanceEventType.MCP_ERROR,
                         {"error": str(mcp_exc)[:500]},
                     )
@@ -1331,9 +1377,12 @@ def run_stream(
             # recording. Record the new user_input here so it still lands in
             # react_traces (seeded prior turns are NOT recorded).
             if seeded_history is not None:
-                await record_message(recorder, Message(role=Role.USER, content=user_input), 0)
+                await record_message(
+                    recorder, run_id, Message(role=Role.USER, content=user_input), 0
+                )
                 await notify_message(
                     extra_notifier,
+                    run_id,
                     Message(role=Role.USER, content=user_input),
                     0,
                 )
@@ -1352,29 +1401,35 @@ def run_stream(
                 output_type=output_type,
                 state_store=store,
             ):
-                if (
-                    event.type
-                    in (
-                        RunEventType.RUN_COMPLETED,
-                        RunEventType.RUN_PAUSED,
-                        RunEventType.RUN_CANCELLED,
-                    )
-                    and event.run_result
-                    and store is not None
-                ):
-                    persisted = await _persist_loop_outcome(
-                        state_store=store,
-                        run_id=run_id,
-                        result=event.run_result,
-                        sequencer=sequencer,
-                    )
-                    # Pre-pause checkpoint can flip a PAUSED iteration to CANCELLED.
-                    # Re-derive the event type from the persisted status so the
-                    # consumer sees the correct terminal event.
-                    if persisted.status == RunStatus.CANCELLED:
-                        event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                _terminal_types = (
+                    RunEventType.RUN_COMPLETED,
+                    RunEventType.RUN_PAUSED,
+                    RunEventType.RUN_CANCELLED,
+                )
+                terminal_result = event.run_result if event.type in _terminal_types else None
+                if terminal_result is not None:
+                    if store is not None:
+                        persisted = await _persist_loop_outcome(
+                            state_store=store,
+                            run_id=run_id,
+                            result=terminal_result,
+                            sequencer=sequencer,
+                        )
+                        # Pre-pause checkpoint can flip a PAUSED iteration to
+                        # CANCELLED. Re-derive the event type from the persisted
+                        # status so the consumer sees the correct terminal event.
+                        if persisted.status == RunStatus.CANCELLED:
+                            event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                        else:
+                            event = RunEvent(type=event.type, run_result=persisted)
+                        await record_run_finished(recorder, run_id, persisted)
+                        await notify_run_finished(extra_notifier, run_id, persisted)
                     else:
-                        event = RunEvent(type=event.type, run_result=persisted)
+                        # No persistence: skip _persist_loop_outcome but still
+                        # close the lifecycle pair so notifier-side spans
+                        # (OTel root span) don't leak.
+                        await record_run_finished(recorder, run_id, terminal_result)
+                        await notify_run_finished(extra_notifier, run_id, terminal_result)
                     yield event
                 else:
                     # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
@@ -1399,6 +1454,15 @@ def run_stream(
                     await _emit_event_safe(
                         store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
                     )
+            try:
+                await record_run_failed(recorder, run_id, exc)
+                await notify_run_failed(extra_notifier, run_id, exc)
+            except Exception:
+                logger.warning(
+                    "Lifecycle hooks failed during stream error handler for run %s",
+                    run_id,
+                    exc_info=True,
+                )
 
             yield RunEvent(
                 type=RunEventType.RUN_ERROR,
@@ -1653,26 +1717,10 @@ async def _prepare_resume(
         event_sequencer=sequencer,
     )
 
-    # 5. Record + notify injected messages and tool completions
-    #    Recorder is fail-closed (exceptions propagate).
-    #    Notifier is best-effort (swallowed via notify helpers).
-    from dendrux.loops._helpers import notify_message as _notify_msg
-    from dendrux.loops._helpers import notify_tool as _notify_tool
-
-    if tool_results is not None:
-        pending_by_id = {tc.id: tc for tc in pause_state.pending_tool_calls}
-        injected_start = len(pause_state.history)
-        for i, tr in enumerate(tool_results):
-            msg = history[injected_start + i]
-            tc = pending_by_id[tr.call_id]
-            await recorder.on_message_appended(msg, pause_state.iteration)
-            await recorder.on_tool_completed(tc, tr, pause_state.iteration)
-            await _notify_msg(extra_notifier, msg, pause_state.iteration)
-            await _notify_tool(extra_notifier, tc, tr, pause_state.iteration)
-    elif user_input is not None:
-        msg = history[-1]
-        await recorder.on_message_appended(msg, pause_state.iteration)
-        await _notify_msg(extra_notifier, msg, pause_state.iteration)
+    # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
+    # injected-history replay are intentionally NOT done here. The caller
+    # fires them inside its own try/except so a failure during replay still
+    # pairs with on_run_failed. See _replay_resume_injected_history below.
 
     return _ResumeContext(
         history=history,
@@ -1685,11 +1733,60 @@ async def _prepare_resume(
     )
 
 
+async def _replay_resume_injected_history(
+    ctx: _ResumeContext,
+    run_id: str,
+    *,
+    tool_results: list[ToolResult] | None,
+    user_input: str | None,
+) -> None:
+    """Replay tool-result / user-input messages onto recorder + notifier.
+
+    Split out of _prepare_resume so the caller can invoke it INSIDE its
+    own try block, after firing record_run_started. If a recorder write
+    fails here, the caller's except handler fires on_run_failed and the
+    lifecycle pair stays balanced.
+
+    Recorder calls are fail-closed (exceptions propagate); notifier calls
+    are best-effort (swallowed via notify helpers).
+    """
+    from dendrux.loops._helpers import notify_message as _notify_msg
+    from dendrux.loops._helpers import notify_tool as _notify_tool
+    from dendrux.loops._helpers import notify_tool_started as _notify_tool_started
+
+    pause_state = ctx.pause_state
+    history = ctx.history
+    recorder = ctx.recorder
+    extra_notifier = ctx.notifier
+
+    if tool_results is not None:
+        pending_by_id = {tc.id: tc for tc in pause_state.pending_tool_calls}
+        injected_start = len(pause_state.history)
+        for i, tr in enumerate(tool_results):
+            msg = history[injected_start + i]
+            tc = pending_by_id[tr.call_id]
+            # Fire tool_started so OTel can pair a span with on_tool_completed.
+            # The tool actually started when the loop dispatched it before pause;
+            # the start event is replayed here on resume because that's the only
+            # point at which an external observer receives the call_id.
+            await recorder.on_tool_started(run_id, tc, pause_state.iteration)
+            await _notify_tool_started(extra_notifier, run_id, tc, pause_state.iteration)
+            await recorder.on_message_appended(run_id, msg, pause_state.iteration)
+            await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
+            await _notify_msg(extra_notifier, run_id, msg, pause_state.iteration)
+            await _notify_tool(extra_notifier, run_id, tc, tr, pause_state.iteration)
+    elif user_input is not None:
+        msg = history[-1]
+        await recorder.on_message_appended(run_id, msg, pause_state.iteration)
+        await _notify_msg(extra_notifier, run_id, msg, pause_state.iteration)
+
+
 async def _execute_approved_tools(
     agent: Agent,
     pause_state: PauseState,
     recorder: LoopRecorder,
     notifier: LoopNotifier | None,
+    run_id: str,
     *,
     history: list[Message] | None = None,
     resolved_loop: Loop | None = None,
@@ -1714,8 +1811,8 @@ async def _execute_approved_tools(
 
     for tc in pause_state.pending_tool_calls:
         tr = await _execute_tool(tc, lookups)
-        await recorder.on_tool_completed(tc, tr, pause_state.iteration)
-        await _ntfy_tool(notifier, tc, tr, pause_state.iteration)
+        await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
+        await _ntfy_tool(notifier, run_id, tc, tr, pause_state.iteration)
         result_msg = Message(
             role=Role.TOOL,
             content=tr.payload,
@@ -1724,8 +1821,8 @@ async def _execute_approved_tools(
             meta={"is_error": True} if not tr.success else {},
         )
         target_history.append(result_msg)
-        await recorder.on_message_appended(result_msg, pause_state.iteration)
-        await _ntfy_msg(notifier, result_msg, pause_state.iteration)
+        await recorder.on_message_appended(run_id, result_msg, pause_state.iteration)
+        await _ntfy_msg(notifier, run_id, result_msg, pause_state.iteration)
         results.append((tc, tr))
 
     return results
@@ -1797,43 +1894,65 @@ async def _resume_core(
         if not claimed:
             await _raise_resume_claim_failure(state_store, run_id, expected_status)
 
-    # 4-8. Prepare history, notifier, sequencer (shared with resume_stream)
-    ctx = await _prepare_resume(
-        run_id,
-        pause_state,
-        state_store=state_store,
-        agent=agent,
-        provider=provider,
-        strategy=strategy,
-        loop=loop,
-        expected_status=expected_status,
-        tool_results=tool_results,
-        user_input=user_input,
-        extra_notifier=extra_notifier,
-    )
+    # 4-10. Everything that runs after on_run_started fires must live
+    #       inside the try block so on_run_failed can balance the lifecycle
+    #       pair on any failure (including injected-history replay errors).
+    ctx: _ResumeContext | None = None
+    ctx_token = None
 
-    # 9. Set delegation context — resumed run is the active parent for any
-    #    nested agent.run() calls spawned during this resume cycle.
-    #    Read max_delegation_depth from persisted metadata so the depth
-    #    guard survives pause/resume cycles.
-    run_record = await state_store.get_run(run_id)
-    resume_delegation_level = run_record.delegation_level if run_record else 0
-    resume_max_depth: int | None = None
-    if run_record and run_record.meta:
-        raw = run_record.meta.get("dendrux.max_delegation_depth")
-        if isinstance(raw, int):
-            resume_max_depth = raw
-    resume_ctx = DelegationContext(
-        run_id=run_id,
-        delegation_level=resume_delegation_level,
-        persisted=True,
-        store_identity=get_store_identity(state_store),
-        max_delegation_depth=resume_max_depth,
-    )
-    ctx_token = set_delegation_context(resume_ctx)
-
-    # 10. Re-enter loop (batch)
     try:
+        # 4-8. Prepare history, notifier, sequencer (shared with resume_stream).
+        #      Does NOT fire any lifecycle hooks — that's the caller's job.
+        ctx = await _prepare_resume(
+            run_id,
+            pause_state,
+            state_store=state_store,
+            agent=agent,
+            provider=provider,
+            strategy=strategy,
+            loop=loop,
+            expected_status=expected_status,
+            tool_results=tool_results,
+            user_input=user_input,
+            extra_notifier=extra_notifier,
+        )
+
+        # 8a. Fire run-level lifecycle hooks. AFTER this point, any failure
+        #     must pair with on_run_failed in the except handler.
+        await record_run_started(
+            ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
+        )
+        await notify_run_started(
+            ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
+        )
+
+        # 8b. Replay injected tool/user-input history. Inside the try so
+        #     a recorder failure here fires on_run_failed.
+        await _replay_resume_injected_history(
+            ctx, run_id, tool_results=tool_results, user_input=user_input
+        )
+
+        # 9. Set delegation context — resumed run is the active parent for any
+        #    nested agent.run() calls spawned during this resume cycle.
+        #    Read max_delegation_depth from persisted metadata so the depth
+        #    guard survives pause/resume cycles.
+        run_record = await state_store.get_run(run_id)
+        resume_delegation_level = run_record.delegation_level if run_record else 0
+        resume_max_depth: int | None = None
+        if run_record and run_record.meta:
+            raw = run_record.meta.get("dendrux.max_delegation_depth")
+            if isinstance(raw, int):
+                resume_max_depth = raw
+        resume_ctx = DelegationContext(
+            run_id=run_id,
+            delegation_level=resume_delegation_level,
+            persisted=True,
+            store_identity=get_store_identity(state_store),
+            max_delegation_depth=resume_max_depth,
+        )
+        ctx_token = set_delegation_context(resume_ctx)
+
+        # 10. Re-enter loop (batch)
         # Approval-approve: execute pending tools before loop re-entry.
         # Runs inside try/except so failures properly finalize as ERROR.
         _is_approval_approve = (
@@ -1854,6 +1973,7 @@ async def _resume_core(
                 pause_state,
                 ctx.recorder,
                 ctx.notifier,
+                run_id,
                 history=ctx.history,
                 resolved_loop=ctx.resolved_loop,
             )
@@ -1864,12 +1984,14 @@ async def _resume_core(
             }
             await _rec_gov(
                 ctx.recorder,
+                run_id,
                 "approval.decided",
                 pause_state.iteration,
                 _decided_data,
             )
             await _ntfy_gov(
                 ctx.notifier,
+                run_id,
                 "approval.decided",
                 pause_state.iteration,
                 _decided_data,
@@ -1891,12 +2013,14 @@ async def _resume_core(
             }
             await _rec_gov_r(
                 ctx.recorder,
+                run_id,
                 "approval.decided",
                 pause_state.iteration,
                 _rejected_data,
             )
             await _ntfy_gov_r(
                 ctx.notifier,
+                run_id,
                 "approval.decided",
                 pause_state.iteration,
                 _rejected_data,
@@ -1925,6 +2049,9 @@ async def _resume_core(
             sequencer=ctx.sequencer,
         )
 
+        await record_run_finished(ctx.recorder, run_id, result)
+        await notify_run_finished(ctx.notifier, run_id, result)
+
         return result
 
     except Exception as exc:
@@ -1940,13 +2067,30 @@ async def _resume_core(
         except Exception:
             logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
         if error_won:
+            # Use ctx.sequencer if available; otherwise fall back to a fresh
+            # sequencer so the run.error event still emits with sane numbering.
+            err_sequencer = ctx.sequencer if ctx is not None else EventSequencer()
             await _emit_event(
-                state_store, run_id, "run.error", ctx.sequencer, {"error": str(exc)[:500]}
+                state_store, run_id, "run.error", err_sequencer, {"error": str(exc)[:500]}
             )
+        # Fire on_run_failed only if _prepare_resume returned (ctx exists).
+        # If _prepare_resume itself raised, on_run_started never fired, so
+        # the lifecycle pair is balanced (both unfired).
+        if ctx is not None:
+            try:
+                await record_run_failed(ctx.recorder, run_id, exc)
+                await notify_run_failed(ctx.notifier, run_id, exc)
+            except Exception:
+                logger.warning(
+                    "Lifecycle hooks failed during resume error handler for run %s",
+                    run_id,
+                    exc_info=True,
+                )
         raise
 
     finally:
-        reset_delegation_context(ctx_token)
+        if ctx_token is not None:
+            reset_delegation_context(ctx_token)
 
 
 def resume_stream(
@@ -1973,7 +2117,7 @@ def resume_stream(
     from dendrux.types import RunEvent, RunResult
     from dendrux.types import RunStream as _RunStream
 
-    _shared: dict[str, Any] = {"state_store": state_store, "sequencer": None}
+    _shared: dict[str, Any] = {"state_store": state_store, "sequencer": None, "ctx": None}
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
@@ -2038,7 +2182,10 @@ def resume_stream(
             if not claimed:
                 await _raise_resume_claim_failure(store, run_id, expected)
 
-            # 5. Prepare (shared helper — history, notifier, sequencer)
+            # 5. Prepare (shared helper — history, notifier, sequencer).
+            #    Does NOT fire any lifecycle hooks; that's done below inside
+            #    the same try block so on_run_failed pairs with any failure
+            #    after on_run_started fires.
             ctx = await _prepare_resume(
                 run_id,
                 pause_state,
@@ -2051,6 +2198,22 @@ def resume_stream(
                 extra_notifier=extra_notifier,
             )
             _shared["sequencer"] = ctx.sequencer
+            _shared["ctx"] = ctx
+
+            # 5a. Fire run-level lifecycle hooks. After this point, any
+            #     failure must pair with on_run_failed in the except handler.
+            await record_run_started(
+                ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+            await notify_run_started(
+                ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+
+            # 5b. Replay injected tool/user-input history. Inside the try
+            #     so a recorder failure here fires on_run_failed.
+            await _replay_resume_injected_history(
+                ctx, run_id, tool_results=tool_results, user_input=user_input
+            )
 
             # 6. Set delegation context for the generator lifetime.
             #    Read max_delegation_depth from persisted metadata so the
@@ -2086,6 +2249,7 @@ def resume_stream(
                     pause_state,
                     ctx.recorder,
                     ctx.notifier,
+                    run_id,
                     history=ctx.history,
                     resolved_loop=ctx.resolved_loop,
                 ):
@@ -2108,12 +2272,14 @@ def resume_stream(
                 }
                 await _rec_gov_s(
                     ctx.recorder,
+                    run_id,
                     "approval.decided",
                     pause_state.iteration,
                     _decided_data_s,
                 )
                 await _ntfy_gov_s(
                     ctx.notifier,
+                    run_id,
                     "approval.decided",
                     pause_state.iteration,
                     _decided_data_s,
@@ -2133,12 +2299,14 @@ def resume_stream(
                 }
                 await _rec_gov_r(
                     ctx.recorder,
+                    run_id,
                     "approval.decided",
                     pause_state.iteration,
                     _rejected_data_s,
                 )
                 await _ntfy_gov_r(
                     ctx.notifier,
+                    run_id,
                     "approval.decided",
                     pause_state.iteration,
                     _rejected_data_s,
@@ -2178,6 +2346,8 @@ def resume_stream(
                         event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
                     else:
                         event = RunEvent(type=event.type, run_result=persisted)
+                    await record_run_finished(ctx.recorder, run_id, persisted)
+                    await notify_run_finished(ctx.notifier, run_id, persisted)
                     yield event
                 else:
                     yield event
@@ -2185,6 +2355,7 @@ def resume_stream(
         except Exception as exc:
             store = _shared.get("state_store")
             sequencer = _shared.get("sequencer")
+            err_ctx = _shared.get("ctx")
             if store is not None:
                 error_won = False
                 try:
@@ -2205,6 +2376,21 @@ def resume_stream(
                         sequencer,
                         {"error": str(exc)[:500]},
                     )
+            try:
+                if err_ctx is not None:
+                    await record_run_failed(err_ctx.recorder, run_id, exc)
+                    await notify_run_failed(err_ctx.notifier, run_id, exc)
+                else:
+                    # Setup failed before _prepare_resume built the recorder.
+                    # Fire the notifier-side hook so OTel can surface the error
+                    # even when no DB-side recorder exists.
+                    await notify_run_failed(extra_notifier, run_id, exc)
+            except Exception:
+                logger.warning(
+                    "Lifecycle hooks failed during resume_stream error handler for run %s",
+                    run_id,
+                    exc_info=True,
+                )
 
             yield RunEvent(
                 type=RunEventType.RUN_ERROR,

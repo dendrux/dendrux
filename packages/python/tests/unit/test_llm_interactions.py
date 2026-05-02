@@ -89,7 +89,7 @@ class TestRecorderLLMInteraction:
             text="hello",
             usage=UsageStats(input_tokens=100, output_tokens=50, total_tokens=150),
         )
-        await obs.on_llm_call_completed(response, iteration=1)
+        await obs.on_llm_call_completed("r1", response, iteration=1)
 
         assert len(store.usages) == 1, "legacy token_usage should still be written"
         assert len(store.llm_interactions) == 1, "llm_interactions should be written"
@@ -102,7 +102,7 @@ class TestRecorderLLMInteraction:
             text="hi",
             usage=UsageStats(input_tokens=100, output_tokens=50, total_tokens=150, cost_usd=0.01),
         )
-        await obs.on_llm_call_completed(response, iteration=2)
+        await obs.on_llm_call_completed("r1", response, iteration=2)
 
         rec = store.llm_interactions[0]
         assert rec["model"] == "claude-sonnet"
@@ -131,7 +131,7 @@ class TestRecorderLLMInteraction:
         response = LLMResponse(text="4", usage=UsageStats())
 
         await obs.on_llm_call_completed(
-            response, iteration=1, semantic_messages=messages, semantic_tools=tools
+            "r1", response, iteration=1, semantic_messages=messages, semantic_tools=tools
         )
 
         rec = store.llm_interactions[0]
@@ -165,7 +165,7 @@ class TestRecorderLLMInteraction:
             tool_calls=[tc],
             usage=UsageStats(input_tokens=50, output_tokens=20, total_tokens=70, cost_usd=0.001),
         )
-        await obs.on_llm_call_completed(response, iteration=1)
+        await obs.on_llm_call_completed("r1", response, iteration=1)
 
         rec = store.llm_interactions[0]
         sr = rec["semantic_response"]
@@ -192,7 +192,7 @@ class TestRecorderLLMInteraction:
             provider_request={"model": "claude-sonnet-4-6", "messages": [{"role": "user"}]},
             provider_response={"id": "msg_abc", "type": "message"},
         )
-        await obs.on_llm_call_completed(response, iteration=1)
+        await obs.on_llm_call_completed("r1", response, iteration=1)
 
         rec = store.llm_interactions[0]
         assert rec["provider_request"]["model"] == "claude-sonnet-4-6"
@@ -204,7 +204,7 @@ class TestRecorderLLMInteraction:
         obs = PersistenceRecorder(store, "run_1")
 
         response = LLMResponse(text="hi", usage=UsageStats())
-        await obs.on_llm_call_completed(response, iteration=1, duration_ms=1420)
+        await obs.on_llm_call_completed("r1", response, iteration=1, duration_ms=1420)
 
         rec = store.llm_interactions[0]
         assert rec["duration_ms"] == 1420
@@ -215,7 +215,7 @@ class TestRecorderLLMInteraction:
         obs = PersistenceRecorder(store, "run_1")
 
         response = LLMResponse(text="hi", usage=UsageStats())
-        await obs.on_llm_call_completed(response, iteration=1)
+        await obs.on_llm_call_completed("r1", response, iteration=1)
 
         rec = store.llm_interactions[0]
         assert rec["semantic_request"] is None
@@ -233,7 +233,7 @@ class TestRecorderLLMInteraction:
         obs = PersistenceRecorder(store, "run_1")
 
         response = LLMResponse(text="hi", usage=UsageStats())
-        await obs.on_llm_call_completed(response, iteration=1)
+        await obs.on_llm_call_completed("r1", response, iteration=1)
 
         assert len(store.usages) == 1, "legacy write should proceed despite interaction failure"
         assert len(store.llm_interactions) == 0

@@ -8,6 +8,7 @@ from dendrux.agent import Agent
 from dendrux.guardrails import PII, GuardrailEngine, Pattern, PromptInjection, SecretDetection
 from dendrux.guardrails._engine import deanonymize_text
 from dendrux.llm.mock import MockLLM
+from dendrux.loops.base import BaseNotifier, BaseRecorder
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
 from dendrux.strategies.native import NativeToolCalling
@@ -971,17 +972,19 @@ class TestGuardrailReAct:
 
         events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 events.append({"event_type": event_type, "data": data})
 
         await ReActLoop().run(
@@ -1059,16 +1062,16 @@ class TestNotifierGuardrailFindingsSymmetry:
 
     async def test_singlecall_notifier_receives_guardrail_findings(self) -> None:
         """SingleCall: incoming PII findings reach the notifier on the LLM event."""
-        from dendrux.loops.base import LoopNotifier
 
         captured: dict[str, dict] = {}
 
-        class CapturingNotifier(LoopNotifier):
-            async def on_message_appended(self, message, iteration):
+        class CapturingNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
             async def on_llm_call_completed(
                 self,
+                run_id,
                 response,
                 iteration,
                 *,
@@ -1079,10 +1082,12 @@ class TestNotifierGuardrailFindingsSymmetry:
             ):
                 captured["findings"] = guardrail_findings
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 pass
 
         llm = MockLLM([_response("Classified.")])
@@ -1114,16 +1119,16 @@ class TestNotifierGuardrailFindingsSymmetry:
 
     async def test_react_notifier_receives_guardrail_findings(self) -> None:
         """ReAct: same symmetry across the iterative loop."""
-        from dendrux.loops.base import LoopNotifier
 
         captured_findings: list[dict | None] = []
 
-        class CapturingNotifier(LoopNotifier):
-            async def on_message_appended(self, message, iteration):
+        class CapturingNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
             async def on_llm_call_completed(
                 self,
+                run_id,
                 response,
                 iteration,
                 *,
@@ -1134,10 +1139,12 @@ class TestNotifierGuardrailFindingsSymmetry:
             ):
                 captured_findings.append(guardrail_findings)
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 pass
 
         llm = MockLLM([_response("done")])
@@ -1431,17 +1438,19 @@ class TestPromptInjectionToolResultBoundary:
 
         events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 events.append({"event_type": event_type, "data": data})
 
         await ReActLoop().run(
@@ -1488,17 +1497,19 @@ class TestDBStoresRaw:
 
         trace_records: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 trace_records.append({"role": message.role.value, "content": message.content})
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 pass
 
         await ReActLoop().run(
@@ -1529,17 +1540,19 @@ class TestDBStoresRaw:
 
         tool_records: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 tool_records.append({"params": dict(tool_call.params or {})})
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 pass
 
         await ReActLoop().run(
@@ -1569,17 +1582,19 @@ class TestDBStoresRaw:
 
         tool_results: list[str] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 tool_results.append(tool_result.payload)
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 pass
 
         await ReActLoop().run(
@@ -1678,17 +1693,19 @@ class TestMultiTurnGuardrail:
 
         events: list[dict] = []
 
-        class SpyRecorder:
-            async def on_message_appended(self, message, iteration):
+        class SpyRecorder(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kw):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
-            async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
                 events.append({"event_type": event_type, "data": data})
 
         await ReActLoop().run(

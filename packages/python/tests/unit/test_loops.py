@@ -10,7 +10,7 @@ import pytest
 
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
-from dendrux.loops.base import Loop
+from dendrux.loops.base import BaseNotifier, Loop
 from dendrux.loops.react import ReActLoop
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.tool import get_tool_def, tool
@@ -737,18 +737,21 @@ class TestReActLoopCostAccumulation:
 class TestReActLoopFinalMessagePersistence:
     async def test_finish_notifies_notifier_with_assistant_message(self) -> None:
         """F-01: The final assistant message must be notified to the notifier on Finish."""
-        from dendrux.loops.base import LoopNotifier
 
         recorded_messages: list[Message] = []
 
-        class RecordingNotifier(LoopNotifier):
-            async def on_message_appended(self, message: Message, iteration: int) -> None:
+        class RecordingNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message: Message, iteration: int) -> None:
                 recorded_messages.append(message)
 
-            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
+            async def on_llm_call_completed(
+                self, run_id, response, iteration: int, **kwargs
+            ) -> None:
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
+            async def on_tool_completed(
+                self, run_id, tool_call, tool_result, iteration: int
+            ) -> None:
                 pass
 
         llm = MockLLM([LLMResponse(text="The answer is 42")])
@@ -771,19 +774,22 @@ class TestReActLoopFinalMessagePersistence:
 
     async def test_clarification_notifies_notifier_with_assistant_message(self) -> None:
         """F-03: The assistant message must be notified on Clarification too."""
-        from dendrux.loops.base import LoopNotifier
         from dendrux.strategies.base import Strategy
 
         recorded_messages: list[Message] = []
 
-        class RecordingNotifier(LoopNotifier):
-            async def on_message_appended(self, message: Message, iteration: int) -> None:
+        class RecordingNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message: Message, iteration: int) -> None:
                 recorded_messages.append(message)
 
-            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
+            async def on_llm_call_completed(
+                self, run_id, response, iteration: int, **kwargs
+            ) -> None:
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
+            async def on_tool_completed(
+                self, run_id, tool_call, tool_result, iteration: int
+            ) -> None:
                 pass
 
         class ClarifyStrategy(Strategy):
@@ -820,18 +826,21 @@ class TestReActLoopFinalMessagePersistence:
 
     async def test_tool_call_then_finish_persists_all_messages(self) -> None:
         """Complete flow: tool call + finish should persist all messages including final."""
-        from dendrux.loops.base import LoopNotifier
 
         recorded_messages: list[Message] = []
 
-        class RecordingNotifier(LoopNotifier):
-            async def on_message_appended(self, message: Message, iteration: int) -> None:
+        class RecordingNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message: Message, iteration: int) -> None:
                 recorded_messages.append(message)
 
-            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
+            async def on_llm_call_completed(
+                self, run_id, response, iteration: int, **kwargs
+            ) -> None:
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
+            async def on_tool_completed(
+                self, run_id, tool_call, tool_result, iteration: int
+            ) -> None:
                 pass
 
         tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t1")
@@ -866,16 +875,19 @@ class TestReActLoopFinalMessagePersistence:
 class TestReActLoopNotifierWarnings:
     async def test_notifier_failure_surfaces_in_meta(self) -> None:
         """F-04: Notifier exceptions should be captured in RunResult.meta, not silently lost."""
-        from dendrux.loops.base import LoopNotifier
 
-        class FailingNotifier(LoopNotifier):
-            async def on_message_appended(self, message: Message, iteration: int) -> None:
+        class FailingNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message: Message, iteration: int) -> None:
                 raise RuntimeError("DB connection lost")
 
-            async def on_llm_call_completed(self, response, iteration: int, **kwargs) -> None:
+            async def on_llm_call_completed(
+                self, run_id, response, iteration: int, **kwargs
+            ) -> None:
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration: int) -> None:
+            async def on_tool_completed(
+                self, run_id, tool_call, tool_result, iteration: int
+            ) -> None:
                 pass
 
         llm = MockLLM([LLMResponse(text="done")])
@@ -898,16 +910,15 @@ class TestReActLoopNotifierWarnings:
 
     async def test_no_warnings_when_notifier_healthy(self) -> None:
         """No notifier_warnings key when everything works fine."""
-        from dendrux.loops.base import LoopNotifier
 
-        class HealthyNotifier(LoopNotifier):
-            async def on_message_appended(self, message, iteration):
+        class HealthyNotifier(BaseNotifier):
+            async def on_message_appended(self, run_id, message, iteration):
                 pass
 
-            async def on_llm_call_completed(self, response, iteration, **kwargs):
+            async def on_llm_call_completed(self, run_id, response, iteration, **kwargs):
                 pass
 
-            async def on_tool_completed(self, tool_call, tool_result, iteration):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
                 pass
 
         llm = MockLLM([LLMResponse(text="ok")])

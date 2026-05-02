@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from dendrux.agent import Agent
+from dendrux.loops.base import BaseNotifier, BaseRecorder
 from dendrux.tool import tool
 from dendrux.types import GovernanceEventType
 
@@ -36,7 +37,7 @@ def dummy_tool(x: int) -> int:
     return x
 
 
-class RecordingRecorder:
+class RecordingRecorder(BaseRecorder):
     """Minimal recorder that captures governance events."""
 
     def __init__(self) -> None:
@@ -44,6 +45,7 @@ class RecordingRecorder:
 
     async def on_governance_event(
         self,
+        run_id,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
@@ -62,7 +64,7 @@ class RecordingRecorder:
         pass
 
 
-class RecordingNotifier:
+class RecordingNotifier(BaseNotifier):
     """Minimal notifier that captures governance events."""
 
     def __init__(self) -> None:
@@ -70,6 +72,7 @@ class RecordingNotifier:
 
     async def on_governance_event(
         self,
+        run_id,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
@@ -146,7 +149,7 @@ class TestEmitInitEvents:
 
         recorder = RecordingRecorder()
         notifier = RecordingNotifier()
-        await _emit_init_events(agent, recorder, notifier)
+        await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
         loaded = [
             (et, it, d)
@@ -178,7 +181,7 @@ class TestEmitInitEvents:
 
         recorder = RecordingRecorder()
         notifier = RecordingNotifier()
-        await _emit_init_events(agent, recorder, notifier)
+        await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
         denied = [
             (et, it, d)
@@ -205,7 +208,7 @@ class TestEmitInitEvents:
 
         recorder = RecordingRecorder()
         notifier = RecordingNotifier()
-        await _emit_init_events(agent, recorder, notifier)
+        await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
         assert len(notifier.governance_events) == 1
         assert notifier.governance_events[0][0] == GovernanceEventType.SKILL_REGISTERED
@@ -219,7 +222,7 @@ class TestEmitInitEvents:
 
         recorder = RecordingRecorder()
         notifier = RecordingNotifier()
-        await _emit_init_events(agent, recorder, notifier)
+        await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
         assert len(recorder.governance_events) == 0
 
@@ -237,7 +240,7 @@ class TestEmitInitEvents:
         agent._ensure_skills_loaded()
 
         notifier = RecordingNotifier()
-        await _emit_init_events(agent, None, notifier)
+        await _emit_init_events(agent, None, notifier, "test-run-id")
 
         # Notifier still gets events even without persistence
         assert len(notifier.governance_events) == 1
@@ -256,7 +259,7 @@ class TestEmitInitEvents:
         agent._ensure_skills_loaded()
 
         recorder = RecordingRecorder()
-        await _emit_init_events(agent, recorder, None)
+        await _emit_init_events(agent, recorder, None, "test-run-id")
 
         assert len(recorder.governance_events) == 1
 
@@ -303,7 +306,7 @@ class TestEmitInitEvents:
         with patch.object(agent, "get_tool_lookups", new_callable=AsyncMock):
             recorder = RecordingRecorder()
             notifier = RecordingNotifier()
-            await _emit_init_events(agent, recorder, notifier)
+            await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
         mcp_events = [
             (et, d)
@@ -350,7 +353,7 @@ class TestEmitInitEvents:
 
         with patch.object(agent, "get_tool_lookups", new_callable=AsyncMock):
             recorder = RecordingRecorder()
-            await _emit_init_events(agent, recorder, None)
+            await _emit_init_events(agent, recorder, None, "test-run-id")
 
         mcp_events = [
             d
@@ -371,7 +374,7 @@ class TestEmitInitEvents:
         agent._ensure_skills_loaded()
 
         with patch.object(agent, "get_tool_lookups", new_callable=AsyncMock) as mock:
-            await _emit_init_events(agent, RecordingRecorder(), RecordingNotifier())
+            await _emit_init_events(agent, RecordingRecorder(), RecordingNotifier(), "test-run-id")
             mock.assert_not_called()
 
     async def test_mcp_discovery_failure_raises_wrapped(self) -> None:
@@ -391,7 +394,7 @@ class TestEmitInitEvents:
             ),
             pytest.raises(_MCPDiscoveryError, match="Connection refused") as exc_info,
         ):
-            await _emit_init_events(agent, RecordingRecorder(), RecordingNotifier())
+            await _emit_init_events(agent, RecordingRecorder(), RecordingNotifier(), "test-run-id")
 
         # Original cause is preserved
         assert isinstance(exc_info.value.__cause__, ConnectionError)
@@ -417,11 +420,11 @@ class TestEmitInitEvents:
         )
 
         with pytest.raises(RuntimeError, match="DB write failed"):
-            await _emit_init_events(agent, bad_recorder, None)
+            await _emit_init_events(agent, bad_recorder, None, "test-run-id")
 
         # Should NOT be wrapped in _MCPDiscoveryError — it's a skill emission failure
         try:
-            await _emit_init_events(agent, bad_recorder, None)
+            await _emit_init_events(agent, bad_recorder, None, "test-run-id")
         except _MCPDiscoveryError:
             pytest.fail("Skill emission failure was misclassified as _MCPDiscoveryError")
         except RuntimeError:
@@ -446,7 +449,7 @@ class TestEmitInitEvents:
         agent._ensure_skills_loaded()
 
         recorder = RecordingRecorder()
-        await _emit_init_events(agent, recorder, None)
+        await _emit_init_events(agent, recorder, None, "test-run-id")
 
         for _, iteration, _, _ in recorder.governance_events:
             assert iteration == 0
@@ -487,6 +490,7 @@ class TestConsoleNotifierInitEvents:
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
+            "r1",
             GovernanceEventType.SKILL_REGISTERED,
             0,
             {"skill_name": "pdf-processing", "description": "Extract text from PDFs"},
@@ -499,6 +503,7 @@ class TestConsoleNotifierInitEvents:
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
+            "r1",
             GovernanceEventType.SKILL_DENIED,
             0,
             {"skill_name": "organize-notes", "reason": "denied_by_policy"},
@@ -511,6 +516,7 @@ class TestConsoleNotifierInitEvents:
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
+            "r1",
             GovernanceEventType.MCP_CONNECTED,
             0,
             {
@@ -528,6 +534,7 @@ class TestConsoleNotifierInitEvents:
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
+            "r1",
             GovernanceEventType.SKILL_INVOKED,
             1,
             {"skill_name": "pdf-processing"},
@@ -541,6 +548,7 @@ class TestConsoleNotifierInitEvents:
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
+            "r1",
             GovernanceEventType.MCP_ERROR,
             0,
             {"error": "Connection refused"},

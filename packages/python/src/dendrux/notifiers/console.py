@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from dendrux.loops.base import LoopNotifier
+from dendrux.loops.base import BaseNotifier
 from dendrux.types import GovernanceEventType as _GovType
 from dendrux.types import Message, Role, ToolCall, ToolResult
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 _console = Console()
 
 
-class ConsoleNotifier(LoopNotifier):
+class ConsoleNotifier(BaseNotifier):
     """Rich terminal notifier for agent runs.
 
     Args:
@@ -57,7 +57,7 @@ class ConsoleNotifier(LoopNotifier):
         self._total_cache_creation = 0
         self._run_start = 0.0
 
-    async def on_message_appended(self, message: Message, iteration: int) -> None:
+    async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         """Called when a message is appended to history."""
         if iteration != self._iteration:
             self._iteration = iteration
@@ -88,6 +88,7 @@ class ConsoleNotifier(LoopNotifier):
 
     async def on_llm_call_completed(
         self,
+        run_id: str,
         response: LLMResponse,
         iteration: int,
         *,
@@ -121,7 +122,11 @@ class ConsoleNotifier(LoopNotifier):
         )
 
     async def on_tool_completed(
-        self, tool_call: ToolCall, tool_result: ToolResult, iteration: int
+        self,
+        run_id: str,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+        iteration: int,
     ) -> None:
         """Called after a tool execution completes."""
         elapsed = 0.0
@@ -152,9 +157,11 @@ class ConsoleNotifier(LoopNotifier):
 
     async def on_governance_event(
         self,
+        run_id: str,
         event_type: str,
         iteration: int,
         data: dict[str, Any],
+        *,
         correlation_id: str | None = None,
     ) -> None:
         """Called when a governance action fires."""
