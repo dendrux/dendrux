@@ -1,13 +1,13 @@
 ---
-title: OpenTelemetry — V1 integration
+title: OpenTelemetry V1 integration
 description: Emit GenAI-semconv spans for Dendrux runs onto your existing OpenTelemetry tracer. Optional, fail-open, no exporter ownership.
 ---
 
-# OpenTelemetry — V1 integration
+# OpenTelemetry V1 integration
 
-Dendrux ships an `OpenTelemetryNotifier` that emits a small, GenAI-semconv span tree (`invoke_agent` → `chat` → `execute_tool`) onto the host application's existing OTel `TracerProvider`. The host's spans, the host's exporter, the host's backend — Dendrux is just a guest in your observability stack.
+Dendrux ships an `OpenTelemetryNotifier` that emits a small, GenAI-semconv span tree (`invoke_agent` → `chat` → `execute_tool`) onto the host application's existing OTel `TracerProvider`. The host's spans, the host's exporter, the host's backend. Dendrux just plugs into whatever's already wired up.
 
-This is a **V1 integration**. It covers the most common case (spans on lifecycle hooks) cleanly and safely. Cross-process trace continuity, native metrics, and log signals are deliberately deferred — see [What V1 deliberately leaves out](#what-v1-deliberately-leaves-out) at the end.
+This is a **V1 integration**. It covers the most common case (spans on lifecycle hooks) cleanly and safely. Cross-process trace continuity, native metrics, and log signals are out of scope for now (see [What V1 leaves out](#what-v1-leaves-out) at the end).
 
 ## Status
 
@@ -84,7 +84,7 @@ Three span types cover the surface:
 | `chat <model>`         | One LLM call               | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`   |
 | `execute_tool <tool>`  | One tool execution         | `dendrux.tool.name`, `dendrux.tool.call_id`, `dendrux.tool.success`                 |
 
-A run that pauses (waiting for a client tool, human input, or approval) closes its `invoke_agent` span with `dendrux.run.status=waiting_*`. The matching resume call opens a fresh `invoke_agent` span — pause/resume is two spans on the OTel side, in the same trace if your wrapper propagates context, in different traces if not.
+A run that pauses (waiting for a client tool, human input, or approval) closes its `invoke_agent` span with `dendrux.run.status=waiting_*`. The matching resume call opens a fresh `invoke_agent` span. Pause/resume is two spans on the OTel side: same trace if your wrapper propagates context, different traces if not.
 
 ## Governance events
 
@@ -116,7 +116,7 @@ OpenTelemetryNotifier(
 )
 ```
 
-Both **bypass** Dendrux's PII guardrail redaction — only flip them in trusted environments. Capturing prompt content (not just completion) is deferred until V2; serializing multimodal/tool-call content needs a more careful design.
+Both **bypass** Dendrux's PII guardrail redaction. Only flip them in trusted environments. Capturing prompt content (not just completion) is deferred until V2; serializing multimodal/tool-call content needs a more careful design.
 
 ## Concurrent runs
 
@@ -144,17 +144,17 @@ orphan-closed spans are ERROR                    0  ✓
 
 Re-run this after any change to the notifier, the runtime lifecycle, or your loop implementation. If the invariants table flips red, OTel output regressed.
 
-## What V1 deliberately leaves out
+## What V1 leaves out
 
-This integration ships the most useful 80% in a small surface. The remaining items are **deferred, not forgotten** — they will be reconsidered when real-world usage surfaces a need.
+This integration ships a small surface that covers the most common need. The remaining items are **deferred, not forgotten**. They will be reconsidered when real usage surfaces a need.
 
-- **Cross-process trace continuity across pause/resume.** Today, a run that pauses (waiting for a human) and resumes via a separate HTTP request becomes two separate `invoke_agent` spans, each correctly stitched into its own request trace, but not into one logical multi-hour trace. Stitching across the pause boundary requires persisting `traceparent` in `RunStore` and rehydrating it on resume — a runtime-level change, not a notifier-level one.
-- **Native metrics signal.** OTel metrics for token usage, tool call counts, run duration, etc. are not emitted natively. Most backends derive these from spans for free. We may add native counters / histograms later for cardinality control.
+- **Cross-process trace continuity across pause/resume.** Today, a run that pauses (waiting for a human) and resumes via a separate HTTP request becomes two separate `invoke_agent` spans, each correctly stitched into its own request trace, but not into one logical multi-hour trace. Stitching across the pause boundary requires persisting `traceparent` in `RunStore` and rehydrating it on resume. That's a runtime-level change, not a notifier-level one.
+- **Native metrics signal.** OTel metrics for token usage, tool call counts, run duration, etc. are not emitted natively. Most backends derive these from spans for free. Native counters / histograms may land later for cardinality control.
 - **Native log signal.** `LoopRecorder` is Dendrux's audit source of truth. Routing the same events out as OTel logs is possible but creates two sources of truth; if you want log/trace correlation, the recommended path today is a downstream exporter that reads sanitized recorder events.
 - **Prompt capture.** `include_messages=True` only captures completion text in V1. Capturing prompts requires JSON-serializing multimodal and tool-call content correctly, with size guards.
-- **`auto_instrument()` helper.** No magical one-call hook installs the notifier globally. Pass it explicitly per `agent.run()` call. We may add a helper if usage demands.
+- **`auto_instrument()` helper.** There is no one-call hook that installs the notifier globally. Pass it explicitly per `agent.run()` call. A helper may follow if usage demands.
 
-In short, this V1 is **the minimum correct shape** of "Dendrux speaks OTel." More robust approaches (durable trace stitching, full GenAI metrics, log correlation, exporter-side fanout) are on the roadmap but will land only when the V1 surface has been exercised against real workloads. The notifier rail is intentionally narrow so it can evolve without breaking.
+V1 is the minimum correct shape of "Dendrux speaks OTel." More involved approaches (durable trace stitching, full GenAI metrics, log correlation, exporter-side fanout) are on the roadmap and will land once the V1 surface has been exercised against real workloads. The notifier rail is kept narrow on purpose so it can grow without breaking.
 
 ## Related
 
