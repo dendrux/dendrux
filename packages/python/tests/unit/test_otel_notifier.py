@@ -47,7 +47,16 @@ async def boom(_: str = "") -> str:
 
 @pytest.fixture(scope="session")
 def _provider_and_exporter() -> tuple[TracerProvider, InMemorySpanExporter]:
-    """Process-global TracerProvider — OTel disallows override after first set."""
+    """Process-global TracerProvider — OTel disallows override after first set.
+
+    Caveat: ``set_tracer_provider`` is one-shot per process. Once this
+    session fixture installs its provider, any other test file in the
+    same pytest run that also calls ``set_tracer_provider`` will be
+    silently ignored (just a stderr warning). If a future test file
+    needs its own provider, factor this fixture out to a shared
+    ``conftest.py`` so both files use the same instance and the
+    InMemorySpanExporter remains the source of truth.
+    """
     provider = TracerProvider()
     exp = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exp))
@@ -327,15 +336,22 @@ class TestConcurrentRuns:
 
         invoke = _spans_by_name(exporter, "invoke_agent")
         assert len(invoke) == 2
+        # Each agent gets its own invoke span, distinct trace IDs.
         names = {_attr(s, "gen_ai.agent.name") for s in invoke}
         assert names == {"A", "B"}
-        # Each chat span's parent must be its own invoke span.
+        invoke_by_name = {_attr(s, "gen_ai.agent.name"): s for s in invoke}
+        assert invoke_by_name["A"].context.trace_id != invoke_by_name["B"].context.trace_id
+
+        # Each chat span's model matches the LLM of the agent that owns its parent.
         chats = _spans_by_name(exporter, "chat")
         assert len(chats) == 2
         invoke_by_id = {s.context.span_id: s for s in invoke}
         for c in chats:
             parent = invoke_by_id[c.parent.span_id]
-            assert _attr(c, "gen_ai.request.model") == _attr(parent, "gen_ai.request.model")
+            parent_name = _attr(parent, "gen_ai.agent.name")
+            expected_model = "model-a" if parent_name == "A" else "model-b"
+            assert _attr(c, "gen_ai.request.model") == expected_model
+            assert c.context.trace_id == parent.context.trace_id
 
 
 # ------------------------------------------------------------------
@@ -425,3 +441,260 @@ class TestImportGuard:
                 OpenTelemetryNotifier()
         finally:
             otel_mod._OTEL_AVAILABLE = original
+
+
+# ------------------------------------------------------------------
+# Fail-open: failures in non-entry-point hooks
+# ------------------------------------------------------------------
+
+
+class _BrokenSpan:
+    """Span that raises on every mutation — exercises the in-hook try/except guards.
+
+    The entry-point hook (start_span) succeeds via a real tracer; the
+    failure happens later when the notifier tries to set attributes,
+    set status, or end the span. This proves fail-open holds across
+    the full hook surface, not just the start path covered by
+    TestFailOpen.
+    """
+
+    def __init__(self) -> None:
+        self.ended = False
+
+    def set_attribute(self, *a: Any, **kw: Any) -> None:
+        raise RuntimeError("set_attribute exploded")
+
+    def set_status(self, *a: Any, **kw: Any) -> None:
+        raise RuntimeError("set_status exploded")
+
+    def record_exception(self, *a: Any, **kw: Any) -> None:
+        raise RuntimeError("record_exception exploded")
+
+    def add_event(self, *a: Any, **kw: Any) -> None:
+        raise RuntimeError("add_event exploded")
+
+    def end(self, *a: Any, **kw: Any) -> None:
+        self.ended = True
+
+
+class _BrokenSpanTracer:
+    """Tracer that returns broken spans — start_span succeeds, mutations don't."""
+
+    def __init__(self) -> None:
+        self.spans: list[_BrokenSpan] = []
+
+    def start_span(self, *a: Any, **kw: Any) -> _BrokenSpan:
+        s = _BrokenSpan()
+        self.spans.append(s)
+        return s
+
+
+class TestFailOpenNonEntryPoint:
+    async def test_run_completes_when_span_mutations_raise(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        tracer = _BrokenSpanTracer()
+        notifier = OpenTelemetryNotifier(tracer=tracer)
+        tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t1")
+        llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="3")])
+        agent = Agent(prompt="Test.", tools=[add])
+
+        result = await run(agent, provider=llm, user_input="1+2?", extra_notifier=notifier)
+
+        assert result.status == RunStatus.SUCCESS
+        # All started spans got at least one mutation attempt — the guards
+        # caught the exceptions and we still got the run done.
+        assert len(tracer.spans) >= 1
+
+
+# ------------------------------------------------------------------
+# Simulated pause/resume — driving notifier hooks directly
+# ------------------------------------------------------------------
+
+
+class TestPauseResumeLifecycle:
+    """Pause/resume goes through two on_run_started → on_run_finished cycles.
+
+    The runner-level pause/resume integration is covered by the lifecycle-hook
+    test suite (PRs #5, #6). Here we just verify the OTel notifier produces
+    two clean invoke_agent spans — one per cycle — with no leaks.
+    """
+
+    async def test_two_cycles_yield_two_clean_invoke_agent_spans(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        from dendrux.types import RunResult
+
+        notifier = OpenTelemetryNotifier()
+
+        # Cycle 1: pause as waiting_client_tool.
+        await notifier.on_run_started("run-pr", agent_name="alice", agent_model="m1")
+        paused = RunResult(run_id="run-pr", status=RunStatus.WAITING_CLIENT_TOOL)
+        await notifier.on_run_finished("run-pr", paused)
+
+        # Cycle 2: resume to terminal SUCCESS.
+        await notifier.on_run_started("run-pr", agent_name="alice", agent_model="m1")
+        done = RunResult(run_id="run-pr", status=RunStatus.SUCCESS, answer="x")
+        await notifier.on_run_finished("run-pr", done)
+
+        invoke = _spans_by_name(exporter, "invoke_agent")
+        assert len(invoke) == 2
+        statuses = [_attr(s, "dendrux.run.status") for s in invoke]
+        assert statuses == [RunStatus.WAITING_CLIENT_TOOL.value, RunStatus.SUCCESS.value]
+        # No leaked state in the notifier's internal dicts.
+        assert notifier._run_spans == {}
+        assert notifier._run_models == {}
+
+
+# ------------------------------------------------------------------
+# Governance: non-scalar data preservation
+# ------------------------------------------------------------------
+
+
+class TestGovernanceNonScalarData:
+    async def test_dict_value_is_json_stringified_not_dropped(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        from dendrux.types import RunResult
+
+        notifier = OpenTelemetryNotifier()
+        await notifier.on_run_started("run-gov", agent_name="alice", agent_model="m")
+        await notifier.on_governance_event(
+            "run-gov",
+            "guardrail.detected",
+            iteration=0,
+            data={"scalar_str": "hi", "scalar_int": 7, "complex": {"nested": [1, 2, 3]}},
+            correlation_id="corr-1",
+        )
+        await notifier.on_run_finished(
+            "run-gov",
+            RunResult(run_id="run-gov", status=RunStatus.SUCCESS, answer="x"),
+        )
+
+        invoke = _spans_by_name(exporter, "invoke_agent")[0]
+        gov_events = [e for e in invoke.events if e.name == "governance.guardrail.detected"]
+        assert len(gov_events) == 1
+        attrs = dict(gov_events[0].attributes)
+        assert attrs["dendrux.governance.scalar_str"] == "hi"
+        assert attrs["dendrux.governance.scalar_int"] == 7
+        # Non-scalar value survives as JSON rather than being silently dropped.
+        assert attrs["dendrux.governance.complex"] == '{"nested": [1, 2, 3]}'
+        assert attrs["dendrux.correlation_id"] == "corr-1"
+
+
+# ------------------------------------------------------------------
+# Orphan child spans closed on run terminal — stream-cancellation safety
+# ------------------------------------------------------------------
+
+
+class TestOrphanChildClosure:
+    """Stream cancellation (GeneratorExit / asyncio.CancelledError) bypasses
+    the loop's ``except Exception`` paths, so on_llm_call_completed/failed
+    may not fire for the in-flight LLM call. The notifier's terminal hooks
+    must sweep these or the chat/tool spans leak forever in observability
+    backends.
+
+    The runner-level guarantee that on_run_finished fires on abandoned
+    streams is covered by ``tests/integration/test_lifecycle_hooks_resume.py``
+    (PR #5 cleanup tests). Here we test the OTel layer in isolation:
+    given a terminal hook fires with children still open, they get closed.
+    """
+
+    async def test_orphan_chat_span_closed_when_run_terminates_as_cancelled(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        from dendrux.types import RunResult
+
+        notifier = OpenTelemetryNotifier()
+        await notifier.on_run_started("run-stream", agent_name="alice", agent_model="m1")
+        # LLM call started, but stream gets abandoned — completed/failed never fire.
+        await notifier.on_llm_call_started("run-stream", iteration=0)
+        # Runner-level cleanup detects abandonment and finalizes the run.
+        await notifier.on_run_finished(
+            "run-stream", RunResult(run_id="run-stream", status=RunStatus.CANCELLED)
+        )
+
+        chat = _spans_by_name(exporter, "chat")
+        assert len(chat) == 1
+        assert chat[0].status.status_code == StatusCode.ERROR
+        assert _attr(chat[0], "dendrux.span.orphan_close_reason") is not None
+        assert "cancelled" in _attr(chat[0], "dendrux.span.orphan_close_reason")
+        # Notifier internal state cleared — no leaks.
+        assert notifier._llm_spans == {}
+        assert notifier._run_spans == {}
+
+    async def test_orphan_tool_span_closed_when_run_fails(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        notifier = OpenTelemetryNotifier()
+        tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t1")
+
+        await notifier.on_run_started("run-fail", agent_name="alice", agent_model="m1")
+        await notifier.on_tool_started("run-fail", tc, iteration=0)
+        # Some downstream exception kills the run before tool_completed fires.
+        await notifier.on_run_failed("run-fail", RuntimeError("boom"), iteration=0)
+
+        tool_spans = _spans_by_name(exporter, "execute_tool")
+        assert len(tool_spans) == 1
+        assert tool_spans[0].status.status_code == StatusCode.ERROR
+        assert _attr(tool_spans[0], "dendrux.tool.success") is False
+        assert _attr(tool_spans[0], "dendrux.span.orphan_close_reason") is not None
+        # No leaks.
+        assert notifier._tool_spans == {}
+        assert notifier._run_spans == {}
+
+
+# ------------------------------------------------------------------
+# Tool span keying — concurrent runs with overlapping tool_call.id
+# ------------------------------------------------------------------
+
+
+class TestToolSpanKeying:
+    async def test_concurrent_runs_with_same_tool_call_id_dont_collide(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        from dendrux.types import RunResult, ToolResult
+
+        notifier = OpenTelemetryNotifier()
+        # Both runs use the SAME tool_call.id — caller misbehavior or fixture pattern.
+        # With (run_id, tool_call.id) keying, no collision; with id-only keying,
+        # the second on_tool_started would overwrite the first's span and one
+        # span would never be ended.
+        tc_a = ToolCall(name="add", params={}, id="shared-id", provider_tool_call_id="p1")
+        tc_b = ToolCall(name="add", params={}, id="shared-id", provider_tool_call_id="p2")
+
+        await notifier.on_run_started("run-A", agent_name="A", agent_model="m")
+        await notifier.on_run_started("run-B", agent_name="B", agent_model="m")
+        await notifier.on_tool_started("run-A", tc_a, iteration=0)
+        await notifier.on_tool_started("run-B", tc_b, iteration=0)
+        await notifier.on_tool_completed(
+            "run-A",
+            tc_a,
+            ToolResult(name="add", call_id="shared-id", payload="3", success=True),
+            iteration=0,
+        )
+        await notifier.on_tool_completed(
+            "run-B",
+            tc_b,
+            ToolResult(name="add", call_id="shared-id", payload="3", success=True),
+            iteration=0,
+        )
+        await notifier.on_run_finished("run-A", RunResult(run_id="run-A", status=RunStatus.SUCCESS))
+        await notifier.on_run_finished("run-B", RunResult(run_id="run-B", status=RunStatus.SUCCESS))
+
+        tool_spans = _spans_by_name(exporter, "execute_tool")
+        assert len(tool_spans) == 2  # both closed cleanly, no orphans
+        # Each tool span belongs to its own run's trace.
+        invoke_traces = {
+            _attr(s, "gen_ai.agent.name"): s.context.trace_id
+            for s in _spans_by_name(exporter, "invoke_agent")
+        }
+        run_id_by_trace = {
+            invoke_traces["A"]: "run-A",
+            invoke_traces["B"]: "run-B",
+        }
+        for t in tool_spans:
+            # No orphan close — both completed normally.
+            assert _attr(t, "dendrux.span.orphan_close_reason") is None
+            assert t.context.trace_id in run_id_by_trace
+        assert notifier._tool_spans == {}

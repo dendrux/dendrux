@@ -173,6 +173,8 @@ It overrides `on_message_appended`, `on_llm_call_completed`, `on_tool_completed`
 
 `CompositeNotifier` fans a single set of callbacks out to a list of inner notifiers. If you want both terminal output and a metrics sink, wrap them: `CompositeNotifier([console, metrics])`. It implements every hook by forwarding to each child, swallowing per-child exceptions so one broken notifier does not prevent the others from running.
 
+For OpenTelemetry, install `dendrux[otel]` and pass `OpenTelemetryNotifier()` from `dendrux.notifiers.otel`. It emits a GenAI-semconv span tree (`invoke_agent` → `chat` → `execute_tool`) on the host application's existing `TracerProvider`. This is a V1 integration — see [the OpenTelemetry recipe](/docs/recipes/opentelemetry) for setup, span shape, and what the V1 surface deliberately leaves out (cross-process trace continuity, native metrics, log signals — deferred until real usage validates the design).
+
 ## Fail-open semantics
 
 The loop does not call your notifier directly. It calls a thin wrapper in `dendrux/loops/_helpers.py` that swallows exceptions:
