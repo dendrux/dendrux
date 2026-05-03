@@ -1,0 +1,163 @@
+---
+title: OpenTelemetry — V1 integration
+description: Emit GenAI-semconv spans for Dendrux runs onto your existing OpenTelemetry tracer. Optional, fail-open, no exporter ownership.
+---
+
+# OpenTelemetry — V1 integration
+
+Dendrux ships an `OpenTelemetryNotifier` that emits a small, GenAI-semconv span tree (`invoke_agent` → `chat` → `execute_tool`) onto the host application's existing OTel `TracerProvider`. The host's spans, the host's exporter, the host's backend — Dendrux is just a guest in your observability stack.
+
+This is a **V1 integration**. It covers the most common case (spans on lifecycle hooks) cleanly and safely. Cross-process trace continuity, native metrics, and log signals are deliberately deferred — see [What V1 deliberately leaves out](#what-v1-deliberately-leaves-out) at the end.
+
+## Status
+
+- **Optional.** OTel is an opt-in extra. Dendrux works the same with or without it.
+- **Additive.** No changes to your existing code paths. Pass the notifier in, that's it.
+- **Fail-open.** If the OTel SDK or your exporter raises, the run still completes. Observability never kills work.
+- **GenAI-semconv targeted.** Uses `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.*`. The semconv is still marked Development upstream, so we hold to a stable subset.
+
+## Install
+
+```bash
+pip install dendrux[otel]
+```
+
+That pulls `opentelemetry-api` only. Your application installs whatever SDK + exporter your stack already uses (`opentelemetry-sdk`, `opentelemetry-exporter-otlp`, the Datadog exporter, the Honeycomb exporter, etc.).
+
+## The single line you add
+
+If your app already has OTel wired up (most do, via the auto-instrumentors for FastAPI / SQLAlchemy / requests / etc.), the entire integration is one extra notifier:
+
+```python
+from dendrux.notifiers.otel import OpenTelemetryNotifier
+
+result = await agent.run(
+    "summarize this PDF",
+    notifier=OpenTelemetryNotifier(),
+)
+```
+
+If you're already passing a `ConsoleNotifier`, compose:
+
+```python
+from dendrux.notifiers import CompositeNotifier, ConsoleNotifier
+from dendrux.notifiers.otel import OpenTelemetryNotifier
+
+result = await agent.run(
+    "summarize this PDF",
+    notifier=CompositeNotifier([
+        ConsoleNotifier(),
+        OpenTelemetryNotifier(),
+    ]),
+)
+```
+
+That is the entire integration. No env vars, no config files, no wrapper classes.
+
+## What you see in your tracing UI
+
+A FastAPI request that calls `agent.run()` produces a tree like this in Jaeger / Honeycomb / Datadog:
+
+```text
+POST /runs                                                   1.2s
+└─ invoke_agent  [my_research_agent]                         1.1s
+   ├─ chat  [claude-sonnet-4-6]                              340ms
+   │   gen_ai.usage.input_tokens: 1240
+   │   gen_ai.usage.output_tokens: 87
+   │
+   ├─ execute_tool  [web_search]                             420ms
+   │   dendrux.tool.name: web_search
+   │   dendrux.tool.success: true
+   │
+   └─ execute_tool  [pdf_extract]                            55ms
+```
+
+The `POST /runs` span comes from your FastAPI auto-instrumentation. The `invoke_agent` span attaches to it automatically because the OTel notifier respects whatever span is currently active when `agent.run()` is called.
+
+## Span shape
+
+Three span types cover the surface:
+
+| Span name              | Operation                  | Notable attributes                                                                  |
+| ---------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
+| `invoke_agent <name>`  | The whole agent run        | `gen_ai.agent.name`, `dendrux.framework`, `dendrux.run.id`, `dendrux.run.status`    |
+| `chat <model>`         | One LLM call               | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`   |
+| `execute_tool <tool>`  | One tool execution         | `dendrux.tool.name`, `dendrux.tool.call_id`, `dendrux.tool.success`                 |
+
+A run that pauses (waiting for a client tool, human input, or approval) closes its `invoke_agent` span with `dendrux.run.status=waiting_*`. The matching resume call opens a fresh `invoke_agent` span — pause/resume is two spans on the OTel side, in the same trace if your wrapper propagates context, in different traces if not.
+
+## Governance events
+
+Whenever the loop fires a governance event (`policy.denied`, `approval.requested`, `approval.decided`, `budget.threshold`, `budget.exceeded`, `guardrail.detected`, `guardrail.redacted`, etc.), the notifier attaches it as an OTel **span event** on the active `invoke_agent` span. Each event carries `dendrux.governance.*` attributes for whatever scalar data the loop emitted.
+
+This means a single click in your tracing UI shows the full audit story for a run, in temporal order, alongside the spans.
+
+## Failure semantics
+
+| Failure                  | Span behavior                                                                |
+| ------------------------ | ---------------------------------------------------------------------------- |
+| Tool returns `success=False` | `execute_tool` span closes with `Status.ERROR`; `dendrux.tool.success=false` |
+| Provider raises          | `chat` span closes with `Status.ERROR`; exception recorded via `record_exception` |
+| Run errors out           | `invoke_agent` span closes with `Status.ERROR`; exception recorded            |
+| Stream consumer abandons | `invoke_agent` closes as `cancelled`; any in-flight `chat` / `execute_tool` spans get swept and marked ERROR with `dendrux.span.orphan_close_reason` |
+
+That last row is the subtle one. Stream cancellation (`asyncio.CancelledError`, `GeneratorExit`) is a `BaseException` and bypasses the loop's `except Exception` paths, so `on_llm_call_completed` / `on_llm_call_failed` may not fire. The notifier sweeps any open child spans on the run-level terminal hook so they never leak as never-ending operations in your backend.
+
+## Safe defaults
+
+By default, no prompt content, completion text, or tool arguments are captured as span attributes. Only IDs, names, model, token counts, and statuses go on the wire.
+
+Two opt-in flags exist for power users / debugging:
+
+```python
+OpenTelemetryNotifier(
+    include_tool_params=True,    # adds dendrux.tool.params (JSON) to tool spans
+    include_messages=True,        # adds gen_ai.completion to chat spans (V1: completion text only)
+)
+```
+
+Both **bypass** Dendrux's PII guardrail redaction — only flip them in trusted environments. Capturing prompt content (not just completion) is deferred until V2; serializing multimodal/tool-call content needs a more careful design.
+
+## Concurrent runs
+
+Span lookup is keyed by `run_id` (and `(run_id, tool_call.id)` for tool spans). One `OpenTelemetryNotifier` instance can be shared across many concurrent runs without any contextvar gymnastics or cross-contamination.
+
+## Worked end-to-end example
+
+`examples/21_otel_complete_cycle.py` runs a 7-stage tour exercising every notifier hook (streaming tools, deny, approval pause/resume, sync rejection, client-tool resume, budget cap, PII guardrails) and prints a per-stage Rich tree of every span emitted, plus a final invariants check:
+
+```text
+total spans                          37
+invoke_agent spans (root-of-run)     10   ← matches on_run_started=10
+chat spans                           16   ← matches on_llm_call_started=16
+execute_tool spans                   11   ← matches on_tool_started=11
+ERROR-status spans                    1
+orphan-closed spans                   0
+governance span events               13   ← matches on_governance_event=13
+
+invariant                               violations  status
+invoke_agent has framework + run.id              0  ✓
+chat / execute_tool has live parent              0  ✓
+chat has both usage attrs (or neither)           0  ✓
+orphan-closed spans are ERROR                    0  ✓
+```
+
+Re-run this after any change to the notifier, the runtime lifecycle, or your loop implementation. If the invariants table flips red, OTel output regressed.
+
+## What V1 deliberately leaves out
+
+This integration ships the most useful 80% in a small surface. The remaining items are **deferred, not forgotten** — they will be reconsidered when real-world usage surfaces a need.
+
+- **Cross-process trace continuity across pause/resume.** Today, a run that pauses (waiting for a human) and resumes via a separate HTTP request becomes two separate `invoke_agent` spans, each correctly stitched into its own request trace, but not into one logical multi-hour trace. Stitching across the pause boundary requires persisting `traceparent` in `RunStore` and rehydrating it on resume — a runtime-level change, not a notifier-level one.
+- **Native metrics signal.** OTel metrics for token usage, tool call counts, run duration, etc. are not emitted natively. Most backends derive these from spans for free. We may add native counters / histograms later for cardinality control.
+- **Native log signal.** `LoopRecorder` is Dendrux's audit source of truth. Routing the same events out as OTel logs is possible but creates two sources of truth; if you want log/trace correlation, the recommended path today is a downstream exporter that reads sanitized recorder events.
+- **Prompt capture.** `include_messages=True` only captures completion text in V1. Capturing prompts requires JSON-serializing multimodal and tool-call content correctly, with size guards.
+- **`auto_instrument()` helper.** No magical one-call hook installs the notifier globally. Pass it explicitly per `agent.run()` call. We may add a helper if usage demands.
+
+In short, this V1 is **the minimum correct shape** of "Dendrux speaks OTel." More robust approaches (durable trace stitching, full GenAI metrics, log correlation, exporter-side fanout) are on the roadmap but will land only when the V1 surface has been exercised against real workloads. The notifier rail is intentionally narrow so it can evolve without breaking.
+
+## Related
+
+- [Notifier](/docs/architecture/notifier) — the underlying extension point and its contract.
+- [Recorder](/docs/architecture/recorder) — Dendrux's audit-truth side of the same hook surface.
+- [Governance](/docs/architecture/governance) — what the `governance.*` span events represent.
