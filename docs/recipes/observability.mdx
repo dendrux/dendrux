@@ -1,0 +1,244 @@
+---
+title: Observability stack
+description: Recorder + Notifier + OpenTelemetry + Dashboard + RunStore — how dendrux's four observability surfaces compose into one stack you get for free.
+---
+
+# Observability stack
+
+Dendrux ships four observability surfaces that look separate but are actually one layered stack: a durable **recorder** writes truth to your database, a fail-open **notifier** dispatches live events, the **OpenTelemetry notifier** routes those events into whatever tracing backend your app already uses, and the **dashboard** plus **RunStore** read the durable record back for visualization and APIs.
+
+You don't choose between them. They compose: same hook surface, different consumers, different failure policies, different time horizons. This page is the umbrella story — for the individual contracts see [Notifier](/docs/architecture/notifier), [Recorder](/docs/architecture/recorder), the [OpenTelemetry recipe](/docs/recipes/opentelemetry), and [Mounting the read router](/docs/recipes/mount-read-router).
+
+## The stack at a glance
+
+```text
+                     Agent loop emits events
+                  (LLM calls, tools, governance)
+                              │
+                ┌─────────────┴──────────────┐
+                │   same hook surface,        │
+                │   two seams                 │
+                ▼                              ▼
+       ┌─────────────────┐           ┌─────────────────────┐
+       │  Recorder       │           │  Notifier           │
+       │  (fail-closed)  │           │  (fail-open)        │
+       │                 │           │                     │
+       │  writes truth   │           │  ConsoleNotifier    │
+       │  to StateStore  │           │  CompositeNotifier  │
+       │  (6 DB tables)  │           │  OpenTelemetry-     │
+       │                 │           │    Notifier         │
+       │                 │           │  YourCustomNotifier │
+       └────────┬────────┘           └─────────────────────┘
+                │                              │
+                ▼                              ▼
+       ┌──────────────────┐         ┌────────────────────┐
+       │  Read consumers  │         │  Live consumers    │
+       │  ──────────────  │         │  ───────────────   │
+       │  Dashboard       │         │  Your terminal     │
+       │  RunStore        │         │  Datadog / Jaeger  │
+       │  make_read_router│         │   / Honeycomb      │
+       │  Your BI         │         │  PagerDuty / Slack │
+       └──────────────────┘         └────────────────────┘
+        "what happened"              "what's happening"
+```
+
+Each row in the picture answers a different question:
+
+| Surface | Failure policy | Consumes | Answers |
+| --- | --- | --- | --- |
+| **Recorder** | Fail-closed | The runtime loop | "What happened?" (audit truth) |
+| **Notifier** | Fail-open | The runtime loop | "What's happening?" (live wire) |
+| **OpenTelemetryNotifier** | Fail-open | The notifier surface | "What's happening across all my services?" (host's tracing stack) |
+| **Dashboard** | Reads DB | The recorder's output | "Show me run X visually" (embedded UI) |
+| **RunStore + read router** | Reads DB | The recorder's output | "Let me build my own UI / billing / exports" (programmatic + HTTP) |
+
+The split that does the work is **fail-closed vs fail-open**. The recorder cannot drop a write — if persistence fails on a critical path, the run stops. The notifier cannot kill a run — if your Slack webhook is down, the agent keeps going. Same events, two consumers, deliberately asymmetric guarantees.
+
+## The whole stack in one configuration
+
+```python
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.notifiers import CompositeNotifier, ConsoleNotifier
+from dendrux.notifiers.otel import OpenTelemetryNotifier
+from dendrux.store import RunStore
+
+
+@tool
+async def lookup_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"Sunny, 72F in {city}"
+
+
+# 1. Recorder: configured implicitly by passing database_url.
+async with Agent(
+    provider=AnthropicProvider(model="claude-sonnet-4-6"),
+    prompt="You are a helpful assistant.",
+    tools=[lookup_weather],
+    database_url="sqlite+aiosqlite:///app.db",
+) as agent:
+
+    # 2. Notifier: compose as many as you want.
+    notifier = CompositeNotifier([
+        ConsoleNotifier(),           # live terminal output
+        OpenTelemetryNotifier(),     # emit spans onto host's TracerProvider
+        # MyAlertNotifier(),         # your own subclass — Slack, PagerDuty, custom metrics
+    ])
+
+    result = await agent.run(
+        "What's the weather in Paris?",
+        notifier=notifier,
+    )
+
+# 3. Read past — Dashboard is one way.
+#    $ dendrux dashboard --database-url sqlite+aiosqlite:///app.db
+
+# 4. Or build your own UI / BI / exports via RunStore.
+async with RunStore.from_database_url("sqlite+aiosqlite:///app.db") as store:
+    detail = await store.get_run(result.run_id)
+    events = await store.get_events(result.run_id)
+    print(f"Run finished as {detail.status} with {len(events)} events")
+```
+
+That single block configures all four observability surfaces. Nothing else is required.
+
+## What each layer captures, per run
+
+Same agent run, same events, captured four different ways:
+
+### Recorder — durable rows in your DB
+
+`PersistenceRecorder` runs automatically when `database_url` (or `state_store`) is configured. It writes into six tables:
+
+| Table | What lands here |
+| --- | --- |
+| `agent_runs` | Run anchor: status, model, tenant, parent for delegation, token + cost rollups |
+| `react_traces` | Every USER / ASSISTANT / TOOL message the loop saw |
+| `tool_calls` | Every tool invocation with params, result payload, success, duration |
+| `llm_interactions` | Per-LLM-call semantic request/response plus the raw provider payloads |
+| `token_usage` | Per-call token counts (kept for backcompat) |
+| `run_events` | Append-only state log: `run.started`, `llm.completed`, `tool.completed`, `policy.denied`, `approval.requested`, `budget.threshold`, etc. with monotonic `sequence_index` |
+
+This is the audit truth. Replays, billing rollups, SSE event streams, the embedded dashboard, and the public `RunStore` all read from these rows.
+
+### Notifier — live event dispatch
+
+The notifier sees the same events as the recorder but doesn't persist anything itself. Three built-in implementations cover most needs:
+
+- **`ConsoleNotifier`** prints a Rich-formatted live progress view to the terminal during the run.
+- **`CompositeNotifier([n1, n2, ...])`** fans events out to multiple notifiers; one failing never breaks the others.
+- **`OpenTelemetryNotifier()`** emits a [GenAI-semconv span tree](/docs/recipes/opentelemetry) onto your host application's existing `TracerProvider`.
+
+You implement your own by subclassing `BaseNotifier` and overriding only the hooks you care about — see [Notifier](/docs/architecture/notifier) for the full hook list and contract.
+
+### OpenTelemetryNotifier — your host's tracing backend
+
+`OpenTelemetryNotifier` is one specific Notifier. It produces a span tree shaped like:
+
+```text
+POST /runs                                          1.2s   ← your FastAPI / Django auto-instrumentation
+└─ invoke_agent  [my_agent]                         1.1s
+   ├─ chat  [claude-sonnet-4-6]                     340ms
+   │   gen_ai.usage.input_tokens: 1240
+   │   gen_ai.usage.output_tokens: 87
+   └─ execute_tool  [lookup_weather]                42ms
+```
+
+The spans attach to whatever span is active when `agent.run()` is called, so if your web framework has OTel auto-instrumentation, the agent's spans land inside the request trace automatically. Dendrux doesn't own the exporter — Datadog, Honeycomb, Jaeger, Grafana, or self-hosted OTLP all work because they're whatever your app already configured.
+
+Install with `pip install dendrux[otel]` and pass `OpenTelemetryNotifier()` per `agent.run()`. The full recipe is at [OpenTelemetry V1 integration](/docs/recipes/opentelemetry).
+
+### Dashboard — embedded UI reader
+
+```bash
+dendrux dashboard --database-url sqlite+aiosqlite:///app.db
+```
+
+Serves a small React UI plus a read-only HTTP API. It reads `run_events`, `agent_runs`, `react_traces`, `tool_calls`, `llm_interactions` straight from the recorder's tables and reconstructs:
+
+- A list of runs (filter by status, tenant, agent name)
+- Per-run timelines with pause segments as first-class nodes (so client-tool wait time is visible)
+- A delegation tree view for parent-child runs
+- A payload inspector with three modes (Formatted, Raw JSON, Evidence with semantic + provider payloads)
+
+The dashboard is a reference *consumer* of dendrux's public read APIs — it has no privileged access. Everything it does, your own UI can do too.
+
+### RunStore + make_read_router — programmatic + HTTP
+
+`RunStore` is the typed Python facade. `make_read_router(store)` is the same surface exposed as a mountable FastAPI router.
+
+```python
+from dendrux.store import RunStore
+
+async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
+    failed_runs = await store.list_runs(status="error", limit=20)
+    for run in failed_runs:
+        events = await store.get_events(run.run_id)
+        # build your billing rollup, custom export, alerting check, etc.
+```
+
+For HTTP exposure, the [Mounting the read router recipe](/docs/recipes/mount-read-router) shows the full mount with auth, plus every endpoint's response shape.
+
+## Recommended composition
+
+For a production app, this is what we'd ship by default:
+
+```python
+notifier = CompositeNotifier([
+    ConsoleNotifier(),           # dev: see runs in the terminal
+    OpenTelemetryNotifier(),     # ops: spans in Datadog / Honeycomb / whatever
+    MyAlertNotifier(),           # business: page on-call when guardrails fire
+])
+
+agent = Agent(
+    provider=...,
+    tools=[...],
+    prompt="...",
+    database_url=os.environ["DATABASE_URL"],   # recorder writes audit truth
+    guardrails=[PII(), SecretDetection()],     # findings flow through all 3 notifiers
+    budget=Budget(max_tokens=100_000),         # threshold events flow through all 3
+)
+```
+
+Then expose the read side to your team:
+
+```python
+from dendrux.http import make_read_router
+
+app.include_router(
+    make_read_router(store=RunStore.from_database_url(os.environ["DATABASE_URL"])),
+    prefix="/api/dendrux",
+    dependencies=[Depends(authorize)],
+)
+```
+
+That gives you live terminal output, full distributed tracing in your tracing backend, on-call alerting on governance events, an audited DB record of every run, and a HTTP surface your dashboards and BI can query. With one block of configuration.
+
+## Why four surfaces (and not one)
+
+A reasonable question: if everything funnels through the same hooks, why not ship one unified observability primitive? The answer is the failure-policy split.
+
+- The **recorder is fail-closed** because losing audit data silently is worse than losing the run. If a critical write to `react_traces` or `tool_calls` fails after retries, the run stops. You can ship code that depends on the audit being complete.
+- The **notifier is fail-open** because losing a Slack notification is better than losing the run. If your OTel exporter is down or your custom alerter throws, the agent finishes and writes its result. You can ship flaky notifiers without compromising correctness.
+
+A unified primitive would force you to pick one policy. The split lets you keep the audit hard and the wire soft, which is exactly the property you want in production.
+
+## Worked end-to-end example
+
+`examples/22_observability_complete_stack.py` runs one agent with all four surfaces active simultaneously and prints a Rich report showing exactly what each layer captured. Run it after configuring `ANTHROPIC_API_KEY`:
+
+```bash
+pip install 'dendrux[anthropic,otel]'
+python examples/22_observability_complete_stack.py
+```
+
+The output shows the recorder's row counts per table, the notifier hooks that fired, the OTel span tree for the run, the custom alert notifier's counters, and the RunStore replay of the same run — all from one `agent.run()` call.
+
+## Related
+
+- [Notifier](/docs/architecture/notifier) — the extension contract and per-hook semantics
+- [Recorder](/docs/architecture/recorder) — what the recorder writes per hook and the two-tier durability policy
+- [OpenTelemetry V1 integration](/docs/recipes/opentelemetry) — span shape, semconv attributes, V1 scope
+- [Mounting the read router](/docs/recipes/mount-read-router) — HTTP surface for the read side
+- [State persistence](/docs/architecture/state-persistence) — the StateStore that the recorder writes to
+- [Governance](/docs/architecture/governance) — what governance events flow through all four surfaces
