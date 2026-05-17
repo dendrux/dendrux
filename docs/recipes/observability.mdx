@@ -11,38 +11,32 @@ You don't choose between them. They compose: same hook surface, different consum
 
 ## The stack at a glance
 
-```text
-                     Agent loop emits events
-                  (LLM calls, tools, governance)
-                              │
-                ┌─────────────┴──────────────┐
-                │   same hook surface,        │
-                │   two seams                 │
-                ▼                              ▼
-       ┌─────────────────┐           ┌─────────────────────┐
-       │  Recorder       │           │  Notifier           │
-       │  (fail-closed)  │           │  (fail-open)        │
-       │                 │           │                     │
-       │  writes truth   │           │  ConsoleNotifier    │
-       │  to StateStore  │           │  CompositeNotifier  │
-       │  (6 DB tables)  │           │  OpenTelemetry-     │
-       │                 │           │    Notifier         │
-       │                 │           │  YourCustomNotifier │
-       └────────┬────────┘           └─────────────────────┘
-                │                              │
-                ▼                              ▼
-       ┌──────────────────┐         ┌────────────────────┐
-       │  Read consumers  │         │  Live consumers    │
-       │  ──────────────  │         │  ───────────────   │
-       │  Dashboard       │         │  Your terminal     │
-       │  RunStore        │         │  Datadog / Jaeger  │
-       │  make_read_router│         │   / Honeycomb      │
-       │  Your BI         │         │  PagerDuty / Slack │
-       └──────────────────┘         └────────────────────┘
-        "what happened"              "what's happening"
-```
+<Mermaid chart={`flowchart TD
+    Loop["Agent loop emits events<br/>(LLM, tools, governance)"]
+    Recorder["Recorder<br/>fail-closed"]
+    Notifier["Notifier<br/>fail-open"]
+    Store[("StateStore<br/>6 DB tables")]
+    Read["Read consumers<br/>Dashboard · RunStore · make_read_router · Your BI"]
+    Live["Live consumers<br/>Console · OTel → Datadog/Jaeger/Honeycomb · PagerDuty/Slack"]
 
-Each row in the picture answers a different question:
+    Loop --> Recorder
+    Loop --> Notifier
+    Recorder --> Store
+    Store --> Read
+    Notifier --> Live
+
+    classDef src fill:#0d1018,stroke:#3a4258,color:#e8e8ee
+    classDef truth fill:#15192a,stroke:#4a90e2,color:#e8e8ee
+    classDef live fill:#15192a,stroke:#e2b04a,color:#e8e8ee
+    classDef store fill:#0d1018,stroke:#6b7280,color:#e8e8ee
+
+    class Loop src
+    class Recorder,Read truth
+    class Notifier,Live live
+    class Store store
+`} />
+
+Each surface answers a different question:
 
 | Surface | Failure policy | Consumes | Answers |
 | --- | --- | --- | --- |
