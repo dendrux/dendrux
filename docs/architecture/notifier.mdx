@@ -121,7 +121,39 @@ All `submit_*` and `resume` methods accept the same `notifier=` argument. If you
 
 ## What a real run looks like
 
-Running a two-iteration ReAct query ("What is 15 + 27?" with an `add` tool) and printing `capture.log` afterwards:
+Wire the `CaptureNotifier` from above into a two-iteration ReAct query and print its log:
+
+```python
+import asyncio
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
+async def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+
+async def main() -> None:
+    capture = CaptureNotifier()             # the BaseNotifier subclass shown above
+    async with Agent(
+        name="calculator",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a calculator. Use the add tool.",
+        tools=[add],
+        database_url="sqlite+aiosqlite:///demo.db",
+    ) as agent:
+        await agent.run("What is 15 + 27?", notifier=capture)   # notifier is per-call
+
+    print("\n".join(capture.log))
+
+
+asyncio.run(main())
+```
+
+Output:
 
 ```text
 on_run_started         run=01HXX... agent='calculator'

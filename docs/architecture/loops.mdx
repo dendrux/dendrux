@@ -112,7 +112,38 @@ That last bullet is the safety cap. `Agent(max_iterations=...)` defaults to 10, 
 
 In `ReActLoop`, `iteration_count` is the number of LLM turns the agent made before returning. Each trip through the loop body increments it by 1. A run that calls a tool once and then answers uses 2 iterations: one to decide "call this tool," and one to read the result and produce a final answer.
 
-Here is a real run. A calculator agent with an `add` tool is asked "What is 15 + 27?" The DB rows afterward:
+Here is a real run. A calculator agent with an `add` tool is asked "What is 15 + 27?":
+
+```python
+import asyncio
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
+async def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+
+async def main() -> None:
+    async with Agent(
+        name="Calc",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a calculator. Use the add tool.",
+        tools=[add],                         # ReActLoop is the default
+        database_url="sqlite+aiosqlite:///calc.db",
+    ) as agent:
+        result = await agent.run("What is 15 + 27?")
+        print(result.iteration_count)        # 2  (one turn to call add, one to answer)
+        print(result.answer)                 # "15 + 27 = **42**"
+
+
+asyncio.run(main())
+```
+
+The DB rows afterward:
 
 ```text
 ==== ReActLoop ====
@@ -180,6 +211,30 @@ return RunResult(
 Note `steps=[]`. `AgentStep` is a ReAct concept (reasoning plus action). SingleCall does not produce steps because there is no action taxonomy to classify: the LLM's text is the answer, full stop.
 
 A real SingleCall run, sentiment classifier prompted with "I love this product!":
+
+```python
+import asyncio
+
+from dendrux import Agent, SingleCall
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+async def main() -> None:
+    async with Agent(
+        name="Classifier",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="Classify the sentiment. Reply with one word: positive, negative, or neutral.",
+        loop=SingleCall(),                   # no tools, exactly one LLM call
+    ) as agent:
+        result = await agent.run("I love this product!")
+        print(result.answer)                 # "positive"
+        print(result.iteration_count)        # 1  (always 1 for SingleCall)
+
+
+asyncio.run(main())
+```
+
+The DB rows afterward:
 
 ```text
 ==== SingleCall ====
