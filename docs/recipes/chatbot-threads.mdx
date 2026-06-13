@@ -34,7 +34,7 @@ history.append(ChatMessage.assistant(result.answer))
 
 `ChatMessage` is intentionally narrower than the internal `Message` — only `role` and `text`. Tool calls, call IDs, and runtime metadata are hidden so the dev can't accidentally inject malformed runtime state.
 
-**Storage of the conversation is the dev's job.** Dendrux only reads `history=` as input for the next turn. Persist the chat log in your own table — this preserves the library-not-platform boundary. The chatbot example at `examples/18_chatbot.py` keeps `history` in a Python list; a real app would load it from `messages` in your DB before each turn.
+**Storage of the conversation is the dev's job.** Dendrux only reads `history=` as input for the next turn. Persist the chat log in your own table — this preserves the library-not-platform boundary. The chatbot example at `examples/18_chatbot.py` keeps `history` in a Python list; a real app would load it from `messages` in your DB before each turn. For the full picture of which data lives in your DB vs Dendrux's, a minimal app schema, and the per-turn request lifecycle, see [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary).
 
 **With PII guardrails on, your `history` accumulates real names**, not placeholders. The runner deanonymizes `result.answer` on the way back to your code, so appending it gives a natural-language transcript. The DB row keeps the placeholder version for audit. See [PII redaction — user-facing answer](/docs/architecture/pii-redaction#deanonymization-the-user-facing-answer).
 

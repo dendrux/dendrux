@@ -9,6 +9,8 @@ Everything dendrux knows about a run lives in your database. Not in memory, not 
 
 This page walks through each table with real row contents from a vetted run (`dendrux==0.2.0a1` against SQLite). Every value below was copied from a real `quickstart.db` produced by the [Quickstart](/docs/quickstart) example.
 
+> **Building a product on top of this?** These six tables are Dendrux's run-state and audit surface, not your product database. If you are building a chat app, store your user-visible chats and messages in your own tables and link to Dendrux by run ID. See [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary) for the boundary, a minimal schema, and the request lifecycle.
+
 ## Why on-disk state
 
 In-memory agent state evaporates the moment a process crashes, gets killed, restarts, or falls behind a load balancer that routes the next request to a different worker. Dendrux's whole point is that an agent can pause for minutes or hours (waiting on a human, a slow tool, or an upstream service) and resume from anywhere. That requires the state to live somewhere durable that any process can read.
