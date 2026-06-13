@@ -1,0 +1,150 @@
+---
+title: Your app DB vs the Dendrux DB
+description: Which data belongs in your product database and which belongs to Dendrux, a minimal ChatGPT-style schema, the request lifecycle for one chat turn, and how to link each turn to its run.
+---
+
+# Your app DB vs the Dendrux DB
+
+If you are building a real product on top of Dendrux (a chatbot, an assistant, a workflow tool), the first question is almost always: where does my data go? You already have your own tables for users and conversations. Dendrux also writes tables. Knowing which side owns what is the difference between a clean integration and a painful one.
+
+The short answer: **Dendrux owns run state and the audit trail. You own everything your product shows to a user.** They are two separate databases, linked by one ID.
+
+## The two databases
+
+<Mermaid chart={`flowchart LR
+    subgraph App["Your app database (you own this)"]
+        users["users"]
+        chats["chats"]
+        messages["messages<br/>has dendrux_run_id"]
+    end
+    subgraph Dx["Dendrux database (Dendrux owns this)"]
+        runs[("agent_runs")]
+        traces["react_traces"]
+        tools["tool_calls"]
+        llm["llm_interactions"]
+        events["run_events"]
+    end
+    messages -. "dendrux_run_id + metadata.thread_id" .-> runs
+`} />
+
+Your tables hold product truth: who the user is, which conversations exist, what each message says, what the UI renders. Dendrux's [six tables](/docs/architecture/state-persistence) hold execution truth: every LLM call, every tool invocation, the ordered event log, and the pause state needed to resume. The two meet at a single point: the **run ID** that each of your assistant messages records, plus the `metadata.thread_id` you stamp on every run.
+
+> **The boundary rule.** Do not use Dendrux tables as your product chat database. Store product-visible chats and messages in your own tables. Link to Dendrux using run IDs and run metadata. Treat the Dendrux schema as an internal, append-only audit surface that you read through `RunStore`, never write to directly.
+
+## A minimal ChatGPT-style schema
+
+This is all the product-side schema a chat app needs. Note `dendrux_run_id` on `messages`: that one column is the entire link back to Dendrux.
+
+```sql
+CREATE TABLE chats (
+    id       TEXT PRIMARY KEY,        -- your ID format (ULID/UUID)
+    user_id  TEXT NOT NULL,
+    title    TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE messages (
+    id        TEXT PRIMARY KEY,
+    chat_id   TEXT NOT NULL REFERENCES chats(id),
+    role      TEXT NOT NULL,          -- 'user' | 'assistant'
+    content   TEXT,                   -- nullable while an assistant turn streams
+    status    TEXT NOT NULL,          -- your enum, e.g. 'pending' | 'streaming' | 'complete' | 'error'
+    dendrux_run_id TEXT,              -- set on assistant messages; links to agent_runs.id
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+One assistant message maps to one Dendrux run, so a column on `messages` is enough. You only need a separate `agent_run_links(message_id, dendrux_run_id)` join table if a single message can span multiple runs (for example a "regenerate" feature that keeps history, or a turn that internally fans out to sub-agents you want to surface individually). Start with the column; add the join table only when that need is real.
+
+## What not to store
+
+The mistakes below all come from blurring the boundary. Avoid them:
+
+- **Do not duplicate `tool_calls` into your `messages` table.** Tool invocations, their params, and results already live in Dendrux. If your UI needs to show "called the refund tool," read it from `RunStore.get_tool_invocations(run_id)`, do not re-persist it.
+- **Do not store raw provider payloads in your app DB** unless you have a specific product reason. The full Anthropic/OpenAI request and response are already preserved verbatim in `llm_interactions`. Copying them into your tables just duplicates a large audit record you do not own.
+- **Do not query `react_traces` as your user-facing transcript.** That table is the message history Dendrux ships to the model, in model-shaped form (tool roles, placeholder PII, internal ordering). Your transcript is your own `messages` rows, which you control and can render exactly as the user should see them.
+- **Do not write to any Dendrux table.** It is append-only and owned by the runtime. Read through `RunStore` or the read router.
+
+## Dendrux does not reconstruct your conversation
+
+This is the single most important thing to internalize, because it is easy to assume the opposite.
+
+> Dendrux does not automatically rebuild your next chat turn from previous runs. Your app loads the prior turns from your `messages` table and passes them in via `history=`.
+
+Each `agent.run()` is one turn. Dendrux reads the `history=` you give it as input and does not persist it back as your conversation (it only records the new turn's execution into its own tables). So the loop is always: load prior turns from your DB, convert to `ChatMessage`, run, then save the new user message and the assistant answer back to your DB. See [Chatbot threads](/docs/recipes/chatbot-threads) for the `history=` and `ChatMessage` mechanics.
+
+## The request lifecycle for one turn
+
+Here is the full path of a single chat message in a streaming app. The run ID is available immediately from the stream (before the first token), so you can link the assistant message at creation time and fill its content as the stream completes.
+
+```python
+@app.post("/chats/{chat_id}/messages")
+async def post_message(chat_id: str, body: NewMessage, user: User = Depends(auth)):
+    # 1. Persist the user's message in YOUR db.
+    await db.save_message(chat_id, role="user", content=body.text, status="complete")
+
+    # 2. Load prior turns from YOUR db and convert to Dendrux's input type.
+    rows = await db.load_messages(chat_id)
+    history = [
+        ChatMessage.user(m.content) if m.role == "user" else ChatMessage.assistant(m.content)
+        for m in rows
+    ]
+
+    # 3. Start the run. run_id is available before iteration.
+    stream = agent.stream(
+        user_input=body.text,
+        history=history,
+        metadata={"thread_id": chat_id, "user_id": user.id},
+    )
+
+    # 4. Create the assistant placeholder linked to the run up front.
+    assistant_id = await db.save_message(
+        chat_id, role="assistant", content=None,
+        status="streaming", dendrux_run_id=stream.run_id,
+    )
+
+    # 5. Stream tokens to the client, accumulating the final answer.
+    async def emit():
+        answer = []
+        async with stream:
+            async for event in stream:
+                if event.type == RunEventType.TEXT_DELTA:
+                    answer.append(event.text)
+                    yield sse(event.text)
+        # 6. Persist the final answer back to YOUR db.
+        await db.update_message(assistant_id, content="".join(answer), status="complete")
+
+    return StreamingResponse(emit(), media_type="text/event-stream")
+```
+
+The non-streaming version is the same shape with `await agent.run(...)` in place of the stream, saving `result.answer` and `result.run_id` after it returns.
+
+## Recommended metadata keys
+
+`metadata` is opaque JSON that lands on the run row. Dendrux stores it and never reads it during execution; it exists purely for your dev-side queries and rollups. For a production app, stamp every run with:
+
+```python
+metadata={
+    "thread_id": str(chat_id),     # the conversation; the canonical chatbot key
+    "user_id": str(user_id),       # who asked
+    "tenant_id": str(tenant_id),   # org/workspace scoping for multi-tenant apps
+    "request_id": request_id,      # ties a run to your HTTP/trace logs
+}
+```
+
+Keys are restricted to `[A-Za-z0-9_-]+` for filter safety. With these in place you can answer "every run in this chat," "this user's cost this month," or "the run behind request X" without touching your own tables. The query mechanics are in [Chatbot threads](/docs/recipes/chatbot-threads#querying-every-run-in-a-thread).
+
+## Read through the public APIs, not raw SQL
+
+When you need Dendrux's execution data (for a cost view, a debug panel, a per-thread inspector), reach for the public read surface rather than writing SQL against the tables:
+
+- **`RunStore`** for programmatic reads: `list_runs(metadata_filter=...)`, `get_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pauses`.
+- **[`make_read_router`](/docs/recipes/mount-read-router)** to expose those same reads over HTTP and SSE for a frontend.
+
+Direct table queries are reasonable only for advanced internal debugging. For anything your product depends on, use the APIs: they are the stable contract, the schema is not.
+
+## Where this fits
+
+- Architecture: [State persistence](/docs/architecture/state-persistence) explains what each of Dendrux's six tables holds.
+- Recipes: [Chatbot threads](/docs/recipes/chatbot-threads) for `history=`, `ChatMessage`, and `metadata_filter` queries.
+- Recipes: [Mount the read router](/docs/recipes/mount-read-router) to serve run data to your frontend.
