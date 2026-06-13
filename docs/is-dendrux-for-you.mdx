@@ -27,7 +27,7 @@ Most production agents hit at least one of these. Many hit all three.
 
 - **It's a single prompt in, single completion out.** No tools, no pauses, no audit requirement. Call the provider SDK directly.
 - **It's a stateless chatbot** where losing an in-flight turn on restart is acceptable and you keep history yourself. You can run dendrux without persistence, but its value is the part you'd be turning off.
-- **You already run a durable execution engine** (Temporal, Inngest, and similar) and only want the LLM call inside an existing workflow step. See [How dendrux compares](/docs/how-dendrux-compares) for where the line sits.
+- **You already run a durable execution engine** and only want the LLM call inside an existing workflow step.
 
 There's no shame in the "no" column. Dendrux is deliberately a [library, not a platform](/docs): if you don't need durable pause/resume, it's asking you to carry a database for nothing.
 
