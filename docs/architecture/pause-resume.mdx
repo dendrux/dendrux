@@ -55,7 +55,45 @@ The `react_traces` table still holds the conversation up to the pause, the `llm_
 
 A `submit_*` call loads the run, verifies the status is one it can resume from, saves any new input into `pause_data`, atomically flips the status to `running`, and re-enters the loop. The loop reconstructs the in-memory state from the DB rows. No information is passed between the two processes except the `run_id`.
 
-The row above after calling `submit_approval(run_id, approved=True)`:
+The full cycle, end to end. `run()` returns a paused result; a later call (which could be in a different process holding only the `run_id`) resumes it to completion:
+
+```python
+import asyncio
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
+async def refund(order_id: int) -> str:
+    """Refund an order by its id."""
+    return f"Refunded order {order_id}"
+
+
+async def main() -> None:
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. Use the refund tool when a refund is requested.",
+        tools=[refund],
+        require_approval=["refund"],          # refund gates on approval
+        database_url="sqlite+aiosqlite:///pr.db",
+    ) as agent:
+        paused = await agent.run("Refund order 42 using the refund tool.")
+        print(paused.status.value)            # waiting_approval
+
+        # Later, elsewhere: only the run_id is needed to resume.
+        done = await agent.submit_approval(paused.run_id, approved=True)
+        print(done.status.value)              # success
+        print(done.answer)                    # "The refund has been successfully processed..."
+
+
+asyncio.run(main())
+```
+
+The other two pause statuses resume the same way, with the method that matches the pause: `submit_tool_results(run_id, results=...)` for `waiting_client_tool` and `submit_input(run_id, text=...)` for `waiting_human_input`.
+
+The DB row above after calling `submit_approval(run_id, approved=True)`:
 
 ```text
 id: 01KPG17P8XNWVJC1EN0M3XKCK4

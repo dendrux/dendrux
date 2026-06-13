@@ -256,6 +256,49 @@ dendrux db status                        # show the current migration revision
 
 If the tables are missing when a run starts, dendrux raises `SchemaNotInitializedError` carrying these exact commands, rather than letting a raw "relation does not exist" error surface mid-run.
 
+## Reading runs back through RunStore
+
+You do not query these tables with raw SQL. `RunStore` is the public read API over the same six tables: one method per concern, keyed by `run_id`. Here a run is executed, then read back from a fresh store handle (which could be a different process):
+
+```python
+import asyncio
+
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///quickstart.db"
+
+    async with Agent(
+        name="QA",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="Answer in one short sentence.",
+        database_url=url,
+    ) as agent:
+        result = await agent.run("What is the capital of France?")
+
+    # Read the persisted state back through the public API.
+    store = RunStore.from_database_url(url)
+    async with store:
+        run = await store.get_run(result.run_id)              # the agent_runs row
+        events = await store.get_events(result.run_id)         # the run_events timeline
+        llm_calls = await store.get_llm_calls(result.run_id)   # one row per LLM turn
+
+        print(run.status, run.model)
+        # success claude-haiku-4-5
+        print([e.event_type for e in events])
+        # ['run.started', 'llm.completed', 'run.completed']
+        print(llm_calls[0].model, llm_calls[0].input_tokens, llm_calls[0].output_tokens)
+        # claude-haiku-4-5 20 10  (token counts vary per run)
+
+
+asyncio.run(main())
+```
+
+`RunStore` also exposes `get_tool_invocations`, `get_traces`, `get_pauses`, and `list_runs(metadata_filter=...)`. See [Chatbot threads](/docs/recipes/chatbot-threads) for the metadata-filter query patterns and [Mount the read router](/docs/recipes/mount-read-router) to expose these reads over HTTP.
+
 ## What's next
 
 - [Event ordering](/docs/architecture/event-ordering): why `sequence_index` exists and how SSE resume uses it.

@@ -23,7 +23,45 @@ The caller does not have to know which branch applies. `cancel_run` sets the coo
 
 This is the deterministic path. The run is not doing anything, so we can immediately flip the status.
 
-The scratchpad below starts a run that pauses for approval, then calls `cancel_run` instead of `submit_approval`. The DB state before and after is pulled directly from SQLite.
+The example below starts a run that pauses for approval, then calls `cancel_run` instead of `submit_approval`:
+
+```python
+import asyncio
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
+async def refund(order_id: int) -> str:
+    """Refund an order by its id."""
+    return f"Refunded order {order_id}"
+
+
+async def main() -> None:
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. Use the refund tool when a refund is requested.",
+        tools=[refund],
+        require_approval=["refund"],            # refund pauses the run for approval
+        database_url="sqlite+aiosqlite:///cancel.db",
+    ) as agent:
+        result = await agent.run("Refund order 42 using the refund tool.")
+        print(result.status.value)              # waiting_approval
+
+        cancelled = await agent.cancel_run(result.run_id)
+        print(cancelled.status.value)           # cancelled  (instead of approving)
+
+        # idempotent: cancelling a terminal run is a no-op, never raises
+        again = await agent.cancel_run(result.run_id)
+        print(again.status.value)               # cancelled
+
+
+asyncio.run(main())
+```
+
+The DB state before and after, pulled directly from SQLite, shows the single-statement transition:
 
 ```text
 first.run returned: status=waiting_approval
