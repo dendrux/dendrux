@@ -239,6 +239,21 @@ Dendrux uses **SQLAlchemy 2.x async**. Anything async-SQLAlchemy supports works:
 
 The schema doesn't use any SQLite-specific or Postgres-specific features. Switching backends is a connection string change.
 
+## Setting up the schema
+
+SQLite creates its tables automatically on first use, so there is nothing to run. Every other backend needs the tables created once before the first run. Dendrux ships an Alembic migration set and a small CLI for exactly this:
+
+```bash
+pip install "dendrux[postgres]"          # asyncpg driver (alembic is already bundled)
+export DENDRUX_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
+dendrux db migrate                       # create / upgrade the six tables
+dendrux db status                        # show the current migration revision
+```
+
+`DENDRUX_DATABASE_URL` is the one knob the CLI reads. It never accepts the URL as a flag, so credentials stay out of your shell history and process list. The same variable is also the fallback your app uses when you build an `Agent` without an explicit `database_url=`, so setting it once covers both migration and runtime.
+
+If the tables are missing when a run starts, dendrux raises `SchemaNotInitializedError` carrying these exact commands, rather than letting a raw "relation does not exist" error surface mid-run.
+
 ## What's next
 
 - [Event ordering](/docs/architecture/event-ordering): why `sequence_index` exists and how SSE resume uses it.

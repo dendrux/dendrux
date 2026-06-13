@@ -15,6 +15,7 @@ Suggested HTTP mappings:
     RunAlreadyTerminalError     -> 409
     InvalidToolResultError      -> 400
     PersistenceNotConfiguredError -> 500
+    SchemaNotInitializedError   -> 500
 """
 
 from __future__ import annotations
@@ -130,6 +131,26 @@ class PersistenceNotConfiguredError(RuntimeError):
         )
 
 
+class SchemaNotInitializedError(RuntimeError):
+    """Raised when the configured database has no Dendrux tables yet.
+
+    SQLite auto-creates its schema on first use, so this never fires
+    there. Postgres (and other backends) require an explicit migration
+    step before the first run. The message points at the CLI commands
+    that set the schema up.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Dendrux tables not found in the configured database. "
+            "Run migrations before the first run:\n\n"
+            "    export DENDRUX_DATABASE_URL=<your-database-url>\n"
+            "    dendrux db migrate\n\n"
+            "SQLite auto-creates its schema; Postgres and other backends "
+            "require this step. Check status with 'dendrux db status'."
+        )
+
+
 __all__ = [
     "InvalidToolResultError",
     "PauseStatusMismatchError",
@@ -138,4 +159,5 @@ __all__ = [
     "RunAlreadyTerminalError",
     "RunNotFoundError",
     "RunNotPausedError",
+    "SchemaNotInitializedError",
 ]

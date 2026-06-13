@@ -89,6 +89,30 @@ def _record_to_run_result(record: Any) -> RunResult:
     )
 
 
+async def _verify_schema_initialized(engine: AsyncEngine, url: str) -> None:
+    """Fail fast with setup guidance if a non-SQLite database has no tables.
+
+    SQLite auto-creates its schema in ``_create_private_engine`` / ``get_engine``,
+    so the check is skipped there. For Postgres and other backends the schema
+    must be migrated first; a missing ``agent_runs`` table means the dev never
+    ran ``dendrux db migrate``, so raise a clear, actionable error instead of
+    letting a raw "relation does not exist" surface mid-run.
+    """
+    if url.startswith("sqlite"):
+        return
+
+    from sqlalchemy import inspect as _sa_inspect
+
+    from dendrux.errors import SchemaNotInitializedError
+
+    async with engine.connect() as conn:
+        present = await conn.run_sync(
+            lambda sync_conn: _sa_inspect(sync_conn).has_table("agent_runs")
+        )
+    if not present:
+        raise SchemaNotInitializedError()
+
+
 class Agent:
     """Dendrux agent — definition and runtime facade.
 
@@ -603,6 +627,7 @@ class Agent:
         if self._database_url is not None:
             engine = await self._create_private_engine(self._database_url)
             self._private_engine = engine
+            await _verify_schema_initialized(engine, self._database_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
             return self._lazy_store
 
@@ -611,6 +636,7 @@ class Agent:
             from dendrux.db.session import get_engine
 
             engine = await get_engine(env_url)
+            await _verify_schema_initialized(engine, env_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
             return self._lazy_store
 

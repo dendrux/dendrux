@@ -17,6 +17,7 @@ from dendrux.errors import (
     RunAlreadyTerminalError,
     RunNotFoundError,
     RunNotPausedError,
+    SchemaNotInitializedError,
 )
 from dendrux.loops.single import SingleCall
 from dendrux.runtime.context import DelegationDepthExceededError
@@ -47,6 +48,7 @@ __all__ = [
     "RunAlreadyTerminalError",
     "RunNotFoundError",
     "RunNotPausedError",
+    "SchemaNotInitializedError",
     "SingleCall",
     "StructuredOutputValidationError",
     "run",

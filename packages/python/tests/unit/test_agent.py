@@ -352,6 +352,72 @@ class TestAgentPrivateEngine:
 
 
 # ------------------------------------------------------------------
+# Persistence: schema verification (first-run setup DX)
+# ------------------------------------------------------------------
+
+
+class TestSchemaVerification:
+    """Non-SQLite backends must be migrated before first use; fail fast if not.
+
+    The url argument only gates the SQLite skip, so a file-backed SQLite
+    engine paired with a postgres-looking url exercises the real
+    inspector path deterministically without a live Postgres.
+    """
+
+    async def test_raises_when_tables_missing(self):
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from dendrux.agent import _verify_schema_initialized
+        from dendrux.errors import SchemaNotInitializedError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            url = f"sqlite+aiosqlite:///{Path(tmp) / 'empty.db'}"
+            engine = create_async_engine(url)
+            try:
+                with pytest.raises(SchemaNotInitializedError, match="dendrux db migrate"):
+                    await _verify_schema_initialized(engine, "postgresql+asyncpg://nope")
+            finally:
+                await engine.dispose()
+
+    async def test_passes_when_tables_present(self):
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from dendrux.agent import _verify_schema_initialized
+        from dendrux.db.models import Base
+
+        with tempfile.TemporaryDirectory() as tmp:
+            url = f"sqlite+aiosqlite:///{Path(tmp) / 'ready.db'}"
+            engine = create_async_engine(url)
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                # postgres-looking url forces the inspector path, not the skip
+                await _verify_schema_initialized(engine, "postgresql+asyncpg://nope")
+            finally:
+                await engine.dispose()
+
+    async def test_skips_sqlite_even_without_tables(self):
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from dendrux.agent import _verify_schema_initialized
+
+        with tempfile.TemporaryDirectory() as tmp:
+            url = f"sqlite+aiosqlite:///{Path(tmp) / 'empty.db'}"
+            engine = create_async_engine(url)
+            try:
+                # SQLite auto-creates elsewhere, so the check is a no-op here
+                await _verify_schema_initialized(engine, url)
+            finally:
+                await engine.dispose()
+
+    def test_error_is_exported(self):
+        from dendrux import SchemaNotInitializedError as Exported
+        from dendrux.errors import SchemaNotInitializedError
+
+        assert Exported is SchemaNotInitializedError
+
+
+# ------------------------------------------------------------------
 # Validation
 # ------------------------------------------------------------------
 
