@@ -1,0 +1,38 @@
+---
+title: Is dendrux for you?
+description: The three situations dendrux is built for, the ones it isn't, and a one-line test to decide before you read further.
+---
+
+# Is dendrux for you?
+
+Dendrux does one thing exceptionally well: it lets an agent run **stop and wait for something outside the process, then resume later** with nothing lost. Everything else in the library exists to make that safe, auditable, and easy.
+
+So the question that decides whether dendrux is for you is short:
+
+> **Does a run ever need to pause, hand control to something outside the process, and continue later?**
+
+If yes, dendrux is built for exactly that. If no, you may not need a persistence layer at all, and a thinner library will serve you better. Be honest about the answer before reading the rest of these docs.
+
+## Reach for dendrux when
+
+**1. A human has to approve, answer, or intervene mid-run.** Refunds over a threshold, a destructive action, a clarifying question the model can't resolve alone. The run pauses at `waiting_approval` or `waiting_human_input`, persists, and resumes when the person responds, possibly hours later, possibly from a different process. See [Human-in-the-loop approval](/docs/recipes/hitl-approval).
+
+**2. A tool runs on the client, not your server.** A spreadsheet cell the user has to fill, a browser action, a desktop app, a device. The server can't execute that tool, so the run pauses at `waiting_client_tool`, ships the call to the client, and resumes when the client posts the result back. This is the case most agent libraries don't have an answer for. See [Client-side tools](/docs/recipes/client-tools).
+
+**3. A run is long, multi-step, and must survive a restart and be auditable.** Deploys happen, processes get OOM-killed, machines reboot. With dendrux the run's full state is on disk, so a fresh process resumes it by ID, and every LLM call, tool execution, and pause is recorded as evidence you can query. See [State persistence](/docs/architecture/state-persistence) and the [observability stack](/docs/recipes/observability).
+
+Most production agents hit at least one of these. Many hit all three.
+
+## You probably don't need dendrux when
+
+- **It's a single prompt in, single completion out.** No tools, no pauses, no audit requirement. Call the provider SDK directly.
+- **It's a stateless chatbot** where losing an in-flight turn on restart is acceptable and you keep history yourself. You can run dendrux without persistence, but its value is the part you'd be turning off.
+- **You already run a durable execution engine** (Temporal, Inngest, and similar) and only want the LLM call inside an existing workflow step. See [How dendrux compares](/docs/how-dendrux-compares) for where the line sits.
+
+There's no shame in the "no" column. Dendrux is deliberately a [library, not a platform](/docs): if you don't need durable pause/resume, it's asking you to carry a database for nothing.
+
+## The one-line test, restated
+
+If you can finish the sentence *"the run has to stop here and wait for \_\_\_ before it can continue"*, dendrux is for you, and the blank is your pause point. If you can't, start with something simpler and come back when you can.
+
+Convinced? The fastest way to feel it is the [Quickstart](/docs/quickstart): you'll pause a run in one process and resume it in another in about five minutes.

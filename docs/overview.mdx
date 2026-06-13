@@ -27,18 +27,36 @@ That's the whole library. The rest of these docs explain how it does that and ho
 
 Dendrux is a **library**, not a hosted platform.
 
+## Is this for you?
+
+The value is durable pause/resume. If your agent never needs to stop and wait for a human, a client-side tool, or to survive a restart mid-run, a thinner library will serve you better. [Is dendrux for you?](/docs/is-dendrux-for-you) is a two-minute self-check, and [How dendrux compares](/docs/how-dendrux-compares) places it next to agent frameworks and durable execution engines.
+
+## Three capabilities worth knowing
+
+Everything in dendrux serves one of these. Each has a front-door page:
+
+<div className="docs-cards">
+
+**[Pause and resume](/docs/architecture/pause-resume)**: the differentiator. A run can stop for an approval, a human answer, or a client-side tool, persist to your database, and resume in a *different* process, by ID.
+
+**[Governance](/docs/architecture/governance)**: four protective layers (tool deny, human approval, advisory budgets, content guardrails with PII redaction) you turn on per agent as kwargs, not per call.
+
+**[Evidence and observability](/docs/recipes/observability)**: one stack: a fail-closed recorder, a fail-open notifier, OpenTelemetry, a dashboard, and a read API. Every LLM call, tool execution, and pause is recorded.
+
+</div>
+
 ## Where to go next
 
 <div className="docs-cards">
 
-**[Architecture](/docs/architecture/runs)**: how dendrux works under the hood. Start here if you want to understand the model before writing code.
+**[Quickstart](/docs/quickstart)**: install dendrux and run your first pause/resume agent in five minutes. Start here.
 
-**[Quickstart](/docs/quickstart)**: install dendrux and run your first pause/resume agent in five minutes.
+**[Architecture](/docs/architecture/runs)**: how dendrux works under the hood, once you've felt the loop.
 
 **[Recipes](/docs/recipes/hitl-approval)**: task-shaped guides for human-in-the-loop approval, browser-side tools, cancelling a run, mounting the read router, and per-thread chatbot observability.
 
-**[Building a product?](/docs/recipes/app-database-boundary)** Read [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary) first: which data lives in your database vs Dendrux's, a minimal ChatGPT-style schema, and the request lifecycle for one chat turn.
+**[Building a product?](/docs/recipes/app-database-boundary)** Read [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary): which data lives in your database vs Dendrux's, a minimal ChatGPT-style schema, and the request lifecycle for one chat turn.
 
 </div>
 
-If you're new, the recommended order is **Architecture, then Quickstart, then Recipes**. Reading the architecture pages first is unusual for software docs, but dendrux's value is in *how* it persists and resumes. The API only makes sense once you know that model.
+The recommended order is **Quickstart, then Architecture, then Recipes**. Run the five-minute pause/resume demo first: dendrux's value is in *how* it persists and resumes, and the architecture pages land far better once you've seen it happen.

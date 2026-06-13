@@ -1,0 +1,54 @@
+---
+title: How dendrux compares
+description: Where dendrux sits relative to agent frameworks, durable execution engines, and a do-it-yourself database, and when to pick which.
+---
+
+# How dendrux compares
+
+Dendrux occupies a specific slot: **the resumable, auditable agent loop, as a library you embed in your own server.** That slot sits between two larger categories you've probably already considered, and one you could always build yourself. This page is about where the lines are, not about who's better. For most teams the honest answer is "use dendrux *with* one of these," not "instead of."
+
+## The slot, in one sentence
+
+Most agent frameworks help you **compose** the loop in process. Most durable engines help you **run** arbitrary work reliably. Dendrux does the narrow thing in the middle: it **persists an agent loop** so it can pause for the real world and resume in any process, with every step recorded as evidence.
+
+## Versus agent frameworks
+
+LangChain / LangGraph, CrewAI, the OpenAI Agents SDK, and similar libraries are about *constructing* an agent: prompts, tools, multi-agent graphs, memory. That's most of the work, and dendrux doesn't try to replace all of it.
+
+The difference is what happens when a run has to **stop**. Composing the loop in memory is table stakes; persisting it so a *different OS process* can resume it by ID, and so a tool can execute on the user's **client** while the server waits, is dendrux's center of gravity. If your agent never needs to pause for a human or a client-side tool and never needs to survive a restart mid-run, a composition-first framework is lighter and you should use it. If it does, that's the exact gap dendrux fills.
+
+Dendrux also stays deliberately small: tools are plain Python functions, there's no registry or DSL, and it reads MCP servers as a tool *source* rather than competing with them. You can use it alongside a heavier framework for the parts it doesn't cover.
+
+## Versus durable execution engines
+
+Temporal, Inngest, Restate, and the like are general-purpose **durable execution**: any workflow, any language, replay-based recovery, retries, schedules. They are powerful and battle-tested, and they are the right tool for company-wide orchestration.
+
+The tradeoffs that make dendrux a different choice:
+
+| | Durable execution engines | Dendrux |
+| --- | --- | --- |
+| Scope | Any durable workflow | The agent loop specifically |
+| Infra | Separate workers / a service to operate | Your existing async server + your database |
+| LLM awareness | You build it | Built in: token/cost rollups, prompt cache, provider streaming, governance |
+| Pause for a *client-side* tool | You model it yourself | First-class (`waiting_client_tool`) |
+| Recovery model | Replay / automatic retry | State on disk; you resume or reconcile (no workers, no auto-retry) |
+
+If you already operate one of these, you may want the LLM call to live inside one of its steps, and dendrux can sit there too. If you don't, standing up a worker fleet just to make one agent resumable is a lot of machinery for the job dendrux does with a table in the database you already run.
+
+## Versus rolling your own
+
+A `runs` table with a `status` column, your own loop, and a few endpoints is a completely reasonable starting point, and it's roughly what dendrux *is* underneath. The reason to reach for the library is that the unglamorous parts are already solved and tested:
+
+- A monotonic, reconnect-safe [event log](/docs/architecture/event-ordering) and SSE stream.
+- An atomic claim (compare-and-set) so two processes can't resume the same pause twice.
+- [Cancellation](/docs/architecture/cancellation) that's cooperative for running runs and atomic for paused ones.
+- Four [governance](/docs/architecture/governance) layers (deny, approval, budget, guardrails with PII redaction) as kwargs.
+- A durable [recorder](/docs/architecture/recorder) plus a fail-open [notifier](/docs/architecture/notifier), and a read API your own UI can mount.
+
+Build it yourself if the surface is genuinely small and you want zero dependencies. Use dendrux when you'd otherwise be reimplementing the list above, and you'd rather spend that time on your product.
+
+## What dendrux is not pretending to be
+
+To keep the comparison honest: dendrux is a **library** at an early version. It does not run a server, workers, schedulers, or crash recovery for you. It does not auto-retry crashed runs. You own deployment, scaling, and auth. That's a deliberate [scope choice](/docs), not a roadmap gap, and it's why dendrux drops into an app you already have instead of asking you to adopt a platform.
+
+Next: the [Quickstart](/docs/quickstart) to feel the core loop, or [Is dendrux for you?](/docs/is-dendrux-for-you) if you're still deciding.
