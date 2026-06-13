@@ -19,7 +19,45 @@ The rest of this page focuses on `deny`, which is the most commonly used. The ot
 
 ## A real deny in action
 
-An admin agent has two tools: `refund` and `delete_user`. `delete_user` is in the deny list. The user asks the agent to delete user 42. Captured from a live run:
+An admin agent has two tools: `refund` and `delete_user`. `delete_user` is in the deny list. The user asks the agent to delete user 42:
+
+```python
+import asyncio
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
+async def refund(order_id: int) -> str:
+    """Issue a refund for an order."""
+    return f"Refunded order {order_id}"
+
+
+@tool(target="server")
+async def delete_user(user_id: int) -> str:
+    """Permanently delete a user."""
+    return f"Deleted user {user_id}"
+
+
+async def main() -> None:
+    async with Agent(
+        name="Admin",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are an admin agent.",
+        tools=[refund, delete_user],
+        deny=["delete_user"],                 # delete_user can never execute
+        database_url="sqlite+aiosqlite:///admin.db",
+    ) as agent:
+        result = await agent.run("Delete user 42 using the delete_user tool.")
+        print(result.status.value)            # success  (deny is a gate, not a run-killer)
+        print(result.answer)                  # "...delete_user has been denied by policy..."
+
+
+asyncio.run(main())
+```
+
+Captured from a live run of that script:
 
 ```text
 status: success

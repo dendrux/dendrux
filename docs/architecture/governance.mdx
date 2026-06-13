@@ -49,6 +49,47 @@ PROVIDER_RETRY          = 'provider.retry'
 
 Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
 
+## Producing and reading a governance event
+
+Turn on a guardrail and the governance events land on the same `run_events` stream you read with `RunStore.get_events`. Here a PII guardrail redacts an email from the incoming message:
+
+```python
+import asyncio
+
+from dendrux import Agent
+from dendrux.guardrails import PII
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///gov.db"
+
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. Reply briefly.",
+        guardrails=[PII(engine="presidio")],   # redact PII before it reaches the model
+        database_url=url,
+    ) as agent:
+        result = await agent.run("My email is jane.doe@example.com, can you confirm it?")
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        for e in await store.get_events(result.run_id):
+            print(e.sequence_index, e.event_type)
+        # 0 run.started
+        # 1 guardrail.detected
+        # 2 guardrail.redacted
+        # 3 llm.completed
+        # 4 run.completed
+
+
+asyncio.run(main())
+```
+
+Lifecycle events (`run.started`, `llm.completed`, `run.completed`) and governance events (`guardrail.detected`, `guardrail.redacted`) share one ordered stream. Adding `require_approval=[...]` puts `approval.requested` / `approval.decided` on the same stream; `deny=[...]` adds `policy.denied`. See [Approval](/docs/architecture/approval) and [Access control](/docs/architecture/access-control) for runnable examples of those.
+
 ## A run that exercises two layers
 
 The scratchpad below builds an agent with PII redaction *and* an approval gate, then runs the input `"Refund order 42 for jane.doe@example.com."` Both layers fire. Real `run_events` from the run:

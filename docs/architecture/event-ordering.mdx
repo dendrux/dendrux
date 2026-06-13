@@ -74,6 +74,41 @@ print([e.sequence_index for e in events])
 # [4, 5, 6, 7, 8]
 ```
 
+A complete, self-contained version you can run. A short run produces a three-event log; reading it back with `after_sequence_index` excludes the event the client already saw:
+
+```python
+import asyncio
+
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///events.db"
+
+    async with Agent(
+        name="QA",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="Answer in one short sentence.",
+        database_url=url,
+    ) as agent:
+        result = await agent.run("What is the capital of France?")
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        print([e.sequence_index for e in await store.get_events(result.run_id)])
+        # [0, 1, 2]
+
+        # A client that already saw seq=0 reconnects: strict > cursor, no replay of seq 0.
+        resumed = await store.get_events(result.run_id, after_sequence_index=0)
+        print([e.sequence_index for e in resumed])
+        # [1, 2]
+
+
+asyncio.run(main())
+```
+
 ## Why a DB-backed cursor instead of an in-memory queue
 
 A typical event-bus design broadcasts new events through an in-process pub/sub queue. It is fast, but it does not survive process restarts, it does not work across multiple web instances, and it cannot replay events the client missed while offline.

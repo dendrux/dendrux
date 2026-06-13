@@ -12,24 +12,33 @@ The power of this design is that the two halves of the flow do not have to share
 ## Declaring an approval gate
 
 ```python
-from dendrux import Agent, tool
+import asyncio
 
-@tool()
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
 async def refund(order_id: int) -> str:
     """Issue a refund."""
     return f"Refunded order {order_id}"
 
-agent = Agent(
-    provider=...,
-    prompt="You are a support agent.",
-    tools=[refund],
-    require_approval=["refund"],     # refund cannot execute without submit_approval
-    database_url="sqlite+aiosqlite:///demo.db",
-)
 
-result = await agent.run("Please refund order 42.")
-# result.status is RunStatus.WAITING_APPROVAL
-# result.run_id is the handle for submit_approval later
+async def main() -> None:
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. Use the refund tool when a refund is requested.",
+        tools=[refund],
+        require_approval=["refund"],     # refund cannot execute without submit_approval
+        database_url="sqlite+aiosqlite:///demo.db",
+    ) as agent:
+        result = await agent.run("Refund order 42 using the refund tool.")
+        print(result.status.value)       # waiting_approval
+        print(result.run_id)             # handle for submit_approval later
+
+
+asyncio.run(main())
 ```
 
 The gated tool is registered normally. The runtime just remembers its name. At dispatch time, a call to a name in `require_approval` is intercepted before the tool function would run.
@@ -64,7 +73,21 @@ Five things to notice:
 
 ## The reject path
 
-`submit_approval(run_id, approved=False, rejection_reason="...")` is the other branch. A live capture with the same `refund` agent, rejected with the reason `"Manager declined: amount exceeds automatic threshold."`:
+`submit_approval(run_id, approved=False, rejection_reason="...")` is the other branch. It resumes the run, skips the tool, and feeds a synthetic failed tool result (carrying the reason) back to the model:
+
+```python
+paused = await agent.run("Refund order 42 using the refund tool.")
+print(paused.status.value)   # waiting_approval
+
+done = await agent.submit_approval(
+    paused.run_id,
+    approved=False,
+    rejection_reason="Manager declined: amount exceeds automatic threshold.",
+)
+print(done.status.value)     # success  (the run finishes; the model handles the rejection)
+```
+
+A live capture with the same `refund` agent, rejected with that reason:
 
 ```text
 first: status=waiting_approval
