@@ -219,17 +219,41 @@ The regex engine runs first and claims the structured tokens it knows about; Pre
 ## SecretDetection: block by default
 
 ```python
-from dendrux.guardrails import SecretDetection
+import asyncio
 
-agent = Agent(
-    ...,
-    guardrails=[SecretDetection()],   # action='block' by default
-)
+from dendrux import Agent
+from dendrux.guardrails import SecretDetection
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///secrets.db"
+
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a helpful assistant.",
+        guardrails=[SecretDetection()],   # action='block' by default
+        database_url=url,
+    ) as agent:
+        result = await agent.run("Here is my key: AKIAIOSFODNN7EXAMPLE, please store it.")
+        print(result.status.value)        # error  (the secret never reaches the model)
+        print(result.error)
+        # Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY matched 'AKIAIOSFODNN7EXAMPLE'
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        print([e.event_type for e in await store.get_events(result.run_id)])
+        # ['run.started', 'guardrail.blocked', 'run.completed']
+
+
+asyncio.run(main())
 ```
 
 `SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. The default action is `block`, not `redact`, because a secret that leaked into a prompt should stop the conversation rather than be silently replaced.
 
-Running the input `"Here is my key: AKIAIOSFODNN7EXAMPLE, please store it."` against the default configuration:
+The captured governance rows from that run:
 
 ```text
 status: error
