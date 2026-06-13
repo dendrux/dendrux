@@ -16,6 +16,43 @@ print(result.status.value)   # "cancelled" if cancel won, original terminal othe
 
 That is it. No sequencing, no polling, no separate claim step. You give it a `run_id` and it makes the right call against the DB. Persistence is required (`PersistenceNotConfiguredError` otherwise), and the run must exist (`RunNotFoundError` otherwise).
 
+A complete, runnable example. A run pauses for approval; instead of approving, cancel it:
+
+```python
+import asyncio
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+
+
+@tool(target="server")
+async def refund(order_id: int) -> str:
+    """Issue a refund for an order."""
+    return f"Refunded order {order_id}"
+
+
+async def main() -> None:
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a support agent. Use the refund tool when a refund is requested.",
+        tools=[refund],
+        require_approval=["refund"],
+        database_url="sqlite+aiosqlite:///cancel.db",
+    ) as agent:
+        paused = await agent.run("Refund order 42 using the refund tool.")
+        print(paused.status.value)                       # waiting_approval
+
+        cancelled = await agent.cancel_run(paused.run_id)
+        print(cancelled.status.value)                    # cancelled
+
+        # Idempotent: cancelling a terminal run is a no-op, never raises.
+        print((await agent.cancel_run(paused.run_id)).status.value)  # cancelled
+
+
+asyncio.run(main())
+```
+
 ## What happens, by state
 
 `cancel_run` looks at the run's current persisted status and picks one of four paths.

@@ -54,6 +54,54 @@ result = await agent.run(
 
 That is the entire integration. No env vars, no config files, no wrapper classes.
 
+## A self-contained example
+
+Your real app sends spans to its existing exporter. To see the span tree locally without a backend, wire up an in-memory exporter:
+
+```python
+import asyncio
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.notifiers.otel import OpenTelemetryNotifier
+
+
+@tool(target="server")
+async def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+
+exporter = InMemorySpanExporter()
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(exporter))
+trace.set_tracer_provider(provider)
+
+
+async def main() -> None:
+    async with Agent(
+        name="Calc",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a calculator. Use the add tool.",
+        tools=[add],
+        database_url="sqlite+aiosqlite:///otel.db",
+    ) as agent:
+        await agent.run("What is 15 + 27?", notifier=OpenTelemetryNotifier())
+
+    print([s.name for s in exporter.get_finished_spans()])
+    # ['chat claude-haiku-4-5', 'execute_tool add', 'chat claude-haiku-4-5', 'invoke_agent Calc']
+
+
+asyncio.run(main())
+```
+
+Children (`chat`, `execute_tool`) finish before their `invoke_agent` parent, which is why they appear first in the exporter's completion-ordered list.
+
 ## What you see in your tracing UI
 
 A FastAPI request that calls `agent.run()` produces a tree like this in Jaeger / Honeycomb / Datadog:
