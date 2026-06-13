@@ -1,4 +1,13 @@
-"""19 — CLI chatbot with Postgres + governance (PII, PromptInjection, Budget)."""
+"""19 — CLI chatbot with Postgres + governance (PII, PromptInjection, Budget).
+
+First-time setup: Postgres tables are not auto-created. Create them once before
+running this example, otherwise the first turn raises SchemaNotInitializedError:
+
+    export DENDRUX_DATABASE_URL=postgresql+asyncpg://postgres:root@localhost:5432/dendrux
+    dendrux db migrate
+
+SQLite needs none of this (it auto-creates). See docs: architecture/state-persistence.
+"""
 
 from __future__ import annotations
 
