@@ -1,0 +1,102 @@
+---
+title: API glossary
+description: Every public symbol Dendrux exports, grouped by area, with its import path and a one-line description. The map for navigating the rest of the docs.
+---
+
+# API glossary
+
+This is the full public surface of Dendrux: everything you import in normal use. Each entry links to the page that explains it in depth. If a symbol is not listed here, treat it as internal and subject to change.
+
+## Core
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `Agent` | `from dendrux import Agent` | The agent: definition + runtime facade. See [Agent](/docs/reference/agent). |
+| `tool` | `from dendrux import tool` | Decorator that turns an async function into a tool. |
+| `Budget` | `from dendrux import Budget` | Advisory per-run token cap. See [Budget](/docs/architecture/budget). |
+| `run` | `from dendrux import run` | Low-level functional runner behind `Agent.run` (advanced use). |
+| `sweep` | `from dendrux import sweep` | One-shot reconciliation of stale/abandoned runs (you schedule it). |
+
+## Loops
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `ReActLoop` | `from dendrux.loops import ReActLoop` | Default loop: think, act, observe, repeat. See [Loops](/docs/architecture/loops). |
+| `SingleCall` | `from dendrux import SingleCall` | One LLM call, no tools, supports `output_type`. |
+| `Loop` | `from dendrux.loops import Loop` | Base class for custom loops. |
+
+## Chat history
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `ChatMessage` | `from dendrux.chat import ChatMessage` | One prior turn passed via `history=`. See [Chatbot threads](/docs/recipes/chatbot-threads). |
+| `ChatRole` | `from dendrux.chat import ChatRole` | `USER` or `ASSISTANT`. |
+
+## Providers
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `AnthropicProvider` | `from dendrux.llm.anthropic import AnthropicProvider` | Anthropic Messages API provider. |
+| `OpenAIProvider` | `from dendrux.llm.openai import OpenAIProvider` | OpenAI Chat Completions provider. |
+| `OpenAIResponsesProvider` | `from dendrux.llm.openai_responses import OpenAIResponsesProvider` | OpenAI Responses API provider (built-in tools). |
+
+Caching is automatic for all built-in providers. See [Prompt cache](/docs/architecture/prompt-cache).
+
+## Guardrails
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `PII` | `from dendrux.guardrails import PII` | Redact/block/warn on PII (regex or Presidio). See [Guardrails](/docs/architecture/guardrails). |
+| `SecretDetection` | `from dendrux.guardrails import SecretDetection` | Block on leaked secrets (AWS keys, tokens, PEM). |
+| `PromptInjection` | `from dendrux.guardrails import PromptInjection` | Regex injection guard (you supply patterns). See [Patterns](/docs/recipes/prompt-injection-patterns). |
+| `Pattern` | `from dendrux.guardrails import Pattern` | A named regex `Pattern(name, regex)`. |
+| `Guardrail` | `from dendrux.guardrails import Guardrail` | Protocol for custom guardrails (`async scan(text)`). |
+| `Finding` | `from dendrux.guardrails import Finding` | One detection: entity type, span, score, text. |
+
+## Notifiers
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `ConsoleNotifier` | `from dendrux.notifiers import ConsoleNotifier` | Rich terminal output. See [Notifier](/docs/architecture/notifier). |
+| `CompositeNotifier` | `from dendrux.notifiers import CompositeNotifier` | Fan one event set out to many notifiers. |
+| `OpenTelemetryNotifier` | `from dendrux.notifiers.otel import OpenTelemetryNotifier` | GenAI-semconv spans. See [OpenTelemetry](/docs/recipes/opentelemetry). |
+| `BaseNotifier` | `from dendrux.loops.base import BaseNotifier` | No-op base to subclass for custom notifiers. |
+
+## Persistence and reads
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
+| `make_read_router` | `from dendrux.http import make_read_router` | Mountable FastAPI read router. See [make_read_router](/docs/reference/read-router). |
+
+`RunStore` read methods return these record types (all from `dendrux.store`): `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`. Fields are documented on the [RunStore](/docs/reference/run-store) page.
+
+## Tool sources
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `MCPServer` | `from dendrux.mcp import MCPServer` | An MCP tool source for `tool_sources=`. See [MCP](/docs/architecture/mcp). |
+
+## Result and event types
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`. |
+| `RunStatus` | `from dendrux.types import RunStatus` | `pending`, `running`, `waiting_*`, `success`, `error`, `cancelled`, `max_iterations`. |
+| `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
+| `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
+| `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |
+| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 15 governance event types. See [Governance](/docs/architecture/governance). |
+| `CreateRunResult` | `from dendrux import CreateRunResult` | Idempotent-create outcome. |
+
+## Errors
+
+All exceptions live in `dendrux.errors` (and the most common ones are re-exported from `dendrux`). Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`.
+
+## Where to go next
+
+- [Agent](/docs/reference/agent): the constructor and every runtime method.
+- [RunStore](/docs/reference/run-store): every read method and record type.
+- [make_read_router](/docs/reference/read-router): the HTTP read surface.
+- [Errors](/docs/reference/errors): the exception hierarchy and HTTP mappings.
+- [HTTP API surface](/docs/reference/http-api): the read router's endpoints in detail.

@@ -1,0 +1,75 @@
+---
+title: Errors
+description: The public exception hierarchy Dendrux raises, when each fires, the constructor arguments, and a suggested HTTP status mapping for your write routes.
+---
+
+# Errors
+
+Dendrux's runtime methods raise typed exceptions on precondition failures. You catch them in your own routes (or CLI, or jobs) and map them to status codes. Dendrux never forces a status-code contract.
+
+```python
+from dendrux.errors import (
+    RunNotFoundError, RunNotPausedError, PauseStatusMismatchError,
+    RunAlreadyClaimedError, RunAlreadyTerminalError, InvalidToolResultError,
+    PersistenceNotConfiguredError, SchemaNotInitializedError,
+)
+```
+
+The most common ones are also re-exported from the top-level `dendrux` package.
+
+## The hierarchy
+
+| Exception | Base | Raised when | Suggested HTTP |
+| --- | --- | --- | --- |
+| `RunNotFoundError(run_id)` | `LookupError` | `run_id` does not exist in the store. | 404 |
+| `RunNotPausedError(run_id, current_status)` | `RuntimeError` | A submit method is called on a run that is not paused. | 409 |
+| `PauseStatusMismatchError(run_id, current_status, expected_status)` | `RuntimeError` | Submit called for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). | 409 |
+| `RunAlreadyClaimedError(run_id)` | `RuntimeError` | A concurrent submit already won the CAS claim on this pause. | 409 |
+| `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method targets a run that is already terminal. (`cancel_run` does not raise this.) | 409 |
+| `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set (unknown or duplicate ids). | 400 |
+| `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` / `DENDRUX_DATABASE_URL` is configured. | 500 |
+| `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
+
+Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling.
+
+## Also exported from `dendrux`
+
+A few related exceptions live on the package root rather than `dendrux.errors`:
+
+| Exception | Raised when |
+| --- | --- |
+| `RunAlreadyActiveError` | An idempotent create finds an already-active run. |
+| `IdempotencyConflictError` | An `idempotency_key` collides with a different request fingerprint. |
+| `StructuredOutputValidationError` | A SingleCall `output_type` fails validation. |
+| `DelegationDepthExceededError` | A sub-agent exceeds `max_delegation_depth`. |
+
+## Example: mapping errors in a write route
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from dendrux.errors import (
+    PauseStatusMismatchError, PersistenceNotConfiguredError,
+    RunAlreadyClaimedError, RunAlreadyTerminalError,
+    RunNotFoundError, RunNotPausedError,
+)
+
+@router.post("/runs/{run_id}/approval")
+async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
+    try:
+        result = await agent.submit_approval(
+            run_id, approved=body["approved"], rejection_reason=body.get("rejection_reason"),
+        )
+    except RunNotFoundError:
+        raise HTTPException(404, "run not found")
+    except (RunNotPausedError, PauseStatusMismatchError,
+            RunAlreadyClaimedError, RunAlreadyTerminalError) as e:
+        raise HTTPException(409, str(e))
+    except PersistenceNotConfiguredError:
+        raise HTTPException(500, "persistence not configured")
+    return {"status": result.status.value, "answer": result.answer}
+```
+
+## Where this fits
+
+- [Agent](/docs/reference/agent): which method raises which error.
+- [Human-in-the-loop approval](/docs/recipes/hitl-approval) and [Cancelling a run](/docs/recipes/cancel-run): error handling in context.

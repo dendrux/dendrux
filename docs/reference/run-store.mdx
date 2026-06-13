@@ -1,0 +1,109 @@
+---
+title: RunStore
+description: The read-only facade over Dendrux's six tables. Constructors, every read method with its exact signature, and the record types they return.
+---
+
+# RunStore
+
+`RunStore` is the public, read-only way to query everything Dendrux persisted about a run. It is a plain Python object you can call from any code (routes, admin scripts, background jobs) and it is what [`make_read_router`](/docs/reference/read-router) is built on.
+
+```python
+from dendrux.store import RunStore
+
+store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
+async with store:
+    run = await store.get_run(run_id)
+    events = await store.get_events(run_id)
+```
+
+## Constructors and lifecycle
+
+```python
+@classmethod
+def from_database_url(database_url: str) -> RunStore     # store owns the engine
+@classmethod
+def from_engine(engine: AsyncEngine) -> RunStore         # caller owns the engine
+async def close() -> None
+```
+
+`from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` reuses an engine you already have; `close()` is then a no-op and you dispose the engine yourself. `RunStore` is an async context manager.
+
+## Read methods
+
+```python
+async def list_runs(
+    *,
+    status: str | list[str] | None = None,
+    agent_name: str | None = None,
+    parent_run_id: str | None = None,
+    tenant_id: str | None = None,
+    started_after: datetime | None = None,
+    started_before: datetime | None = None,
+    metadata_filter: dict[str, Any] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[RunSummary]
+
+async def count_runs(*, status=..., agent_name=..., parent_run_id=...,
+                     tenant_id=..., started_after=..., started_before=...,
+                     metadata_filter=...) -> int
+
+async def get_run(run_id: str) -> RunDetail | None
+async def get_events(run_id: str, *, after_sequence_index: int | None = None,
+                     limit: int | None = None) -> list[StoredEvent]
+async def stream_events(run_id: str, *, after_sequence_index: int | None = None,
+                        poll_interval_s: float = 0.5) -> AsyncIterator[StoredEvent]
+async def get_llm_calls(run_id: str, *, iteration=None, limit=None, offset=0) -> list[LLMCall]
+async def get_tool_invocations(run_id: str, *, iteration=None, limit=None, offset=0) -> list[ToolInvocation]
+async def get_traces(run_id: str, *, limit=None, offset=0) -> list[TraceEntry]
+async def get_pauses(run_id: str) -> list[PausePair]
+async def get_pii_mapping(run_id: str) -> dict[str, str]
+```
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `list_runs` | `RunSummary` page | Filters AND together. `metadata_filter` is exact-match across `meta` keys. |
+| `count_runs` | `int` | Same filters as `list_runs`, for pagination totals. |
+| `get_run` | `RunDetail` or `None` | One run's full anchor row. |
+| `get_events` | `StoredEvent` list | `after_sequence_index` is a strict `>` cursor (reconnect-safe). See [Event ordering](/docs/architecture/event-ordering). |
+| `stream_events` | async iterator | The same source SSE polls. |
+| `get_llm_calls` | `LLMCall` list | Per-LLM-call usage, cache, raw payloads. |
+| `get_tool_invocations` | `ToolInvocation` list | Per tool execution: params, result, success. |
+| `get_traces` | `TraceEntry` list | Conversation messages in order. |
+| `get_pauses` | `PausePair` list | HITL pause/resume cycles. |
+| `get_pii_mapping` | `dict[str, str]` | Placeholder to real value. See [PII redaction](/docs/architecture/pii-redaction). |
+
+### `metadata_filter`
+
+`list_runs` and `count_runs` accept `metadata_filter: dict[str, Any]` (the HTTP router does not expose this). It does exact-match equality across every key in the run's `meta` JSON, AND across keys (`jsonb @>` on Postgres, repeated `json_extract` on SQLite). Keys are restricted to `^[A-Za-z0-9_-]+$`; nested paths are out of scope. The canonical use is per-conversation observability:
+
+```python
+runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"})
+total = await store.count_runs(metadata_filter={"user_id": "u_123"}, status="error")
+```
+
+See [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
+
+## Record types
+
+All returned from `dendrux.store`. Fields, exact as persisted:
+
+**`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`.
+
+**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`.
+
+**`StoredEvent`** (from `get_events`): `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data`, `created_at`.
+
+**`LLMCall`** (from `get_llm_calls`): `iteration`, `provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_usd`, `duration_ms`, `provider_request`, `provider_response`, `created_at`.
+
+**`ToolInvocation`** (from `get_tool_invocations`): `iteration`, `tool_name`, `tool_call_id`, `provider_tool_call_id`, `target`, `params`, `result`, `success`, `error`, `duration_ms`, `created_at`.
+
+**`TraceEntry`** (from `get_traces`): `role`, `content`, `order_index`, `meta`, `created_at`.
+
+**`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`.
+
+## Where this fits
+
+- [State persistence](/docs/architecture/state-persistence): the tables behind these records.
+- [make_read_router](/docs/reference/read-router): the same reads over HTTP.
+- [HTTP API surface](/docs/reference/http-api): the endpoint shapes.

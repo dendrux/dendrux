@@ -1,0 +1,162 @@
+---
+title: Agent
+description: The Agent constructor and every public runtime method (run, resume, the submit family, stream, cancel, retry, close) with exact signatures.
+---
+
+# Agent
+
+`Agent` holds an agent's identity, capabilities, and limits, and exposes the runtime methods that execute it. Construct it once and reuse it across many runs.
+
+```python
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+
+agent = Agent(
+    name="Support",
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="You are a support agent.",
+    tools=[...],
+    database_url="sqlite+aiosqlite:///app.db",
+)
+```
+
+`Agent` is an async context manager. Use `async with Agent(...) as agent:` so MCP sources, the provider, and any agent-owned engine close cleanly. All runtime methods are `async`.
+
+## Constructor
+
+```python
+Agent(
+    *,
+    provider: LLMProvider,
+    prompt: str,
+    name: str = ...,                       # defaults to the class name
+    tools: list[Callable] = [],
+    tool_sources: list[MCPServer] | None = None,
+    max_iterations: int = 10,
+    max_delegation_depth: int | None = None,
+    loop: Loop | None = None,              # defaults to ReActLoop
+    output_type: type[BaseModel] | None = None,
+    database_url: str | None = None,
+    database_options: dict[str, Any] | None = None,
+    state_store: StateStore | None = None,
+    deny: list[str] | None = None,
+    require_approval: list[str] | None = None,
+    budget: Budget | None = None,
+    guardrails: list[Guardrail] | None = None,
+    skills_dir: str | Path | None = None,
+    skills: list[Skill] | None = None,
+    deny_skills: list[str] | None = None,
+)
+```
+
+| Parameter | Purpose |
+| --- | --- |
+| `provider` | The LLM provider. Required. See [providers in the glossary](/docs/reference/api-glossary#providers). |
+| `prompt` | The system prompt. Required (a subclass may set it as a class attribute instead). |
+| `name` | Used for the run's owner and `cache_key_prefix`. Defaults to the class name. |
+| `tools` | List of `@tool`-decorated functions. Empty for a pure chatbot. |
+| `tool_sources` | List of `MCPServer` tool sources. See [MCP](/docs/architecture/mcp). |
+| `max_iterations` | ReAct safety cap on LLM turns. Default 10. |
+| `max_delegation_depth` | Max sub-agent nesting depth. |
+| `loop` | `ReActLoop()` (default) or `SingleCall()`. See [Loops](/docs/architecture/loops). |
+| `output_type` | A pydantic model for structured output. SingleCall only. |
+| `database_url` | SQLAlchemy async URL. Enables persistence. Falls back to `DENDRUX_DATABASE_URL`. |
+| `database_options` | Extra kwargs passed to `create_async_engine`. |
+| `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). |
+| `deny` | Tool names that can never execute. See [Access control](/docs/architecture/access-control). |
+| `require_approval` | Server-tool names that pause for approval. See [Approval](/docs/architecture/approval). |
+| `budget` | A `Budget(max_tokens=..., warn_at=...)`. See [Budget](/docs/architecture/budget). |
+| `guardrails` | List of guardrails scanned each turn. See [Guardrails](/docs/architecture/guardrails). |
+| `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. See [Skills](/docs/architecture/skills). |
+
+Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, and tools with `SingleCall` all raise `ValueError`.
+
+## `run`
+
+```python
+async def run(
+    user_input: str,
+    *,
+    history: list[ChatMessage] | None = None,
+    tenant_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    notifier: LoopNotifier | None = None,
+    idempotency_key: str | None = None,
+    output_type: type[BaseModel] | None = None,
+) -> RunResult
+```
+
+Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence.
+
+## `stream`
+
+```python
+def stream(
+    user_input: str,
+    *,
+    history: list[ChatMessage] | None = None,
+    tenant_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    notifier: LoopNotifier | None = None,
+) -> RunStream
+```
+
+Same inputs as `run`, but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. Guardrails are not supported on the streaming path.
+
+## `resume`, `submit_tool_results`, `submit_input`, `submit_approval`
+
+The submit family resumes a paused run. Each one matches a pause status (see [Pause and resume](/docs/architecture/pause-resume)). All require persistence and the run to exist.
+
+```python
+async def submit_tool_results(run_id: str, results: list[ToolResult], *, notifier=None) -> RunResult
+async def submit_input(run_id: str, text: str, *, notifier=None) -> RunResult
+async def submit_approval(run_id: str, *, approved: bool, rejection_reason: str | None = None, notifier=None) -> RunResult
+async def resume(run_id: str, *, tool_results=None, user_input=None, notifier=None) -> RunResult
+```
+
+| Method | Resumes | Raises |
+| --- | --- | --- |
+| `submit_tool_results` | `waiting_client_tool` | `InvalidToolResultError` on id mismatch; the shared resume errors below. |
+| `submit_input` | `waiting_human_input` | the shared resume errors below. |
+| `submit_approval` | `waiting_approval` | the shared resume errors below. |
+| `resume` | generic resume entry point | same. |
+
+Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `PersistenceNotConfiguredError`. See [Errors](/docs/reference/errors).
+
+## `resume_stream`
+
+```python
+def resume_stream(run_id: str, *, tool_results=None, user_input=None, notifier=None) -> RunStream
+```
+
+Streaming variant of resume: returns a `RunStream` for the resumed run.
+
+## `cancel_run`
+
+```python
+async def cancel_run(run_id: str) -> RunResult
+```
+
+Request cancellation. Works for paused runs (atomic CAS to `cancelled`), running runs (cooperative flag), and terminal runs (no-op, never raises). Returns the persisted state. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
+
+## `retry`
+
+```python
+async def retry(run_id: str, *, tenant_id=None, metadata=None, notifier=None, **kwargs) -> RunResult
+```
+
+Start a fresh run that reuses an existing terminal run's input and approximate prior context. Requires persistence.
+
+## `close`
+
+```python
+async def close() -> None
+```
+
+Close MCP sources, the provider, and any agent-owned engine. Called for you by `async with Agent(...)`. The shared global engine from `DENDRUX_DATABASE_URL` is not disposed (it is not agent-owned).
+
+## Where this fits
+
+- [Runs and the lifecycle](/docs/architecture/runs): the status state machine these methods move through.
+- [RunStore](/docs/reference/run-store): read back what a run produced.
+- [Errors](/docs/reference/errors): the exceptions the submit family raises.

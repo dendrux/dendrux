@@ -1,0 +1,64 @@
+---
+title: make_read_router
+description: The factory that returns a mountable FastAPI read router over RunStore. Signature, the endpoints it adds, and the auth contract.
+---
+
+# make_read_router
+
+`make_read_router` builds a read-only FastAPI `APIRouter` over a [`RunStore`](/docs/reference/run-store). Mount it into your app and you get the full read surface (list, detail, events, SSE, drill-downs) with one auth dependency.
+
+```python
+from dendrux.http import make_read_router
+```
+
+## Signature
+
+```python
+def make_read_router(*, store: RunStore, authorize: Callable[..., Any]) -> APIRouter
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `store` | The `RunStore` the router reads from. |
+| `authorize` | A FastAPI dependency. Raise `HTTPException` to deny; return anything (ignored) to allow. Runs on every route except `/health`. |
+
+Returns a plain `APIRouter`. You own the prefix, CORS, TLS, rate limiting, and middleware. Write routes (submit / cancel) are yours to build on `Agent` methods.
+
+## Mount
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+from dendrux.http import make_read_router
+from dendrux.store import RunStore
+
+app = FastAPI()
+store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
+
+async def authorize(request: Request) -> None:
+    if request.headers.get("authorization") != f"Bearer {TOKEN}":
+        raise HTTPException(401, "unauthorized")
+
+app.include_router(make_read_router(store=store, authorize=authorize), prefix="/api")
+```
+
+## Endpoints added
+
+| Method + path | Returns |
+| --- | --- |
+| `GET /health` | `{"status": "ok"}` (unauthenticated, for probes) |
+| `GET /runs` | Filtered, paginated run list |
+| `GET /runs/{run_id}` | One run's detail (404 if unknown) |
+| `GET /runs/{run_id}/events` | Paginated event log (`?after=N` cursor) |
+| `GET /runs/{run_id}/events/stream` | Server-Sent Events stream |
+| `GET /runs/{run_id}/llm-calls` | Per-LLM-call records |
+| `GET /runs/{run_id}/tool-calls` | Per-tool-execution records |
+| `GET /runs/{run_id}/traces` | Conversation messages in order |
+| `GET /runs/{run_id}/pauses` | Pause/resume pairs |
+
+Full request/response shapes, query params, and the SSE cursor rules are in the [HTTP API surface](/docs/reference/http-api) and the [Mount the read router](/docs/recipes/mount-read-router) recipe. `metadata_filter` is not exposed over HTTP by design; call `RunStore.list_runs` directly or wrap it in your own route.
+
+## Where this fits
+
+- [Mounting the read router](/docs/recipes/mount-read-router): the end-to-end recipe with captured responses.
+- [RunStore](/docs/reference/run-store): the methods these endpoints call.
+- [HTTP API surface](/docs/reference/http-api): every endpoint in detail.
