@@ -53,7 +53,45 @@ Default TTL is Anthropic's default (5 minutes). Configure a longer one via the p
 
 ## A real cache trace
 
-Ran the same calculator agent twice, back-to-back, with a system prompt padded to ~7700 tokens. Captured telemetry:
+Run the same agent twice back-to-back with a long, stable system prompt, then read the cache columns off each run with `RunStore.get_llm_calls`. The first run writes the cache entry (`cache_creation`); the second reads it (`cache_read`):
+
+```python
+import asyncio
+
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///cache.db"
+    # A long, stable system prompt is the cheapest thing to keep sending.
+    big_prompt = "You are a helpful assistant. " + ("Background context sentence. " * 1200)
+
+    async with Agent(
+        name="QA",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt=big_prompt,
+        database_url=url,
+    ) as agent:
+        r1 = await agent.run("What is 2+2?")
+        r2 = await agent.run("What is 3+3?")
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        for label, rid in (("run1", r1.run_id), ("run2", r2.run_id)):
+            c = (await store.get_llm_calls(rid))[0]
+            print(label, "fresh:", c.input_tokens,
+                  "cache_read:", c.cache_read_input_tokens,
+                  "cache_creation:", c.cache_creation_input_tokens)
+        # run1 fresh: 3 cache_read: 0    cache_creation: 4818   <- first call writes the cache
+        # run2 fresh: 3 cache_read: 4808 cache_creation: 10      <- second call reads it
+
+
+asyncio.run(main())
+```
+
+The longer captured telemetry below ran the same agent twice with a ~7700-token prompt:
 
 ```text
 RUN 1       status=success  input_fresh=9   cache_read=15491   cache_creation=0

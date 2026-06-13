@@ -92,7 +92,52 @@ This is the progressive-disclosure pattern: only pay for the skills the model ac
 
 ## The full run lifecycle
 
-A captured run with one loaded skill, one denied skill, and a prompt that triggers the loaded one (`"Please format this JSON for me: ..."`):
+A complete example: write a `SKILL.md`, load it with `skills_dir=`, run a prompt that triggers it, and read the skill events back:
+
+```python
+import asyncio
+from pathlib import Path
+
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+# 1. A skill on disk: _skills/json-formatter/SKILL.md
+skill_dir = Path("_skills/json-formatter")
+skill_dir.mkdir(parents=True, exist_ok=True)
+(skill_dir / "SKILL.md").write_text(
+    "---\n"
+    "name: json-formatter\n"
+    "description: Format raw JSON strings into pretty indented output with 2-space indent.\n"
+    "---\n\n"
+    "# JSON Formatter\n\n"
+    "When asked to format JSON, parse it and re-emit with 2-space indent.\n"
+)
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///skills.db"
+
+    async with Agent(
+        name="Helper",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="You are a helpful assistant.",
+        skills_dir="_skills",
+        database_url=url,
+    ) as agent:
+        result = await agent.run('Please format this JSON for me: {"b": 2, "a": 1}')
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        print([e.event_type for e in await store.get_events(result.run_id)])
+        # ['run.started', 'skill.registered', 'llm.completed', 'tool.completed',
+        #  'skill.invoked', 'llm.completed', 'run.completed']
+
+
+asyncio.run(main())
+```
+
+The captured timeline below adds a second, denied skill (`deny_skills=["dangerous-tool"]`) to also show `skill.denied`:
 
 ```text
 run_events:

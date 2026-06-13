@@ -12,15 +12,35 @@ The reasoning is deliberate. A hard enforcement mechanism that preempts an in-fl
 ## Declaring a budget
 
 ```python
-from dendrux import Agent, Budget
+import asyncio
 
-agent = Agent(
-    provider=...,
-    prompt="...",
-    tools=[...],
-    budget=Budget(max_tokens=500, warn_at=(0.5, 0.75, 0.9)),
-    database_url="sqlite+aiosqlite:///demo.db",
-)
+from dendrux import Agent, Budget
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///demo.db"
+
+    async with Agent(
+        name="QA",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="Answer in one short sentence.",
+        # A deliberately tiny cap so the thresholds fire on one short call.
+        budget=Budget(max_tokens=10, warn_at=(0.5, 0.75, 0.9)),
+        database_url=url,
+    ) as agent:
+        result = await agent.run("What is the capital of France?")
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        print([e.event_type for e in await store.get_events(result.run_id)])
+        # ['run.started', 'llm.completed', 'budget.threshold', 'budget.threshold',
+        #  'budget.threshold', 'budget.exceeded', 'run.completed']
+    print(result.status.value)   # success  (budget is advisory; the run still finishes)
+
+
+asyncio.run(main())
 ```
 
 Two parameters:

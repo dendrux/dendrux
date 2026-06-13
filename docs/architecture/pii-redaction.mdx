@@ -72,6 +72,38 @@ If you want database-level redaction or encryption of persisted data, that is a 
 }
 ```
 
+Read the mapping back through the public API with `RunStore.get_pii_mapping`:
+
+```python
+import asyncio
+
+from dendrux import Agent
+from dendrux.guardrails import PII
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///pii.db"
+
+    async with Agent(
+        name="Support",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="Reply in one short sentence.",
+        guardrails=[PII(engine="presidio")],
+        database_url=url,
+    ) as agent:
+        result = await agent.run("My name is Anmol and my email is anmol@example.com.")
+
+    store = RunStore.from_database_url(url)
+    async with store:
+        print(await store.get_pii_mapping(result.run_id))
+        # {'<<EMAIL_ADDRESS_1>>': 'anmol@example.com', '<<PERSON_1>>': 'Anmol'}
+
+
+asyncio.run(main())
+```
+
 Three invariants this mapping enforces:
 
 1. **Stable tokens.** If the same email appears in two different messages, the same `<<EMAIL_ADDRESS_1>>` token is used both times. The guardrail engine checks the reverse index before minting a new placeholder.
