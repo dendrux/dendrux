@@ -15,7 +15,8 @@ The short answer: **Dendrux owns run state and the audit trail. You own everythi
     subgraph App["Your app database (you own this)"]
         users["users"]
         chats["chats"]
-        messages["messages<br/>has dendrux_run_id"]
+        messages["messages"]
+        links["dendrux_run_id<br/>column or link table"]
     end
     subgraph Dx["Dendrux database (Dendrux owns this)"]
         runs[("agent_runs")]
@@ -24,16 +25,17 @@ The short answer: **Dendrux owns run state and the audit trail. You own everythi
         llm["llm_interactions"]
         events["run_events"]
     end
-    messages -. "dendrux_run_id + metadata.thread_id" .-> runs
+    messages --- links
+    links -. "run_id + metadata.thread_id" .-> runs
 `} />
 
-Your tables hold product truth: who the user is, which conversations exist, what each message says, what the UI renders. Dendrux's [six tables](/docs/architecture/state-persistence) hold execution truth: every LLM call, every tool invocation, the ordered event log, and the pause state needed to resume. The two meet at a single point: the **run ID** that each of your assistant messages records, plus the `metadata.thread_id` you stamp on every run.
+Your tables hold product truth: who the user is, which conversations exist, what each message says, what the UI renders. Dendrux's [six tables](/docs/architecture/state-persistence) hold execution truth: every LLM call, every tool invocation, the ordered event log, and the pause state needed to resume. The two meet at a single point: the **run ID** that your turn records (a column on the message or a row in a link table), plus the `metadata.thread_id` you stamp on every run.
 
 > **The boundary rule.** Do not use Dendrux tables as your product chat database. Store product-visible chats and messages in your own tables. Link to Dendrux using run IDs and run metadata. Treat the Dendrux schema as an internal, append-only audit surface that you read through `RunStore`, never write to directly.
 
 ## A minimal ChatGPT-style schema
 
-This is all the product-side schema a chat app needs. Note `dendrux_run_id` on `messages`: that one column is the entire link back to Dendrux.
+There are two ways to link your product data to Dendrux, and which you pick is a real design decision. Both keep the boundary intact (your tables own product truth, Dendrux owns execution truth); they differ only in how the link is modeled. Every chat app starts with the same two tables:
 
 ```sql
 CREATE TABLE chats (
@@ -48,13 +50,53 @@ CREATE TABLE messages (
     chat_id   TEXT NOT NULL REFERENCES chats(id),
     role      TEXT NOT NULL,          -- 'user' | 'assistant'
     content   TEXT,                   -- nullable while an assistant turn streams
-    status    TEXT NOT NULL,          -- your enum, e.g. 'pending' | 'streaming' | 'complete' | 'error'
-    dendrux_run_id TEXT,              -- set on assistant messages; links to agent_runs.id
     created_at TIMESTAMPTZ DEFAULT now()
 );
 ```
 
-One assistant message maps to one Dendrux run, so a column on `messages` is enough. You only need a separate `agent_run_links(message_id, dendrux_run_id)` join table if a single message can span multiple runs (for example a "regenerate" feature that keeps history, or a turn that internally fans out to sub-agents you want to surface individually). Start with the column; add the join table only when that need is real.
+### Pattern A: a run-ID column on messages (simplest)
+
+Add `dendrux_run_id` (and a `status`) to the assistant message. That one column is the entire link back to Dendrux.
+
+```sql
+ALTER TABLE messages
+    ADD COLUMN status         TEXT NOT NULL DEFAULT 'complete',  -- 'pending' | 'streaming' | 'complete' | 'error'
+    ADD COLUMN dendrux_run_id TEXT;                              -- set on assistant messages; links to agent_runs.id
+```
+
+This is the right call for a prototype or a linear chat where one assistant message is produced by exactly one run and there is no regenerate. One lookup, no joins.
+
+### Pattern B: an agent_run_links turn table (production)
+
+Model the **turn** as its own entity: one row ties together a user message, the assistant message it produced, and the run that connected them.
+
+```sql
+CREATE TABLE agent_run_links (
+    id                   TEXT PRIMARY KEY,
+    chat_id              TEXT NOT NULL REFERENCES chats(id),
+    user_message_id      TEXT NOT NULL REFERENCES messages(id),
+    assistant_message_id TEXT REFERENCES messages(id),   -- null while pending; set once the answer row exists
+    dendrux_run_id       TEXT UNIQUE,                     -- null until the run starts; unique so a run links to one turn
+    status               TEXT NOT NULL DEFAULT 'pending', -- the TURN lifecycle lives here, not on the message
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_agent_run_links_chat ON agent_run_links(chat_id);
+```
+
+Why this is the better shape for a real product:
+
+- **Regenerate falls out for free.** Keep one user message, produce a new assistant message from a new run, and you simply get a second link row sharing `user_message_id`. The invariants "one user message maps to one run" and "one assistant message is produced by one run" both still hold per row. Edit-and-rerun and retries behave the same way: a new row, the old one preserved, with a clean per-turn audit.
+- **Status lives in the right place.** The turn lifecycle (`pending` to `streaming` to `complete` or `error`) is a property of the linkage, not of the message content. Keeping it on the link row lets your `messages` rows stay as pure content.
+- **Your `messages` table carries zero Dendrux columns.** All coupling to Dendrux is isolated in this one table, which is exactly the boundary this page is about.
+
+Two modeling notes. Pick a single owner for turn status (the link row, not also the message) so they cannot drift. And decide whether `assistant_message_id` is nullable: if you create the assistant placeholder up front, as the lifecycle below does, it can be `NOT NULL`; if you create the link while still `pending` before any answer row exists, keep it nullable. `dendrux_run_id` stays null until the run starts and is `UNIQUE` so a run can never be double-linked; set it the moment you have it, which is immediately from `stream().run_id`, before the first token.
+
+### Which to use
+
+- **Prototype or linear chat, one answer per turn** leans to Pattern A: fewer tables, fewer joins.
+- **A real product with regenerate, edit, retries, per-turn analytics, or strict message immutability** leans to Pattern B. It is a fine default for that tier.
 
 ## What not to store
 
@@ -118,6 +160,8 @@ async def post_message(chat_id: str, body: NewMessage, user: User = Depends(auth
 ```
 
 The non-streaming version is the same shape with `await agent.run(...)` in place of the stream, saving `result.answer` and `result.run_id` after it returns.
+
+The example above uses Pattern A (the run ID and status on the assistant message). With Pattern B, the steps are identical except the run ID and status live on a turn row instead: at step 4 insert an `agent_run_links` row (`user_message_id`, the freshly created `assistant_message_id`, `dendrux_run_id=stream.run_id`, `status='streaming'`), and at step 6 update that link row's status to `complete` while writing the answer to the plain `messages` row. Same choreography, one extra row write, and your `messages` table stays free of Dendrux columns.
 
 ## Recommended metadata keys
 
