@@ -60,6 +60,58 @@ result = await agent.run("Add up Q3 sales from Sheet1!A1:A12 and tell me if it b
 
 The whole sequence is recorded in `run_events` and visible in the dashboard. See [Pause and resume](/docs/architecture/pause-resume) for the wire shape.
 
+The full cycle in one runnable script, with the browser step simulated in Python. `RunStore.get_pauses` is the public way to read the pending call (your HTTP layer would instead surface it from the `run.paused` SSE frame):
+
+```python
+import asyncio
+import json
+
+from dendrux import Agent, tool
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.store import RunStore
+from dendrux.types import ToolResult
+
+
+@tool(target="client")
+async def read_excel_range(sheet: str, cell_range: str) -> str:
+    """Read a range of cells from the user's Excel spreadsheet."""
+    return ""  # body unused; the run pauses for the client to execute it
+
+
+async def main() -> None:
+    url = "sqlite+aiosqlite:///app.db"
+
+    async with Agent(
+        name="Analyst",
+        provider=AnthropicProvider(model="claude-haiku-4-5"),
+        prompt="Use read_excel_range (a client tool) to read spreadsheet cells when asked.",
+        tools=[read_excel_range],
+        database_url=url,
+    ) as agent:
+        paused = await agent.run("Read Sheet1 range A1:A3 with read_excel_range.")
+        print(paused.status.value)                       # waiting_client_tool
+
+        # The pending call (id + params) is in the pause. Your client executes it.
+        store = RunStore.from_database_url(url)
+        async with store:
+            pending = (await store.get_pauses(paused.run_id))[-1].pending_tool_calls[0]
+            # {'id': '...', 'name': 'read_excel_range', 'target': 'client', 'params': {...}}
+
+        results = [
+            ToolResult(
+                name=pending["name"],
+                call_id=pending["id"],            # use the dendrux ULID, not the provider id
+                payload=json.dumps([[1], [2], [3]]),  # whatever the client read
+            )
+        ]
+        done = await agent.submit_tool_results(paused.run_id, results)
+        print(done.status.value)                         # success
+        print(done.answer)                               # references the submitted cell values
+
+
+asyncio.run(main())
+```
+
 ## HTTP routes
 
 A minimal FastAPI app that mounts the read router for observation and exposes three write routes. Lifted from `examples/03_client_tools/server.py`:
