@@ -283,6 +283,7 @@ class AnthropicProvider(LLMProvider):
 
         # Attach adapter-boundary payloads for evidence layer
         llm_response.provider_request = captured_request
+        llm_response.model = captured_request["model"]
         llm_response.provider_response = response.model_dump()
 
         return llm_response
@@ -400,6 +401,7 @@ class AnthropicProvider(LLMProvider):
             usage=usage,
         )
         llm_response.provider_request = captured_request
+        llm_response.model = captured_request["model"]
         llm_response.provider_response = final_message.model_dump()
 
         yield StreamEvent(type=StreamEventType.DONE, raw=llm_response)

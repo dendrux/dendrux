@@ -207,7 +207,7 @@ class PersistenceRecorder(BaseRecorder):
                 self._run_id,
                 iteration_index=iteration,
                 usage=response.usage,
-                model=self._model,
+                model=response.model or self._model,
                 provider=self._provider_name,
                 duration_ms=duration_ms,
                 semantic_request=semantic_request,
@@ -230,7 +230,7 @@ class PersistenceRecorder(BaseRecorder):
                 self._run_id,
                 iteration_index=iteration,
                 usage=response.usage,
-                model=self._model,
+                model=response.model or self._model,
                 provider=self._provider_name,
             )
         except Exception:
@@ -251,7 +251,7 @@ class PersistenceRecorder(BaseRecorder):
                 "cache_read_input_tokens": response.usage.cache_read_input_tokens,
                 "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
                 "cost_usd": response.usage.cost_usd,
-                "model": self._model,
+                "model": response.model or self._model,
                 "has_tool_calls": bool(response.tool_calls),
             },
         )

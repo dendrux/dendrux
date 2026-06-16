@@ -1,0 +1,112 @@
+---
+title: dendrux in a web or chat endpoint
+description: How to run dendrux inside a stateless HTTP server — build the Agent per request, share the expensive resources, switch model per turn, and resume long runs across processes.
+---
+
+# dendrux in a web or chat endpoint
+
+dendrux is built to run inside *your* server. This recipe is the architecture for doing that well: what to build per request, what to share, how to switch model per turn, and how a single long-running task survives across requests.
+
+## The one idea
+
+**The Agent is a disposable executor. The run is the durable thing.**
+
+- dendrux persists run state (runs, events, traces, tool calls, LLM calls, pauses) to your database.
+- It does **not** persist the Agent object or the conversation history. Your app owns the conversation.
+
+Because state lives in the DB, you can build a fresh Agent on each request — even on a different machine — and resume any run by ID. Constructing an Agent does no I/O, so this is cheap. The [Quickstart](/docs/quickstart) shows the proof: a run started in one process is resumed in another.
+
+## Build per request, share the expensive parts
+
+Building the `Agent` object is essentially free. The cost is in the resources it connects to. Build those **once per worker** and reuse them:
+
+| Resource | Cost if rebuilt per request | What to do |
+| --- | --- | --- |
+| DB engine | A new connection pool every request | Share one: set `DENDRUX_DATABASE_URL` or inject a `state_store`. |
+| MCP server | Re-spawns a subprocess / reconnects + re-lists tools | Pool the `MCPServer` objects; reuse them. |
+| Provider client | Loses connection keep-alive | Optional: pool by `(vendor, model)`. |
+
+```python
+# ---- once per worker (startup) ----
+from dendrux.db.session import get_engine
+from dendrux.runtime.state import SQLAlchemyStateStore
+
+engine = await get_engine(os.environ["DENDRUX_DATABASE_URL"])  # shared singleton
+STORE  = SQLAlchemyStateStore(engine)
+MCP_POOL  = {}   # name -> MCPServer (sessions stay open)
+PROVIDERS = {}   # (vendor, model) -> provider
+
+# ---- per request ----
+@app.post("/chat")
+async def chat(req):
+    agent = Agent(
+        provider=PROVIDERS[(req.vendor, req.model)],
+        prompt=req.system_prompt,
+        tools=[TOOLS[t] for t in req.enabled_tools],          # current selection
+        tool_sources=[MCP_POOL[m] for m in req.enabled_mcps], # current selection
+        state_store=STORE,                                    # shared engine
+    )
+    result = await agent.run(
+        req.text,
+        history=req.transcript,                               # your app owns this
+        metadata={"thread_id": req.thread_id},
+    )
+    return {"answer": result.answer}
+```
+
+### Do not call `close()` per request when you pool
+
+`agent.close()` (and `async with Agent(...)`) closes the provider and the MCP sources. That is what you want for a one-off script, but it is **wrong** when those are shared: it tears down the pool the next request needs.
+
+The Agent has no destructor, so simply **not** calling `close()` leaves everything open. In a pooled server: let the lightweight Agent be garbage-collected, and close the pooled `MCPServer`/provider objects yourself at worker shutdown.
+
+```python
+@app.on_event("shutdown")
+async def shutdown():
+    for mcp in MCP_POOL.values():
+        await mcp.close()
+    for provider in PROVIDERS.values():
+        await provider.close()
+```
+
+## Switching model or vendor per turn
+
+For a "pick your model per message" chatbot:
+
+- **Model (same vendor):** pass it to `run()`. No new Agent needed.
+
+  ```python
+  await agent.run(req.text, history=req.transcript, model="claude-opus-4-1")
+  ```
+
+  The model actually used is recorded per call, so [`RunStore.get_llm_calls`](/docs/reference/run-store) reflects the real model for billing and observability.
+
+- **Vendor, prompt, or tool set:** rebuild the Agent with the new `provider` / `prompt` / `tools`. Construction is cheap, and rebuilding is the clean way to reflect a capability set the user changed mid-chat.
+
+## New turn vs. continuing a long run
+
+A long-running task usually **pauses and resumes** rather than finishing in one call. Use the right entry point:
+
+- **New turn** → `agent.run(...)` starts a new run.
+- **Continue a paused run** → `agent.submit_tool_results()` / `submit_input()` / `submit_approval()` / `resume()` on the existing `run_id`.
+
+Both work with a freshly built Agent, possibly in a different process. One thing to know: on resume, dendrux replays the conversation from the DB but takes the **provider, model, prompt, and tools from the Agent you resume with** — not from a saved snapshot. So keep the config consistent across the resume. The clean way is to stash a config key when you start the run and read it back:
+
+```python
+# start
+await agent.run(text, metadata={"thread_id": tid, "config_id": cfg_id})
+
+# later — resume with the SAME config the run started with
+run = await store.get_run(run_id)
+agent = build_agent(load_config(run.meta["config_id"]))
+await agent.submit_tool_results(run_id, results)
+```
+
+New *turns* can use the user's latest model/tool selection; an *in-flight* run should be resumed with its own config (especially if it paused waiting on a client tool the user may have since toggled off).
+
+## Where this fits
+
+- [Quickstart](/docs/quickstart): the pause-in-one-process, resume-in-another proof.
+- [Chatbot threads](/docs/recipes/chatbot-threads): grouping turns into a conversation with `metadata`.
+- [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary): who stores what.
+- [Pause and resume](/docs/architecture/pause-resume): the resume entry points in detail.

@@ -753,7 +753,12 @@ class Agent:
                 is raised. Requires persistence (database_url, state_store, or
                 DENDRUX_DATABASE_URL). The hash includes ``history`` — same input
                 with different history is treated as a different request.
-            **kwargs: Forwarded to the LLM provider (temperature, max_tokens, etc.).
+            **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
+                the provider's configured model for this call only (e.g.
+                ``model="claude-opus-4-1"``) — useful for per-turn model selection
+                in a chatbot. Also accepts ``temperature``, ``max_tokens``, and
+                other provider sampling params. The model actually used is recorded
+                per LLM call (see ``RunStore.get_llm_calls``).
 
         Returns:
             RunResult with status, answer, steps, and usage stats.
@@ -1330,7 +1335,12 @@ class Agent:
             notifier: Optional notifier for lifecycle events.
             max_delegation_depth: Maximum allowed delegation depth for the run
                 tree. Default 10. None means unbounded.
-            **kwargs: Forwarded to the LLM provider (temperature, max_tokens, etc.).
+            **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
+                the provider's configured model for this call only (e.g.
+                ``model="claude-opus-4-1"``) — useful for per-turn model selection
+                in a chatbot. Also accepts ``temperature``, ``max_tokens``, and
+                other provider sampling params. The model actually used is recorded
+                per LLM call (see ``RunStore.get_llm_calls``).
 
         Returns:
             RunStream — async iterable of RunEvent objects.

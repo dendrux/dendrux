@@ -72,6 +72,8 @@ class MockLLM(LLMProvider):
 
         response = self._responses[self._call_count]
         self._call_count += 1
+        # Mirror real providers: honor a per-call ``model=`` override.
+        response.model = kwargs.get("model") or self._model
         return response
 
     @property
