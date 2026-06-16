@@ -69,6 +69,17 @@ async def shutdown():
         await provider.close()
 ```
 
+### Shortcut for simple scripts: a provider recipe string
+
+For a one-off script (not a pooled server) you can skip constructing the provider yourself:
+
+```python
+async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...") as agent:
+    print((await agent.run("hi")).answer)
+```
+
+`provider="vendor:model"` builds the provider for you — reading the API key from the environment — the same way `database_url` builds an engine, and `async with` closes it. Supported vendors: `anthropic`, `openai`, `openai-responses`. Pass a provider **instance** when you need full configuration (custom `base_url`, explicit `api_key`, sampling defaults) or when pooling across requests.
+
 ## Switching model or vendor per turn
 
 For a "pick your model per message" chatbot:

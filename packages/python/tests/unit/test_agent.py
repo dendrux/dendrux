@@ -543,6 +543,31 @@ class TestAgentLifecycle:
             assert a is agent
         provider.close.assert_awaited_once()
 
+    async def test_recipe_string_builds_provider(self, monkeypatch):
+        """A 'vendor:model' string builds the provider for you."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        from dendrux.llm.anthropic import AnthropicProvider
+
+        agent = Agent(provider="anthropic:claude-haiku-4-5", prompt="Hello.")
+        assert isinstance(agent._provider, AnthropicProvider)
+        assert agent._provider.model == "claude-haiku-4-5"
+
+    async def test_recipe_string_provider_is_closed(self, monkeypatch):
+        """A recipe-built provider is closed by close() like any other."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        agent = Agent(provider="anthropic:claude-haiku-4-5", prompt="Hello.")
+        agent._provider.close = AsyncMock()  # type: ignore[union-attr]
+        await agent.close()
+        agent._provider.close.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_invalid_provider_spec_raises(self):
+        from dendrux.agent import _build_provider_from_spec
+
+        with pytest.raises(ValueError, match="vendor:model"):
+            _build_provider_from_spec("anthropic")  # missing model
+        with pytest.raises(ValueError, match="Unknown provider vendor"):
+            _build_provider_from_spec("acme:some-model")
+
     async def test_close_without_provider_is_noop(self):
         agent = Agent(prompt="Hello.")
         await agent.close()  # should not raise
