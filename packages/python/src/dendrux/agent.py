@@ -113,6 +113,40 @@ async def _verify_schema_initialized(engine: AsyncEngine, url: str) -> None:
         raise SchemaNotInitializedError()
 
 
+def _build_provider_from_spec(spec: str) -> LLMProvider:
+    """Build a provider from a ``"vendor:model"`` recipe string.
+
+    A convenience that mirrors ``database_url``: hand the agent a recipe
+    string and it constructs the provider (reading the API key from the
+    environment). Supported vendors: ``anthropic``, ``openai``,
+    ``openai-responses``. Pass a provider instance for full configuration.
+    """
+    vendor, sep, model = spec.partition(":")
+    vendor = vendor.strip().lower()
+    model = model.strip()
+    if not sep or not model:
+        raise ValueError(
+            f"Invalid provider spec {spec!r}. Use 'vendor:model', "
+            "e.g. 'anthropic:claude-haiku-4-5'."
+        )
+    if vendor == "anthropic":
+        from dendrux.llm.anthropic import AnthropicProvider
+
+        return AnthropicProvider(model=model)
+    if vendor == "openai":
+        from dendrux.llm.openai import OpenAIProvider
+
+        return OpenAIProvider(model=model)
+    if vendor == "openai-responses":
+        from dendrux.llm.openai_responses import OpenAIResponsesProvider
+
+        return OpenAIResponsesProvider(model=model)
+    raise ValueError(
+        f"Unknown provider vendor {vendor!r}. Supported: anthropic, openai, "
+        "openai-responses. Or pass a provider instance you construct yourself."
+    )
+
+
 class Agent:
     """Dendrux agent — definition and runtime facade.
 
@@ -149,7 +183,7 @@ class Agent:
     def __init__(
         self,
         *,
-        provider: LLMProvider,
+        provider: LLMProvider | str,
         prompt: str,
         name: str = ...,
         tools: list[Callable[..., Any]] = ...,
@@ -174,7 +208,7 @@ class Agent:
     def __init__(
         self,
         *,
-        provider: LLMProvider | None = ...,
+        provider: LLMProvider | str | None = ...,
         name: str = ...,
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
@@ -206,7 +240,7 @@ class Agent:
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         loop: Loop | None = None,
         output_type: type[BaseModel] | None = None,
-        provider: LLMProvider | None | _UnsetType = _UNSET,
+        provider: LLMProvider | str | None | _UnsetType = _UNSET,
         database_url: str | None = None,
         database_options: dict[str, Any] | None = None,
         state_store: StateStore | None = None,
@@ -251,7 +285,14 @@ class Agent:
         self._output_type: type[BaseModel] | None = output_type
 
         # --- Provider ---
-        self._provider: LLMProvider | None = None if isinstance(provider, _UnsetType) else provider
+        # A "vendor:model" recipe string builds the provider for you (mirrors
+        # how database_url builds an engine). A provider instance is used as-is.
+        _resolved_provider = None if isinstance(provider, _UnsetType) else provider
+        self._provider: LLMProvider | None = (
+            _build_provider_from_spec(_resolved_provider)
+            if isinstance(_resolved_provider, str)
+            else _resolved_provider
+        )
 
         # --- Persistence ---
         if database_url is not None and state_store is not None:
@@ -1802,6 +1843,11 @@ class Agent:
         Only disposes the private engine created from an explicit database_url.
         The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
         owned by this agent and is left untouched.
+
+        When pooling a provider or ``MCPServer`` across many agents/requests,
+        do not call ``close()`` per request (it would close the shared object);
+        let the lightweight agent be garbage-collected and close the pooled
+        objects yourself at shutdown. See the web-endpoint recipe.
         """
         for source in self._tool_sources:
             try:
