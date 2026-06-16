@@ -256,6 +256,9 @@ class LLMResponse:
     # provider_response: the raw vendor response dict (e.g. response.model_dump()).
     provider_request: dict[str, Any] | None = None
     provider_response: dict[str, Any] | None = None
+    # The model actually used for this call. Honors a per-call ``model=`` override;
+    # falls back to the provider's configured model when a provider leaves it unset.
+    model: str | None = None
 
 
 @dataclass(frozen=True)

@@ -352,6 +352,7 @@ class OpenAIResponsesProvider(LLMProvider):
 
         # Attach adapter-boundary payloads for evidence layer
         llm_response.provider_request = captured_request
+        llm_response.model = captured_request["model"]
         llm_response.provider_response = response.model_dump()
 
         return llm_response
@@ -499,6 +500,7 @@ class OpenAIResponsesProvider(LLMProvider):
             usage=usage,
         )
         llm_response.provider_request = captured_request
+        llm_response.model = captured_request["model"]
         if _completed_response is not None and hasattr(_completed_response, "model_dump"):
             llm_response.provider_response = _completed_response.model_dump()
 

@@ -45,7 +45,7 @@ from dendrux.notifiers.otel import OpenTelemetryNotifier
 from dendrux.store import RunStore
 
 if TYPE_CHECKING:
-    from dendrux.types import LLMResponse, Message, RunResult, ToolCall, ToolResult
+    from dendrux.types import LLMResponse, Message, ToolCall, ToolResult
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
@@ -131,8 +131,9 @@ async def lookup_customer(customer_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _print_recorder_summary(detail: Any, events: list[Any], llm_calls: list[Any],
-                            tools: list[Any], traces: list[Any]) -> None:
+def _print_recorder_summary(
+    detail: Any, events: list[Any], llm_calls: list[Any], tools: list[Any], traces: list[Any]
+) -> None:
     table = Table(title="Layer 1: Recorder (durable audit in DB)")
     table.add_column("Table", style="cyan")
     table.add_column("Rows for this run", justify="right")
@@ -141,10 +142,12 @@ def _print_recorder_summary(detail: Any, events: list[Any], llm_calls: list[Any]
     table.add_row("agent_runs", "1", f"status={detail.status}, model={detail.model}")
     table.add_row("react_traces", str(len(traces)), "user / assistant / tool messages")
     table.add_row("tool_calls", str(len(tools)), "every tool invocation persisted")
-    table.add_row("llm_interactions", str(len(llm_calls)),
-                  "semantic + provider payloads per LLM call")
-    table.add_row("run_events", str(len(events)),
-                  "lifecycle + governance event log, monotonic sequence")
+    table.add_row(
+        "llm_interactions", str(len(llm_calls)), "semantic + provider payloads per LLM call"
+    )
+    table.add_row(
+        "run_events", str(len(events)), "lifecycle + governance event log, monotonic sequence"
+    )
 
     console.print(table)
     console.print()
@@ -197,17 +200,24 @@ def _print_otel_spans(exporter: InMemorySpanExporter) -> None:
         status = span.status.status_code.name
         suffix = ""
         if span.name.startswith("chat") and "gen_ai.usage.input_tokens" in span.attributes:
-            suffix = f" · tokens={span.attributes['gen_ai.usage.input_tokens']}" \
-                     f"/{span.attributes.get('gen_ai.usage.output_tokens', 0)}"
-        gov_events = [e.name for e in span.events
-                      if e.name.startswith(("policy.", "approval.", "budget.",
-                                            "guardrail.", "skill.", "mcp."))]
+            suffix = (
+                f" · tokens={span.attributes['gen_ai.usage.input_tokens']}"
+                f"/{span.attributes.get('gen_ai.usage.output_tokens', 0)}"
+            )
+        gov_events = [
+            e.name
+            for e in span.events
+            if e.name.startswith(
+                ("policy.", "approval.", "budget.", "guardrail.", "skill.", "mcp.")
+            )
+        ]
         gov_suffix = f" · gov: {', '.join(gov_events)}" if gov_events else ""
         return f"[{status}] {span.name}  {dur_ms}ms{suffix}{gov_suffix}"
 
     tree = Tree("[bold]Layer 3: OpenTelemetryNotifier (host's TracerProvider)[/bold]")
     roots = children.get(None, []) + [
-        s for parent_id, sibs in children.items()
+        s
+        for parent_id, sibs in children.items()
         if parent_id is not None and parent_id not in span_by_id
         for s in sibs
     ]
@@ -246,7 +256,9 @@ def _print_runstore_replay(detail: Any, events: list[Any], pauses: list[Any]) ->
     )
     table.add_row("event count", str(len(events)))
     table.add_row("pause cycles", str(len(pauses)))
-    table.add_row("answer", (detail.answer or "")[:80] + ("..." if detail.answer and len(detail.answer) > 80 else ""))
+    _answer = detail.answer or ""
+    _preview = _answer[:80] + ("..." if len(_answer) > 80 else "")
+    table.add_row("answer", _preview)
 
     console.print(table)
     console.print()
@@ -297,11 +309,13 @@ async def main() -> None:
         guardrails=[PII()],
         budget=Budget(max_tokens=20_000, warn_at=(0.5, 0.75, 0.9)),
     ) as agent:
-        notifier = CompositeNotifier([
-            ConsoleNotifier(),
-            OpenTelemetryNotifier(),
-            alert_notifier,
-        ])
+        notifier = CompositeNotifier(
+            [
+                ConsoleNotifier(),
+                OpenTelemetryNotifier(),
+                alert_notifier,
+            ]
+        )
 
         result = await agent.run(
             "Look up customer C-7782, then check the weather in their city — assume Paris.",
@@ -309,8 +323,12 @@ async def main() -> None:
         )
 
     console.print()
-    console.print(Panel(f"[bold]Run complete: {result.status.value}[/bold]\n\n{result.answer or ''}",
-                        title="Result"))
+    console.print(
+        Panel(
+            f"[bold]Run complete: {result.status.value}[/bold]\n\n{result.answer or ''}",
+            title="Result",
+        )
+    )
     console.print()
 
     # ---- Read back via RunStore — same source as the dashboard would use ----
@@ -324,8 +342,9 @@ async def main() -> None:
         pauses = await store.get_pauses(result.run_id)
 
     # ---- Report ----
-    console.print(Panel("[bold]What each observability layer captured[/bold]",
-                        title="Stack report"))
+    console.print(
+        Panel("[bold]What each observability layer captured[/bold]", title="Stack report")
+    )
     console.print()
     _print_recorder_summary(detail, events, llm_calls, tool_invocations, traces)
     _print_notifier_summary(alert_notifier)
@@ -335,7 +354,8 @@ async def main() -> None:
     console.print(
         Panel(
             "All four surfaces saw the same agent run.\n\n"
-            "Same hook events. Different consumers, different time horizons, different failure policies:\n"
+            "Same hook events. Different consumers, different time horizons, "
+            "different failure policies:\n"
             "  • Recorder: durable, fail-closed, queryable forever via RunStore\n"
             "  • Notifier (live): fail-open, dispatched as the run unfolds\n"
             "  • OTel: spans plug into the host's existing observability stack\n"

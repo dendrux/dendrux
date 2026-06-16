@@ -261,3 +261,41 @@ class TestResumeCoreCAsBugFix:
         # The fix: error_won check before _emit_event in the except block
         assert "error_won" in source, "_resume_core should use error_won CAS check"
         assert "if error_won:" in source, "_resume_core should guard emit with 'if error_won:'"
+
+
+# ------------------------------------------------------------------
+# Recorded model reflects the actual per-call model (per-turn override)
+# ------------------------------------------------------------------
+
+
+class TestRecorderRecordsActualModel:
+    """The recorded model must reflect the model actually used for the call
+    (honoring a per-call ``model=`` override), not just the recorder default.
+    Falls back to the default when a provider leaves ``LLMResponse.model``
+    unset, so existing providers/paths are unaffected.
+    """
+
+    async def test_uses_response_model_when_set(self) -> None:
+        store = MockStateStore()
+        obs = PersistenceRecorder(
+            store, "run_1", model="claude-haiku-4-5", provider_name="Anthropic"
+        )
+
+        response = LLMResponse(text="hi", usage=UsageStats(), model="claude-opus-4-1")
+        await obs.on_llm_call_completed("run_1", response, iteration=1)
+
+        assert store.llm_interactions[0]["model"] == "claude-opus-4-1"
+        assert store.usages[0]["model"] == "claude-opus-4-1"
+        assert store._events["run_1"][0]["data"]["model"] == "claude-opus-4-1"
+
+    async def test_falls_back_to_default_when_unset(self) -> None:
+        store = MockStateStore()
+        obs = PersistenceRecorder(
+            store, "run_1", model="claude-haiku-4-5", provider_name="Anthropic"
+        )
+
+        response = LLMResponse(text="hi", usage=UsageStats())  # model unset
+        await obs.on_llm_call_completed("run_1", response, iteration=1)
+
+        assert store.llm_interactions[0]["model"] == "claude-haiku-4-5"
+        assert store.usages[0]["model"] == "claude-haiku-4-5"

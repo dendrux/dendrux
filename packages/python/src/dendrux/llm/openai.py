@@ -355,6 +355,7 @@ class OpenAIProvider(LLMProvider):
 
         # Attach adapter-boundary payloads for evidence layer
         llm_response.provider_request = captured_request
+        llm_response.model = captured_request["model"]
         llm_response.provider_response = response.model_dump()
 
         return llm_response
@@ -527,6 +528,7 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
         )
         llm_response.provider_request = captured_request
+        llm_response.model = captured_request["model"]
         llm_response.provider_response = {
             "object": "chat.completion.chunked",
             "finish_reason": finish_reason,
