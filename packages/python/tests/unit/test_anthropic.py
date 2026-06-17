@@ -67,8 +67,8 @@ class TestCapabilities:
     def test_streaming_tool_deltas_implemented(self, provider: AnthropicProvider) -> None:
         assert provider.capabilities.supports_streaming_tool_deltas is True
 
-    def test_thinking_not_implemented(self, provider: AnthropicProvider) -> None:
-        assert provider.capabilities.supports_thinking is False
+    def test_thinking_implemented(self, provider: AnthropicProvider) -> None:
+        assert provider.capabilities.supports_thinking is True
 
     def test_multimodal_not_implemented(self, provider: AnthropicProvider) -> None:
         assert provider.capabilities.supports_multimodal is False
@@ -662,6 +662,8 @@ class _FakeDelta:
     type: str
     text: str | None = None
     partial_json: str | None = None
+    thinking: str | None = None
+    signature: str | None = None
 
 
 @dataclass
@@ -670,6 +672,7 @@ class _FakeStreamEvent:
     content_block: _FakeContentBlock | None = None
     delta: _FakeDelta | None = None
     index: int = 0
+    usage: object | None = None
 
 
 class _FakeStream:
@@ -1013,3 +1016,256 @@ class TestApiKeyValidation:
     def test_accepts_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
         AnthropicProvider(model="claude-sonnet-4-6")
+
+
+# ------------------------------------------------------------------
+# Thinking / reasoning (Phase 1 — complete() path)
+# ------------------------------------------------------------------
+
+
+@dataclass
+class _FakeThinkingBlock:
+    type: str
+    thinking: str = ""
+    signature: str = ""
+
+    def model_dump(self) -> dict:
+        return {"type": self.type, "thinking": self.thinking, "signature": self.signature}
+
+
+@dataclass
+class _FakeOutputTokensDetails:
+    thinking_tokens: int
+
+
+@dataclass
+class _FakeUsage:
+    input_tokens: int = 100
+    output_tokens: int = 50
+    output_tokens_details: object | None = None
+
+
+@dataclass
+class _FakeResponse:
+    content: list
+    usage: _FakeUsage
+
+
+class TestThinkingApiKwargs:
+    """thinking/effort/show_thinking/thinking_budget → API request shape."""
+
+    @staticmethod
+    def _build(provider: AnthropicProvider, **kwargs: object) -> dict:
+        api_kwargs, _ = provider._build_api_kwargs(
+            [Message(role=Role.USER, content="hi")], None, dict(kwargs)
+        )
+        return api_kwargs
+
+    def test_off_by_default(self, provider: AnthropicProvider) -> None:
+        api_kwargs = self._build(provider)
+        assert "thinking" not in api_kwargs
+        assert "output_config" not in api_kwargs
+
+    def test_thinking_on_adaptive(self, provider: AnthropicProvider) -> None:
+        api_kwargs = self._build(provider, thinking=True)
+        assert api_kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+    def test_effort_to_output_config(self, provider: AnthropicProvider) -> None:
+        api_kwargs = self._build(provider, thinking=True, effort="high")
+        assert api_kwargs["output_config"] == {"effort": "high"}
+
+    def test_effort_extra_alias_to_xhigh(self, provider: AnthropicProvider) -> None:
+        api_kwargs = self._build(provider, thinking=True, effort="extra")
+        assert api_kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_show_thinking_false_omits(self, provider: AnthropicProvider) -> None:
+        api_kwargs = self._build(provider, thinking=True, show_thinking=False)
+        assert api_kwargs["thinking"]["display"] == "omitted"
+
+    def test_thinking_budget_uses_manual_mode(self, provider: AnthropicProvider) -> None:
+        api_kwargs = self._build(provider, thinking=True, thinking_budget=10_000)
+        assert api_kwargs["thinking"] == {
+            "type": "enabled",
+            "budget_tokens": 10_000,
+            "display": "summarized",
+        }
+
+    def test_temperature_dropped_when_thinking_on(self) -> None:
+        p = AnthropicProvider(api_key="sk-test", model="claude-sonnet-4-6", temperature=0.5)
+        assert "temperature" not in self._build(p, thinking=True)
+
+    def test_temperature_kept_when_thinking_off(self) -> None:
+        p = AnthropicProvider(api_key="sk-test", model="claude-sonnet-4-6", temperature=0.5)
+        assert self._build(p)["temperature"] == 0.5
+
+    def test_constructor_default_thinking(self) -> None:
+        p = AnthropicProvider(
+            api_key="sk-test", model="claude-opus-4-8", thinking=True, effort="medium"
+        )
+        api_kwargs = self._build(p)
+        assert api_kwargs["thinking"]["type"] == "adaptive"
+        assert api_kwargs["output_config"] == {"effort": "medium"}
+
+    def test_per_call_overrides_constructor(self) -> None:
+        p = AnthropicProvider(api_key="sk-test", model="claude-opus-4-8", thinking=True)
+        assert "thinking" not in self._build(p, thinking=False)
+
+
+class TestThinkingNormalize:
+    """_normalize_response reads thinking blocks + reasoning_tokens."""
+
+    def test_reads_thinking_text_and_blocks(self, provider: AnthropicProvider) -> None:
+        resp = _FakeResponse(
+            content=[
+                _FakeThinkingBlock(type="thinking", thinking="Let me think...", signature="sig123"),
+                TextBlock(type="text", text="The answer is 21", citations=None),
+            ],
+            usage=_FakeUsage(),
+        )
+        result = provider._normalize_response(resp)
+        assert result.text == "The answer is 21"
+        assert result.reasoning == "Let me think..."
+        assert result.reasoning_blocks is not None
+        assert result.reasoning_blocks[0]["signature"] == "sig123"
+
+    def test_redacted_thinking_kept_without_text(self, provider: AnthropicProvider) -> None:
+        resp = _FakeResponse(
+            content=[
+                _FakeThinkingBlock(type="redacted_thinking", thinking="", signature="enc"),
+                TextBlock(type="text", text="ok", citations=None),
+            ],
+            usage=_FakeUsage(),
+        )
+        result = provider._normalize_response(resp)
+        assert result.reasoning is None
+        assert result.reasoning_blocks[0]["type"] == "redacted_thinking"
+
+    def test_reasoning_tokens_from_usage_details_object(self, provider: AnthropicProvider) -> None:
+        resp = _FakeResponse(
+            content=[TextBlock(type="text", text="hi", citations=None)],
+            usage=_FakeUsage(output_tokens_details=_FakeOutputTokensDetails(thinking_tokens=312)),
+        )
+        result = provider._normalize_response(resp)
+        assert result.usage.reasoning_tokens == 312
+
+    def test_reasoning_tokens_from_usage_details_dict(self, provider: AnthropicProvider) -> None:
+        # The live Anthropic SDK delivers output_tokens_details as a plain dict.
+        resp = _FakeResponse(
+            content=[TextBlock(type="text", text="hi", citations=None)],
+            usage=_FakeUsage(output_tokens_details={"thinking_tokens": 59}),
+        )
+        result = provider._normalize_response(resp)
+        assert result.usage.reasoning_tokens == 59
+
+    def test_bc_no_thinking_leaves_reasoning_none(self, provider: AnthropicProvider) -> None:
+        resp = _FakeResponse(
+            content=[TextBlock(type="text", text="hi", citations=None)],
+            usage=_FakeUsage(),
+        )
+        result = provider._normalize_response(resp)
+        assert result.reasoning is None
+        assert result.reasoning_blocks is None
+        assert result.usage.reasoning_tokens is None
+
+
+@dataclass
+class _FakeFinalMessage:
+    content: list
+    usage: _FakeUsage
+
+    def model_dump(self) -> dict:
+        return {"id": "msg_fake", "type": "message"}
+
+
+class TestThinkingStream:
+    """complete_stream emits REASONING_DELTA + DONE carries reasoning."""
+
+    @staticmethod
+    def _thinking_stream_events() -> list[_FakeStreamEvent]:
+        return [
+            _FakeStreamEvent(
+                type="content_block_start",
+                content_block=_FakeContentBlock(type="thinking"),
+            ),
+            _FakeStreamEvent(
+                type="content_block_delta",
+                delta=_FakeDelta(type="thinking_delta", thinking="Let me "),
+            ),
+            _FakeStreamEvent(
+                type="content_block_delta",
+                delta=_FakeDelta(type="thinking_delta", thinking="reason."),
+            ),
+            _FakeStreamEvent(
+                type="content_block_delta",
+                delta=_FakeDelta(type="signature_delta", signature="sig123"),
+            ),
+            _FakeStreamEvent(type="content_block_stop"),
+            _FakeStreamEvent(
+                type="content_block_start",
+                content_block=_FakeContentBlock(type="text"),
+            ),
+            _FakeStreamEvent(
+                type="content_block_delta",
+                delta=_FakeDelta(type="text_delta", text="The answer."),
+            ),
+            _FakeStreamEvent(type="content_block_stop"),
+            # Thinking-token count arrives on message_delta, not final usage.
+            _FakeStreamEvent(
+                type="message_delta",
+                usage=_FakeUsage(output_tokens_details={"thinking_tokens": 12}),
+            ),
+        ]
+
+    async def test_reasoning_deltas_emitted(self, provider: AnthropicProvider) -> None:
+        # final message usage has NO details — count must come from message_delta.
+        final_msg = _FakeFinalMessage(
+            content=[
+                _FakeThinkingBlock(type="thinking", thinking="Let me reason.", signature="sig123"),
+                TextBlock(type="text", text="The answer.", citations=None),
+            ],
+            usage=_FakeUsage(),
+        )
+        provider._client.messages.stream = MagicMock(
+            return_value=_FakeStream(self._thinking_stream_events(), final_msg)
+        )
+
+        collected = []
+        async for event in provider.complete_stream([Message(role=Role.USER, content="Hi")]):
+            collected.append(event)
+
+        reasoning_events = [e for e in collected if e.type == StreamEventType.REASONING_DELTA]
+        text_events = [e for e in collected if e.type == StreamEventType.TEXT_DELTA]
+        assert [e.text for e in reasoning_events] == ["Let me ", "reason."]
+        assert [e.text for e in text_events] == ["The answer."]
+
+        done = collected[-1]
+        assert done.type == StreamEventType.DONE
+        assert done.raw.reasoning == "Let me reason."
+        assert done.raw.reasoning_blocks[0]["signature"] == "sig123"
+        assert done.raw.usage.reasoning_tokens == 12
+        assert done.raw.text == "The answer."
+
+    async def test_no_reasoning_delta_when_text_only(self, provider: AnthropicProvider) -> None:
+        # BC: a plain text stream emits zero REASONING_DELTA events.
+        final_msg = _FakeFinalMessage(
+            content=[TextBlock(type="text", text="hi", citations=None)],
+            usage=_FakeUsage(),
+        )
+        events = [
+            _FakeStreamEvent(
+                type="content_block_start", content_block=_FakeContentBlock(type="text")
+            ),
+            _FakeStreamEvent(
+                type="content_block_delta", delta=_FakeDelta(type="text_delta", text="hi")
+            ),
+            _FakeStreamEvent(type="content_block_stop"),
+        ]
+        provider._client.messages.stream = MagicMock(return_value=_FakeStream(events, final_msg))
+
+        collected = []
+        async for event in provider.complete_stream([Message(role=Role.USER, content="Hi")]):
+            collected.append(event)
+
+        assert not [e for e in collected if e.type == StreamEventType.REASONING_DELTA]
+        assert collected[-1].raw.reasoning is None
+        assert collected[-1].raw.reasoning_blocks is None

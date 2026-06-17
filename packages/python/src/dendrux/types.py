@@ -196,6 +196,10 @@ class UsageStats:
     OpenAI-compatible backends without prompt_tokens_details), or an int
     (possibly 0) when the provider did report it. This distinction lets
     downstream tooling tell "didn't report" apart from "reported zero".
+
+    ``reasoning_tokens`` is the count of internal reasoning/thinking tokens
+    the model billed within ``output_tokens`` (Anthropic thinking, OpenAI
+    reasoning). ``None`` when the provider did not report it.
     """
 
     input_tokens: int = 0
@@ -204,6 +208,7 @@ class UsageStats:
     cost_usd: float | None = None
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +264,13 @@ class LLMResponse:
     # The model actually used for this call. Honors a per-call ``model=`` override;
     # falls back to the provider's configured model when a provider leaves it unset.
     model: str | None = None
+    # Reasoning/thinking the model surfaced (summary text — never raw CoT).
+    # None unless thinking was enabled and a summary/display was requested.
+    reasoning: str | None = None
+    # Opaque provider reasoning artifacts to replay verbatim for multi-turn
+    # tool use (Anthropic thinking blocks + signature, OpenAI reasoning items).
+    # Stored and round-tripped as-is; never interpreted by Dendrux.
+    reasoning_blocks: list[Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -563,12 +575,15 @@ class StreamEventType(StrEnum):
     """Types of events emitted during streaming LLM responses.
 
     TEXT_DELTA: Incremental text token from the LLM.
+    REASONING_DELTA: Incremental reasoning/thinking token (``text`` carries it).
+        Only emitted when thinking is enabled; arrives before TEXT_DELTA.
     TOOL_USE_START: A tool call block has begun (name known, args pending).
     TOOL_USE_END: A tool call is fully assembled and ready to execute.
     DONE: Stream finished. ``raw`` carries the full ``LLMResponse``.
     """
 
     TEXT_DELTA = "text_delta"
+    REASONING_DELTA = "reasoning_delta"
     TOOL_USE_START = "tool_use_start"
     TOOL_USE_END = "tool_use_end"
     DONE = "done"
@@ -610,6 +625,7 @@ class RunEventType(StrEnum):
 
     LLM output events (translated from provider StreamEvent):
         TEXT_DELTA: Incremental text token from the LLM.
+        REASONING_DELTA: Incremental reasoning/thinking token (in ``text``).
         TOOL_USE_START: A tool call block has begun (name known, args pending).
         TOOL_USE_END: A tool call is fully assembled.
 
@@ -627,6 +643,7 @@ class RunEventType(StrEnum):
 
     # LLM output (translated from provider StreamEvent)
     TEXT_DELTA = "text_delta"
+    REASONING_DELTA = "reasoning_delta"
     TOOL_USE_START = "tool_use_start"
     TOOL_USE_END = "tool_use_end"
 
