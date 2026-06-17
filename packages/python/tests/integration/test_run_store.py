@@ -99,6 +99,29 @@ class TestListRuns:
     async def test_empty(self, store) -> None:
         assert await store.list_runs() == []
 
+    async def test_reasoning_tokens_match_detail(self, store, internal_store) -> None:
+        """RunSummary.total_reasoning_tokens mirrors RunDetail's for the same run."""
+        await internal_store.create_run("r1", "Thinker", model="m")
+        await internal_store.finalize_run(
+            "r1",
+            status="success",
+            answer="ok",
+            total_usage=UsageStats(input_tokens=10, output_tokens=20, reasoning_tokens=7),
+        )
+
+        summary = (await store.list_runs())[0]
+        detail = await store.get_run("r1")
+
+        assert summary.total_reasoning_tokens == 7
+        assert summary.total_reasoning_tokens == detail.total_reasoning_tokens
+
+    async def test_reasoning_tokens_default_zero(self, store, internal_store) -> None:
+        """Runs without reasoning report 0, not None."""
+        await internal_store.create_run("r1", "Plain", model="m")
+
+        summary = (await store.list_runs())[0]
+        assert summary.total_reasoning_tokens == 0
+
 
 # ------------------------------------------------------------------
 # metadata_filter — chatbot thread observability + general meta filter
