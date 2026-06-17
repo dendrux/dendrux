@@ -23,6 +23,8 @@ export interface LLMCallNode {
   // null when the provider didn't report cache stats; 0 means reported zero.
   cache_read_input_tokens: number | null;
   cache_creation_input_tokens: number | null;
+  // reasoning/thinking tokens (billed within output_tokens); null if unreported.
+  reasoning_tokens: number | null;
 }
 
 export interface ToolCallNode {
@@ -123,6 +125,7 @@ export interface RunSummary {
   total_cost_usd: number | null;
   total_cache_read_tokens: number;
   total_cache_creation_tokens: number;
+  total_reasoning_tokens: number;
   created_at: string | null;
   updated_at: string | null;
 }

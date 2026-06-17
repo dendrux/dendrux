@@ -103,6 +103,7 @@ class RunRecord:
     total_cost_usd: float | None = None
     total_cache_read_tokens: int = 0
     total_cache_creation_tokens: int = 0
+    total_reasoning_tokens: int = 0
     meta: dict[str, Any] | None = None
     last_progress_at: datetime | None = None
     failure_reason: str | None = None
@@ -256,6 +257,7 @@ class LLMInteractionRecord:
     duration_ms: int | None = None
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
     created_at: datetime | None = None
 
 
@@ -811,6 +813,7 @@ class SQLAlchemyStateStore:
                 duration_ms=duration_ms,
                 cache_read_input_tokens=usage.cache_read_input_tokens,
                 cache_creation_input_tokens=usage.cache_creation_input_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
                 meta=meta,
             )
             session.add(record)
@@ -850,6 +853,7 @@ class SQLAlchemyStateStore:
                 duration_ms=duration_ms,
                 cache_read_input_tokens=usage.cache_read_input_tokens,
                 cache_creation_input_tokens=usage.cache_creation_input_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
                 guardrail_findings=guardrail_findings,
             )
             session.add(record)
@@ -897,6 +901,7 @@ class SQLAlchemyStateStore:
                     duration_ms=r.duration_ms,
                     cache_read_input_tokens=r.cache_read_input_tokens,
                     cache_creation_input_tokens=r.cache_creation_input_tokens,
+                    reasoning_tokens=r.reasoning_tokens,
                     created_at=_to_aware_utc(r.created_at),
                 )
                 for r in rows
@@ -948,6 +953,7 @@ class SQLAlchemyStateStore:
                     values["total_cache_creation_tokens"] = (
                         total_usage.cache_creation_input_tokens or 0
                     )
+                    values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
 
@@ -1022,6 +1028,7 @@ class SQLAlchemyStateStore:
                     values["total_cache_creation_tokens"] = (
                         total_usage.cache_creation_input_tokens or 0
                     )
+                    values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
 
@@ -2045,6 +2052,7 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         total_cost_usd=float(row.total_cost_usd) if row.total_cost_usd is not None else None,
         total_cache_read_tokens=row.total_cache_read_tokens,
         total_cache_creation_tokens=row.total_cache_creation_tokens,
+        total_reasoning_tokens=row.total_reasoning_tokens,
         meta=row.meta,
         last_progress_at=_to_aware_utc(row.last_progress_at),
         failure_reason=row.failure_reason,

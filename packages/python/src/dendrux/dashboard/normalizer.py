@@ -65,6 +65,8 @@ class LLMCallNode:
     # Cache telemetry (None when provider didn't report)
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
+    # Reasoning/thinking tokens (billed within output_tokens; None if unreported)
+    reasoning_tokens: int | None = None
 
 
 @dataclass
@@ -220,6 +222,7 @@ class RunSummary:
     total_cost_usd: float | None = None
     total_cache_read_tokens: int = 0
     total_cache_creation_tokens: int = 0
+    total_reasoning_tokens: int = 0
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -292,6 +295,7 @@ async def normalize_timeline(
         total_cost_usd=run_record.total_cost_usd,
         total_cache_read_tokens=run_record.total_cache_read_tokens,
         total_cache_creation_tokens=run_record.total_cache_creation_tokens,
+        total_reasoning_tokens=run_record.total_reasoning_tokens,
         created_at=run_record.created_at,
         updated_at=run_record.updated_at,
     )
@@ -368,6 +372,7 @@ async def normalize_timeline(
                     assistant_text=assistant_text_by_iter.get(event.iteration_index),
                     cache_read_input_tokens=data.get("cache_read_input_tokens"),
                     cache_creation_input_tokens=data.get("cache_creation_input_tokens"),
+                    reasoning_tokens=data.get("reasoning_tokens"),
                 )
             )
 
@@ -522,6 +527,7 @@ def _summary_to_dict(s: RunSummary) -> dict[str, Any]:
         "total_cost_usd": s.total_cost_usd,
         "total_cache_read_tokens": s.total_cache_read_tokens,
         "total_cache_creation_tokens": s.total_cache_creation_tokens,
+        "total_reasoning_tokens": s.total_reasoning_tokens,
         "created_at": _utc_iso(s.created_at),
         "updated_at": _utc_iso(s.updated_at),
     }
@@ -550,6 +556,7 @@ def _node_to_dict(node: TimelineNode) -> dict[str, Any]:
             "assistant_text": node.assistant_text,
             "cache_read_input_tokens": node.cache_read_input_tokens,
             "cache_creation_input_tokens": node.cache_creation_input_tokens,
+            "reasoning_tokens": node.reasoning_tokens,
         }
     if isinstance(node, ToolCallNode):
         return {

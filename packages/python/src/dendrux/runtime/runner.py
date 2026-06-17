@@ -886,6 +886,7 @@ async def _build_cached_result(
             output_tokens=run.total_output_tokens,
             total_tokens=run.total_input_tokens + run.total_output_tokens,
             cost_usd=run.total_cost_usd,
+            reasoning_tokens=run.total_reasoning_tokens,
         ),
         error=run.error,
     )

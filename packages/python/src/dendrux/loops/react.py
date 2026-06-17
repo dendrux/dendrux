@@ -24,6 +24,7 @@ import inspect
 import json
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux.guardrails._engine import GuardrailEngine
@@ -137,6 +138,8 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
         total.cache_creation_input_tokens = (
             total.cache_creation_input_tokens or 0
         ) + step_usage.cache_creation_input_tokens
+    if step_usage.reasoning_tokens is not None:
+        total.reasoning_tokens = (total.reasoning_tokens or 0) + step_usage.reasoning_tokens
 
 
 async def _check_budget(
@@ -240,6 +243,9 @@ def _snapshot_usage(usage: UsageStats) -> UsageStats:
         output_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
         cost_usd=usage.cost_usd,
+        cache_read_input_tokens=usage.cache_read_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
     )
 
 
@@ -316,6 +322,7 @@ async def _init_loop_state(
         cache_creation_input_tokens=(
             initial_usage.cache_creation_input_tokens if initial_usage else None
         ),
+        reasoning_tokens=(initial_usage.reasoning_tokens if initial_usage else None),
     )
 
     return _LoopState(
@@ -905,6 +912,8 @@ class ReActLoop(Loop):
             )
 
             step = strategy.parse_response(response)
+            if response.reasoning is not None:
+                step = replace(step, meta={**step.meta, "reasoning": response.reasoning})
             steps.append(step)
 
             if isinstance(step.action, Finish):
@@ -1126,6 +1135,8 @@ class ReActLoop(Loop):
                     async for event in provider_stream:
                         if event.type == StreamEventType.TEXT_DELTA:
                             yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                        elif event.type == StreamEventType.REASONING_DELTA:
+                            yield RunEvent(type=RunEventType.REASONING_DELTA, text=event.text)
                         elif event.type == StreamEventType.TOOL_USE_START:
                             yield RunEvent(
                                 type=RunEventType.TOOL_USE_START,
@@ -1205,6 +1216,8 @@ class ReActLoop(Loop):
             )
 
             step = strategy.parse_response(llm_response)
+            if llm_response.reasoning is not None:
+                step = replace(step, meta={**step.meta, "reasoning": llm_response.reasoning})
             steps.append(step)
 
             if isinstance(step.action, Finish):

@@ -178,8 +178,14 @@ class PersistenceRecorder(BaseRecorder):
                 ]
 
         semantic_response: dict[str, Any] | None = None
-        if response.text is not None or response.tool_calls is not None:
+        if (
+            response.text is not None
+            or response.tool_calls is not None
+            or response.reasoning is not None
+        ):
             semantic_response = {}
+            if response.reasoning is not None:
+                semantic_response["reasoning"] = response.reasoning
             if response.text is not None:
                 semantic_response["text"] = response.text
             if response.tool_calls is not None:
@@ -199,6 +205,7 @@ class PersistenceRecorder(BaseRecorder):
                 "cost_usd": response.usage.cost_usd,
                 "cache_read_input_tokens": response.usage.cache_read_input_tokens,
                 "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
+                "reasoning_tokens": response.usage.reasoning_tokens,
             }
 
         # BEST-EFFORT: llm_interactions (full forensics)
@@ -250,6 +257,7 @@ class PersistenceRecorder(BaseRecorder):
                 "output_tokens": response.usage.output_tokens,
                 "cache_read_input_tokens": response.usage.cache_read_input_tokens,
                 "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
+                "reasoning_tokens": response.usage.reasoning_tokens,
                 "cost_usd": response.usage.cost_usd,
                 "model": response.model or self._model,
                 "has_tool_calls": bool(response.tool_calls),
