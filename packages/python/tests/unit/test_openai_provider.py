@@ -56,6 +56,7 @@ class FakeUsage:
     prompt_tokens: int = 100
     completion_tokens: int = 50
     total_tokens: int = 150
+    completion_tokens_details: Any = None
 
 
 @dataclass
@@ -1243,3 +1244,63 @@ class TestApiKeyValidation:
             base_url="http://localhost:8000/v1",
             api_key="not-needed",
         )
+
+
+# ---------------------------------------------------------------------------
+# Reasoning / thinking (Chat: effort → reasoning_effort + reasoning_tokens)
+# ---------------------------------------------------------------------------
+class TestReasoning:
+    @staticmethod
+    def _build(provider: OpenAIProvider, **kwargs: object) -> dict:
+        api_kwargs, _ = provider._build_api_kwargs(
+            [Message(role=Role.USER, content="hi")], None, dict(kwargs)
+        )
+        return api_kwargs
+
+    def test_bc_no_reasoning_by_default(self, provider: OpenAIProvider) -> None:
+        # gpt-4o / compatible backends must NOT receive reasoning_effort.
+        assert "reasoning_effort" not in self._build(provider)
+
+    def test_effort_maps_to_reasoning_effort(self, provider: OpenAIProvider) -> None:
+        assert self._build(provider, effort="high")["reasoning_effort"] == "high"
+
+    def test_effort_extra_alias(self, provider: OpenAIProvider) -> None:
+        assert self._build(provider, effort="extra")["reasoning_effort"] == "xhigh"
+
+    def test_effort_overrides_reasoning_effort(self) -> None:
+        p = OpenAIProvider(model="gpt-5", api_key="t", reasoning_effort="low")
+        assert self._build(p, effort="high")["reasoning_effort"] == "high"
+
+    def test_ctor_reasoning_effort_still_sent(self) -> None:
+        p = OpenAIProvider(model="gpt-5", api_key="t", reasoning_effort="medium")
+        assert self._build(p)["reasoning_effort"] == "medium"
+
+    def test_ctor_effort_sent(self) -> None:
+        p = OpenAIProvider(model="gpt-5", api_key="t", effort="high")
+        assert self._build(p)["reasoning_effort"] == "high"
+
+    def test_thinking_kwarg_does_not_inject_effort(self, provider: OpenAIProvider) -> None:
+        # thinking alone must not add reasoning_effort (would break gpt-4o).
+        assert "reasoning_effort" not in self._build(provider, thinking=True)
+
+    def test_reasoning_tokens_from_usage_object(self, provider: OpenAIProvider) -> None:
+        @dataclass
+        class _Details:
+            reasoning_tokens: int
+
+        resp = FakeChatCompletion(
+            choices=[FakeChoice(message=FakeMessage(content="hi"))],
+            usage=FakeUsage(completion_tokens_details=_Details(reasoning_tokens=42)),
+        )
+        assert provider._normalize_response(resp).usage.reasoning_tokens == 42
+
+    def test_reasoning_tokens_from_usage_dict(self, provider: OpenAIProvider) -> None:
+        resp = FakeChatCompletion(
+            choices=[FakeChoice(message=FakeMessage(content="hi"))],
+            usage=FakeUsage(completion_tokens_details={"reasoning_tokens": 42}),
+        )
+        assert provider._normalize_response(resp).usage.reasoning_tokens == 42
+
+    def test_bc_no_reasoning_tokens_when_absent(self, provider: OpenAIProvider) -> None:
+        resp = FakeChatCompletion(choices=[FakeChoice(message=FakeMessage(content="hi"))])
+        assert provider._normalize_response(resp).usage.reasoning_tokens is None

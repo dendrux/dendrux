@@ -53,6 +53,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_EFFORT_ALIASES = {"extra": "xhigh"}
+
+
+def _normalize_effort(effort: str) -> str:
+    """Map a Dendrux effort alias to OpenAI's vocabulary."""
+    return _EFFORT_ALIASES.get(effort, effort)
+
+
+def _reasoning_tokens_from(details: Any) -> int | None:
+    """Read reasoning_tokens from output_tokens_details (dict or object)."""
+    if isinstance(details, dict):
+        return details.get("reasoning_tokens")
+    if details is not None:
+        return getattr(details, "reasoning_tokens", None)
+    return None
+
+
 def _build_usage_with_cache(usage: Any) -> UsageStats:
     """Build UsageStats from an OpenAI Responses API usage object.
 
@@ -66,6 +83,7 @@ def _build_usage_with_cache(usage: Any) -> UsageStats:
     output_tokens = getattr(usage, "output_tokens", 0) or 0
     details = getattr(usage, "input_tokens_details", None)
     cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
+    reasoning_tokens = _reasoning_tokens_from(getattr(usage, "output_tokens_details", None))
     fresh_input = max(0, raw_input - (cache_read or 0))
     return UsageStats(
         input_tokens=fresh_input,
@@ -73,6 +91,7 @@ def _build_usage_with_cache(usage: Any) -> UsageStats:
         total_tokens=fresh_input + output_tokens,
         cache_read_input_tokens=cache_read,
         cache_creation_input_tokens=None,
+        reasoning_tokens=reasoning_tokens,
     )
 
 
@@ -131,7 +150,7 @@ class OpenAIResponsesProvider(LLMProvider):
         supports_tool_call_ids=True,
         supports_streaming=True,
         supports_streaming_tool_deltas=True,
-        supports_thinking=False,
+        supports_thinking=True,
         supports_multimodal=False,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
@@ -148,6 +167,9 @@ class OpenAIResponsesProvider(LLMProvider):
         max_output_tokens: int = 16_000,
         temperature: float | None = None,
         reasoning_effort: str | None = None,
+        thinking: bool = False,
+        effort: str | None = None,
+        show_thinking: bool = True,
         timeout: float = 120.0,
         max_retries: int = 3,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
@@ -161,6 +183,14 @@ class OpenAIResponsesProvider(LLMProvider):
             max_output_tokens: Maximum output tokens per call. Override per-call.
             temperature: Sampling temperature. None = model default.
             reasoning_effort: Reasoning depth ("low", "medium", "high").
+            thinking: Enable reasoning + surface its summary. Default False.
+                When on (or when effort is set), the ``reasoning`` param is sent.
+            effort: Cross-vendor reasoning effort (low|medium|high|xhigh;
+                "extra"→xhigh). Overrides ``reasoning_effort``.
+            show_thinking: When reasoning is on, request a summary
+                (reasoning.summary="auto") so reasoning text is returned.
+                Default True. Sent only with the reasoning param, so
+                non-reasoning models stay unaffected unless you opt in.
             timeout: HTTP request timeout in seconds.
             max_retries: Number of automatic retries on transient errors.
             prompt_cache_retention: Responses API prompt-cache retention.
@@ -191,6 +221,9 @@ class OpenAIResponsesProvider(LLMProvider):
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
+        self._thinking = thinking
+        self._effort = effort
+        self._show_thinking = show_thinking
         self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
 
@@ -264,10 +297,26 @@ class OpenAIResponsesProvider(LLMProvider):
             elif attr is not None:
                 api_kwargs[key] = attr
 
-        # Handle reasoning_effort — Responses API uses nested reasoning object
+        # Reasoning — Responses API uses a nested object. `effort` (cross-vendor)
+        # overrides reasoning_effort; `show_thinking` requests a summary so the
+        # reasoning text is returned. We send the reasoning param only when
+        # reasoning is wanted (effort set or thinking on), so non-reasoning
+        # models stay unaffected by default.
+        thinking_on = kwargs.pop("thinking", self._thinking)
+        show_thinking = kwargs.pop("show_thinking", self._show_thinking)
+        effort = kwargs.pop("effort", self._effort)
         reasoning_effort = kwargs.pop("reasoning_effort", self._reasoning_effort)
-        if reasoning_effort is not None:
-            api_kwargs["reasoning"] = {"effort": reasoning_effort}
+        effective_effort = _normalize_effort(effort) if effort is not None else reasoning_effort
+        if effective_effort is not None or thinking_on:
+            reasoning: dict[str, Any] = {}
+            if effective_effort is not None:
+                reasoning["effort"] = effective_effort
+            # Summary is requested only when thinking is explicitly opted into,
+            # so legacy reasoning_effort callers keep their exact request shape.
+            if thinking_on and show_thinking:
+                reasoning["summary"] = "auto"
+            if reasoning:
+                api_kwargs["reasoning"] = reasoning
 
         # Forward remaining supported kwargs
         already_handled = {
@@ -413,6 +462,7 @@ class OpenAIResponsesProvider(LLMProvider):
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         usage = UsageStats()
 
@@ -429,6 +479,13 @@ class OpenAIResponsesProvider(LLMProvider):
                 if delta_text:
                     text_parts.append(delta_text)
                     yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=delta_text)
+
+            # --- Reasoning summary deltas (arrive before output text) ---
+            elif event_type == "response.reasoning_summary_text.delta":
+                delta_text = event.delta
+                if delta_text:
+                    reasoning_parts.append(delta_text)
+                    yield StreamEvent(type=StreamEventType.REASONING_DELTA, text=delta_text)
 
             # --- Function call lifecycle (ordered: added → delta → done) ---
             elif event_type == "response.output_item.added":
@@ -492,12 +549,24 @@ class OpenAIResponsesProvider(LLMProvider):
                 error_msg = getattr(event, "error", "Unknown streaming error")
                 raise RuntimeError(f"Responses API stream failed: {error_msg}")
 
+        # Reasoning items (for multi-turn replay) come from the completed response.
+        reasoning_blocks: list[Any] | None = None
+        if _completed_response is not None:
+            blocks = [
+                item.model_dump() if hasattr(item, "model_dump") else item
+                for item in getattr(_completed_response, "output", None) or []
+                if getattr(item, "type", None) == "reasoning"
+            ]
+            reasoning_blocks = blocks or None
+
         # Assemble the final LLMResponse
         llm_response = LLMResponse(
             text="".join(text_parts) if text_parts else None,
             tool_calls=tool_calls if tool_calls else None,
             raw=None,
             usage=usage,
+            reasoning="".join(reasoning_parts) if reasoning_parts else None,
+            reasoning_blocks=reasoning_blocks,
         )
         llm_response.provider_request = captured_request
         llm_response.model = captured_request["model"]
@@ -599,10 +668,13 @@ class OpenAIResponsesProvider(LLMProvider):
         """
         text = response.output_text if hasattr(response, "output_text") else None
 
-        # Extract function calls from output items
+        # Extract function calls + reasoning items from output
         tool_calls: list[ToolCall] = []
+        reasoning_parts: list[str] = []
+        reasoning_blocks: list[Any] = []
         for item in response.output:
-            if getattr(item, "type", None) == "function_call":
+            item_type = getattr(item, "type", None)
+            if item_type == "function_call":
                 params = parse_tool_json_strict(
                     item.arguments or "",
                     tool_name=item.name,
@@ -615,6 +687,14 @@ class OpenAIResponsesProvider(LLMProvider):
                         provider_tool_call_id=item.call_id,
                     )
                 )
+            elif item_type == "reasoning":
+                # Keep the reasoning item for multi-turn replay; surface the
+                # summary text when present.
+                reasoning_blocks.append(item.model_dump() if hasattr(item, "model_dump") else item)
+                for part in getattr(item, "summary", None) or []:
+                    part_text = getattr(part, "text", None)
+                    if part_text:
+                        reasoning_parts.append(part_text)
 
         # Extract usage
         usage = UsageStats()
@@ -626,4 +706,6 @@ class OpenAIResponsesProvider(LLMProvider):
             tool_calls=tool_calls if tool_calls else None,
             raw=response,
             usage=usage,
+            reasoning="".join(reasoning_parts) if reasoning_parts else None,
+            reasoning_blocks=reasoning_blocks if reasoning_blocks else None,
         )

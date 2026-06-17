@@ -56,6 +56,22 @@ logger = logging.getLogger(__name__)
 
 _OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1/"
 
+_EFFORT_ALIASES = {"extra": "xhigh"}
+
+
+def _normalize_effort(effort: str) -> str:
+    """Map a Dendrux effort alias to OpenAI's vocabulary."""
+    return _EFFORT_ALIASES.get(effort, effort)
+
+
+def _reasoning_tokens_from(details: Any) -> int | None:
+    """Read reasoning_tokens from completion_tokens_details (dict or object)."""
+    if isinstance(details, dict):
+        return details.get("reasoning_tokens")
+    if details is not None:
+        return getattr(details, "reasoning_tokens", None)
+    return None
+
 
 def _build_usage_with_cache(usage: Any) -> UsageStats:
     """Build UsageStats from an OpenAI Chat Completions usage object.
@@ -71,6 +87,7 @@ def _build_usage_with_cache(usage: Any) -> UsageStats:
     completion_tokens = usage.completion_tokens or 0
     details = getattr(usage, "prompt_tokens_details", None)
     cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
+    reasoning_tokens = _reasoning_tokens_from(getattr(usage, "completion_tokens_details", None))
     fresh_input = max(0, prompt_tokens - (cache_read or 0))
     return UsageStats(
         input_tokens=fresh_input,
@@ -78,6 +95,7 @@ def _build_usage_with_cache(usage: Any) -> UsageStats:
         total_tokens=fresh_input + completion_tokens,
         cache_read_input_tokens=cache_read,
         cache_creation_input_tokens=None,
+        reasoning_tokens=reasoning_tokens,
     )
 
 
@@ -144,7 +162,7 @@ class OpenAIProvider(LLMProvider):
         supports_tool_call_ids=True,
         supports_streaming=True,
         supports_streaming_tool_deltas=True,
-        supports_thinking=False,
+        supports_thinking=True,
         supports_multimodal=False,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
@@ -161,6 +179,7 @@ class OpenAIProvider(LLMProvider):
         max_tokens: int = 16_000,
         temperature: float | None = None,
         reasoning_effort: str | None = None,
+        effort: str | None = None,
         timeout: float = 120.0,
         max_retries: int = 3,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
@@ -174,6 +193,11 @@ class OpenAIProvider(LLMProvider):
             max_tokens: Maximum output tokens per call. Override per-call via kwargs.
             temperature: Sampling temperature. None = model default. For GPT-4o family.
             reasoning_effort: Reasoning depth ("low", "medium", "high"). For o-series/GPT-5.
+            effort: Cross-vendor reasoning effort (low|medium|high|xhigh; "extra"→xhigh).
+                Overrides ``reasoning_effort`` when both set. Only sent when set, so
+                non-reasoning models (gpt-4o) and compatible backends are unaffected.
+                OpenAI Chat returns no reasoning text — only ``reasoning_tokens``; use
+                OpenAIResponsesProvider to surface reasoning summaries.
             timeout: HTTP request timeout in seconds.
             max_retries: Number of automatic retries on transient errors.
             prompt_cache_retention: OpenAI prompt-cache retention. ``None``
@@ -198,6 +222,7 @@ class OpenAIProvider(LLMProvider):
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
+        self._effort = effort
         self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
 
@@ -256,6 +281,16 @@ class OpenAIProvider(LLMProvider):
             "tools": api_tools,
             "max_tokens": max_tokens,
         }
+
+        # `effort` is the cross-vendor reasoning knob; it overrides
+        # reasoning_effort. `thinking` is accepted for API uniformity but does
+        # not by itself add/remove reasoning_effort — sending it to a
+        # non-reasoning model (gpt-4o) or compatible backend would break the
+        # call, so we only send a value when one is explicitly given.
+        kwargs.pop("thinking", None)
+        effort = kwargs.pop("effort", self._effort)
+        if effort is not None:
+            kwargs["reasoning_effort"] = _normalize_effort(effort)
 
         # Apply constructor defaults for optional params (per-call kwargs override)
         for attr, key in [
