@@ -100,6 +100,7 @@ class RunDetail:
     answer: str | None
     error: str | None
     failure_reason: str | None
+    total_reasoning_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +132,8 @@ class LLMCall:
     provider_request: dict[str, Any] | None
     provider_response: dict[str, Any] | None
     created_at: datetime | None
+    reasoning_tokens: int | None = None
+    reasoning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +479,7 @@ def _run_to_detail(record: Any) -> RunDetail:
         answer=record.answer,
         error=record.error,
         failure_reason=record.failure_reason,
+        total_reasoning_tokens=record.total_reasoning_tokens,
     )
 
 
@@ -505,6 +509,8 @@ def _llm_to_public(record: Any) -> LLMCall:
         provider_request=record.provider_request,
         provider_response=record.provider_response,
         created_at=record.created_at,
+        reasoning_tokens=record.reasoning_tokens,
+        reasoning=(record.semantic_response or {}).get("reasoning"),
     )
 
 

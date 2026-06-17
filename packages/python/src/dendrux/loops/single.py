@@ -443,6 +443,7 @@ class SingleCall(Loop):
             cost_usd=response.usage.cost_usd,
             cache_read_input_tokens=response.usage.cache_read_input_tokens,
             cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
+            reasoning_tokens=response.usage.reasoning_tokens,
         )
 
         await _check_budget(
@@ -456,6 +457,9 @@ class SingleCall(Loop):
             notifier_warnings,
         )
 
+        sc_meta = guardrail_meta(g_engine, notifier_warnings)
+        if response.reasoning is not None:
+            sc_meta["reasoning"] = response.reasoning
         return RunResult(
             run_id=resolved_run_id,
             status=RunStatus.SUCCESS,
@@ -464,7 +468,7 @@ class SingleCall(Loop):
             steps=[],
             iteration_count=1,
             usage=usage,
-            meta=guardrail_meta(g_engine, notifier_warnings),
+            meta=sc_meta,
         )
 
     async def run_stream(
@@ -567,6 +571,8 @@ class SingleCall(Loop):
                 async for event in provider_stream:
                     if event.type == StreamEventType.TEXT_DELTA:
                         yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                    elif event.type == StreamEventType.REASONING_DELTA:
+                        yield RunEvent(type=RunEventType.REASONING_DELTA, text=event.text)
                     elif event.type in (
                         StreamEventType.TOOL_USE_START,
                         StreamEventType.TOOL_USE_END,
@@ -647,6 +653,7 @@ class SingleCall(Loop):
             cost_usd=llm_response.usage.cost_usd,
             cache_read_input_tokens=llm_response.usage.cache_read_input_tokens,
             cache_creation_input_tokens=llm_response.usage.cache_creation_input_tokens,
+            reasoning_tokens=llm_response.usage.reasoning_tokens,
         )
 
         await _check_budget(
@@ -660,6 +667,9 @@ class SingleCall(Loop):
             notifier_warnings,
         )
 
+        sc_stream_meta: dict[str, Any] = {}
+        if llm_response.reasoning is not None:
+            sc_stream_meta["reasoning"] = llm_response.reasoning
         yield RunEvent(
             type=RunEventType.RUN_COMPLETED,
             run_result=RunResult(
@@ -669,5 +679,6 @@ class SingleCall(Loop):
                 steps=[],
                 iteration_count=1,
                 usage=usage,
+                meta=sc_stream_meta,
             ),
         )

@@ -138,6 +138,9 @@ function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
         {node.cache_read_input_tokens != null && (
           <StatCard label="Cached" value={formatTokens(node.cache_read_input_tokens)} mono />
         )}
+        {node.reasoning_tokens != null && (
+          <StatCard label="Reasoning" value={formatTokens(node.reasoning_tokens)} mono />
+        )}
         {node.cost_usd != null && <StatCard label="Cost" value={formatCost(node.cost_usd)} mono />}
         {node.model && <StatCard label="Model" value={node.model} />}
         {interaction?.duration_ms != null && <StatCard label="Latency" value={formatDuration(interaction.duration_ms)} mono />}

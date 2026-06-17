@@ -47,6 +47,9 @@ export function RunHeader({ summary }: RunHeaderProps) {
           <MetaBlock label="Model" value={summary.model} />
         )}
         <MetaBlock label="Tokens" value={formatTokens(summary.total_input_tokens + summary.total_output_tokens)} mono />
+        {summary.total_reasoning_tokens > 0 && (
+          <MetaBlock label="Reasoning" value={formatTokens(summary.total_reasoning_tokens)} mono />
+        )}
         <MetaBlock label="Cost" value={formatCost(summary.total_cost_usd)} mono />
 
         {/* System prompt is now shown inside the LLM Call inspector */}
