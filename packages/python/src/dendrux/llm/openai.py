@@ -269,17 +269,23 @@ class OpenAIProvider(LLMProvider):
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools) if tools else openai.NOT_GIVEN
 
-        # Resolve max_tokens: per-call kwargs override constructor default
-        max_tokens = kwargs.pop(
+        # Resolve the output-token cap: per-call kwargs override constructor default.
+        # The official OpenAI endpoint requires `max_completion_tokens` (gpt-5 and
+        # o-series reject `max_tokens` with a 400, and it's deprecated for gpt-4o
+        # too); OpenAI-compatible backends (vLLM, Groq, Ollama, etc.) still expect
+        # `max_tokens`. Gate on base_url, mirroring the prompt_cache_key routing below.
+        max_output_tokens = kwargs.pop(
             "max_completion_tokens",
             kwargs.pop("max_tokens", self._max_tokens),
         )
+        is_openai_endpoint = str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL
+        token_param = "max_completion_tokens" if is_openai_endpoint else "max_tokens"
 
         api_kwargs: dict[str, Any] = {
             "model": kwargs.pop("model", self._model),
             "messages": api_messages,
             "tools": api_tools,
-            "max_tokens": max_tokens,
+            token_param: max_output_tokens,
         }
 
         # `effort` is the cross-vendor reasoning knob; it overrides
@@ -317,7 +323,7 @@ class OpenAIProvider(LLMProvider):
         # Cache routing — derive key from prefix or run_id.
         # Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.) since some
         # compatible backends reject unknown OpenAI-specific request fields.
-        if str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL:
+        if is_openai_endpoint:
             cache_key_source = cache_key_prefix or run_id
             if cache_key_source:
                 api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"

@@ -507,7 +507,7 @@ class TestComplete:
         assert "unknown_param" not in call_kwargs
 
     async def test_complete_default_max_tokens(self, provider: OpenAIProvider) -> None:
-        """Default max_tokens is 16_000 when not specified."""
+        """Default output cap is 16_000, sent as max_completion_tokens on OpenAI."""
         from unittest.mock import AsyncMock
 
         fake_response = FakeChatCompletion(
@@ -520,7 +520,49 @@ class TestComplete:
         await provider.complete(msgs)
 
         call_kwargs = mock_create.call_args[1]
+        # Official endpoint requires max_completion_tokens (gpt-5/o-series reject
+        # max_tokens with a 400; it is deprecated for gpt-4o too).
+        assert call_kwargs["max_completion_tokens"] == 16_000
+        assert "max_tokens" not in call_kwargs
+
+    async def test_complete_max_completion_tokens_per_call(self, provider: OpenAIProvider) -> None:
+        """Per-call max_tokens / max_completion_tokens override the default cap."""
+        from unittest.mock import AsyncMock
+
+        fake_response = FakeChatCompletion(
+            choices=[FakeChoice(message=FakeMessage(content="ok"))],
+        )
+        mock_create = AsyncMock(return_value=fake_response)
+        provider._client.chat.completions.create = mock_create
+
+        msgs = [Message(role=Role.USER, content="Hi")]
+        await provider.complete(msgs, max_tokens=128)
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["max_completion_tokens"] == 128
+        assert "max_tokens" not in call_kwargs
+
+    async def test_complete_compatible_backend_uses_max_tokens(self) -> None:
+        """Compatible backends (custom base_url) keep the legacy max_tokens key."""
+        from unittest.mock import AsyncMock
+
+        p = OpenAIProvider(
+            model="meta-llama/Llama-3-70B",
+            api_key="not-needed",
+            base_url="http://localhost:8000/v1",
+        )
+        fake_response = FakeChatCompletion(
+            choices=[FakeChoice(message=FakeMessage(content="ok"))],
+        )
+        mock_create = AsyncMock(return_value=fake_response)
+        p._client.chat.completions.create = mock_create
+
+        msgs = [Message(role=Role.USER, content="Hi")]
+        await p.complete(msgs)
+
+        call_kwargs = mock_create.call_args[1]
         assert call_kwargs["max_tokens"] == 16_000
+        assert "max_completion_tokens" not in call_kwargs
 
 
 # ---------------------------------------------------------------------------

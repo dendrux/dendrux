@@ -1,0 +1,76 @@
+---
+title: Models and providers
+description: The three first-class provider classes, which one to reach for, how OpenAI-compatible backends fit, and the per-model output-token caps that dendrux handles for you.
+---
+
+# Models and providers
+
+A **provider** is the thin adapter between dendrux's universal types and a vendor's HTTP API. You construct one, hand it to `Agent(provider=...)`, and the loop calls it. Providers do shape translation only — no agent-loop awareness, no business logic.
+
+Three first-class provider classes ship in the box. Everything below is read from the `dendrux==0.2.0a4` source.
+
+| Class | Vendor / API | Import |
+| --- | --- | --- |
+| `AnthropicProvider` | Anthropic Messages API | `dendrux.llm.anthropic` |
+| `OpenAIProvider` | OpenAI **Chat Completions** (and any OpenAI-compatible server) | `dendrux.llm.openai` |
+| `OpenAIResponsesProvider` | OpenAI **Responses** API | `dendrux.llm.openai_responses` |
+
+```python
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.llm.openai import OpenAIProvider
+from dendrux.llm.openai_responses import OpenAIResponsesProvider
+
+agent = Agent(prompt="…", provider=AnthropicProvider(model="claude-opus-4-8"))
+```
+
+## Picking a provider
+
+There are two OpenAI providers because OpenAI runs two different request/response APIs, and they differ in what they can surface.
+
+- **OpenAI, current models** → `OpenAIResponsesProvider`. The Responses API is OpenAI's current direction and the only one that returns **reasoning summaries** (the model's thinking, as text) for gpt-5 / o-series. See [Reasoning and thinking](/docs/architecture/reasoning).
+- **Legacy OpenAI models, or any OpenAI-compatible server** → `OpenAIProvider`. Chat Completions is the universal endpoint. It returns reasoning **token counts** but no reasoning text.
+- **Anthropic** → `AnthropicProvider`.
+
+The Responses API is OpenAI-only. Pointing `OpenAIResponsesProvider` at a non-OpenAI backend will not work — that is exactly the case `OpenAIProvider` covers.
+
+## OpenAI-compatible backends
+
+`OpenAIProvider` speaks plain Chat Completions, so it drives any server that implements that wire format — vLLM, SGLang, Groq, Together, Ollama, LM Studio — by setting `base_url`. There is no separate provider class per backend.
+
+```python
+# vLLM / SGLang / local
+OpenAIProvider(model="meta-llama/Llama-3-70B", base_url="http://localhost:8000/v1", api_key="not-needed")
+
+# Groq
+OpenAIProvider(model="llama-3.3-70b", base_url="https://api.groq.com/openai/v1", api_key="gsk-…")
+```
+
+When `base_url` points away from the official endpoint, dendrux drops OpenAI-specific request fields (the prompt-cache key, the OpenAI-only output-token parameter) that some compatible backends reject. You get the universal request shape automatically.
+
+## The output-token cap is per-API
+
+Every provider takes a constructor default for the maximum output tokens per call and lets you override it per call via kwargs. The wire parameter name differs by API, and dendrux picks the right one for you:
+
+| Provider / endpoint | Wire parameter | Constructor arg |
+| --- | --- | --- |
+| `AnthropicProvider` | `max_tokens` | `max_tokens=` |
+| `OpenAIProvider`, **official** OpenAI endpoint | `max_completion_tokens` | `max_tokens=` |
+| `OpenAIProvider`, **compatible** backend (custom `base_url`) | `max_tokens` | `max_tokens=` |
+| `OpenAIResponsesProvider` | `max_output_tokens` | `max_output_tokens=` |
+
+The OpenAI Chat Completions case is the subtle one. gpt-5 and o-series models **reject** `max_tokens` on Chat Completions with an HTTP 400 (`Unsupported parameter: 'max_tokens' … Use 'max_completion_tokens' instead`); `max_tokens` is deprecated for gpt-4o-era models too. So on the official endpoint `OpenAIProvider` always sends `max_completion_tokens`, which works for gpt-4o, gpt-5, and o-series alike. Compatible backends that still expect the older `max_tokens` keep getting it. The selection is gated on `base_url`, the same way prompt-cache routing is — you do not configure it.
+
+You keep using the friendly constructor name regardless of endpoint:
+
+```python
+# Constructor default applies to every call …
+provider = OpenAIProvider(model="gpt-5.5", max_tokens=4_000)
+
+# … and a per-call kwarg overrides it for one call.
+await agent.run("…", max_tokens=512)
+```
+
+## Per-call overrides
+
+Anything you pass to `agent.run(...)` / `agent.stream(...)` is forwarded to the provider for that call and overrides the constructor default. Common knobs: `model`, `max_tokens`, `temperature`, and the reasoning controls (`thinking`, `effort`) covered in [Reasoning and thinking](/docs/architecture/reasoning). Unknown kwargs are ignored rather than forwarded blindly, so a kwarg meant for one provider will not break another.

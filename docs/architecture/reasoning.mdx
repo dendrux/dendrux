@@ -1,0 +1,87 @@
+---
+title: Reasoning and thinking
+description: Turn on extended thinking for Anthropic and OpenAI with one switch, control depth and whether the trace is returned, and read the reasoning tokens back from every run.
+---
+
+# Reasoning and thinking
+
+Modern Anthropic and OpenAI models can spend extra tokens "thinking" before they answer. dendrux exposes this as a small, uniform set of controls that work the same way across both vendors, and it threads the resulting reasoning — token counts and, where the vendor returns it, the summary text — through the same run-result, persistence, streaming, and dashboard rails as everything else.
+
+It is **off by default**. Every existing app keeps its exact behavior until you opt in. Everything below is read from the `dendrux==0.2.0a4` source.
+
+## The controls
+
+The reasoning knobs are constructor arguments on the provider, and every one of them can also be overridden per call via `agent.run(...)` / `agent.stream(...)` kwargs.
+
+| Control | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `thinking` | `bool` | `False` | Master switch. Off → no reasoning request is sent at all. |
+| `effort` | `str \| None` | `None` | Depth: `low` \| `medium` \| `high` \| `xhigh` (`"extra"` is an alias for `xhigh`). |
+| `show_thinking` | `bool` | `True` | When thinking is on: `True` returns the summarized trace; `False` omits it (faster first token). |
+| `thinking_budget` | `int \| None` | `None` | **Anthropic only.** Forces legacy manual thinking with a fixed token budget. `None` → adaptive thinking. |
+
+```python
+from dendrux import Agent
+from dendrux.llm.anthropic import AnthropicProvider
+
+agent = Agent(
+    prompt="…",
+    provider=AnthropicProvider(model="claude-opus-4-8", thinking=True, effort="high"),
+)
+
+# Per-call override — turn thinking up for one hard question, off for the rest.
+await agent.run("Prove this edge case is unreachable.", effort="max")
+```
+
+`effort` is the cross-vendor vocabulary. `max` is Anthropic-only; OpenAI additionally accepts `none` / `minimal`. Each provider normalizes the value to its own API field, so you write one word and it lands correctly on either vendor.
+
+## What each provider does
+
+The switch is uniform; what the vendor *returns* is not. The key split is **token counts everywhere, summary text only where the API offers it**.
+
+| Provider | Mode | Reasoning text? | Notes |
+| --- | --- | --- | --- |
+| `AnthropicProvider` | Adaptive by default; `thinking_budget` switches to legacy manual | Yes — summarized (`show_thinking=True`) | `temperature` is dropped while thinking is on (incompatible). |
+| `OpenAIResponsesProvider` | Reasoning via the Responses API | Yes — summary (`show_thinking=True`) | The provider to use when you want gpt-5 / o-series thinking as text. |
+| `OpenAIProvider` (Chat Completions) | `effort` → `reasoning_effort` | No | Chat Completions returns reasoning **token counts only**, never the trace. |
+
+Adaptive thinking is the only mode current Anthropic models (4.6–4.8 / Fable / Mythos) support; `thinking_budget` exists for older models and fixed-cost workloads. See [Models and providers](/docs/architecture/models) for picking between the two OpenAI providers.
+
+## Reading reasoning back
+
+Reasoning rides the existing token-and-evidence rails, so it shows up everywhere usage already does.
+
+**On the run result.** `RunResult.usage.reasoning_tokens` is the run total (`None` if the provider did not report it):
+
+```python
+result = await agent.run("…")
+print(result.usage.reasoning_tokens)   # e.g. 72
+```
+
+**While streaming.** When the vendor returns a trace, `agent.stream(...)` emits `REASONING_DELTA` events alongside the usual text deltas; the chunk text is on `event.text`.
+
+```python
+from dendrux.types import RunEventType
+
+async for event in agent.stream("…"):
+    if event.type == RunEventType.REASONING_DELTA:
+        print(event.text, end="")
+```
+
+**From the store, after the fact.** Per-call reasoning is on `LLMCall` and the run total is on `RunDetail`:
+
+| Field | Where | Meaning |
+| --- | --- | --- |
+| `LLMCall.reasoning_tokens` | per LLM call | reasoning tokens for that call |
+| `LLMCall.reasoning` | per LLM call | summary text for that call, if returned |
+| `RunDetail.total_reasoning_tokens` | per run | summed across the run |
+
+These are backed by three nullable columns added without breaking the schema — `llm_interactions.reasoning_tokens`, `token_usage.reasoning_tokens`, and `agent_runs.total_reasoning_tokens` (see [State persistence](/docs/architecture/state-persistence)). The [dashboard](/docs/recipes/observability) surfaces the same numbers: a run-header total, a per-call stat, and the summary text in the payload inspector.
+
+## Reasoning tokens and your budget
+
+Reasoning tokens are billed **inside** `output_tokens` — the provider already counts them there. dendrux reports `reasoning_tokens` as an informational breakdown and never adds it on top of the output total, so a [budget](/docs/architecture/budget) is not double-charged. Turning thinking on will raise output-token spend (that is the point); the budget sees that spend through the normal output count, with the reasoning portion broken out so you can see how much of it was thinking.
+
+## Backward compatibility
+
+`thinking` defaults to `False`, the new persistence columns are nullable, and the cross-vendor effort values are opt-in — so an app that never sets these controls sends the exact same requests and stores the exact same rows it did before reasoning existed. A reasoning kwarg meant for one provider (e.g. `thinking` on the Chat Completions provider, which has no trace to return) is accepted and ignored rather than forwarded into a request that would break.
