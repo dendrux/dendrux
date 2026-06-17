@@ -43,6 +43,7 @@ class FakeUsage:
     input_tokens: int = 100
     output_tokens: int = 50
     total_tokens: int = 150
+    output_tokens_details: Any = None
 
 
 @dataclass
@@ -917,3 +918,80 @@ class TestApiKeyValidation:
     def test_accepts_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
         OpenAIResponsesProvider(model="gpt-4o")
+
+
+# ---------------------------------------------------------------------------
+# Reasoning / thinking (Responses: reasoning param shape + summary text)
+# ---------------------------------------------------------------------------
+@dataclass
+class FakeSummaryPart:
+    type: str = "summary_text"
+    text: str = "Let me think."
+
+
+@dataclass
+class FakeReasoningItem:
+    type: str = "reasoning"
+    summary: list[Any] = field(default_factory=lambda: [FakeSummaryPart()])
+
+    def model_dump(self) -> dict[str, Any]:
+        return {"type": "reasoning", "summary": [{"text": "Let me think."}]}
+
+
+class TestReasoning:
+    @staticmethod
+    def _build(provider: OpenAIResponsesProvider, **kwargs: object) -> dict:
+        api_kwargs, _ = provider._build_api_kwargs(
+            [Message(role=Role.USER, content="hi")], None, dict(kwargs)
+        )
+        return api_kwargs
+
+    def test_bc_no_reasoning_by_default(self, provider: OpenAIResponsesProvider) -> None:
+        assert "reasoning" not in self._build(provider)
+
+    def test_legacy_reasoning_effort_no_summary(self) -> None:
+        # BC: reasoning_effort alone keeps its exact request shape (no summary).
+        p = OpenAIResponsesProvider(model="gpt-5", api_key="t", reasoning_effort="high")
+        assert self._build(p)["reasoning"] == {"effort": "high"}
+
+    def test_thinking_requests_summary(self) -> None:
+        p = OpenAIResponsesProvider(model="gpt-5", api_key="t", thinking=True)
+        assert self._build(p)["reasoning"] == {"summary": "auto"}
+
+    def test_thinking_with_effort(self) -> None:
+        p = OpenAIResponsesProvider(model="gpt-5", api_key="t", thinking=True, effort="high")
+        assert self._build(p)["reasoning"] == {"effort": "high", "summary": "auto"}
+
+    def test_effort_extra_alias(self) -> None:
+        p = OpenAIResponsesProvider(model="gpt-5", api_key="t", thinking=True, effort="extra")
+        assert self._build(p)["reasoning"]["effort"] == "xhigh"
+
+    def test_show_thinking_false_omits_summary(self) -> None:
+        p = OpenAIResponsesProvider(
+            model="gpt-5", api_key="t", thinking=True, show_thinking=False, effort="high"
+        )
+        assert self._build(p)["reasoning"] == {"effort": "high"}
+
+    def test_effort_overrides_reasoning_effort(self) -> None:
+        p = OpenAIResponsesProvider(
+            model="gpt-5", api_key="t", reasoning_effort="low", thinking=True, effort="high"
+        )
+        assert self._build(p)["reasoning"]["effort"] == "high"
+
+    def test_normalize_extracts_reasoning(self, provider: OpenAIResponsesProvider) -> None:
+        resp = FakeResponse(
+            output=[FakeReasoningItem(), FakeFunctionCall()],
+            output_text="answer",
+            usage=FakeUsage(output_tokens_details={"reasoning_tokens": 30}),
+        )
+        result = provider._normalize_response(resp)
+        assert result.reasoning == "Let me think."
+        assert result.reasoning_blocks[0]["type"] == "reasoning"
+        assert result.usage.reasoning_tokens == 30
+
+    def test_bc_normalize_no_reasoning(self, provider: OpenAIResponsesProvider) -> None:
+        resp = FakeResponse(output=[FakeOutputText()], output_text="hi")
+        result = provider._normalize_response(resp)
+        assert result.reasoning is None
+        assert result.reasoning_blocks is None
+        assert result.usage.reasoning_tokens is None
