@@ -54,6 +54,24 @@ _SUPPORTED_KWARGS = frozenset(
     {"temperature", "top_p", "top_k", "stop_sequences", "model", "max_tokens"}
 )
 
+# Dendrux effort vocabulary → Anthropic. "extra" is the consumer label for
+# "xhigh"; every other value passes through (Anthropic validates it).
+_EFFORT_ALIASES = {"extra": "xhigh"}
+
+
+def _normalize_effort(effort: str) -> str:
+    """Map a Dendrux effort alias to Anthropic's vocabulary."""
+    return _EFFORT_ALIASES.get(effort, effort)
+
+
+def _reasoning_tokens_from_details(details: Any) -> int | None:
+    """Read thinking_tokens from output_tokens_details (dict or typed object)."""
+    if isinstance(details, dict):
+        return details.get("thinking_tokens")
+    if details is not None:
+        return getattr(details, "thinking_tokens", None)
+    return None
+
 
 class AnthropicProvider(LLMProvider):
     """Anthropic Messages API provider.
@@ -77,7 +95,7 @@ class AnthropicProvider(LLMProvider):
         supports_tool_call_ids=True,
         supports_streaming=True,
         supports_streaming_tool_deltas=True,
-        supports_thinking=False,  # Not implemented yet
+        supports_thinking=True,
         supports_multimodal=False,  # Not implemented yet
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
@@ -92,6 +110,10 @@ class AnthropicProvider(LLMProvider):
         api_key: str | None = None,
         max_tokens: int = 16_000,
         temperature: float | None = None,
+        thinking: bool = False,
+        effort: str | None = None,
+        show_thinking: bool = True,
+        thinking_budget: int | None = None,
         timeout: float = 120.0,
         max_retries: int = 3,
         cache_ttl: Literal["5m", "1h"] | None = None,
@@ -103,6 +125,16 @@ class AnthropicProvider(LLMProvider):
             api_key: API key. Defaults to ANTHROPIC_API_KEY env var.
             max_tokens: Maximum output tokens per call. Override per-call via kwargs.
             temperature: Sampling temperature. None = model default. Override per-call.
+            thinking: Enable extended/adaptive thinking. Default False (off).
+                When on, ``temperature`` is omitted (incompatible with thinking).
+            effort: Thinking effort — low|medium|high|xhigh|max ("extra"→xhigh).
+                Sent as ``output_config.effort`` when thinking is on.
+            show_thinking: When thinking is on, ``True`` returns summarized
+                thinking text (display=summarized); ``False`` omits it
+                (display=omitted, faster first token). Default True.
+            thinking_budget: Force legacy manual thinking with a fixed
+                ``budget_tokens`` (older models / precise cost). Default None
+                → adaptive thinking.
             timeout: HTTP request timeout in seconds.
             max_retries: Number of automatic retries on transient errors.
             cache_ttl: Anthropic prompt-cache TTL. ``None`` (default) omits the
@@ -123,6 +155,10 @@ class AnthropicProvider(LLMProvider):
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._thinking = thinking
+        self._effort = effort
+        self._show_thinking = show_thinking
+        self._thinking_budget = thinking_budget
         self._timeout = timeout
         self._cache_ttl = cache_ttl
 
@@ -214,7 +250,18 @@ class AnthropicProvider(LLMProvider):
             "tools": api_tools,
         }
 
-        if "temperature" in kwargs:
+        # Resolve thinking controls — per-call kwargs override constructor.
+        thinking_on = kwargs.pop("thinking", self._thinking)
+        effort = kwargs.pop("effort", self._effort)
+        show_thinking = kwargs.pop("show_thinking", self._show_thinking)
+        thinking_budget = kwargs.pop("thinking_budget", self._thinking_budget)
+        if thinking_on:
+            self._apply_thinking(api_kwargs, effort, show_thinking, thinking_budget)
+
+        # Temperature is incompatible with thinking — only send it when off.
+        if thinking_on:
+            kwargs.pop("temperature", None)
+        elif "temperature" in kwargs:
             api_kwargs["temperature"] = kwargs.pop("temperature")
         elif self._temperature is not None:
             api_kwargs["temperature"] = self._temperature
@@ -225,6 +272,31 @@ class AnthropicProvider(LLMProvider):
 
         captured_request = {k: v for k, v in api_kwargs.items() if v is not anthropic.NOT_GIVEN}
         return api_kwargs, captured_request
+
+    def _apply_thinking(
+        self,
+        api_kwargs: dict[str, Any],
+        effort: str | None,
+        show_thinking: bool,
+        thinking_budget: int | None,
+    ) -> None:
+        """Build the ``thinking`` + ``output_config`` API params.
+
+        Adaptive mode by default (the only mode on current 4.6–4.8 / Fable /
+        Mythos models); a ``thinking_budget`` switches to legacy manual mode
+        for older models or fixed-cost workloads.
+        """
+        display = "summarized" if show_thinking else "omitted"
+        if thinking_budget is not None:
+            api_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+                "display": display,
+            }
+        else:
+            api_kwargs["thinking"] = {"type": "adaptive", "display": display}
+        if effort is not None:
+            api_kwargs["output_config"] = {"effort": _normalize_effort(effort)}
 
     async def complete(
         self,
@@ -315,6 +387,9 @@ class AnthropicProvider(LLMProvider):
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        # Thinking-token count arrives on the message_delta event, not on the
+        # streamed final message's usage — capture it here.
+        stream_reasoning_tokens: int | None = None
 
         # Per-block state for tool call assembly
         _current_tool_name: str | None = None
@@ -345,6 +420,15 @@ class AnthropicProvider(LLMProvider):
                                 type=StreamEventType.TEXT_DELTA,
                                 text=delta.text,
                             )
+                        elif delta.type == "thinking_delta":
+                            yield StreamEvent(
+                                type=StreamEventType.REASONING_DELTA,
+                                text=delta.thinking,
+                            )
+                        elif delta.type == "signature_delta":
+                            # Carried on the final message's blocks; nothing to
+                            # surface live.
+                            pass
                         elif delta.type == "input_json_delta":
                             _current_tool_json_parts.append(delta.partial_json)
 
@@ -374,6 +458,14 @@ class AnthropicProvider(LLMProvider):
                             _current_tool_id = None
                             _current_tool_json_parts = []
 
+                    elif event.type == "message_delta":
+                        details = getattr(
+                            getattr(event, "usage", None), "output_tokens_details", None
+                        )
+                        captured = _reasoning_tokens_from_details(details)
+                        if captured is not None:
+                            stream_reasoning_tokens = captured
+
                 # Get the final message for usage stats and provider response
                 final_message = await stream.get_final_message()
 
@@ -384,21 +476,18 @@ class AnthropicProvider(LLMProvider):
         finally:
             end_call_attempt_tracking(attempt_token)
 
-        usage = UsageStats(
-            input_tokens=final_message.usage.input_tokens,
-            output_tokens=final_message.usage.output_tokens,
-            total_tokens=final_message.usage.input_tokens + final_message.usage.output_tokens,
-            cache_read_input_tokens=getattr(final_message.usage, "cache_read_input_tokens", None),
-            cache_creation_input_tokens=getattr(
-                final_message.usage, "cache_creation_input_tokens", None
-            ),
-        )
+        usage = self._usage_from_response(final_message.usage)
+        if usage.reasoning_tokens is None and stream_reasoning_tokens is not None:
+            usage.reasoning_tokens = stream_reasoning_tokens
+        reasoning, reasoning_blocks = self._extract_reasoning(final_message.content)
 
         llm_response = LLMResponse(
             text="".join(text_parts) if text_parts else None,
             tool_calls=tool_calls if tool_calls else None,
             raw=final_message,
             usage=usage,
+            reasoning=reasoning,
+            reasoning_blocks=reasoning_blocks,
         )
         llm_response.provider_request = captured_request
         llm_response.model = captured_request["model"]
@@ -517,6 +606,48 @@ class AnthropicProvider(LLMProvider):
     # Inbound conversions: Anthropic → Dendrux
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _usage_from_response(usage: Any) -> UsageStats:
+        """Build UsageStats from an Anthropic Usage object.
+
+        ``reasoning_tokens`` is read from ``output_tokens_details.thinking_tokens``
+        when the SDK reports it (None otherwise) — these are billed within
+        ``output_tokens``.
+        """
+        details = getattr(usage, "output_tokens_details", None)
+        reasoning_tokens = _reasoning_tokens_from_details(details)
+        return UsageStats(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.input_tokens + usage.output_tokens,
+            cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", None),
+            cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", None),
+            reasoning_tokens=reasoning_tokens,
+        )
+
+    @staticmethod
+    def _extract_reasoning(content: list[Any]) -> tuple[str | None, list[Any] | None]:
+        """Pull reasoning summary text + replay blocks from message content.
+
+        Keeps the full thinking/redacted_thinking blocks (incl. signature) for
+        multi-turn replay; surfaces the summary text when present (an
+        ``omitted`` display yields blocks with empty thinking text).
+        """
+        reasoning_parts: list[str] = []
+        reasoning_blocks: list[Any] = []
+        for block in content:
+            if block.type in ("thinking", "redacted_thinking"):
+                reasoning_blocks.append(
+                    block.model_dump() if hasattr(block, "model_dump") else block
+                )
+                thinking_text = getattr(block, "thinking", None)
+                if thinking_text:
+                    reasoning_parts.append(thinking_text)
+        return (
+            "".join(reasoning_parts) if reasoning_parts else None,
+            reasoning_blocks if reasoning_blocks else None,
+        )
+
     def _normalize_structured_response(self, response: anthropic.types.Message) -> LLMResponse:
         """Extract structured output from a forced tool_use response.
 
@@ -536,15 +667,7 @@ class AnthropicProvider(LLMProvider):
                 "'structured_output' but none was found in the response."
             )
 
-        usage = UsageStats(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            total_tokens=response.usage.input_tokens + response.usage.output_tokens,
-            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
-            cache_creation_input_tokens=getattr(
-                response.usage, "cache_creation_input_tokens", None
-            ),
-        )
+        usage = self._usage_from_response(response.usage)
 
         return LLMResponse(
             text=json.dumps(structured_data),
@@ -575,19 +698,14 @@ class AnthropicProvider(LLMProvider):
                     )
                 )
 
-        usage = UsageStats(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            total_tokens=response.usage.input_tokens + response.usage.output_tokens,
-            cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
-            cache_creation_input_tokens=getattr(
-                response.usage, "cache_creation_input_tokens", None
-            ),
-        )
+        reasoning, reasoning_blocks = self._extract_reasoning(response.content)
+        usage = self._usage_from_response(response.usage)
 
         return LLMResponse(
             text="".join(text_parts) if text_parts else None,
             tool_calls=tool_calls if tool_calls else None,
             raw=response,
             usage=usage,
+            reasoning=reasoning,
+            reasoning_blocks=reasoning_blocks,
         )
