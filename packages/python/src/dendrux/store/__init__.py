@@ -75,6 +75,7 @@ class RunSummary:
     model: str | None
     parent_run_id: str | None
     delegation_level: int
+    total_reasoning_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +456,7 @@ def _run_to_summary(record: Any) -> RunSummary:
         model=record.model,
         parent_run_id=record.parent_run_id,
         delegation_level=record.delegation_level,
+        total_reasoning_tokens=record.total_reasoning_tokens,
     )
 
 
