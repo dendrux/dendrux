@@ -195,17 +195,20 @@ class AnthropicProvider(LLMProvider):
         self,
         system_prompt: str,
         api_messages: list[dict[str, Any]],
+        *,
+        mark_first: bool = False,
     ) -> tuple[Any, list[dict[str, Any]]]:
-        """Apply cache_control to system block and last message's last block.
+        """Apply cache_control to system block and selected messages.
 
-        The marker on the last message warms the next iteration's cache —
-        the call that writes it pays full creation; the next call reads it.
+        Always marks the last message (warms the next iteration's cache — the
+        call that writes it pays full creation, the next reads it). When
+        ``mark_first`` is set (a stable context head is present), also marks the
+        first user message so the frozen ``tools+system+stable`` prefix is
+        cached across runs.
 
-        Returns ``(system, messages)`` where:
-        - ``system`` is a block list with cache_control, or ``NOT_GIVEN`` when
-          no system prompt was provided.
-        - ``messages`` is a fresh list with the last message deep-copied and
-          augmented with cache_control. The caller's input is never mutated.
+        Returns ``(system, messages)`` where ``system`` is a block list with
+        cache_control (or ``NOT_GIVEN``) and ``messages`` is a fresh list with
+        only the marked messages deep-copied. The caller's input is never mutated.
         """
         marker = self._cache_control_marker()
 
@@ -218,14 +221,22 @@ class AnthropicProvider(LLMProvider):
             return system_blocks, api_messages
 
         new_messages = list(api_messages)
-        last = copy.deepcopy(new_messages[-1])
-        content = last["content"]
+        indices = {len(new_messages) - 1}
+        if mark_first:
+            indices.add(0)
+        for i in indices:
+            marked = copy.deepcopy(new_messages[i])
+            self._mark_last_block(marked, marker)
+            new_messages[i] = marked
+        return system_blocks, new_messages
+
+    @staticmethod
+    def _mark_last_block(message: dict[str, Any], marker: dict[str, Any]) -> None:
+        content = message["content"]
         if isinstance(content, str):
-            last["content"] = [{"type": "text", "text": content, "cache_control": marker}]
+            message["content"] = [{"type": "text", "text": content, "cache_control": marker}]
         elif isinstance(content, list) and content:
             content[-1]["cache_control"] = marker
-        new_messages[-1] = last
-        return system_blocks, new_messages
 
     def _build_api_kwargs(
         self,
@@ -240,7 +251,12 @@ class AnthropicProvider(LLMProvider):
         """
         system_prompt, api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools) if tools else anthropic.NOT_GIVEN
-        system_blocks, cached_messages = self._apply_cache_control(system_prompt, api_messages)
+        # A stable context head (folded into the first user message) gets its own
+        # cross-run cache breakpoint at api_messages[0].
+        has_stable_head = any(m.placement == "stable" for m in messages)
+        system_blocks, cached_messages = self._apply_cache_control(
+            system_prompt, api_messages, mark_first=has_stable_head
+        )
 
         api_kwargs: dict[str, Any] = {
             "model": kwargs.pop("model", self._model),

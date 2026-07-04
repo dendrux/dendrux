@@ -1269,3 +1269,37 @@ class TestThinkingStream:
         assert not [e for e in collected if e.type == StreamEventType.REASONING_DELTA]
         assert collected[-1].raw.reasoning is None
         assert collected[-1].raw.reasoning_blocks is None
+
+
+class TestStableHeadCacheBreakpoint:
+    """A placement='stable' head message gets its own cross-run cache breakpoint."""
+
+    def _messages(self, *, stable: bool) -> list[Message]:
+        first = Message(
+            role=Role.USER,
+            content="STABLE CONTEXT:\nspec\n\nUSER MESSAGE:\nQ1",
+            placement="stable" if stable else "dynamic",
+        )
+        return [
+            Message(role=Role.SYSTEM, content="sys"),
+            first,
+            Message(role=Role.ASSISTANT, content="A1"),
+            Message(role=Role.USER, content="Q2"),
+        ]
+
+    def test_stable_head_marks_first_message(self, provider: AnthropicProvider) -> None:
+        api_kwargs, _ = provider._build_api_kwargs(self._messages(stable=True), None, {})
+        msgs = api_kwargs["messages"]
+        # First wire message (system extracted) = the stable head → cache_control.
+        assert isinstance(msgs[0]["content"], list)
+        assert msgs[0]["content"][-1].get("cache_control") is not None
+        # Last message keeps its within-run warming marker too.
+        assert msgs[-1]["content"][-1].get("cache_control") is not None
+
+    def test_no_stable_head_leaves_first_unmarked(self, provider: AnthropicProvider) -> None:
+        api_kwargs, _ = provider._build_api_kwargs(self._messages(stable=False), None, {})
+        msgs = api_kwargs["messages"]
+        # No stable head → first message is a plain (unmarked) string.
+        assert isinstance(msgs[0]["content"], str)
+        # Last message still marked (unchanged behavior).
+        assert msgs[-1]["content"][-1].get("cache_control") is not None

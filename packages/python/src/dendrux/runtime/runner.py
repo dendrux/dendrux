@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import normalize_chat_history
+from dendrux.context_blocks import ContextBlock, fold_context
 from dendrux.loops._helpers import (
     notify_message,
     notify_run_failed,
@@ -494,6 +495,7 @@ async def run(
     provider: LLMProvider,
     user_input: str,
     history: list[ChatMessage] | None = ...,
+    context: list[ContextBlock] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -514,6 +516,7 @@ async def run(
     provider: LLMProvider,
     user_input: str,
     history: list[ChatMessage] | None = ...,
+    context: list[ContextBlock] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -532,6 +535,7 @@ async def run(
     provider: LLMProvider,
     user_input: str,
     history: list[ChatMessage] | None = None,
+    context: list[ContextBlock] | None = None,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
@@ -606,14 +610,7 @@ async def run(
     # do not separately append user_input — same contract as resume).
     # The runner will record the new user_input itself (after the recorder
     # is constructed) so seeded prior turns stay out of react_traces.
-    seeded_history: list[Message] | None
-    if normalized_history:
-        seeded_history = [
-            *normalized_history,
-            Message(role=Role.USER, content=user_input),
-        ]
-    else:
-        seeded_history = None
+    seeded_history = fold_context(normalized_history, context, user_input)
 
     provider_kwargs = dict(kwargs) if kwargs else {}
 
@@ -651,6 +648,7 @@ async def run(
                 user_input,
                 output_type_name=output_type_name,
                 history=normalized_history or None,
+                context=context or None,
             )
 
         create_result = await state_store.create_run(
@@ -1150,6 +1148,7 @@ def run_stream(
     provider: LLMProvider,
     user_input: str,
     history: list[ChatMessage] | None = ...,
+    context: list[ContextBlock] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -1170,6 +1169,7 @@ def run_stream(
     provider: LLMProvider,
     user_input: str,
     history: list[ChatMessage] | None = ...,
+    context: list[ContextBlock] | None = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -1188,6 +1188,7 @@ def run_stream(
     provider: LLMProvider,
     user_input: str,
     history: list[ChatMessage] | None = None,
+    context: list[ContextBlock] | None = None,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
@@ -1241,14 +1242,7 @@ def run_stream(
     # (loops use initial_history as-is and do not separately append user_input).
     # The new user_input is recorded by the runner itself inside _generate()
     # so seeded prior turns stay out of react_traces.
-    seeded_history: list[Message] | None
-    if normalized_history:
-        seeded_history = [
-            *normalized_history,
-            Message(role=Role.USER, content=user_input),
-        ]
-    else:
-        seeded_history = None
+    seeded_history = fold_context(normalized_history, context, user_input)
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
