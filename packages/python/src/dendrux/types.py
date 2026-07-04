@@ -70,6 +70,16 @@ class Message:
                     from the corresponding ASSISTANT message.
         name:       Present on TOOL messages only. Cached convenience field for
                     debugging/logging — call_id is the authoritative identity.
+
+    Origin envelope (context-blocks foundation):
+        kind:       Block identity. Defaults from role (TOOL -> "tool_result",
+                    SYSTEM -> "system", else "chat"). Dev-supplied context blocks
+                    set their own opaque kind; Dendrux carries it uninterpreted.
+        placement:  Cache intent, "stable" | "dynamic". Only meaningful for
+                    context-origin messages (drives the stable/dynamic assembly
+                    split); ignored for history/scratchpad, which are positioned
+                    by the assembly order.
+        source:     Optional free-form provenance label (citations/telemetry).
     """
 
     role: Role
@@ -78,8 +88,20 @@ class Message:
     tool_calls: list[ToolCall] | None = None
     call_id: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    kind: str = "chat"
+    placement: str = "dynamic"
+    source: str | None = None
 
     def __post_init__(self) -> None:
+        if self.placement not in ("stable", "dynamic"):
+            raise ValueError(f"placement must be 'stable' or 'dynamic', got {self.placement!r}")
+        # Derive kind from role when left at the generic default. A TOOL message
+        # is always a tool_result; a SYSTEM message is always system context.
+        if self.kind == "chat":
+            if self.role == Role.TOOL:
+                object.__setattr__(self, "kind", "tool_result")
+            elif self.role == Role.SYSTEM:
+                object.__setattr__(self, "kind", "system")
         if self.role == Role.TOOL:
             if not self.name:
                 raise ValueError("TOOL messages require name")
@@ -472,6 +494,14 @@ def _message_to_dict(m: Message) -> dict[str, Any]:
             except (TypeError, ValueError):
                 safe_meta[k] = str(v)
         d["meta"] = safe_meta
+    # Origin envelope — only persist non-default values (kind for TOOL/SYSTEM is
+    # re-derived from role on load, so serialize only when it carries new info).
+    if m.kind not in ("chat", "tool_result", "system"):
+        d["kind"] = m.kind
+    if m.placement != "dynamic":
+        d["placement"] = m.placement
+    if m.source is not None:
+        d["source"] = m.source
     return d
 
 
@@ -486,6 +516,9 @@ def _message_from_dict(d: dict[str, Any]) -> Message:
         tool_calls=tool_calls,
         call_id=d.get("call_id"),
         meta=d.get("meta", {}),
+        kind=d.get("kind", "chat"),
+        placement=d.get("placement", "dynamic"),
+        source=d.get("source"),
     )
 
 
@@ -847,24 +880,37 @@ def compute_idempotency_fingerprint(
     user_input: str,
     output_type_name: str | None = None,
     history: list[Message] | None = None,
+    context: list[Any] | None = None,
 ) -> str:
     """Deterministic SHA-256 fingerprint for idempotency conflict detection.
 
-    Includes agent_name + user_input + output_type + chat history (request
-    identity). Does NOT include provider kwargs (temperature, max_tokens) —
-    those are execution tuning, not request identity.
+    Includes agent_name + user_input + output_type + chat history + per-run
+    context (request identity). Does NOT include provider kwargs (temperature,
+    max_tokens) — those are execution tuning, not request identity.
 
     output_type changes the return shape contract, so two calls with
     different output_types must be treated as different requests.
 
     History is hashed as the canonical list of (role, content) pairs from
     the normalized Message objects — different construction paths producing
-    equivalent normalized history hash identically.
+    equivalent normalized history hash identically. Context blocks are hashed
+    by (kind, placement, source, content) so the same input with different
+    context is treated as a different request.
     """
     data: dict[str, Any] = {"agent_name": agent_name, "user_input": user_input}
     if output_type_name is not None:
         data["output_type"] = output_type_name
     if history:
         data["history"] = [{"role": m.role.value, "content": m.content} for m in history]
+    if context:
+        data["context"] = [
+            {
+                "kind": b.kind,
+                "placement": b.placement,
+                "source": b.source,
+                "content": b.content,
+            }
+            for b in context
+        ]
     payload = json.dumps(data, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

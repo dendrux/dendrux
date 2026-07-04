@@ -1,5 +1,7 @@
 """Tests for core types."""
 
+from dataclasses import replace
+
 import pytest
 
 from dendrux.types import (
@@ -18,6 +20,8 @@ from dendrux.types import (
     ToolResult,
     ToolTarget,
     UsageStats,
+    _message_from_dict,
+    _message_to_dict,
 )
 
 
@@ -109,6 +113,86 @@ class TestMessageInvariants:
     def test_system_cannot_have_name(self) -> None:
         with pytest.raises(ValueError, match="SYSTEM messages cannot have name"):
             Message(role=Role.SYSTEM, content="prompt", name="sys")
+
+
+class TestMessageOriginEnvelope:
+    """Origin envelope (kind/placement/source) — context-blocks foundation (PR 1)."""
+
+    def test_defaults(self) -> None:
+        msg = Message(role=Role.USER, content="Hi")
+        assert msg.kind == "chat"
+        assert msg.placement == "dynamic"
+        assert msg.source is None
+
+    def test_kind_derived_from_tool_role(self) -> None:
+        msg = Message(role=Role.TOOL, content="{}", name="add", call_id="01ABC")
+        assert msg.kind == "tool_result"
+
+    def test_kind_derived_from_system_role(self) -> None:
+        msg = Message(role=Role.SYSTEM, content="You are helpful")
+        assert msg.kind == "system"
+
+    def test_explicit_kind_preserved(self) -> None:
+        # Dev-supplied context blocks carry an opaque kind Dendrux never interprets.
+        msg = Message(role=Role.USER, content="spec", kind="project_instructions")
+        assert msg.kind == "project_instructions"
+
+    def test_explicit_placement_stable(self) -> None:
+        msg = Message(role=Role.USER, content="spec", placement="stable")
+        assert msg.placement == "stable"
+
+    def test_invalid_placement_rejected(self) -> None:
+        with pytest.raises(ValueError, match="placement"):
+            Message(role=Role.USER, content="x", placement="sticky")
+
+    def test_replace_preserves_envelope(self) -> None:
+        # Guardrail redaction reconstructs via replace() — the envelope must survive.
+        msg = Message(
+            role=Role.USER,
+            content="secret",
+            kind="project_memory",
+            placement="stable",
+            source="project:42",
+        )
+        redacted = replace(msg, content="[REDACTED]")
+        assert redacted.content == "[REDACTED]"
+        assert redacted.kind == "project_memory"
+        assert redacted.placement == "stable"
+        assert redacted.source == "project:42"
+
+    def test_snapshot_roundtrip_context_block(self) -> None:
+        msg = Message(
+            role=Role.USER,
+            content="doc",
+            kind="retrieved_doc",
+            placement="stable",
+            source="https://x",
+        )
+        restored = _message_from_dict(_message_to_dict(msg))
+        assert restored.kind == "retrieved_doc"
+        assert restored.placement == "stable"
+        assert restored.source == "https://x"
+
+    def test_snapshot_roundtrip_tool_result(self) -> None:
+        msg = Message(role=Role.TOOL, content="{}", name="add", call_id="01ABC")
+        restored = _message_from_dict(_message_to_dict(msg))
+        assert restored.kind == "tool_result"
+
+    def test_snapshot_omits_default_envelope(self) -> None:
+        # A plain chat message must not bloat the snapshot with default envelope keys.
+        d = _message_to_dict(Message(role=Role.USER, content="Hi"))
+        assert "kind" not in d
+        assert "placement" not in d
+        assert "source" not in d
+
+    def test_legacy_snapshot_without_envelope(self) -> None:
+        # Snapshots written before PR 1 have no envelope keys — load with defaults,
+        # role-derived kind still applies.
+        restored = _message_from_dict(
+            {"role": "tool", "content": "{}", "name": "add", "call_id": "01ABC"}
+        )
+        assert restored.kind == "tool_result"
+        assert restored.placement == "dynamic"
 
 
 class TestToolCall:

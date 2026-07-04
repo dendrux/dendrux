@@ -14,6 +14,7 @@ Constraints:
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
@@ -179,14 +180,9 @@ class SingleCall(Loop):
                     )
                 if cleaned != msg.content:
                     _in_was_redacted = True
-                    messages[msg_idx] = Message(
-                        role=msg.role,
-                        content=cleaned,
-                        name=msg.name,
-                        tool_calls=msg.tool_calls,
-                        call_id=msg.call_id,
-                        meta=msg.meta,
-                    )
+                    # replace() preserves the origin envelope
+                    # (kind/placement/source) through redaction.
+                    messages[msg_idx] = replace(msg, content=cleaned)
             if all_in_findings:
                 _in_entities = list({f.entity_type for f in all_in_findings})
                 await record_governance(

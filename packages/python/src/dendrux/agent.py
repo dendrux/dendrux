@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from dendrux.chat import ChatMessage
+    from dendrux.context_blocks import ContextBlock
     from dendrux.guardrails._protocol import Guardrail
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
@@ -727,6 +728,7 @@ class Agent:
         user_input: str,
         *,
         history: list[ChatMessage] | None = ...,
+        context: list[ContextBlock] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -742,6 +744,7 @@ class Agent:
         user_input: str,
         *,
         history: list[ChatMessage] | None = ...,
+        context: list[ContextBlock] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -755,6 +758,7 @@ class Agent:
         user_input: str,
         *,
         history: list[ChatMessage] | None = None,
+        context: list[ContextBlock] | None = None,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
@@ -779,6 +783,13 @@ class Agent:
                 with ASSISTANT, no consecutive same-role messages, no empty
                 content. Invalid history raises ``ValueError`` before any
                 run is created. ``None`` and ``[]`` mean "no prior context."
+            context: Optional per-run context blocks (``ContextBlock``) folded
+                into the message content — retrieved docs, project
+                instructions/memory, referenced files. ``placement="stable"``
+                blocks fold into the first user message (cached frozen prefix);
+                ``"dynamic"`` (default) fold into the current user message
+                (volatile tail). Read-only, never persisted as forward state;
+                the idempotency hash includes it. See ``dendrux.context_blocks``.
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
             notifier: Optional notifier for lifecycle events (e.g. ConsoleNotifier
@@ -858,6 +869,7 @@ class Agent:
             provider=provider,
             user_input=user_input,
             history=history,
+            context=context,
             state_store=store,
             tenant_id=tenant_id,
             metadata=metadata,
@@ -1306,6 +1318,7 @@ class Agent:
         user_input: str,
         *,
         history: list[ChatMessage] | None = ...,
+        context: list[ContextBlock] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -1319,6 +1332,7 @@ class Agent:
         user_input: str,
         *,
         history: list[ChatMessage] | None = ...,
+        context: list[ContextBlock] | None = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -1330,6 +1344,7 @@ class Agent:
         user_input: str,
         *,
         history: list[ChatMessage] | None = None,
+        context: list[ContextBlock] | None = None,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
@@ -1419,6 +1434,7 @@ class Agent:
             provider=provider,
             user_input=user_input,
             history=history,
+            context=context,
             state_store_resolver=self._resolve_state_store,
             tenant_id=tenant_id,
             metadata=metadata,
