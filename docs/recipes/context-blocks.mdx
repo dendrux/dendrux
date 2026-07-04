@@ -1,0 +1,101 @@
+---
+title: Per-run context — retrieval, instructions, and the prompt cache
+description: Pass retrieved docs, project instructions, or memory into a turn with context=. Mark what never changes as stable and it folds into the cached prefix; everything else rides the volatile tail. One new type, one new argument.
+---
+
+# Per-run context — retrieval, instructions, and the prompt cache
+
+A run often needs material that is neither the agent's identity nor the conversation: retrieved documents for this question, a project's instructions, accumulated memory, the files the user just referenced. Stuffing that into the agent `prompt=` bloats a value meant to be frozen; stuffing it into `history=` pretends it was said out loud.
+
+Dendrux gives you a third channel: `context=`. One new type, one new argument, nothing else changes.
+
+```python
+from dendrux import Agent, ContextBlock
+
+result = await agent.run(user_message, history=chat_history, context=[
+    ContextBlock(project.instructions, kind="project_instructions", placement="stable"),
+    ContextBlock(retrieved_docs,       kind="retrieved_doc",        placement="dynamic"),
+])
+```
+
+## The one decision: `placement`
+
+Classify each block by **how it changes turn to turn**, not by what it is.
+
+| The content… | `placement` | Where it lands | Cache |
+| --- | --- | --- | --- |
+| never changes (instructions, a pinned spec) | `stable` | folded into the **first** user message | cached across turns |
+| changes each turn (docs, this turn's files) | `dynamic` (default) | folded into the **current** user message | volatile tail — never breaks the prefix |
+
+`stable` is a promise: *"this is byte-identical on every turn."* Keep that promise and the block sits in the cached prefix and is read back from cache on every later turn. Break it — send different bytes — and you simply lose that block's cache hit. Correctness is never affected, and Dendrux never reclassifies for you. You decide; the cost shows up in the existing cache telemetry.
+
+A file attached in the middle of a conversation is **not** stable context — it belongs to the history turn where it appeared. Pass it as part of `history=`, not as a `stable` block.
+
+## Retrieval (the common case)
+
+Retrieved chunks change every turn, so they are `dynamic` — which is the default:
+
+```python
+result = await agent.run(question, context=[
+    ContextBlock(doc.text, kind="retrieved_doc", source=doc.url) for doc in docs
+])
+```
+
+`kind` and `source` are opaque — Dendrux carries them for your audit and telemetry but never interprets them. Your app owns its taxonomy.
+
+## Project context out of the prompt
+
+Project instructions are *runtime context*, not agent *identity*. Move them out of `prompt=` and into `context=` as a `stable` block. The prompt stays a small, frozen persona; the instructions cache:
+
+```python
+agent = Agent(provider=p, prompt="You are Orbit's assistant.")   # identity only
+
+result = await agent.run(user_message, history=chat_history, context=[
+    ContextBlock(project.instructions, kind="project_instructions",
+                 placement="stable", source=f"project:{project.id}"),
+    ContextBlock(project.memory_text,  kind="project_memory", placement="stable"),
+    ContextBlock(selected_file_snippets, kind="referenced_files"),   # dynamic
+])
+```
+
+## In a multi-turn loop
+
+`context=` mirrors `history=`: per-run, read-only, re-supplied each call, never persisted as forward state. Store only the raw turns in your history — never bake dynamic context into them, or archived turns stop caching.
+
+```python
+history = []
+stable = [ContextBlock(project.instructions, placement="stable")]
+
+while (msg := next_user_message()):
+    result = await agent.run(msg, history=history, context=stable + fresh_docs_for(msg))
+    history.append(ChatMessage.user(msg))
+    history.append(ChatMessage.assistant(result.answer))
+```
+
+## Why it caches
+
+Blocks fold into user-message **text**, so the wire stays a clean user/assistant alternation on every provider — no consecutive same-role messages, no per-provider special-casing. On Anthropic, the stable head gets an explicit cache breakpoint; on OpenAI, automatic prefix caching covers the same frozen prefix. See [Prompt cache](/docs/architecture/prompt-cache) for how the cached prefix is built.
+
+`examples/28_context_blocks.py` demonstrates the round trip against real APIs — a stable block written on turn 1 and read back from cache on turn 2, on both Anthropic and OpenAI.
+
+## What the model sees
+
+```
+STABLE CONTEXT:
+<your stable blocks>
+
+USER MESSAGE:
+<first turn>
+...history...
+ADDITIONAL CONTEXT:
+<your dynamic blocks>
+
+USER INPUT:
+<current question>
+```
+
+The labels are structural wrappers Dendrux adds; your block content is passed verbatim. When a band is empty, no wrapper is added — omit `context=` entirely and the request is byte-identical to a plain `history=` turn.
+
+## What stays the same
+
+`context=` is additive. `prompt=`, `tools=`, `history=`, `RunResult`, streaming, cancellation, and guardrails are untouched. For passing prior conversation turns, see [Chatbot threads](/docs/recipes/chatbot-threads); for the caching mechanics, [Prompt cache](/docs/architecture/prompt-cache).
