@@ -198,6 +198,22 @@ class TestRecorderLLMInteraction:
         assert rec["provider_request"]["model"] == "claude-sonnet-4-6"
         assert rec["provider_response"]["id"] == "msg_abc"
 
+    async def test_interaction_id_joins_row_to_event(self) -> None:
+        """The recorder mints one id used for both the llm_interactions row
+        and the llm.completed event's correlation_id (1:1 join key)."""
+        store = MockStateStore()
+        obs = PersistenceRecorder(store, "run_1")
+
+        response = LLMResponse(text="hi", usage=UsageStats())
+        await obs.on_llm_call_completed("run_1", response, iteration=1)
+
+        interaction_id = store.llm_interactions[0]["interaction_id"]
+        assert interaction_id, "recorder should pass a minted interaction_id"
+
+        event = store._events["run_1"][0]
+        assert event["event_type"] == "llm.completed"
+        assert event["correlation_id"] == interaction_id
+
     async def test_duration_ms_passed_through(self) -> None:
         """duration_ms kwarg flows from loop → recorder → save_llm_interaction."""
         store = MockStateStore()

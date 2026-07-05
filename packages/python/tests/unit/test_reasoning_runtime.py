@@ -32,6 +32,7 @@ class TestUsageRollup:
 
 def _fake_llm_record(**over: object) -> SimpleNamespace:
     base = dict(
+        id="llm_1",
         iteration_index=1,
         provider="anthropic",
         model="claude-sonnet-4-6",

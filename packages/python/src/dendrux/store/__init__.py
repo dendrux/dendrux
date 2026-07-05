@@ -118,8 +118,16 @@ class StoredEvent:
 
 @dataclass(frozen=True, slots=True)
 class LLMCall:
-    """One LLM round-trip recorded during a run."""
+    """One LLM round-trip recorded during a run.
 
+    ``id`` is the interaction's stable identifier. The matching
+    ``llm.completed`` event in ``run_events`` carries it as
+    ``StoredEvent.correlation_id``, so an event stream can be joined 1:1
+    to full LLM payloads — mirroring ``tool.completed.correlation_id`` →
+    ``ToolInvocation.tool_call_id``.
+    """
+
+    id: str
     iteration: int
     provider: str | None
     model: str | None
@@ -498,6 +506,7 @@ def _event_to_stored(record: Any) -> StoredEvent:
 
 def _llm_to_public(record: Any) -> LLMCall:
     return LLMCall(
+        id=record.id,
         iteration=record.iteration_index,
         provider=record.provider,
         model=record.model,

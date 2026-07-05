@@ -377,6 +377,7 @@ class TestGetLLMCalls:
         assert len(calls) == 1
         call = calls[0]
         assert isinstance(call, LLMCall)
+        assert isinstance(call.id, str) and call.id
         assert call.iteration == 0
         assert call.input_tokens == 100
         assert call.output_tokens == 20
@@ -409,6 +410,31 @@ class TestGetLLMCalls:
 
         page = await store.get_llm_calls("r1", limit=2, offset=2)
         assert [c.iteration for c in page] == [2, 3]
+
+    async def test_id_joins_to_llm_completed_event(self, store, internal_store) -> None:
+        """LLMCall.id round-trips and matches the llm.completed event's
+        correlation_id — the public 1:1 join for LLM payloads."""
+        await internal_store.create_run("r1", "Agent")
+        await internal_store.save_llm_interaction(
+            "r1",
+            iteration_index=0,
+            usage=UsageStats(input_tokens=1, output_tokens=1, total_tokens=2),
+            interaction_id="01JJOINKEYLLMINTERACTION00",
+        )
+        await internal_store.save_run_event(
+            "r1",
+            event_type="llm.completed",
+            sequence_index=0,
+            correlation_id="01JJOINKEYLLMINTERACTION00",
+        )
+
+        call = (await store.get_llm_calls("r1"))[0]
+        events = await store.get_events("r1")
+        completed = [e for e in events if e.event_type == "llm.completed"]
+
+        assert call.id == "01JJOINKEYLLMINTERACTION00"
+        assert len(completed) == 1
+        assert completed[0].correlation_id == call.id
 
 
 # ------------------------------------------------------------------
