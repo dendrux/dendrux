@@ -338,6 +338,7 @@ class StateStore(Protocol):
         provider_request: dict[str, Any] | None = None,
         provider_response: dict[str, Any] | None = None,
         guardrail_findings: dict[str, Any] | None = None,
+        interaction_id: str | None = None,
     ) -> None: ...
 
     async def get_llm_interactions(
@@ -833,12 +834,13 @@ class SQLAlchemyStateStore:
         provider_request: dict[str, Any] | None = None,
         provider_response: dict[str, Any] | None = None,
         guardrail_findings: dict[str, Any] | None = None,
+        interaction_id: str | None = None,
     ) -> None:
         from dendrux.db.models import LLMInteraction
 
         async with self._session_factory() as session:
             record = LLMInteraction(
-                id=generate_ulid(),
+                id=interaction_id or generate_ulid(),
                 agent_run_id=run_id,
                 iteration_index=iteration_index,
                 model=model,

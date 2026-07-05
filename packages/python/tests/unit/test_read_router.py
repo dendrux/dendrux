@@ -532,6 +532,7 @@ class TestLLMCallsEndpoint:
             assert set(body.keys()) == {"items", "limit", "offset"}
             assert len(body["items"]) == 1
             call = body["items"][0]
+            assert isinstance(call["id"], str) and call["id"]
             assert call["iteration"] == 0
             assert call["input_tokens"] == 10
             assert call["cache_read_input_tokens"] == 2

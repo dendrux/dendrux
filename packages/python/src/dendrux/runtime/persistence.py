@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime.durability import retry_critical
+from dendrux.types import generate_ulid
 
 if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
@@ -208,6 +209,11 @@ class PersistenceRecorder(BaseRecorder):
                 "reasoning_tokens": response.usage.reasoning_tokens,
             }
 
+        # Client-minted before either write so the llm_interactions row and
+        # the llm.completed event share one id — a stable 1:1 join key even
+        # if the best-effort interaction save below fails.
+        interaction_id = generate_ulid()
+
         # BEST-EFFORT: llm_interactions (full forensics)
         try:
             await self._store.save_llm_interaction(
@@ -222,6 +228,7 @@ class PersistenceRecorder(BaseRecorder):
                 provider_request=response.provider_request,
                 provider_response=response.provider_response,
                 guardrail_findings=guardrail_findings,
+                interaction_id=interaction_id,
             )
         except Exception:
             logger.warning(
@@ -248,7 +255,8 @@ class PersistenceRecorder(BaseRecorder):
                 exc_info=True,
             )
 
-        # FAIL-CLOSED: run event (lifecycle audit trail)
+        # FAIL-CLOSED: run event (lifecycle audit trail). correlation_id joins
+        # 1:1 to LLMCall.id, mirroring tool.completed -> ToolInvocation.tool_call_id.
         await self._emit_event(
             "llm.completed",
             iteration,
@@ -262,6 +270,7 @@ class PersistenceRecorder(BaseRecorder):
                 "model": response.model or self._model,
                 "has_tool_calls": bool(response.tool_calls),
             },
+            correlation_id=interaction_id,
         )
 
         # BEST-EFFORT: touch progress for sweep
