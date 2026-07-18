@@ -108,7 +108,12 @@ async def run_via_recipe_string() -> None:
 
 
 async def demo_native_tools_guard(no_tools_model: str) -> None:
-    """Tools + incapable model → explicit error, not silent text."""
+    """Tools + incapable model → explicit error, not silent text.
+
+    Surfacing differs by API, both loud: `agent.run()` re-raises the
+    ValueError; `agent.stream()` reports it in-band as a `run_error` event
+    carrying the same message (streams surface failures as events).
+    """
     print(f"\n== native-tools guard on {no_tools_model} ==")
     agent = Agent(
         provider=OpenRouterProvider(model=no_tools_model),

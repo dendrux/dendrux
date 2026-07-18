@@ -235,6 +235,55 @@ class TestGuardWiring:
                 pass
         create.assert_not_awaited()
 
+    async def test_agent_run_surfaces_guard_as_raised_error(self, catalog_ok: AsyncMock) -> None:
+        """Full stack: agent.run() re-raises the guard's ValueError."""
+        from dendrux import Agent, tool
+
+        @tool()
+        async def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+        agent = Agent(
+            provider=_provider(model="tiny/no-tools-model"),
+            prompt="You are a calculator.",
+            tools=[add],
+        )
+        async with agent:
+            with pytest.raises(ValueError, match="does not advertise native tool"):
+                await agent.run("What is 1 + 1?")
+
+    async def test_agent_stream_surfaces_guard_as_run_error_event(
+        self, catalog_ok: AsyncMock
+    ) -> None:
+        """Full stack: agent.stream() surfaces the guard in-band as run_error.
+
+        Streams report failures as events, not exceptions — the guard message
+        must arrive on the run_error event so stream consumers see it.
+        """
+        from dendrux import Agent, tool
+        from dendrux.types import RunEventType
+
+        @tool()
+        async def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+        agent = Agent(
+            provider=_provider(model="tiny/no-tools-model"),
+            prompt="You are a calculator.",
+            tools=[add],
+        )
+        events = []
+        async with agent:
+            stream = agent.stream("What is 1 + 1?")
+            async with stream:
+                async for event in stream:
+                    events.append(event)
+        error_events = [e for e in events if e.type == RunEventType.RUN_ERROR]
+        assert len(error_events) == 1
+        assert "does not advertise native tool" in (error_events[0].error or "")
+
     async def test_guard_checks_per_call_model_override(self, catalog_ok: AsyncMock) -> None:
         """A per-call model= override is guarded, not the constructor model."""
         provider = _provider(model="deepseek/deepseek-chat")
