@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -42,39 +43,129 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Per-process catalog cache keyed by models URL. A failed fetch is cached as
-# None so a flaky metadata endpoint costs at most one request per process —
-# the guard degrades to a warning, it never breaks runs.
-_catalog_cache: dict[str, dict[str, frozenset[str]] | None] = {}
+
+@dataclass(frozen=True, slots=True)
+class OpenRouterModel:
+    """A model in the OpenRouter catalog — an immutable snapshot.
+
+    Rich typed data instead of filter flags: compose any selection with
+    plain Python, e.g.
+    ``[m for m in models if m.is_free and m.supports_tools]``.
+    """
+
+    id: str
+    """OpenRouter model slug, e.g. ``"deepseek/deepseek-chat"``."""
+    name: str
+    """Human-readable name, e.g. ``"DeepSeek V3"``."""
+    context_length: int | None
+    """Maximum context window in tokens, when advertised."""
+    supported_parameters: tuple[str, ...]
+    """Request parameters the model supports (``"tools"``, ``"temperature"``, ...)."""
+    prompt_price: float | None
+    """Input price in USD per token; ``0.0`` for free models, None if unparseable."""
+    completion_price: float | None
+    """Output price in USD per token; ``0.0`` for free models, None if unparseable."""
+    input_modalities: tuple[str, ...]
+    """Accepted input modalities (``"text"``, ``"image"``, ...); empty if unknown."""
+    output_modalities: tuple[str, ...]
+    """Produced output modalities; empty if unknown."""
+
+    @property
+    def supports_tools(self) -> bool:
+        """True when the model advertises native function calling."""
+        return "tools" in self.supported_parameters
+
+    @property
+    def is_free(self) -> bool:
+        """True when both prompt and completion prices are zero."""
+        return self.prompt_price == 0 and self.completion_price == 0
+
+    @property
+    def is_multimodal(self) -> bool:
+        """True when the model accepts any non-text input (image, audio, ...)."""
+        return any(m != "text" for m in self.input_modalities)
 
 
-async def _fetch_catalog(models_url: str) -> dict[str, frozenset[str]] | None:
-    """Fetch {model_id -> supported_parameters} from OpenRouter, None on failure."""
+def _parse_price(value: Any) -> float | None:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(models_url)
-            resp.raise_for_status()
-            payload = resp.json()
-    except Exception as exc:  # noqa: BLE001 — degrade path, never break runs
-        logger.warning(
-            "Could not fetch OpenRouter model catalog from %s (%s). "
-            "Native-tool support cannot be verified; proceeding without the check.",
-            models_url,
-            exc,
-        )
+        return float(value)
+    except (TypeError, ValueError):
         return None
-    catalog: dict[str, frozenset[str]] = {}
+
+
+def _parse_modalities(arch: dict[str, Any], key: str, side: int) -> tuple[str, ...]:
+    """Read modalities from architecture metadata.
+
+    Prefers the explicit ``input_modalities``/``output_modalities`` lists;
+    falls back to parsing the legacy ``modality`` string
+    (e.g. ``"text+image->text"``, side 0 = input, 1 = output).
+    """
+    explicit = arch.get(key)
+    if isinstance(explicit, list):
+        return tuple(m for m in explicit if isinstance(m, str))
+    modality = arch.get("modality")
+    if isinstance(modality, str) and "->" in modality:
+        parts = modality.split("->")
+        if len(parts) == 2:
+            return tuple(m.strip() for m in parts[side].split("+") if m.strip())
+    return ()
+
+
+def _parse_model_entry(entry: dict[str, Any]) -> OpenRouterModel | None:
+    model_id = entry.get("id")
+    if not isinstance(model_id, str):
+        return None
+    params = entry.get("supported_parameters") or []
+    pricing = entry.get("pricing") or {}
+    arch = entry.get("architecture") or {}
+    context_length = entry.get("context_length")
+    return OpenRouterModel(
+        id=model_id,
+        name=entry.get("name") or model_id,
+        context_length=int(context_length) if isinstance(context_length, int | float) else None,
+        supported_parameters=tuple(p for p in params if isinstance(p, str)),
+        prompt_price=_parse_price(pricing.get("prompt")),
+        completion_price=_parse_price(pricing.get("completion")),
+        input_modalities=_parse_modalities(arch, "input_modalities", 0),
+        output_modalities=_parse_modalities(arch, "output_modalities", 1),
+    )
+
+
+# Per-process catalog cache keyed by models URL — one fetch serves both the
+# native-tools guard and list_models(), so they can never disagree. A failed
+# fetch is cached as None so a flaky metadata endpoint costs at most one
+# request per process on the guard path (which degrades to a warning, never
+# a broken run); list_models() refetches and raises instead.
+_catalog_cache: dict[str, dict[str, OpenRouterModel] | None] = {}
+
+
+async def _fetch_catalog(models_url: str) -> dict[str, OpenRouterModel]:
+    """Fetch {model_id -> OpenRouterModel} from OpenRouter. Raises on failure."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(models_url)
+        resp.raise_for_status()
+        payload = resp.json()
+    catalog: dict[str, OpenRouterModel] = {}
     for entry in payload.get("data", []):
-        model_id = entry.get("id")
-        params = entry.get("supported_parameters") or []
-        if isinstance(model_id, str):
-            catalog[model_id] = frozenset(p for p in params if isinstance(p, str))
+        model = _parse_model_entry(entry)
+        if model is not None:
+            catalog[model.id] = model
     return catalog
 
 
-async def _get_catalog(models_url: str) -> dict[str, frozenset[str]] | None:
+async def _get_catalog(models_url: str) -> dict[str, OpenRouterModel] | None:
+    """Cached catalog for the guard path — swallows fetch failures as None."""
     if models_url not in _catalog_cache:
-        _catalog_cache[models_url] = await _fetch_catalog(models_url)
+        try:
+            _catalog_cache[models_url] = await _fetch_catalog(models_url)
+        except Exception as exc:  # noqa: BLE001 — degrade path, never break runs
+            logger.warning(
+                "Could not fetch OpenRouter model catalog from %s (%s). "
+                "Native-tool support cannot be verified; proceeding without the check.",
+                models_url,
+                exc,
+            )
+            _catalog_cache[models_url] = None
     return _catalog_cache[models_url]
 
 
@@ -163,6 +254,33 @@ class OpenRouterProvider(OpenAIProvider):
     def __repr__(self) -> str:
         return f"OpenRouterProvider(model={self._model!r})"
 
+    async def list_models(self, *, refresh: bool = False) -> list[OpenRouterModel]:
+        """List the OpenRouter model catalog as typed snapshots.
+
+        Serves from the same per-process cache the native-tools guard uses,
+        so a model picked from this list is guaranteed to pass the guard.
+        Pass ``refresh=True`` to force a refetch — anything beyond
+        process-lifetime caching (TTLs, persistence) is application policy
+        and stays in your hands.
+
+        Unlike the guard (which degrades to a warning), this raises on fetch
+        failure — an explicit listing request deserves a real error, not an
+        empty catalog.
+
+        Usage:
+            models = await provider.list_models()
+            free_tool_models = [m for m in models if m.is_free and m.supports_tools]
+            text_only = [m for m in models if not m.is_multimodal]
+
+        Returns:
+            All catalog models as :class:`OpenRouterModel` snapshots.
+        """
+        catalog = _catalog_cache.get(self._models_url)
+        if refresh or catalog is None:
+            catalog = await _fetch_catalog(self._models_url)
+            _catalog_cache[self._models_url] = catalog
+        return list(catalog.values())
+
     def _warn_once(self, model: str, reason: str, message: str) -> None:
         key = (model, reason)
         if key not in self._tool_warnings_emitted:
@@ -187,8 +305,8 @@ class OpenRouterProvider(OpenAIProvider):
                 f"{model!r} supports native tool calling. Proceeding.",
             )
             return
-        supported = catalog.get(model)
-        if supported is None:
+        entry = catalog.get(model)
+        if entry is None:
             self._warn_once(
                 model,
                 "unknown-model",
@@ -196,7 +314,7 @@ class OpenRouterProvider(OpenAIProvider):
                 f"verify native tool support. Proceeding.",
             )
             return
-        if "tools" in supported:
+        if entry.supports_tools:
             self._tools_verified.add(model)
             return
         message = (

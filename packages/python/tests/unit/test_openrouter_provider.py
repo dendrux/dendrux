@@ -24,12 +24,40 @@ from dendrux.llm._helpers import (  # noqa: E402
     parse_tool_json_strict,
 )
 from dendrux.llm.openai import OpenAIProvider  # noqa: E402
-from dendrux.llm.openrouter import OPENROUTER_BASE_URL, OpenRouterProvider  # noqa: E402
+from dendrux.llm.openrouter import (  # noqa: E402
+    OPENROUTER_BASE_URL,
+    OpenRouterModel,
+    OpenRouterProvider,
+    _parse_model_entry,
+)
 from dendrux.types import Message, Role, ToolDef  # noqa: E402
 
+
+def _model(
+    model_id: str,
+    params: tuple[str, ...] = (),
+    *,
+    prompt_price: float | None = 0.000002,
+    completion_price: float | None = 0.000006,
+    input_modalities: tuple[str, ...] = ("text",),
+) -> OpenRouterModel:
+    return OpenRouterModel(
+        id=model_id,
+        name=model_id,
+        context_length=131_072,
+        supported_parameters=params,
+        prompt_price=prompt_price,
+        completion_price=completion_price,
+        input_modalities=input_modalities,
+        output_modalities=("text",),
+    )
+
+
 CATALOG = {
-    "deepseek/deepseek-chat": frozenset({"tools", "tool_choice", "temperature"}),
-    "tiny/no-tools-model": frozenset({"temperature", "top_p"}),
+    "deepseek/deepseek-chat": _model(
+        "deepseek/deepseek-chat", ("tools", "tool_choice", "temperature")
+    ),
+    "tiny/no-tools-model": _model("tiny/no-tools-model", ("temperature", "top_p")),
 }
 
 
@@ -133,11 +161,13 @@ class TestNativeToolsGuard:
     async def test_catalog_fetch_failure_proceeds_with_warning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        monkeypatch.setattr(openrouter_mod, "_fetch_catalog", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            openrouter_mod, "_fetch_catalog", AsyncMock(side_effect=ConnectionError("boom"))
+        )
         provider = _provider()
         with caplog.at_level(logging.WARNING):
             await provider._ensure_native_tool_support("deepseek/deepseek-chat")
-        assert "catalog unavailable" in caplog.text
+        assert "catalog" in caplog.text and "cannot verify" in caplog.text.lower()
 
     async def test_unknown_model_proceeds_with_warning(
         self, catalog_ok: AsyncMock, caplog: pytest.LogCaptureFixture
@@ -159,7 +189,7 @@ class TestNativeToolsGuard:
     async def test_failed_fetch_cached_not_retried_per_call(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fetch = AsyncMock(return_value=None)
+        fetch = AsyncMock(side_effect=ConnectionError("boom"))
         monkeypatch.setattr(openrouter_mod, "_fetch_catalog", fetch)
         provider = _provider()
         await provider._ensure_native_tool_support("deepseek/deepseek-chat")
@@ -268,3 +298,139 @@ class TestDictArguments:
     def test_strict_still_raises_on_malformed_string(self) -> None:
         with pytest.raises(ValueError, match="invalid JSON"):
             parse_tool_json_strict("{broken", tool_name="add", call_id="c1")
+
+
+# ---------------------------------------------------------------------------
+# list_models() — public catalog listing
+# ---------------------------------------------------------------------------
+class TestListModels:
+    async def test_returns_typed_snapshots(self, catalog_ok: AsyncMock) -> None:
+        provider = _provider()
+        models = await provider.list_models()
+        assert {m.id for m in models} == set(CATALOG)
+        assert all(isinstance(m, OpenRouterModel) for m in models)
+
+    async def test_served_from_shared_cache(self, catalog_ok: AsyncMock) -> None:
+        """list_models and the guard share one fetch — they can never disagree."""
+        provider = _provider()
+        await provider._ensure_native_tool_support("deepseek/deepseek-chat")
+        models = await provider.list_models()
+        assert catalog_ok.await_count == 1
+        picked = next(m for m in models if m.supports_tools)
+        assert picked.id in provider._tools_verified or picked.id == "deepseek/deepseek-chat"
+
+    async def test_refresh_forces_refetch(self, catalog_ok: AsyncMock) -> None:
+        provider = _provider()
+        await provider.list_models()
+        await provider.list_models()
+        assert catalog_ok.await_count == 1
+        await provider.list_models(refresh=True)
+        assert catalog_ok.await_count == 2
+
+    async def test_raises_on_fetch_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unlike the guard's soft-warn, an explicit listing raises."""
+        monkeypatch.setattr(
+            openrouter_mod, "_fetch_catalog", AsyncMock(side_effect=ConnectionError("boom"))
+        )
+        provider = _provider()
+        with pytest.raises(ConnectionError):
+            await provider.list_models()
+
+    async def test_refetches_after_guard_path_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cached guard-path failure (None) does not poison list_models."""
+        fetch = AsyncMock(side_effect=[ConnectionError("boom"), CATALOG])
+        monkeypatch.setattr(openrouter_mod, "_fetch_catalog", fetch)
+        provider = _provider()
+        await provider._ensure_native_tool_support("deepseek/deepseek-chat")  # caches None
+        models = await provider.list_models()  # refetches instead of returning nothing
+        assert {m.id for m in models} == set(CATALOG)
+
+    def test_filtering_composes_with_plain_python(self) -> None:
+        models = [
+            _model("free/tools:free", ("tools",), prompt_price=0.0, completion_price=0.0),
+            _model("paid/tools", ("tools",)),
+            _model("free/chat-only:free", (), prompt_price=0.0, completion_price=0.0),
+            _model("paid/vision", ("tools",), input_modalities=("text", "image")),
+        ]
+        assert [m.id for m in models if m.is_free and m.supports_tools] == ["free/tools:free"]
+        assert [m.id for m in models if m.is_multimodal] == ["paid/vision"]
+        assert [m.id for m in models if not m.is_multimodal and not m.is_free] == ["paid/tools"]
+
+
+# ---------------------------------------------------------------------------
+# OpenRouterModel properties
+# ---------------------------------------------------------------------------
+class TestModelProperties:
+    def test_supports_tools(self) -> None:
+        assert _model("a", ("tools",)).supports_tools
+        assert not _model("b", ("temperature",)).supports_tools
+
+    def test_is_free(self) -> None:
+        assert _model("a", prompt_price=0.0, completion_price=0.0).is_free
+        assert not _model("b").is_free
+        # Unknown pricing is not "free"
+        assert not _model("c", prompt_price=None, completion_price=None).is_free
+
+    def test_is_multimodal(self) -> None:
+        assert _model("a", input_modalities=("text", "image")).is_multimodal
+        assert not _model("b", input_modalities=("text",)).is_multimodal
+        # Unknown modalities are not claimed multimodal
+        assert not _model("c", input_modalities=()).is_multimodal
+
+
+# ---------------------------------------------------------------------------
+# Catalog entry parsing
+# ---------------------------------------------------------------------------
+class TestParseModelEntry:
+    def test_full_entry(self) -> None:
+        model = _parse_model_entry(
+            {
+                "id": "deepseek/deepseek-chat",
+                "name": "DeepSeek V3",
+                "context_length": 163840,
+                "pricing": {"prompt": "0.0000002", "completion": "0.0000008"},
+                "supported_parameters": ["tools", "temperature"],
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"],
+                },
+            }
+        )
+        assert model is not None
+        assert model.name == "DeepSeek V3"
+        assert model.context_length == 163840
+        assert model.prompt_price == pytest.approx(2e-7)
+        assert model.supports_tools and not model.is_free and not model.is_multimodal
+
+    def test_free_variant(self) -> None:
+        model = _parse_model_entry(
+            {
+                "id": "meta-llama/llama-3.3-70b-instruct:free",
+                "pricing": {"prompt": "0", "completion": "0"},
+                "supported_parameters": [],
+            }
+        )
+        assert model is not None
+        assert model.is_free
+        assert model.name == "meta-llama/llama-3.3-70b-instruct:free"  # falls back to id
+
+    def test_legacy_modality_string_fallback(self) -> None:
+        model = _parse_model_entry(
+            {"id": "x/vision", "architecture": {"modality": "text+image->text"}}
+        )
+        assert model is not None
+        assert model.input_modalities == ("text", "image")
+        assert model.output_modalities == ("text",)
+        assert model.is_multimodal
+
+    def test_missing_fields_degrade_to_none_or_empty(self) -> None:
+        model = _parse_model_entry({"id": "bare/model"})
+        assert model is not None
+        assert model.context_length is None
+        assert model.prompt_price is None
+        assert model.input_modalities == ()
+
+    def test_entry_without_id_skipped(self) -> None:
+        assert _parse_model_entry({"name": "no id"}) is None

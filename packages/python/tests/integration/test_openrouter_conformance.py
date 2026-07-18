@@ -60,3 +60,22 @@ async def test_native_tool_call_round_trip(model: str) -> None:
     assert call.name == "echo"
     assert isinstance(call.params, dict)
     assert "hello" in str(call.params.get("text", "")).lower()
+
+
+@requires_openrouter_key
+async def test_list_models_live() -> None:
+    """The live catalog parses into snapshots with usable filter axes."""
+    from dendrux.llm.openrouter import OpenRouterProvider
+
+    async with OpenRouterProvider(model="deepseek/deepseek-chat") as provider:
+        models = await provider.list_models(refresh=True)
+
+    assert len(models) > 100  # the catalog is large; a tiny list means a parse bug
+    by_id = {m.id: m for m in models}
+    assert "deepseek/deepseek-chat" in by_id
+    assert by_id["deepseek/deepseek-chat"].supports_tools
+    # Every axis is populated somewhere in the catalog
+    assert any(m.is_free for m in models)
+    assert any(not m.is_free for m in models)
+    assert any(m.is_multimodal for m in models)
+    assert any(m.supports_tools for m in models)
