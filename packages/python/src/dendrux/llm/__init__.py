@@ -22,4 +22,12 @@ def __getattr__(name: str) -> type:  # noqa: N807
         from dendrux.llm.openai_responses import OpenAIResponsesProvider
 
         return OpenAIResponsesProvider
+    if name == "OpenRouterProvider":
+        from dendrux.llm.openrouter import OpenRouterProvider
+
+        return OpenRouterProvider
+    if name == "OpenRouterModel":
+        from dendrux.llm.openrouter import OpenRouterModel
+
+        return OpenRouterModel
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

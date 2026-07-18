@@ -120,7 +120,8 @@ def _build_provider_from_spec(spec: str) -> LLMProvider:
     A convenience that mirrors ``database_url``: hand the agent a recipe
     string and it constructs the provider (reading the API key from the
     environment). Supported vendors: ``anthropic``, ``openai``,
-    ``openai-responses``. Pass a provider instance for full configuration.
+    ``openai-responses``, ``openrouter``. Pass a provider instance for full
+    configuration.
     """
     vendor, sep, model = spec.partition(":")
     vendor = vendor.strip().lower()
@@ -142,9 +143,14 @@ def _build_provider_from_spec(spec: str) -> LLMProvider:
         from dendrux.llm.openai_responses import OpenAIResponsesProvider
 
         return OpenAIResponsesProvider(model=model)
+    if vendor == "openrouter":
+        from dendrux.llm.openrouter import OpenRouterProvider
+
+        return OpenRouterProvider(model=model)
     raise ValueError(
         f"Unknown provider vendor {vendor!r}. Supported: anthropic, openai, "
-        "openai-responses. Or pass a provider instance you construct yourself."
+        "openai-responses, openrouter. Or pass a provider instance you "
+        "construct yourself."
     )
 
 

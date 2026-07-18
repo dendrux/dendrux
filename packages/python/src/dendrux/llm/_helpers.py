@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_tool_json_lossy(
-    raw_json: str,
+    raw_json: str | dict[str, Any],
     *,
     provider: str,
     model: str,
@@ -36,7 +36,13 @@ def parse_tool_json_lossy(
 
     Used in streaming paths where a malformed tool call should be logged
     and degraded gracefully rather than crashing the stream.
+
+    Accepts an already-parsed dict as-is: some OpenAI-compatible backends
+    (a few OpenRouter upstreams) return ``arguments`` as an object instead
+    of a JSON string.
     """
+    if isinstance(raw_json, dict):
+        return raw_json
     if not raw_json:
         return {}
     try:
@@ -58,7 +64,7 @@ def parse_tool_json_lossy(
 
 
 def parse_tool_json_strict(
-    raw_json: str,
+    raw_json: str | dict[str, Any],
     *,
     tool_name: str,
     call_id: str,
@@ -67,7 +73,13 @@ def parse_tool_json_strict(
 
     Used in batch (non-streaming) normalization where invalid JSON
     indicates a provider-side issue that should surface immediately.
+
+    Accepts an already-parsed dict as-is: some OpenAI-compatible backends
+    (a few OpenRouter upstreams) return ``arguments`` as an object instead
+    of a JSON string.
     """
+    if isinstance(raw_json, dict):
+        return raw_json
     if not raw_json:
         return {}
     try:

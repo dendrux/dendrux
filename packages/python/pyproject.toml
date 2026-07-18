@@ -42,6 +42,8 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=1.50,<3.0"]
+# OpenRouter rides the OpenAI-compatible transport — alias for discoverability.
+openrouter = ["dendrux[openai]"]
 http = ["fastapi>=0.135,<1.0", "uvicorn[standard]"]
 # `db` is kept as an empty alias for backwards compatibility with anyone
 # who already depends on `dendrux[db]`. SQLAlchemy + aiosqlite + alembic

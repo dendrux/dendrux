@@ -560,6 +560,14 @@ class TestAgentLifecycle:
         await agent.close()
         agent._provider.close.assert_awaited_once()  # type: ignore[union-attr]
 
+    async def test_recipe_string_builds_openrouter_provider(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        from dendrux.llm.openrouter import OpenRouterProvider
+
+        agent = Agent(provider="openrouter:deepseek/deepseek-chat", prompt="Hello.")
+        assert isinstance(agent._provider, OpenRouterProvider)
+        assert agent._provider.model == "deepseek/deepseek-chat"
+
     async def test_invalid_provider_spec_raises(self):
         from dendrux.agent import _build_provider_from_spec
 
