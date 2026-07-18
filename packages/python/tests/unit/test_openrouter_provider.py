@@ -434,3 +434,13 @@ class TestParseModelEntry:
 
     def test_entry_without_id_skipped(self) -> None:
         assert _parse_model_entry({"name": "no id"}) is None
+
+    def test_negative_price_sentinel_is_none(self) -> None:
+        """OpenRouter reports '-1' for variable pricing (auto-routers)."""
+        model = _parse_model_entry(
+            {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}}
+        )
+        assert model is not None
+        assert model.prompt_price is None
+        assert model.completion_price is None
+        assert not model.is_free

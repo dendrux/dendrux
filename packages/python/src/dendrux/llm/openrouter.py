@@ -88,9 +88,12 @@ class OpenRouterModel:
 
 def _parse_price(value: Any) -> float | None:
     try:
-        return float(value)
+        price = float(value)
     except (TypeError, ValueError):
         return None
+    # OpenRouter uses "-1" as a variable-pricing sentinel (e.g. auto-routers);
+    # a negative per-token price is not a price.
+    return price if price >= 0 else None
 
 
 def _parse_modalities(arch: dict[str, Any], key: str, side: int) -> tuple[str, ...]:
