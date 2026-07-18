@@ -7,13 +7,14 @@ description: The three first-class provider classes, which one to reach for, how
 
 A **provider** is the thin adapter between dendrux's universal types and a vendor's HTTP API. You construct one, hand it to `Agent(provider=...)`, and the loop calls it. Providers do shape translation only — no agent-loop awareness, no business logic.
 
-Three first-class provider classes ship in the box. Everything below is read from the `dendrux==0.2.0a4` source.
+Four first-class provider classes ship in the box. Everything below is read from the dendrux source.
 
 | Class | Vendor / API | Import |
 | --- | --- | --- |
 | `AnthropicProvider` | Anthropic Messages API | `dendrux.llm.anthropic` |
 | `OpenAIProvider` | OpenAI **Chat Completions** (and any OpenAI-compatible server) | `dendrux.llm.openai` |
 | `OpenAIResponsesProvider` | OpenAI **Responses** API | `dendrux.llm.openai_responses` |
+| `OpenRouterProvider` | OpenRouter (open-source + premium catalog) | `dendrux.llm.openrouter` |
 
 ```python
 from dendrux import Agent
@@ -31,6 +32,7 @@ There are two OpenAI providers because OpenAI runs two different request/respons
 - **OpenAI, current models** → `OpenAIResponsesProvider`. The Responses API is OpenAI's current direction and the only one that returns **reasoning summaries** (the model's thinking, as text) for gpt-5 / o-series. See [Reasoning and thinking](/docs/architecture/reasoning).
 - **Legacy OpenAI models, or any OpenAI-compatible server** → `OpenAIProvider`. Chat Completions is the universal endpoint. It returns reasoning **token counts** but no reasoning text.
 - **Anthropic** → `AnthropicProvider`.
+- **Open-source or aggregated premium models via OpenRouter** → `OpenRouterProvider`. A preset over `OpenAIProvider` that adds a native-tools capability guard and a queryable model catalog. See [the OpenRouter recipe](/docs/recipes/openrouter).
 
 The Responses API is OpenAI-only. Pointing `OpenAIResponsesProvider` at a non-OpenAI backend will not work — that is exactly the case `OpenAIProvider` covers.
 
