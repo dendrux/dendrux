@@ -1,0 +1,115 @@
+---
+title: OpenRouter — open-source and premium models
+description: Run any OpenRouter catalog model through dendrux — native tool calling with an explicit capability guard, list_models() for building model pickers and cost tiers, and the same pause/resume machinery as every other provider.
+---
+
+# OpenRouter — open-source and premium models
+
+`OpenRouterProvider` gives your agents OpenRouter's aggregated catalog — DeepSeek, Llama, Qwen, Mistral, Gemini and hundreds more — through one API key. It is a thin preset over `OpenAIProvider` (OpenRouter speaks the Chat Completions wire format), so streaming, native tool calling, usage capture, pause/resume, and the evidence layer all work unchanged.
+
+```python
+from dendrux import Agent
+from dendrux.llm.openrouter import OpenRouterProvider
+
+# OPENROUTER_API_KEY in the environment
+agent = Agent(
+    provider=OpenRouterProvider(model="deepseek/deepseek-chat"),
+    prompt="…",
+    tools=[…],
+)
+
+# or the recipe string — provider built for you
+agent = Agent(provider="openrouter:deepseek/deepseek-chat", prompt="…")
+```
+
+Install: the provider rides the OpenAI transport, so `pip install "dendrux[openrouter]"` (an alias of `dendrux[openai]`).
+
+## The one idea
+
+**A model that can't do native tool calling doesn't error — it silently ignores your tools.**
+
+It returns plain text, `tool_calls` comes back empty, and the run "succeeds" with an answer that never used your tools. You cannot detect this from a response: a *capable* model that simply chose not to call a tool this turn looks identical. OpenRouter's catalog mixes both kinds of model, so dendrux guards on the **capability fact** instead — OpenRouter's per-model `supported_parameters` metadata.
+
+## The native-tools guard
+
+The guard fires only when tools are actually passed. Tool-free use of any catalog model is unrestricted.
+
+| Situation | What happens |
+| --- | --- |
+| Tools passed, model advertises `tools` | Runs normally |
+| Tools passed, model lacks `tools` | **Raises** with an explicit error naming the model and pointing at tool-capable alternatives |
+| Tools passed, model lacks `tools`, `require_native_tools=False` | Warns once, proceeds |
+| No tools passed | Guard never invoked — any model, zero friction |
+| Catalog fetch fails or model slug unknown | Warns, proceeds — a metadata hiccup never breaks a run |
+
+The catalog is fetched lazily on the first tools-bearing call and cached per process.
+
+How the error surfaces differs by API, but both are loud:
+
+- `agent.run()` **re-raises** the `ValueError`.
+- `agent.stream()` reports it in-band as a `run_error` **event** carrying the same message — streams surface failures as events, not exceptions.
+
+dendrux also sends OpenRouter's `provider.require_parameters` routing flag by default, so requests only route to upstreams that honor the parameters you sent. The same model slug fans out to multiple upstream hosts with different tool fidelity; without this, an upstream can silently drop your `tools`.
+
+## `list_models()` — build on the catalog
+
+The catalog is queryable as typed, immutable snapshots. There are no filter kwargs — every field is a filter axis, composed with plain Python:
+
+```python
+async with OpenRouterProvider(model="deepseek/deepseek-chat") as provider:
+    models = await provider.list_models()
+
+free_tool_models = [m for m in models if m.is_free and m.supports_tools]
+text_only        = [m for m in models if not m.is_multimodal]
+vision           = [m for m in models if "image" in m.input_modalities]
+cheap_big_ctx    = [
+    m for m in models
+    if m.supports_tools
+    and (m.context_length or 0) >= 128_000
+    and m.prompt_price is not None and m.prompt_price < 1e-6
+]
+```
+
+`OpenRouterModel` fields and properties:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Model slug, e.g. `deepseek/deepseek-chat` |
+| `name` | Human-readable name |
+| `context_length` | Max context window in tokens |
+| `supported_parameters` | Request params the model supports (`tools`, `temperature`, …) |
+| `prompt_price` / `completion_price` | USD per token; `0.0` for free models, `None` when unknown or variable |
+| `input_modalities` / `output_modalities` | `text`, `image`, `audio`, … |
+| `supports_tools` | Property: `"tools"` in supported_parameters |
+| `is_free` | Property: both prices are zero |
+| `is_multimodal` | Property: accepts any non-text input |
+
+Two guarantees worth designing around:
+
+1. **The list and the guard share one cache.** A model picked from `list_models()` cannot then fail the tools guard — they read the same data.
+2. **Free variants are separate slugs** (e.g. `meta-llama/llama-3.3-70b-instruct:free`) with their *own* `supported_parameters`. Some free routes have narrower capability than their paid siblings; per-slug data handles that correctly.
+
+Caching is mechanism, not policy: `list_models()` serves from the per-process cache, `list_models(refresh=True)` forces a refetch, and it **raises** on fetch failure (unlike the guard's soft-warn — an explicit listing request deserves a real error). TTLs, persistence, and per-tenant caching are your application's concern.
+
+What this unlocks: model-picker UIs that only offer models that will actually work, free-tier vs premium product plans driven by live pricing, cost-aware routing ("cheapest tool-capable model with 128k context"), and startup config validation that fails fast if a slug vanished from the catalog.
+
+## Attribution and routing extras
+
+```python
+OpenRouterProvider(
+    model="meta-llama/llama-3.3-70b-instruct",
+    app_url="https://myapp.example",   # HTTP-Referer — OpenRouter rankings
+    app_name="MyApp",                  # X-Title
+    extra_body={"provider": {"order": ["deepseek"]}},  # pin upstreams; merges over require_parameters
+)
+```
+
+`extra_body` passes any OpenRouter request extension; your `provider` entries merge over the default `require_parameters: true`.
+
+## Models without native tools
+
+For now, non-tool models are **text-only** through dendrux — the guard makes that boundary explicit instead of silent. A prompt-based tool-call shim (tool definitions serialized into the system prompt, calls parsed from text) is a planned extension reached via `require_native_tools=False`. Most models people reach for through OpenRouter — DeepSeek, Llama 3.3, Qwen, Mistral Large, Gemini — support native tools today.
+
+## Reference example
+
+[`examples/29_openrouter.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/29_openrouter.py) runs all of this against the live API: catalog filtering, a native tool round-trip, the recipe string, and the guard demo.
