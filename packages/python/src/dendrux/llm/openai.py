@@ -183,6 +183,8 @@ class OpenAIProvider(LLMProvider):
         timeout: float = 120.0,
         max_retries: int = 3,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
+        default_headers: dict[str, str] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         """Create an OpenAI Chat Completions provider.
 
@@ -204,6 +206,13 @@ class OpenAIProvider(LLMProvider):
                 (default) omits the field so OpenAI uses its in-memory default
                 (5–10 min idle, up to 1 h). Set ``"24h"`` for long-running
                 workflows on supported models. Hyphenated literal per the SDK.
+            default_headers: Extra HTTP headers sent with every request
+                (e.g. OpenRouter attribution headers).
+            extra_body: Extra JSON fields merged into every request body —
+                for vendor extensions of the Chat Completions API (e.g.
+                OpenRouter's ``provider`` routing block). A per-call
+                ``extra_body`` kwarg shallow-merges over this, per-call keys
+                winning.
         """
         if api_key is None and not os.getenv("OPENAI_API_KEY"):
             raise ValueError(
@@ -217,6 +226,7 @@ class OpenAIProvider(LLMProvider):
             base_url=base_url,
             http_client=make_telemetry_http_client(httpx.Timeout(timeout, connect=10.0)),
             max_retries=max_retries,
+            default_headers=default_headers,
         )
         self._model = model
         self._max_tokens = max_tokens
@@ -225,6 +235,7 @@ class OpenAIProvider(LLMProvider):
         self._effort = effort
         self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
+        self._extra_body = extra_body
 
     @property
     def model(self) -> str:
@@ -329,6 +340,13 @@ class OpenAIProvider(LLMProvider):
                 api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
             if self._prompt_cache_retention is not None:
                 api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
+
+        # Vendor extensions of the request body (e.g. OpenRouter's `provider`
+        # routing block). Per-call extra_body shallow-merges over the
+        # constructor default, per-call keys winning.
+        call_extra_body = kwargs.pop("extra_body", None)
+        if self._extra_body or call_extra_body:
+            api_kwargs["extra_body"] = {**(self._extra_body or {}), **(call_extra_body or {})}
 
         captured_request = {k: v for k, v in api_kwargs.items() if v is not openai.NOT_GIVEN}
         return api_kwargs, captured_request
