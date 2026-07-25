@@ -82,6 +82,23 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/dendrux"]
 
+# Explicit allowlist so the sdist is deterministic: only these paths ship,
+# regardless of untracked working-tree files. Without it, hatchling's default
+# sweeps in anything not gitignored (e.g. session logs, generated example
+# output). The `output` exclude guards example runs that write in-tree.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "alembic.ini",
+    "Makefile",
+]
+exclude = [
+    "**/output",
+]
+
 # --- Tool configs ---
 
 [tool.ruff]
