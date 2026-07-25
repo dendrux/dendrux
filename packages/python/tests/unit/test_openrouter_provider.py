@@ -296,6 +296,58 @@ class TestGuardWiring:
 
 
 # ---------------------------------------------------------------------------
+# Optional model — discovery-only construction
+# ---------------------------------------------------------------------------
+class TestOptionalModel:
+    def test_construct_without_model(self) -> None:
+        provider = OpenRouterProvider(api_key="sk-or-test")
+        assert provider._model is None
+
+    def test_repr_without_model(self) -> None:
+        assert repr(OpenRouterProvider(api_key="sk-or-test")) == "OpenRouterProvider(model=None)"
+
+    async def test_list_models_works_without_model(self, catalog_ok: AsyncMock) -> None:
+        """The whole point: discovery needs no model."""
+        provider = OpenRouterProvider(api_key="sk-or-test")
+        models = await provider.list_models()
+        assert {m.id for m in models} == set(CATALOG)
+
+    async def test_complete_without_model_raises_before_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = OpenRouterProvider(api_key="sk-or-test")
+        create = AsyncMock()
+        monkeypatch.setattr(provider._client.chat.completions, "create", create)
+        with pytest.raises(ValueError, match="without a model"):
+            await provider.complete([Message(role=Role.USER, content="hi")])
+        create.assert_not_awaited()
+
+    async def test_complete_stream_without_model_raises_before_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = OpenRouterProvider(api_key="sk-or-test")
+        create = AsyncMock()
+        monkeypatch.setattr(provider._client.chat.completions, "create", create)
+        with pytest.raises(ValueError, match="without a model"):
+            stream = provider.complete_stream([Message(role=Role.USER, content="hi")])
+            async for _ in stream:
+                pass
+        create.assert_not_awaited()
+
+    async def test_per_call_model_enables_inference_without_constructor_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A model= override lets a discovery-only provider run a one-off call."""
+        sentinel = object()
+        monkeypatch.setattr(OpenAIProvider, "complete", AsyncMock(return_value=sentinel))
+        provider = OpenRouterProvider(api_key="sk-or-test")
+        result = await provider.complete(
+            [Message(role=Role.USER, content="hi")], model="deepseek/deepseek-chat"
+        )
+        assert result is sentinel
+
+
+# ---------------------------------------------------------------------------
 # extra_body flows into the request kwargs (OpenAIProvider passthrough)
 # ---------------------------------------------------------------------------
 class TestExtraBodyPassthrough:

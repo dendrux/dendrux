@@ -192,7 +192,7 @@ class OpenRouterProvider(OpenAIProvider):
     def __init__(
         self,
         *,
-        model: str,
+        model: str | None = None,
         api_key: str | None = None,
         app_url: str | None = None,
         app_name: str | None = None,
@@ -204,7 +204,10 @@ class OpenRouterProvider(OpenAIProvider):
 
         Args:
             model: OpenRouter model slug (e.g. "deepseek/deepseek-chat",
-                "meta-llama/llama-3.3-70b-instruct").
+                "meta-llama/llama-3.3-70b-instruct"). Optional — omit it to
+                build a discovery-only provider for ``list_models()``. Running
+                inference then requires a model passed per call, or ``complete``/
+                ``complete_stream`` raise.
             api_key: OpenRouter API key. Defaults to OPENROUTER_API_KEY env var.
             app_url: Optional attribution URL, sent as ``HTTP-Referer``.
             app_name: Optional attribution name, sent as ``X-Title``.
@@ -242,7 +245,9 @@ class OpenRouterProvider(OpenAIProvider):
 
         base_url = kwargs.pop("base_url", OPENROUTER_BASE_URL)
         super().__init__(
-            model=model,
+            # None is allowed for discovery-only providers; inference is guarded
+            # by _require_model, so a None model never reaches the request.
+            model=model,  # type: ignore[arg-type]
             api_key=api_key,
             base_url=base_url,
             default_headers=headers or None,
@@ -283,6 +288,22 @@ class OpenRouterProvider(OpenAIProvider):
             catalog = await _fetch_catalog(self._models_url)
             _catalog_cache[self._models_url] = catalog
         return list(catalog.values())
+
+    def _require_model(self, kwargs: dict[str, Any]) -> str:
+        """Resolve the effective model for inference, raising if none is set.
+
+        A discovery-only provider (constructed without a model) can call
+        ``list_models()`` but not run — inference needs a concrete slug,
+        supplied at construction or per call.
+        """
+        model = kwargs.get("model") or self._model
+        if not model:
+            raise ValueError(
+                "OpenRouterProvider was created without a model. Pass "
+                "model='<slug>' to the constructor, or model=... per call, to "
+                "run inference — list_models() works without a model."
+            )
+        return model
 
     def _warn_once(self, model: str, reason: str, message: str) -> None:
         key = (model, reason)
@@ -343,8 +364,9 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ) -> LLMResponse:
         """Send messages via OpenRouter; guards native tool support when tools are passed."""
+        model = self._require_model(kwargs)
         if tools:
-            await self._ensure_native_tool_support(kwargs.get("model", self._model))
+            await self._ensure_native_tool_support(model)
         return await super().complete(
             messages,
             tools,
@@ -365,8 +387,9 @@ class OpenRouterProvider(OpenAIProvider):
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream via OpenRouter; guards native tool support when tools are passed."""
+        model = self._require_model(kwargs)
         if tools:
-            await self._ensure_native_tool_support(kwargs.get("model", self._model))
+            await self._ensure_native_tool_support(model)
         async for event in super().complete_stream(
             messages,
             tools,

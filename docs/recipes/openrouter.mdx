@@ -53,10 +53,10 @@ dendrux also sends OpenRouter's `provider.require_parameters` routing flag by de
 
 ## `list_models()` — build on the catalog
 
-The catalog is queryable as typed, immutable snapshots. There are no filter kwargs — every field is a filter axis, composed with plain Python:
+The catalog is queryable as typed, immutable snapshots — no model needed, since discovery isn't tied to a chosen one. There are no filter kwargs either; every field is a filter axis, composed with plain Python:
 
 ```python
-async with OpenRouterProvider(model="deepseek/deepseek-chat") as provider:
+async with OpenRouterProvider() as provider:   # discovery-only: no model required
     models = await provider.list_models()
 
 free_tool_models = [m for m in models if m.is_free and m.supports_tools]
