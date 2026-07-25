@@ -117,6 +117,27 @@ agent = Agent(provider=f"openrouter:{model['id']}", prompt="…")
 
 Everything past the fetch is yours: the schema, the refresh cadence, evicting slugs that vanished, and — the load-bearing part — what "best" means. dendrux surfaces the capability axes (tools, context, price, modalities); ranking across them is a product decision it never makes for you.
 
+## Usage and cost accounting
+
+OpenRouter returns real spend on every response — automatically, no request flag needed (the old `usage: {include: true}` opt-in is deprecated and always-on). dendrux maps it onto the same cross-provider `UsageStats` every provider reports, so cost is a first-class field, not something you reconstruct from a pricing table:
+
+- `usage.cost` → `cost_usd` — what OpenRouter charged your account for the call, in USD (the same unit as the per-token prices `list_models()` reports).
+- `prompt_tokens_details.cache_write_tokens` → `cache_creation_input_tokens`, alongside the `cached_tokens` → `cache_read_input_tokens` mapping every OpenAI-wire provider already gets.
+
+Both stream and non-stream paths are covered — cost rides the final SSE chunk — and per-call values roll up into run-level totals through the normal accumulator, so `RunStore` and the dashboard show cost per run with nothing extra to wire:
+
+```python
+resp = await agent.run("Summarize this thread.")
+print(resp.usage.cost_usd)                    # e.g. 0.000123  (USD)
+print(resp.usage.cache_creation_input_tokens) # tokens written to cache
+
+# Run-level total, aggregated across every iteration:
+run = await store.get_run(resp.run_id)
+print(run.total_cost_usd)
+```
+
+A model that reports no cost (a rare compatible backend) leaves `cost_usd` as `None`; a free model reporting `0.0` keeps the `0.0` — "didn't report" stays distinct from "reported zero." OpenRouter's `cost_details.upstream_inference_cost` (the underlying provider's cost, distinct from what OpenRouter billed you) isn't mapped to a first-class field in v1 — it's available on the raw response for anyone who needs the margin.
+
 ## Attribution and routing extras
 
 ```python

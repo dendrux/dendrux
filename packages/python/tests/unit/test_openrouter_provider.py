@@ -11,6 +11,7 @@ All unit tests are fully mocked — no network.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -30,7 +31,7 @@ from dendrux.llm.openrouter import (  # noqa: E402
     OpenRouterProvider,
     _parse_model_entry,
 )
-from dendrux.types import Message, Role, ToolDef  # noqa: E402
+from dendrux.types import Message, Role, StreamEventType, ToolDef, UsageStats  # noqa: E402
 
 
 def _model(
@@ -545,3 +546,167 @@ class TestParseModelEntry:
         assert model.prompt_price is None
         assert model.completion_price is None
         assert not model.is_free
+
+
+# ---------------------------------------------------------------------------
+# Usage accounting — OpenRouter cost + cache-write mapping
+# ---------------------------------------------------------------------------
+def _usage(**fields: Any) -> Any:
+    """A real OpenAI CompletionUsage carrying OpenRouter's extra fields.
+
+    Built from the actual SDK type (``extra='allow'``) so the test exercises
+    the same extra-field retention production relies on — not a stand-in that
+    would pass regardless of whether the SDK keeps unknown fields.
+    """
+    from openai.types import CompletionUsage
+
+    base: dict[str, Any] = {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    base.update(fields)
+    return CompletionUsage.model_validate(base)
+
+
+@dataclass
+class _FakeDelta:
+    content: str | None = None
+    tool_calls: Any = None
+
+
+@dataclass
+class _FakeStreamChoice:
+    delta: _FakeDelta = field(default_factory=_FakeDelta)
+    index: int = 0
+    finish_reason: str | None = None
+
+
+@dataclass
+class _FakeChunk:
+    choices: list[Any] = field(default_factory=list)
+    usage: Any = None
+
+
+@dataclass
+class _FakeMessage:
+    role: str = "assistant"
+    content: str | None = "ok"
+    tool_calls: Any = None
+
+
+@dataclass
+class _FakeChoice:
+    message: _FakeMessage = field(default_factory=_FakeMessage)
+    index: int = 0
+    finish_reason: str = "stop"
+
+
+@dataclass
+class _FakeCompletion:
+    choices: list[Any] = field(default_factory=lambda: [_FakeChoice()])
+    usage: Any = None
+
+    def model_dump(self) -> dict[str, Any]:
+        return {"fake": True}
+
+
+async def _astream(chunks: list[Any]) -> Any:
+    for chunk in chunks:
+        yield chunk
+
+
+class TestUsageAccounting:
+    """OpenRouter maps its extra usage fields onto the cross-provider UsageStats.
+
+    ``cost`` -> ``cost_usd`` (USD; what OpenRouter charged the account) and
+    ``prompt_tokens_details.cache_write_tokens`` -> ``cache_creation_input_tokens``.
+    Populating these at the source is enough — the run-level accumulator and
+    RunStore already carry both.
+    """
+
+    def test_cost_mapped_to_cost_usd(self) -> None:
+        stats = _provider()._normalize_usage(_usage(cost=0.000123))
+        assert stats.cost_usd == pytest.approx(0.000123)
+
+    def test_cache_write_mapped_to_cache_creation(self) -> None:
+        stats = _provider()._normalize_usage(
+            _usage(prompt_tokens_details={"cached_tokens": 40, "cache_write_tokens": 10})
+        )
+        assert stats.cache_creation_input_tokens == 10
+        # base mapping still holds: cached-read + fresh-input normalization
+        assert stats.cache_read_input_tokens == 40
+        assert stats.input_tokens == 60
+
+    def test_missing_cost_leaves_none(self) -> None:
+        """A compatible backend that omits cost must not fabricate a number."""
+        stats = _provider()._normalize_usage(_usage())
+        assert stats.cost_usd is None
+        assert stats.cache_creation_input_tokens is None
+
+    def test_zero_cost_preserved(self) -> None:
+        """Free models report cost 0.0 — a reported zero survives, not -> None."""
+        stats = _provider()._normalize_usage(_usage(cost=0.0))
+        assert stats.cost_usd == 0.0
+
+    def test_base_reasoning_tokens_preserved_through_override(self) -> None:
+        stats = _provider()._normalize_usage(
+            _usage(completion_tokens_details={"reasoning_tokens": 5})
+        )
+        assert stats.reasoning_tokens == 5
+
+    async def test_non_streaming_complete_surfaces_cost(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _provider()
+        completion = _FakeCompletion(
+            usage=_usage(cost=0.0005, prompt_tokens_details={"cache_write_tokens": 8})
+        )
+        monkeypatch.setattr(
+            provider._client.chat.completions, "create", AsyncMock(return_value=completion)
+        )
+        result = await provider.complete([Message(role=Role.USER, content="hi")])
+        assert result.usage.cost_usd == pytest.approx(0.0005)
+        assert result.usage.cache_creation_input_tokens == 8
+
+    async def test_streaming_final_chunk_surfaces_cost(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _provider()
+        chunks = [
+            _FakeChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(content="hi"))]),
+            # OpenRouter attaches usage to the final SSE chunk (empty choices)
+            _FakeChunk(
+                choices=[],
+                usage=_usage(cost=0.0009, prompt_tokens_details={"cache_write_tokens": 3}),
+            ),
+        ]
+        monkeypatch.setattr(
+            provider._client.chat.completions,
+            "create",
+            AsyncMock(return_value=_astream(chunks)),
+        )
+        done = None
+        async for event in provider.complete_stream([Message(role=Role.USER, content="hi")]):
+            if event.type == StreamEventType.DONE:
+                done = event
+        assert done is not None
+        assert done.raw.usage.cost_usd == pytest.approx(0.0009)
+        assert done.raw.usage.cache_creation_input_tokens == 3
+
+    def test_multi_iteration_aggregation(self) -> None:
+        """Per-call cost + cache-write sum into the run-level total."""
+        from dendrux.loops.react import _accumulate_usage
+
+        provider = _provider()
+        total = UsageStats()
+        _accumulate_usage(
+            total,
+            provider._normalize_usage(
+                _usage(cost=0.001, prompt_tokens_details={"cache_write_tokens": 10})
+            ),
+        )
+        _accumulate_usage(
+            total,
+            provider._normalize_usage(
+                _usage(cost=0.002, prompt_tokens_details={"cache_write_tokens": 5})
+            ),
+        )
+        assert total.cost_usd == pytest.approx(0.003)
+        assert total.cache_creation_input_tokens == 15

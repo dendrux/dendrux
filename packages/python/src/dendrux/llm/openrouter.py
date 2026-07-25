@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -37,7 +37,7 @@ from dendrux.llm.openai import OpenAIProvider
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from dendrux.types import LLMResponse, Message, StreamEvent, ToolDef
+    from dendrux.types import LLMResponse, Message, StreamEvent, ToolDef, UsageStats
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,27 @@ async def _get_catalog(models_url: str) -> dict[str, OpenRouterModel] | None:
             )
             _catalog_cache[models_url] = None
     return _catalog_cache[models_url]
+
+
+def _read_usage_extra(obj: Any, field: str) -> Any:
+    """Read a non-standard usage field OpenRouter adds on the OpenAI wire.
+
+    The OpenAI SDK retains fields its schema does not define (``extra='allow'``),
+    so OpenRouter's ``cost`` / ``cache_write_tokens`` surface via attribute
+    access or ``model_extra``; a raw dict is handled too. Returns ``None`` when
+    the field is absent.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(field)
+    value = getattr(obj, field, None)
+    if value is not None:
+        return value
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(field)
+    return None
 
 
 class OpenRouterProvider(OpenAIProvider):
@@ -352,6 +373,35 @@ class OpenRouterProvider(OpenAIProvider):
         if self._require_native_tools:
             raise ValueError(message)
         self._warn_once(model, "no-native-tools", message)
+
+    def _normalize_usage(self, usage: Any) -> UsageStats:
+        """Enrich base usage with OpenRouter's cost and cache-write fields.
+
+        OpenRouter returns these on the standard usage object and they ride
+        through the OpenAI SDK as extra fields:
+
+          - ``cost`` → ``cost_usd``. USD-denominated, matching the USD
+            per-token pricing :meth:`list_models` already exposes; it is what
+            OpenRouter charged the account for this call. (``upstream_inference_cost``
+            stays available on the raw response — not mapped in v1.)
+          - ``prompt_tokens_details.cache_write_tokens`` →
+            ``cache_creation_input_tokens``, aligning with Anthropic's field.
+
+        A missing field leaves the base value unchanged; a reported zero (e.g.
+        free models) is preserved. Populating these at the source is enough —
+        the run-level accumulator and RunStore already carry both.
+        """
+        base = super()._normalize_usage(usage)
+        cost = _read_usage_extra(usage, "cost")
+        details = _read_usage_extra(usage, "prompt_tokens_details")
+        cache_write = _read_usage_extra(details, "cache_write_tokens")
+        return replace(
+            base,
+            cost_usd=float(cost) if cost is not None else base.cost_usd,
+            cache_creation_input_tokens=(
+                int(cache_write) if cache_write is not None else base.cache_creation_input_tokens
+            ),
+        )
 
     async def complete(
         self,
