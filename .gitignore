@@ -54,6 +54,10 @@ htmlcov/
 scratch/
 **/scratch/
 
+# Generated example run output
+examples/**/output/
+**/examples/**/output/
+
 # Dashboard (React build artifacts — keep dir via .gitkeep, ignore contents)
 node_modules/
 packages/python/src/dendrite/dashboard/static/*
