@@ -138,6 +138,57 @@ print(run.total_cost_usd)
 
 A model that reports no cost (a rare compatible backend) leaves `cost_usd` as `None`; a free model reporting `0.0` keeps the `0.0` — "didn't report" stays distinct from "reported zero." OpenRouter's `cost_details.upstream_inference_cost` (the underlying provider's cost, distinct from what OpenRouter billed you) isn't mapped to a first-class field in v1 — it's available on the raw response for anyone who needs the margin.
 
+## Reasoning controls
+
+Reasoning-capable models (DeepSeek R1, Qwen3, GPT-5, …) reason **by default** on OpenRouter — so an app that omits reasoning config and shows "Think: Off" is misleading: the model still burns reasoning tokens. dendrux wires reasoning into its cross-vendor knobs so you send the right directive with one flag.
+
+```python
+from dendrux.llm.openrouter import OpenRouterProvider
+
+# Off — sends reasoning={"enabled": False}
+OpenRouterProvider(model="qwen/qwen3-14b", thinking=False)
+
+# On at a chosen depth — sends reasoning={"effort": "medium"}
+OpenRouterProvider(model="qwen/qwen3-14b", thinking=True, effort="medium")
+```
+
+- `thinking=False` → `reasoning={"enabled": False}` — OpenRouter's disable directive. (Verified against live models: `effort="none"` does *not* disable reasoning on Qwen3, and `exclude` still bills reasoning tokens — `enabled: false` is the right one.) On a model whose metadata marks reasoning **mandatory**, this raises before the request.
+
+> **Reliability caveat.** A true zero depends on the model's OpenRouter **upstream** honoring the disable. Some Qwen3 hosts ignore the reasoning toggle and keep reasoning regardless — dendrux sends the correct directive, but can't force an upstream to obey it. When a hard zero matters, pin a compliant upstream: `extra_body={"provider": {"order": ["<host>"], "allow_fallbacks": False}}`, and confirm with `call.reasoning_tokens` (below).
+>
+> Recording stays honest either way: if a model reasons **despite** `thinking=False`, those reasoning tokens — and any reasoning text it emits — are recorded as-is. dendrux reports what the model actually did (and billed), never what you asked for, so cost and observability stay accurate even when a directive is ignored.
+- `effort` is the cross-vendor knob (`low`/`medium`/`high`/`xhigh`; `"extra"`→`xhigh`); OpenRouter also accepts `minimal`/`none`. It works even on budget-based models — OpenRouter cross-converts effort↔max_tokens.
+- Both are overridable per call.
+
+### Rendering Off / Low / Medium / High / Always-on
+
+`list_models()` carries the metadata to build the control — and to hide "Off" when it isn't allowed:
+
+```python
+for m in await provider.list_models():
+    caps = m.reasoning
+    caps.supported          # accepts a reasoning parameter at all
+    caps.mandatory          # reasoning can't be disabled → hide "Off"
+    caps.supported_efforts   # ("high","medium","low",…); () ⇒ no effort selector
+    caps.default_effort      # the model's default effort when on
+    caps.default_enabled     # whether reasoning is on by default (bool | None)
+    caps.supports_max_tokens # takes a reasoning.max_tokens budget → show a budget control
+```
+
+For a token budget instead of an effort level (Anthropic/Gemini/some Qwen), pass it straight through: `extra_body={"reasoning": {"max_tokens": 2000}}`.
+
+### Reasoning tokens vs. reasoning text
+
+These are **separate** response data: `reasoning_tokens` counts internal reasoning the model billed; `reasoning` is a human-readable summary the provider *chose* to expose (often absent). dendrux surfaces both on the public LLM call, so an app can say precisely "reasoning happened, but no readable summary was recorded":
+
+```python
+call = (await store.get_llm_calls(run_id))[-1]
+call.reasoning_tokens   # e.g. 773  — reasoning happened
+call.reasoning          # None      — but no reasoning text was exposed
+```
+
+Across multi-step tool calls, dendrux preserves OpenRouter's `reasoning_details` and replays them on later turns (per OpenRouter's guidance), so the model keeps its reasoning context through a tool loop — and streamed reasoning arrives as `reasoning_delta` run events.
+
 ## Attribution and routing extras
 
 ```python

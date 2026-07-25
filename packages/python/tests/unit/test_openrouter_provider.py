@@ -30,6 +30,7 @@ from dendrux.llm.openrouter import (  # noqa: E402
     OpenRouterModel,
     OpenRouterProvider,
     _parse_model_entry,
+    _parse_reasoning,
 )
 from dendrux.types import Message, Role, StreamEventType, ToolDef, UsageStats  # noqa: E402
 
@@ -710,3 +711,229 @@ class TestUsageAccounting:
         )
         assert total.cost_usd == pytest.approx(0.003)
         assert total.cache_creation_input_tokens == 15
+
+
+# ---------------------------------------------------------------------------
+# Reasoning capability metadata
+# ---------------------------------------------------------------------------
+class TestReasoningMetadata:
+    def test_effort_based_model(self) -> None:
+        # Mirrors OpenRouter's documented /models reasoning object shape.
+        m = _parse_model_entry(
+            {
+                "id": "google/gemini-3.5-flash",
+                "supported_parameters": ["reasoning", "reasoning_effort", "tools"],
+                "reasoning": {
+                    "supported_efforts": ["high", "medium", "low", "minimal"],
+                    "default_effort": "medium",
+                    "default_enabled": True,
+                    "mandatory": True,
+                },
+            }
+        )
+        assert m is not None
+        assert m.supports_reasoning
+        assert m.reasoning.mandatory
+        assert m.reasoning.supported_efforts == ("high", "medium", "low", "minimal")
+        assert m.reasoning.default_effort == "medium"
+        assert m.reasoning.default_enabled is True
+        assert m.reasoning.supports_max_tokens is False  # absent → False
+
+    def test_budget_based_model_has_no_efforts(self) -> None:
+        """qwen3-style: reasoning supported, not mandatory, token-budget based."""
+        m = _parse_model_entry(
+            {
+                "id": "qwen/qwen3-14b",
+                "supported_parameters": ["reasoning", "tools"],
+                "reasoning": {"mandatory": False, "supports_max_tokens": True},
+            }
+        )
+        assert m is not None
+        assert m.supports_reasoning
+        assert not m.reasoning.mandatory
+        assert m.reasoning.supported_efforts == ()
+        assert m.reasoning.default_effort is None
+        assert m.reasoning.default_enabled is None
+        assert m.reasoning.supports_max_tokens is True
+
+    def test_no_reasoning_param_means_unsupported(self) -> None:
+        m = _parse_model_entry({"id": "x/y", "supported_parameters": ["tools"]})
+        assert m is not None
+        assert not m.supports_reasoning
+        assert not m.reasoning.mandatory
+
+    def test_reasoning_param_without_object(self) -> None:
+        caps = _parse_reasoning({"id": "x/y"}, ("reasoning",))
+        assert caps.supported
+        assert not caps.mandatory
+        assert caps.supported_efforts == ()
+
+
+# ---------------------------------------------------------------------------
+# Reasoning controls — thinking/effort → the OpenRouter reasoning block
+# ---------------------------------------------------------------------------
+class TestReasoningBlock:
+    def test_thinking_false_is_genuine_off(self) -> None:
+        # {"enabled": False} — the only payload that zeroes reasoning tokens
+        # (verified live: effort:"none" does NOT disable on Qwen3).
+        assert OpenRouterProvider._reasoning_block(False, None) == {"enabled": False}
+
+    def test_thinking_false_wins_over_effort(self) -> None:
+        assert OpenRouterProvider._reasoning_block(False, "high") == {"enabled": False}
+
+    def test_effort_passthrough(self) -> None:
+        assert OpenRouterProvider._reasoning_block(True, "medium") == {"effort": "medium"}
+        assert OpenRouterProvider._reasoning_block(None, "high") == {"effort": "high"}
+
+    def test_effort_extra_alias_maps_to_xhigh(self) -> None:
+        assert OpenRouterProvider._reasoning_block(None, "extra") == {"effort": "xhigh"}
+
+    def test_thinking_true_enables_default(self) -> None:
+        assert OpenRouterProvider._reasoning_block(True, None) == {"enabled": True}
+
+    def test_unset_leaves_request_untouched(self) -> None:
+        assert OpenRouterProvider._reasoning_block(None, None) is None
+
+
+class TestReasoningWiring:
+    async def test_constructor_reasoning_injected_into_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _provider(thinking=True, effort="medium")
+        captured: dict[str, Any] = {}
+
+        async def fake_create(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return _FakeCompletion(usage=_usage())
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        await provider.complete([Message(role=Role.USER, content="hi")])
+        assert captured["extra_body"]["reasoning"] == {"effort": "medium"}
+        # routing block still intact alongside reasoning
+        assert captured["extra_body"]["provider"]["require_parameters"] is True
+
+    async def test_no_reasoning_leaves_body_clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        provider = _provider()  # no thinking/effort
+        captured: dict[str, Any] = {}
+
+        async def fake_create(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return _FakeCompletion(usage=_usage())
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        await provider.complete([Message(role=Role.USER, content="hi")])
+        assert "reasoning" not in captured["extra_body"]
+
+    async def test_per_call_thinking_overrides_constructor(
+        self, catalog_ok: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = _provider(model="deepseek/deepseek-chat", thinking=True, effort="high")
+        captured: dict[str, Any] = {}
+
+        async def fake_create(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return _FakeCompletion(usage=_usage())
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        # deepseek/deepseek-chat in CATALOG has no reasoning object → not mandatory
+        await provider.complete([Message(role=Role.USER, content="hi")], thinking=False)
+        assert captured["extra_body"]["reasoning"] == {"enabled": False}
+
+    async def test_reasoning_recorded_even_when_off_requested(
+        self, catalog_ok: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If a model reasons anyway despite thinking=False (upstream ignored the
+        disable), the tokens + text are recorded faithfully — recording reflects
+        what the model actually did and billed, never what we requested."""
+        provider = _provider(model="deepseek/deepseek-chat", thinking=False)
+        msg = _FakeMessage(content="answer")
+        msg.reasoning = "reasoned despite the off switch"  # type: ignore[attr-defined]
+        completion = _FakeCompletion(
+            choices=[_FakeChoice(message=msg)],
+            usage=_usage(completion_tokens_details={"reasoning_tokens": 42}),
+        )
+
+        async def fake_create(**kwargs: Any) -> Any:
+            # we DID send the disable directive...
+            assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+            return completion
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        resp = await provider.complete([Message(role=Role.USER, content="hi")])
+        # ...but recording mirrors reality, not the request
+        assert resp.usage.reasoning_tokens == 42
+        assert resp.reasoning == "reasoned despite the off switch"
+
+
+# ---------------------------------------------------------------------------
+# Mandatory-reasoning guard
+# ---------------------------------------------------------------------------
+def _catalog_with_reasoning(model_id: str, *, mandatory: bool) -> dict[str, OpenRouterModel]:
+    entry = _parse_model_entry(
+        {
+            "id": model_id,
+            "supported_parameters": ["reasoning", "tools"],
+            "reasoning": {"mandatory": mandatory},
+        }
+    )
+    assert entry is not None
+    return {model_id: entry}
+
+
+class TestMandatoryReasoningGuard:
+    async def test_thinking_false_on_mandatory_model_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fetch = AsyncMock(return_value=_catalog_with_reasoning("x/mand", mandatory=True))
+        monkeypatch.setattr(openrouter_mod, "_fetch_catalog", fetch)
+        provider = _provider(model="x/mand", thinking=False)
+        create = AsyncMock()
+        monkeypatch.setattr(provider._client.chat.completions, "create", create)
+        with pytest.raises(ValueError, match="mandatory reasoning"):
+            await provider.complete([Message(role=Role.USER, content="hi")])
+        create.assert_not_awaited()
+
+    async def test_thinking_false_on_optional_model_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fetch = AsyncMock(return_value=_catalog_with_reasoning("x/opt", mandatory=False))
+        monkeypatch.setattr(openrouter_mod, "_fetch_catalog", fetch)
+        provider = _provider(model="x/opt", thinking=False)
+
+        async def fake_create(**kwargs: Any) -> Any:
+            return _FakeCompletion(usage=_usage())
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        result = await provider.complete([Message(role=Role.USER, content="hi")])
+        assert result is not None
+
+    async def test_mandatory_guard_only_fires_when_disabling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """thinking=True on a mandatory model must not touch the catalog."""
+        fetch = AsyncMock(side_effect=AssertionError("catalog should not be fetched"))
+        monkeypatch.setattr(openrouter_mod, "_fetch_catalog", fetch)
+        provider = _provider(model="x/mand", thinking=True, effort="high")
+
+        async def fake_create(**kwargs: Any) -> Any:
+            return _FakeCompletion(usage=_usage())
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        result = await provider.complete([Message(role=Role.USER, content="hi")])
+        assert result is not None
+
+    async def test_mandatory_guard_degrades_when_catalog_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            openrouter_mod, "_fetch_catalog", AsyncMock(side_effect=ConnectionError("boom"))
+        )
+        provider = _provider(model="x/unknown", thinking=False)
+
+        async def fake_create(**kwargs: Any) -> Any:
+            return _FakeCompletion(usage=_usage())
+
+        monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+        with caplog.at_level(logging.WARNING):
+            result = await provider.complete([Message(role=Role.USER, content="hi")])
+        assert result is not None  # never breaks a run on a metadata hiccup

@@ -229,6 +229,8 @@ async def _append_assistant(
         role=Role.ASSISTANT,
         content=response.text or "",
         tool_calls=response.tool_calls,
+        reasoning=response.reasoning,
+        reasoning_blocks=response.reasoning_blocks,
     )
     history.append(msg)
     await _record_message(recorder, run_id, msg, iteration)

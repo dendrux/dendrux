@@ -91,6 +91,11 @@ class Message:
     kind: str = "chat"
     placement: str = "dynamic"
     source: str | None = None
+    # Reasoning the model surfaced on an ASSISTANT turn: ``reasoning`` is the
+    # human-readable summary (never raw CoT); ``reasoning_blocks`` are opaque
+    # provider artifacts replayed verbatim across tool-call iterations.
+    reasoning: str | None = None
+    reasoning_blocks: list[Any] | None = None
 
     def __post_init__(self) -> None:
         if self.placement not in ("stable", "dynamic"):
@@ -502,6 +507,12 @@ def _message_to_dict(m: Message) -> dict[str, Any]:
         d["placement"] = m.placement
     if m.source is not None:
         d["source"] = m.source
+    # Reasoning summary + opaque replay blocks — persisted so a run paused
+    # mid-tool-loop keeps its reasoning context across resume.
+    if m.reasoning is not None:
+        d["reasoning"] = m.reasoning
+    if m.reasoning_blocks is not None:
+        d["reasoning_blocks"] = m.reasoning_blocks
     return d
 
 
@@ -519,6 +530,8 @@ def _message_from_dict(d: dict[str, Any]) -> Message:
         kind=d.get("kind", "chat"),
         placement=d.get("placement", "dynamic"),
         source=d.get("source"),
+        reasoning=d.get("reasoning"),
+        reasoning_blocks=d.get("reasoning_blocks"),
     )
 
 
