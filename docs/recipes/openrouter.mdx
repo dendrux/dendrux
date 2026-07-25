@@ -93,6 +93,30 @@ Caching is mechanism, not policy: `list_models()` serves from the per-process ca
 
 What this unlocks: model-picker UIs that only offer models that will actually work, free-tier vs premium product plans driven by live pricing, cost-aware routing ("cheapest tool-capable model with 128k context"), and startup config validation that fails fast if a slug vanished from the catalog.
 
+## Persisting the catalog
+
+`list_models()` fetches live and caches per process — deliberately nothing more. The catalog changes on OpenRouter's schedule, not yours, so most apps don't want a network round-trip on every model decision. The pattern: snapshot into your own store, refresh on a cadence you own, and read from the store at request time.
+
+`OpenRouterModel` is a frozen dataclass of JSON-native fields, so it serializes without ceremony:
+
+```python
+from dataclasses import asdict
+
+async with OpenRouterProvider(model="deepseek/deepseek-chat") as provider:
+    for m in await provider.list_models(refresh=True):
+        await upsert_model_row(asdict(m))   # your table, your schema
+```
+
+Run that from anything that fires on a cadence — a weekly cron, a worker tick, a deploy hook. Between refreshes your "which model for this job?" logic reads stored rows and never touches the network:
+
+```python
+rows  = await load_tool_capable_models(min_context=128_000)   # a SQL WHERE
+model = cheapest(rows)                                         # your ranking
+agent = Agent(provider=f"openrouter:{model['id']}", prompt="…")
+```
+
+Everything past the fetch is yours: the schema, the refresh cadence, evicting slugs that vanished, and — the load-bearing part — what "best" means. dendrux surfaces the capability axes (tools, context, price, modalities); ranking across them is a product decision it never makes for you.
+
 ## Attribution and routing extras
 
 ```python
