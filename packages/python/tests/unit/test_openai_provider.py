@@ -1486,6 +1486,27 @@ class TestReasoningReplay:
         )
         assert out[0]["reasoning_details"] == blocks
 
-    def test_no_reasoning_blocks_no_details_key(self, provider: OpenAIProvider) -> None:
+    def test_falls_back_to_reasoning_string(self, provider: OpenAIProvider) -> None:
+        """Raw-string-only models: replay message.reasoning when no blocks."""
+        out = provider._convert_messages(
+            [Message(role=Role.ASSISTANT, content="ans", reasoning="raw chain of thought")]
+        )
+        assert out[0]["reasoning"] == "raw chain of thought"
+        assert "reasoning_details" not in out[0]
+
+    def test_blocks_win_over_string(self, provider: OpenAIProvider) -> None:
+        blocks = [{"type": "reasoning.text", "text": "x"}]
+        out = provider._convert_messages(
+            [
+                Message(
+                    role=Role.ASSISTANT, content="ans", reasoning="ignored", reasoning_blocks=blocks
+                )
+            ]
+        )
+        assert out[0]["reasoning_details"] == blocks
+        assert "reasoning" not in out[0]
+
+    def test_no_reasoning_no_keys(self, provider: OpenAIProvider) -> None:
         out = provider._convert_messages([Message(role=Role.ASSISTANT, content="ans")])
         assert "reasoning_details" not in out[0]
+        assert "reasoning" not in out[0]

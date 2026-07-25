@@ -718,14 +718,16 @@ class TestUsageAccounting:
 # ---------------------------------------------------------------------------
 class TestReasoningMetadata:
     def test_effort_based_model(self) -> None:
+        # Mirrors OpenRouter's documented /models reasoning object shape.
         m = _parse_model_entry(
             {
-                "id": "openai/gpt-5",
+                "id": "google/gemini-3.5-flash",
                 "supported_parameters": ["reasoning", "reasoning_effort", "tools"],
                 "reasoning": {
-                    "mandatory": True,
                     "supported_efforts": ["high", "medium", "low", "minimal"],
                     "default_effort": "medium",
+                    "default_enabled": True,
+                    "mandatory": True,
                 },
             }
         )
@@ -734,14 +736,16 @@ class TestReasoningMetadata:
         assert m.reasoning.mandatory
         assert m.reasoning.supported_efforts == ("high", "medium", "low", "minimal")
         assert m.reasoning.default_effort == "medium"
+        assert m.reasoning.default_enabled is True
+        assert m.reasoning.supports_max_tokens is False  # absent → False
 
     def test_budget_based_model_has_no_efforts(self) -> None:
-        """qwen3-style: reasoning supported, not mandatory, no effort list."""
+        """qwen3-style: reasoning supported, not mandatory, token-budget based."""
         m = _parse_model_entry(
             {
                 "id": "qwen/qwen3-14b",
                 "supported_parameters": ["reasoning", "tools"],
-                "reasoning": {"mandatory": False},
+                "reasoning": {"mandatory": False, "supports_max_tokens": True},
             }
         )
         assert m is not None
@@ -749,6 +753,8 @@ class TestReasoningMetadata:
         assert not m.reasoning.mandatory
         assert m.reasoning.supported_efforts == ()
         assert m.reasoning.default_effort is None
+        assert m.reasoning.default_enabled is None
+        assert m.reasoning.supports_max_tokens is True
 
     def test_no_reasoning_param_means_unsupported(self) -> None:
         m = _parse_model_entry({"id": "x/y", "supported_parameters": ["tools"]})

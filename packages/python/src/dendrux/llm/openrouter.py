@@ -61,10 +61,20 @@ class OpenRouterReasoningCapabilities:
     empty when the model is budget-based (``max_tokens``) rather than effort-based."""
     default_effort: str | None
     """The model's default effort when reasoning is on, when advertised."""
+    default_enabled: bool | None
+    """Whether reasoning is on by default, when advertised (else ``None``)."""
+    supports_max_tokens: bool
+    """True when the model takes a ``reasoning.max_tokens`` budget (show a token
+    budget control) rather than only effort levels."""
 
 
 _NO_REASONING = OpenRouterReasoningCapabilities(
-    supported=False, mandatory=False, supported_efforts=(), default_effort=None
+    supported=False,
+    mandatory=False,
+    supported_efforts=(),
+    default_effort=None,
+    default_enabled=None,
+    supports_max_tokens=False,
 )
 
 
@@ -158,10 +168,16 @@ def _parse_reasoning(
     raw = entry.get("reasoning")
     if not isinstance(raw, dict):
         return OpenRouterReasoningCapabilities(
-            supported=supported, mandatory=False, supported_efforts=(), default_effort=None
+            supported=supported,
+            mandatory=False,
+            supported_efforts=(),
+            default_effort=None,
+            default_enabled=None,
+            supports_max_tokens=False,
         )
     efforts = raw.get("supported_efforts")
     default_effort = raw.get("default_effort")
+    default_enabled = raw.get("default_enabled")
     return OpenRouterReasoningCapabilities(
         supported=supported,
         mandatory=bool(raw.get("mandatory", False)),
@@ -169,6 +185,8 @@ def _parse_reasoning(
             tuple(e for e in efforts if isinstance(e, str)) if isinstance(efforts, list) else ()
         ),
         default_effort=default_effort if isinstance(default_effort, str) else None,
+        default_enabled=default_enabled if isinstance(default_enabled, bool) else None,
+        supports_max_tokens=bool(raw.get("supports_max_tokens", False)),
     )
 
 

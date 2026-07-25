@@ -694,11 +694,16 @@ class OpenAIProvider(LLMProvider):
                     ]
                 else:
                     api_msg = {"role": "assistant", "content": msg.content}
-                # Replay provider reasoning artifacts verbatim so multi-step
-                # tool calls keep the model's reasoning context, per OpenRouter's
-                # guidance. Inert for pure OpenAI, which never populates these.
+                # Replay provider reasoning so multi-step tool calls keep the
+                # model's reasoning context, per OpenRouter's guidance. Prefer
+                # the structured blocks (verbatim — required for encrypted/
+                # summarized types); fall back to the plaintext string for
+                # models that only return raw reasoning. Inert for pure OpenAI,
+                # which never populates either.
                 if msg.reasoning_blocks:
                     api_msg["reasoning_details"] = msg.reasoning_blocks
+                elif msg.reasoning:
+                    api_msg["reasoning"] = msg.reasoning
                 api_messages.append(api_msg)
 
             elif msg.role == Role.TOOL:
