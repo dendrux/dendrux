@@ -184,6 +184,22 @@ class TestMessageOriginEnvelope:
         assert "kind" not in d
         assert "placement" not in d
         assert "source" not in d
+        assert "reasoning" not in d
+        assert "reasoning_blocks" not in d
+
+    def test_snapshot_roundtrips_reasoning(self) -> None:
+        # Reasoning summary + replay blocks survive pause/resume so a run
+        # paused mid-tool-loop keeps its reasoning context.
+        blocks = [{"type": "reasoning.text", "text": "why", "id": "r1"}]
+        msg = Message(
+            role=Role.ASSISTANT,
+            content="ans",
+            reasoning="because",
+            reasoning_blocks=blocks,
+        )
+        restored = _message_from_dict(_message_to_dict(msg))
+        assert restored.reasoning == "because"
+        assert restored.reasoning_blocks == blocks
 
     def test_legacy_snapshot_without_envelope(self) -> None:
         # Snapshots written before PR 1 have no envelope keys — load with defaults,

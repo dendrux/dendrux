@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from dendrux.llm.openai import OpenAIProvider
+from dendrux.llm.openai import OpenAIProvider, _normalize_effort
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -42,6 +42,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRouterReasoningCapabilities:
+    """A model's reasoning capabilities, from OpenRouter's ``/models`` metadata.
+
+    Enough for an app to render Off / Low / Medium / High / Always-on controls
+    and to know when "Off" is not an option.
+    """
+
+    supported: bool
+    """True when the model accepts a ``reasoning`` request parameter."""
+    mandatory: bool
+    """True when reasoning cannot be disabled — an app should hide "Off"."""
+    supported_efforts: tuple[str, ...]
+    """Effort levels the model accepts (e.g. ``("high", "medium", "low")``);
+    empty when the model is budget-based (``max_tokens``) rather than effort-based."""
+    default_effort: str | None
+    """The model's default effort when reasoning is on, when advertised."""
+
+
+_NO_REASONING = OpenRouterReasoningCapabilities(
+    supported=False, mandatory=False, supported_efforts=(), default_effort=None
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +93,18 @@ class OpenRouterModel:
     """Accepted input modalities (``"text"``, ``"image"``, ...); empty if unknown."""
     output_modalities: tuple[str, ...]
     """Produced output modalities; empty if unknown."""
+    reasoning: OpenRouterReasoningCapabilities = _NO_REASONING
+    """Reasoning capabilities (support, mandatory, efforts) from ``/models``."""
 
     @property
     def supports_tools(self) -> bool:
         """True when the model advertises native function calling."""
         return "tools" in self.supported_parameters
+
+    @property
+    def supports_reasoning(self) -> bool:
+        """True when the model accepts reasoning controls."""
+        return self.reasoning.supported
 
     @property
     def is_free(self) -> bool:
@@ -114,6 +145,33 @@ def _parse_modalities(arch: dict[str, Any], key: str, side: int) -> tuple[str, .
     return ()
 
 
+def _parse_reasoning(
+    entry: dict[str, Any], supported_parameters: tuple[str, ...]
+) -> OpenRouterReasoningCapabilities:
+    """Read reasoning capabilities from a ``/models`` entry.
+
+    ``supported`` is derived from ``supported_parameters`` (OpenRouter has no
+    standalone flag); ``mandatory``/``supported_efforts``/``default_effort``
+    come from the nested ``reasoning`` object when present.
+    """
+    supported = "reasoning" in supported_parameters
+    raw = entry.get("reasoning")
+    if not isinstance(raw, dict):
+        return OpenRouterReasoningCapabilities(
+            supported=supported, mandatory=False, supported_efforts=(), default_effort=None
+        )
+    efforts = raw.get("supported_efforts")
+    default_effort = raw.get("default_effort")
+    return OpenRouterReasoningCapabilities(
+        supported=supported,
+        mandatory=bool(raw.get("mandatory", False)),
+        supported_efforts=(
+            tuple(e for e in efforts if isinstance(e, str)) if isinstance(efforts, list) else ()
+        ),
+        default_effort=default_effort if isinstance(default_effort, str) else None,
+    )
+
+
 def _parse_model_entry(entry: dict[str, Any]) -> OpenRouterModel | None:
     model_id = entry.get("id")
     if not isinstance(model_id, str):
@@ -122,15 +180,17 @@ def _parse_model_entry(entry: dict[str, Any]) -> OpenRouterModel | None:
     pricing = entry.get("pricing") or {}
     arch = entry.get("architecture") or {}
     context_length = entry.get("context_length")
+    supported_parameters = tuple(p for p in params if isinstance(p, str))
     return OpenRouterModel(
         id=model_id,
         name=entry.get("name") or model_id,
         context_length=int(context_length) if isinstance(context_length, int | float) else None,
-        supported_parameters=tuple(p for p in params if isinstance(p, str)),
+        supported_parameters=supported_parameters,
         prompt_price=_parse_price(pricing.get("prompt")),
         completion_price=_parse_price(pricing.get("completion")),
         input_modalities=_parse_modalities(arch, "input_modalities", 0),
         output_modalities=_parse_modalities(arch, "output_modalities", 1),
+        reasoning=_parse_reasoning(entry, supported_parameters),
     )
 
 
@@ -218,6 +278,8 @@ class OpenRouterProvider(OpenAIProvider):
         app_url: str | None = None,
         app_name: str | None = None,
         require_native_tools: bool = True,
+        thinking: bool | None = None,
+        effort: str | None = None,
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -236,6 +298,20 @@ class OpenRouterProvider(OpenAIProvider):
                 whose catalog metadata lacks native tool support raises instead
                 of silently returning text that ignores the tools. Set False to
                 downgrade to a warning.
+            thinking: Reasoning on/off. ``False`` sends ``reasoning={"enabled":
+                False}`` — OpenRouter's disable directive (not ``exclude``,
+                which still bills reasoning). Yields zero reasoning tokens on
+                upstreams that honor it; some Qwen3 hosts ignore the toggle, so
+                pin a compliant upstream via ``extra_body`` when a hard zero is
+                required. ``True`` enables reasoning (with ``effort`` if given,
+                else the model default). ``None`` (default) leaves the request
+                untouched. Overridable per call. On a model whose catalog
+                metadata marks reasoning ``mandatory``, ``thinking=False`` raises.
+            effort: Reasoning effort — the cross-vendor knob (``low``/``medium``/
+                ``high``/``xhigh``; ``"extra"``→``xhigh``). OpenRouter also
+                accepts ``minimal`` and ``none``. Sent as ``reasoning={"effort":
+                ...}``; OpenRouter cross-converts effort↔max_tokens, so it works
+                on budget-based models too. Overridable per call.
             extra_body: Extra JSON fields for the request body. Merged with the
                 default ``provider`` routing block; keys you set win, and your
                 ``provider`` entries merge over ``require_parameters=True``.
@@ -276,6 +352,12 @@ class OpenRouterProvider(OpenAIProvider):
             **kwargs,
         )
         self._require_native_tools = require_native_tools
+        # Reasoning defaults (overridable per call). Named to avoid colliding
+        # with OpenAIProvider's own `_effort`/`_reasoning_effort`, which drive
+        # the `reasoning_effort` top-level param — OpenRouter instead routes
+        # reasoning through its unified `reasoning` request block.
+        self._default_thinking = thinking
+        self._default_effort = effort
         self._models_url = base_url.rstrip("/") + "/models"
         self._tools_verified: set[str] = set()
         self._tool_warnings_emitted: set[tuple[str, str]] = set()
@@ -374,6 +456,84 @@ class OpenRouterProvider(OpenAIProvider):
             raise ValueError(message)
         self._warn_once(model, "no-native-tools", message)
 
+    @staticmethod
+    def _reasoning_block(thinking: bool | None, effort: str | None) -> dict[str, Any] | None:
+        """Build OpenRouter's ``reasoning`` request block, or None to omit it.
+
+        ``thinking=False`` wins and sends ``{"enabled": False}`` — OpenRouter's
+        standard disable directive, and the one to prefer (verified live:
+        ``effort="none"`` does *not* disable on Qwen3, and ``exclude`` still
+        bills reasoning, just hides it). Whether it yields zero reasoning
+        tokens depends on the model's upstream honoring it — some (e.g. certain
+        Qwen3 hosts) ignore the toggle; pin a compliant upstream via
+        ``extra_body={"provider": {...}}`` when a hard zero is required.
+        Otherwise an explicit ``effort`` is used, then a bare ``thinking=True``
+        enables the model default. When nothing is set, the request is
+        untouched.
+        """
+        if thinking is False:
+            return {"enabled": False}
+        if effort is not None:
+            return {"effort": _normalize_effort(effort)}
+        if thinking is True:
+            return {"enabled": True}
+        return None
+
+    def _resolve_reasoning(
+        self, kwargs: dict[str, Any]
+    ) -> tuple[bool | None, dict[str, Any] | None]:
+        """Pop per-call ``thinking``/``effort`` (over constructor defaults) and
+        build the reasoning block. Popping keeps them from reaching the base
+        provider, which would otherwise route them to ``reasoning_effort``."""
+        thinking = kwargs.pop("thinking", self._default_thinking)
+        effort = kwargs.pop("effort", self._default_effort)
+        return thinking, self._reasoning_block(thinking, effort)
+
+    async def _ensure_reasoning_allowed(self, model: str, thinking: bool | None) -> None:
+        """Refuse ``thinking=False`` on a model that mandates reasoning.
+
+        Keyed on catalog metadata like the native-tools guard; a metadata
+        hiccup degrades to a warning rather than a broken run.
+        """
+        if thinking is not False:
+            return
+        catalog = await _get_catalog(self._models_url)
+        if catalog is None:
+            self._warn_once(
+                model,
+                "reasoning-catalog-unavailable",
+                f"OpenRouter model catalog unavailable — cannot verify whether "
+                f"{model!r} allows disabling reasoning. Proceeding.",
+            )
+            return
+        entry = catalog.get(model)
+        if entry is None:
+            self._warn_once(
+                model,
+                "reasoning-unknown-model",
+                f"Model {model!r} not found in the OpenRouter catalog — cannot verify "
+                f"whether reasoning can be disabled. Proceeding.",
+            )
+            return
+        if entry.reasoning.mandatory:
+            raise ValueError(
+                f"Model {model!r} (via OpenRouter) has mandatory reasoning — it cannot "
+                f"be turned off, so thinking=False is invalid. Check "
+                f"OpenRouterModel.reasoning.mandatory to hide the Off option in your UI, "
+                f"or omit thinking to use the model's reasoning."
+            )
+
+    @staticmethod
+    def _apply_reasoning(kwargs: dict[str, Any], reasoning: dict[str, Any] | None) -> None:
+        """Merge the reasoning block into per-call ``extra_body`` (ours wins).
+
+        Sits alongside the constructor ``provider`` routing block, which the
+        base provider merges separately — different key, no clobber.
+        """
+        if reasoning is None:
+            return
+        kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "reasoning": reasoning}
+
     def _normalize_usage(self, usage: Any) -> UsageStats:
         """Enrich base usage with OpenRouter's cost and cache-write fields.
 
@@ -415,8 +575,11 @@ class OpenRouterProvider(OpenAIProvider):
     ) -> LLMResponse:
         """Send messages via OpenRouter; guards native tool support when tools are passed."""
         model = self._require_model(kwargs)
+        thinking, reasoning = self._resolve_reasoning(kwargs)
         if tools:
             await self._ensure_native_tool_support(model)
+        await self._ensure_reasoning_allowed(model, thinking)
+        self._apply_reasoning(kwargs, reasoning)
         return await super().complete(
             messages,
             tools,
@@ -438,8 +601,11 @@ class OpenRouterProvider(OpenAIProvider):
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream via OpenRouter; guards native tool support when tools are passed."""
         model = self._require_model(kwargs)
+        thinking, reasoning = self._resolve_reasoning(kwargs)
         if tools:
             await self._ensure_native_tool_support(model)
+        await self._ensure_reasoning_allowed(model, thinking)
+        self._apply_reasoning(kwargs, reasoning)
         async for event in super().complete_stream(
             messages,
             tools,

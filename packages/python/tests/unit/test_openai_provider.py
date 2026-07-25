@@ -1346,3 +1346,146 @@ class TestReasoning:
     def test_bc_no_reasoning_tokens_when_absent(self, provider: OpenAIProvider) -> None:
         resp = FakeChatCompletion(choices=[FakeChoice(message=FakeMessage(content="hi"))])
         assert provider._normalize_response(resp).usage.reasoning_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# Reasoning content capture (OpenRouter/compatible extras on the OpenAI wire)
+# ---------------------------------------------------------------------------
+@dataclass
+class _RMsg:
+    content: str | None = "answer"
+    tool_calls: Any = None
+    reasoning: str | None = None
+    reasoning_details: Any = None
+
+
+@dataclass
+class _RChoice:
+    message: _RMsg = field(default_factory=_RMsg)
+    index: int = 0
+    finish_reason: str = "stop"
+
+
+@dataclass
+class _RCompletion:
+    choices: list[Any] = field(default_factory=lambda: [_RChoice()])
+    usage: Any = None
+
+    def model_dump(self) -> dict[str, Any]:
+        return {"fake": True}
+
+
+@dataclass
+class _RDelta:
+    content: str | None = None
+    tool_calls: Any = None
+    reasoning: str | None = None
+    reasoning_details: Any = None
+
+
+class TestReasoningCapture:
+    """message.reasoning / reasoning_details -> LLMResponse fields.
+
+    Inert for pure OpenAI (returns neither); exercised by OpenRouter, which
+    rides this same transport.
+    """
+
+    def test_non_streaming_captures_text_and_blocks(self, provider: OpenAIProvider) -> None:
+        blocks = [{"type": "reasoning.text", "text": "step 1", "id": "r1"}]
+        comp = _RCompletion(
+            choices=[
+                _RChoice(
+                    message=_RMsg(content="42", reasoning="thinking", reasoning_details=blocks)
+                )
+            ]
+        )
+        r = provider._normalize_response(comp)
+        assert r.reasoning == "thinking"
+        assert r.reasoning_blocks == blocks
+
+    def test_non_streaming_absent_reasoning_is_none(self, provider: OpenAIProvider) -> None:
+        r = provider._normalize_response(
+            _RCompletion(choices=[_RChoice(message=_RMsg(content="42"))])
+        )
+        assert r.reasoning is None
+        assert r.reasoning_blocks is None
+
+    def test_reasoning_content_alias(self, provider: OpenAIProvider) -> None:
+        """`reasoning_content` is accepted as an alias for `reasoning`."""
+        msg = _RMsg(content="42")
+        # Only the alias present (no `reasoning`); set it explicitly to empty.
+        msg.reasoning = None
+        object.__setattr__(msg, "reasoning_content", "via alias")
+        r = provider._normalize_response(_RCompletion(choices=[_RChoice(message=msg)]))
+        assert r.reasoning == "via alias"
+
+    def test_empty_reasoning_string_is_none(self, provider: OpenAIProvider) -> None:
+        r = provider._normalize_response(
+            _RCompletion(choices=[_RChoice(message=_RMsg(content="42", reasoning=""))])
+        )
+        assert r.reasoning is None
+
+    async def test_streaming_emits_reasoning_deltas_and_final(
+        self, provider: OpenAIProvider
+    ) -> None:
+        chunks = [
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(reasoning="I think "))]),
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(reasoning="therefore "))]),
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(content="answer"))]),
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(), finish_reason="stop")]),
+            FakeChunk(
+                choices=[],
+                usage=FakeChunkUsage(prompt_tokens=5, completion_tokens=2, total_tokens=7),
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=MockAsyncStream(chunks))
+        events = []
+        async for event in provider.complete_stream([Message(role=Role.USER, content="hi")]):
+            events.append(event)
+        deltas = [e for e in events if e.type == StreamEventType.REASONING_DELTA]
+        assert "".join(e.text for e in deltas) == "I think therefore "
+        done = next(e for e in events if e.type == StreamEventType.DONE)
+        assert done.raw.reasoning == "I think therefore "
+        assert done.raw.text == "answer"
+
+    async def test_streaming_accumulates_reasoning_blocks(self, provider: OpenAIProvider) -> None:
+        b1 = [{"type": "reasoning.encrypted", "data": "a"}]
+        b2 = [{"type": "reasoning.encrypted", "data": "b"}]
+        chunks = [
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(reasoning_details=b1))]),
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(reasoning_details=b2))]),
+            FakeChunk(choices=[FakeStreamChoice(delta=_RDelta(content="x"), finish_reason="stop")]),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=MockAsyncStream(chunks))
+        done = None
+        async for event in provider.complete_stream([Message(role=Role.USER, content="hi")]):
+            if event.type == StreamEventType.DONE:
+                done = event
+        assert done is not None
+        assert done.raw.reasoning_blocks == b1 + b2
+
+
+class TestReasoningReplay:
+    """Message.reasoning_blocks -> assistant `reasoning_details` on the wire."""
+
+    def test_tool_call_assistant_replays_reasoning_details(self, provider: OpenAIProvider) -> None:
+        blocks = [{"type": "reasoning.text", "text": "why", "id": "r1"}]
+        tc = ToolCall(name="add", params={"a": 1}, provider_tool_call_id="call_1")
+        msgs = [
+            Message(role=Role.USER, content="add"),
+            Message(role=Role.ASSISTANT, content="", tool_calls=[tc], reasoning_blocks=blocks),
+        ]
+        out = provider._convert_messages(msgs)
+        assert out[1]["reasoning_details"] == blocks
+        assert out[1]["tool_calls"][0]["function"]["name"] == "add"
+
+    def test_plain_assistant_replays_reasoning_details(self, provider: OpenAIProvider) -> None:
+        blocks = [{"type": "reasoning.text", "text": "x"}]
+        out = provider._convert_messages(
+            [Message(role=Role.ASSISTANT, content="ans", reasoning_blocks=blocks)]
+        )
+        assert out[0]["reasoning_details"] == blocks
+
+    def test_no_reasoning_blocks_no_details_key(self, provider: OpenAIProvider) -> None:
+        out = provider._convert_messages([Message(role=Role.ASSISTANT, content="ans")])
+        assert "reasoning_details" not in out[0]

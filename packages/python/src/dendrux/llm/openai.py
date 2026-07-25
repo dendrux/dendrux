@@ -73,6 +73,44 @@ def _reasoning_tokens_from(details: Any) -> int | None:
     return None
 
 
+def _extra_attr(obj: Any, field: str) -> Any:
+    """Read a field that may live in a Pydantic model's ``model_extra``.
+
+    OpenAI-compatible backends (notably OpenRouter) return reasoning fields
+    the OpenAI schema doesn't define; ``extra='allow'`` keeps them, reachable
+    via attribute access or ``model_extra``. Pure OpenAI returns none of them,
+    so every reader below is inert there.
+    """
+    value = getattr(obj, field, None)
+    if value is not None:
+        return value
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(field)
+    return None
+
+
+def _reasoning_text_from(obj: Any) -> str | None:
+    """Reasoning summary text from a message or stream delta.
+
+    OpenRouter surfaces it as ``reasoning`` (``reasoning_content`` is an
+    accepted alias). Empty strings collapse to ``None`` so "no text exposed"
+    stays distinct from "reasoning happened" (which ``reasoning_tokens`` marks).
+    """
+    for field in ("reasoning", "reasoning_content"):
+        value = _extra_attr(obj, field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _reasoning_details_from(obj: Any) -> list[Any] | None:
+    """Opaque reasoning artifacts (``reasoning_details``) to replay verbatim
+    across tool-call iterations, per OpenRouter's guidance."""
+    value = _extra_attr(obj, "reasoning_details")
+    return value if isinstance(value, list) and value else None
+
+
 def _build_usage_with_cache(usage: Any) -> UsageStats:
     """Build UsageStats from an OpenAI Chat Completions usage object.
 
@@ -474,6 +512,8 @@ class OpenAIProvider(LLMProvider):
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        reasoning_parts: list[str] = []
+        reasoning_block_acc: list[Any] = []
         usage = UsageStats()
         finish_reason: str | None = None
 
@@ -492,6 +532,16 @@ class OpenAIProvider(LLMProvider):
 
             choice = chunk.choices[0]
             delta = choice.delta
+
+            # --- Reasoning deltas (OpenRouter/compatible; inert on pure OpenAI) ---
+            # Reasoning streams before content, so emit it first.
+            reasoning_delta = _reasoning_text_from(delta)
+            if reasoning_delta:
+                reasoning_parts.append(reasoning_delta)
+                yield StreamEvent(type=StreamEventType.REASONING_DELTA, text=reasoning_delta)
+            reasoning_detail_delta = _reasoning_details_from(delta)
+            if reasoning_detail_delta:
+                reasoning_block_acc.extend(reasoning_detail_delta)
 
             # --- Text deltas ---
             if delta.content:
@@ -585,6 +635,8 @@ class OpenAIProvider(LLMProvider):
             tool_calls=tool_calls if tool_calls else None,
             raw=None,
             usage=usage,
+            reasoning="".join(reasoning_parts) if reasoning_parts else None,
+            reasoning_blocks=reasoning_block_acc if reasoning_block_acc else None,
         )
         llm_response.provider_request = captured_request
         llm_response.model = captured_request["model"]
@@ -640,9 +692,14 @@ class OpenAIProvider(LLMProvider):
                         }
                         for tc in msg.tool_calls
                     ]
-                    api_messages.append(api_msg)
                 else:
-                    api_messages.append({"role": "assistant", "content": msg.content})
+                    api_msg = {"role": "assistant", "content": msg.content}
+                # Replay provider reasoning artifacts verbatim so multi-step
+                # tool calls keep the model's reasoning context, per OpenRouter's
+                # guidance. Inert for pure OpenAI, which never populates these.
+                if msg.reasoning_blocks:
+                    api_msg["reasoning_details"] = msg.reasoning_blocks
+                api_messages.append(api_msg)
 
             elif msg.role == Role.TOOL:
                 original_call = resolve_tool_message_call(msg, call_index)
@@ -726,4 +783,6 @@ class OpenAIProvider(LLMProvider):
             tool_calls=tool_calls,
             raw=response,
             usage=usage,
+            reasoning=_reasoning_text_from(message),
+            reasoning_blocks=_reasoning_details_from(message),
         )
