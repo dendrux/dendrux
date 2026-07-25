@@ -485,7 +485,7 @@ class OpenAIProvider(LLMProvider):
         async for chunk in stream:
             # Usage arrives in the final chunk
             if chunk.usage:
-                usage = _build_usage_with_cache(chunk.usage)
+                usage = self._normalize_usage(chunk.usage)
 
             if not chunk.choices:
                 continue
@@ -675,6 +675,17 @@ class OpenAIProvider(LLMProvider):
     # Inbound conversions: OpenAI → Dendrux
     # ------------------------------------------------------------------
 
+    def _normalize_usage(self, usage: Any) -> UsageStats:
+        """Map a provider usage object to :class:`UsageStats`.
+
+        Overridable seam for OpenAI-compatible presets that return extra
+        usage fields on the same wire format (e.g. OpenRouter's ``cost`` and
+        ``cache_write_tokens``). The base implementation covers the standard
+        Chat Completions usage shape; both the streaming and non-streaming
+        paths route through here so an override enriches both at once.
+        """
+        return _build_usage_with_cache(usage)
+
     def _normalize_response(self, response: Any) -> LLMResponse:
         """Convert OpenAI ChatCompletion to Dendrux LLMResponse."""
         if not response.choices:
@@ -708,7 +719,7 @@ class OpenAIProvider(LLMProvider):
         # Extract usage
         usage = UsageStats()
         if response.usage:
-            usage = _build_usage_with_cache(response.usage)
+            usage = self._normalize_usage(response.usage)
 
         return LLMResponse(
             text=text,
