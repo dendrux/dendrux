@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from dendrux.agent import Agent
 from dendrux.tool import tool
@@ -178,26 +179,19 @@ class TestResultNormalization:
         content: list[Any] | None = None,
         is_error: bool = False,
         structured_content: dict[str, Any] | None = None,
-    ) -> MagicMock:
-        """Create a mock CallToolResult."""
-        result = MagicMock()
-        result.isError = is_error
-        result.structuredContent = structured_content
-        if content is None:
-            content = []
-        result.content = content
-        return result
+    ) -> CallToolResult:
+        """Create a real SDK v2 CallToolResult."""
+        return CallToolResult(
+            isError=is_error,
+            structuredContent=structured_content,
+            content=content or [],
+        )
 
-    def _make_text_content(self, text: str) -> MagicMock:
-        block = MagicMock()
-        block.type = "text"
-        block.text = text
-        return block
+    def _make_text_content(self, text: str) -> TextContent:
+        return TextContent(text=text)
 
-    def _make_image_content(self) -> MagicMock:
-        block = MagicMock()
-        block.type = "image"
-        return block
+    def _make_image_content(self) -> ImageContent:
+        return ImageContent(data="aW1hZ2U=", mimeType="image/png")
 
     def test_text_content(self) -> None:
         from dendrux.mcp._server import _normalize_mcp_result
@@ -219,13 +213,20 @@ class TestResultNormalization:
         result = self._make_result(content=[])
         assert _normalize_mcp_result(result) == ""
 
-    def test_unsupported_content_type(self) -> None:
+    def test_non_text_content_is_preserved(self) -> None:
         from dendrux.mcp._server import _normalize_mcp_result
 
         result = self._make_result(content=[self._make_image_content()])
         normalized = _normalize_mcp_result(result)
-        assert "unsupported content type" in normalized
-        assert "image" in normalized
+        assert normalized == {
+            "content": [
+                {
+                    "type": "image",
+                    "data": "aW1hZ2U=",
+                    "mimeType": "image/png",
+                }
+            ]
+        }
 
     def test_structured_content_preferred(self) -> None:
         """structuredContent takes priority over text blocks."""

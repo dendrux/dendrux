@@ -171,20 +171,37 @@ async def _emit_init_events(
         except Exception as exc:
             raise _MCPDiscoveryError(str(exc)) from exc
 
-        # Initialize from all sources so zero-tool sources still get events
+        # Initialize from all sources so zero-tool and failed optional sources
+        # still produce explicit, auditable events.
         source_tools: dict[str, list[str]] = {src.name: [] for src in agent._tool_sources}
         for td in agent._discovered_tool_defs or []:
             src = td.meta.get("source_name", "unknown")
             source_tools.setdefault(src, []).append(td.name)
 
-        for source_name, tool_names in source_tools.items():
+        for source in agent._tool_sources:
+            source_error = getattr(source, "last_error", None)
+            if isinstance(source_error, str) and source_error:
+                await _emit_init_governance_event(
+                    recorder,
+                    notifier,
+                    run_id,
+                    GovernanceEventType.MCP_ERROR,
+                    {
+                        "source_name": source.name,
+                        "error": source_error,
+                        "failure_mode": getattr(source, "failure_mode", "strict"),
+                    },
+                )
+                continue
+
+            tool_names = source_tools[source.name]
             await _emit_init_governance_event(
                 recorder,
                 notifier,
                 run_id,
                 GovernanceEventType.MCP_CONNECTED,
                 {
-                    "source_name": source_name,
+                    "source_name": source.name,
                     "tool_count": len(tool_names),
                     "tool_names": tool_names,
                 },

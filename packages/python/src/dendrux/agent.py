@@ -43,7 +43,9 @@ if TYPE_CHECKING:
     from dendrux.guardrails._protocol import Guardrail
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
+    from dendrux.mcp._host import MCPHost
     from dendrux.mcp._server import MCPServer
+    from dendrux.mcp._source import MCPSource
     from dendrux.runtime.state import StateStore
     from dendrux.skills._loader import Skill
     from dendrux.tools import ToolLookups
@@ -194,7 +196,7 @@ class Agent:
         prompt: str,
         name: str = ...,
         tools: list[Callable[..., Any]] = ...,
-        tool_sources: list[MCPServer] | None = ...,
+        tool_sources: list[MCPServer | MCPSource | MCPHost] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
@@ -219,7 +221,7 @@ class Agent:
         name: str = ...,
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
-        tool_sources: list[MCPServer] | None = ...,
+        tool_sources: list[MCPServer | MCPSource | MCPHost] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
@@ -242,7 +244,7 @@ class Agent:
         name: str | _UnsetType = _UNSET,
         prompt: str | _UnsetType = _UNSET,
         tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
-        tool_sources: list[MCPServer] | None = None,
+        tool_sources: list[MCPServer | MCPSource | MCPHost] | None = None,
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         loop: Loop | None = None,
@@ -326,16 +328,30 @@ class Agent:
         self._private_engine: AsyncEngine | None = None
 
         # --- MCP tool sources ---
-        self._tool_sources: list[MCPServer] = list(tool_sources) if tool_sources else []
-        if self._tool_sources:
+        self._tool_sources: list[MCPServer] = []
+        if tool_sources:
+            from dendrux.mcp._host import MCPHost as _MCPHost
             from dendrux.mcp._server import MCPServer as _MCPServer
+            from dendrux.mcp._source import MCPSource as _MCPSource
 
             seen_names: set[str] = set()
-            for i, src in enumerate(self._tool_sources):
-                if not isinstance(src, _MCPServer):
+            expanded_sources: list[MCPServer | MCPSource] = []
+            for configured_source in tool_sources:
+                if isinstance(configured_source, _MCPHost):
+                    expanded_sources.extend(configured_source.tool_sources)
+                else:
+                    expanded_sources.append(configured_source)
+
+            for i, configured_source in enumerate(expanded_sources):
+                if isinstance(configured_source, _MCPSource):
+                    src = _MCPServer.from_source(configured_source)
+                elif isinstance(configured_source, _MCPServer):
+                    src = configured_source
+                else:
                     raise ValueError(
-                        f"Agent '{self.name}' tool_sources[{i}] is {type(src).__name__}, "
-                        f"not an MCPServer instance. Use MCPServer(name, url=... | command=[...])."
+                        f"Agent '{self.name}' tool_sources[{i}] is "
+                        f"{type(configured_source).__name__}, not an MCPServer, MCPSource, "
+                        "or MCPHost instance. Use MCPSource.http(...) or MCPSource.stdio(...)."
                     )
                 if src.name in seen_names:
                     raise ValueError(
@@ -343,6 +359,7 @@ class Agent:
                         f"Each MCP source must have a unique name."
                     )
                 seen_names.add(src.name)
+                self._tool_sources.append(src)
         self._discovered_tool_defs: list[ToolDef] | None = None
         self._mcp_executors: dict[str, Callable[..., Any]] | None = None
         self._discovery_lock = asyncio.Lock()
@@ -1542,7 +1559,17 @@ class Agent:
 
             try:
                 for source in self._tool_sources:
-                    tool_defs = await source._discover()
+                    try:
+                        tool_defs = await source._discover()
+                    except Exception:
+                        if getattr(source, "failure_mode", "strict") != "best_effort":
+                            raise
+                        _agent_logger.warning(
+                            "Optional MCP source '%s' is unavailable; continuing without it",
+                            source.name,
+                            exc_info=True,
+                        )
+                        continue
                     opened_sources.append(source)
                     for td in tool_defs:
                         # Collision check against reserved name
@@ -1840,6 +1867,9 @@ class Agent:
         cancelled). Paused runs are still active. Calling refresh()
         with active or paused runs closes MCP sessions under active
         executors and invalidates the frozen skill context.
+
+        For MCPHost-backed sources this clears only the agent snapshot;
+        call ``host.refresh()`` first to refresh the shared server catalog.
         """
         # Close MCP sessions
         for source in self._tool_sources:
@@ -1866,10 +1896,9 @@ class Agent:
         The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
         owned by this agent and is left untouched.
 
-        When pooling a provider or ``MCPServer`` across many agents/requests,
-        do not call ``close()`` per request (it would close the shared object);
-        let the lightweight agent be garbage-collected and close the pooled
-        objects yourself at shutdown. See the web-endpoint recipe.
+        Use ``MCPHost`` when sharing MCP sources across agents; its leases are
+        safe to close per agent and the host remains application-owned. A
+        directly shared ``MCPServer`` is not safe to close per request.
         """
         for source in self._tool_sources:
             try:
