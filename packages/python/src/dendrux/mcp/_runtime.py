@@ -6,9 +6,11 @@ import math
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from threading import Lock
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
-from dendrux.mcp._source import MCPSource
+from dendrux.mcp._errors import MCPBindingConflictError
+from dendrux.mcp._source import MCPPhysicalIdentity, MCPSource
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -180,11 +182,16 @@ class MCPRuntime:
         self.idle_timeout = _non_negative_float(idle_timeout, "idle_timeout")
         self.shutdown_timeout = _positive_float(shutdown_timeout, "shutdown_timeout")
         self._state = MCPRuntimeState.OPEN
+        # evict() must remove entries here, or an evicted connection key could
+        # never be rebound to a changed endpoint.
+        self._registrations: dict[tuple[str | None, str], MCPPhysicalIdentity] = {}
+        self._lock = Lock()
 
     @property
     def state(self) -> MCPRuntimeState:
         """Return the current application-owned lifecycle state."""
-        return self._state
+        with self._lock:
+            return self._state
 
     def bind(
         self,
@@ -195,33 +202,48 @@ class MCPRuntime:
         credentials: MCPCredentialProvider | None = None,
     ) -> MCPBinding:
         """Create an inert binding without opening an MCP connection."""
-        if self._state is not MCPRuntimeState.OPEN:
-            raise RuntimeError("MCPRuntime is closed and cannot create new bindings.")
-        _validate_identity_key(tenant_key, "tenant", optional=True)
-        _validate_identity_key(connection_key, "connection", optional=False)
-        if not isinstance(source, MCPSource):
-            raise ValueError("MCPRuntime source must be an MCPSource instance.")
-        if credentials is not None and not isinstance(credentials, MCPCredentialProvider):
-            raise ValueError(
-                "MCPRuntime credentials must implement MCPCredentialProvider.get_auth()."
+        with self._lock:
+            if self._state is not MCPRuntimeState.OPEN:
+                raise RuntimeError("MCPRuntime is closed and cannot create new bindings.")
+            _validate_identity_key(tenant_key, "tenant", optional=True)
+            _validate_identity_key(connection_key, "connection", optional=False)
+            if not isinstance(source, MCPSource):
+                raise ValueError("MCPRuntime source must be an MCPSource instance.")
+            if credentials is not None and not isinstance(credentials, MCPCredentialProvider):
+                raise ValueError(
+                    "MCPRuntime credentials must implement MCPCredentialProvider.get_auth()."
+                )
+            _validate_namespace(source.name)
+
+            identity = tenant_key, connection_key
+            physical_identity = source.physical_identity
+            registered_identity = self._registrations.get(identity)
+            if registered_identity is None:
+                self._registrations[identity] = physical_identity
+            elif registered_identity != physical_identity:
+                mismatch: Literal["transport", "endpoint"] = (
+                    "transport" if registered_identity[0] != physical_identity[0] else "endpoint"
+                )
+                raise MCPBindingConflictError(identity, mismatch=mismatch)
+
+            return MCPBinding(
+                runtime=self,
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source=source,
+                namespace=source.name,
+                policy=MCPToolPolicy(),
+                credentials=credentials,
             )
-        _validate_namespace(source.name)
-        return MCPBinding(
-            runtime=self,
-            tenant_key=tenant_key,
-            connection_key=connection_key,
-            source=source,
-            namespace=source.name,
-            policy=MCPToolPolicy(),
-            credentials=credentials,
-        )
 
     async def close(self) -> None:
         """Close the inert runtime contract idempotently."""
-        if self._state is MCPRuntimeState.CLOSED:
-            return
-        self._state = MCPRuntimeState.DRAINING
-        self._state = MCPRuntimeState.CLOSED
+        with self._lock:
+            if self._state is MCPRuntimeState.CLOSED:
+                return
+            self._state = MCPRuntimeState.DRAINING
+            self._registrations.clear()
+            self._state = MCPRuntimeState.CLOSED
 
     async def __aenter__(self) -> MCPRuntime:
         return self

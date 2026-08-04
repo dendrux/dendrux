@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 
 class MCPError(RuntimeError):
     """Base class for Dendrux MCP runtime errors."""
@@ -9,6 +11,23 @@ class MCPError(RuntimeError):
 
 class MCPConnectionError(MCPError):
     """An MCP source could not be connected to or discovered."""
+
+
+class MCPBindingConflictError(MCPError):
+    """A runtime connection identity was rebound to a different target."""
+
+    def __init__(
+        self,
+        identity: tuple[str | None, str],
+        *,
+        mismatch: Literal["transport", "endpoint"],
+    ) -> None:
+        self.identity = identity
+        self.mismatch = mismatch
+        super().__init__(
+            f"MCP binding {identity!r} is already registered for a different "
+            f"physical target ({mismatch} mismatch)."
+        )
 
 
 class MCPToolCallError(MCPError):

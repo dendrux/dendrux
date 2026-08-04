@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 
 import pytest
 
+from dendrux.mcp._errors import MCPBindingConflictError
 from dendrux.mcp._runtime import (
+    MCPBinding,
     MCPCredentialProvider,
     MCPRuntime,
     MCPRuntimeState,
@@ -119,6 +122,108 @@ class TestMCPBindingContracts:
         assert first.identity == ("tenant-a", "github-work")
         assert second.identity == ("tenant-b", "github-work")
         assert first.identity != second.identity
+
+    def test_same_identity_can_create_different_agent_views(self) -> None:
+        runtime = MCPRuntime()
+
+        first = runtime.bind(
+            tenant_key="tenant-a",
+            connection_key="github-work",
+            source=MCPSource.http(
+                "github",
+                "https://mcp.example.com",
+                headers={"Authorization": "Bearer old-token"},
+                allowed_tools=["read_issue"],
+                call_timeout=10.0,
+            ),
+        )
+        second = runtime.bind(
+            tenant_key="tenant-a",
+            connection_key="github-work",
+            source=MCPSource.http(
+                "github_work",
+                "https://mcp.example.com",
+                headers={"Authorization": "Bearer new-token"},
+                allowed_tools=["create_issue"],
+                call_timeout=60.0,
+            ),
+        )
+
+        assert first.identity == second.identity
+        assert first.namespace == "github"
+        assert second.namespace == "github_work"
+
+    @pytest.mark.parametrize(
+        "conflicting_source",
+        [
+            MCPSource.http("github", "https://other.example.com"),
+            MCPSource.stdio("github", ["github-mcp", "serve"]),
+        ],
+    )
+    def test_same_identity_rejects_a_different_physical_target(
+        self,
+        conflicting_source: MCPSource,
+    ) -> None:
+        runtime = MCPRuntime()
+        runtime.bind(
+            tenant_key="tenant-a",
+            connection_key="github-work",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+        )
+
+        with pytest.raises(MCPBindingConflictError, match="different physical target") as caught:
+            runtime.bind(
+                tenant_key="tenant-a",
+                connection_key="github-work",
+                source=conflicting_source,
+            )
+
+        assert caught.value.identity == ("tenant-a", "github-work")
+
+    def test_tenants_can_reuse_connection_keys_for_different_targets(self) -> None:
+        runtime = MCPRuntime()
+
+        first = runtime.bind(
+            tenant_key="tenant-a",
+            connection_key="github",
+            source=MCPSource.http("github", "https://one.example.com"),
+        )
+        second = runtime.bind(
+            tenant_key="tenant-b",
+            connection_key="github",
+            source=MCPSource.http("github", "https://two.example.com"),
+        )
+
+        assert first.identity != second.identity
+
+    def test_concurrent_conflicting_binds_register_only_one_target(self) -> None:
+        runtime = MCPRuntime()
+        sources = (
+            MCPSource.http("github", "https://one.example.com"),
+            MCPSource.http("github", "https://two.example.com"),
+        )
+
+        def bind(source: MCPSource) -> object:
+            try:
+                return runtime.bind(connection_key="github", source=source)
+            except MCPBindingConflictError as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(bind, sources))
+
+        assert sum(isinstance(result, MCPBindingConflictError) for result in results) == 1
+        winning_binding = next(
+            result for result in results if not isinstance(result, MCPBindingConflictError)
+        )
+        assert isinstance(winning_binding, MCPBinding)
+        assert (
+            runtime.bind(
+                connection_key="github",
+                source=winning_binding.source,
+            ).source.physical_identity
+            == winning_binding.source.physical_identity
+        )
 
     @pytest.mark.parametrize(
         ("tenant_key", "connection_key"),

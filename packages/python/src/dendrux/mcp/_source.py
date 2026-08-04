@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 MCPFailureMode = Literal["strict", "best_effort"]
+MCPPhysicalIdentity = (
+    tuple[Literal["http"], str] | tuple[Literal["stdio"], tuple[str, ...], Path | None]
+)
 
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -33,10 +36,10 @@ def _copy_string_mapping(value: Mapping[str, str] | None, field_name: str) -> Ma
 class MCPSource:
     """Configuration for one remote or subprocess MCP server.
 
-    Prefer :meth:`http` and :meth:`stdio` for construction. This object is
-    immutable so it can later be used safely as part of a connection-pool key.
-    Authentication objects are passed through to ``httpx2.AsyncClient`` by the
-    official MCP SDK adapter.
+    Prefer :meth:`http` and :meth:`stdio` for construction. The object is
+    immutable configuration; use :attr:`physical_identity` when comparing
+    connection targets. Authentication objects are passed through to
+    ``httpx2.AsyncClient`` by the official MCP SDK adapter.
     """
 
     name: str
@@ -165,3 +168,11 @@ class MCPSource:
     @property
     def transport(self) -> Literal["http", "stdio"]:
         return "http" if self.url is not None else "stdio"
+
+    @property
+    def physical_identity(self) -> MCPPhysicalIdentity:
+        """Return the hashable transport target, excluding policy and credentials."""
+        if self.url is not None:
+            return "http", self.url
+        assert self.command is not None
+        return "stdio", self.command, self.cwd

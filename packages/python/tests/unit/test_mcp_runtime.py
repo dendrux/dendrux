@@ -78,6 +78,71 @@ class TestMCPSource:
         assert source.command == ("server", "--root", "/workspace")
         assert source.env == {"LOG_LEVEL": "warning"}
 
+    def test_http_physical_identity_contains_only_the_connection_target(self) -> None:
+        first = MCPSource.http(
+            "github_personal",
+            "https://mcp.example.com/github",
+            headers={"Authorization": "Bearer old-token"},
+            auth=object(),
+            connect_timeout=10.0,
+            call_timeout=20.0,
+            max_result_bytes=100,
+            allowed_tools=["read_issue"],
+            failure_mode="best_effort",
+        )
+        second = MCPSource.http(
+            "github_work",
+            "https://mcp.example.com/github",
+            headers={"Authorization": "Bearer new-token"},
+            auth=object(),
+            connect_timeout=30.0,
+            call_timeout=60.0,
+            max_result_bytes=200,
+            allowed_tools=["create_issue"],
+        )
+
+        assert first.physical_identity == ("http", "https://mcp.example.com/github")
+        assert first.physical_identity == second.physical_identity
+        assert hash(first.physical_identity) == hash(second.physical_identity)
+
+    def test_stdio_physical_identity_excludes_environment_and_policy(self) -> None:
+        first = MCPSource.stdio(
+            "github_personal",
+            ["github-mcp", "serve"],
+            cwd="/workspace",
+            env={"GITHUB_TOKEN": "old-token"},
+            allowed_tools=["read_issue"],
+        )
+        second = MCPSource.stdio(
+            "github_work",
+            ["github-mcp", "serve"],
+            cwd="/workspace",
+            env={"GITHUB_TOKEN": "new-token"},
+            allowed_tools=["create_issue"],
+        )
+
+        assert first.physical_identity == (
+            "stdio",
+            ("github-mcp", "serve"),
+            Path("/workspace"),
+        )
+        assert first.physical_identity == second.physical_identity
+        assert hash(first.physical_identity) == hash(second.physical_identity)
+
+    def test_physical_identity_changes_with_the_connection_target(self) -> None:
+        assert (
+            MCPSource.http("one", "https://one.example.com").physical_identity
+            != MCPSource.http("two", "https://two.example.com").physical_identity
+        )
+        assert (
+            MCPSource.stdio("one", ["server", "one"]).physical_identity
+            != MCPSource.stdio("two", ["server", "two"]).physical_identity
+        )
+        assert (
+            MCPSource.stdio("one", ["server"], cwd="/one").physical_identity
+            != MCPSource.stdio("two", ["server"], cwd="/two").physical_identity
+        )
+
     def test_transport_specific_options_are_rejected(self) -> None:
         with pytest.raises(ValueError, match="only valid for HTTP"):
             MCPSource(
