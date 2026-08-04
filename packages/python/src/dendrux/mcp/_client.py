@@ -92,8 +92,9 @@ class MCPClientAdapter:
             await stack.aclose()
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            detail = str(exc) or type(exc).__name__
             raise MCPConnectionError(
-                f"Failed to connect to MCP source '{self.source.name}': {exc}"
+                f"Failed to connect to MCP source '{self.source.name}': {detail}"
             ) from exc
 
     async def list_tools(self) -> list[Any]:
