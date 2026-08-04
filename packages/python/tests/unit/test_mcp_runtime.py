@@ -115,9 +115,7 @@ class TestMCPToolAdaptation:
             assert tool_defs[0].meta["server_name"] == "dendrux-test-server"
 
             executor = server._create_executor("echo")
-            assert await executor(message="hello through MCP") == {
-                "result": "hello through MCP"
-            }
+            assert await executor(message="hello through MCP") == {"result": "hello through MCP"}
         finally:
             await server.close()
 

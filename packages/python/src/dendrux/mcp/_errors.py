@@ -17,4 +17,3 @@ class MCPToolCallError(MCPError):
 
 class MCPResultTooLargeError(MCPError):
     """An MCP result exceeded the configured output boundary."""
-

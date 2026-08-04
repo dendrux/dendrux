@@ -17,15 +17,12 @@ MCPFailureMode = Literal["strict", "best_effort"]
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
-def _copy_string_mapping(
-    value: Mapping[str, str] | None, field_name: str
-) -> Mapping[str, str]:
+def _copy_string_mapping(value: Mapping[str, str] | None, field_name: str) -> Mapping[str, str]:
     copied = dict(value or {})
     if not all(isinstance(key, str) and isinstance(item, str) for key, item in copied.items()):
         raise ValueError(f"MCPSource {field_name} must contain only string keys and values.")
     has_newline = any(
-        "\r" in key or "\n" in key or "\r" in item or "\n" in item
-        for key, item in copied.items()
+        "\r" in key or "\n" in key or "\r" in item or "\n" in item for key, item in copied.items()
     )
     if has_newline:
         raise ValueError(f"MCPSource {field_name} cannot contain newline characters.")

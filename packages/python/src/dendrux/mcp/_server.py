@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._errors import MCPToolCallError
@@ -45,7 +45,10 @@ def _normalize_mcp_result(result: Any, *, max_result_bytes: int = 1_000_000) -> 
 def _annotation_dict(annotations: Any) -> dict[str, Any] | None:
     if annotations is None:
         return None
-    return annotations.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return cast(
+        "dict[str, Any]",
+        annotations.model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
 
 
 def _tool_is_parallel_safe(annotations: Any) -> bool:
@@ -139,8 +142,7 @@ class MCPServer:
         """Connect once, discover all allowed tools, and adapt them to ToolDef."""
         if self._client is not None or self._session is not None:
             raise RuntimeError(
-                f"MCPServer '{self.name}' is already connected. "
-                "Call close() before re-discovering."
+                f"MCPServer '{self.name}' is already connected. Call close() before re-discovering."
             )
 
         adapter = MCPClientAdapter(self.source)
