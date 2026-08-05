@@ -1642,3 +1642,348 @@ class TestDoubleFailurePaths:
         # rather than blocking on a waiter that no one will ever set.
         assert await runtime._wait_for_quiet(expired, lambda: False) is False
         assert runtime._drain_waiters == set()
+
+
+async def _wait_until(predicate: Any, *, timeout: float = 1.0) -> None:
+    """Poll until predicate() is true, or fail the test."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition was never reached")
+
+
+class TestIdleRetirement:
+    """Idle retirement closes the socket but keeps the identity bindable.
+
+    Unlike eviction, the registration and generation survive, so the same
+    MCPConnection handle transparently reconnects on next use.
+    """
+
+    @pytest.mark.asyncio
+    async def test_idle_connection_is_closed_after_its_timeout(self) -> None:
+        async with MCPRuntime(idle_timeout=0.05, shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            await agent.close()
+            assert adapter.closed is False  # still warm immediately after release
+
+            await _wait_until(lambda: adapter.closed)
+            assert runtime._entries == {}
+
+    @pytest.mark.asyncio
+    async def test_the_same_handle_reconnects_after_retirement(self) -> None:
+        async with MCPRuntime(idle_timeout=0.05, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            await first.get_tool_lookups()
+            await first.close()
+            await _wait_until(lambda: _InstrumentedAdapter.instances[0].closed)
+
+            # The registration survived: no rebind, no stale-handle error.
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            lookups = await second.get_tool_lookups()
+
+            assert sorted(lookups.fn) == ["github__read", "github__write"]
+            assert await lookups.fn["github__read"](value=1) == "read:ok"
+            assert len(_InstrumentedAdapter.instances) == 2
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_a_new_lease_cancels_pending_retirement(self) -> None:
+        async with MCPRuntime(idle_timeout=0.2, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            await first.get_tool_lookups()
+            await first.close()
+
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            await second.get_tool_lookups()
+            await asyncio.sleep(0.3)  # well past the original idle deadline
+
+            adapter = _InstrumentedAdapter.instances[0]
+            assert adapter.closed is False
+            assert len(_InstrumentedAdapter.instances) == 1
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_an_in_flight_call_defers_retirement(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        async with MCPRuntime(idle_timeout=0.05, shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            call = asyncio.create_task(lookups.fn["github__write"](value="running"))
+            await _await_first_call(adapter)
+            await agent.close()  # lease released, call still running
+            await asyncio.sleep(0.15)
+
+            assert adapter.closed is False  # never closed under a live call
+
+            _InstrumentedAdapter.call_gate.set()
+            assert await call == "write:ok"
+            await _wait_until(lambda: adapter.closed)
+
+    @pytest.mark.asyncio
+    async def test_zero_idle_timeout_retires_immediately(self) -> None:
+        async with MCPRuntime(idle_timeout=0, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+
+            await _wait_until(lambda: _InstrumentedAdapter.instances[0].closed)
+
+            # Still reusable: retirement is not eviction.
+            reused = Agent(prompt="reused", tool_sources=[connection.tools()])
+            await reused.get_tool_lookups()
+            assert len(_InstrumentedAdapter.instances) == 2
+            await reused.close()
+
+    @pytest.mark.asyncio
+    async def test_tenants_retire_independently(self) -> None:
+        async with MCPRuntime(idle_timeout=0.05, shutdown_timeout=0.05) as runtime:
+            idle_agent = Agent(
+                prompt="a", tool_sources=[_bind(runtime, tenant_key="tenant-a").tools()]
+            )
+            busy_agent = Agent(
+                prompt="b", tool_sources=[_bind(runtime, tenant_key="tenant-b").tools()]
+            )
+            await idle_agent.get_tool_lookups()
+            busy_lookups = await busy_agent.get_tool_lookups()
+            adapter_a, adapter_b = _InstrumentedAdapter.instances
+
+            await idle_agent.close()
+            await _wait_until(lambda: adapter_a.closed)
+
+            assert adapter_b.closed is False
+            assert await busy_lookups.fn["github__read"](value=1) == "read:ok"
+            await busy_agent.close()
+
+    @pytest.mark.asyncio
+    async def test_a_lease_racing_retirement_reconnects_transparently(self) -> None:
+        _InstrumentedAdapter.close_gate = asyncio.Event()  # retirement stalls mid-close
+        async with MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            await first.get_tool_lookups()
+            await first.close()
+            await _wait_until(lambda: _InstrumentedAdapter.instances[0].close_calls == 1)
+
+            # Lease arrives while retirement is in flight: it must wait for the
+            # retirement to finish and then reconnect, never raise stale-handle.
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            lookups = await asyncio.wait_for(second.get_tool_lookups(), timeout=1.0)
+
+            assert sorted(lookups.fn) == ["github__read", "github__write"]
+            assert len(_InstrumentedAdapter.instances) == 2
+            _InstrumentedAdapter.close_gate.set()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_eviction_during_retirement_still_invalidates_the_handle(self) -> None:
+        _InstrumentedAdapter.close_gate = asyncio.Event()
+        async with MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05) as runtime:
+            stale = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[stale.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+            await _wait_until(lambda: _InstrumentedAdapter.instances[0].close_calls == 1)
+
+            await asyncio.wait_for(
+                runtime.evict(connection_key="github-1", mode="force"), timeout=1.0
+            )
+            _InstrumentedAdapter.close_gate.set()
+
+            # Eviction outranks retirement: the handle is now permanently stale.
+            with pytest.raises(MCPStaleConnectionError):
+                await Agent(prompt="stale", tool_sources=[stale.tools()]).get_tool_lookups()
+
+            rebound = _bind(runtime)
+            assert rebound.generation != stale.generation
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_timers_and_closes_once(self) -> None:
+        runtime = MCPRuntime(idle_timeout=0.05, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        adapter = _InstrumentedAdapter.instances[0]
+        await agent.close()
+
+        # Shutdown races the pending idle timer: exactly one close either way.
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+        await asyncio.sleep(0.15)
+
+        assert adapter.close_calls == 1
+        assert runtime.state is MCPRuntimeState.CLOSED
+        assert runtime._entries == {}
+
+    @pytest.mark.asyncio
+    async def test_resistant_retirement_stays_bounded_and_tracked(self) -> None:
+        _InstrumentedAdapter.close_gate = asyncio.Event()  # never released here
+        runtime = MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+
+        await _wait_until(lambda: len(runtime._abandoned_tasks) == 1)
+        assert runtime._entries == {}  # released despite the stuck transport
+
+        _InstrumentedAdapter.close_gate.set()
+        await _wait_until(lambda: runtime._abandoned_tasks == set())
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_retirement_cycles_leak_no_tasks_or_timers(self) -> None:
+        before = len(asyncio.all_tasks())
+        runtime = MCPRuntime(idle_timeout=0.02, shutdown_timeout=0.05)
+        connection = _bind(runtime)
+
+        for index in range(5):
+            agent = Agent(prompt=f"run-{index}", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+            await _wait_until(lambda: runtime._entries == {})
+
+        assert len(_InstrumentedAdapter.instances) == 5
+        assert all(adapter.closed for adapter in _InstrumentedAdapter.instances)
+
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+        await asyncio.sleep(0.05)
+
+        assert runtime._entries == {}
+        assert runtime._evictions == {}
+        assert runtime._abandoned_tasks == set()
+        assert runtime._drain_waiters == set()
+        assert len(asyncio.all_tasks()) <= before + 1  # only this test's task
+
+    @pytest.mark.asyncio
+    async def test_retirement_cancels_an_abandoned_establishment(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()  # never released
+        runtime = MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+
+        discovery = asyncio.create_task(agent.get_tool_lookups())
+        await asyncio.sleep(0.05)
+        assert len(_InstrumentedAdapter.instances) == 1
+
+        # The only requester walks away mid-handshake: the half-open socket
+        # must be reclaimed rather than left connecting forever.
+        discovery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await discovery
+
+        await _wait_until(lambda: runtime._entries == {})
+        assert _InstrumentedAdapter.instances[0].close_calls == 1
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_retirement_defers_to_a_concurrent_eviction(self) -> None:
+        async with MCPRuntime(idle_timeout=10.0, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            entry = agent._tool_sources[0]._entry
+            assert entry is not None
+            await agent.close()
+
+            # An eviction fences the entry after its idle timer fired but
+            # before the retirement body runs. Retirement owns neither the
+            # entry nor its transport any more and must not touch either.
+            entry.fenced = True
+            await runtime._retire(connection.identity, entry)
+
+            assert runtime._entries.get(connection.identity) is entry
+            assert _InstrumentedAdapter.instances[0].closed is False
+            assert entry.retire_task is None
+
+    @pytest.mark.asyncio
+    async def test_retirement_is_bounded_when_establishment_resists_cancellation(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        _InstrumentedAdapter.suppress_cancel = True  # ignores idle cancellation
+        runtime = MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+
+        discovery = asyncio.create_task(agent.get_tool_lookups())
+        await asyncio.sleep(0.05)
+        discovery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await discovery
+
+        # Retirement cannot interrupt the handshake, so it hands the task off
+        # rather than blocking: the identity is released either way.
+        await _wait_until(lambda: len(runtime._abandoned_tasks) == 1)
+        assert runtime._entries == {}
+
+        _InstrumentedAdapter.connect_gate.set()
+        await _wait_until(lambda: runtime._abandoned_tasks == set())
+        assert _InstrumentedAdapter.instances[0].closed is True
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_failed_establishment_cancels_its_pending_idle_timer(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        _InstrumentedAdapter.connect_error = ConnectionError("handshake refused")
+        runtime = MCPRuntime(idle_timeout=300.0, shutdown_timeout=0.05)
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+
+        discovery = asyncio.create_task(agent.get_tool_lookups())
+        await asyncio.sleep(0.05)
+        entry = runtime._entries[connection.identity]
+
+        # The sole waiter walks away mid-handshake, so its release arms an
+        # idle timer against an entry that never finished establishing.
+        discovery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await discovery
+        assert entry.idle_handle is not None
+
+        # The shared handshake then fails and discards the entry. A surviving
+        # timer would pin the entry, its source and its credentials in the
+        # event loop for the whole idle window.
+        _InstrumentedAdapter.connect_gate.set()
+        await _wait_until(lambda: runtime._entries == {})
+
+        assert entry.idle_handle is None
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_none_keeps_connections_warm(self) -> None:
+        async with MCPRuntime(idle_timeout=None, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            entry = runtime._entries[connection.identity]
+            adapter = _InstrumentedAdapter.instances[0]
+
+            await agent.close()
+            await asyncio.sleep(0.1)
+
+            assert entry.idle_handle is None  # no timer is ever armed
+            assert adapter.closed is False
+            assert runtime._entries != {}
+
+            # Explicit eviction is unaffected by disabling idle retirement.
+            await runtime.evict(connection_key="github-1", mode="drain", timeout=1.0)
+            assert adapter.closed is True
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_none_still_closes_at_shutdown(self) -> None:
+        runtime = MCPRuntime(idle_timeout=None, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        adapter = _InstrumentedAdapter.instances[0]
+        await agent.close()
+        await asyncio.sleep(0.05)
+
+        assert adapter.closed is False
+
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+        assert adapter.closed is True
+        assert runtime._entries == {}
