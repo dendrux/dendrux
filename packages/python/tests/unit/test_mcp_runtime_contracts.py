@@ -7,13 +7,15 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from dendrux.agent import Agent
 from dendrux.mcp._errors import MCPBindingConflictError
 from dendrux.mcp._runtime import (
-    MCPBinding,
+    MCPConnection,
     MCPCredentialProvider,
     MCPRuntime,
     MCPRuntimeState,
     MCPToolPolicy,
+    MCPToolView,
 )
 from dendrux.mcp._source import MCPSource
 
@@ -83,26 +85,35 @@ class TestMCPRuntimeConfiguration:
         assert runtime.state is MCPRuntimeState.CLOSED
 
 
-class TestMCPBindingContracts:
-    def test_bind_is_lazy_and_defaults_to_application_partition(self) -> None:
+class TestMCPConnectionContracts:
+    def test_bind_returns_a_lazy_connection_handle(self) -> None:
         runtime = MCPRuntime()
         source = MCPSource.http("github", "https://mcp.example.com")
         credentials = _Credentials()
 
-        binding = runtime.bind(
+        connection = runtime.bind(
             connection_key="connection-1",
             source=source,
             credentials=credentials,
         )
 
-        assert binding.runtime is runtime
-        assert binding.tenant_key is None
-        assert binding.connection_key == "connection-1"
-        assert binding.source is source
-        assert binding.namespace == "github"
-        assert binding.policy == MCPToolPolicy()
-        assert binding.credentials is credentials
+        assert isinstance(connection, MCPConnection)
+        assert connection.runtime is runtime
+        assert connection.tenant_key is None
+        assert connection.connection_key == "connection-1"
+        assert connection.source is source
+        assert connection.credentials is credentials
         assert credentials.calls == 0
+
+    def test_namespace_and_policy_exist_only_on_the_view(self) -> None:
+        connection = MCPRuntime().bind(
+            connection_key="connection-1",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+        )
+
+        assert not hasattr(connection, "namespace")
+        assert not hasattr(connection, "policy")
+        assert not hasattr(connection, "with_policy")
 
     def test_tenant_and_connection_identity_are_independent(self) -> None:
         runtime = MCPRuntime()
@@ -123,7 +134,7 @@ class TestMCPBindingContracts:
         assert second.identity == ("tenant-b", "github-work")
         assert first.identity != second.identity
 
-    def test_same_identity_can_create_different_agent_views(self) -> None:
+    def test_same_identity_rebinds_across_rotation_and_tuning_changes(self) -> None:
         runtime = MCPRuntime()
 
         first = runtime.bind(
@@ -133,7 +144,6 @@ class TestMCPBindingContracts:
                 "github",
                 "https://mcp.example.com",
                 headers={"Authorization": "Bearer old-token"},
-                allowed_tools=["read_issue"],
                 call_timeout=10.0,
             ),
         )
@@ -144,14 +154,12 @@ class TestMCPBindingContracts:
                 "github_work",
                 "https://mcp.example.com",
                 headers={"Authorization": "Bearer new-token"},
-                allowed_tools=["create_issue"],
                 call_timeout=60.0,
             ),
         )
 
         assert first.identity == second.identity
-        assert first.namespace == "github"
-        assert second.namespace == "github_work"
+        assert first.source.physical_identity == second.source.physical_identity
 
     @pytest.mark.parametrize(
         "conflicting_source",
@@ -213,16 +221,16 @@ class TestMCPBindingContracts:
             results = list(executor.map(bind, sources))
 
         assert sum(isinstance(result, MCPBindingConflictError) for result in results) == 1
-        winning_binding = next(
+        winning_connection = next(
             result for result in results if not isinstance(result, MCPBindingConflictError)
         )
-        assert isinstance(winning_binding, MCPBinding)
+        assert isinstance(winning_connection, MCPConnection)
         assert (
             runtime.bind(
                 connection_key="github",
-                source=winning_binding.source,
+                source=winning_connection.source,
             ).source.physical_identity
-            == winning_binding.source.physical_identity
+            == winning_connection.source.physical_identity
         )
 
     @pytest.mark.parametrize(
@@ -251,31 +259,122 @@ class TestMCPBindingContracts:
                 source=source,
             )
 
-    def test_credentials_are_redacted_from_repr(self) -> None:
+    def test_credentials_are_redacted_from_reprs(self) -> None:
         runtime = MCPRuntime()
         credentials = _Credentials()
-        binding = runtime.bind(
+        connection = runtime.bind(
             connection_key="connection-1",
             source=MCPSource.http("github", "https://mcp.example.com"),
             credentials=credentials,
         )
 
-        rendered = repr(binding)
+        for rendered in (repr(connection), repr(connection.tools())):
+            assert "must-not-leak" not in rendered
+            assert "credentials" not in rendered
 
-        assert "must-not-leak" not in rendered
-        assert "credentials" not in rendered
-
-    def test_binding_is_immutable(self) -> None:
-        binding = MCPRuntime().bind(
+    def test_connection_is_immutable(self) -> None:
+        connection = MCPRuntime().bind(
             connection_key="connection-1",
             source=MCPSource.http("github", "https://mcp.example.com"),
         )
 
         with pytest.raises(FrozenInstanceError):
-            binding.namespace = "changed"  # type: ignore[misc]
+            connection.connection_key = "changed"  # type: ignore[misc]
 
     def test_credential_provider_protocol_is_structural(self) -> None:
         assert isinstance(_Credentials(), MCPCredentialProvider)
+
+    def test_agent_rejects_a_bare_connection_with_guidance(self) -> None:
+        connection = MCPRuntime().bind(
+            connection_key="connection-1",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+        )
+
+        with pytest.raises(ValueError, match=r"connection\.tools\("):
+            Agent(prompt="test", tool_sources=[connection])
+
+
+class TestMCPToolViewContracts:
+    def test_tools_returns_an_explicit_all_tools_view_by_default(self) -> None:
+        credentials = _Credentials()
+        connection = MCPRuntime().bind(
+            connection_key="connection-1",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+            credentials=credentials,
+        )
+
+        view = connection.tools()
+
+        assert isinstance(view, MCPToolView)
+        assert view.connection is connection
+        assert view.namespace == "github"
+        assert view.policy == MCPToolPolicy()
+        assert credentials.calls == 0
+
+    def test_tools_returns_an_independent_agent_view(self) -> None:
+        connection = MCPRuntime().bind(
+            tenant_key="tenant-a",
+            connection_key="github-work",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+        )
+
+        restricted = connection.tools(
+            namespace="github_work",
+            allowed_tools=["read_file"],
+            force_serial_tools=["write_file"],
+        )
+
+        assert restricted.identity == connection.identity
+        assert restricted.connection.source is connection.source
+        assert restricted.namespace == "github_work"
+        assert restricted.policy == MCPToolPolicy(
+            allowed_tools=["read_file"],
+            force_serial_tools=["write_file"],
+        )
+
+    def test_different_views_share_the_same_connection_identity(self) -> None:
+        connection = MCPRuntime().bind(
+            tenant_key="tenant-a",
+            connection_key="github-work",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+        )
+
+        read_only = connection.tools(namespace="github", allowed_tools=["read_file"])
+        maintainer = connection.tools(
+            namespace="github_admin",
+            allowed_tools=["read_file", "create_issue"],
+        )
+
+        assert read_only.connection is maintainer.connection
+        assert read_only.identity == maintainer.identity
+        assert read_only.namespace != maintainer.namespace
+        assert read_only.policy != maintainer.policy
+
+    def test_view_is_immutable(self) -> None:
+        view = (
+            MCPRuntime()
+            .bind(
+                connection_key="connection-1",
+                source=MCPSource.http("github", "https://mcp.example.com"),
+            )
+            .tools()
+        )
+
+        with pytest.raises(FrozenInstanceError):
+            view.namespace = "changed"  # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        "namespace",
+        ["", "github work", "github.personal", "github__work", "github\nwork"],
+    )
+    def test_invalid_namespaces_are_rejected(self, namespace: str) -> None:
+        connection = MCPRuntime().bind(
+            connection_key="github-work",
+            source=MCPSource.http("github", "https://mcp.example.com"),
+        )
+
+        with pytest.raises(ValueError, match="namespace"):
+            connection.tools(namespace=namespace)
 
 
 class TestMCPToolPolicyContracts:
@@ -315,40 +414,3 @@ class TestMCPToolPolicyContracts:
     ) -> None:
         with pytest.raises(ValueError, match=field):
             MCPToolPolicy(**{field: value})  # type: ignore[arg-type]
-
-    def test_with_policy_returns_an_independent_agent_view(self) -> None:
-        binding = MCPRuntime().bind(
-            tenant_key="tenant-a",
-            connection_key="github-work",
-            source=MCPSource.http("github", "https://mcp.example.com"),
-        )
-
-        restricted = binding.with_policy(
-            namespace="github_work",
-            allowed_tools=["read_file"],
-            force_serial_tools=["write_file"],
-        )
-
-        assert restricted is not binding
-        assert restricted.identity == binding.identity
-        assert restricted.source is binding.source
-        assert restricted.namespace == "github_work"
-        assert restricted.policy == MCPToolPolicy(
-            allowed_tools=["read_file"],
-            force_serial_tools=["write_file"],
-        )
-        assert binding.namespace == "github"
-        assert binding.policy == MCPToolPolicy()
-
-    @pytest.mark.parametrize(
-        "namespace",
-        ["", "github work", "github.personal", "github__work", "github\nwork"],
-    )
-    def test_invalid_namespaces_are_rejected(self, namespace: str) -> None:
-        binding = MCPRuntime().bind(
-            connection_key="github-work",
-            source=MCPSource.http("github", "https://mcp.example.com"),
-        )
-
-        with pytest.raises(ValueError, match="namespace"):
-            binding.with_policy(namespace=namespace)

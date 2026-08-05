@@ -36,7 +36,6 @@ async def main() -> None:
     everything = MCPSource.stdio(
         name="everything",
         command=["npx", "-y", "@modelcontextprotocol/server-everything@2026.7.4"],
-        allowed_tools=("echo",),
         connect_timeout=60,  # allows a cold first-run npx download
         call_timeout=30,
         max_result_bytes=100_000,
@@ -64,7 +63,7 @@ Prerequisites are Node.js with `npx`, an Anthropic API key, and `dendrux[anthrop
 
 | Object | Responsibility | Typical lifetime |
 | --- | --- | --- |
-| `MCPSource` | Immutable connection, authentication, filtering, and limit configuration. | Application configuration. |
+| `MCPSource` | Immutable connection, authentication, and limit configuration. | Application configuration. |
 | `MCPHost` | Owns SDK connections and discovered catalogs so multiple agents can share them safely. | One worker, tenant, or credential identity. |
 | `MCPServer` | Backward-compatible facade used by the runtime. Existing `MCPServer(...)` code still works. | Prefer `MCPSource` in new code. |
 
@@ -81,7 +80,6 @@ github = MCPSource.http(
     name="github",
     url="https://mcp.example.com/github",
     headers={"Authorization": "Bearer ..."},
-    allowed_tools=("search_code", "get_issue", "create_issue"),
     connect_timeout=10,
     call_timeout=60,
     max_result_bytes=500_000,
@@ -156,7 +154,6 @@ Create separate hosts for different tenants or credential identities. A host del
 `MCPSource` and `MCPHost` construction perform no network or subprocess I/O. Discovery happens lazily when `agent.run()` or `agent.get_tool_lookups()` first needs the tools.
 
 - Every paginated `tools/list` page is collected.
-- `allowed_tools` filters by the original MCP tool name before model exposure.
 - The agent receives a stable catalog for its lifetime.
 - An `MCPHost` caches each source catalog across its agents.
 - `await agent.refresh()` clears a directly owned agent catalog.
@@ -244,7 +241,6 @@ Common options on `MCPSource.http(...)` and `MCPSource.stdio(...)`:
 | `connect_timeout` | `30.0` | Maximum initial connection/negotiation time in seconds. |
 | `call_timeout` | `120.0` | Per-tool SDK and Dendrux execution timeout. |
 | `max_result_bytes` | `1_000_000` | Maximum normalized result size. |
-| `allowed_tools` | all | Original MCP names exposed to the agent. |
 | `failure_mode` | `"strict"` | `"strict"` or `"best_effort"`. |
 
 HTTP-only options are `url`, `headers`, and `auth`. Stdio-only options are `command`, `env`, and `cwd`; mixing transport-specific options raises `ValueError` during construction.

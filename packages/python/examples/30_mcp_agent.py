@@ -37,7 +37,6 @@ async def main() -> None:
     everything = MCPSource.stdio(
         name="everything",
         command=["npx", "-y", "@modelcontextprotocol/server-everything@2026.7.4"],
-        allowed_tools=("echo",),
         # Leave room for a first-run npx download and protocol negotiation.
         connect_timeout=60,
         call_timeout=30,

@@ -52,7 +52,6 @@ class MCPSource:
     connect_timeout: float = 30.0
     call_timeout: float = 120.0
     max_result_bytes: int = 1_000_000
-    allowed_tools: frozenset[str] | None = None
     failure_mode: MCPFailureMode = "strict"
 
     def __post_init__(self) -> None:
@@ -103,11 +102,6 @@ class MCPSource:
 
         object.__setattr__(self, "headers", _copy_string_mapping(self.headers, "headers"))
         object.__setattr__(self, "env", _copy_string_mapping(self.env, "env"))
-        if self.allowed_tools is not None:
-            allowed = frozenset(self.allowed_tools)
-            if not all(isinstance(name, str) and name for name in allowed):
-                raise ValueError("MCPSource allowed_tools must contain non-empty strings.")
-            object.__setattr__(self, "allowed_tools", allowed)
 
     @classmethod
     def http(
@@ -120,7 +114,6 @@ class MCPSource:
         connect_timeout: float = 30.0,
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
-        allowed_tools: Sequence[str] | None = None,
         failure_mode: MCPFailureMode = "strict",
     ) -> MCPSource:
         """Configure a production Streamable HTTP MCP source."""
@@ -132,7 +125,6 @@ class MCPSource:
             connect_timeout=connect_timeout,
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
-            allowed_tools=frozenset(allowed_tools) if allowed_tools is not None else None,
             failure_mode=failure_mode,
         )
 
@@ -147,7 +139,6 @@ class MCPSource:
         connect_timeout: float = 30.0,
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
-        allowed_tools: Sequence[str] | None = None,
         failure_mode: MCPFailureMode = "strict",
     ) -> MCPSource:
         """Configure a trusted local subprocess MCP source."""
@@ -161,7 +152,6 @@ class MCPSource:
             connect_timeout=connect_timeout,
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
-            allowed_tools=frozenset(allowed_tools) if allowed_tools is not None else None,
             failure_mode=failure_mode,
         )
 

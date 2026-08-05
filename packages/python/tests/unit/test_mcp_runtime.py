@@ -58,13 +58,27 @@ class TestMCPSource:
             "github",
             "https://mcp.example.com",
             headers={"Authorization": "Bearer secret"},
-            allowed_tools=["search_code"],
             failure_mode="best_effort",
         )
 
         assert source.transport == "http"
-        assert source.allowed_tools == frozenset({"search_code"})
+        assert not hasattr(source, "allowed_tools")
         assert source.failure_mode == "best_effort"
+
+    def test_source_level_tool_allowlists_are_not_supported(self) -> None:
+        with pytest.raises(TypeError, match="allowed_tools"):
+            MCPSource.http(  # type: ignore[call-arg]
+                "github",
+                "https://mcp.example.com",
+                allowed_tools=["search_code"],
+            )
+
+        with pytest.raises(TypeError, match="allowed_tools"):
+            MCPServer(  # type: ignore[call-arg]
+                "github",
+                url="https://mcp.example.com",
+                allowed_tools=["search_code"],
+            )
 
     def test_stdio_configuration(self) -> None:
         source = MCPSource.stdio(
@@ -87,7 +101,6 @@ class TestMCPSource:
             connect_timeout=10.0,
             call_timeout=20.0,
             max_result_bytes=100,
-            allowed_tools=["read_issue"],
             failure_mode="best_effort",
         )
         second = MCPSource.http(
@@ -98,27 +111,26 @@ class TestMCPSource:
             connect_timeout=30.0,
             call_timeout=60.0,
             max_result_bytes=200,
-            allowed_tools=["create_issue"],
         )
 
         assert first.physical_identity == ("http", "https://mcp.example.com/github")
         assert first.physical_identity == second.physical_identity
         assert hash(first.physical_identity) == hash(second.physical_identity)
 
-    def test_stdio_physical_identity_excludes_environment_and_policy(self) -> None:
+    def test_stdio_physical_identity_excludes_environment_and_tuning(self) -> None:
         first = MCPSource.stdio(
             "github_personal",
             ["github-mcp", "serve"],
             cwd="/workspace",
             env={"GITHUB_TOKEN": "old-token"},
-            allowed_tools=["read_issue"],
+            call_timeout=10.0,
         )
         second = MCPSource.stdio(
             "github_work",
             ["github-mcp", "serve"],
             cwd="/workspace",
             env={"GITHUB_TOKEN": "new-token"},
-            allowed_tools=["create_issue"],
+            call_timeout=60.0,
         )
 
         assert first.physical_identity == (
@@ -185,7 +197,7 @@ class TestMCPToolAdaptation:
             await server.close()
 
     @pytest.mark.asyncio
-    async def test_discovery_filters_tools_and_sets_safe_parallelism(self) -> None:
+    async def test_discovery_exposes_tools_and_sets_safe_parallelism(self) -> None:
         _FakeClientAdapter.tools = [
             Tool(
                 name="read",
@@ -203,7 +215,6 @@ class TestMCPToolAdaptation:
         source = MCPSource.http(
             "store",
             "https://mcp.example.com",
-            allowed_tools=["read"],
             call_timeout=45.0,
         )
         server = MCPServer.from_source(source)
@@ -211,8 +222,9 @@ class TestMCPToolAdaptation:
         with patch("dendrux.mcp._server.MCPClientAdapter", _FakeClientAdapter):
             tool_defs = await server._discover()
 
-        assert [tool.name for tool in tool_defs] == ["store__read"]
+        assert [tool.name for tool in tool_defs] == ["store__read", "store__delete"]
         assert tool_defs[0].parallel is True
+        assert tool_defs[1].parallel is False
         assert tool_defs[0].timeout_seconds == 45.0
         assert tool_defs[0].meta["protocol_version"] == "2026-07-28"
         await server.close()

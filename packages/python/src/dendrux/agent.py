@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
     from dendrux.mcp._host import MCPHost
+    from dendrux.mcp._runtime import MCPToolView
     from dendrux.mcp._server import MCPServer
     from dendrux.mcp._source import MCPSource
     from dendrux.runtime.state import StateStore
@@ -196,7 +197,7 @@ class Agent:
         prompt: str,
         name: str = ...,
         tools: list[Callable[..., Any]] = ...,
-        tool_sources: list[MCPServer | MCPSource | MCPHost] | None = ...,
+        tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
@@ -221,7 +222,7 @@ class Agent:
         name: str = ...,
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
-        tool_sources: list[MCPServer | MCPSource | MCPHost] | None = ...,
+        tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
         loop: Loop | None = ...,
@@ -244,7 +245,7 @@ class Agent:
         name: str | _UnsetType = _UNSET,
         prompt: str | _UnsetType = _UNSET,
         tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
-        tool_sources: list[MCPServer | MCPSource | MCPHost] | None = None,
+        tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = None,
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         loop: Loop | None = None,
@@ -331,11 +332,20 @@ class Agent:
         self._tool_sources: list[MCPServer] = []
         if tool_sources:
             from dendrux.mcp._host import MCPHost as _MCPHost
+            from dendrux.mcp._runtime import (
+                MCPConnection as _MCPConnection,
+            )
+            from dendrux.mcp._runtime import (
+                MCPToolView as _MCPToolView,
+            )
+            from dendrux.mcp._runtime import (
+                _ViewToolSource,
+            )
             from dendrux.mcp._server import MCPServer as _MCPServer
             from dendrux.mcp._source import MCPSource as _MCPSource
 
             seen_names: set[str] = set()
-            expanded_sources: list[MCPServer | MCPSource] = []
+            expanded_sources: list[MCPServer | MCPSource | MCPToolView] = []
             for configured_source in tool_sources:
                 if isinstance(configured_source, _MCPHost):
                     expanded_sources.extend(configured_source.tool_sources)
@@ -345,13 +355,22 @@ class Agent:
             for i, configured_source in enumerate(expanded_sources):
                 if isinstance(configured_source, _MCPSource):
                     src = _MCPServer.from_source(configured_source)
+                elif isinstance(configured_source, _MCPToolView):
+                    src = _ViewToolSource(configured_source)
                 elif isinstance(configured_source, _MCPServer):
                     src = configured_source
+                elif isinstance(configured_source, _MCPConnection):
+                    raise ValueError(
+                        f"Agent '{self.name}' tool_sources[{i}] is an MCPConnection, "
+                        "which exposes no tools by itself. Call connection.tools(...) "
+                        "and pass the resulting view instead."
+                    )
                 else:
                     raise ValueError(
                         f"Agent '{self.name}' tool_sources[{i}] is "
                         f"{type(configured_source).__name__}, not an MCPServer, MCPSource, "
-                        "or MCPHost instance. Use MCPSource.http(...) or MCPSource.stdio(...)."
+                        "MCPHost, or MCPToolView instance. Use MCPSource.http(...) or "
+                        "MCPSource.stdio(...)."
                     )
                 if src.name in seen_names:
                     raise ValueError(

@@ -14,20 +14,27 @@ class MCPConnectionError(MCPError):
 
 
 class MCPBindingConflictError(MCPError):
-    """A runtime connection identity was rebound to a different target."""
+    """A runtime connection identity was rebound to a conflicting source."""
 
     def __init__(
         self,
         identity: tuple[str | None, str],
         *,
-        mismatch: Literal["transport", "endpoint"],
+        mismatch: Literal["transport", "endpoint", "configuration"],
     ) -> None:
         self.identity = identity
         self.mismatch = mismatch
-        super().__init__(
-            f"MCP binding {identity!r} is already registered for a different "
-            f"physical target ({mismatch} mismatch)."
-        )
+        if mismatch == "configuration":
+            message = (
+                f"MCP binding {identity!r} has a live connection with a different "
+                "configuration. Evict or close it before rebinding with new settings."
+            )
+        else:
+            message = (
+                f"MCP binding {identity!r} is already registered for a different "
+                f"physical target ({mismatch} mismatch)."
+            )
+        super().__init__(message)
 
 
 class MCPToolCallError(MCPError):

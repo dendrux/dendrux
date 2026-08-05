@@ -66,6 +66,91 @@ def _tool_meta(tool: Any) -> dict[str, Any] | None:
     return dict(value) if value else None
 
 
+def build_mcp_tool_defs(
+    *,
+    source: MCPSource,
+    namespace: str,
+    tools: Sequence[Any],
+    connection_info: Any,
+    force_serial_tools: frozenset[str] = frozenset(),
+) -> list[ToolDef]:
+    """Adapt raw MCP tools to namespaced ToolDefs for one Agent view."""
+    tool_defs: list[ToolDef] = []
+    seen_names: set[str] = set()
+    for tool in tools:
+        sanitized = _sanitize_tool_name(tool.name)
+        canonical = f"{namespace}__{sanitized}"
+        _validate_canonical_name(canonical, source.name, tool.name)
+        if canonical in seen_names:
+            raise ValueError(
+                f"MCP source '{source.name}' has duplicate tool names after "
+                f"sanitization: '{tool.name}' → '{canonical}'. "
+                "Two tools cannot share the same canonical name."
+            )
+        seen_names.add(canonical)
+
+        annotations = _annotation_dict(tool.annotations)
+        meta: dict[str, Any] = {
+            "source_name": source.name,
+            "namespace": namespace,
+            "mcp_tool_name": tool.name,
+            "transport": source.transport,
+            "annotations": annotations,
+            "title": getattr(tool, "title", None),
+            "output_schema": getattr(tool, "output_schema", None),
+            "mcp_meta": _tool_meta(tool),
+        }
+        if connection_info is not None:
+            meta.update(
+                {
+                    "protocol_version": connection_info.protocol_version,
+                    "server_name": connection_info.server_name,
+                    "server_version": connection_info.server_version,
+                }
+            )
+
+        tool_defs.append(
+            ToolDef(
+                name=canonical,
+                description=tool.description or "",
+                parameters=tool.input_schema,
+                target=ToolTarget.SERVER,
+                parallel=(
+                    _tool_is_parallel_safe(tool.annotations) and tool.name not in force_serial_tools
+                ),
+                timeout_seconds=source.call_timeout,
+                has_explicit_timeout=True,
+                meta=meta,
+            )
+        )
+    return tool_defs
+
+
+def create_mcp_executor(
+    adapter: MCPClientAdapter,
+    *,
+    namespace: str,
+    mcp_tool_name: str,
+    max_result_bytes: int,
+) -> Callable[..., Any]:
+    """Create an async Dendrux executor bound to one live MCP adapter."""
+
+    async def executor(**params: Any) -> Any:
+        try:
+            result = await adapter.call_tool(mcp_tool_name, params)
+        except Exception as exc:
+            raise MCPToolCallError(
+                f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {exc}"
+            ) from exc
+        normalized = normalize_mcp_result(result, max_result_bytes=max_result_bytes)
+        is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
+        if is_error:
+            raise MCPToolCallError(str(normalized or "MCP tool returned an error"))
+        return normalized
+
+    return executor
+
+
 class MCPServer:
     """One MCP tool source managed through the official SDK v2 client.
 
@@ -93,7 +178,6 @@ class MCPServer:
         connect_timeout: float = 30.0,
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
-        allowed_tools: Sequence[str] | None = None,
         failure_mode: MCPFailureMode = "strict",
     ) -> None:
         # Keep the legacy error wording and private transport attributes while
@@ -114,7 +198,6 @@ class MCPServer:
             connect_timeout=connect_timeout,
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
-            allowed_tools=frozenset(allowed_tools) if allowed_tools is not None else None,
             failure_mode=failure_mode,
         )
         self._configure(source)
@@ -154,63 +237,19 @@ class MCPServer:
             self._session = adapter._client
             all_tools = await adapter.list_tools()
 
-            if self.source.allowed_tools is not None:
-                all_tools = [tool for tool in all_tools if tool.name in self.source.allowed_tools]
-
             if not all_tools:
                 logger.warning(
-                    "MCP source '%s' discovered zero allowed tools. "
+                    "MCP source '%s' discovered zero tools. "
                     "This may indicate a configuration problem.",
                     self.name,
                 )
 
-            connection_info = adapter.info
-            tool_defs: list[ToolDef] = []
-            seen_names: set[str] = set()
-            for tool in all_tools:
-                sanitized = _sanitize_tool_name(tool.name)
-                canonical = f"{self.name}__{sanitized}"
-                _validate_canonical_name(canonical, self.name, tool.name)
-                if canonical in seen_names:
-                    raise ValueError(
-                        f"MCP source '{self.name}' has duplicate tool names after "
-                        f"sanitization: '{tool.name}' → '{canonical}'. "
-                        "Two tools cannot share the same canonical name."
-                    )
-                seen_names.add(canonical)
-
-                annotations = _annotation_dict(tool.annotations)
-                meta: dict[str, Any] = {
-                    "source_name": self.name,
-                    "mcp_tool_name": tool.name,
-                    "transport": self.source.transport,
-                    "annotations": annotations,
-                    "title": getattr(tool, "title", None),
-                    "output_schema": getattr(tool, "output_schema", None),
-                    "mcp_meta": _tool_meta(tool),
-                }
-                if connection_info is not None:
-                    meta.update(
-                        {
-                            "protocol_version": connection_info.protocol_version,
-                            "server_name": connection_info.server_name,
-                            "server_version": connection_info.server_version,
-                        }
-                    )
-
-                tool_defs.append(
-                    ToolDef(
-                        name=canonical,
-                        description=tool.description or "",
-                        parameters=tool.input_schema,
-                        target=ToolTarget.SERVER,
-                        parallel=_tool_is_parallel_safe(tool.annotations),
-                        timeout_seconds=self.source.call_timeout,
-                        has_explicit_timeout=True,
-                        meta=meta,
-                    )
-                )
-            return tool_defs
+            return build_mcp_tool_defs(
+                source=self.source,
+                namespace=self.name,
+                tools=all_tools,
+                connection_info=adapter.info,
+            )
         except BaseException as exc:
             self.last_error = str(exc)
             await self.close()
@@ -221,24 +260,12 @@ class MCPServer:
         adapter = self._client
         if adapter is None:
             raise RuntimeError("Cannot create an MCP executor before discovery.")
-
-        async def executor(**params: Any) -> Any:
-            try:
-                result = await adapter.call_tool(mcp_tool_name, params)
-            except Exception as exc:
-                raise MCPToolCallError(
-                    f"MCP tool '{self.name}__{mcp_tool_name}' call failed: {exc}"
-                ) from exc
-            normalized = normalize_mcp_result(
-                result,
-                max_result_bytes=self.source.max_result_bytes,
-            )
-            is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
-            if is_error:
-                raise MCPToolCallError(str(normalized or "MCP tool returned an error"))
-            return normalized
-
-        return executor
+        return create_mcp_executor(
+            adapter,
+            namespace=self.name,
+            mcp_tool_name=mcp_tool_name,
+            max_result_bytes=self.source.max_result_bytes,
+        )
 
     async def close(self) -> None:
         """Close the SDK client and underlying HTTP/subprocess transport."""
