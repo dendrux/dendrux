@@ -232,14 +232,22 @@ class _ViewToolSource(MCPServer):
         self.last_error: str | None = None
         self._entry: _ConnectionEntry | None = None
         self._leased = False
+        self._close_generation = 0
 
     async def _discover(self) -> list[ToolDef]:
         connection = self._view.connection
+        close_generation = self._close_generation
         self.last_error = None
         try:
             if not self._leased:
                 self._entry = await connection.runtime._lease(connection)
                 self._leased = True
+                if self._close_generation != close_generation:
+                    # The Agent was closed from another task while we were
+                    # connecting. Its close() could not release a lease we did
+                    # not hold yet, so hand it back here or this connection
+                    # stays pinned for the life of the runtime.
+                    raise RuntimeError(f"MCP tool view '{self.name}' was closed during discovery.")
             entry = self._entry
             assert entry is not None
             policy = self._view.policy
@@ -307,6 +315,7 @@ class _ViewToolSource(MCPServer):
 
     async def close(self) -> None:
         """Release this view's lease; the shared connection stays open."""
+        self._close_generation += 1
         if self._leased:
             entry = self._entry
             connection = self._view.connection
@@ -783,8 +792,6 @@ class MCPRuntime:
                 entry.adapter = adapter
                 entry.raw_tools = list(raw_tools)
                 entry.info = adapter.info
-                # Every waiter may have already left while we connected.
-                self._maybe_schedule_idle(identity, entry)
         if not still_current:
             try:
                 await adapter.close()

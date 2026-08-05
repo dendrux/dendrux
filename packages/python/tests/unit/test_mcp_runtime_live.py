@@ -1987,3 +1987,72 @@ class TestIdleRetirement:
         await asyncio.wait_for(runtime.close(), timeout=1.0)
         assert adapter.closed is True
         assert runtime._entries == {}
+
+
+class TestConcurrentAgentTeardown:
+    """An Agent torn down mid-discovery must not pin its connection."""
+
+    @pytest.mark.asyncio
+    async def test_closing_an_agent_during_discovery_releases_its_lease(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        runtime = MCPRuntime(idle_timeout=0.05, shutdown_timeout=0.3)
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+
+        discovery = asyncio.create_task(agent.get_tool_lookups())
+        await asyncio.sleep(0.05)
+        entry = runtime._entries[connection.identity]
+
+        # Another task tears the Agent down while the handshake is running.
+        # close() cannot release a lease the view has not taken yet, so the
+        # view must hand it back as soon as discovery acquires it.
+        await agent.close()
+        _InstrumentedAdapter.connect_gate.set()
+        with pytest.raises(RuntimeError, match="closed during discovery"):
+            await discovery
+
+        assert entry.leases == 0
+        # A pinned lease would block retirement forever and burn the whole
+        # shutdown budget; the connection must retire on schedule instead.
+        await _wait_until(lambda: runtime._entries == {})
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+        assert _InstrumentedAdapter.instances[0].closed is True
+
+    @pytest.mark.asyncio
+    async def test_refresh_can_rediscover_a_managed_view(self) -> None:
+        runtime = MCPRuntime(idle_timeout=None)
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+
+        first = await agent.get_tool_lookups()
+        assert sorted(first.fn) == ["github__read", "github__write"]
+
+        await agent.refresh()
+        assert runtime._entries[connection.identity].leases == 0
+
+        second = await agent.get_tool_lookups()
+        assert sorted(second.fn) == ["github__read", "github__write"]
+        assert _total_connects() == 1
+
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_transient_discovery_failure_can_retry_the_same_view(self) -> None:
+        runtime = MCPRuntime(idle_timeout=None)
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+        _InstrumentedAdapter.connect_error = ConnectionError("temporary handshake failure")
+
+        with pytest.raises(ConnectionError, match="temporary handshake failure"):
+            await agent.get_tool_lookups()
+
+        _InstrumentedAdapter.connect_error = None
+        lookups = await agent.get_tool_lookups()
+
+        assert sorted(lookups.fn) == ["github__read", "github__write"]
+        assert _total_connects() == 2
+        assert _InstrumentedAdapter.instances[0].closed is True
+
+        await agent.close()
+        await runtime.close()
