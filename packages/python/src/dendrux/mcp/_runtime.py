@@ -12,7 +12,15 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from dendrux.mcp._client import MCPClientAdapter
-from dendrux.mcp._errors import MCPBindingConflictError, MCPConnectionError, MCPToolCallError
+from dendrux.mcp._errors import (
+    MCPBindingConflictError,
+    MCPConnectionError,
+    MCPConnectionEvictingError,
+    MCPOutcomeUnknownError,
+    MCPRuntimeClosedError,
+    MCPStaleConnectionError,
+    MCPToolCallError,
+)
 from dendrux.mcp._server import MCPServer, build_mcp_tool_defs, create_mcp_executor
 from dendrux.mcp._source import MCPSource
 
@@ -28,6 +36,9 @@ _NAMESPACE_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 # Post-drain grace for connection and cleanup tasks: enough for cooperative
 # cancellation/close to finish, but bounded when a transport misbehaves.
 _FORCED_CANCEL_GRACE = 0.05
+
+
+MCPEvictionMode = Literal["drain", "force"]
 
 
 class MCPRuntimeState(StrEnum):
@@ -134,6 +145,7 @@ class MCPConnection:
         repr=False,
         compare=False,
     )
+    generation: int = 0
 
     @property
     def identity(self) -> tuple[str | None, str]:
@@ -280,6 +292,14 @@ class _ViewToolSource(MCPServer):
             connection.runtime._begin_call(connection.identity, entry)
             try:
                 return await executor(**params)
+            except BaseException as exc:
+                if entry.force_evicted:
+                    raise MCPOutcomeUnknownError(
+                        f"MCP tool '{self.name}__{mcp_tool_name}' was interrupted by a "
+                        "forced eviction. The server may already have applied it, so "
+                        "it must not be retried automatically."
+                    ) from exc
+                raise
             finally:
                 connection.runtime._end_call(entry)
 
@@ -310,6 +330,9 @@ class _ConnectionEntry:
     __slots__ = (
         "active_calls",
         "adapter",
+        "close_started",
+        "evicted",
+        "force_evicted",
         "info",
         "leases",
         "raw_tools",
@@ -325,6 +348,23 @@ class _ConnectionEntry:
         self.leases = 0
         self.active_calls = 0
         self.task: asyncio.Task[None] | None = None
+        # Fenced: no new leases or calls. force_evicted additionally means
+        # in-flight calls may be interrupted, so their outcome is unknown.
+        self.evicted = False
+        self.force_evicted = False
+        self.close_started = False
+
+
+@dataclass(slots=True)
+class _Registration:
+    """Canonical configuration for one connection identity.
+
+    ``generation`` increments whenever an identity is bound after an
+    eviction, which is what invalidates handles issued before it.
+    """
+
+    source: MCPSource
+    generation: int
 
 
 def _same_connection_config(registered: MCPSource, candidate: MCPSource) -> bool:
@@ -369,12 +409,14 @@ class MCPRuntime:
         # The registered source is the canonical configuration for an
         # identity. evict() must remove entries here, or an evicted
         # connection key could never be rebound to a changed endpoint.
-        self._registrations: dict[tuple[str | None, str], MCPSource] = {}
+        self._registrations: dict[tuple[str | None, str], _Registration] = {}
         self._entries: dict[tuple[str | None, str], _ConnectionEntry] = {}
+        self._evictions: dict[tuple[str | None, str], asyncio.Task[None]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._drain_event: asyncio.Event | None = None
+        self._drain_waiters: set[asyncio.Event] = set()
         self._close_task: asyncio.Task[None] | None = None
         self._abandoned_tasks: set[asyncio.Task[None]] = set()
+        self._generation_seq = 0
         self._lock = Lock()
 
     def _bind_loop(self) -> None:
@@ -409,10 +451,50 @@ class MCPRuntime:
             self._abandoned_tasks.add(task)
         task.add_done_callback(self._abandoned_task_done)
 
+    def _notify_drain(self) -> None:
+        """Wake every drain waiter (runtime shutdown and evictions)."""
+        with self._lock:
+            waiters = list(self._drain_waiters)
+        for waiter in waiters:
+            waiter.set()
+
+    async def _wait_for_quiet(
+        self,
+        deadline: float,
+        is_quiet: Callable[[], bool],
+    ) -> bool:
+        """Wait until ``is_quiet()`` holds or the deadline passes.
+
+        Returns True when the drain completed, False when it timed out.
+        ``is_quiet`` is evaluated under the runtime lock.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            waiter = asyncio.Event()
+            with self._lock:
+                if is_quiet():
+                    return True
+                self._drain_waiters.add(waiter)
+            try:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.wait_for(waiter.wait(), timeout=remaining)
+            except TimeoutError:
+                return False
+            finally:
+                with self._lock:
+                    self._drain_waiters.discard(waiter)
+
     async def _close_adapter(self, entry: _ConnectionEntry) -> None:
-        adapter = entry.adapter
-        if adapter is None:
-            return
+        """Close an entry's transport at most once across all callers."""
+        with self._lock:
+            adapter = entry.adapter
+            if adapter is None or entry.close_started:
+                return
+            # Guards against runtime shutdown and eviction both closing the
+            # same transport when they run concurrently.
+            entry.close_started = True
         try:
             await adapter.close()
         except Exception:
@@ -427,19 +509,32 @@ class MCPRuntime:
         identity = connection.identity
         with self._lock:
             if self._state is not MCPRuntimeState.OPEN:
-                raise RuntimeError("MCPRuntime is closed and cannot open MCP connections.")
+                raise MCPRuntimeClosedError("MCPRuntime is closed and cannot open MCP connections.")
             self._bind_loop()
-            registered_source = self._registrations.get(identity)
-            if registered_source is None or not _same_connection_config(
-                registered_source, connection.source
+            if identity in self._evictions:
+                raise MCPConnectionEvictingError(
+                    identity,
+                    f"MCP connection {identity!r} is being evicted and cannot accept "
+                    "new leases. Bind again once eviction completes.",
+                )
+            registration = self._registrations.get(identity)
+            if registration is None:
+                raise MCPStaleConnectionError(
+                    identity,
+                    f"MCP connection handle {identity!r} is no longer registered; it was "
+                    "evicted or never bound. Bind again and use the new handle.",
+                )
+            if registration.generation != connection.generation or not _same_connection_config(
+                registration.source, connection.source
             ):
-                raise RuntimeError(
+                raise MCPStaleConnectionError(
+                    identity,
                     f"MCP connection handle {identity!r} was superseded by a rebind "
-                    "with a different configuration. Bind again and use the new handle."
+                    "with a different configuration. Bind again and use the new handle.",
                 )
             entry = self._entries.get(identity)
             if entry is None:
-                entry = _ConnectionEntry(registered_source)
+                entry = _ConnectionEntry(registration.source)
                 entry.task = asyncio.get_running_loop().create_task(
                     self._open_connection(identity, entry)
                 )
@@ -470,7 +565,7 @@ class MCPRuntime:
             raw_tools = await adapter.list_tools()
         except BaseException:
             with self._lock:
-                if self._entries.get(identity) is entry:
+                if self._entries.get(identity) is entry and not entry.evicted:
                     # Discard so the identity can be retried with a fresh entry.
                     del self._entries[identity]
             if adapter is not None:
@@ -487,7 +582,7 @@ class MCPRuntime:
             # A force-closed or evicted entry must never receive a live
             # adapter: a transport that suppressed cancellation could
             # otherwise publish into an already-closed runtime.
-            still_current = self._entries.get(identity) is entry
+            still_current = self._entries.get(identity) is entry and not entry.evicted
             if still_current:
                 entry.adapter = adapter
                 entry.raw_tools = list(raw_tools)
@@ -520,11 +615,9 @@ class MCPRuntime:
         """
         with self._lock:
             self._bind_loop()
-            if self._entries.get(identity) is entry and entry.leases > 0:
+            if entry.leases > 0:
                 entry.leases -= 1
-            event = self._drain_event
-        if event is not None:
-            event.set()
+        self._notify_drain()
 
     def _begin_call(
         self,
@@ -538,6 +631,7 @@ class MCPRuntime:
                 self._state is not MCPRuntimeState.OPEN
                 or self._entries.get(identity) is not entry
                 or entry.adapter is None
+                or entry.evicted
             ):
                 raise MCPToolCallError(
                     "MCP tool view is no longer active on its managed connection."
@@ -550,9 +644,7 @@ class MCPRuntime:
             self._bind_loop()
             if entry.active_calls > 0:
                 entry.active_calls -= 1
-            event = self._drain_event
-        if event is not None:
-            event.set()
+        self._notify_drain()
 
     @property
     def state(self) -> MCPRuntimeState:
@@ -571,7 +663,7 @@ class MCPRuntime:
         """Register a connection identity and return its lazy handle."""
         with self._lock:
             if self._state is not MCPRuntimeState.OPEN:
-                raise RuntimeError("MCPRuntime is closed and cannot bind new connections.")
+                raise MCPRuntimeClosedError("MCPRuntime is closed and cannot bind new connections.")
             _validate_identity_key(tenant_key, "tenant", optional=True)
             _validate_identity_key(connection_key, "connection", optional=False)
             if not isinstance(source, MCPSource):
@@ -583,11 +675,21 @@ class MCPRuntime:
             _validate_namespace(source.name)
 
             identity = tenant_key, connection_key
-            registered_source = self._registrations.get(identity)
-            if registered_source is None:
-                self._registrations[identity] = source
+            if identity in self._evictions:
+                raise MCPConnectionEvictingError(
+                    identity,
+                    f"MCP connection {identity!r} is being evicted. "
+                    "Bind again once eviction completes.",
+                )
+            registration = self._registrations.get(identity)
+            if registration is None:
+                # First bind, or the first bind after an eviction: a new
+                # generation invalidates every handle issued before it.
+                self._generation_seq += 1
+                registration = _Registration(source=source, generation=self._generation_seq)
+                self._registrations[identity] = registration
             else:
-                registered_physical = registered_source.physical_identity
+                registered_physical = registration.source.physical_identity
                 physical_identity = source.physical_identity
                 if registered_physical != physical_identity:
                     mismatch: Literal["transport", "endpoint"] = (
@@ -597,14 +699,15 @@ class MCPRuntime:
                     )
                     raise MCPBindingConflictError(identity, mismatch=mismatch)
                 if (
-                    not _same_connection_config(registered_source, source)
+                    not _same_connection_config(registration.source, source)
                     and identity in self._entries
                 ):
                     raise MCPBindingConflictError(identity, mismatch="configuration")
                 # The newest bind becomes canonical: a non-live rebind may
                 # rotate configuration outright, and a config-equivalent one
-                # refreshes the auth object for the next open.
-                self._registrations[identity] = source
+                # refreshes the auth object for the next open. The generation
+                # is unchanged, so existing handles stay valid.
+                registration.source = source
 
             return MCPConnection(
                 runtime=self,
@@ -612,7 +715,160 @@ class MCPRuntime:
                 connection_key=connection_key,
                 source=source,
                 credentials=credentials,
+                generation=registration.generation,
             )
+
+    async def evict(
+        self,
+        *,
+        connection_key: str,
+        tenant_key: str | None = None,
+        mode: MCPEvictionMode = "drain",
+        timeout: float | None = None,
+    ) -> None:
+        """Close and forget one managed connection.
+
+        ``mode="drain"`` stops new leases and calls, waits up to ``timeout``
+        seconds for active ones to finish, then starts transport cleanup.
+        ``mode="force"`` fences the connection immediately and starts bounded
+        best-effort cleanup. If a transport resists closing, cleanup continues
+        in the background and a replacement connection may open after this
+        method returns; Dendrux will not route new work to the fenced transport.
+        Interrupted tool calls raise :class:`MCPOutcomeUnknownError` because
+        the server may already have applied their effect, and they must never
+        be retried automatically.
+
+        Only the exact ``(tenant_key, connection_key)`` partition is affected.
+        Handles issued before the eviction are invalid afterwards, and the key
+        may be rebound with a new endpoint or credentials. Concurrent and
+        repeated calls share one operation; a ``force`` call escalates an
+        in-flight drain.
+        """
+        if mode not in ("drain", "force"):
+            raise ValueError("MCPRuntime evict mode must be 'drain' or 'force'.")
+        resolved_timeout = (
+            self.shutdown_timeout if timeout is None else _positive_float(timeout, "evict timeout")
+        )
+        _validate_identity_key(tenant_key, "tenant", optional=True)
+        _validate_identity_key(connection_key, "connection", optional=False)
+
+        identity = tenant_key, connection_key
+        shutdown_task: asyncio.Task[None] | None = None
+        with self._lock:
+            if self._state is MCPRuntimeState.CLOSED:
+                return
+            self._bind_loop()
+            if self._state is MCPRuntimeState.DRAINING:
+                entry = self._entries.get(identity)
+                escalate = mode == "force" and entry is not None and not entry.force_evicted
+                if escalate:
+                    assert entry is not None
+                    entry.evicted = True
+                    entry.force_evicted = True
+                shutdown_task = self._close_task
+                task = None
+            else:
+                task = self._evictions.get(identity)
+                if task is not None:
+                    entry = self._entries.get(identity)
+                    escalate = mode == "force" and entry is not None and not entry.force_evicted
+                    if escalate:
+                        assert entry is not None
+                        entry.force_evicted = True
+                else:
+                    escalate = False
+                    entry = self._entries.get(identity)
+                    if entry is None:
+                        # Nothing live: drop the registration so the key can be
+                        # rebound with a different endpoint or credentials.
+                        self._registrations.pop(identity, None)
+                        return
+                    entry.evicted = True
+                    if mode == "force":
+                        entry.force_evicted = True
+                    registration = self._registrations.get(identity)
+                    task = asyncio.get_running_loop().create_task(
+                        self._evict_impl(
+                            identity,
+                            entry,
+                            generation=registration.generation if registration else None,
+                            timeout=resolved_timeout,
+                        )
+                    )
+                    self._evictions[identity] = task
+        if escalate:
+            # Wake the in-flight drain so it stops waiting for live work.
+            self._notify_drain()
+        if shutdown_task is not None:
+            await asyncio.shield(shutdown_task)
+            return
+        assert task is not None
+        # Shielded so one cancelled caller cannot abort a shared eviction.
+        await asyncio.shield(task)
+
+    async def _evict_impl(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        generation: int | None,
+        timeout: float,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            deadline = loop.time() + timeout
+
+            def quiet() -> bool:
+                return entry.force_evicted or not (entry.leases or entry.active_calls)
+
+            drained = await self._wait_for_quiet(deadline, quiet)
+            with self._lock:
+                if not drained or entry.leases or entry.active_calls:
+                    # Escalation: the transport closes underneath work that is
+                    # still running, so those calls have an unknown outcome.
+                    if not entry.force_evicted:
+                        logger.warning(
+                            "MCP source '%s' eviction drain timed out; forcing close.",
+                            entry.source.name,
+                        )
+                    entry.force_evicted = True
+
+            task = entry.task
+            if task is not None and not task.done():
+                task.cancel()
+                done, pending = await asyncio.wait({task}, timeout=_FORCED_CANCEL_GRACE)
+                for finished in done:
+                    self._consume_task_exception(finished)
+                for unfinished in pending:
+                    logger.warning(
+                        "MCP source '%s' connect task ignored eviction cancellation; "
+                        "abandoning it.",
+                        entry.source.name,
+                    )
+                    self._track_abandoned_task(unfinished)
+
+            close_task = loop.create_task(self._close_adapter(entry))
+            done, pending = await asyncio.wait({close_task}, timeout=_FORCED_CANCEL_GRACE)
+            for finished in done:
+                self._consume_task_exception(finished)
+            for unfinished in pending:
+                logger.warning(
+                    "MCP source '%s' connection cleanup exceeded the eviction grace; "
+                    "allowing it to finish in the background.",
+                    entry.source.name,
+                )
+                self._track_abandoned_task(unfinished)
+        finally:
+            with self._lock:
+                if self._entries.get(identity) is entry:
+                    del self._entries[identity]
+                registration = self._registrations.get(identity)
+                # Remove the registration only if this eviction still owns it,
+                # so a newer rebind is never deleted by an older cleanup.
+                if registration is not None and registration.generation == generation:
+                    del self._registrations[identity]
+                self._evictions.pop(identity, None)
+            self._notify_drain()
 
     async def close(self) -> None:
         """Drain active leases, then start bounded transport cleanup.
@@ -623,8 +879,6 @@ class MCPRuntime:
         retained and observed until its cleanup task eventually finishes.
         """
         with self._lock:
-            if self._state is MCPRuntimeState.CLOSED and self._close_task is None:
-                return
             self._bind_loop()
             if self._close_task is None:
                 self._close_task = asyncio.get_running_loop().create_task(self._close_impl())
@@ -638,25 +892,25 @@ class MCPRuntime:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.shutdown_timeout
-        while True:
-            with self._lock:
-                if not any(entry.leases or entry.active_calls for entry in self._entries.values()):
-                    break
-                event = asyncio.Event()
-                self._drain_event = event
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                await asyncio.wait_for(event.wait(), timeout=remaining)
-            except TimeoutError:
-                break
+
+        def quiet() -> bool:
+            return not any(
+                (entry.leases or entry.active_calls) and not entry.force_evicted
+                for entry in self._entries.values()
+            )
+
+        drained = await self._wait_for_quiet(deadline, quiet)
 
         with self._lock:
             entries = list(self._entries.values())
-            self._entries.clear()
-            self._registrations.clear()
-            self._drain_event = None
+            for entry in entries:
+                entry.evicted = True
+                if not drained and (entry.leases or entry.active_calls):
+                    # Forced shutdown closes the transport underneath a running
+                    # call, so its outcome is unknown just as in a forced evict.
+                    entry.force_evicted = True
+            eviction_tasks = list(self._evictions.values())
+        self._notify_drain()
         connect_tasks = {
             entry.task: entry
             for entry in entries
@@ -704,7 +958,21 @@ class MCPRuntime:
                     entry.source.name,
                 )
                 self._track_abandoned_task(task)
+        if eviction_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in eviction_tasks),
+                return_exceptions=True,
+            )
+            for task in eviction_tasks:
+                exception = self._consume_task_exception(task)
+                if exception is not None:
+                    logger.warning(
+                        "MCPRuntime eviction failed during shutdown",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
         with self._lock:
+            self._entries.clear()
+            self._registrations.clear()
             self._state = MCPRuntimeState.CLOSED
 
     async def __aenter__(self) -> MCPRuntime:
