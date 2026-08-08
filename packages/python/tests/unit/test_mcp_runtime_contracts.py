@@ -39,6 +39,7 @@ class TestMCPRuntimeConfiguration:
         assert runtime.max_connections == 100
         assert runtime.max_in_flight_calls == 100
         assert runtime.idle_timeout == 300.0
+        assert runtime.connection_wait_timeout == 10.0
         assert runtime.shutdown_timeout == 30.0
         assert runtime.state is MCPRuntimeState.OPEN
 

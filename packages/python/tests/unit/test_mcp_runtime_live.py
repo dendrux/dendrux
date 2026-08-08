@@ -9,6 +9,7 @@ on Agent.close(), and drain-based runtime shutdown.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, patch
 
@@ -19,6 +20,7 @@ from dendrux.agent import Agent
 from dendrux.mcp._client import MCPConnectionInfo
 from dendrux.mcp._errors import (
     MCPBindingConflictError,
+    MCPConnectionCapacityError,
     MCPConnectionEvictingError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
@@ -52,6 +54,7 @@ class _InstrumentedAdapter:
     close_gate: ClassVar[asyncio.Event | None] = None
     call_gate: ClassVar[asyncio.Event | None] = None
     connect_error: ClassVar[Exception | None] = None
+    fail_urls: ClassVar[set[str]] = set()
     close_error: ClassVar[Exception | None] = None
     call_error: ClassVar[Exception | None] = None
     suppress_cancel: ClassVar[bool] = False
@@ -85,6 +88,8 @@ class _InstrumentedAdapter:
                         continue
             else:
                 await gate.wait()
+        if self.source.url in type(self).fail_urls:
+            raise ConnectionError(f"refused: {self.source.url}")
         error = type(self).connect_error
         if error is not None:
             raise error
@@ -125,6 +130,7 @@ def _reset_adapter() -> Any:
     _InstrumentedAdapter.close_gate = None
     _InstrumentedAdapter.call_gate = None
     _InstrumentedAdapter.connect_error = None
+    _InstrumentedAdapter.fail_urls = set()
     _InstrumentedAdapter.close_error = None
     _InstrumentedAdapter.call_error = None
     _InstrumentedAdapter.suppress_cancel = False
@@ -2056,3 +2062,597 @@ class TestConcurrentAgentTeardown:
 
         await agent.close()
         await runtime.close()
+
+
+def _bind_key(
+    runtime: MCPRuntime,
+    key: str,
+    *,
+    tenant_key: str | None = None,
+) -> MCPConnection:
+    """Bind one identity whose URL identifies it in adapter assertions."""
+    return runtime.bind(
+        connection_key=key,
+        tenant_key=tenant_key,
+        source=MCPSource.http("github", f"https://mcp.example.com/{key}"),
+    )
+
+
+def _opened_keys() -> list[str]:
+    return [str(a.source.url).rsplit("/", 1)[-1] for a in _InstrumentedAdapter.instances]
+
+
+class TestConnectionCapacity:
+    """max_connections caps live physical entries, not registrations."""
+
+    @pytest.mark.asyncio
+    async def test_registrations_consume_no_capacity(self) -> None:
+        async with MCPRuntime(max_connections=1, shutdown_timeout=0.05) as runtime:
+            for index in range(50):
+                _bind_key(runtime, f"idle-{index}")
+
+            assert runtime._entries == {}
+
+            agent = Agent(prompt="test", tool_sources=[_bind_key(runtime, "live").tools()])
+            await agent.get_tool_lookups()
+
+            assert len(runtime._entries) == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_cap_limits_concurrent_physical_connections(self) -> None:
+        async with MCPRuntime(
+            max_connections=2, connection_wait_timeout=0.05, shutdown_timeout=0.05
+        ) as runtime:
+            held = []
+            for index in range(2):
+                agent = Agent(
+                    prompt=f"a{index}",
+                    tool_sources=[_bind_key(runtime, f"c{index}").tools()],
+                )
+                await agent.get_tool_lookups()
+                held.append(agent)
+
+            assert len(_InstrumentedAdapter.instances) == 2
+
+            third = Agent(prompt="third", tool_sources=[_bind_key(runtime, "c2").tools()])
+            with pytest.raises(MCPConnectionCapacityError) as excinfo:
+                await third.get_tool_lookups()
+
+            assert excinfo.value.identity == (None, "c2")
+            assert excinfo.value.limit == 2
+            assert excinfo.value.timeout == 0.05
+            assert len(_InstrumentedAdapter.instances) == 2
+            for agent in held:
+                await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_zero_wait_timeout_fails_fast(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=0, shutdown_timeout=0.05
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with pytest.raises(MCPConnectionCapacityError):
+                await Agent(
+                    prompt="second", tool_sources=[_bind_key(runtime, "c1").tools()]
+                ).get_tool_lookups()
+
+            assert loop.time() - started < 0.05  # never waited
+            await busy.close()
+
+    @pytest.mark.asyncio
+    async def test_existing_identity_reuse_bypasses_the_queue(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            shared = _bind_key(runtime, "c0")
+            first = Agent(prompt="first", tool_sources=[shared.tools()])
+            await first.get_tool_lookups()
+
+            queued = asyncio.create_task(
+                Agent(
+                    prompt="queued", tool_sources=[_bind_key(runtime, "c1").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+            assert not queued.done()
+
+            # The same identity needs no slot, so it must not wait behind c1.
+            second = Agent(prompt="second", tool_sources=[shared.tools(namespace="gh")])
+            lookups = await asyncio.wait_for(second.get_tool_lookups(), timeout=0.5)
+            assert sorted(lookups.fn) == ["gh__read", "gh__write"]
+            assert len(_InstrumentedAdapter.instances) == 1
+
+            # Releasing every lease makes c0 reclaimable and admits c1.
+            await first.close()
+            await second.close()
+            await asyncio.wait_for(queued, timeout=2.0)
+            assert _opened_keys() == ["c0", "c1"]
+
+    @pytest.mark.asyncio
+    async def test_many_waiters_for_one_identity_share_one_position(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            shared = _bind_key(runtime, "c1")
+            agents = [Agent(prompt=f"w{i}", tool_sources=[shared.tools()]) for i in range(5)]
+            waiters = [asyncio.create_task(a.get_tool_lookups()) for a in agents]
+            await asyncio.sleep(0.05)
+            later = asyncio.create_task(
+                Agent(
+                    prompt="later", tool_sources=[_bind_key(runtime, "c2").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+
+            await busy.close()
+            results = await asyncio.wait_for(asyncio.gather(*waiters), timeout=2.0)
+
+            assert all(sorted(r.fn) == ["github__read", "github__write"] for r in results)
+            assert _opened_keys() == ["c0", "c1"]  # five waiters, one connection
+            assert not later.done()  # c2 is still behind the busy c1
+
+            for agent in agents:
+                await agent.close()
+            await asyncio.wait_for(later, timeout=2.0)
+            assert _opened_keys() == ["c0", "c1", "c2"]
+
+    @pytest.mark.asyncio
+    async def test_admission_is_fifo(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            first_waiter = asyncio.create_task(
+                Agent(
+                    prompt="first", tool_sources=[_bind_key(runtime, "first").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+            second_waiter = asyncio.create_task(
+                Agent(
+                    prompt="second", tool_sources=[_bind_key(runtime, "second").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+
+            await busy.close()
+            await asyncio.wait_for(first_waiter, timeout=2.0)
+
+            assert _opened_keys() == ["c0", "first"]
+            assert not second_waiter.done()  # strictly behind the first
+            second_waiter.cancel()
+            await asyncio.gather(second_waiter, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_a_new_identity_cannot_barge_past_the_queue(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            queued = asyncio.create_task(
+                Agent(
+                    prompt="queued", tool_sources=[_bind_key(runtime, "queued").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+
+            # Freeing the slot and racing a brand-new identity against the
+            # queue head: the head must still win.
+            await busy.close()
+            latecomer = asyncio.create_task(
+                Agent(
+                    prompt="late", tool_sources=[_bind_key(runtime, "late").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.wait_for(queued, timeout=2.0)
+
+            assert _opened_keys() == ["c0", "queued"]
+            assert not latecomer.done()
+            latecomer.cancel()
+            await asyncio.gather(latecomer, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_head_does_not_block_the_queue(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            head = asyncio.create_task(
+                Agent(
+                    prompt="head", tool_sources=[_bind_key(runtime, "head").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+            follower = asyncio.create_task(
+                Agent(
+                    prompt="follower", tool_sources=[_bind_key(runtime, "follower").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+
+            head.cancel()
+            await asyncio.gather(head, return_exceptions=True)
+            await busy.close()
+            await asyncio.wait_for(follower, timeout=2.0)
+
+            assert _opened_keys() == ["c0", "follower"]
+            assert runtime._admission_queue == deque()
+
+    @pytest.mark.asyncio
+    async def test_timed_out_head_does_not_block_the_queue(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=0.3, shutdown_timeout=0.05
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            head = asyncio.create_task(
+                Agent(
+                    prompt="head", tool_sources=[_bind_key(runtime, "head").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.15)
+            follower = asyncio.create_task(
+                Agent(
+                    prompt="follower", tool_sources=[_bind_key(runtime, "follower").tools()]
+                ).get_tool_lookups()
+            )
+
+            with pytest.raises(MCPConnectionCapacityError):
+                await head
+            await busy.close()
+            await asyncio.wait_for(follower, timeout=2.0)
+
+            assert _opened_keys() == ["c0", "follower"]
+
+    @pytest.mark.asyncio
+    async def test_last_release_triggers_pressure_retirement(self) -> None:
+        async with MCPRuntime(
+            max_connections=1,
+            connection_wait_timeout=5.0,
+            idle_timeout=None,  # capacity pressure must retire regardless
+            shutdown_timeout=0.05,
+        ) as runtime:
+            busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+            await busy.get_tool_lookups()
+
+            waiter = asyncio.create_task(
+                Agent(
+                    prompt="waiter", tool_sources=[_bind_key(runtime, "c1").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+            assert not waiter.done()
+
+            await busy.close()
+            await asyncio.wait_for(waiter, timeout=2.0)
+
+            assert _InstrumentedAdapter.instances[0].closed is True  # c0 retired
+            assert _opened_keys() == ["c0", "c1"]
+
+    @pytest.mark.asyncio
+    async def test_pressure_retires_the_oldest_idle_connection(self) -> None:
+        async with MCPRuntime(
+            max_connections=2,
+            connection_wait_timeout=5.0,
+            idle_timeout=None,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            older = Agent(prompt="older", tool_sources=[_bind_key(runtime, "older").tools()])
+            newer = Agent(prompt="newer", tool_sources=[_bind_key(runtime, "newer").tools()])
+            await older.get_tool_lookups()
+            await newer.get_tool_lookups()
+
+            await older.close()  # idle first
+            await asyncio.sleep(0.01)
+            await newer.close()  # idle second
+
+            await asyncio.wait_for(
+                Agent(
+                    prompt="third", tool_sources=[_bind_key(runtime, "third").tools()]
+                ).get_tool_lookups(),
+                timeout=2.0,
+            )
+
+            by_key = dict(zip(_opened_keys(), _InstrumentedAdapter.instances, strict=False))
+            assert by_key["older"].closed is True
+            assert by_key["newer"].closed is False
+
+    @pytest.mark.asyncio
+    async def test_pressure_retirement_preserves_the_registration(self) -> None:
+        async with MCPRuntime(
+            max_connections=1,
+            connection_wait_timeout=5.0,
+            idle_timeout=None,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            retired = _bind_key(runtime, "c0")
+            first = Agent(prompt="first", tool_sources=[retired.tools()])
+            await first.get_tool_lookups()
+            await first.close()
+
+            pressure = Agent(prompt="pressure", tool_sources=[_bind_key(runtime, "c1").tools()])
+            await asyncio.wait_for(pressure.get_tool_lookups(), timeout=2.0)
+            await pressure.close()
+
+            # Retirement is not eviction: the original handle still works.
+            reused = Agent(prompt="reused", tool_sources=[retired.tools()])
+            lookups = await asyncio.wait_for(reused.get_tool_lookups(), timeout=2.0)
+
+            assert sorted(lookups.fn) == ["github__read", "github__write"]
+            await reused.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_connection_releases_its_slot(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        _InstrumentedAdapter.fail_urls = {"https://mcp.example.com/broken"}
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            failing = asyncio.create_task(
+                Agent(
+                    prompt="failing", tool_sources=[_bind_key(runtime, "broken").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+            queued = asyncio.create_task(
+                Agent(
+                    prompt="queued", tool_sources=[_bind_key(runtime, "healthy").tools()]
+                ).get_tool_lookups()
+            )
+            await asyncio.sleep(0.05)
+            assert not queued.done()
+
+            _InstrumentedAdapter.connect_gate.set()
+            with pytest.raises(ConnectionError):
+                await failing
+
+            # The slot the doomed handshake held must free immediately.
+            await asyncio.wait_for(queued, timeout=2.0)
+            assert _opened_keys() == ["broken", "healthy"]
+
+    @pytest.mark.asyncio
+    async def test_wait_timeout_excludes_the_handshake(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=0.05, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="slow", tool_sources=[_bind_key(runtime, "c0").tools()])
+            discovery = asyncio.create_task(agent.get_tool_lookups())
+
+            # Admitted immediately; the slow handshake must not be charged
+            # against the capacity wait budget.
+            await asyncio.sleep(0.2)
+            assert not discovery.done()
+
+            _InstrumentedAdapter.connect_gate.set()
+            lookups = await asyncio.wait_for(discovery, timeout=1.0)
+            assert sorted(lookups.fn) == ["github__read", "github__write"]
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_tenants_hold_independent_physical_entries(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=0.05, shutdown_timeout=0.05
+        ) as runtime:
+            tenant_a = Agent(
+                prompt="a",
+                tool_sources=[_bind_key(runtime, "github", tenant_key="tenant-a").tools()],
+            )
+            await tenant_a.get_tool_lookups()
+
+            # Same connection key, different tenant: a separate connection that
+            # cannot reuse tenant-a's, so it must queue and time out.
+            tenant_b = Agent(
+                prompt="b",
+                tool_sources=[_bind_key(runtime, "github", tenant_key="tenant-b").tools()],
+            )
+            with pytest.raises(MCPConnectionCapacityError) as excinfo:
+                await tenant_b.get_tool_lookups()
+
+            assert excinfo.value.identity == ("tenant-b", "github")
+            assert len(_InstrumentedAdapter.instances) == 1
+            await tenant_a.close()
+
+    @pytest.mark.asyncio
+    async def test_resistant_cleanup_releases_logical_capacity(self) -> None:
+        _InstrumentedAdapter.close_gate = asyncio.Event()  # never released
+        runtime = MCPRuntime(
+            max_connections=1,
+            connection_wait_timeout=5.0,
+            idle_timeout=None,
+            shutdown_timeout=0.05,
+        )
+        busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+        await busy.get_tool_lookups()
+        await busy.close()
+
+        waiter = Agent(prompt="waiter", tool_sources=[_bind_key(runtime, "c1").tools()])
+
+        # Pressure retirement hands the stuck close to background tracking;
+        # the logical slot must free at handoff, not at socket close.
+        await asyncio.wait_for(waiter.get_tool_lookups(), timeout=2.0)
+
+        assert len(runtime._abandoned_tasks) == 1
+        assert _opened_keys() == ["c0", "c1"]
+        _InstrumentedAdapter.close_gate.set()
+        await waiter.close()
+        await asyncio.wait_for(runtime.close(), timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_pressure_retirement_does_not_arm_an_idle_timer_too(self) -> None:
+        _InstrumentedAdapter.close_gate = asyncio.Event()
+        runtime = MCPRuntime(
+            max_connections=1,
+            connection_wait_timeout=5.0,
+            idle_timeout=300.0,
+            shutdown_timeout=0.05,
+        )
+        first = Agent(prompt="first", tool_sources=[_bind_key(runtime, "first").tools()])
+        await first.get_tool_lookups()
+        entry = runtime._entries[(None, "first")]
+        waiting_agent = Agent(
+            prompt="waiting",
+            tool_sources=[_bind_key(runtime, "waiting").tools()],
+        )
+        waiting = asyncio.create_task(waiting_agent.get_tool_lookups())
+        await _wait_until(lambda: bool(runtime._admission_queue))
+
+        await first.close()
+        await _wait_until(lambda: entry.retire_task is not None)
+
+        assert entry.idle_handle is None
+        _InstrumentedAdapter.close_gate.set()
+        await asyncio.wait_for(waiting, timeout=2.0)
+        await waiting_agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_evicting_a_queued_identity_wakes_it_immediately(self) -> None:
+        runtime = MCPRuntime(
+            max_connections=1,
+            connection_wait_timeout=5.0,
+            shutdown_timeout=0.05,
+        )
+        busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "busy").tools()])
+        await busy.get_tool_lookups()
+        queued_agent = Agent(
+            prompt="queued",
+            tool_sources=[_bind_key(runtime, "queued").tools()],
+        )
+        queued = asyncio.create_task(queued_agent.get_tool_lookups())
+        await _wait_until(lambda: bool(runtime._admission_queue))
+
+        await runtime.evict(connection_key="queued", mode="force")
+
+        with pytest.raises(MCPStaleConnectionError):
+            await asyncio.wait_for(queued, timeout=0.5)
+        assert runtime._admission_queue == deque()
+        assert runtime._admissions == {}
+        await queued_agent.close()
+        await busy.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_live_eviction_releases_capacity_for_the_fifo_head(self) -> None:
+        runtime = MCPRuntime(
+            max_connections=1,
+            connection_wait_timeout=5.0,
+            shutdown_timeout=0.05,
+        )
+        busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "busy").tools()])
+        await busy.get_tool_lookups()
+        queued_agent = Agent(
+            prompt="queued",
+            tool_sources=[_bind_key(runtime, "queued").tools()],
+        )
+        queued = asyncio.create_task(queued_agent.get_tool_lookups())
+        await _wait_until(lambda: bool(runtime._admission_queue))
+
+        evicting = asyncio.create_task(
+            runtime.evict(connection_key="busy", mode="drain", timeout=1.0)
+        )
+        await _wait_until(lambda: (None, "busy") in runtime._evictions)
+        assert not queued.done()
+        await busy.close()
+        await asyncio.wait_for(evicting, timeout=2.0)
+        lookups = await asyncio.wait_for(queued, timeout=2.0)
+
+        assert sorted(lookups.fn) == ["github__read", "github__write"]
+        assert _opened_keys() == ["busy", "queued"]
+        await queued_agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_wakes_capacity_waiters(self) -> None:
+        runtime = MCPRuntime(max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05)
+        busy = Agent(prompt="busy", tool_sources=[_bind_key(runtime, "c0").tools()])
+        await busy.get_tool_lookups()
+
+        waiter = asyncio.create_task(
+            Agent(
+                prompt="waiter", tool_sources=[_bind_key(runtime, "c1").tools()]
+            ).get_tool_lookups()
+        )
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+
+        closing = asyncio.create_task(runtime.close())
+        with pytest.raises(MCPRuntimeClosedError):
+            await asyncio.wait_for(waiter, timeout=2.0)
+
+        await busy.close()
+        await asyncio.wait_for(closing, timeout=2.0)
+        assert runtime._admission_queue == deque()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_fences_new_admission_before_it_yields(self) -> None:
+        runtime = MCPRuntime(max_connections=1, shutdown_timeout=0.05)
+        connection = _bind_key(runtime, "late")
+        start = asyncio.Event()
+
+        async def close_runtime() -> None:
+            await start.wait()
+            await runtime.close()
+
+        async def open_connection() -> Any:
+            await start.wait()
+            return await Agent(
+                prompt="late",
+                tool_sources=[connection.tools()],
+            ).get_tool_lookups()
+
+        closing = asyncio.create_task(close_runtime())
+        opening = asyncio.create_task(open_connection())
+        await asyncio.sleep(0)
+        start.set()
+        closed_result, open_result = await asyncio.gather(
+            closing,
+            opening,
+            return_exceptions=True,
+        )
+
+        assert closed_result is None
+        assert isinstance(open_result, MCPRuntimeClosedError)
+        assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_opens_never_exceed_the_cap(self) -> None:
+        async with MCPRuntime(
+            max_connections=3, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            peak = 0
+
+            async def one(index: int) -> None:
+                nonlocal peak
+                agent = Agent(
+                    prompt=f"a{index}",
+                    tool_sources=[_bind_key(runtime, f"c{index}").tools()],
+                )
+                await agent.get_tool_lookups()
+                peak = max(peak, len(runtime._entries))
+                assert len(runtime._entries) <= 3
+                await agent.close()
+
+            await asyncio.wait_for(asyncio.gather(*(one(i) for i in range(12))), timeout=10.0)
+
+            assert peak == 3  # the cap is actually reached, not merely respected
+
+    def test_connection_wait_timeout_is_validated(self) -> None:
+        for invalid in (-1.0, float("inf"), "5"):
+            with pytest.raises(ValueError, match="connection_wait_timeout"):
+                MCPRuntime(connection_wait_timeout=invalid)  # type: ignore[arg-type]

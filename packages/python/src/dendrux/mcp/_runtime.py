@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
+from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from threading import Lock
@@ -14,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._errors import (
     MCPBindingConflictError,
+    MCPConnectionCapacityError,
     MCPConnectionError,
     MCPConnectionEvictingError,
     MCPOutcomeUnknownError,
@@ -343,6 +346,7 @@ class _ConnectionEntry:
         "fenced",
         "force_evicted",
         "idle_handle",
+        "idle_seq",
         "info",
         "leases",
         "raw_tools",
@@ -370,6 +374,25 @@ class _ConnectionEntry:
         # never touch a replacement connection.
         self.idle_handle: asyncio.TimerHandle | None = None
         self.retire_task: asyncio.Task[None] | None = None
+        # Monotonic stamp of when this entry last became idle. Ordering, not
+        # time: capacity pressure retires the smallest sequence first. Tracked
+        # even when idle_timeout is None, which only disables the timer.
+        self.idle_seq: int | None = None
+
+
+class _Admission:
+    """One FIFO position in the queue for opening a physical connection.
+
+    Every caller waiting on the same missing identity shares one position, so
+    a hundred Agents racing for one server never crowd out other identities.
+    """
+
+    __slots__ = ("event", "identity", "waiters")
+
+    def __init__(self, identity: tuple[str | None, str]) -> None:
+        self.identity = identity
+        self.event = asyncio.Event()
+        self.waiters = 0
 
 
 @dataclass(slots=True)
@@ -408,8 +431,9 @@ class MCPRuntime:
     * **Idle retirement** — after ``idle_timeout`` seconds with no leases and
       no in-flight calls, the transport closes but the registration and its
       generation survive, so existing handles reconnect transparently. Pass
-      ``idle_timeout=None`` to disable it and keep connections warm; ``0``
-      retires as soon as the last lease is released.
+      ``idle_timeout=None`` to disable timed retirement; capacity pressure may
+      still retire an idle connection. ``0`` retires as soon as the last lease
+      is released.
     * **Eviction** — :meth:`evict` closes the transport *and* forgets the
       registration, permanently invalidating every handle issued for it.
     * **Shutdown** — :meth:`close` drains, then tears everything down.
@@ -425,6 +449,7 @@ class MCPRuntime:
         max_connections: int = 100,
         max_in_flight_calls: int = 100,
         idle_timeout: float | None = 300.0,
+        connection_wait_timeout: float = 10.0,
         shutdown_timeout: float = 30.0,
     ) -> None:
         self.max_connections = _positive_int(max_connections, "max_connections")
@@ -437,6 +462,12 @@ class MCPRuntime:
         # whose subprocess startup costs more than holding the connection.
         self.idle_timeout: float | None = (
             None if idle_timeout is None else _non_negative_float(idle_timeout, "idle_timeout")
+        )
+        # Bounds only the wait for a free connection slot, never the MCP
+        # handshake itself. 0 fails fast instead of queueing.
+        self.connection_wait_timeout = _non_negative_float(
+            connection_wait_timeout,
+            "connection_wait_timeout",
         )
         self.shutdown_timeout = _positive_float(shutdown_timeout, "shutdown_timeout")
         self._state = MCPRuntimeState.OPEN
@@ -451,6 +482,11 @@ class MCPRuntime:
         self._close_task: asyncio.Task[None] | None = None
         self._abandoned_tasks: set[asyncio.Task[None]] = set()
         self._generation_seq = 0
+        # Insertion into _entries *is* the slot reservation, so capacity is
+        # always len(self._entries) with no counter that could drift.
+        self._admission_queue: deque[_Admission] = deque()
+        self._admissions: dict[tuple[str | None, str], _Admission] = {}
+        self._idle_seq = 0
         self._lock = Lock()
 
     def _bind_loop(self) -> None:
@@ -521,11 +557,122 @@ class MCPRuntime:
                     self._drain_waiters.discard(waiter)
 
     def _cancel_idle(self, entry: _ConnectionEntry) -> None:
-        """Cancel a pending idle timer. Caller must hold the runtime lock."""
+        """Clear idle state on an entry. Caller must hold the runtime lock."""
         handle = entry.idle_handle
         if handle is not None:
             handle.cancel()
             entry.idle_handle = None
+        entry.idle_seq = None
+
+    def _discard_entry(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+    ) -> None:
+        """Relinquish ownership of one entry and free its slot.
+
+        The single place a physical entry leaves the runtime, so capacity and
+        the admission queue can never disagree with ``_entries``. Caller must
+        hold the runtime lock.
+        """
+        if self._entries.get(identity) is entry:
+            self._cancel_idle(entry)
+            del self._entries[identity]
+        self._pump_admissions()
+
+    def _pump_admissions(self) -> None:
+        """Admit the queue head, or start one retirement to make room.
+
+        Caller must hold the runtime lock.
+        """
+        while self._admission_queue:
+            head = self._admission_queue[0]
+            if head.waiters == 0:
+                # Every caller for this identity left; drop the position so it
+                # cannot wedge the queue behind an absent waiter.
+                self._admission_queue.popleft()
+                if self._admissions.get(head.identity) is head:
+                    del self._admissions[head.identity]
+                continue
+            if len(self._entries) < self.max_connections:
+                head.event.set()
+            else:
+                # Only the head may provoke reclamation, and only one at a
+                # time: the retirement frees a slot and pumps again.
+                self._try_pressure_retire()
+            return
+
+    def _can_admit(self, admission: _Admission | None) -> bool:
+        """Whether this caller may open a new connection right now.
+
+        A free slot is not enough: queued identities must not be barged past,
+        so only the queue head (or any caller when nothing is queued) wins.
+        Caller must hold the runtime lock.
+        """
+        if len(self._entries) >= self.max_connections:
+            return False
+        if not self._admission_queue:
+            return True
+        return self._admission_queue[0] is admission
+
+    def _enqueue_admission(
+        self,
+        identity: tuple[str | None, str],
+        admission: _Admission | None,
+    ) -> _Admission:
+        """Join (or create) this identity's single FIFO position.
+
+        Caller must hold the runtime lock.
+        """
+        if admission is not None:
+            return admission
+        existing = self._admissions.get(identity)
+        if existing is None:
+            existing = _Admission(identity)
+            self._admissions[identity] = existing
+            self._admission_queue.append(existing)
+        existing.waiters += 1
+        return existing
+
+    def _release_admission(self, admission: _Admission | None) -> None:
+        """Drop one waiter from a FIFO position, retiring it when empty.
+
+        Caller must hold the runtime lock.
+        """
+        if admission is None:
+            return
+        if admission.waiters > 0:
+            admission.waiters -= 1
+        if admission.waiters:
+            return
+        if self._admissions.get(admission.identity) is admission:
+            del self._admissions[admission.identity]
+        with contextlib.suppress(ValueError):
+            self._admission_queue.remove(admission)
+        # A departing head must hand the queue to the next caller.
+        self._pump_admissions()
+
+    def _try_pressure_retire(self) -> None:
+        """Retire the longest-idle connection to free a slot, if one exists.
+
+        Capacity pressure retires regardless of ``idle_timeout``; that option
+        only disables the *timer*. Caller must hold the runtime lock.
+        """
+        if self._state is not MCPRuntimeState.OPEN or self._loop is None:
+            return
+        if any(entry.retire_task is not None for entry in self._entries.values()):
+            return  # a reclamation is already in flight
+        candidate: tuple[tuple[str | None, str], _ConnectionEntry] | None = None
+        for identity, entry in self._entries.items():
+            if entry.idle_seq is None or not self._is_retirable(identity, entry):
+                continue
+            if candidate is None or entry.idle_seq < candidate[1].idle_seq:  # type: ignore[operator]
+                candidate = (identity, entry)
+        if candidate is None:
+            return  # every connection is busy; a release will pump again
+        identity, entry = candidate
+        self._cancel_idle(entry)
+        entry.retire_task = self._loop.create_task(self._retire(identity, entry))
 
     def _is_retirable(
         self,
@@ -557,21 +704,24 @@ class MCPRuntime:
         the runtime lock.
         """
         loop = self._loop
-        idle_timeout = self.idle_timeout
-        if (
-            loop is None
-            or idle_timeout is None
-            or entry.idle_handle is not None
-            or entry.retire_task is not None
-            or not self._is_retirable(identity, entry)
-        ):
+        if loop is None or entry.retire_task is not None or not self._is_retirable(identity, entry):
             return
-        entry.idle_handle = loop.call_later(
-            idle_timeout,
-            self._on_idle_expired,
-            identity,
-            entry,
-        )
+        if entry.idle_seq is None:
+            self._idle_seq += 1
+            entry.idle_seq = self._idle_seq
+            # Newly reclaimable: a waiting caller can now retire this entry
+            # even though len(_entries) has not changed yet.
+            self._pump_admissions()
+            if entry.retire_task is not None:
+                return
+        idle_timeout = self.idle_timeout
+        if idle_timeout is not None and entry.idle_handle is None:
+            entry.idle_handle = loop.call_later(
+                idle_timeout,
+                self._on_idle_expired,
+                identity,
+                entry,
+            )
 
     def _on_idle_expired(
         self,
@@ -623,8 +773,7 @@ class MCPRuntime:
             )
         finally:
             with self._lock:
-                if self._entries.get(identity) is entry:
-                    del self._entries[identity]
+                self._discard_entry(identity, entry)
                 entry.retire_task = None
             self._notify_drain()
 
@@ -696,52 +845,92 @@ class MCPRuntime:
             )
 
     async def _lease(self, connection: MCPConnection) -> _ConnectionEntry:
-        """Lease the shared physical connection, opening it single-flight."""
+        """Lease the shared physical connection, opening it single-flight.
+
+        Opening a *new* physical connection consumes one of
+        ``max_connections`` slots and queues FIFO when the pool is full;
+        reusing a live one never waits.
+        """
         identity = connection.identity
-        while True:
-            with self._lock:
-                if self._state is not MCPRuntimeState.OPEN:
-                    raise MCPRuntimeClosedError(
-                        "MCPRuntime is closed and cannot open MCP connections."
-                    )
-                self._bind_loop()
-                if identity in self._evictions:
-                    raise MCPConnectionEvictingError(
-                        identity,
-                        f"MCP connection {identity!r} is being evicted and cannot accept "
-                        "new leases. Bind again once eviction completes.",
-                    )
-                registration = self._registrations.get(identity)
-                if registration is None:
-                    raise MCPStaleConnectionError(
-                        identity,
-                        f"MCP connection handle {identity!r} is no longer registered; it was "
-                        "evicted or never bound. Bind again and use the new handle.",
-                    )
-                if registration.generation != connection.generation or not _same_connection_config(
-                    registration.source, connection.source
-                ):
-                    raise MCPStaleConnectionError(
-                        identity,
-                        f"MCP connection handle {identity!r} was superseded by a rebind "
-                        "with a different configuration. Bind again and use the new handle.",
-                    )
-                entry = self._entries.get(identity)
-                retire_task = entry.retire_task if entry is not None else None
-                if retire_task is None:
-                    if entry is None:
-                        entry = _ConnectionEntry(registration.source)
-                        entry.task = asyncio.get_running_loop().create_task(
-                            self._open_connection(identity, entry)
+        admission: _Admission | None = None
+        deadline: float | None = None
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                with self._lock:
+                    if self._state is not MCPRuntimeState.OPEN:
+                        raise MCPRuntimeClosedError(
+                            "MCPRuntime is closed and cannot open MCP connections."
                         )
-                        self._entries[identity] = entry
-                    self._cancel_idle(entry)
-                    entry.leases += 1
-                    task = entry.task
-                    break
-            # This socket is being retired for idleness. Retirement is bounded,
-            # so wait it out and reconnect instead of failing the caller.
-            await asyncio.shield(retire_task)
+                    self._bind_loop()
+                    if identity in self._evictions:
+                        raise MCPConnectionEvictingError(
+                            identity,
+                            f"MCP connection {identity!r} is being evicted and cannot accept "
+                            "new leases. Bind again once eviction completes.",
+                        )
+                    registration = self._registrations.get(identity)
+                    if registration is None:
+                        raise MCPStaleConnectionError(
+                            identity,
+                            f"MCP connection handle {identity!r} is no longer registered; it was "
+                            "evicted or never bound. Bind again and use the new handle.",
+                        )
+                    if (
+                        registration.generation != connection.generation
+                        or not _same_connection_config(registration.source, connection.source)
+                    ):
+                        raise MCPStaleConnectionError(
+                            identity,
+                            f"MCP connection handle {identity!r} was superseded by a rebind "
+                            "with a different configuration. Bind again and use the new handle.",
+                        )
+                    entry = self._entries.get(identity)
+                    retire_task = entry.retire_task if entry is not None else None
+                    if retire_task is None:
+                        if entry is not None:
+                            # Reusing a live identity needs no slot, so it never
+                            # queues behind callers opening other connections.
+                            self._cancel_idle(entry)
+                            entry.leases += 1
+                            task = entry.task
+                            break
+                        if self._can_admit(admission):
+                            entry = _ConnectionEntry(registration.source)
+                            entry.task = loop.create_task(self._open_connection(identity, entry))
+                            # Insertion into _entries is the slot reservation.
+                            self._entries[identity] = entry
+                            self._release_admission(admission)
+                            admission = None
+                            entry.leases += 1
+                            task = entry.task
+                            break
+                        if deadline is None:
+                            deadline = loop.time() + self.connection_wait_timeout
+                        if loop.time() >= deadline:
+                            raise MCPConnectionCapacityError(
+                                identity,
+                                limit=self.max_connections,
+                                timeout=self.connection_wait_timeout,
+                            )
+                        admission = self._enqueue_admission(identity, admission)
+                        admission.event.clear()
+                        waiter = admission.event
+                        remaining = deadline - loop.time()
+                        self._pump_admissions()
+                if retire_task is not None:
+                    # This socket is being retired for idleness. Retirement is
+                    # bounded, so wait it out and reconnect rather than fail.
+                    await asyncio.shield(retire_task)
+                    continue
+                try:
+                    await asyncio.wait_for(waiter.wait(), timeout=remaining)
+                except TimeoutError:
+                    continue  # re-check under the lock, then raise the capacity error
+        finally:
+            if admission is not None:
+                with self._lock:
+                    self._release_admission(admission)
 
         assert task is not None
         try:
@@ -767,12 +956,9 @@ class MCPRuntime:
         except BaseException:
             with self._lock:
                 if self._entries.get(identity) is entry and not entry.fenced:
-                    # A waiter that walked away mid-handshake may have armed an
-                    # idle timer on this entry. Drop it with the entry, or the
-                    # loop pins the entry and its credentials until it expires.
-                    self._cancel_idle(entry)
-                    # Discard so the identity can be retried with a fresh entry.
-                    del self._entries[identity]
+                    # Discard so the identity can be retried with a fresh entry,
+                    # freeing its slot and any idle timer a departed waiter armed.
+                    self._discard_entry(identity, entry)
             if adapter is not None:
                 try:
                     await adapter.close()
@@ -993,8 +1179,13 @@ class MCPRuntime:
                     entry = self._entries.get(identity)
                     if entry is None:
                         # Nothing live: drop the registration so the key can be
-                        # rebound with a different endpoint or credentials.
+                        # rebound with a different endpoint or credentials. A
+                        # caller already queued for this identity must re-check
+                        # immediately instead of sleeping until its timeout.
                         self._registrations.pop(identity, None)
+                        admission = self._admissions.get(identity)
+                        if admission is not None:
+                            admission.event.set()
                         return
                     entry.fenced = True
                     if mode == "force":
@@ -1062,8 +1253,7 @@ class MCPRuntime:
             )
         finally:
             with self._lock:
-                if self._entries.get(identity) is entry:
-                    del self._entries[identity]
+                self._discard_entry(identity, entry)
                 registration = self._registrations.get(identity)
                 # Remove the registration only if this eviction still owns it,
                 # so a newer rebind is never deleted by an older cleanup.
@@ -1083,15 +1273,18 @@ class MCPRuntime:
         with self._lock:
             self._bind_loop()
             if self._close_task is None:
+                # Fence synchronously before yielding to _close_impl. Otherwise
+                # a ready lease task can reserve and fully open a connection
+                # after shutdown has already been requested.
+                self._state = MCPRuntimeState.DRAINING
+                for admission in self._admission_queue:
+                    admission.event.set()
                 self._close_task = asyncio.get_running_loop().create_task(self._close_impl())
             task = self._close_task
         # Shielded so one cancelled caller cannot abort the shared shutdown.
         await asyncio.shield(task)
 
     async def _close_impl(self) -> None:
-        with self._lock:
-            self._state = MCPRuntimeState.DRAINING
-
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.shutdown_timeout
 

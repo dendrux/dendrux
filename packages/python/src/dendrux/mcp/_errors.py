@@ -64,6 +64,29 @@ class MCPConnectionEvictingError(MCPConnectionStateError):
     """
 
 
+class MCPConnectionCapacityError(MCPConnectionStateError):
+    """The runtime had no free connection slot within the wait budget.
+
+    Transient: the identity is still registered and the same handle succeeds
+    once another connection is released, retired, or evicted.
+    """
+
+    def __init__(
+        self,
+        identity: tuple[str | None, str],
+        *,
+        limit: int,
+        timeout: float,
+    ) -> None:
+        self.limit = limit
+        self.timeout = timeout
+        super().__init__(
+            identity,
+            f"MCP connection {identity!r} could not be opened: the runtime is at its "
+            f"{limit}-connection limit and no slot became free within {timeout}s.",
+        )
+
+
 class MCPStaleConnectionError(MCPConnectionStateError):
     """The connection handle no longer matches its registered identity.
 
