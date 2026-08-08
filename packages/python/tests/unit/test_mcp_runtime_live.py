@@ -20,6 +20,8 @@ from dendrux.agent import Agent
 from dendrux.mcp._client import MCPConnectionInfo
 from dendrux.mcp._errors import (
     MCPBindingConflictError,
+    MCPCallCapacityError,
+    MCPCapacityError,
     MCPConnectionCapacityError,
     MCPConnectionEvictingError,
     MCPOutcomeUnknownError,
@@ -58,6 +60,12 @@ class _InstrumentedAdapter:
     close_error: ClassVar[Exception | None] = None
     call_error: ClassVar[Exception | None] = None
     suppress_cancel: ClassVar[bool] = False
+    suppress_call_cancel: ClassVar[bool] = False
+    # Call admission instrumentation: the order calls entered the transport,
+    # and how many were ever inside it at once.
+    call_log: ClassVar[list[str]] = []
+    in_call: ClassVar[int] = 0
+    peak_in_call: ClassVar[int] = 0
 
     def __init__(self, source: MCPSource) -> None:
         self.source = source
@@ -99,17 +107,32 @@ class _InstrumentedAdapter:
         return list(type(self).tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        cls = type(self)
         self.call_tool_calls += 1
-        gate = type(self).call_gate
-        if gate is not None:
-            await gate.wait()
-        if self.closed:
-            # A real transport fails an in-flight call once it is closed.
-            raise ConnectionError("transport closed")
-        error = type(self).call_error
-        if error is not None:
-            raise error
-        return CallToolResult(content=[TextContent(text=f"{name}:ok")])
+        cls.call_log.append(str(arguments.get("value", name)))
+        cls.in_call += 1
+        cls.peak_in_call = max(cls.peak_in_call, cls.in_call)
+        try:
+            gate = cls.call_gate
+            if gate is not None:
+                if cls.suppress_call_cancel:
+                    while True:
+                        try:
+                            await gate.wait()
+                            break
+                        except asyncio.CancelledError:
+                            continue
+                else:
+                    await gate.wait()
+            if self.closed:
+                # A real transport fails an in-flight call once it is closed.
+                raise ConnectionError("transport closed")
+            error = cls.call_error
+            if error is not None:
+                raise error
+            return CallToolResult(content=[TextContent(text=f"{name}:ok")])
+        finally:
+            cls.in_call -= 1
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -134,6 +157,10 @@ def _reset_adapter() -> Any:
     _InstrumentedAdapter.close_error = None
     _InstrumentedAdapter.call_error = None
     _InstrumentedAdapter.suppress_cancel = False
+    _InstrumentedAdapter.suppress_call_cancel = False
+    _InstrumentedAdapter.call_log = []
+    _InstrumentedAdapter.in_call = 0
+    _InstrumentedAdapter.peak_in_call = 0
     with patch("dendrux.mcp._runtime.MCPClientAdapter", _InstrumentedAdapter):
         yield
 
@@ -164,6 +191,10 @@ def _bind(
 
 def _total_connects() -> int:
     return sum(adapter.connect_calls for adapter in _InstrumentedAdapter.instances)
+
+
+def _total_calls() -> int:
+    return sum(adapter.call_tool_calls for adapter in _InstrumentedAdapter.instances)
 
 
 class TestAgentConsumesToolViews:
@@ -941,7 +972,7 @@ class TestExplicitEviction:
         late = Agent(prompt="late", tool_sources=[connection.tools(namespace="late")])
         with pytest.raises(RuntimeError, match="evict"):
             await late.get_tool_lookups()
-        with pytest.raises(MCPToolCallError):
+        with pytest.raises(MCPConnectionEvictingError):
             await retained(value="must-not-run")
         assert adapter.call_tool_calls == 0
 
@@ -2656,3 +2687,614 @@ class TestConnectionCapacity:
         for invalid in (-1.0, float("inf"), "5"):
             with pytest.raises(ValueError, match="connection_wait_timeout"):
                 MCPRuntime(connection_wait_timeout=invalid)  # type: ignore[arg-type]
+
+
+class TestCallConcurrency:
+    """max_in_flight_calls caps executing tool calls across the whole runtime."""
+
+    @pytest.mark.asyncio
+    async def test_cap_limits_simultaneously_executing_calls(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=2, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            call = lookups.fn["github__read"]
+
+            pending = [asyncio.create_task(call(value=index)) for index in range(5)]
+            await _wait_until(lambda: len(runtime._call_queue) == 3)
+
+            assert runtime._in_flight_calls == 2
+            assert _total_calls() == 2  # three never reached the transport
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=2.0)
+
+            assert _InstrumentedAdapter.peak_in_call == 2
+            assert _total_calls() == 5
+            assert runtime._in_flight_calls == 0
+            assert runtime._call_queue == deque()
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_queued_calls_start_in_fifo_order(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            call = lookups.fn["github__read"]
+
+            pending = [asyncio.create_task(call(value="first"))]
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            for position, label in enumerate(("second", "third", "fourth"), start=1):
+                pending.append(asyncio.create_task(call(value=label)))
+                await _wait_until(lambda queued=position: len(runtime._call_queue) == queued)
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=2.0)
+
+            assert _InstrumentedAdapter.call_log == ["first", "second", "third", "fourth"]
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_wait_timeout_raises_a_typed_capacity_error(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=0.05, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            busy = asyncio.create_task(lookups.fn["github__read"](value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+            with pytest.raises(MCPCallCapacityError) as excinfo:
+                await lookups.fn["github__write"](value="shed")
+
+            assert excinfo.value.identity == (None, "github-1")
+            assert excinfo.value.tool == "github__write"
+            assert excinfo.value.limit == 1
+            assert excinfo.value.timeout == 0.05
+            assert isinstance(excinfo.value, MCPCapacityError)
+            # Shedding is not a failed call: nothing was attempted server-side.
+            assert not isinstance(excinfo.value, MCPToolCallError)
+            assert _total_calls() == 1
+            assert runtime._call_queue == deque()
+            assert runtime._in_flight_calls == 1  # the busy call kept its slot
+
+            entry = agent._tool_sources[0]._entry
+            assert entry is not None
+            assert entry.active_calls == 1  # the shed call never counted
+
+            gate.set()
+            await asyncio.wait_for(busy, timeout=1.0)
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_zero_call_wait_timeout_sheds_immediately(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            busy = asyncio.create_task(lookups.fn["github__read"](value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with pytest.raises(MCPCallCapacityError):
+                await lookups.fn["github__write"](value="shed")
+
+            assert loop.time() - started < 0.05  # never queued
+            gate.set()
+            await asyncio.wait_for(busy, timeout=1.0)
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_call_releases_its_slot(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionError("server exploded")
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+
+            # With a single slot and zero wait budget, one leaked slot would
+            # turn the next call into a capacity error instead of a retry.
+            for _ in range(3):
+                with pytest.raises(MCPToolCallError):
+                    await lookups.fn["github__write"](value="boom")
+                assert runtime._in_flight_calls == 0
+
+            _InstrumentedAdapter.call_error = None
+            assert await lookups.fn["github__write"](value="ok") == "write:ok"
+            assert runtime._in_flight_calls == 0
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_queued_call_frees_its_position(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            call = lookups.fn["github__read"]
+
+            busy = asyncio.create_task(call(value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            abandoned = asyncio.create_task(call(value="abandoned"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+            follower = asyncio.create_task(call(value="follower"))
+            await _wait_until(lambda: len(runtime._call_queue) == 2)
+
+            abandoned.cancel()
+            await asyncio.gather(abandoned, return_exceptions=True)
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(busy, follower), timeout=2.0)
+
+            # The cancelled position neither ran nor wedged the one behind it.
+            assert _InstrumentedAdapter.call_log == ["busy", "follower"]
+            assert runtime._in_flight_calls == 0
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelling_an_executing_call_releases_its_slot(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            call = lookups.fn["github__read"]
+
+            running = asyncio.create_task(call(value="running"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            queued = asyncio.create_task(call(value="queued"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+            gate.set()
+            assert await asyncio.wait_for(queued, timeout=1.0) == "read:ok"
+            assert runtime._in_flight_calls == 0
+            entry = agent._tool_sources[0]._entry
+            assert entry is not None
+            assert entry.active_calls == 0
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_agent_close_invalidates_its_queued_call(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            busy_agent = Agent(prompt="busy", tool_sources=[connection.tools()])
+            busy_lookups = await busy_agent.get_tool_lookups()
+            queued_agent = Agent(prompt="queued", tool_sources=[connection.tools(namespace="gh")])
+            queued_lookups = await queued_agent.get_tool_lookups()
+
+            busy = asyncio.create_task(busy_lookups.fn["github__read"](value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            queued = asyncio.create_task(queued_lookups.fn["gh__read"](value="queued"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+            await queued_agent.close()
+
+            with pytest.raises(MCPToolCallError):
+                await asyncio.wait_for(queued, timeout=1.0)
+            assert runtime._call_queue == deque()
+
+            gate.set()
+            await asyncio.wait_for(busy, timeout=1.0)
+            assert _InstrumentedAdapter.call_log == ["busy"]
+            await busy_agent.close()
+
+    @pytest.mark.asyncio
+    async def test_agent_close_wakes_only_its_own_shared_connection_waiters(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            busy_agent = Agent(prompt="busy", tool_sources=[connection.tools(namespace="busy")])
+            closing_agent = Agent(
+                prompt="closing", tool_sources=[connection.tools(namespace="closing")]
+            )
+            surviving_agent = Agent(
+                prompt="surviving", tool_sources=[connection.tools(namespace="surviving")]
+            )
+            busy_call = (await busy_agent.get_tool_lookups()).fn["busy__read"]
+            closing_call = (await closing_agent.get_tool_lookups()).fn["closing__read"]
+            surviving_call = (await surviving_agent.get_tool_lookups()).fn["surviving__read"]
+
+            busy = asyncio.create_task(busy_call(value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            doomed = asyncio.create_task(closing_call(value="closing"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+            survivor = asyncio.create_task(surviving_call(value="surviving"))
+            await _wait_until(lambda: len(runtime._call_queue) == 2)
+            doomed_waiter, surviving_waiter = runtime._call_queue
+
+            await closing_agent.close()
+
+            assert doomed_waiter.event.is_set()
+            assert not surviving_waiter.event.is_set()
+            with pytest.raises(MCPToolCallError):
+                await asyncio.wait_for(doomed, timeout=1.0)
+            assert list(runtime._call_queue) == [surviving_waiter]
+            assert not surviving_waiter.event.is_set()
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(busy, survivor), timeout=2.0)
+            assert _InstrumentedAdapter.call_log == ["busy", "surviving"]
+            await busy_agent.close()
+            await surviving_agent.close()
+
+    @pytest.mark.asyncio
+    async def test_eviction_rejects_only_its_own_queued_calls(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_connections=5,
+            max_in_flight_calls=1,
+            call_wait_timeout=5.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            agents = []
+            calls = {}
+            for key in ("busy", "evicted", "spared"):
+                agent = Agent(prompt=key, tool_sources=[_bind_key(runtime, key).tools()])
+                lookups = await agent.get_tool_lookups()
+                agents.append(agent)
+                calls[key] = lookups.fn["github__read"]
+
+            busy = asyncio.create_task(calls["busy"](value="busy"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            doomed = asyncio.create_task(calls["evicted"](value="evicted"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+            spared = asyncio.create_task(calls["spared"](value="spared"))
+            await _wait_until(lambda: len(runtime._call_queue) == 2)
+
+            await asyncio.wait_for(
+                runtime.evict(connection_key="evicted", mode="force", timeout=0.5),
+                timeout=2.0,
+            )
+
+            with pytest.raises((MCPConnectionEvictingError, MCPStaleConnectionError)) as excinfo:
+                await asyncio.wait_for(doomed, timeout=1.0)
+            # It never started, so its outcome is known: it did not happen.
+            assert not isinstance(excinfo.value, MCPOutcomeUnknownError)
+            assert not isinstance(excinfo.value, MCPToolCallError)
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(busy, spared), timeout=2.0)
+
+            assert _InstrumentedAdapter.call_log == ["busy", "spared"]
+            for agent in agents:
+                await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_wakes_queued_calls_with_a_closed_error(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        runtime = MCPRuntime(max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        lookups = await agent.get_tool_lookups()
+        call = lookups.fn["github__read"]
+
+        busy = asyncio.create_task(call(value="busy"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+        queued = asyncio.create_task(call(value="queued"))
+        await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+        closing = asyncio.create_task(runtime.close())
+        with pytest.raises(MCPRuntimeClosedError):
+            await asyncio.wait_for(queued, timeout=2.0)
+
+        gate.set()
+        await asyncio.gather(busy, return_exceptions=True)
+        await asyncio.wait_for(closing, timeout=2.0)
+
+        assert runtime._call_queue == deque()
+        assert _InstrumentedAdapter.call_log == ["busy"]
+        await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_call_slots_are_global_not_per_connection(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_connections=4,
+            max_in_flight_calls=1,
+            call_wait_timeout=5.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            agents = []
+            calls = {}
+            for tenant, key in (("tenant-a", "alpha"), ("tenant-b", "beta")):
+                agent = Agent(
+                    prompt=key,
+                    tool_sources=[_bind_key(runtime, key, tenant_key=tenant).tools()],
+                )
+                lookups = await agent.get_tool_lookups()
+                agents.append(agent)
+                calls[key] = lookups.fn["github__read"]
+
+            first = asyncio.create_task(calls["alpha"](value="alpha"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            second = asyncio.create_task(calls["beta"](value="beta"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+            # Two live connections, one shared call budget.
+            assert len(runtime._entries) == 2
+            assert _total_calls() == 1
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(first, second), timeout=2.0)
+
+            assert _InstrumentedAdapter.peak_in_call == 1
+            for agent in agents:
+                await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_force_eviction_reclaims_slot_from_a_resistant_call(self) -> None:
+        old_gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = old_gate
+        _InstrumentedAdapter.suppress_call_cancel = True
+        runtime = MCPRuntime(
+            max_connections=2,
+            max_in_flight_calls=1,
+            call_wait_timeout=0.1,
+            shutdown_timeout=0.05,
+        )
+        old_agent = Agent(prompt="old", tool_sources=[_bind_key(runtime, "old").tools()])
+        old_call = (await old_agent.get_tool_lookups()).fn["github__write"]
+        resistant = asyncio.create_task(old_call(value="old"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        await asyncio.wait_for(
+            runtime.evict(connection_key="old", mode="force"),
+            timeout=1.0,
+        )
+
+        assert not resistant.done()
+        assert runtime._in_flight_calls == 0
+        assert runtime._active_call_permits == set()
+
+        _InstrumentedAdapter.call_gate = None
+        new_agent = Agent(prompt="new", tool_sources=[_bind_key(runtime, "new").tools()])
+        new_call = (await new_agent.get_tool_lookups()).fn["github__read"]
+        assert await new_call(value="new") == "read:ok"
+        assert runtime._in_flight_calls == 0
+
+        old_gate.set()
+        with pytest.raises(MCPOutcomeUnknownError):
+            await resistant
+        await asyncio.sleep(0)
+        assert runtime._in_flight_calls == 0
+        assert runtime._abandoned_tasks == set()
+        await old_agent.close()
+        await new_agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_forced_call_restores_the_caller_cancellation_count(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        runtime = MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        converted = asyncio.Event()
+        observed: dict[str, int] = {}
+
+        async def caller() -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            async with asyncio.timeout(0.3):
+                observed["before"] = task.cancelling()
+                try:
+                    await call(value="running")
+                except MCPOutcomeUnknownError:
+                    observed["after"] = task.cancelling()
+                    converted.set()
+                    await asyncio.sleep(10)
+
+        task = asyncio.create_task(caller())
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+        await runtime.evict(connection_key="github-1", mode="force")
+        await asyncio.wait_for(converted.wait(), timeout=1.0)
+
+        assert observed == {"before": 0, "after": 0}
+        with pytest.raises(TimeoutError):
+            await task
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_application_cancellation_is_not_converted_during_force_state(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        runtime = MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        task = asyncio.create_task(call(value="running"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+        entry = agent._tool_sources[0]._entry
+        assert entry is not None
+
+        # The connection can become forced immediately before an unrelated
+        # application cancellation reaches the executor. Without an explicit
+        # runtime-interruption marker, that cancellation must remain one.
+        with runtime._lock:
+            entry.force_evicted = True
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert runtime._in_flight_calls == 0
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_force_waits_for_permit_release_not_caller_completion(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        runtime = MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        converted = asyncio.Event()
+        finish_caller = asyncio.Event()
+
+        async def caller() -> None:
+            try:
+                await call(value="running")
+            except MCPOutcomeUnknownError:
+                converted.set()
+                await finish_caller.wait()
+
+        task = asyncio.create_task(caller())
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+        await runtime.evict(connection_key="github-1", mode="force")
+        await asyncio.wait_for(converted.wait(), timeout=1.0)
+
+        assert not task.done()
+        assert task.cancelling() == 0
+        assert runtime._in_flight_calls == 0
+        assert runtime._abandoned_tasks == set()
+        assert not any(
+            "tool call ignored forced cancellation" in record.getMessage()
+            for record in caplog.records
+        )
+
+        finish_caller.set()
+        await task
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_late_abandoned_call_cannot_release_a_newer_slot(self) -> None:
+        old_gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = old_gate
+        _InstrumentedAdapter.suppress_call_cancel = True
+        runtime = MCPRuntime(
+            max_connections=2,
+            max_in_flight_calls=1,
+            call_wait_timeout=1.0,
+            shutdown_timeout=0.05,
+        )
+        old_agent = Agent(prompt="old", tool_sources=[_bind_key(runtime, "old").tools()])
+        old_call = (await old_agent.get_tool_lookups()).fn["github__write"]
+        abandoned = asyncio.create_task(old_call(value="old"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+        await runtime.evict(connection_key="old", mode="force")
+
+        new_gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = new_gate
+        new_agent = Agent(prompt="new", tool_sources=[_bind_key(runtime, "new").tools()])
+        new_call = (await new_agent.get_tool_lookups()).fn["github__read"]
+        current = asyncio.create_task(new_call(value="new"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        old_gate.set()
+        with pytest.raises(MCPOutcomeUnknownError):
+            await abandoned
+        assert runtime._in_flight_calls == 1
+        assert not current.done()
+
+        new_gate.set()
+        assert await current == "read:ok"
+        assert runtime._in_flight_calls == 0
+        await old_agent.close()
+        await new_agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_forced_shutdown_abandons_resistant_call_permits(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        _InstrumentedAdapter.suppress_call_cancel = True
+        runtime = MCPRuntime(
+            max_in_flight_calls=1,
+            call_wait_timeout=1.0,
+            shutdown_timeout=0.01,
+        )
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        resistant = asyncio.create_task(call(value="running"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+        assert not resistant.done()
+        assert runtime._in_flight_calls == 0
+        assert runtime._active_call_permits == set()
+        gate.set()
+        with pytest.raises(MCPOutcomeUnknownError):
+            await resistant
+        await asyncio.sleep(0)
+        assert runtime._in_flight_calls == 0
+        assert runtime._abandoned_tasks == set()
+        await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_the_wait_budget_does_not_bound_the_call_itself(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=2, call_wait_timeout=0.02, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+
+            slow = asyncio.create_task(lookups.fn["github__read"](value="slow"))
+            await _wait_until(lambda: runtime._in_flight_calls == 1)
+            await asyncio.sleep(0.1)  # far past the admission budget
+
+            assert not slow.done()
+            gate.set()
+            assert await asyncio.wait_for(slow, timeout=1.0) == "read:ok"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_never_exceed_the_cap(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=3, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            call = lookups.fn["github__read"]
+
+            pending = [asyncio.create_task(call(value=index)) for index in range(24)]
+            await _wait_until(lambda: len(runtime._call_queue) == 21)
+
+            gate.set()
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=5.0)
+
+            assert _InstrumentedAdapter.peak_in_call == 3  # reached, never exceeded
+            assert _total_calls() == 24
+            assert runtime._in_flight_calls == 0
+            assert runtime._call_queue == deque()
+            await agent.close()
+
+    def test_call_wait_timeout_is_validated(self) -> None:
+        for invalid in (-1.0, float("nan"), "5"):
+            with pytest.raises(ValueError, match="call_wait_timeout"):
+                MCPRuntime(call_wait_timeout=invalid)  # type: ignore[arg-type]

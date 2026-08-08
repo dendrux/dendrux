@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._errors import (
     MCPBindingConflictError,
+    MCPCallCapacityError,
     MCPConnectionCapacityError,
     MCPConnectionError,
     MCPConnectionEvictingError,
@@ -236,6 +237,10 @@ class _ViewToolSource(MCPServer):
         self._entry: _ConnectionEntry | None = None
         self._leased = False
         self._close_generation = 0
+        # Queue ownership is per Agent view, not per physical connection. It
+        # lets close() invalidate only this Agent's waiting calls when several
+        # Agents share one entry.
+        self._call_owner = object()
 
     async def _discover(self) -> list[ToolDef]:
         connection = self._view.connection
@@ -294,17 +299,48 @@ class _ViewToolSource(MCPServer):
         )
         connection = self._view.connection
 
-        async def guarded_executor(**params: Any) -> Any:
+        def check_lease() -> None:
+            """Fail unless this view still holds this exact lease."""
             if not self._leased or self._entry is not entry:
                 raise MCPToolCallError(
                     f"MCP tool view '{self.name}' is no longer active. "
                     "Create or discover tools from an active Agent before calling it."
                 )
-            connection.runtime._begin_call(connection.identity, entry)
+
+        async def guarded_executor(**params: Any) -> Any:
+            permit = await connection.runtime._begin_call(
+                connection.identity,
+                entry,
+                tool=f"{self.name}__{mcp_tool_name}",
+                owner=self._call_owner,
+                # Re-checked on every wake, so one message covers both a stale
+                # executor and an Agent that closed while its call was queued.
+                check_lease=check_lease,
+            )
             try:
                 return await executor(**params)
+            except asyncio.CancelledError as exc:
+                if not permit.interrupted:
+                    raise
+                # Absorb only the cancellation issued by MCPRuntime. If the
+                # application also cancelled this Agent task, its independent
+                # request remains and cancellation must keep propagating.
+                remaining = permit.task.uncancel()
+                permit.interrupted = False
+                if remaining:
+                    raise
+                raise MCPOutcomeUnknownError(
+                    f"MCP tool '{self.name}__{mcp_tool_name}' was interrupted by a "
+                    "forced eviction. The server may already have applied it, so "
+                    "it must not be retried automatically."
+                ) from exc
             except BaseException as exc:
                 if entry.force_evicted:
+                    if permit.interrupted:
+                        remaining = permit.task.uncancel()
+                        permit.interrupted = False
+                        if remaining:
+                            raise asyncio.CancelledError from exc
                     raise MCPOutcomeUnknownError(
                         f"MCP tool '{self.name}__{mcp_tool_name}' was interrupted by a "
                         "forced eviction. The server may already have applied it, so "
@@ -312,7 +348,7 @@ class _ViewToolSource(MCPServer):
                     ) from exc
                 raise
             finally:
-                connection.runtime._end_call(connection.identity, entry)
+                connection.runtime._end_call(connection.identity, permit)
 
         return guarded_executor
 
@@ -323,7 +359,11 @@ class _ViewToolSource(MCPServer):
             entry = self._entry
             connection = self._view.connection
             if entry is not None:
-                connection.runtime._release(connection.identity, entry)
+                connection.runtime._release(
+                    connection.identity,
+                    entry,
+                    call_owner=self._call_owner,
+                )
             # Keep ownership intact when release rejects (for example, from
             # the wrong event loop) so the lease can still be released from
             # its owning loop.
@@ -342,6 +382,7 @@ class _ConnectionEntry:
     __slots__ = (
         "active_calls",
         "adapter",
+        "call_permits",
         "close_started",
         "fenced",
         "force_evicted",
@@ -362,6 +403,7 @@ class _ConnectionEntry:
         self.info: Any = None
         self.leases = 0
         self.active_calls = 0
+        self.call_permits: set[_CallPermit] = set()
         self.task: asyncio.Task[None] | None = None
         # fenced: no new leases or calls may be taken on this entry. Set by
         # eviction, idle retirement, and shutdown alike. force_evicted is
@@ -378,6 +420,35 @@ class _ConnectionEntry:
         # time: capacity pressure retires the smallest sequence first. Tracked
         # even when idle_timeout is None, which only disables the timer.
         self.idle_seq: int | None = None
+
+
+class _CallPermit:
+    """Exact-once ownership of one admitted runtime-wide call slot."""
+
+    __slots__ = ("entry", "interrupted", "release_event", "released", "task")
+
+    def __init__(self, entry: _ConnectionEntry, task: asyncio.Task[Any]) -> None:
+        self.entry = entry
+        self.task = task
+        self.interrupted = False
+        self.release_event = asyncio.Event()
+        self.released = False
+
+
+class _CallWaiter:
+    """One FIFO position in the queue for a global tool-call slot.
+
+    Unlike connection admissions, positions are never shared: two calls on one
+    connection want two slots, so each queues for itself. The entry is kept so
+    an eviction can reject exactly the calls queued against it.
+    """
+
+    __slots__ = ("entry", "event", "owner")
+
+    def __init__(self, entry: _ConnectionEntry, owner: object) -> None:
+        self.entry = entry
+        self.owner = owner
+        self.event = asyncio.Event()
 
 
 class _Admission:
@@ -441,6 +512,13 @@ class MCPRuntime:
     All three are bounded: a transport that resists cancellation or closing
     is handed to background tracking rather than waited on, so no caller can
     be blocked by a misbehaving server.
+
+    Tool calls are bounded separately by ``max_in_flight_calls``, one budget
+    shared by every connection: any number of Agents may hold leases, but only
+    that many MCP operations are admitted at once. Calls over the limit queue
+    FIFO for up to ``call_wait_timeout`` and are then shed, having never been
+    sent. Forced cleanup releases logical capacity after a bounded grace even
+    if a hostile transport keeps its already-started operation alive.
     """
 
     def __init__(
@@ -450,6 +528,7 @@ class MCPRuntime:
         max_in_flight_calls: int = 100,
         idle_timeout: float | None = 300.0,
         connection_wait_timeout: float = 10.0,
+        call_wait_timeout: float = 10.0,
         shutdown_timeout: float = 30.0,
     ) -> None:
         self.max_connections = _positive_int(max_connections, "max_connections")
@@ -469,6 +548,9 @@ class MCPRuntime:
             connection_wait_timeout,
             "connection_wait_timeout",
         )
+        # Bounds only the wait for a free call slot, never the tool call
+        # itself. 0 sheds load immediately instead of queueing.
+        self.call_wait_timeout = _non_negative_float(call_wait_timeout, "call_wait_timeout")
         self.shutdown_timeout = _positive_float(shutdown_timeout, "shutdown_timeout")
         self._state = MCPRuntimeState.OPEN
         # The registered source is the canonical configuration for an
@@ -480,14 +562,22 @@ class MCPRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._drain_waiters: set[asyncio.Event] = set()
         self._close_task: asyncio.Task[None] | None = None
-        self._abandoned_tasks: set[asyncio.Task[None]] = set()
+        self._abandoned_tasks: set[asyncio.Task[Any]] = set()
         self._generation_seq = 0
         # Insertion into _entries *is* the slot reservation, so capacity is
         # always len(self._entries) with no counter that could drift.
         self._admission_queue: deque[_Admission] = deque()
         self._admissions: dict[tuple[str | None, str], _Admission] = {}
         self._idle_seq = 0
+        # Exact permits, rather than a free-standing counter, bound aggregate
+        # process load without drifting across cancellation and forced cleanup.
+        self._active_call_permits: set[_CallPermit] = set()
+        self._call_queue: deque[_CallWaiter] = deque()
         self._lock = Lock()
+
+    @property
+    def _in_flight_calls(self) -> int:
+        return len(self._active_call_permits)
 
     def _bind_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -500,23 +590,26 @@ class MCPRuntime:
             )
 
     @staticmethod
-    def _consume_task_exception(task: asyncio.Task[None]) -> BaseException | None:
+    def _consume_task_exception(task: asyncio.Task[Any]) -> BaseException | None:
         try:
             return task.exception()
         except asyncio.CancelledError:
             return None
 
-    def _abandoned_task_done(self, task: asyncio.Task[None]) -> None:
+    def _abandoned_task_done(self, task: asyncio.Task[Any]) -> None:
         exception = self._consume_task_exception(task)
         with self._lock:
             self._abandoned_tasks.discard(task)
-        if exception is not None and not isinstance(exception, MCPConnectionError):
+        if exception is not None and not isinstance(
+            exception,
+            (MCPConnectionError, MCPOutcomeUnknownError),
+        ):
             logger.warning(
                 "MCPRuntime background cleanup failed",
                 exc_info=(type(exception), exception, exception.__traceback__),
             )
 
-    def _track_abandoned_task(self, task: asyncio.Task[None]) -> None:
+    def _track_abandoned_task(self, task: asyncio.Task[Any]) -> None:
         with self._lock:
             self._abandoned_tasks.add(task)
         task.add_done_callback(self._abandoned_task_done)
@@ -997,7 +1090,13 @@ class MCPRuntime:
                 entry.source.name,
             )
 
-    def _release(self, identity: tuple[str | None, str], entry: _ConnectionEntry) -> None:
+    def _release(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        call_owner: object | None = None,
+    ) -> None:
         """Release one lease held on an exact entry.
 
         The entry token guards against a stale waiter unwinding after its
@@ -1008,41 +1107,234 @@ class MCPRuntime:
             self._bind_loop()
             if entry.leases > 0:
                 entry.leases -= 1
+            # A failed lease acquisition has no call owner. An Agent release
+            # wakes only calls belonging to that view; other Agents can share
+            # this physical entry and must remain asleep in FIFO order.
+            if call_owner is not None:
+                self._wake_call_waiters_for_owner(call_owner)
             self._maybe_schedule_idle(identity, entry)
         self._notify_drain()
 
-    def _begin_call(
+    def _can_start_call(self, waiter: _CallWaiter | None) -> bool:
+        """Whether this caller may occupy a call slot right now.
+
+        A free slot is not enough: queued callers must not be barged past, so
+        only the queue head (or any caller when nothing is queued) wins.
+        Caller must hold the runtime lock.
+        """
+        if self._in_flight_calls >= self.max_in_flight_calls:
+            return False
+        if not self._call_queue:
+            return True
+        return self._call_queue[0] is waiter
+
+    def _pump_calls(self) -> None:
+        """Hand a freed call slot to the queue head.
+
+        Caller must hold the runtime lock.
+        """
+        if self._call_queue and self._in_flight_calls < self.max_in_flight_calls:
+            self._call_queue[0].event.set()
+
+    def _wake_call_waiters_for_owner(self, owner: object) -> None:
+        """Wake only queued calls owned by one closing Agent view."""
+        for waiter in self._call_queue:
+            if waiter.owner is owner:
+                waiter.event.set()
+
+    def _wake_call_waiters_for_entry(self, entry: _ConnectionEntry) -> None:
+        """Wake every queued call on one fenced physical connection."""
+        for waiter in self._call_queue:
+            if waiter.entry is entry:
+                waiter.event.set()
+
+    def _wake_all_call_waiters(self) -> None:
+        """Wake every queued call during runtime shutdown."""
+        for waiter in self._call_queue:
+            waiter.event.set()
+
+    def _dequeue_call(self, waiter: _CallWaiter) -> None:
+        """Drop one FIFO position and hand the queue on.
+
+        Caller must hold the runtime lock.
+        """
+        with contextlib.suppress(ValueError):
+            self._call_queue.remove(waiter)
+        self._pump_calls()
+
+    def _check_call_state(
         self,
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
+        check_lease: Callable[[], None],
     ) -> None:
-        """Account for one tool call against an exact live connection entry."""
-        with self._lock:
-            self._bind_loop()
-            if (
-                self._state is not MCPRuntimeState.OPEN
-                or self._entries.get(identity) is not entry
-                or entry.adapter is None
-                or entry.fenced
-            ):
-                raise MCPToolCallError(
-                    "MCP tool view is no longer active on its managed connection."
-                )
-            entry.active_calls += 1
+        """Reject a call whose lease, runtime, or connection is gone.
+
+        Re-evaluated on every wake, so a queued call can never start against a
+        connection that was evicted meanwhile or an Agent that has closed.
+        Runtime shutdown wins over all narrower states; otherwise the view
+        owns its lease-invalid message. Caller must hold the runtime lock.
+        """
+        if self._state is not MCPRuntimeState.OPEN:
+            raise MCPRuntimeClosedError("MCPRuntime is closed and cannot start MCP tool calls.")
+        check_lease()
+        if identity in self._evictions:
+            raise MCPConnectionEvictingError(
+                identity,
+                f"MCP connection {identity!r} is being evicted and cannot start tool calls.",
+            )
+        if self._entries.get(identity) is not entry or entry.adapter is None or entry.fenced:
+            raise MCPStaleConnectionError(
+                identity,
+                f"MCP connection {identity!r} no longer owns the entry for this tool view. "
+                "Bind again and use a new view.",
+            )
+
+    async def _begin_call(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        tool: str,
+        owner: object,
+        check_lease: Callable[[], None],
+    ) -> _CallPermit:
+        """Occupy one runtime-wide call slot for an exact live connection.
+
+        Queues FIFO while every slot is busy. ``call_wait_timeout`` bounds only
+        the wait for admission; once admitted a call runs for as long as it
+        needs. A caller that leaves before admission — shed, cancelled, or
+        invalidated — never counted against either budget.
+        """
+        loop = asyncio.get_running_loop()
+        waiter: _CallWaiter | None = None
+        deadline: float | None = None
+        try:
+            while True:
+                with self._lock:
+                    self._bind_loop()
+                    self._check_call_state(identity, entry, check_lease)
+                    if self._can_start_call(waiter):
+                        task = asyncio.current_task()
+                        assert task is not None
+                        permit = _CallPermit(entry, task)
+                        self._active_call_permits.add(permit)
+                        entry.call_permits.add(permit)
+                        entry.active_calls += 1
+                        if waiter is not None:
+                            self._dequeue_call(waiter)
+                            waiter = None
+                        return permit
+                    if deadline is None:
+                        deadline = loop.time() + self.call_wait_timeout
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise MCPCallCapacityError(
+                            identity,
+                            tool=tool,
+                            limit=self.max_in_flight_calls,
+                            timeout=self.call_wait_timeout,
+                        )
+                    if waiter is None:
+                        waiter = _CallWaiter(entry, owner)
+                        self._call_queue.append(waiter)
+                    waiter.event.clear()
+                    event = waiter.event
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except TimeoutError:
+                    continue  # re-check under the lock, then shed
+        finally:
+            if waiter is not None:
+                with self._lock:
+                    self._dequeue_call(waiter)
 
     def _end_call(
         self,
         identity: tuple[str | None, str],
-        entry: _ConnectionEntry,
+        permit: _CallPermit,
     ) -> None:
-        """Release one in-flight call token and wake a draining runtime."""
+        """Release one exact call permit and wake a draining runtime."""
         with self._lock:
             self._bind_loop()
-            if entry.active_calls > 0:
-                entry.active_calls -= 1
-            # A call outliving its Agent is what kept this connection alive.
-            self._maybe_schedule_idle(identity, entry)
-        self._notify_drain()
+            released = self._release_call_permit(identity, permit)
+        if released:
+            self._notify_drain()
+
+    def _release_call_permit(
+        self,
+        identity: tuple[str | None, str],
+        permit: _CallPermit,
+    ) -> bool:
+        """Release a permit once, including after forced abandonment.
+
+        Caller must hold the runtime lock. A late executor ``finally`` sees
+        ``released`` and becomes a no-op, so it cannot decrement a newer call.
+        """
+        if permit.released:
+            return False
+        permit.released = True
+        permit.release_event.set()
+        entry = permit.entry
+        self._active_call_permits.discard(permit)
+        entry.call_permits.discard(permit)
+        if entry.active_calls > 0:
+            entry.active_calls -= 1
+        self._pump_calls()
+        self._maybe_schedule_idle(identity, entry)
+        return True
+
+    async def _interrupt_active_calls(
+        self,
+        entries: dict[tuple[str | None, str], _ConnectionEntry],
+    ) -> None:
+        """Cancel forced calls and reclaim resistant permits after one grace.
+
+        Physical execution may outlive the grace when a transport suppresses
+        cancellation. The connection is already fenced and its result is
+        outcome-unknown, so the runtime releases logical capacity and observes
+        the task until its eventual completion.
+        """
+        with self._lock:
+            owned = [
+                (identity, permit)
+                for identity, entry in entries.items()
+                for permit in tuple(entry.call_permits)
+            ]
+        if not owned:
+            return
+
+        # No await may be introduced between this snapshot and cancel(): every
+        # permit still belongs to a task suspended inside its executor, so the
+        # runtime-issued cancellation is attributable without racing release.
+        for _, permit in owned:
+            permit.interrupted = True
+            permit.task.cancel()
+
+        release_waiters = [asyncio.create_task(permit.release_event.wait()) for _, permit in owned]
+        _, pending_waiters = await asyncio.wait(
+            release_waiters,
+            timeout=_FORCED_CANCEL_GRACE,
+        )
+        for waiter in pending_waiters:
+            waiter.cancel()
+        if pending_waiters:
+            await asyncio.gather(*pending_waiters, return_exceptions=True)
+
+        released = False
+        resistant = 0
+        with self._lock:
+            for identity, permit in owned:
+                if not permit.released:
+                    resistant += 1
+                released = self._release_call_permit(identity, permit) or released
+        if released:
+            self._notify_drain()
+        for _ in range(resistant):
+            logger.warning(
+                "MCP tool call ignored forced cancellation; releasing its runtime slot "
+                "while its caller remains responsible for eventual task completion."
+            )
 
     @property
     def state(self) -> MCPRuntimeState:
@@ -1193,6 +1485,9 @@ class MCPRuntime:
                     # Eviction outranks idle retirement: it also forgets the
                     # registration, so the handle becomes permanently stale.
                     self._cancel_idle(entry)
+                    # Calls queued for a slot on this connection will never get
+                    # to run; reject them now rather than after their budget.
+                    self._wake_call_waiters_for_entry(entry)
                     registration = self._registrations.get(identity)
                     task = asyncio.get_running_loop().create_task(
                         self._evict_impl(
@@ -1240,6 +1535,8 @@ class MCPRuntime:
                         )
                     entry.force_evicted = True
 
+            if entry.force_evicted:
+                await self._interrupt_active_calls({identity: entry})
             await self._teardown_entry(
                 entry,
                 loop=loop,
@@ -1279,6 +1576,7 @@ class MCPRuntime:
                 self._state = MCPRuntimeState.DRAINING
                 for admission in self._admission_queue:
                     admission.event.set()
+                self._wake_all_call_waiters()
                 self._close_task = asyncio.get_running_loop().create_task(self._close_impl())
             task = self._close_task
         # Shielded so one cancelled caller cannot abort the shared shutdown.
@@ -1309,7 +1607,11 @@ class MCPRuntime:
                 *self._evictions.values(),
                 *(entry.retire_task for entry in entries if entry.retire_task is not None),
             ]
+            forced_entries = {
+                identity: entry for identity, entry in self._entries.items() if entry.force_evicted
+            }
         self._notify_drain()
+        await self._interrupt_active_calls(forced_entries)
         connect_tasks = {
             entry.task: entry
             for entry in entries

@@ -40,6 +40,7 @@ class TestMCPRuntimeConfiguration:
         assert runtime.max_in_flight_calls == 100
         assert runtime.idle_timeout == 300.0
         assert runtime.connection_wait_timeout == 10.0
+        assert runtime.call_wait_timeout == 10.0
         assert runtime.shutdown_timeout == 30.0
         assert runtime.state is MCPRuntimeState.OPEN
 
@@ -49,6 +50,7 @@ class TestMCPRuntimeConfiguration:
             ("max_connections", 0, "max_connections"),
             ("max_in_flight_calls", 0, "max_in_flight_calls"),
             ("idle_timeout", -1.0, "idle_timeout"),
+            ("call_wait_timeout", -1.0, "call_wait_timeout"),
             ("shutdown_timeout", 0.0, "shutdown_timeout"),
         ],
     )

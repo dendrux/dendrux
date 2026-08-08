@@ -45,6 +45,14 @@ class MCPRuntimeClosedError(MCPError):
     """
 
 
+class MCPCapacityError(MCPError):
+    """Base for runtime saturation failures.
+
+    Always transient, and always raised before anything is sent: the request
+    never reached the MCP server, so backing off and retrying is safe.
+    """
+
+
 class MCPConnectionStateError(MCPError):
     """Base for connection-identity lifecycle failures.
 
@@ -64,7 +72,7 @@ class MCPConnectionEvictingError(MCPConnectionStateError):
     """
 
 
-class MCPConnectionCapacityError(MCPConnectionStateError):
+class MCPConnectionCapacityError(MCPConnectionStateError, MCPCapacityError):
     """The runtime had no free connection slot within the wait budget.
 
     Transient: the identity is still registered and the same handle succeeds
@@ -94,6 +102,34 @@ class MCPStaleConnectionError(MCPConnectionStateError):
     by a rebind with different configuration. Bind again and use the new
     handle; retrying with this one can never succeed.
     """
+
+
+class MCPCallCapacityError(MCPCapacityError):
+    """No MCP tool-call slot became free within the wait budget.
+
+    Load shedding, not failure: the call was never started, so the server
+    state is untouched and the same call may simply be retried. It is
+    deliberately not an :class:`MCPToolCallError` subclass, because nothing
+    was actually attempted against the server.
+    """
+
+    def __init__(
+        self,
+        identity: tuple[str | None, str],
+        *,
+        tool: str,
+        limit: int,
+        timeout: float,
+    ) -> None:
+        self.identity = identity
+        self.tool = tool
+        self.limit = limit
+        self.timeout = timeout
+        super().__init__(
+            f"MCP tool '{tool}' on connection {identity!r} was not started: the "
+            f"runtime is at its {limit} in-flight call limit and no slot became "
+            f"free within {timeout}s."
+        )
 
 
 class MCPToolCallError(MCPError):
