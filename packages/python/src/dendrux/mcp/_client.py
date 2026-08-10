@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -13,9 +14,12 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from dendrux.mcp._errors import MCPConnectionError
+from dendrux.mcp._source import redact_source_text
 
 if TYPE_CHECKING:
     from dendrux.mcp._source import MCPSource
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,24 +93,75 @@ class MCPClientAdapter:
             self._stack = stack
             self._client = client
         except BaseException as exc:
+            failure: BaseException = exc
+        else:
+            return
+        cleanup_failure: BaseException | None = None
+        try:
             await stack.aclose()
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            detail = str(exc) or type(exc).__name__
-            raise MCPConnectionError(
-                f"Failed to connect to MCP source '{self.source.name}': {detail}"
-            ) from exc
+        except BaseException as exc:
+            cleanup_failure = exc
+        # Cleanup must never replace the primary transport failure with an
+        # unsafe exception chain. A cancellation or process-level signal still
+        # wins; ordinary cleanup errors are retained only as redacted debug
+        # diagnostics.
+        if isinstance(failure, asyncio.CancelledError):
+            raise failure from None
+        if cleanup_failure is not None and not isinstance(cleanup_failure, Exception):
+            raise cleanup_failure from None
+        if cleanup_failure is not None:
+            logger.debug(
+                "MCP source '%s' cleanup after connect failure also failed: %s (%s)",
+                self.source.name,
+                redact_source_text(self.source, str(cleanup_failure))
+                or type(cleanup_failure).__name__,
+                type(cleanup_failure).__name__,
+            )
+        # Raised after the handler has exited. Inside it, Python attaches the
+        # original exception as __context__ even with `from None`, and
+        # error-monitoring SDKs walk __context__ regardless of
+        # __suppress_context__ — which would republish the endpoint.
+        raise self._safe_error("connect to", failure) from None
 
     async def list_tools(self) -> list[Any]:
         client = self._require_client()
-        tools: list[Any] = []
-        cursor: str | None = None
-        while True:
-            page = await client.list_tools(cursor=cursor, cache_mode="refresh")
-            tools.extend(page.tools)
-            cursor = page.next_cursor
-            if cursor is None:
-                return tools
+        try:
+            tools: list[Any] = []
+            cursor: str | None = None
+            while True:
+                page = await client.list_tools(cursor=cursor, cache_mode="refresh")
+                tools.extend(page.tools)
+                cursor = page.next_cursor
+                if cursor is None:
+                    return tools
+        except Exception as exc:
+            # Discovery fails on its own request, not just at connect: a token
+            # can expire between the two. Its text reaches last_error and the
+            # persisted MCP_ERROR governance event, so it needs the same care.
+            failure: Exception = exc
+        raise self._safe_error("list tools from", failure) from None
+
+    def _safe_error(self, action: str, exc: BaseException) -> MCPConnectionError:
+        """Build a transport error that cannot carry configured credentials.
+
+        Only the exception class is rendered, because ``str()`` of this error
+        becomes ``last_error`` and is persisted. The redacted detail stays
+        reachable on the error and through debug logging so operators are not
+        left with an undiagnosable failure.
+        """
+        detail = redact_source_text(self.source, str(exc)) or type(exc).__name__
+        logger.debug(
+            "MCP source '%s' failed to %s: %s (%s)",
+            self.source.name,
+            action,
+            detail,
+            type(exc).__name__,
+        )
+        error = MCPConnectionError(
+            f"Failed to {action} MCP source '{self.source.name}' ({type(exc).__name__})."
+        )
+        error.transport_detail = detail
+        return error
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         client = self._require_client()

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -18,6 +18,91 @@ MCPPhysicalIdentity = (
 )
 
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+_REDACTED = "[redacted]"
+
+
+def safe_endpoint(url: str) -> str:
+    """Return an endpoint stripped of its query string.
+
+    Presigned URLs carry their credential in the query, so only the scheme,
+    host, and path are safe to show. Userinfo cannot appear here: MCPSource
+    rejects it at construction.
+    """
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def redact_source_text(source: MCPSource, text: str) -> str:
+    """Strip a source's configured credentials out of third-party text.
+
+    Transport libraries routinely echo the request URL, argv, or header values
+    into their exception messages, and that text reaches persisted governance
+    events, tool results, and model context. Exact substring replacement is
+    used rather than pattern matching because the runtime knows precisely
+    which values are secret, so it neither misses one nor guesses.
+    """
+    if not text:
+        return text
+
+    replacements: list[tuple[str, str]] = []
+    if source.url:
+        parsed_url = urlsplit(source.url)
+        endpoint = safe_endpoint(source.url)
+        if endpoint != source.url:
+            replacements.append((source.url, endpoint))
+        query = parsed_url.query
+        if query:
+            replacements.append((query, _REDACTED))
+            # Libraries may normalize percent-encoding or report only a query
+            # value rather than the configured URL. Cover both raw and decoded
+            # forms independently.
+            for component in query.split("&"):
+                _, separator, raw_value = component.partition("=")
+                if separator and raw_value:
+                    replacements.append((raw_value, _REDACTED))
+                    replacements.append((unquote_plus(raw_value), _REDACTED))
+            replacements.extend(
+                (value, _REDACTED) for _, value in parse_qsl(query, keep_blank_values=True) if value
+            )
+    replacements.extend((value, _REDACTED) for value in source.headers.values() if value)
+    for name, value in source.headers.items():
+        if name.lower() in {"authorization", "proxy-authorization"}:
+            _, separator, credential = value.partition(" ")
+            if separator and credential:
+                replacements.append((credential, _REDACTED))
+    replacements.extend((value, _REDACTED) for value in source.env.values() if value)
+    if isinstance(source.auth, str) and source.auth:
+        replacements.append((source.auth, _REDACTED))
+
+    # Longest needle first: a full URL must be rewritten before its own query
+    # string, or the shorter match would corrupt the replacement.
+    for needle, replacement in sorted(replacements, key=lambda pair: len(pair[0]), reverse=True):
+        text = text.replace(needle, replacement)
+    if source.command:
+        for argument in sorted(set(source.command[1:]), key=len, reverse=True):
+            if argument:
+                text = text.replace(argument, _REDACTED)
+    return text
+
+
+def redact_source_value(source: MCPSource, value: Any) -> Any:
+    """Recursively redact configured credentials while preserving value shape."""
+    if isinstance(value, str):
+        return redact_source_text(source, value)
+    if isinstance(value, list):
+        return [redact_source_value(source, item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_source_value(source, item) for item in value)
+    if isinstance(value, dict):
+        return {
+            redact_source_text(source, key) if isinstance(key, str) else key: redact_source_value(
+                source,
+                item,
+            )
+            for key, item in value.items()
+        }
+    return value
 
 
 def _copy_string_mapping(value: Mapping[str, str] | None, field_name: str) -> Mapping[str, str]:
@@ -43,8 +128,11 @@ class MCPSource:
     """
 
     name: str
-    url: str | None = None
-    command: tuple[str, ...] | None = None
+    # Endpoints can contain signed query parameters, and command arguments can
+    # contain subprocess credentials. They remain available as configuration
+    # but must never appear through the default dataclass representation.
+    url: str | None = field(default=None, repr=False)
+    command: tuple[str, ...] | None = field(default=None, repr=False)
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     auth: Any = field(default=None, repr=False, compare=False)
     env: Mapping[str, str] = field(default_factory=dict, repr=False)

@@ -298,6 +298,14 @@ class _ViewToolSource(MCPServer):
             max_result_bytes=self.source.max_result_bytes,
         )
         connection = self._view.connection
+        qualified_name = f"{self.name}__{mcp_tool_name}"
+
+        def unknown_outcome() -> MCPOutcomeUnknownError:
+            return MCPOutcomeUnknownError(
+                f"MCP tool '{qualified_name}' was interrupted by a forced eviction. "
+                "The server may already have applied it, so it must not be retried "
+                "automatically."
+            )
 
         def check_lease() -> None:
             """Fail unless this view still holds this exact lease."""
@@ -311,14 +319,14 @@ class _ViewToolSource(MCPServer):
             permit = await connection.runtime._begin_call(
                 connection.identity,
                 entry,
-                tool=f"{self.name}__{mcp_tool_name}",
+                tool=qualified_name,
                 owner=self._call_owner,
                 # Re-checked on every wake, so one message covers both a stale
                 # executor and an Agent that closed while its call was queued.
                 check_lease=check_lease,
             )
             try:
-                return await executor(**params)
+                result = await executor(**params)
             except asyncio.CancelledError as exc:
                 if not permit.interrupted:
                     raise
@@ -329,24 +337,29 @@ class _ViewToolSource(MCPServer):
                 permit.interrupted = False
                 if remaining:
                     raise
-                raise MCPOutcomeUnknownError(
-                    f"MCP tool '{self.name}__{mcp_tool_name}' was interrupted by a "
-                    "forced eviction. The server may already have applied it, so "
-                    "it must not be retried automatically."
-                ) from exc
+                raise unknown_outcome() from exc
             except BaseException as exc:
                 if entry.force_evicted:
                     if permit.interrupted:
                         remaining = permit.task.uncancel()
                         permit.interrupted = False
+                        # A non-zero remainder is an application cancellation.
+                        # Raise it now instead of letting the unrelated tool
+                        # failure hide it until some later suspension point.
                         if remaining:
                             raise asyncio.CancelledError from exc
-                    raise MCPOutcomeUnknownError(
-                        f"MCP tool '{self.name}__{mcp_tool_name}' was interrupted by a "
-                        "forced eviction. The server may already have applied it, so "
-                        "it must not be retried automatically."
-                    ) from exc
+                    raise unknown_outcome() from exc
                 raise
+            else:
+                if permit.interrupted:
+                    remaining = permit.task.uncancel()
+                    permit.interrupted = False
+                    if remaining:
+                        raise asyncio.CancelledError
+                    # A normal return is a definitive server response. Forced
+                    # teardown prevents future work; it does not make this
+                    # already-completed call's outcome uncertain.
+                return result
             finally:
                 connection.runtime._end_call(connection.identity, permit)
 
@@ -600,10 +613,7 @@ class MCPRuntime:
         exception = self._consume_task_exception(task)
         with self._lock:
             self._abandoned_tasks.discard(task)
-        if exception is not None and not isinstance(
-            exception,
-            (MCPConnectionError, MCPOutcomeUnknownError),
-        ):
+        if exception is not None and not isinstance(exception, MCPConnectionError):
             logger.warning(
                 "MCPRuntime background cleanup failed",
                 exc_info=(type(exception), exception, exception.__traceback__),
@@ -1292,8 +1302,8 @@ class MCPRuntime:
 
         Physical execution may outlive the grace when a transport suppresses
         cancellation. The connection is already fenced and its result is
-        outcome-unknown, so the runtime releases logical capacity and observes
-        the task until its eventual completion.
+        outcome-unknown, so the runtime releases logical capacity; the caller
+        remains responsible for its task because the runtime did not create it.
         """
         with self._lock:
             owned = [
@@ -1308,6 +1318,14 @@ class MCPRuntime:
         # permit still belongs to a task suspended inside its executor, so the
         # runtime-issued cancellation is attributable without racing release.
         for _, permit in owned:
+            if permit.interrupted:
+                # A forced eviction and a forced shutdown can both reach the
+                # same permit inside one grace. At most one runtime-issued
+                # cancellation may be outstanding, or the executor's uncancel()
+                # would read the second one back as an application request and
+                # re-raise CancelledError — telling the caller that nothing
+                # happened when the outcome is in fact unknown.
+                continue
             permit.interrupted = True
             permit.task.cancel()
 
@@ -1322,18 +1340,23 @@ class MCPRuntime:
             await asyncio.gather(*pending_waiters, return_exceptions=True)
 
         released = False
-        resistant = 0
         with self._lock:
+            resistant = [permit for _, permit in owned if not permit.released]
             for identity, permit in owned:
-                if not permit.released:
-                    resistant += 1
                 released = self._release_call_permit(identity, permit) or released
         if released:
             self._notify_drain()
-        for _ in range(resistant):
+        if resistant:
+            # Tenant and connection keys are opaque application identifiers
+            # and may contain PII. Only validated source labels are safe for
+            # automatic library logs.
+            sources = ", ".join(sorted({permit.entry.source.name for permit in resistant}))
             logger.warning(
-                "MCP tool call ignored forced cancellation; releasing its runtime slot "
-                "while its caller remains responsible for eventual task completion."
+                "%d MCP tool call(s) on source(s) %s ignored forced cancellation; "
+                "releasing their runtime slots while their callers remain responsible "
+                "for eventual task completion.",
+                len(resistant),
+                sources,
             )
 
     @property

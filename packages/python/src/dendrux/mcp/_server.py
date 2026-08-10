@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any, cast
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._errors import MCPToolCallError
 from dendrux.mcp._result import normalize_mcp_result
-from dendrux.mcp._source import MCPFailureMode, MCPSource
+from dendrux.mcp._source import (
+    MCPFailureMode,
+    MCPSource,
+    redact_source_text,
+    redact_source_value,
+)
 from dendrux.types import ToolDef, ToolTarget
 
 if TYPE_CHECKING:
@@ -139,14 +144,24 @@ def create_mcp_executor(
         try:
             result = await adapter.call_tool(mcp_tool_name, params)
         except Exception as exc:
-            raise MCPToolCallError(
-                f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {exc}"
-            ) from exc
-        normalized = normalize_mcp_result(result, max_result_bytes=max_result_bytes)
-        is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
-        if is_error:
-            raise MCPToolCallError(str(normalized or "MCP tool returned an error"))
-        return normalized
+            failure: Exception = exc
+        else:
+            normalized = normalize_mcp_result(result, max_result_bytes=max_result_bytes)
+            redacted = redact_source_value(adapter.source, normalized)
+            is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
+            if is_error:
+                # Server-authored text lands in the same sink, so it gets the
+                # same scrub in case the server echoes a credential back.
+                raise MCPToolCallError(str(redacted or "MCP tool returned an error"))
+            return redacted
+        # Unlike a connect failure, this text is worth keeping: the model reads
+        # it to correct itself. So it is redacted rather than suppressed — and
+        # raised outside the handler, because both the message and __context__
+        # would otherwise reach the run store and the model's context window.
+        detail = redact_source_text(adapter.source, str(failure)) or type(failure).__name__
+        raise MCPToolCallError(
+            f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {detail}"
+        ) from None
 
     return executor
 

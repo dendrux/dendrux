@@ -20,6 +20,7 @@ from dendrux.mcp import (
 )
 from dendrux.mcp._client import MCPConnectionInfo
 from dendrux.mcp._result import normalize_mcp_result
+from dendrux.mcp._source import redact_source_text
 from dendrux.types import ToolDef, ToolTarget
 
 
@@ -64,6 +65,73 @@ class TestMCPSource:
         assert source.transport == "http"
         assert not hasattr(source, "allowed_tools")
         assert source.failure_mode == "best_effort"
+
+    def test_source_repr_omits_endpoints_that_may_contain_credentials(self) -> None:
+        http = MCPSource.http(
+            "remote",
+            "https://mcp.example.com/connect?access_token=query-secret",
+        )
+        stdio = MCPSource.stdio(
+            "local",
+            ["mcp-server", "--token", "command-secret"],
+        )
+
+        for source, secret in ((http, "query-secret"), (stdio, "command-secret")):
+            assert secret not in repr(source)
+
+    def test_redaction_removes_every_configured_credential_channel(self) -> None:
+        source = MCPSource.http(
+            "remote",
+            "https://mcp.example.com/connect?access_token=QUERY%2FSECRET",
+            headers={"Authorization": "Bearer HEADER-SECRET"},
+            auth="AUTH-SECRET",
+        )
+        text = (
+            "401 for url 'https://mcp.example.com/connect?access_token=QUERY%2FSECRET' "
+            "sent header Bearer HEADER-SECRET (token HEADER-SECRET; "
+            "decoded query QUERY/SECRET; auth AUTH-SECRET)"
+        )
+
+        redacted = redact_source_text(source, text)
+
+        assert "QUERY%2FSECRET" not in redacted
+        assert "QUERY/SECRET" not in redacted
+        assert "HEADER-SECRET" not in redacted
+        assert "AUTH-SECRET" not in redacted
+        # The endpoint itself stays: it is what makes the message diagnosable.
+        assert "https://mcp.example.com/connect" in redacted
+
+    def test_redaction_covers_argv_and_env_without_mangling_subcommands(self) -> None:
+        source = MCPSource.stdio(
+            "local",
+            ["mcp-server", "serve", "--token", "short7", "ARGV-SUPERSECRET"],
+            env={"API_KEY": "ENV-SUPERSECRET"},
+        )
+        text = (
+            "spawn failed: mcp-server serve --token short7 ARGV-SUPERSECRET "
+            "env API_KEY=ENV-SUPERSECRET"
+        )
+
+        redacted = redact_source_text(source, text)
+
+        assert "ARGV-SUPERSECRET" not in redacted
+        assert "short7" not in redacted
+        assert "ENV-SUPERSECRET" not in redacted
+        # Security wins over argv diagnostics: every argument is removed by
+        # exact substring, even where a formatter embeds it in other text.
+        assert "prefixshort7suffix" not in redact_source_text(
+            source,
+            "formatter emitted prefixshort7suffix",
+        )
+
+    def test_redaction_leaves_credential_free_text_untouched(self) -> None:
+        source = MCPSource.http("remote", "https://mcp.example.com/connect")
+
+        assert redact_source_text(source, "") == ""
+        assert (
+            redact_source_text(source, "connection refused to https://mcp.example.com/connect")
+            == "connection refused to https://mcp.example.com/connect"
+        )
 
     def test_source_level_tool_allowlists_are_not_supported(self) -> None:
         with pytest.raises(TypeError, match="allowed_tools"):

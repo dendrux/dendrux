@@ -267,12 +267,16 @@ class TestMCPConnectionContracts:
         credentials = _Credentials()
         connection = runtime.bind(
             connection_key="connection-1",
-            source=MCPSource.http("github", "https://mcp.example.com"),
+            source=MCPSource.http(
+                "github",
+                "https://mcp.example.com?access_token=url-must-not-leak",
+            ),
             credentials=credentials,
         )
 
         for rendered in (repr(connection), repr(connection.tools())):
             assert "must-not-leak" not in rendered
+            assert "url-must-not-leak" not in rendered
             assert "credentials" not in rendered
 
     def test_connection_is_immutable(self) -> None:

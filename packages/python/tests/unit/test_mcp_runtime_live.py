@@ -55,12 +55,15 @@ class _InstrumentedAdapter:
     connect_gate: ClassVar[asyncio.Event | None] = None
     close_gate: ClassVar[asyncio.Event | None] = None
     call_gate: ClassVar[asyncio.Event | None] = None
+    call_cancel_seen: ClassVar[asyncio.Event | None] = None
+    call_cancel_pause: ClassVar[asyncio.Event | None] = None
     connect_error: ClassVar[Exception | None] = None
     fail_urls: ClassVar[set[str]] = set()
     close_error: ClassVar[Exception | None] = None
     call_error: ClassVar[Exception | None] = None
     suppress_cancel: ClassVar[bool] = False
     suppress_call_cancel: ClassVar[bool] = False
+    return_after_close: ClassVar[bool] = False
     # Call admission instrumentation: the order calls entered the transport,
     # and how many were ever inside it at once.
     call_log: ClassVar[list[str]] = []
@@ -115,7 +118,16 @@ class _InstrumentedAdapter:
         try:
             gate = cls.call_gate
             if gate is not None:
-                if cls.suppress_call_cancel:
+                if cls.call_cancel_seen is not None:
+                    try:
+                        await gate.wait()
+                    except asyncio.CancelledError:
+                        cls.call_cancel_seen.set()
+                        pause = cls.call_cancel_pause
+                        if pause is not None:
+                            await pause.wait()
+                        raise
+                elif cls.suppress_call_cancel:
                     while True:
                         try:
                             await gate.wait()
@@ -124,7 +136,7 @@ class _InstrumentedAdapter:
                             continue
                 else:
                     await gate.wait()
-            if self.closed:
+            if self.closed and not cls.return_after_close:
                 # A real transport fails an in-flight call once it is closed.
                 raise ConnectionError("transport closed")
             error = cls.call_error
@@ -152,12 +164,15 @@ def _reset_adapter() -> Any:
     _InstrumentedAdapter.connect_gate = None
     _InstrumentedAdapter.close_gate = None
     _InstrumentedAdapter.call_gate = None
+    _InstrumentedAdapter.call_cancel_seen = None
+    _InstrumentedAdapter.call_cancel_pause = None
     _InstrumentedAdapter.connect_error = None
     _InstrumentedAdapter.fail_urls = set()
     _InstrumentedAdapter.close_error = None
     _InstrumentedAdapter.call_error = None
     _InstrumentedAdapter.suppress_cancel = False
     _InstrumentedAdapter.suppress_call_cancel = False
+    _InstrumentedAdapter.return_after_close = False
     _InstrumentedAdapter.call_log = []
     _InstrumentedAdapter.in_call = 0
     _InstrumentedAdapter.peak_in_call = 0
@@ -978,6 +993,22 @@ class TestExplicitEviction:
 
         await agent.close()
         await asyncio.wait_for(evicting, timeout=1.0)
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_retained_call_raises_stale_after_eviction_completes(self) -> None:
+        runtime = MCPRuntime(shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        retained = (await agent.get_tool_lookups()).fn["github__write"]
+
+        await runtime.evict(connection_key="github-1", mode="force")
+
+        with pytest.raises(MCPStaleConnectionError) as excinfo:
+            await retained(value="must-not-run")
+        assert excinfo.value.identity == (None, "github-1")
+        assert not isinstance(excinfo.value, MCPToolCallError)
+        assert _total_calls() == 0
+        await agent.close()
         await runtime.close()
 
     @pytest.mark.asyncio
@@ -3053,7 +3084,10 @@ class TestCallConcurrency:
                 await agent.close()
 
     @pytest.mark.asyncio
-    async def test_force_eviction_reclaims_slot_from_a_resistant_call(self) -> None:
+    async def test_force_eviction_reclaims_slot_from_a_resistant_call(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         old_gate = asyncio.Event()
         _InstrumentedAdapter.call_gate = old_gate
         _InstrumentedAdapter.suppress_call_cancel = True
@@ -3063,19 +3097,44 @@ class TestCallConcurrency:
             call_wait_timeout=0.1,
             shutdown_timeout=0.05,
         )
-        old_agent = Agent(prompt="old", tool_sources=[_bind_key(runtime, "old").tools()])
+        old_agent = Agent(
+            prompt="old",
+            tool_sources=[
+                _bind_key(
+                    runtime,
+                    "private-connection-key",
+                    tenant_key="alice@example.com",
+                ).tools()
+            ],
+        )
         old_call = (await old_agent.get_tool_lookups()).fn["github__write"]
         resistant = asyncio.create_task(old_call(value="old"))
         await _wait_until(lambda: runtime._in_flight_calls == 1)
 
         await asyncio.wait_for(
-            runtime.evict(connection_key="old", mode="force"),
+            runtime.evict(
+                tenant_key="alice@example.com",
+                connection_key="private-connection-key",
+                mode="force",
+            ),
             timeout=1.0,
         )
 
         assert not resistant.done()
         assert runtime._in_flight_calls == 0
         assert runtime._active_call_permits == set()
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if "ignored forced cancellation" in record.getMessage()
+        ]
+        assert warnings == [
+            "1 MCP tool call(s) on source(s) github ignored forced "
+            "cancellation; releasing their runtime slots while their callers remain "
+            "responsible for eventual task completion."
+        ]
+        assert "alice@example.com" not in warnings[0]
+        assert "private-connection-key" not in warnings[0]
 
         _InstrumentedAdapter.call_gate = None
         new_agent = Agent(prompt="new", tool_sources=[_bind_key(runtime, "new").tools()])
@@ -3092,6 +3151,92 @@ class TestCallConcurrency:
         await old_agent.close()
         await new_agent.close()
         await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_resistant_success_after_force_restores_cancellation_state(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        _InstrumentedAdapter.suppress_call_cancel = True
+        _InstrumentedAdapter.return_after_close = True
+        runtime = MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        running = asyncio.create_task(call(value="mutating"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        await runtime.evict(connection_key="github-1", mode="force")
+        assert not running.done()
+        assert running.cancelling() == 1
+        gate.set()
+
+        assert await running == "write:ok"
+        assert running.cancelling() == 0
+        assert runtime._in_flight_calls == 0
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_application_cancel_wins_when_resistant_call_returns(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        _InstrumentedAdapter.suppress_call_cancel = True
+        _InstrumentedAdapter.return_after_close = True
+        runtime = MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        running = asyncio.create_task(call(value="mutating"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        await runtime.evict(connection_key="github-1", mode="force")
+        running.cancel()  # independent application request
+        gate.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        assert running.cancelling() == 1
+        assert runtime._in_flight_calls == 0
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_eviction_racing_shutdown_interrupts_a_call_only_once(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        _InstrumentedAdapter.suppress_call_cancel = True
+        runtime = MCPRuntime(shutdown_timeout=0.2)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        running = asyncio.create_task(call(value="mutating"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        # Forced eviction and forced shutdown both reach this permit while it
+        # is still held, so both would cancel it without the interrupt guard.
+        evicting = asyncio.create_task(
+            runtime.evict(connection_key="github-1", mode="force", timeout=0.5)
+        )
+        await asyncio.sleep(0)  # let the eviction reach its grace window
+        closing = asyncio.create_task(runtime.close())
+        await asyncio.wait_for(asyncio.gather(evicting, closing), timeout=2.0)
+
+        # Read before releasing the gate: the count only drops once the
+        # executor unwinds and calls uncancel().
+        cancel_requests = running.cancelling()
+        gate.set()  # the stubborn transport finally returns
+
+        # Nothing above may assert: this transport swallows cancellation, so a
+        # failure before the gate opens would spin the loop during teardown
+        # instead of reporting. Capture, then judge.
+        outcome: BaseException | None = None
+        try:
+            await asyncio.wait_for(asyncio.shield(running), timeout=1.0)
+        except BaseException as exc:  # noqa: BLE001
+            outcome = exc
+
+        assert cancel_requests == 1  # exactly one runtime-issued request
+        # A second cancellation surfaces as CancelledError, telling the caller
+        # nothing happened when the server may already have applied it.
+        assert isinstance(outcome, MCPOutcomeUnknownError), f"got {outcome!r}"
+        await agent.close()
 
     @pytest.mark.asyncio
     async def test_forced_call_restores_the_caller_cancellation_count(self) -> None:
@@ -3145,6 +3290,30 @@ class TestCallConcurrency:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert runtime._in_flight_calls == 0
+        await agent.close()
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_application_cancellation_survives_runtime_interruption(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        _InstrumentedAdapter.call_cancel_seen = asyncio.Event()
+        _InstrumentedAdapter.call_cancel_pause = asyncio.Event()
+        runtime = MCPRuntime(max_in_flight_calls=1, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        call = (await agent.get_tool_lookups()).fn["github__write"]
+        task = asyncio.create_task(call(value="running"))
+        await _wait_until(lambda: runtime._in_flight_calls == 1)
+
+        evicting = asyncio.create_task(runtime.evict(connection_key="github-1", mode="force"))
+        assert _InstrumentedAdapter.call_cancel_seen is not None
+        await asyncio.wait_for(_InstrumentedAdapter.call_cancel_seen.wait(), timeout=1.0)
+        task.cancel()  # application cancellation, independent of the runtime's
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(evicting, timeout=1.0)
+        assert task.cancelling() == 1
         assert runtime._in_flight_calls == 0
         await agent.close()
         await runtime.close()
