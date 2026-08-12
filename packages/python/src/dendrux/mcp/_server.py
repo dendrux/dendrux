@@ -1,94 +1,199 @@
-"""MCPServer — declarative MCP server configuration.
-
-Connects lazily on first use. Manages transport lifecycle via
-AsyncExitStack so the MCP session stays open for the agent's lifetime.
-"""
+"""Backwards-compatible MCPServer facade over the production MCP adapter."""
 
 from __future__ import annotations
 
 import logging
 import re
-from contextlib import AsyncExitStack
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamable_http_client
-
+from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._errors import MCPToolCallError
+from dendrux.mcp._result import normalize_mcp_result
+from dendrux.mcp._source import (
+    MCPFailureMode,
+    MCPSource,
+    redact_source_text,
+    redact_source_value,
+    safe_source_exception_detail,
+    source_has_opaque_credentials,
+)
 from dendrux.types import ToolDef, ToolTarget
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Provider-safe tool name: Anthropic and OpenAI allow [a-zA-Z0-9_-], max 64 chars.
+# Anthropic and OpenAI accept this portable subset, capped at 64 chars.
 _PROVIDER_SAFE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-
-# Source name: alphanumeric + underscore + hyphen, no double underscore.
-_SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 def _validate_canonical_name(canonical: str, source_name: str, mcp_name: str) -> None:
-    """Validate namespaced name is safe for all LLM providers."""
-    if not _PROVIDER_SAFE_RE.match(canonical):
+    """Validate a namespaced tool name against provider restrictions."""
+    if not _PROVIDER_SAFE_RE.fullmatch(canonical):
         raise ValueError(
             f"MCP tool '{mcp_name}' from source '{source_name}' produces "
             f"canonical name '{canonical}' which is not provider-safe. "
-            f"Tool names must match [a-zA-Z0-9_-] and be <= 64 chars."
+            "Tool names must match [a-zA-Z0-9_-] and be <= 64 chars."
         )
 
 
 def _sanitize_tool_name(name: str) -> str:
-    """Replace non-provider-safe chars with underscores.
-
-    Preserves alphanumeric, underscore, and hyphen. Everything else
-    becomes underscore.
-    """
+    """Replace non-provider-safe characters with underscores."""
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
-def _normalize_mcp_result(result: Any) -> Any:
-    """Normalize MCP CallToolResult to a JSON-serializable Python object.
+def _normalize_mcp_result(result: Any, *, max_result_bytes: int = 1_000_000) -> Any:
+    """Compatibility export for the result normalizer."""
+    return normalize_mcp_result(result, max_result_bytes=max_result_bytes)
 
-    Returns a Python object (dict, list, or str) — NOT a JSON string.
-    The loop's _execute_tool() already calls json.dumps(result) on the
-    return value, so returning a pre-serialized JSON string would
-    double-encode it.
 
-    Priority:
-    1. structuredContent (if present) — return as dict/list
-    2. text Content blocks — join with newlines, return as str
-    3. non-text Content blocks — clear unsupported marker
-    """
-    if result.structuredContent is not None:
-        return result.structuredContent
+def _annotation_dict(annotations: Any) -> dict[str, Any] | None:
+    if annotations is None:
+        return None
+    return cast(
+        "dict[str, Any]",
+        annotations.model_dump(mode="json", by_alias=True, exclude_none=True),
+    )
 
-    texts = []
-    for content in result.content:
-        if content.type == "text":
-            texts.append(content.text)
+
+def _tool_is_parallel_safe(annotations: Any) -> bool:
+    """Only explicitly read-only, non-destructive MCP tools run in parallel."""
+    if annotations is None:
+        return False
+    return bool(
+        getattr(annotations, "read_only_hint", False)
+        and not getattr(annotations, "destructive_hint", False)
+    )
+
+
+def _tool_meta(tool: Any) -> dict[str, Any] | None:
+    value = getattr(tool, "meta", None)
+    return dict(value) if value else None
+
+
+def build_mcp_tool_defs(
+    *,
+    source: MCPSource,
+    namespace: str,
+    tools: Sequence[Any],
+    connection_info: Any,
+    force_serial_tools: frozenset[str] = frozenset(),
+) -> list[ToolDef]:
+    """Adapt raw MCP tools to namespaced ToolDefs for one Agent view."""
+    tool_defs: list[ToolDef] = []
+    seen_names: set[str] = set()
+    for tool in tools:
+        sanitized = _sanitize_tool_name(tool.name)
+        canonical = f"{namespace}__{sanitized}"
+        _validate_canonical_name(canonical, source.name, tool.name)
+        if canonical in seen_names:
+            raise ValueError(
+                f"MCP source '{source.name}' has duplicate tool names after "
+                f"sanitization: '{tool.name}' → '{canonical}'. "
+                "Two tools cannot share the same canonical name."
+            )
+        seen_names.add(canonical)
+
+        annotations = _annotation_dict(tool.annotations)
+        meta: dict[str, Any] = {
+            "source_name": source.name,
+            "namespace": namespace,
+            "mcp_tool_name": tool.name,
+            "transport": source.transport,
+            "annotations": annotations,
+            "title": getattr(tool, "title", None),
+            "output_schema": getattr(tool, "output_schema", None),
+            "mcp_meta": _tool_meta(tool),
+        }
+        if connection_info is not None:
+            meta.update(
+                {
+                    "protocol_version": connection_info.protocol_version,
+                    "server_name": connection_info.server_name,
+                    "server_version": connection_info.server_version,
+                }
+            )
+
+        tool_defs.append(
+            ToolDef(
+                name=canonical,
+                description=tool.description or "",
+                parameters=tool.input_schema,
+                target=ToolTarget.SERVER,
+                parallel=(
+                    _tool_is_parallel_safe(tool.annotations) and tool.name not in force_serial_tools
+                ),
+                timeout_seconds=source.call_timeout,
+                has_explicit_timeout=True,
+                meta=meta,
+            )
+        )
+    return tool_defs
+
+
+def create_mcp_executor(
+    adapter: MCPClientAdapter,
+    *,
+    namespace: str,
+    mcp_tool_name: str,
+    max_result_bytes: int,
+) -> Callable[..., Any]:
+    """Create an async Dendrux executor bound to one live MCP adapter."""
+
+    async def executor(**params: Any) -> Any:
+        # With an opaque auth object even server-authored error text could
+        # carry an echoed credential the runtime cannot recognise, so error
+        # detail cannot be proven clean and is suppressed; mapping, string,
+        # and tuple credentials keep their exact-substring scrub in full.
+        opaque = source_has_opaque_credentials(adapter.source)
+        try:
+            result = await adapter.call_tool(mcp_tool_name, params)
+        except Exception as exc:
+            failure: Exception = exc
         else:
-            texts.append(f"[unsupported content type: {content.type}]")
-    return "\n".join(texts) if texts else ""
+            normalized = normalize_mcp_result(result, max_result_bytes=max_result_bytes)
+            redacted = redact_source_value(adapter.source, normalized)
+            is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
+            if is_error:
+                # Server-authored text lands in the same sink, so it gets the
+                # same scrub in case the server echoes a credential back.
+                message = (
+                    "MCP tool returned an error (detail suppressed: opaque auth)."
+                    if opaque
+                    else str(redacted or "MCP tool returned an error")
+                )
+                raise MCPToolCallError(message)
+            return redacted
+        # Unlike a connect failure, this text is worth keeping: the model reads
+        # it to correct itself. So it is redacted rather than suppressed — and
+        # raised outside the handler, because both the message and __context__
+        # would otherwise reach the run store and the model's context window.
+        detail = (
+            type(failure).__name__
+            if opaque
+            else redact_source_text(adapter.source, str(failure)) or type(failure).__name__
+        )
+        raise MCPToolCallError(
+            f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {detail}"
+        ) from None
+
+    return executor
 
 
 class MCPServer:
-    """Declarative MCP server configuration.
+    """One MCP tool source managed through the official SDK v2 client.
 
-    Connects lazily on first use via ``_discover()``. The MCP session
-    stays open for the server's lifetime (agent-lifetime cache).
-    Call ``close()`` to tear down transport and session.
+    ``MCPServer(name, url=... | command=[...])`` remains supported. New code
+    may configure an :class:`MCPSource` and pass it directly to ``Agent``.
 
-    **Security:** stdio MCP servers run as local subprocesses with full
-    environment access. Only use trusted MCP server implementations.
+    HTTP sources support headers and any authentication object accepted by
+    ``httpx2.AsyncClient`` (including the SDK's OAuth providers). Stdio
+    sources support explicit environment additions and a working directory.
 
-    Args:
-        name: Source name for namespacing (e.g. ``"filesystem"``).
-            Tool names become ``name__tool_name``.
-        url: Streamable HTTP endpoint URL. Mutually exclusive with ``command``.
-        command: stdio subprocess command as a list of args.
-            Mutually exclusive with ``url``.
+    Stdio processes execute with the user's privileges. Use only trusted
+    implementations, or place them behind an isolated MCP gateway/runtime.
     """
 
     def __init__(
@@ -97,85 +202,71 @@ class MCPServer:
         *,
         url: str | None = None,
         command: list[str] | None = None,
+        headers: Mapping[str, str] | None = None,
+        auth: Any = None,
+        env: Mapping[str, str] | None = None,
+        cwd: str | Path | None = None,
+        connect_timeout: float = 30.0,
+        call_timeout: float = 120.0,
+        max_result_bytes: int = 1_000_000,
+        failure_mode: MCPFailureMode = "strict",
     ) -> None:
-        # Validate name
-        if not name or not _SOURCE_NAME_RE.match(name):
-            raise ValueError(
-                f"MCPServer name '{name}' is not a valid identifier. "
-                f"Must match [a-zA-Z0-9_-] and be non-empty."
-            )
-        if "__" in name:
-            raise ValueError(
-                f"MCPServer name '{name}' cannot contain '__'. "
-                f"Double underscore is reserved as the namespace separator."
-            )
+        # Keep the legacy error wording and private transport attributes while
+        # all real configuration lives in the immutable MCPSource.
+        if command is not None and (not isinstance(command, list) or not command):
+            raise ValueError("MCPServer command must be a non-empty list of strings.")
+        if command is not None and not all(isinstance(arg, str) for arg in command):
+            raise ValueError("MCPServer command must contain only strings.")
 
-        # Validate exactly one transport
-        if (url is None) == (command is None):
-            raise ValueError(
-                "MCPServer requires exactly one transport: "
-                "url='...' for HTTP or command=[...] for stdio."
-            )
+        source = MCPSource(
+            name=name,
+            url=url,
+            command=tuple(command) if command is not None else None,
+            headers=dict(headers or {}),
+            auth=auth,
+            env=dict(env or {}),
+            cwd=Path(cwd) if cwd is not None else None,
+            connect_timeout=connect_timeout,
+            call_timeout=call_timeout,
+            max_result_bytes=max_result_bytes,
+            failure_mode=failure_mode,
+        )
+        self._configure(source)
 
-        # Validate command
-        if command is not None:
-            if not isinstance(command, list) or not command:
-                raise ValueError("MCPServer command must be a non-empty list of strings.")
-            if not all(isinstance(arg, str) for arg in command):
-                raise ValueError("MCPServer command must contain only strings.")
+    @classmethod
+    def from_source(cls, source: MCPSource) -> MCPServer:
+        """Create the runtime facade for an immutable source configuration."""
+        server = cls.__new__(cls)
+        server._configure(source)
+        return server
 
-        self.name = name
-        self._url = url
-        self._command = command
-        self._exit_stack: AsyncExitStack | None = None
-        self._session: ClientSession | None = None
+    def _configure(self, source: MCPSource) -> None:
+        self.source = source
+        self.name = source.name
+        self.failure_mode = source.failure_mode
+        self._url = source.url
+        self._command = list(source.command) if source.command is not None else None
+        self._client: MCPClientAdapter | None = None
+        # Retained as compatibility/debugging views; lifecycle belongs to _client.
+        self._exit_stack: Any = None
+        self._session: Any = None
+        self.last_error: str | None = None
 
     async def _discover(self) -> list[ToolDef]:
-        """Connect to MCP server and discover tools.
-
-        Opens transport + session via AsyncExitStack. Contexts stay
-        open until close() is called. Idempotent — raises if already
-        connected (agent-level caching prevents double calls, but
-        the class itself should be safe).
-
-        Returns adapted ToolDefs with namespaced names and meta.
-        """
-        if self._session is not None:
+        """Connect once, discover all allowed tools, and adapt them to ToolDef."""
+        if self._client is not None or self._session is not None:
             raise RuntimeError(
                 f"MCPServer '{self.name}' is already connected. Call close() before re-discovering."
             )
-        self._exit_stack = AsyncExitStack()
-        await self._exit_stack.__aenter__()
 
+        adapter = MCPClientAdapter(self.source)
+        self.last_error = None
         try:
-            if self._command:
-                params = StdioServerParameters(
-                    command=self._command[0],
-                    args=self._command[1:],
-                )
-                read_stream, write_stream = await self._exit_stack.enter_async_context(
-                    stdio_client(params)
-                )
-            else:
-                assert self._url is not None
-                read_stream, write_stream, _ = await self._exit_stack.enter_async_context(
-                    streamable_http_client(self._url)
-                )
-
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await self._session.initialize()
-
-            # Paginate through all tools — some servers split across pages
-            all_tools = []
-            cursor: str | None = None
-            while True:
-                tools_result = await self._session.list_tools(cursor=cursor)
-                all_tools.extend(tools_result.tools)
-                cursor = getattr(tools_result, "nextCursor", None)
-                if not cursor:
-                    break
+            await adapter.connect()
+            self._client = adapter
+            self._exit_stack = adapter._stack
+            self._session = adapter._client
+            all_tools = await adapter.list_tools()
 
             if not all_tools:
                 logger.warning(
@@ -184,75 +275,46 @@ class MCPServer:
                     self.name,
                 )
 
-            tool_defs: list[ToolDef] = []
-            seen_names: set[str] = set()
-
-            for tool in all_tools:
-                sanitized = _sanitize_tool_name(tool.name)
-                canonical = f"{self.name}__{sanitized}"
-
-                _validate_canonical_name(canonical, self.name, tool.name)
-
-                if canonical in seen_names:
-                    raise ValueError(
-                        f"MCP source '{self.name}' has duplicate tool names after "
-                        f"sanitization: '{tool.name}' → '{canonical}'. "
-                        f"Two tools cannot share the same canonical name."
-                    )
-                seen_names.add(canonical)
-
-                # Convert annotations to plain dict for JSON safety
-                annotations: dict[str, Any] | None = None
-                if tool.annotations is not None:
-                    annotations = tool.annotations.model_dump(exclude_none=True)
-
-                td = ToolDef(
-                    name=canonical,
-                    description=tool.description or "",
-                    parameters=tool.inputSchema,
-                    target=ToolTarget.SERVER,
-                    meta={
-                        "source_name": self.name,
-                        "mcp_tool_name": tool.name,
-                        "transport": "stdio" if self._command else "http",
-                        "annotations": annotations,
-                    },
-                )
-                tool_defs.append(td)
-
-            return tool_defs
-
-        except BaseException:
+            return build_mcp_tool_defs(
+                source=self.source,
+                namespace=self.name,
+                tools=all_tools,
+                connection_info=adapter.info,
+            )
+        except BaseException as exc:
+            self.last_error = str(exc)
             await self.close()
             raise
 
     def _create_executor(self, mcp_tool_name: str) -> Callable[..., Any]:
-        """Create a callable that executes an MCP tool via the session.
-
-        The returned coroutine function has the same shape as a local
-        @tool function: ``async def executor(**params) -> Any``.
-        """
-        session = self._session
-        assert session is not None, "Cannot create executor before discovery"
-
-        async def executor(**params: Any) -> Any:
-            result = await session.call_tool(mcp_tool_name, params)
-            normalized = _normalize_mcp_result(result)
-            if result.isError:
-                raise RuntimeError(normalized or "MCP tool returned an error")
-            return normalized
-
-        return executor
+        """Create an async Dendrux executor bound to this MCP connection."""
+        adapter = self._client
+        if adapter is None:
+            raise RuntimeError("Cannot create an MCP executor before discovery.")
+        return create_mcp_executor(
+            adapter,
+            namespace=self.name,
+            mcp_tool_name=mcp_tool_name,
+            max_result_bytes=self.source.max_result_bytes,
+        )
 
     async def close(self) -> None:
-        """Close session + transport. Kills subprocess for stdio.
-
-        Idempotent — safe to call multiple times.
-        """
-        if self._exit_stack is not None:
-            try:
-                await self._exit_stack.aclose()
-            except Exception:
-                logger.warning("MCPServer '%s' cleanup failed", self.name, exc_info=True)
-            self._exit_stack = None
-            self._session = None
+        """Close the SDK client and underlying HTTP/subprocess transport."""
+        client = self._client
+        legacy_stack = self._exit_stack if client is None else None
+        self._client = None
+        self._exit_stack = None
+        self._session = None
+        try:
+            if client is not None:
+                await client.close()
+            elif legacy_stack is not None:
+                await legacy_stack.aclose()
+        except Exception as exc:
+            source = client.source if client is not None else self.source
+            logger.warning(
+                "MCPServer '%s' cleanup failed: %s (%s)",
+                self.name,
+                safe_source_exception_detail(source, exc),
+                type(exc).__name__,
+            )

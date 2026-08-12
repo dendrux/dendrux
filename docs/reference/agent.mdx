@@ -31,7 +31,7 @@ Agent(
     prompt: str,
     name: str = ...,                       # defaults to the class name
     tools: list[Callable] = [],
-    tool_sources: list[MCPServer] | None = None,
+    tool_sources: list[MCPSource | MCPServer | MCPHost] | None = None,
     max_iterations: int = 10,
     max_delegation_depth: int | None = None,
     loop: Loop | None = None,              # defaults to ReActLoop
@@ -55,7 +55,7 @@ Agent(
 | `prompt` | The system prompt. Required (a subclass may set it as a class attribute instead). |
 | `name` | Used for the run's owner and `cache_key_prefix`. Defaults to the class name. |
 | `tools` | List of `@tool`-decorated functions. Empty for a pure chatbot. |
-| `tool_sources` | List of `MCPServer` tool sources. See [MCP](/docs/architecture/mcp). |
+| `tool_sources` | MCP source declarations, compatibility servers, or shared hosts. See [MCP](/docs/architecture/mcp). |
 | `max_iterations` | ReAct safety cap on LLM turns. Default 10. |
 | `max_delegation_depth` | Max sub-agent nesting depth. |
 | `loop` | `ReActLoop()` (default) or `SingleCall()`. See [Loops](/docs/architecture/loops). |
@@ -153,7 +153,7 @@ Start a fresh run that reuses an existing terminal run's input and approximate p
 async def close() -> None
 ```
 
-Close MCP sources, the provider, and any agent-owned engine. Called for you by `async with Agent(...)`. The shared global engine from `DENDRUX_DATABASE_URL` is not disposed (it is not agent-owned).
+Close directly owned MCP sources, the provider, and any agent-owned engine. Called for you by `async with Agent(...)`. `MCPHost` leases do not close the application-owned host; close the host separately at worker shutdown. The shared global engine from `DENDRUX_DATABASE_URL` is not disposed because it is not agent-owned.
 
 ## Where this fits
 

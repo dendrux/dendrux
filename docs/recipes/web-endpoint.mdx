@@ -23,17 +23,26 @@ Building the `Agent` object is essentially free. The cost is in the resources it
 | Resource | Cost if rebuilt per request | What to do |
 | --- | --- | --- |
 | DB engine | A new connection pool every request | Share one: set `DENDRUX_DATABASE_URL` or inject a `state_store`. |
-| MCP server | Re-spawns a subprocess / reconnects + re-lists tools | Pool the `MCPServer` objects; reuse them. |
+| MCP source | Re-spawns a subprocess / reconnects + re-lists tools | Share an application-owned `MCPHost` scoped to one tenant/credential identity. |
 | Provider client | Loses connection keep-alive | Optional: pool by `(vendor, model)`. |
 
 ```python
 # ---- once per worker (startup) ----
 from dendrux.db.session import get_engine
+from dendrux.mcp import MCPHost, MCPSource
 from dendrux.runtime.state import SQLAlchemyStateStore
 
 engine = await get_engine(os.environ["DENDRUX_DATABASE_URL"])  # shared singleton
 STORE  = SQLAlchemyStateStore(engine)
-MCP_POOL  = {}   # name -> MCPServer (sessions stay open)
+MCP_HOSTS = {
+    "github": MCPHost([
+        MCPSource.http(
+            "github",
+            os.environ["GITHUB_MCP_URL"],
+            headers={"Authorization": f"Bearer {os.environ['GITHUB_MCP_TOKEN']}"},
+        )
+    ])
+}
 PROVIDERS = {}   # (vendor, model) -> provider
 
 # ---- per request ----
@@ -43,7 +52,7 @@ async def chat(req):
         provider=PROVIDERS[(req.vendor, req.model)],
         prompt=req.system_prompt,
         tools=[TOOLS[t] for t in req.enabled_tools],          # current selection
-        tool_sources=[MCP_POOL[m] for m in req.enabled_mcps], # current selection
+        tool_sources=[MCP_HOSTS[m] for m in req.enabled_mcps], # shared leases
         state_store=STORE,                                    # shared engine
     )
     result = await agent.run(
@@ -54,17 +63,17 @@ async def chat(req):
     return {"answer": result.answer}
 ```
 
-### Do not call `close()` per request when you pool
+### Ownership at request shutdown
 
-`agent.close()` (and `async with Agent(...)`) closes the provider and the MCP sources. That is what you want for a one-off script, but it is **wrong** when those are shared: it tears down the pool the next request needs.
+`MCPHost` makes MCP ownership explicit: `agent.close()` only releases the agent's host leases and does not close shared MCP connections. The application closes the host during worker shutdown.
 
-The Agent has no destructor, so simply **not** calling `close()` leaves everything open. In a pooled server: let the lightweight Agent be garbage-collected, and close the pooled `MCPServer`/provider objects yourself at worker shutdown.
+The provider in this example is also pooled, so do not call `agent.close()` per request because it would close that provider. Either let the lightweight Agent be garbage-collected, give each request its own provider, or manage provider ownership separately. Close all application-owned pools at worker shutdown:
 
 ```python
 @app.on_event("shutdown")
 async def shutdown():
-    for mcp in MCP_POOL.values():
-        await mcp.close()
+    for host in MCP_HOSTS.values():
+        await host.close()
     for provider in PROVIDERS.values():
         await provider.close()
 ```

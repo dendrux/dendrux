@@ -75,7 +75,9 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `MCPServer` | `from dendrux.mcp import MCPServer` | An MCP tool source for `tool_sources=`. See [MCP](/docs/architecture/mcp). |
+| `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration for `tool_sources=`. See [MCP](/docs/architecture/mcp). |
+| `MCPHost` | `from dendrux.mcp import MCPHost` | Application-owned MCP connections and catalogs shared safely across agents. |
+| `MCPServer` | `from dendrux.mcp import MCPServer` | Backward-compatible source facade; prefer `MCPSource` in new code. |
 
 ## Result and event types
 

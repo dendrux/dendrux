@@ -140,7 +140,8 @@ async def _emit_init_events(
     (populated by get_system_prompt()).
 
     MCP: if agent._tool_sources is non-empty, forces discovery via
-    get_tool_lookups(), then groups discovered tools by source_name.
+    get_tool_lookups(), then groups discovered tools by their
+    Agent-visible namespace (falling back to source_name).
     Discovery failures are wrapped in _MCPDiscoveryError so callers
     can distinguish them from skill emission failures.
     """
@@ -171,13 +172,35 @@ async def _emit_init_events(
         except Exception as exc:
             raise _MCPDiscoveryError(str(exc)) from exc
 
-        # Initialize from all sources so zero-tool sources still get events
+        # Initialize from all sources so zero-tool and failed optional sources
+        # still produce explicit, auditable events. Tools are grouped by the
+        # Agent-visible namespace (== each tool source's name); an aliased
+        # runtime view namespaces its tools differently from its MCP source.
         source_tools: dict[str, list[str]] = {src.name: [] for src in agent._tool_sources}
         for td in agent._discovered_tool_defs or []:
-            src = td.meta.get("source_name", "unknown")
-            source_tools.setdefault(src, []).append(td.name)
+            group = td.meta.get("namespace") or td.meta.get("source_name", "unknown")
+            source_tools.setdefault(group, []).append(td.name)
 
-        for source_name, tool_names in source_tools.items():
+        for source in agent._tool_sources:
+            configured_name = getattr(getattr(source, "source", None), "name", None)
+            source_name = configured_name if isinstance(configured_name, str) else source.name
+            source_error = getattr(source, "last_error", None)
+            if isinstance(source_error, str) and source_error:
+                await _emit_init_governance_event(
+                    recorder,
+                    notifier,
+                    run_id,
+                    GovernanceEventType.MCP_ERROR,
+                    {
+                        "source_name": source_name,
+                        "namespace": source.name,
+                        "error": source_error,
+                        "failure_mode": getattr(source, "failure_mode", "strict"),
+                    },
+                )
+                continue
+
+            tool_names = source_tools[source.name]
             await _emit_init_governance_event(
                 recorder,
                 notifier,
@@ -185,6 +208,7 @@ async def _emit_init_events(
                 GovernanceEventType.MCP_CONNECTED,
                 {
                     "source_name": source_name,
+                    "namespace": source.name,
                     "tool_count": len(tool_names),
                     "tool_names": tool_names,
                 },

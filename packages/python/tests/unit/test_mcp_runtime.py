@@ -1,0 +1,423 @@
+"""Production MCP source, adapter facade, and safety-boundary tests."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
+
+from dendrux.agent import Agent
+from dendrux.mcp import (
+    MCPHost,
+    MCPResultTooLargeError,
+    MCPServer,
+    MCPSource,
+    MCPToolCallError,
+)
+from dendrux.mcp._client import MCPConnectionInfo
+from dendrux.mcp._result import normalize_mcp_result
+from dendrux.mcp._source import redact_source_text
+from dendrux.types import ToolDef, ToolTarget
+
+
+class _FakeClientAdapter:
+    tools: list[Tool] = []
+    result: CallToolResult = CallToolResult(content=[TextContent(text="ok")])
+
+    def __init__(self, source: MCPSource) -> None:
+        self.source = source
+        self._stack = object()
+        self._client = object()
+        self.info = MCPConnectionInfo(
+            protocol_version="2026-07-28",
+            server_name="fake-server",
+            server_version="1.0.0",
+            instructions=None,
+        )
+        self.closed = False
+
+    async def connect(self) -> None:
+        return None
+
+    async def list_tools(self) -> list[Tool]:
+        return list(self.tools)
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        return self.result
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestMCPSource:
+    def test_http_configuration(self) -> None:
+        source = MCPSource.http(
+            "github",
+            "https://mcp.example.com",
+            headers={"Authorization": "Bearer secret"},
+            failure_mode="best_effort",
+        )
+
+        assert source.transport == "http"
+        assert not hasattr(source, "allowed_tools")
+        assert source.failure_mode == "best_effort"
+
+    def test_source_repr_omits_endpoints_that_may_contain_credentials(self) -> None:
+        http = MCPSource.http(
+            "remote",
+            "https://mcp.example.com/connect?access_token=query-secret",
+        )
+        stdio = MCPSource.stdio(
+            "local",
+            ["mcp-server", "--token", "command-secret"],
+        )
+
+        for source, secret in ((http, "query-secret"), (stdio, "command-secret")):
+            assert secret not in repr(source)
+
+    def test_redaction_removes_every_configured_credential_channel(self) -> None:
+        source = MCPSource.http(
+            "remote",
+            "https://mcp.example.com/connect?access_token=QUERY%2FSECRET",
+            headers={"Authorization": "Bearer HEADER-SECRET"},
+            auth="AUTH-SECRET",
+        )
+        text = (
+            "401 for url 'https://mcp.example.com/connect?access_token=QUERY%2FSECRET' "
+            "sent header Bearer HEADER-SECRET (token HEADER-SECRET; "
+            "decoded query QUERY/SECRET; auth AUTH-SECRET)"
+        )
+
+        redacted = redact_source_text(source, text)
+
+        assert "QUERY%2FSECRET" not in redacted
+        assert "QUERY/SECRET" not in redacted
+        assert "HEADER-SECRET" not in redacted
+        assert "AUTH-SECRET" not in redacted
+        # The endpoint itself stays: it is what makes the message diagnosable.
+        assert "https://mcp.example.com/connect" in redacted
+
+    def test_redaction_covers_argv_and_env_without_mangling_subcommands(self) -> None:
+        source = MCPSource.stdio(
+            "local",
+            ["mcp-server", "serve", "--token", "short7", "ARGV-SUPERSECRET"],
+            env={"API_KEY": "ENV-SUPERSECRET"},
+        )
+        text = (
+            "spawn failed: mcp-server serve --token short7 ARGV-SUPERSECRET "
+            "env API_KEY=ENV-SUPERSECRET"
+        )
+
+        redacted = redact_source_text(source, text)
+
+        assert "ARGV-SUPERSECRET" not in redacted
+        assert "short7" not in redacted
+        assert "ENV-SUPERSECRET" not in redacted
+        # Security wins over argv diagnostics: every argument is removed by
+        # exact substring, even where a formatter embeds it in other text.
+        assert "prefixshort7suffix" not in redact_source_text(
+            source,
+            "formatter emitted prefixshort7suffix",
+        )
+
+    def test_redaction_covers_tuple_auth_elements(self) -> None:
+        source = MCPSource.http(
+            "remote",
+            "https://mcp.example.com/connect",
+            auth=("svc-user", "svc-password-123"),
+        )
+
+        cleaned = redact_source_text(source, "basic auth svc-user:svc-password-123 rejected")
+
+        assert "svc-password-123" not in cleaned
+        assert "svc-user" not in cleaned
+
+    def test_redaction_leaves_credential_free_text_untouched(self) -> None:
+        source = MCPSource.http("remote", "https://mcp.example.com/connect")
+
+        assert redact_source_text(source, "") == ""
+        assert (
+            redact_source_text(source, "connection refused to https://mcp.example.com/connect")
+            == "connection refused to https://mcp.example.com/connect"
+        )
+
+    def test_source_level_tool_allowlists_are_not_supported(self) -> None:
+        with pytest.raises(TypeError, match="allowed_tools"):
+            MCPSource.http(  # type: ignore[call-arg]
+                "github",
+                "https://mcp.example.com",
+                allowed_tools=["search_code"],
+            )
+
+        with pytest.raises(TypeError, match="allowed_tools"):
+            MCPServer(  # type: ignore[call-arg]
+                "github",
+                url="https://mcp.example.com",
+                allowed_tools=["search_code"],
+            )
+
+    def test_stdio_configuration(self) -> None:
+        source = MCPSource.stdio(
+            "filesystem",
+            ["server", "--root", "/workspace"],
+            env={"LOG_LEVEL": "warning"},
+            cwd="/workspace",
+        )
+
+        assert source.transport == "stdio"
+        assert source.command == ("server", "--root", "/workspace")
+        assert source.env == {"LOG_LEVEL": "warning"}
+
+    def test_http_physical_identity_contains_only_the_connection_target(self) -> None:
+        first = MCPSource.http(
+            "github_personal",
+            "https://mcp.example.com/github",
+            headers={"Authorization": "Bearer old-token"},
+            auth=object(),
+            connect_timeout=10.0,
+            call_timeout=20.0,
+            max_result_bytes=100,
+            failure_mode="best_effort",
+        )
+        second = MCPSource.http(
+            "github_work",
+            "https://mcp.example.com/github",
+            headers={"Authorization": "Bearer new-token"},
+            auth=object(),
+            connect_timeout=30.0,
+            call_timeout=60.0,
+            max_result_bytes=200,
+        )
+
+        assert first.physical_identity == ("http", "https://mcp.example.com/github")
+        assert first.physical_identity == second.physical_identity
+        assert hash(first.physical_identity) == hash(second.physical_identity)
+
+    def test_stdio_physical_identity_excludes_environment_and_tuning(self) -> None:
+        first = MCPSource.stdio(
+            "github_personal",
+            ["github-mcp", "serve"],
+            cwd="/workspace",
+            env={"GITHUB_TOKEN": "old-token"},
+            call_timeout=10.0,
+        )
+        second = MCPSource.stdio(
+            "github_work",
+            ["github-mcp", "serve"],
+            cwd="/workspace",
+            env={"GITHUB_TOKEN": "new-token"},
+            call_timeout=60.0,
+        )
+
+        assert first.physical_identity == (
+            "stdio",
+            ("github-mcp", "serve"),
+            Path("/workspace"),
+        )
+        assert first.physical_identity == second.physical_identity
+        assert hash(first.physical_identity) == hash(second.physical_identity)
+
+    def test_physical_identity_changes_with_the_connection_target(self) -> None:
+        assert (
+            MCPSource.http("one", "https://one.example.com").physical_identity
+            != MCPSource.http("two", "https://two.example.com").physical_identity
+        )
+        assert (
+            MCPSource.stdio("one", ["server", "one"]).physical_identity
+            != MCPSource.stdio("two", ["server", "two"]).physical_identity
+        )
+        assert (
+            MCPSource.stdio("one", ["server"], cwd="/one").physical_identity
+            != MCPSource.stdio("two", ["server"], cwd="/two").physical_identity
+        )
+
+    def test_transport_specific_options_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="only valid for HTTP"):
+            MCPSource(
+                name="fs",
+                command=("server",),
+                headers={"Authorization": "secret"},
+            )
+
+        with pytest.raises(ValueError, match="only valid for stdio"):
+            MCPSource(name="remote", url="https://example.com/mcp", env={"TOKEN": "x"})
+
+    def test_agent_accepts_source_and_builds_compatibility_facade(self) -> None:
+        source = MCPSource.http("github", "https://mcp.example.com")
+        agent = Agent(prompt="test", tool_sources=[source])
+
+        assert len(agent._tool_sources) == 1
+        assert isinstance(agent._tool_sources[0], MCPServer)
+        assert agent._tool_sources[0].source is source
+
+
+class TestMCPToolAdaptation:
+    @pytest.mark.asyncio
+    async def test_real_sdk_v2_stdio_discovery_and_call(self) -> None:
+        fixture = Path(__file__).parents[1] / "fixtures" / "mcp_echo_server.py"
+        server = MCPServer(
+            "echo",
+            command=[sys.executable, str(fixture)],
+            connect_timeout=10.0,
+            call_timeout=10.0,
+        )
+
+        try:
+            tool_defs = await server._discover()
+            assert [tool.name for tool in tool_defs] == ["echo__echo"]
+            assert tool_defs[0].meta["server_name"] == "dendrux-test-server"
+
+            executor = server._create_executor("echo")
+            assert await executor(message="hello through MCP") == {"result": "hello through MCP"}
+        finally:
+            await server.close()
+
+    @pytest.mark.asyncio
+    async def test_discovery_exposes_tools_and_sets_safe_parallelism(self) -> None:
+        _FakeClientAdapter.tools = [
+            Tool(
+                name="read",
+                description="Read data",
+                input_schema={"type": "object"},
+                annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False),
+            ),
+            Tool(
+                name="delete",
+                description="Delete data",
+                input_schema={"type": "object"},
+                annotations=ToolAnnotations(destructive_hint=True),
+            ),
+        ]
+        source = MCPSource.http(
+            "store",
+            "https://mcp.example.com",
+            call_timeout=45.0,
+        )
+        server = MCPServer.from_source(source)
+
+        with patch("dendrux.mcp._server.MCPClientAdapter", _FakeClientAdapter):
+            tool_defs = await server._discover()
+
+        assert [tool.name for tool in tool_defs] == ["store__read", "store__delete"]
+        assert tool_defs[0].parallel is True
+        assert tool_defs[1].parallel is False
+        assert tool_defs[0].timeout_seconds == 45.0
+        assert tool_defs[0].meta["protocol_version"] == "2026-07-28"
+        await server.close()
+
+    @pytest.mark.asyncio
+    async def test_tools_are_serial_by_default(self) -> None:
+        _FakeClientAdapter.tools = [
+            Tool(name="unknown", description="", input_schema={"type": "object"})
+        ]
+        server = MCPServer("store", url="https://mcp.example.com")
+
+        with patch("dendrux.mcp._server.MCPClientAdapter", _FakeClientAdapter):
+            tool_defs = await server._discover()
+
+        assert tool_defs[0].parallel is False
+        await server.close()
+
+    @pytest.mark.asyncio
+    async def test_best_effort_source_does_not_block_other_tools(self) -> None:
+        optional = MCPServer(
+            "optional",
+            url="https://unavailable.example.com",
+            failure_mode="best_effort",
+        )
+
+        async def fail_discovery() -> list[Any]:
+            optional.last_error = "connection refused"
+            raise ConnectionError("connection refused")
+
+        optional._discover = fail_discovery  # type: ignore[method-assign]
+        optional.close = AsyncMock()  # type: ignore[method-assign]
+        agent = Agent(prompt="test", tool_sources=[optional])
+
+        lookups = await agent.get_tool_lookups()
+
+        assert not lookups.fn
+        assert optional.last_error == "connection refused"
+
+
+class TestMCPHost:
+    @pytest.mark.asyncio
+    async def test_host_shares_discovery_and_owns_shutdown(self) -> None:
+        runtime = MCPServer("shared", url="https://mcp.example.com")
+        discovered = [
+            ToolDef(
+                name="shared__read",
+                description="Read",
+                parameters={"type": "object"},
+                target=ToolTarget.SERVER,
+                parallel=False,
+                meta={"source_name": "shared", "mcp_tool_name": "read"},
+            )
+        ]
+        runtime._discover = AsyncMock(return_value=discovered)  # type: ignore[method-assign]
+
+        async def execute(**params: Any) -> dict[str, Any]:
+            return params
+
+        def create_executor(name: str) -> Any:
+            return execute
+
+        runtime._create_executor = create_executor  # type: ignore[assignment]
+        runtime.close = AsyncMock()  # type: ignore[method-assign]
+        host = MCPHost([runtime])
+        first = Agent(prompt="first", tool_sources=[host])
+        second = Agent(prompt="second", tool_sources=[host])
+
+        first_lookups = await first.get_tool_lookups()
+        second_lookups = await second.get_tool_lookups()
+
+        runtime._discover.assert_awaited_once()
+        assert await first_lookups.fn["shared__read"](value=1) == {"value": 1}
+        assert "shared__read" in second_lookups.fn
+
+        await first.close()
+        runtime.close.assert_not_awaited()
+
+        await host.close()
+        runtime.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_host_refresh_reconnects_on_next_discovery(self) -> None:
+        runtime = MCPServer("shared", url="https://mcp.example.com")
+        runtime._discover = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        runtime.close = AsyncMock()  # type: ignore[method-assign]
+        host = MCPHost([runtime])
+
+        await host.tool_sources[0]._discover()
+        await host.refresh()
+        await host.tool_sources[0]._discover()
+
+        assert runtime._discover.await_count == 2
+        runtime.close.assert_awaited_once()
+        await host.close()
+
+
+class TestMCPResultBoundaries:
+    def test_large_result_is_rejected(self) -> None:
+        result = CallToolResult(content=[TextContent(text="x" * 100)])
+
+        with pytest.raises(MCPResultTooLargeError, match="configured limit"):
+            normalize_mcp_result(result, max_result_bytes=20)
+
+    @pytest.mark.asyncio
+    async def test_mcp_error_result_becomes_typed_exception(self) -> None:
+        server = MCPServer("store", url="https://mcp.example.com")
+        adapter = _FakeClientAdapter(server.source)
+        adapter.result = CallToolResult(
+            content=[TextContent(text="permission denied")],
+            is_error=True,
+        )
+        server._client = adapter  # type: ignore[assignment]
+
+        executor = server._create_executor("write")
+        with pytest.raises(MCPToolCallError, match="permission denied"):
+            await executor(value="x")

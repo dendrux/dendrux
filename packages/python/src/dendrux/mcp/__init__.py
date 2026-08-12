@@ -1,18 +1,19 @@
 """MCP (Model Context Protocol) integration for Dendrux.
 
-Provides MCPServer — a declarative configuration for connecting
-to external MCP servers and discovering tools at runtime.
+Provides a production client wrapper over the official MCP Python SDK.
 
 Usage:
-    from dendrux.mcp import MCPServer
+    from dendrux.mcp import MCPHost, MCPSource
+
+    host = MCPHost([
+        MCPSource.stdio("filesystem", command=[
+            "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp",
+        ]),
+    ])
 
     agent = Agent(
         provider=provider,
-        tool_sources=[
-            MCPServer("filesystem", command=[
-                "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp",
-            ]),
-        ],
+        tool_sources=[host],
     )
 
 Requires the ``mcp`` package: ``pip install dendrux[mcp]``
@@ -27,6 +28,23 @@ except ModuleNotFoundError as err:
         ) from None
     raise  # Real import error from within the mcp package
 
+from dendrux.mcp._errors import (  # noqa: E402
+    MCPConnectionError,
+    MCPError,
+    MCPResultTooLargeError,
+    MCPToolCallError,
+)
+from dendrux.mcp._host import MCPHost  # noqa: E402
 from dendrux.mcp._server import MCPServer  # noqa: E402
+from dendrux.mcp._source import MCPFailureMode, MCPSource  # noqa: E402
 
-__all__ = ["MCPServer"]
+__all__ = [
+    "MCPConnectionError",
+    "MCPError",
+    "MCPFailureMode",
+    "MCPHost",
+    "MCPResultTooLargeError",
+    "MCPServer",
+    "MCPSource",
+    "MCPToolCallError",
+]

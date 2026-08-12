@@ -26,15 +26,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from dendrux import Agent
-from dendrux.mcp import MCPServer
+from dendrux.mcp import MCPSource
 
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
 
 async def main() -> None:
-    server = MCPServer(
+    server = MCPSource.stdio(
         "everything",
-        command=["npx", "-y", "@modelcontextprotocol/server-everything"],
+        ["npx", "-y", "@modelcontextprotocol/server-everything@2026.7.4"],
     )
     async with Agent(
         name="EverythingAgent",

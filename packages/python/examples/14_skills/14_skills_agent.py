@@ -29,7 +29,7 @@ from rich.panel import Panel
 
 from dendrux import Agent
 from dendrux.llm.anthropic import AnthropicProvider
-from dendrux.mcp import MCPServer
+from dendrux.mcp import MCPSource
 from dendrux.notifiers.console import ConsoleNotifier
 
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
@@ -90,12 +90,12 @@ async def main() -> None:
             "Always confirm what you did after completing a task."
         ),
         tool_sources=[
-            MCPServer(
+            MCPSource.stdio(
                 "filesystem",
-                command=[
+                [
                     "npx",
                     "-y",
-                    "@modelcontextprotocol/server-filesystem",
+                    "@modelcontextprotocol/server-filesystem@2026.7.4",
                     str(work_dir),
                 ],
             ),

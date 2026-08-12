@@ -1,140 +1,253 @@
 ---
 title: MCP
-description: Connecting an agent to external Model Context Protocol servers as tool sources, how discovery works, and how errors are reported without ambiguity.
+description: Connect Dendrux agents to remote or subprocess MCP tools with source configuration, shared runtime ownership, policy, and auditable failure handling.
 ---
 
 # MCP
 
-MCP (Model Context Protocol) is an open protocol for exposing tools from a separate process (or remote host) to an LLM client. Dendrux integrates with it through one construct: an `MCPServer` attached to the agent's `tool_sources=[...]`. The agent treats MCP-provided tools as first-class tools, with namespacing to keep names distinct from locally defined ones.
+Model Context Protocol (MCP) servers expose tools that execute outside the agent. Dendrux is an MCP **client and host**: it discovers those external tools, converts them into normal Dendrux tools, and sends calls through the same deny, approval, guardrail, timeout, and audit pipeline as local `@tool` functions.
 
-Install with `pip install dendrux[mcp]`. The integration is optional because it pulls in the `mcp` client package, and many agents have no need for it.
+Dendrux does not help you build MCP servers. Use it to consume existing servers directly or through an MCP gateway.
 
-## Attaching an MCP server
+Install the optional integration:
+
+```bash
+pip install "dendrux[mcp]"
+```
+
+## Complete example: local and MCP tools
+
+This agent has one local Python tool and one tool from the official MCP conformance server:
 
 ```python
-from dendrux import Agent
-from dendrux.llm.anthropic import AnthropicProvider
-from dendrux.mcp import MCPServer
+import asyncio
 
-agent = Agent(
-    provider=AnthropicProvider(model="claude-haiku-4-5"),
-    prompt="You are a filesystem helper.",
-    tool_sources=[
-        MCPServer(
-            "filesystem",
-            command=["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-        ),
-    ],
-    database_url="sqlite+aiosqlite:///demo.db",
+from dendrux import Agent, tool
+from dendrux.mcp import MCPHost, MCPSource
+
+
+@tool()
+async def count_words(text: str) -> dict[str, int]:
+    """Count the words in a piece of text."""
+    return {"word_count": len(text.split())}
+
+
+async def main() -> None:
+    everything = MCPSource.stdio(
+        name="everything",
+        command=["npx", "-y", "@modelcontextprotocol/server-everything@2026.7.4"],
+        connect_timeout=60,  # allows a cold first-run npx download
+        call_timeout=30,
+        max_result_bytes=100_000,
+    )
+
+    async with MCPHost([everything]) as mcp_host:
+        async with Agent(
+            provider="anthropic:claude-haiku-4-5",
+            prompt="Use the echo and count_words tools when requested.",
+            tools=[count_words],
+            tool_sources=[mcp_host],
+        ) as agent:
+            result = await agent.run(
+                "Echo 'Dendrux uses MCP tools safely', then count its words."
+            )
+            print(result.answer)
+
+
+asyncio.run(main())
+```
+
+Prerequisites are Node.js with `npx`, an Anthropic API key, and `dendrux[anthropic,mcp]`. The complete runnable version is [`packages/python/examples/30_mcp_agent.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/30_mcp_agent.py).
+
+## The three objects
+
+| Object | Responsibility | Typical lifetime |
+| --- | --- | --- |
+| `MCPSource` | Immutable connection, authentication, and limit configuration. | Application configuration. |
+| `MCPHost` | Owns SDK connections and discovered catalogs so multiple agents can share them safely. | One worker, tenant, or credential identity. |
+| `MCPServer` | Backward-compatible facade used by the runtime. Existing `MCPServer(...)` code still works. | Prefer `MCPSource` in new code. |
+
+The official MCP Python SDK owns protocol framing, transport negotiation, and the underlying client session. Dendrux owns agent-facing names, lifecycle policy, result boundaries, governance, and evidence.
+
+## Configure an HTTP source
+
+Streamable HTTP is the normal production transport for a separately deployed MCP server or gateway:
+
+```python
+from dendrux.mcp import MCPSource
+
+github = MCPSource.http(
+    name="github",
+    url="https://mcp.example.com/github",
+    headers={"Authorization": "Bearer ..."},
+    connect_timeout=10,
+    call_timeout=60,
+    max_result_bytes=500_000,
+    failure_mode="best_effort",
 )
 ```
 
-Two transports are supported, mutually exclusive per server:
+`auth=` accepts an authentication object supported by the MCP SDK's `httpx2.AsyncClient`, including an SDK OAuth provider. Prefer `headers=` or `auth=` over credentials embedded in a URL; Dendrux rejects credential-bearing URLs.
 
-| Arg | Transport | Use when |
-| --- | --- | --- |
-| `command=[...]` | stdio subprocess | You run a local MCP server as a child process. |
-| `url="..."` | Streamable HTTP | You hit a remote or persistent HTTP-based MCP endpoint. |
+## Configure a stdio source
 
-`tool_sources` is a list, so an agent can attach any number of MCP servers in one declaration. Each one is independent; discovery is per-server.
-
-## Tool naming and namespacing
-
-Every tool discovered from an MCP server is renamed to `source_name__original_tool_name` before the agent sees it. That double underscore is the namespace separator, and `MCPServer` refuses to construct if your `name` contains one. From `dendrux/mcp/_server.py`:
+A stdio source launches a subprocess and speaks MCP over its standard input and output:
 
 ```python
-if "__" in name:
-    raise ValueError(
-        f"MCPServer name '{name}' cannot contain '__'. "
-        f"Double underscore is reserved as the namespace separator."
-    )
+filesystem = MCPSource.stdio(
+    name="filesystem",
+    command=[
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem@2026.7.4",
+        "/workspace",
+    ],
+    env={"LOG_LEVEL": "warning"},
+    cwd="/workspace",
+    call_timeout=30,
+)
 ```
 
-The rename is what lets two MCP servers expose identically-named tools without collision. A `read` tool from a `filesystem` server becomes `filesystem__read`; the same name from a `redis` server becomes `redis__read`. The model sees both, the runtime dispatches the right one, and no global registry has to reconcile anything.
+The subprocess runs with the Dendrux process's operating-system privileges. MCP is not a sandbox. Only run trusted stdio servers directly; put untrusted servers in a container or isolated MCP runtime and connect over HTTP.
 
-## Discovery happens on first run, not at construction
+Pin subprocess package versions, as these examples do, instead of executing an unreviewed future `latest` release.
 
-`MCPServer(...)` is a declaration. No subprocess starts, no connection opens. Discovery runs the first time the agent executes, during init:
+## Simple ownership versus shared ownership
+
+For one short-lived agent, pass a source directly. The agent owns and closes the connection:
 
 ```python
-async def _emit_init_events(agent, recorder, notifier):
-    ...
-    if agent._tool_sources:
-        try:
-            await agent.get_tool_lookups()  # force discovery
-        except Exception as exc:
-            raise _MCPDiscoveryError(str(exc)) from exc
-
-        source_tools = {src.name: [] for src in agent._tool_sources}
-        for td in agent._discovered_tool_defs or []:
-            src = td.meta.get("source_name", "unknown")
-            source_tools.setdefault(src, []).append(td.name)
-
-        for source_name, tool_names in source_tools.items():
-            await _emit_init_governance_event(
-                recorder,
-                notifier,
-                GovernanceEventType.MCP_CONNECTED,
-                {
-                    "source_name": source_name,
-                    "tool_count": len(tool_names),
-                    "tool_names": tool_names,
-                },
-            )
+async with Agent(
+    provider=provider,
+    prompt="You are a filesystem assistant.",
+    tool_sources=[filesystem],
+) as agent:
+    result = await agent.run("List the workspace files.")
 ```
 
-Three things fall out of that:
+For a web worker or multiple agents, use `MCPHost`:
 
-1. **One `mcp.connected` event per source.** The event carries the source name, the tool count, and the full tool list. A reader can replay this to know exactly what the agent had access to on a given run.
-2. **Zero-tool sources still emit.** If an MCP server is reachable but exposes no tools, the event still fires with `tool_count=0`. The audit log records the connection attempt, which is sometimes the important fact.
-3. **Cached for the agent's lifetime.** Once discovered, the tools stay with the agent. Subsequent runs on the same `Agent` instance do not re-query the server. Connections stay open on the source's `AsyncExitStack`; `close()` (handled by the `async with Agent(...)` context manager) tears them down.
+```python
+host = MCPHost([github, filesystem])
 
-## When discovery fails: `mcp.error`
+researcher = Agent(
+    provider=research_provider,
+    prompt="Research the codebase.",
+    tool_sources=[host],
+)
 
-A broken MCP server, a wrong URL, a missing subprocess binary: all of these show up as discovery failures during init. The runner catches them, emits `mcp.error`, and the run terminates with `status=error`. Captured from a live run where `MCPServer("nonexistent", command=["/usr/bin/false"])` was attached (a command that exits immediately):
+reviewer = Agent(
+    provider=review_provider,
+    prompt="Review code changes.",
+    tool_sources=[host],
+)
+
+await researcher.close()  # does not close host connections
+await reviewer.close()
+await host.close()        # application shutdown
+```
+
+Create separate hosts for different tenants or credential identities. A host deliberately never merges authentication contexts.
+
+## Discovery and catalog lifetime
+
+`MCPSource` and `MCPHost` construction perform no network or subprocess I/O. Discovery happens lazily when `agent.run()` or `agent.get_tool_lookups()` first needs the tools.
+
+- Every paginated `tools/list` page is collected.
+- The agent receives a stable catalog for its lifetime.
+- An `MCPHost` caches each source catalog across its agents.
+- `await agent.refresh()` clears a directly owned agent catalog.
+- For a shared host, call `await host.refresh()` between runs, then `await agent.refresh()` for each reused agent that needs the new snapshot.
+
+Do not refresh while a run is active or paused. A run should execute against one stable capability set.
+
+You can force discovery during application startup for a health check:
+
+```python
+lookups = await agent.get_tool_lookups()
+print(sorted(lookups.fn))
+```
+
+## Tool names and policy
+
+MCP tools are exposed as `source_name__tool_name`:
 
 ```text
-exception: McpError: Connection closed
-
-run_events:
-  seq=0  run.started  data={"agent_name": "Agent", "system_prompt": "You are a helpful assistant."}
-  seq=1  mcp.error    data={"error": "Connection closed"}
-  seq=2  run.error    data={"error": "Connection closed"}
-
-agent_runs.status: error
-agent_runs.error:   Connection closed
+github + create_issue  -> github__create_issue
+filesystem + read_file -> filesystem__read_file
 ```
 
-Three events, one clean terminal state. The `mcp.error` event is the audit record of what failed and why; the `run.error` lifecycle event is the generic "this run did not succeed" marker. Both carry the same error string, so a reader scanning either the governance layer or the lifecycle layer sees the cause.
+Namespacing prevents cross-server and local-tool collisions. Characters outside the portable provider subset are converted to `_`; the final name must be at most 64 characters.
 
-The LLM never ran. The runner aborted during init, before the first `llm.completed` could fire. This is deliberate: if an agent's tools are incomplete, continuing the run would mean the model acts on a partial tool set without knowing it. Failing fast with a typed event is the safer default.
-
-## Why declarative at construction, not dynamic at runtime
-
-A common MCP integration shape is "add a tool source at any time and the agent picks it up." Dendrux intentionally does not work that way.
-
-`tool_sources` is fixed at `Agent` construction. You cannot mutate the list after the agent starts running. The reason is the audit story: every run's `mcp.connected` event list is a snapshot of what was available when that run began. If the set could change mid-run, a reader reconstructing "what tools did this agent have when it made that decision" would need to diff event logs across time, and partial results are hard to reason about.
-
-If you need different tool sets for different runs, construct different agents. The cost is low: `Agent` is cheap to build, and the provider / DB connection can be shared.
-
-## Security posture
-
-MCP stdio servers are local subprocesses. They inherit the parent's environment, including env vars, file descriptors, and process permissions. The `MCPServer` docstring calls this out explicitly:
+Use the namespaced name in Dendrux policy:
 
 ```python
-"""
-**Security:** stdio MCP servers run as local subprocesses with full
-environment access. Only use trusted MCP server implementations.
-"""
+agent = Agent(
+    provider=provider,
+    prompt="Help maintain the repository.",
+    tool_sources=[host],
+    deny=["filesystem__delete_file"],
+    require_approval=["github__create_issue"],
+)
 ```
 
-Treat an MCP server like any other dependency you run locally. The protocol does not sandbox anything; dendrux does not sandbox anything. If you want isolation, run the MCP server inside a container or a separate user account and connect via HTTP.
+MCP tool annotations are advisory. Dendrux schedules an MCP tool concurrently only when it is explicitly marked read-only and not destructive; tools without those annotations run serially.
 
-The HTTP transport case is friendlier: it is just an outbound HTTP connection, and the server is whatever you point the URL at. The same "only trust implementations you control or vet" rule applies, but process-level escape is not a concern.
+## Failure modes
+
+Each source chooses how discovery failure affects the run:
+
+```python
+required = MCPSource.http(
+    "payments",
+    "https://payments.example.com/mcp",
+    failure_mode="strict",
+)
+
+optional = MCPSource.http(
+    "analytics",
+    "https://analytics.example.com/mcp",
+    failure_mode="best_effort",
+)
+```
+
+| Mode | Behaviour |
+| --- | --- |
+| `strict` | Default. Discovery failure emits `mcp.error`; initialization stops before the first LLM call. |
+| `best_effort` | Records `mcp.error` for that source and continues with the remaining local and MCP tools. |
+
+A successful source emits `mcp.connected` with its source name, tool count, and namespaced tool list. Zero-tool sources still emit `mcp.connected` with `tool_count=0`.
+
+## Calls, errors, and result limits
+
+MCP calls pass through the ordinary Dendrux server-tool execution path. That means deny rules, approval pauses, guardrails, call limits, timeouts, persisted tool calls, and completion/error events work the same way as for local tools.
+
+The integration preserves:
+
+- `structuredContent` as a JSON-compatible Python value;
+- text-only content as a string;
+- image, audio, resource-link, and embedded-resource blocks in a JSON content envelope;
+- negotiated protocol version and server identity in `ToolDef.meta`.
+
+`max_result_bytes` is enforced before a result enters the model conversation. An oversized result raises `MCPResultTooLargeError`; unsuccessful MCP results raise `MCPToolCallError`; connection failures raise `MCPConnectionError`.
+
+## Configuration reference
+
+Common options on `MCPSource.http(...)` and `MCPSource.stdio(...)`:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `name` | required | Stable namespace used in tool and audit names. |
+| `connect_timeout` | `30.0` | Maximum initial connection/negotiation time in seconds. |
+| `call_timeout` | `120.0` | Per-tool SDK and Dendrux execution timeout. |
+| `max_result_bytes` | `1_000_000` | Maximum normalized result size. |
+| `failure_mode` | `"strict"` | `"strict"` or `"best_effort"`. |
+
+HTTP-only options are `url`, `headers`, and `auth`. Stdio-only options are `command`, `env`, and `cwd`; mixing transport-specific options raises `ValueError` during construction.
 
 ## Where this fits
 
-- Declared on `Agent(tool_sources=[MCPServer(...), ...])`.
-- Discovered on first run in `_emit_init_events`, inside the runner's `try` block.
-- Emits `mcp.connected` (success, once per source) and `mcp.error` (failure, once).
-- MCP tools are dispatched through the normal tool pipeline: deny checks, guardrail deanonymization, approval gates, `tool_calls` row, `tool.completed` event. Nothing in the rest of the system treats them specially.
+- [`Agent.tool_sources`](/docs/reference/agent#constructor) attaches sources or hosts.
+- [Access control](/docs/architecture/access-control) denies namespaced tools deterministically.
+- [Approval](/docs/architecture/approval) pauses before sensitive MCP calls.
+- [Web endpoint recipe](/docs/recipes/web-endpoint) shows worker-scoped host ownership.
