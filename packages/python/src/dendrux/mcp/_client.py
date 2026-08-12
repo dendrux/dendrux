@@ -8,27 +8,46 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import httpx2
 from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError as SDKMCPError
+from mcp.types import CONNECTION_CLOSED
 
 from dendrux.mcp._errors import MCPAuthenticationError, MCPConnectionError
 from dendrux.mcp._source import safe_source_exception_detail, source_has_opaque_credentials
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from dendrux.mcp._source import MCPSource
 
 logger = logging.getLogger(__name__)
 
 _AUTH_REJECTION_STATUSES = (401, 403)
 
+# Failures that mean the transport or session itself died. Timeouts are
+# deliberately absent (a slow server is not a dead one), as are HTTP status
+# errors (a rejection arrives over a working connection) and local protocol
+# errors (a client-side bug does not invalidate the transport).
+_CONNECTION_LOSS_TYPES: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    EOFError,
+    httpx2.NetworkError,
+    httpx2.RemoteProtocolError,
+    anyio.BrokenResourceError,
+    anyio.ClosedResourceError,
+    anyio.EndOfStream,
+)
 
-def _authentication_status(exc: BaseException) -> int | None:
-    """Find a credential-rejection HTTP status anywhere in an error tree.
 
-    SDK and transport layers wrap the original ``httpx`` status error, so the
-    cause/context chain and exception-group branches are all searched.
+def _iter_error_tree(exc: BaseException) -> Iterator[BaseException]:
+    """Yield every distinct exception reachable from one failure.
+
+    SDK and transport layers wrap the original error, so the cause/context
+    chains and exception-group branches are all walked.
     """
     stack: list[BaseException] = [exc]
     seen: set[int] = set()
@@ -37,19 +56,39 @@ def _authentication_status(exc: BaseException) -> int | None:
         if id(node) in seen:
             continue
         seen.add(id(node))
-        response = getattr(node, "response", None)
-        status = getattr(response, "status_code", None)
-        if status is None:
-            status = getattr(node, "status_code", None)
-        if status in _AUTH_REJECTION_STATUSES:
-            return int(status)
+        yield node
         if isinstance(node, BaseExceptionGroup):
             stack.extend(node.exceptions)
         if node.__cause__ is not None:
             stack.append(node.__cause__)
         if node.__context__ is not None:
             stack.append(node.__context__)
+
+
+def _authentication_status(exc: BaseException) -> int | None:
+    """Find a credential-rejection HTTP status anywhere in an error tree."""
+    for node in _iter_error_tree(exc):
+        response = getattr(node, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(node, "status_code", None)
+        if status in _AUTH_REJECTION_STATUSES:
+            return int(status)
     return None
+
+
+def is_connection_loss(exc: BaseException) -> bool:
+    """Whether an error tree shows the physical transport or session died.
+
+    Used by the managed runtime to distinguish a dead connection — which
+    must be fenced and replaced — from a tool that merely failed over a
+    working one, which must never poison the shared connection.
+    """
+    return any(
+        isinstance(node, _CONNECTION_LOSS_TYPES)
+        or (isinstance(node, SDKMCPError) and node.code == CONNECTION_CLOSED)
+        for node in _iter_error_tree(exc)
+    )
 
 
 @dataclass(frozen=True, slots=True)

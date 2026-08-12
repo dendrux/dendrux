@@ -21,6 +21,7 @@ from dendrux.mcp._errors import (
     MCPConnectionCapacityError,
     MCPConnectionError,
     MCPConnectionEvictingError,
+    MCPConnectionLostError,
     MCPCredentialError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
@@ -49,6 +50,7 @@ _FORCED_CANCEL_GRACE = 0.05
 
 
 MCPEvictionMode = Literal["drain", "force"]
+_CallInterruption = Literal["forced", "connection_lost"]
 
 
 class MCPRuntimeState(StrEnum):
@@ -391,7 +393,13 @@ class _ViewToolSource(MCPServer):
         connection = self._view.connection
         qualified_name = f"{self.name}__{mcp_tool_name}"
 
-        def unknown_outcome() -> MCPOutcomeUnknownError:
+        def unknown_outcome(reason: _CallInterruption) -> MCPOutcomeUnknownError:
+            if reason == "connection_lost":
+                return MCPOutcomeUnknownError(
+                    f"MCP tool '{qualified_name}' was interrupted by a lost connection. "
+                    "The server may already have applied it, so it must not be retried "
+                    "automatically. The next acquisition opens a fresh connection."
+                )
             return MCPOutcomeUnknownError(
                 f"MCP tool '{qualified_name}' was interrupted by a forced eviction. "
                 "The server may already have applied it, so it must not be retried "
@@ -410,6 +418,7 @@ class _ViewToolSource(MCPServer):
             permit = await connection.runtime._begin_call(
                 connection.identity,
                 entry,
+                generation=connection.generation,
                 tool=qualified_name,
                 owner=self._call_owner,
                 # Re-checked on every wake, so one message covers both a stale
@@ -419,32 +428,46 @@ class _ViewToolSource(MCPServer):
             try:
                 result = await executor(**params)
             except asyncio.CancelledError as exc:
-                if not permit.interrupted:
+                interruption = permit.interruption
+                if interruption is None:
                     raise
                 # Absorb only the cancellation issued by MCPRuntime. If the
                 # application also cancelled this Agent task, its independent
                 # request remains and cancellation must keep propagating.
                 remaining = permit.task.uncancel()
-                permit.interrupted = False
+                permit.interruption = None
                 if remaining:
                     raise
-                raise unknown_outcome() from exc
+                raise unknown_outcome(interruption) from exc
             except BaseException as exc:
-                if entry.force_evicted:
-                    if permit.interrupted:
+                interruption = permit.interruption
+                if interruption is not None or entry.force_evicted:
+                    if interruption is not None:
                         remaining = permit.task.uncancel()
-                        permit.interrupted = False
+                        permit.interruption = None
                         # A non-zero remainder is an application cancellation.
                         # Raise it now instead of letting the unrelated tool
                         # failure hide it until some later suspension point.
                         if remaining:
                             raise asyncio.CancelledError from exc
-                    raise unknown_outcome() from exc
+                    raise unknown_outcome(interruption or "forced") from exc
+                if isinstance(exc, MCPToolCallError) and exc.connection_lost:
+                    # The transport died underneath this call. The request may
+                    # already have reached the server, so the outcome is
+                    # unknown and must not be retried automatically. Recovery
+                    # only fences the entry so future acquisitions reconnect.
+                    connection.runtime._connection_lost(
+                        connection.identity,
+                        entry,
+                        reporting_permit=permit,
+                    )
+                    raise unknown_outcome("connection_lost") from exc
                 raise
             else:
-                if permit.interrupted:
+                interruption = permit.interruption
+                if interruption is not None:
                     remaining = permit.task.uncancel()
-                    permit.interrupted = False
+                    permit.interruption = None
                     if remaining:
                         raise asyncio.CancelledError
                     # A normal return is a definitive server response. Forced
@@ -486,6 +509,7 @@ class _ConnectionEntry:
     __slots__ = (
         "active_calls",
         "adapter",
+        "broken",
         "call_permits",
         "close_started",
         "fenced",
@@ -511,9 +535,12 @@ class _ConnectionEntry:
         self.task: asyncio.Task[None] | None = None
         # fenced: no new leases or calls may be taken on this entry. Set by
         # eviction, idle retirement, and shutdown alike. force_evicted is
-        # narrower: work was interrupted, so outcomes are unknown.
+        # narrower: work was interrupted, so outcomes are unknown. broken is
+        # narrower still: the transport itself died, so calls that never
+        # started are rejected as safely retryable after re-acquisition.
         self.fenced = False
         self.force_evicted = False
+        self.broken = False
         self.close_started = False
         # Idle retirement: a pending timer, then the task closing this exact
         # physical entry. Both are scoped to this entry so a stale callback can
@@ -529,12 +556,12 @@ class _ConnectionEntry:
 class _CallPermit:
     """Exact-once ownership of one admitted runtime-wide call slot."""
 
-    __slots__ = ("entry", "interrupted", "release_event", "released", "task")
+    __slots__ = ("entry", "interruption", "release_event", "released", "task")
 
     def __init__(self, entry: _ConnectionEntry, task: asyncio.Task[Any]) -> None:
         self.entry = entry
         self.task = task
-        self.interrupted = False
+        self.interruption: _CallInterruption | None = None
         self.release_event = asyncio.Event()
         self.released = False
 
@@ -603,7 +630,7 @@ class MCPRuntime:
     Connect and discovery are lazy and single-flight; Agents lease the
     shared connection through tool views and release on ``Agent.close()``.
 
-    A connection leaves the runtime in one of three ways:
+    A connection leaves the runtime in one of four ways:
 
     * **Idle retirement** — after ``idle_timeout`` seconds with no leases and
       no in-flight calls, the transport closes but the registration and its
@@ -611,6 +638,14 @@ class MCPRuntime:
       ``idle_timeout=None`` to disable timed retirement; capacity pressure may
       still retire an idle connection. ``0`` retires as soon as the last lease
       is released.
+    * **Broken-connection recovery** — a tool call that fails with a
+      classified transport loss fences the connection immediately and retires
+      it like idle retirement: the registration survives and the next
+      acquisition reconnects with freshly resolved credentials. The failed
+      call raises :class:`MCPOutcomeUnknownError` — the server may already
+      have received it — and is never retried automatically; calls that never
+      started raise :class:`MCPConnectionLostError` and are safe to retry
+      after re-acquisition.
     * **Eviction** — :meth:`evict` closes the transport *and* forgets the
       registration, permanently invalidating every handle issued for it.
     * **Shutdown** — :meth:`close` drains, then tears everything down.
@@ -1041,6 +1076,80 @@ class MCPRuntime:
                 type(exc).__name__,
             )
 
+    def _connection_lost(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        reporting_permit: _CallPermit,
+    ) -> None:
+        """Fence one broken physical entry and start its single recovery.
+
+        Reported by every call that fails with a classified transport loss;
+        the fence check makes concurrent reports converge on one recovery
+        operation. Eviction, retirement, and shutdown own the entries they
+        have already fenced, so a loss reported then changes nothing. The
+        registration and its generation are untouched: the same handle
+        reconnects — resolving fresh credentials — on its next acquisition.
+        """
+        released = False
+        with self._lock:
+            if self._entries.get(identity) is not entry:
+                return
+            if not entry.fenced:
+                if self._state is not MCPRuntimeState.OPEN or self._loop is None:
+                    return  # shutdown already tears every transport down
+                entry.broken = True
+                entry.fenced = True
+                self._cancel_idle(entry)
+                entry.retire_task = self._loop.create_task(self._retire_broken(identity, entry))
+            if not entry.broken:
+                return  # eviction or shutdown owns the fenced entry
+
+            # Fence first, then return the reporting call's slot. Pumping the
+            # global queue from _release_call_permit can now only reject calls
+            # queued for this dead entry, never admit one onto its transport.
+            released = self._release_call_permit(identity, reporting_permit)
+            self._wake_call_waiters_for_entry(entry)
+        if released:
+            self._notify_drain()
+
+    async def _retire_broken(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+    ) -> None:
+        """Close a broken connection while keeping its identity bindable.
+
+        Unlike idle retirement this runs while leases and calls still
+        reference the entry: the transport is already dead, so waiting for a
+        drain would only delay the replacement. Admitted calls are interrupted
+        with unknown outcomes before teardown; queued calls were never sent
+        and are rejected as safely retryable.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            await self._interrupt_active_calls(
+                {identity: entry},
+                interruption="connection_lost",
+            )
+            await self._teardown_entry(
+                entry,
+                loop=loop,
+                cancel_warning=(
+                    "MCP source '%s' connect task ignored recovery cancellation; abandoning it."
+                ),
+                close_warning=(
+                    "MCP source '%s' broken-connection cleanup exceeded its grace; "
+                    "allowing it to finish in the background."
+                ),
+            )
+        finally:
+            with self._lock:
+                self._discard_entry(identity, entry)
+                entry.retire_task = None
+            self._notify_drain()
+
     async def _lease(self, connection: MCPConnection) -> _ConnectionEntry:
         """Lease the shared physical connection, opening it single-flight.
 
@@ -1290,6 +1399,7 @@ class MCPRuntime:
         self,
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
+        generation: int,
         check_lease: Callable[[], None],
     ) -> None:
         """Reject a call whose lease, runtime, or connection is gone.
@@ -1307,6 +1417,19 @@ class MCPRuntime:
                 identity,
                 f"MCP connection {identity!r} is being evicted and cannot start tool calls.",
             )
+        registration = self._registrations.get(identity)
+        if registration is None or registration.generation != generation:
+            raise MCPStaleConnectionError(
+                identity,
+                f"MCP connection handle {identity!r} is no longer registered; it was "
+                "evicted or never bound. Bind again and use the new handle.",
+            )
+        if entry.broken:
+            raise MCPConnectionLostError(
+                identity,
+                f"MCP connection {identity!r} lost its transport. This call was "
+                "never sent; acquire tools again to reconnect and retry safely.",
+            )
         if self._entries.get(identity) is not entry or entry.adapter is None or entry.fenced:
             raise MCPStaleConnectionError(
                 identity,
@@ -1319,6 +1442,7 @@ class MCPRuntime:
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
         *,
+        generation: int,
         tool: str,
         owner: object,
         check_lease: Callable[[], None],
@@ -1337,7 +1461,7 @@ class MCPRuntime:
             while True:
                 with self._lock:
                     self._bind_loop()
-                    self._check_call_state(identity, entry, check_lease)
+                    self._check_call_state(identity, entry, generation, check_lease)
                     if self._can_start_call(waiter):
                         task = asyncio.current_task()
                         assert task is not None
@@ -1411,8 +1535,10 @@ class MCPRuntime:
     async def _interrupt_active_calls(
         self,
         entries: dict[tuple[str | None, str], _ConnectionEntry],
+        *,
+        interruption: _CallInterruption = "forced",
     ) -> None:
-        """Cancel forced calls and reclaim resistant permits after one grace.
+        """Interrupt admitted calls and reclaim resistant permits after one grace.
 
         Physical execution may outlive the grace when a transport suppresses
         cancellation. The connection is already fenced and its result is
@@ -1432,7 +1558,7 @@ class MCPRuntime:
         # permit still belongs to a task suspended inside its executor, so the
         # runtime-issued cancellation is attributable without racing release.
         for _, permit in owned:
-            if permit.interrupted:
+            if permit.interruption is not None:
                 # A forced eviction and a forced shutdown can both reach the
                 # same permit inside one grace. At most one runtime-issued
                 # cancellation may be outstanding, or the executor's uncancel()
@@ -1440,7 +1566,7 @@ class MCPRuntime:
                 # re-raise CancelledError — telling the caller that nothing
                 # happened when the outcome is in fact unknown.
                 continue
-            permit.interrupted = True
+            permit.interruption = interruption
             permit.task.cancel()
 
         release_waiters = [asyncio.create_task(permit.release_event.wait()) for _, permit in owned]
@@ -1466,11 +1592,12 @@ class MCPRuntime:
             # automatic library logs.
             sources = ", ".join(sorted({permit.entry.source.name for permit in resistant}))
             logger.warning(
-                "%d MCP tool call(s) on source(s) %s ignored forced cancellation; "
+                "%d MCP tool call(s) on source(s) %s ignored %s cancellation; "
                 "releasing their runtime slots while their callers remain responsible "
                 "for eventual task completion.",
                 len(resistant),
                 sources,
+                "forced" if interruption == "forced" else "connection-recovery",
             )
 
     @property
