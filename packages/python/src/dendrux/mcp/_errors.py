@@ -134,6 +134,17 @@ class MCPStaleConnectionError(MCPConnectionStateError):
     """
 
 
+class MCPConnectionLostError(MCPConnectionStateError):
+    """The physical transport behind a managed connection died.
+
+    Raised only for calls that were *never sent*: they were queued for, or
+    routed to, an entry another call had already proven broken. Nothing
+    reached the server, so acquiring tools again — which opens a replacement
+    connection with freshly resolved credentials — and retrying is safe.
+    The identity stays registered; only the physical transport is gone.
+    """
+
+
 class MCPCallCapacityError(MCPCapacityError):
     """No MCP tool-call slot became free within the wait budget.
 
@@ -163,13 +174,23 @@ class MCPCallCapacityError(MCPCapacityError):
 
 
 class MCPToolCallError(MCPError):
-    """An MCP server returned an unsuccessful tool result."""
+    """An MCP server returned an unsuccessful tool result.
+
+    ``connection_lost`` is True when the failure tree shows the transport or
+    session died mid-call, rather than the tool merely failing over a working
+    connection. The managed runtime consults it to fence the shared physical
+    connection; the message itself is identical either way.
+    """
+
+    connection_lost: bool = False
 
 
 class MCPOutcomeUnknownError(MCPError):
-    """A tool call was interrupted by forced eviction with an unknown outcome.
+    """A tool call was interrupted with an unknown outcome.
 
-    The server may already have applied the effect, so the call must never be
+    Raised when a forced eviction or shutdown tears the transport out from
+    under a running call, and when the transport itself dies mid-call. The
+    server may already have applied the effect, so the call must never be
     retried automatically. It is deliberately not an :class:`MCPToolCallError`
     subclass: handlers that retry failed tool calls must not catch this.
     """

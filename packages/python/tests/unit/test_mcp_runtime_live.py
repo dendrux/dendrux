@@ -20,11 +20,13 @@ from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 from dendrux.agent import Agent
 from dendrux.mcp._client import MCPConnectionInfo
 from dendrux.mcp._errors import (
+    MCPAuthenticationError,
     MCPBindingConflictError,
     MCPCallCapacityError,
     MCPCapacityError,
     MCPConnectionCapacityError,
     MCPConnectionEvictingError,
+    MCPConnectionLostError,
     MCPCredentialError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
@@ -1980,7 +1982,7 @@ class TestTypedFailureModes:
 
     @pytest.mark.asyncio
     async def test_ordinary_tool_failure_is_not_reported_as_unknown_outcome(self) -> None:
-        _InstrumentedAdapter.call_error = ConnectionError("server exploded")
+        _InstrumentedAdapter.call_error = RuntimeError("server exploded")
         async with MCPRuntime(shutdown_timeout=0.05) as runtime:
             agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
             lookups = await agent.get_tool_lookups()
@@ -3404,7 +3406,7 @@ class TestCallConcurrency:
 
     @pytest.mark.asyncio
     async def test_a_failed_call_releases_its_slot(self) -> None:
-        _InstrumentedAdapter.call_error = ConnectionError("server exploded")
+        _InstrumentedAdapter.call_error = RuntimeError("server exploded")
         async with MCPRuntime(
             max_in_flight_calls=1, call_wait_timeout=0, shutdown_timeout=0.05
         ) as runtime:
@@ -4041,3 +4043,532 @@ class TestCallConcurrency:
         for invalid in (-1.0, float("nan"), "5"):
             with pytest.raises(ValueError, match="call_wait_timeout"):
                 MCPRuntime(call_wait_timeout=invalid)  # type: ignore[arg-type]
+
+
+class TestBrokenConnectionRecovery:
+    """A dead transport is fenced once, retired, and replaced lazily.
+
+    The failed in-flight call reports an unknown outcome — the server may
+    already have received it — and is never retried by the runtime. Recovery
+    only clears the way for future work: the registration and generation
+    survive, so the same handle reconnects with freshly resolved credentials
+    on its next acquisition.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_mid_call_reports_unknown_outcome(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+
+            with pytest.raises(MCPOutcomeUnknownError) as excinfo:
+                await lookups.fn["github__write"](value=1)
+
+            assert "must not be retried" in str(excinfo.value)
+            assert isinstance(excinfo.value.__cause__, MCPToolCallError)
+            assert runtime._in_flight_calls == 0
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_next_acquisition_reconnects_after_recovery(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            lookups = await first.get_tool_lookups()
+            broken = _InstrumentedAdapter.instances[0]
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+
+            await _wait_until(lambda: broken.closed and runtime._entries == {})
+            _InstrumentedAdapter.call_error = None
+
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            fresh = await second.get_tool_lookups()
+            assert await fresh.fn["github__write"](value=2) == "write:ok"
+            assert len(_InstrumentedAdapter.instances) == 2
+
+            # The first Agent's view is still bound to the dead transport:
+            # its retained executor fails typed, and nothing was ever sent.
+            with pytest.raises(MCPConnectionLostError) as excinfo:
+                await lookups.fn["github__write"](value=3)
+            assert excinfo.value.identity == (None, "github-1")
+            assert not isinstance(excinfo.value, MCPToolCallError)
+            assert broken.call_tool_calls == 1
+
+            await first.close()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_resolves_fresh_credentials_for_the_same_handle(self) -> None:
+        provider = _Credentials(
+            {"Authorization": "Bearer token-1"},
+            {"Authorization": "Bearer token-2"},
+        )
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=provider)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            lookups = await first.get_tool_lookups()
+            opened = _InstrumentedAdapter.instances[0]
+            assert opened.source.headers["Authorization"] == "Bearer token-1"
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+            await _wait_until(lambda: runtime._entries == {})
+            _InstrumentedAdapter.call_error = None
+
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            await second.get_tool_lookups()
+
+            assert provider.calls == 2
+            replacement = _InstrumentedAdapter.instances[1]
+            assert replacement.source.headers["Authorization"] == "Bearer token-2"
+            await first.close()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_failures_share_one_recovery(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            calls = [
+                asyncio.create_task(lookups.fn["github__write"](value=index)) for index in range(10)
+            ]
+            await _wait_until(lambda: _InstrumentedAdapter.in_call == 10)
+            _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+            gate.set()
+
+            results = await asyncio.gather(*calls, return_exceptions=True)
+            assert all(isinstance(result, MCPOutcomeUnknownError) for result in results)
+
+            await _wait_until(lambda: adapter.closed and runtime._entries == {})
+            assert adapter.close_calls == 1
+            assert len(_InstrumentedAdapter.instances) == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_interrupts_other_in_flight_calls_as_outcome_unknown(self) -> None:
+        """Closing one shared SDK client can cancel its other request waiters;
+        those calls were admitted and must not leak bare cancellation."""
+
+        class _SiblingAdapter(_InstrumentedAdapter):
+            sibling_started = asyncio.Event()
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, Any],
+            ) -> CallToolResult:
+                self.call_tool_calls += 1
+                if arguments["value"] == "dies":
+                    await self.sibling_started.wait()
+                    raise ConnectionResetError("socket died")
+                self.sibling_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        with patch("dendrux.mcp._runtime.MCPClientAdapter", _SiblingAdapter):
+            async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+                agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+                lookups = await agent.get_tool_lookups()
+
+                sibling = asyncio.create_task(lookups.fn["github__write"](value="sibling"))
+                await _SiblingAdapter.sibling_started.wait()
+                failing = asyncio.create_task(lookups.fn["github__write"](value="dies"))
+
+                results = await asyncio.gather(failing, sibling, return_exceptions=True)
+
+                assert all(isinstance(result, MCPOutcomeUnknownError) for result in results)
+                assert all("lost connection" in str(result) for result in results)
+                assert runtime._in_flight_calls == 0
+                await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_reclaims_a_resistant_sibling_call_permit(self) -> None:
+        """A request that ignores the recovery cancellation cannot retain a
+        global call slot or delay opening the replacement connection."""
+
+        class _ResistantSiblingAdapter(_InstrumentedAdapter):
+            sibling_started = asyncio.Event()
+            release_sibling = asyncio.Event()
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, Any],
+            ) -> CallToolResult:
+                self.call_tool_calls += 1
+                if arguments["value"] == "dies":
+                    await self.sibling_started.wait()
+                    raise ConnectionResetError("socket died")
+                self.sibling_started.set()
+                while True:
+                    try:
+                        await self.release_sibling.wait()
+                        return CallToolResult(content=[TextContent(text="late:ok")])
+                    except asyncio.CancelledError:
+                        continue
+
+        with patch("dendrux.mcp._runtime.MCPClientAdapter", _ResistantSiblingAdapter):
+            runtime = MCPRuntime(max_in_flight_calls=2, shutdown_timeout=0.05)
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            sibling = asyncio.create_task(lookups.fn["github__write"](value="sibling"))
+            await _ResistantSiblingAdapter.sibling_started.wait()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value="dies")
+
+            await _wait_until(lambda: runtime._entries == {})
+            assert runtime._in_flight_calls == 0
+
+            replacement = Agent(prompt="replacement", tool_sources=[connection.tools()])
+            await asyncio.wait_for(replacement.get_tool_lookups(), timeout=1.0)
+
+            _ResistantSiblingAdapter.release_sibling.set()
+            assert await asyncio.wait_for(sibling, timeout=1.0) == "late:ok"
+            await agent.close()
+            await replacement.close()
+            await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_restores_the_caller_cancellation_count(self) -> None:
+        """Absorbing the runtime's cancellation must not poison an outer
+        timeout or TaskGroup owned by the application."""
+
+        class _SiblingAdapter(_InstrumentedAdapter):
+            sibling_started = asyncio.Event()
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, Any],
+            ) -> CallToolResult:
+                self.call_tool_calls += 1
+                if arguments["value"] == "dies":
+                    await self.sibling_started.wait()
+                    raise ConnectionResetError("socket died")
+                self.sibling_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        with patch("dendrux.mcp._runtime.MCPClientAdapter", _SiblingAdapter):
+            runtime = MCPRuntime(shutdown_timeout=0.05)
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            call = (await agent.get_tool_lookups()).fn["github__write"]
+            converted = asyncio.Event()
+            finish = asyncio.Event()
+            observed: dict[str, int] = {}
+
+            async def caller() -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                observed["before"] = task.cancelling()
+                with pytest.raises(MCPOutcomeUnknownError, match="lost connection"):
+                    await call(value="sibling")
+                observed["after"] = task.cancelling()
+                converted.set()
+                await finish.wait()
+
+            sibling = asyncio.create_task(caller())
+            await _SiblingAdapter.sibling_started.wait()
+            with pytest.raises(MCPOutcomeUnknownError):
+                await call(value="dies")
+            await asyncio.wait_for(converted.wait(), timeout=1.0)
+
+            assert observed == {"before": 0, "after": 0}
+            finish.set()
+            await sibling
+            await agent.close()
+            await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_application_cancellation_survives_recovery_interruption(self) -> None:
+        """A user cancellation racing the runtime's recovery cancellation
+        remains cancellation rather than becoming an MCP tool error."""
+
+        class _SiblingAdapter(_InstrumentedAdapter):
+            sibling_started = asyncio.Event()
+            runtime_cancel_seen = asyncio.Event()
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, Any],
+            ) -> CallToolResult:
+                self.call_tool_calls += 1
+                if arguments["value"] == "dies":
+                    await self.sibling_started.wait()
+                    raise ConnectionResetError("socket died")
+                self.sibling_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.runtime_cancel_seen.set()
+                    await asyncio.Event().wait()
+                    raise
+
+        with patch("dendrux.mcp._runtime.MCPClientAdapter", _SiblingAdapter):
+            runtime = MCPRuntime(shutdown_timeout=0.05)
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            call = (await agent.get_tool_lookups()).fn["github__write"]
+            sibling = asyncio.create_task(call(value="sibling"))
+            await _SiblingAdapter.sibling_started.wait()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await call(value="dies")
+            await asyncio.wait_for(_SiblingAdapter.runtime_cancel_seen.wait(), timeout=1.0)
+            sibling.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await sibling
+            assert sibling.cancelling() == 1
+            assert runtime._in_flight_calls == 0
+            await agent.close()
+            await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_queued_calls_never_enter_the_broken_transport(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            busy = asyncio.create_task(lookups.fn["github__write"](value="busy"))
+            await _await_first_call(adapter)
+            queued = asyncio.create_task(lookups.fn["github__write"](value="queued"))
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+            _InstrumentedAdapter.call_error = BrokenPipeError("pipe closed")
+            gate.set()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await busy
+            # Well inside the 5s wait budget: the fence wakes the queue.
+            with pytest.raises(MCPConnectionLostError):
+                await asyncio.wait_for(queued, timeout=1.0)
+            assert adapter.call_tool_calls == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_tool_failures_do_not_poison_the_connection(self) -> None:
+        _InstrumentedAdapter.call_error = RuntimeError("tool exploded")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+
+            with pytest.raises(MCPToolCallError) as excinfo:
+                await lookups.fn["github__write"](value=1)
+            assert not isinstance(excinfo.value, MCPOutcomeUnknownError)
+
+            entry = runtime._entries[(None, "github-1")]
+            assert entry.broken is False
+            assert entry.fenced is False
+
+            _InstrumentedAdapter.call_error = None
+            assert await lookups.fn["github__write"](value=2) == "write:ok"
+            assert len(_InstrumentedAdapter.instances) == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_credential_rejection_mid_call_does_not_reconnect(self) -> None:
+        class _RejectedError(RuntimeError):
+            status_code = 401
+
+        _InstrumentedAdapter.call_error = _RejectedError("401 Unauthorized")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+
+            # A rejection arrives over a WORKING transport: refreshing
+            # credentials is the application's move, not reconnection.
+            for attempt in (1, 2):
+                with pytest.raises(MCPToolCallError) as excinfo:
+                    await lookups.fn["github__write"](value=attempt)
+                assert not isinstance(excinfo.value, MCPOutcomeUnknownError)
+
+            assert len(_InstrumentedAdapter.instances) == 1
+            assert _InstrumentedAdapter.instances[0].closed is False
+            assert _total_connects() == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_time_rejection_does_not_reconnect_in_a_loop(self) -> None:
+        _InstrumentedAdapter.connect_error = MCPAuthenticationError(
+            "Failed to connect to MCP source 'github': "
+            "the server rejected its credentials (HTTP 401)."
+        )
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            for _ in range(2):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                with pytest.raises(MCPAuthenticationError):
+                    await agent.get_tool_lookups()
+
+            # One connect attempt per explicit acquisition; the runtime never
+            # retries a credential rejection on its own.
+            assert _total_connects() == 2
+            assert runtime._entries == {}
+
+    @pytest.mark.asyncio
+    async def test_application_cancellation_does_not_mark_the_connection_broken(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.call_gate = gate
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            call = asyncio.create_task(lookups.fn["github__write"](value="cancel-me"))
+            await _await_first_call(adapter)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+
+            entry = runtime._entries[(None, "github-1")]
+            assert entry.broken is False
+            assert entry.fenced is False
+
+            gate.set()
+            assert await lookups.fn["github__write"](value="next") == "write:ok"
+            assert len(_InstrumentedAdapter.instances) == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_frees_the_connection_slot(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            github = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[github.tools()])
+            lookups = await first.get_tool_lookups()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+            _InstrumentedAdapter.call_error = None
+
+            # The first Agent still holds its lease on the dead entry, yet
+            # the slot frees for a different identity once recovery discards
+            # the broken transport.
+            jira = _bind(runtime, connection_key="jira-1")
+            second = Agent(prompt="second", tool_sources=[jira.tools(namespace="jira")])
+            fresh = await asyncio.wait_for(second.get_tool_lookups(), timeout=1.0)
+            assert await fresh.fn["jira__write"](value=2) == "write:ok"
+            await first.close()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_racing_eviction_does_not_double_close(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+            lookups = await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+            await asyncio.wait_for(
+                runtime.evict(connection_key="github-1", mode="force"),
+                timeout=1.0,
+            )
+            await _wait_until(lambda: adapter.closed and not runtime._evictions)
+
+            assert adapter.close_calls == 1
+            assert runtime._entries == {}
+            assert (None, "github-1") not in runtime._registrations
+            with pytest.raises(MCPStaleConnectionError):
+                await lookups.fn["github__write"](value="after-eviction")
+
+            replacement_connection = _bind(runtime)
+            replacement = Agent(
+                prompt="replacement",
+                tool_sources=[replacement_connection.tools()],
+            )
+            await replacement.get_tool_lookups()
+            with pytest.raises(MCPStaleConnectionError):
+                await lookups.fn["github__write"](value="after-rebind")
+            await replacement.close()
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_racing_shutdown_does_not_double_close(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        runtime = MCPRuntime(shutdown_timeout=0.5)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        lookups = await agent.get_tool_lookups()
+        adapter = _InstrumentedAdapter.instances[0]
+
+        with pytest.raises(MCPOutcomeUnknownError):
+            await lookups.fn["github__write"](value=1)
+        await agent.close()
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+        assert adapter.close_calls == 1
+        assert runtime.state is MCPRuntimeState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_resistant_transport_does_not_block_recovery(self) -> None:
+        close_gate = asyncio.Event()
+        _InstrumentedAdapter.close_gate = close_gate
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            lookups = await first.get_tool_lookups()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+
+            # The broken transport never finishes closing, yet the slot frees
+            # after the bounded grace and a replacement can open.
+            await _wait_until(lambda: runtime._entries == {})
+            _InstrumentedAdapter.call_error = None
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            fresh = await asyncio.wait_for(second.get_tool_lookups(), timeout=1.0)
+            assert await fresh.fn["github__write"](value=2) == "write:ok"
+
+            close_gate.set()  # release the abandoned cleanup before shutdown
+            await first.close()
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_is_scoped_to_one_tenant_partition(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            alpha = _bind(runtime, tenant_key="tenant-alpha")
+            beta = _bind(runtime, tenant_key="tenant-beta")
+            agent_alpha = Agent(prompt="alpha", tool_sources=[alpha.tools()])
+            agent_beta = Agent(prompt="beta", tool_sources=[beta.tools()])
+            lookups_alpha = await agent_alpha.get_tool_lookups()
+            lookups_beta = await agent_beta.get_tool_lookups()
+
+            _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups_alpha.fn["github__write"](value=1)
+            _InstrumentedAdapter.call_error = None
+
+            assert await lookups_beta.fn["github__write"](value=2) == "write:ok"
+            await _wait_until(lambda: ("tenant-alpha", "github-1") not in runtime._entries)
+            assert ("tenant-beta", "github-1") in runtime._entries
+            assert _InstrumentedAdapter.instances[1].close_calls == 0
+
+            replacement = Agent(prompt="alpha-2", tool_sources=[alpha.tools()])
+            fresh = await replacement.get_tool_lookups()
+            assert await fresh.fn["github__write"](value=3) == "write:ok"
+            assert len(_InstrumentedAdapter.instances) == 3
+
+            await agent_alpha.close()
+            await agent_beta.close()
+            await replacement.close()
