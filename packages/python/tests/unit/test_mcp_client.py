@@ -10,7 +10,11 @@ from mcp.types import CallToolResult, TextContent
 
 from dendrux.mcp import MCPServer
 from dendrux.mcp._client import MCPClientAdapter
-from dendrux.mcp._errors import MCPConnectionError, MCPToolCallError
+from dendrux.mcp._errors import (
+    MCPAuthenticationError,
+    MCPConnectionError,
+    MCPToolCallError,
+)
 from dendrux.mcp._runtime import MCPRuntime, _ViewToolSource
 from dendrux.mcp._server import create_mcp_executor
 from dendrux.mcp._source import MCPSource
@@ -172,6 +176,64 @@ async def test_cleanup_failure_cannot_replace_or_rechain_safe_connect_error() ->
     assert cleanup_secret not in _rendered_chain(error)
 
 
+@pytest.mark.asyncio
+async def test_opaque_auth_suppresses_connect_cleanup_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cleanup is part of the credential boundary too; an opaque auth
+    object's secret must not reappear through a secondary debug log."""
+
+    class _OpaqueAuth:
+        token = "OPAQUE-CLEANUP-SECRET"
+
+    source = MCPSource.http(
+        "remote",
+        "https://mcp.example.com/c",
+        auth=_OpaqueAuth(),
+    )
+    _FailingClient.error_detail = "connect failed"
+    _CleanupFailingStack.cleanup_detail = "cleanup echoed OPAQUE-CLEANUP-SECRET"
+
+    with (
+        caplog.at_level("DEBUG", logger="dendrux.mcp._client"),
+        patch("dendrux.mcp._client.AsyncExitStack", _CleanupFailingStack),
+        patch("dendrux.mcp._client.Client", _FailingClient),
+        patch("dendrux.mcp._client.streamable_http_client", return_value=object()),
+        pytest.raises(MCPConnectionError),
+    ):
+        await MCPClientAdapter(source).connect()
+
+    assert "OPAQUE-CLEANUP-SECRET" not in caplog.text
+    assert "detail suppressed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolved_credentials_are_redacted_from_connect_failures() -> None:
+    """Provider-resolved values join the source for one connect, so the same
+    exact-substring scrub covers them when the transport echoes them back."""
+
+    class _Provider:
+        async def get_auth(self) -> Any:
+            return {"Authorization": "Bearer RESOLVED-SECRET"}
+
+    source = MCPSource.http("remote", "https://mcp.example.com/c")
+    detail = "401 for url 'https://mcp.example.com/c' with header Bearer RESOLVED-SECRET"
+    client_patch, http_patch, stdio_patch = _failing_sdk(detail)
+    runtime = MCPRuntime(shutdown_timeout=0.05)
+    connection = runtime.bind(connection_key="remote", source=source, credentials=_Provider())
+    managed = _ViewToolSource(connection.tools())
+
+    with client_patch, http_patch, stdio_patch, pytest.raises(MCPConnectionError) as excinfo:
+        await managed._discover()
+
+    error = excinfo.value
+    assert "RESOLVED-SECRET" not in _rendered_chain(error)
+    assert "RESOLVED-SECRET" not in (error.transport_detail or "")
+    assert "[redacted]" in (error.transport_detail or "")
+    assert "RESOLVED-SECRET" not in (managed.last_error or "")
+    await runtime.close()
+
+
 class _RaisingClient:
     """Stands in for a connected SDK client whose requests fail."""
 
@@ -244,6 +306,129 @@ async def test_tool_call_failure_keeps_diagnostics_but_drops_credentials() -> No
     assert "401 for url 'https://mcp.example.com/c'" in str(excinfo.value)
 
 
+class _Response:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+class _HTTPStatusError(RuntimeError):
+    """Shape-compatible stand-in for httpx.HTTPStatusError."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.response = _Response(status_code)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_server_credential_rejection_is_typed(status: int) -> None:
+    """Applications must be able to branch on revoked credentials without
+    parsing transport text."""
+    secret = "REJECTED-SECRET"
+    source = MCPSource.http("remote", f"https://mcp.example.com/c?access_token={secret}")
+    adapter = MCPClientAdapter(source)
+
+    class _RejectingClient:
+        async def list_tools(self, cursor: Any = None, cache_mode: Any = None) -> Any:
+            raise _HTTPStatusError(f"{status} rejected for url '{source.url}'", status)
+
+    adapter._client = _RejectingClient()  # type: ignore[assignment]
+
+    with pytest.raises(MCPAuthenticationError) as excinfo:
+        await adapter.list_tools()
+
+    error = excinfo.value
+    assert isinstance(error, MCPConnectionError)  # existing handlers still catch it
+    assert str(error) == (
+        f"Failed to list tools from MCP source 'remote': "
+        f"the server rejected its credentials (HTTP {status})."
+    )
+    assert error.status_code == status
+    assert secret not in _rendered_chain(error)
+    assert secret not in (error.transport_detail or "")
+
+
+@pytest.mark.asyncio
+async def test_credential_rejection_is_detected_through_the_cause_chain() -> None:
+    """SDK layers wrap transport errors; the status must be found anyway."""
+    source = MCPSource.http("remote", "https://mcp.example.com/c")
+    adapter = MCPClientAdapter(source)
+
+    class _WrappingClient:
+        async def list_tools(self, cursor: Any = None, cache_mode: Any = None) -> Any:
+            try:
+                raise _HTTPStatusError("401 Unauthorized", 401)
+            except _HTTPStatusError as exc:
+                raise RuntimeError("transport request failed") from exc
+
+    adapter._client = _WrappingClient()  # type: ignore[assignment]
+
+    with pytest.raises(MCPAuthenticationError) as excinfo:
+        await adapter.list_tools()
+
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.__context__ is None
+
+
+class _OpaqueAuth:
+    """Stands in for an httpx Auth implementation carrying a secret."""
+
+    token = "OPAQUE-SECRET"
+
+
+@pytest.mark.asyncio
+async def test_opaque_configured_auth_suppresses_transport_detail() -> None:
+    """An auth object's secrets cannot be enumerated, so its transport text
+    cannot be proven clean; suppression is the only sound treatment."""
+    source = MCPSource.http("remote", "https://mcp.example.com/c", auth=_OpaqueAuth())
+    adapter = _connected_adapter(source, "401 rejected header Bearer OPAQUE-SECRET")
+
+    with pytest.raises(MCPConnectionError) as excinfo:
+        await adapter.list_tools()
+
+    assert excinfo.value.transport_detail is None
+    assert "OPAQUE-SECRET" not in _rendered_chain(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_tuple_configured_auth_is_redacted() -> None:
+    """Basic-auth tuples carry exact strings, so they redact instead of
+    costing the transport detail."""
+    source = MCPSource.http(
+        "remote",
+        "https://mcp.example.com/c",
+        auth=("svc-user", "svc-password-123"),
+    )
+    adapter = _connected_adapter(source, "401 for svc-user:svc-password-123")
+
+    with pytest.raises(MCPConnectionError) as excinfo:
+        await adapter.list_tools()
+
+    detail = excinfo.value.transport_detail or ""
+    assert "svc-password-123" not in detail
+    assert detail == "401 for [redacted]:[redacted]"
+
+
+@pytest.mark.asyncio
+async def test_opaque_auth_suppresses_tool_error_detail() -> None:
+    """Tool-call errors reach model context and the run store; with opaque
+    auth the transport text cannot be proven clean there either."""
+    source = MCPSource.http("remote", "https://mcp.example.com/c", auth=_OpaqueAuth())
+    adapter = _connected_adapter(source, "boom with OPAQUE-SECRET inside")
+    executor = create_mcp_executor(
+        adapter,
+        namespace="remote",
+        mcp_tool_name="write",
+        max_result_bytes=10_000,
+    )
+
+    with pytest.raises(MCPToolCallError) as excinfo:
+        await executor(value=1)
+
+    assert "OPAQUE-SECRET" not in _rendered_chain(excinfo.value)
+    assert "RuntimeError" in str(excinfo.value)  # the class survives as a clue
+
+
 @pytest.mark.asyncio
 async def test_server_reported_tool_error_is_also_scrubbed() -> None:
     """A server that echoes a credential back must not reach model context."""
@@ -273,6 +458,34 @@ async def test_server_reported_tool_error_is_also_scrubbed() -> None:
         await executor(value=1)
 
     assert "ECHOED-SECRET" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_server_reported_tool_error_is_suppressed_for_opaque_auth() -> None:
+    """With an opaque auth object even server-authored error text could carry
+    an echoed credential the runtime cannot recognise."""
+    source = MCPSource.http("remote", "https://mcp.example.com/c", auth=_OpaqueAuth())
+
+    class _EchoingClient:
+        async def call_tool(self, name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
+            return CallToolResult(
+                content=[TextContent(text="rejected token OPAQUE-SECRET")],
+                isError=True,
+            )
+
+    adapter = MCPClientAdapter(source)
+    adapter._client = _EchoingClient()  # type: ignore[assignment]
+    executor = create_mcp_executor(
+        adapter,
+        namespace="remote",
+        mcp_tool_name="write",
+        max_result_bytes=10_000,
+    )
+
+    with pytest.raises(MCPToolCallError) as excinfo:
+        await executor(value=1)
+
+    assert "OPAQUE-SECRET" not in str(excinfo.value)
 
 
 @pytest.mark.asyncio

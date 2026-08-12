@@ -33,6 +33,40 @@ def safe_endpoint(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def _auth_secret_values(auth: Any) -> list[str] | None:
+    """Exact secret strings carried by a known auth shape, or None when opaque.
+
+    httpx accepts basic-auth tuples and Auth objects. Tuple elements are
+    exact strings the runtime can redact; an Auth object's internals are
+    unknowable, so callers must treat any text it may have touched as
+    unprovable and suppress rather than redact.
+    """
+    if auth is None:
+        return []
+    if isinstance(auth, str):
+        return [auth] if auth else []
+    if isinstance(auth, (tuple, list)) and all(isinstance(item, str) for item in auth):
+        return [item for item in auth if item]
+    return None
+
+
+def source_has_opaque_credentials(source: MCPSource) -> bool:
+    """Whether error text from this source could carry unredactable secrets."""
+    return _auth_secret_values(source.auth) is None
+
+
+def safe_source_exception_detail(source: MCPSource, exc: BaseException) -> str:
+    """Return credential-safe diagnostic text for a source exception.
+
+    Known credential shapes are scrubbed by exact value. When authentication
+    is opaque, no exception text that may have touched it can be proven safe,
+    so only an explicit suppression marker is returned.
+    """
+    if source_has_opaque_credentials(source):
+        return "[detail suppressed: opaque auth]"
+    return redact_source_text(source, str(exc)) or type(exc).__name__
+
+
 def redact_source_text(source: MCPSource, text: str) -> str:
     """Strip a source's configured credentials out of third-party text.
 
@@ -72,8 +106,7 @@ def redact_source_text(source: MCPSource, text: str) -> str:
             if separator and credential:
                 replacements.append((credential, _REDACTED))
     replacements.extend((value, _REDACTED) for value in source.env.values() if value)
-    if isinstance(source.auth, str) and source.auth:
-        replacements.append((source.auth, _REDACTED))
+    replacements.extend((value, _REDACTED) for value in _auth_secret_values(source.auth) or ())
 
     # Longest needle first: a full URL must be rewritten before its own query
     # string, or the shorter match would corrupt the replacement.

@@ -15,6 +15,8 @@ from dendrux.mcp._source import (
     MCPSource,
     redact_source_text,
     redact_source_value,
+    safe_source_exception_detail,
+    source_has_opaque_credentials,
 )
 from dendrux.types import ToolDef, ToolTarget
 
@@ -141,6 +143,11 @@ def create_mcp_executor(
     """Create an async Dendrux executor bound to one live MCP adapter."""
 
     async def executor(**params: Any) -> Any:
+        # With an opaque auth object even server-authored error text could
+        # carry an echoed credential the runtime cannot recognise, so error
+        # detail cannot be proven clean and is suppressed; mapping, string,
+        # and tuple credentials keep their exact-substring scrub in full.
+        opaque = source_has_opaque_credentials(adapter.source)
         try:
             result = await adapter.call_tool(mcp_tool_name, params)
         except Exception as exc:
@@ -152,13 +159,22 @@ def create_mcp_executor(
             if is_error:
                 # Server-authored text lands in the same sink, so it gets the
                 # same scrub in case the server echoes a credential back.
-                raise MCPToolCallError(str(redacted or "MCP tool returned an error"))
+                message = (
+                    "MCP tool returned an error (detail suppressed: opaque auth)."
+                    if opaque
+                    else str(redacted or "MCP tool returned an error")
+                )
+                raise MCPToolCallError(message)
             return redacted
         # Unlike a connect failure, this text is worth keeping: the model reads
         # it to correct itself. So it is redacted rather than suppressed — and
         # raised outside the handler, because both the message and __context__
         # would otherwise reach the run store and the model's context window.
-        detail = redact_source_text(adapter.source, str(failure)) or type(failure).__name__
+        detail = (
+            type(failure).__name__
+            if opaque
+            else redact_source_text(adapter.source, str(failure)) or type(failure).__name__
+        )
         raise MCPToolCallError(
             f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {detail}"
         ) from None
@@ -294,5 +310,11 @@ class MCPServer:
                 await client.close()
             elif legacy_stack is not None:
                 await legacy_stack.aclose()
-        except Exception:
-            logger.warning("MCPServer '%s' cleanup failed", self.name, exc_info=True)
+        except Exception as exc:
+            source = client.source if client is not None else self.source
+            logger.warning(
+                "MCPServer '%s' cleanup failed: %s (%s)",
+                self.name,
+                safe_source_exception_detail(source, exc),
+                type(exc).__name__,
+            )

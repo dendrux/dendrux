@@ -124,6 +124,18 @@ class TestMCPSource:
             "formatter emitted prefixshort7suffix",
         )
 
+    def test_redaction_covers_tuple_auth_elements(self) -> None:
+        source = MCPSource.http(
+            "remote",
+            "https://mcp.example.com/connect",
+            auth=("svc-user", "svc-password-123"),
+        )
+
+        cleaned = redact_source_text(source, "basic auth svc-user:svc-password-123 rejected")
+
+        assert "svc-password-123" not in cleaned
+        assert "svc-user" not in cleaned
+
     def test_redaction_leaves_credential_free_text_untouched(self) -> None:
         source = MCPSource.http("remote", "https://mcp.example.com/connect")
 

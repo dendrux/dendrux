@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -19,14 +20,17 @@ from dendrux.mcp._runtime import (
 )
 from dendrux.mcp._source import MCPSource
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 
 class _Credentials:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def get_auth(self) -> object:
+    async def get_auth(self) -> Mapping[str, str]:
         self.calls += 1
-        return object()
+        return {"Authorization": "Bearer must-not-leak"}
 
     def __repr__(self) -> str:
         return "_Credentials(token=must-not-leak)"

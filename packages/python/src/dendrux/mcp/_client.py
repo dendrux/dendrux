@@ -13,13 +13,43 @@ from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from dendrux.mcp._errors import MCPConnectionError
-from dendrux.mcp._source import redact_source_text
+from dendrux.mcp._errors import MCPAuthenticationError, MCPConnectionError
+from dendrux.mcp._source import safe_source_exception_detail, source_has_opaque_credentials
 
 if TYPE_CHECKING:
     from dendrux.mcp._source import MCPSource
 
 logger = logging.getLogger(__name__)
+
+_AUTH_REJECTION_STATUSES = (401, 403)
+
+
+def _authentication_status(exc: BaseException) -> int | None:
+    """Find a credential-rejection HTTP status anywhere in an error tree.
+
+    SDK and transport layers wrap the original ``httpx`` status error, so the
+    cause/context chain and exception-group branches are all searched.
+    """
+    stack: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        response = getattr(node, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(node, "status_code", None)
+        if status in _AUTH_REJECTION_STATUSES:
+            return int(status)
+        if isinstance(node, BaseExceptionGroup):
+            stack.extend(node.exceptions)
+        if node.__cause__ is not None:
+            stack.append(node.__cause__)
+        if node.__context__ is not None:
+            stack.append(node.__context__)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +143,7 @@ class MCPClientAdapter:
             logger.debug(
                 "MCP source '%s' cleanup after connect failure also failed: %s (%s)",
                 self.source.name,
-                redact_source_text(self.source, str(cleanup_failure))
-                or type(cleanup_failure).__name__,
+                safe_source_exception_detail(self.source, cleanup_failure),
                 type(cleanup_failure).__name__,
             )
         # Raised after the handler has exited. Inside it, Python attaches the
@@ -147,19 +176,36 @@ class MCPClientAdapter:
         Only the exception class is rendered, because ``str()`` of this error
         becomes ``last_error`` and is persisted. The redacted detail stays
         reachable on the error and through debug logging so operators are not
-        left with an undiagnosable failure.
+        left with an undiagnosable failure — except when the source carries an
+        opaque auth object, whose secrets cannot be enumerated, so its
+        transport text cannot be proven clean and is suppressed outright.
+        A recognisable 401/403 becomes a typed authentication failure.
         """
-        detail = redact_source_text(self.source, str(exc)) or type(exc).__name__
+        detail: str | None
+        if source_has_opaque_credentials(self.source):
+            detail = None
+        else:
+            detail = safe_source_exception_detail(self.source, exc)
         logger.debug(
             "MCP source '%s' failed to %s: %s (%s)",
             self.source.name,
             action,
-            detail,
+            detail if detail is not None else "[detail suppressed: opaque auth]",
             type(exc).__name__,
         )
-        error = MCPConnectionError(
-            f"Failed to {action} MCP source '{self.source.name}' ({type(exc).__name__})."
-        )
+        status = _authentication_status(exc)
+        error: MCPConnectionError
+        if status is not None:
+            auth_error = MCPAuthenticationError(
+                f"Failed to {action} MCP source '{self.source.name}': "
+                f"the server rejected its credentials (HTTP {status})."
+            )
+            auth_error.status_code = status
+            error = auth_error
+        else:
+            error = MCPConnectionError(
+                f"Failed to {action} MCP source '{self.source.name}' ({type(exc).__name__})."
+            )
         error.transport_detail = detail
         return error
 

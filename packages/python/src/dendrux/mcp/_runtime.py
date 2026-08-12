@@ -8,6 +8,7 @@ import logging
 import math
 import re
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from threading import Lock
@@ -20,13 +21,18 @@ from dendrux.mcp._errors import (
     MCPConnectionCapacityError,
     MCPConnectionError,
     MCPConnectionEvictingError,
+    MCPCredentialError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
     MCPStaleConnectionError,
     MCPToolCallError,
 )
 from dendrux.mcp._server import MCPServer, build_mcp_tool_defs, create_mcp_executor
-from dendrux.mcp._source import MCPSource
+from dendrux.mcp._source import (
+    MCPSource,
+    safe_source_exception_detail,
+    source_has_opaque_credentials,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection
@@ -55,11 +61,95 @@ class MCPRuntimeState(StrEnum):
 
 @runtime_checkable
 class MCPCredentialProvider(Protocol):
-    """Application callback that returns ephemeral MCP authentication."""
+    """Application callback that returns ephemeral MCP authentication.
 
-    async def get_auth(self) -> Any:
+    Invoked lazily, once per physical connection attempt — never per Agent,
+    per lease, or per tool call — and bounded by its own ``connect_timeout``
+    budget, separate from the transport handshake's identical budget (a
+    connect behind a slow provider can take up to twice ``connect_timeout``).
+    The provider must return a non-empty mapping: request headers for HTTP
+    sources, environment variables for stdio sources. Only mappings are
+    accepted because their exact values double as redaction needles. Managed
+    connections reject opaque static auth objects for the same reason; use
+    static headers or this provider boundary instead. The resolved value
+    exists only to establish that one transport: it is never persisted,
+    logged, or rendered into errors or representations.
+    """
+
+    async def get_auth(self) -> Mapping[str, str]:
         """Return authentication suitable for the configured MCP transport."""
         ...
+
+
+def _apply_source_credentials(source: MCPSource, resolved: Any) -> MCPSource:
+    """Return a connect-scoped copy of the source with credentials applied.
+
+    Only mappings are accepted — headers for HTTP, environment variables for
+    stdio — because their exact string values become redaction needles on the
+    derived source, which is what lets the exact-substring scrub cover the
+    resolved credentials in every transport and tool-call error. Opaque auth
+    objects are rejected at the managed-runtime boundary because their secret
+    values cannot be enumerated safely.
+    """
+    if not resolved:
+        # A provider exists precisely because the connection needs
+        # authentication; {} or "" merging nothing would trade an obvious
+        # configuration bug for a silently unauthenticated session.
+        description = "None" if resolved is None else f"empty {type(resolved).__name__}"
+        raise MCPCredentialError(
+            f"MCP source '{source.name}' credential provider returned "
+            f"{description} instead of transport credentials."
+        )
+    if not isinstance(resolved, Mapping):
+        target = (
+            "a mapping of request headers"
+            if source.url is not None
+            else "a mapping of environment variables"
+        )
+        raise MCPCredentialError(
+            f"MCP source '{source.name}' credential provider must return "
+            f"{target}, got {type(resolved).__name__}."
+        )
+    if source.url is not None:
+        return replace(source, headers={**source.headers, **resolved})
+    return replace(source, env={**source.env, **resolved})
+
+
+async def _resolve_source_credentials(
+    source: MCPSource,
+    credentials: MCPCredentialProvider,
+) -> MCPSource:
+    """Resolve and apply ephemeral credentials for one connection attempt.
+
+    Resolution and application share one sanitized boundary: cancellation and
+    process-level exits pass through untouched, typed credential errors keep
+    their own value-free messages, and every other exception — from the
+    provider or from merging a lazy secret-backed mapping — is wrapped.
+    """
+    failure: Exception
+    try:
+        async with asyncio.timeout(source.connect_timeout):
+            resolved = await credentials.get_auth()
+        return _apply_source_credentials(source, resolved)
+    except asyncio.CancelledError:
+        raise
+    except MCPCredentialError:
+        raise
+    except Exception as exc:
+        failure = exc
+    # Raised after the handler has exited so the original exception is
+    # detached, not merely suppressed: its text is application-authored and
+    # may embed the very secret being refreshed, and this error's rendering
+    # reaches last_error, governance events, and monitoring SDKs that walk
+    # __context__. Only the class name is safe to keep.
+    logger.debug(
+        "MCP source '%s' credential resolution failed (%s)",
+        source.name,
+        type(failure).__name__,
+    )
+    raise MCPCredentialError(
+        f"Failed to resolve credentials for MCP source '{source.name}' ({type(failure).__name__})."
+    ) from None
 
 
 def _copy_tool_names(
@@ -149,6 +239,7 @@ class MCPConnection:
         repr=False,
         compare=False,
     )
+    credential_identity: str | None = field(default=None, compare=False)
     generation: int = 0
 
     @property
@@ -489,6 +580,8 @@ class _Registration:
 
     source: MCPSource
     generation: int
+    credentials: MCPCredentialProvider | None
+    credential_identity: str | None
 
 
 def _same_connection_config(registered: MCPSource, candidate: MCPSource) -> bool:
@@ -615,8 +708,8 @@ class MCPRuntime:
             self._abandoned_tasks.discard(task)
         if exception is not None and not isinstance(exception, MCPConnectionError):
             logger.warning(
-                "MCPRuntime background cleanup failed",
-                exc_info=(type(exception), exception, exception.__traceback__),
+                "MCPRuntime background cleanup failed (%s); detail suppressed",
+                type(exception).__name__,
             )
 
     def _track_abandoned_task(self, task: asyncio.Task[Any]) -> None:
@@ -940,11 +1033,12 @@ class MCPRuntime:
             entry.close_started = True
         try:
             await adapter.close()
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "MCP source '%s' connection cleanup failed",
+                "MCP source '%s' connection cleanup failed: %s (%s)",
                 entry.source.name,
-                exc_info=True,
+                safe_source_exception_detail(adapter.source, exc),
+                type(exc).__name__,
             )
 
     async def _lease(self, connection: MCPConnection) -> _ConnectionEntry:
@@ -982,6 +1076,8 @@ class MCPRuntime:
                     if (
                         registration.generation != connection.generation
                         or not _same_connection_config(registration.source, connection.source)
+                        or (registration.credentials is None) != (connection.credentials is None)
+                        or registration.credential_identity != connection.credential_identity
                     ):
                         raise MCPStaleConnectionError(
                             identity,
@@ -1000,7 +1096,13 @@ class MCPRuntime:
                             break
                         if self._can_admit(admission):
                             entry = _ConnectionEntry(registration.source)
-                            entry.task = loop.create_task(self._open_connection(identity, entry))
+                            entry.task = loop.create_task(
+                                self._open_connection(
+                                    identity,
+                                    entry,
+                                    credentials=registration.credentials,
+                                )
+                            )
                             # Insertion into _entries is the slot reservation.
                             self._entries[identity] = entry
                             self._release_admission(admission)
@@ -1049,11 +1151,21 @@ class MCPRuntime:
         self,
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
+        *,
+        credentials: MCPCredentialProvider | None,
     ) -> None:
-        """Connect and discover once for an entry; owns cleanup on failure."""
+        """Connect and discover once for an entry; owns cleanup on failure.
+
+        Runs as the entry's single shared task, which is what makes credential
+        resolution single-flight: however many Agents race for this identity,
+        the provider is consulted exactly once per physical connection.
+        """
         adapter: MCPClientAdapter | None = None
         try:
-            adapter = MCPClientAdapter(entry.source)
+            source = entry.source
+            if credentials is not None:
+                source = await _resolve_source_credentials(source, credentials)
+            adapter = MCPClientAdapter(source)
             await adapter.connect()
             raw_tools = await adapter.list_tools()
         except BaseException:
@@ -1065,11 +1177,12 @@ class MCPRuntime:
             if adapter is not None:
                 try:
                     await adapter.close()
-                except Exception:
+                except Exception as exc:
                     logger.warning(
-                        "MCP source '%s' cleanup failed after a connect error",
+                        "MCP source '%s' cleanup failed after a connect error: %s (%s)",
                         entry.source.name,
-                        exc_info=True,
+                        safe_source_exception_detail(adapter.source, exc),
+                        type(exc).__name__,
                     )
             raise
         with self._lock:
@@ -1084,11 +1197,12 @@ class MCPRuntime:
         if not still_current:
             try:
                 await adapter.close()
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "MCP source '%s' cleanup failed after late establishment",
+                    "MCP source '%s' cleanup failed after late establishment: %s (%s)",
                     entry.source.name,
-                    exc_info=True,
+                    safe_source_exception_detail(adapter.source, exc),
+                    type(exc).__name__,
                 )
             raise MCPConnectionError(
                 f"MCP source '{entry.source.name}' connection was released before "
@@ -1372,8 +1486,24 @@ class MCPRuntime:
         source: MCPSource,
         tenant_key: str | None = None,
         credentials: MCPCredentialProvider | None = None,
+        credential_identity: str | None = None,
     ) -> MCPConnection:
-        """Register a connection identity and return its lazy handle."""
+        """Register a connection identity and return its lazy handle.
+
+        ``credentials`` is resolved lazily: the provider runs once per
+        physical connect — shared by every concurrent Agent — and its value
+        is used only to establish that transport. After idle retirement or
+        eviction, the next connection resolves afresh.
+
+        Providers are deliberately not compared by object identity, because
+        applications naturally construct one per request. With no
+        ``credential_identity`` the newest bind silently becomes canonical
+        and is consulted at the next physical connect. Declaring a
+        ``credential_identity`` (any stable non-secret marker, such as a
+        credential row id or rotation counter) makes rotation explicit: a
+        rebind with a different identity conflicts while the connection is
+        live — evict first — and supersedes older handles once it is not.
+        """
         with self._lock:
             if self._state is not MCPRuntimeState.OPEN:
                 raise MCPRuntimeClosedError("MCPRuntime is closed and cannot bind new connections.")
@@ -1381,10 +1511,21 @@ class MCPRuntime:
             _validate_identity_key(connection_key, "connection", optional=False)
             if not isinstance(source, MCPSource):
                 raise ValueError("MCPRuntime source must be an MCPSource instance.")
+            if source_has_opaque_credentials(source):
+                raise ValueError(
+                    "MCPRuntime source auth cannot be opaque because its secret values "
+                    "cannot be redacted. Use static headers or a credentials provider."
+                )
             if credentials is not None and not isinstance(credentials, MCPCredentialProvider):
                 raise ValueError(
                     "MCPRuntime credentials must implement MCPCredentialProvider.get_auth()."
                 )
+            if credential_identity is not None:
+                if credentials is None:
+                    raise ValueError(
+                        "MCPRuntime credential_identity requires a credentials provider."
+                    )
+                _validate_identity_key(credential_identity, "credential identity", optional=False)
             _validate_namespace(source.name)
 
             identity = tenant_key, connection_key
@@ -1399,7 +1540,12 @@ class MCPRuntime:
                 # First bind, or the first bind after an eviction: a new
                 # generation invalidates every handle issued before it.
                 self._generation_seq += 1
-                registration = _Registration(source=source, generation=self._generation_seq)
+                registration = _Registration(
+                    source=source,
+                    generation=self._generation_seq,
+                    credentials=credentials,
+                    credential_identity=credential_identity,
+                )
                 self._registrations[identity] = registration
             else:
                 registered_physical = registration.source.physical_identity
@@ -1411,16 +1557,23 @@ class MCPRuntime:
                         else "endpoint"
                     )
                     raise MCPBindingConflictError(identity, mismatch=mismatch)
-                if (
+                config_changed = (
                     not _same_connection_config(registration.source, source)
-                    and identity in self._entries
-                ):
+                    or (registration.credentials is None) != (credentials is None)
+                    or registration.credential_identity != credential_identity
+                )
+                if config_changed and identity in self._entries:
                     raise MCPBindingConflictError(identity, mismatch="configuration")
                 # The newest bind becomes canonical: a non-live rebind may
                 # rotate configuration outright, and a config-equivalent one
-                # refreshes the auth object for the next open. The generation
-                # is unchanged, so existing handles stay valid.
+                # refreshes the auth object and provider for the next open.
+                # Provider objects are never compared — applications construct
+                # one per request — so only a declared credential_identity
+                # change counts as changed configuration.
+                # The generation is unchanged, so existing handles stay valid.
                 registration.source = source
+                registration.credentials = credentials
+                registration.credential_identity = credential_identity
 
             return MCPConnection(
                 runtime=self,
@@ -1428,6 +1581,7 @@ class MCPRuntime:
                 connection_key=connection_key,
                 source=source,
                 credentials=credentials,
+                credential_identity=credential_identity,
                 generation=registration.generation,
             )
 
@@ -1676,8 +1830,9 @@ class MCPRuntime:
                 exception = self._consume_task_exception(task)
                 if exception is not None:
                     logger.warning(
-                        "MCPRuntime connection teardown failed during shutdown",
-                        exc_info=(type(exception), exception, exception.__traceback__),
+                        "MCPRuntime connection teardown failed during shutdown (%s); "
+                        "detail suppressed",
+                        type(exception).__name__,
                     )
         with self._lock:
             self._entries.clear()

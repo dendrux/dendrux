@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Mapping
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, patch
 
@@ -24,6 +25,7 @@ from dendrux.mcp._errors import (
     MCPCapacityError,
     MCPConnectionCapacityError,
     MCPConnectionEvictingError,
+    MCPCredentialError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
     MCPStaleConnectionError,
@@ -33,6 +35,7 @@ from dendrux.mcp._runtime import (
     MCPConnection,
     MCPRuntime,
     MCPRuntimeState,
+    _resolve_source_credentials,
     _ViewToolSource,
 )
 from dendrux.mcp._source import MCPSource
@@ -181,12 +184,40 @@ def _reset_adapter() -> Any:
 
 
 class _Credentials:
-    def __init__(self) -> None:
+    """Instrumented credential provider returning a scripted value sequence."""
+
+    def __init__(self, *values: Any) -> None:
+        self._values = list(values) or [{"Authorization": "Bearer must-not-leak"}]
         self.calls = 0
+        self.gate: asyncio.Event | None = None
+        self.error: BaseException | None = None
+        self.fail_once = False
+        self.cancelled = False
 
     async def get_auth(self) -> Any:
         self.calls += 1
-        return "must-not-leak"
+        if self.gate is not None:
+            try:
+                await self.gate.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        if self.error is not None:
+            error = self.error
+            if self.fail_once:
+                self.error = None
+            raise error
+        return self._values[min(self.calls - 1, len(self._values) - 1)]
+
+
+def _chain_text(error: BaseException) -> str:
+    """Every message a monitoring SDK would collect from the chain."""
+    parts: list[str] = []
+    node: BaseException | None = error
+    while node is not None:
+        parts.append(str(node))
+        node = node.__cause__ or node.__context__
+    return "\n".join(parts)
 
 
 def _bind(
@@ -195,12 +226,14 @@ def _bind(
     tenant_key: str | None = None,
     connection_key: str = "github-1",
     credentials: Any = None,
+    credential_identity: str | None = None,
 ) -> MCPConnection:
     return runtime.bind(
         connection_key=connection_key,
         tenant_key=tenant_key,
         source=MCPSource.http("github", "https://mcp.example.com"),
         credentials=credentials,
+        credential_identity=credential_identity,
     )
 
 
@@ -368,15 +401,390 @@ class TestConnectionReuse:
             assert sorted(lookups.fn) == ["github__read", "github__write"]
             assert len(_InstrumentedAdapter.instances) == 2
 
+
+class TestCredentialResolution:
     @pytest.mark.asyncio
-    async def test_credential_provider_stays_dormant_in_this_slice(self) -> None:
+    async def test_credentials_resolve_lazily_on_first_connection(self) -> None:
+        credentials = _Credentials({"Authorization": "Bearer live-token"})
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+            assert credentials.calls == 0  # binding alone must not resolve
+
+            await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert credentials.calls == 1
+            # Resolved headers join a connect-scoped copy of the source; the
+            # configured source is never mutated.
+            assert dict(_InstrumentedAdapter.instances[0].source.headers) == {
+                "Authorization": "Bearer live-token"
+            }
+            assert dict(connection.source.headers) == {}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_discovery_resolves_credentials_once(self) -> None:
+        credentials = _Credentials()
+        credentials.gate = asyncio.Event()
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            second = Agent(prompt="second", tool_sources=[connection.tools(namespace="gh")])
+
+            first_task = asyncio.create_task(first.get_tool_lookups())
+            second_task = asyncio.create_task(second.get_tool_lookups())
+            await asyncio.sleep(0.05)
+
+            # Both Agents wait on one in-flight resolution; neither starts its own.
+            assert credentials.calls == 1
+            credentials.gate.set()
+            await asyncio.gather(first_task, second_task)
+
+            assert credentials.calls == 1
+            assert _total_connects() == 1
+
+    @pytest.mark.asyncio
+    async def test_live_connection_reuse_skips_credential_lookup(self) -> None:
         credentials = _Credentials()
         async with MCPRuntime(shutdown_timeout=0.05) as runtime:
-            view = _bind(runtime, credentials=credentials).tools()
+            connection = _bind(runtime, credentials=credentials)
+            await Agent(prompt="first", tool_sources=[connection.tools()]).get_tool_lookups()
+            await Agent(
+                prompt="second",
+                tool_sources=[connection.tools(namespace="gh")],
+            ).get_tool_lookups()
 
-            await Agent(prompt="test", tool_sources=[view]).get_tool_lookups()
+            assert credentials.calls == 1
 
-            assert credentials.calls == 0
+    @pytest.mark.asyncio
+    async def test_retirement_reconnect_resolves_fresh_credentials(self) -> None:
+        credentials = _Credentials(
+            {"Authorization": "Bearer token-1"},
+            {"Authorization": "Bearer token-2"},
+        )
+        async with MCPRuntime(idle_timeout=0, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+            agent = Agent(prompt="first", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()  # idle_timeout=0 retires immediately
+            await asyncio.sleep(0.05)
+            assert _InstrumentedAdapter.instances[0].closed is True
+
+            await Agent(prompt="second", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert credentials.calls == 2
+            assert dict(_InstrumentedAdapter.instances[1].source.headers) == {
+                "Authorization": "Bearer token-2"
+            }
+
+    @pytest.mark.asyncio
+    async def test_eviction_then_rebind_resolves_fresh_credentials(self) -> None:
+        credentials = _Credentials(
+            {"Authorization": "Bearer token-1"},
+            {"Authorization": "Bearer token-2"},
+        )
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            first = _bind(runtime, credentials=credentials)
+            agent = Agent(prompt="first", tool_sources=[first.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+            await runtime.evict(connection_key="github-1")
+
+            rebound = _bind(runtime, credentials=credentials)
+            await Agent(prompt="second", tool_sources=[rebound.tools()]).get_tool_lookups()
+
+            assert credentials.calls == 2
+            assert dict(_InstrumentedAdapter.instances[1].source.headers) == {
+                "Authorization": "Bearer token-2"
+            }
+
+    @pytest.mark.asyncio
+    async def test_http_mapping_credentials_merge_into_headers(self) -> None:
+        credentials = _Credentials({"Authorization": "Bearer resolved-token"})
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = runtime.bind(
+                connection_key="github-1",
+                source=MCPSource.http(
+                    "github",
+                    "https://mcp.example.com",
+                    headers={"X-Static": "configured"},
+                ),
+                credentials=credentials,
+            )
+            await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            adapter = _InstrumentedAdapter.instances[0]
+            assert dict(adapter.source.headers) == {
+                "X-Static": "configured",
+                "Authorization": "Bearer resolved-token",
+            }
+            assert dict(connection.source.headers) == {"X-Static": "configured"}
+
+    @pytest.mark.asyncio
+    async def test_stdio_mapping_credentials_merge_into_env(self) -> None:
+        credentials = _Credentials({"MCP_TOKEN": "resolved-secret"})
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = runtime.bind(
+                connection_key="local-1",
+                source=MCPSource.stdio("local", ["mcp-server"], env={"BASE": "1"}),
+                credentials=credentials,
+            )
+            await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            adapter = _InstrumentedAdapter.instances[0]
+            assert dict(adapter.source.env) == {"BASE": "1", "MCP_TOKEN": "resolved-secret"}
+
+    @pytest.mark.asyncio
+    async def test_stdio_non_mapping_credentials_fail_typed(self) -> None:
+        credentials = _Credentials("bearer-style-token")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = runtime.bind(
+                connection_key="local-1",
+                source=MCPSource.stdio("local", ["mcp-server"]),
+                credentials=credentials,
+            )
+            with pytest.raises(MCPCredentialError, match="environment") as excinfo:
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert "bearer-style-token" not in _chain_text(excinfo.value)
+            assert _InstrumentedAdapter.instances == []  # never reached the transport
+
+    @pytest.mark.asyncio
+    async def test_invalid_resolved_header_values_fail_without_leaking_them(self) -> None:
+        credentials = _Credentials({"Authorization": "Bearer bad\r\nX-Injected: 1"})
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+
+            with pytest.raises(MCPCredentialError, match="ValueError") as excinfo:
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert "X-Injected" not in _chain_text(excinfo.value)
+            assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    async def test_provider_returning_none_fails_typed(self) -> None:
+        credentials = _Credentials(None)
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+
+            with pytest.raises(MCPCredentialError, match="None"):
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    async def test_provider_failure_is_typed_reaches_waiters_and_is_not_sticky(self) -> None:
+        credentials = _Credentials({"Authorization": "Bearer recovered-token"})
+        credentials.error = RuntimeError("refresh failed for token must-not-leak")
+        credentials.fail_once = True
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            second = Agent(prompt="second", tool_sources=[connection.tools(namespace="gh")])
+
+            results = await asyncio.gather(
+                first.get_tool_lookups(),
+                second.get_tool_lookups(),
+                return_exceptions=True,
+            )
+
+            for result in results:
+                assert isinstance(result, MCPCredentialError)
+                assert str(result) == (
+                    "Failed to resolve credentials for MCP source 'github' (RuntimeError)."
+                )
+                # Provider exception text is application-authored and may
+                # embed the very secret being refreshed; it must be detached
+                # from the chain, not merely suppressed in tracebacks.
+                assert result.__context__ is None
+                assert "must-not-leak" not in _chain_text(result)
+            assert _InstrumentedAdapter.instances == []
+
+            retry = Agent(prompt="retry", tool_sources=[connection.tools()])
+            lookups = await retry.get_tool_lookups()
+            assert sorted(lookups.fn) == ["github__read", "github__write"]
+            assert credentials.calls == 2
+            assert dict(_InstrumentedAdapter.instances[-1].source.headers) == {
+                "Authorization": "Bearer recovered-token"
+            }
+
+    @pytest.mark.asyncio
+    async def test_provider_hang_is_bounded_by_connect_timeout(self) -> None:
+        credentials = _Credentials()
+        credentials.gate = asyncio.Event()  # never set
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = runtime.bind(
+                connection_key="github-1",
+                source=MCPSource.http(
+                    "github",
+                    "https://mcp.example.com",
+                    connect_timeout=0.05,
+                ),
+                credentials=credentials,
+            )
+            with pytest.raises(MCPCredentialError, match="TimeoutError"):
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_a_pending_resolution_cleanly(self) -> None:
+        credentials = _Credentials()
+        credentials.gate = asyncio.Event()  # never released
+        runtime = MCPRuntime(shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime, credentials=credentials).tools()])
+
+        discovery = asyncio.create_task(agent.get_tool_lookups())
+        await asyncio.sleep(0.02)
+        assert credentials.calls == 1
+
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+        await asyncio.wait([discovery], timeout=1.0)
+
+        assert discovery.done()
+        assert discovery.cancelled() or discovery.exception() is not None
+        assert credentials.cancelled is True
+        assert _InstrumentedAdapter.instances == []  # never reached the transport
+        assert runtime.state is MCPRuntimeState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_tenants_resolve_credentials_independently(self) -> None:
+        credentials_a = _Credentials({"Authorization": "Bearer token-a"})
+        credentials_b = _Credentials({"Authorization": "Bearer token-b"})
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            view_a = _bind(runtime, tenant_key="tenant-a", credentials=credentials_a).tools()
+            view_b = _bind(runtime, tenant_key="tenant-b", credentials=credentials_b).tools()
+            await Agent(prompt="a", tool_sources=[view_a]).get_tool_lookups()
+            await Agent(prompt="b", tool_sources=[view_b]).get_tool_lookups()
+
+            assert credentials_a.calls == 1
+            assert credentials_b.calls == 1
+            tokens = {
+                dict(adapter.source.headers).get("Authorization")
+                for adapter in _InstrumentedAdapter.instances
+            }
+            assert tokens == {"Bearer token-a", "Bearer token-b"}
+
+    @pytest.mark.asyncio
+    async def test_http_non_mapping_credentials_fail_typed(self) -> None:
+        """Bare tokens and auth objects are rejected: only mapping values give
+        the runtime exact strings it can redact from every error surface."""
+        credentials = _Credentials("raw-token-string")
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+
+            with pytest.raises(MCPCredentialError, match="request headers") as excinfo:
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert "raw-token-string" not in _chain_text(excinfo.value)
+            assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty", [{}, ""])
+    async def test_empty_resolved_credentials_fail_typed(self, empty: Any) -> None:
+        """{} passes an isinstance Mapping check but merges nothing; accepting
+        it would connect silently unauthenticated, the outcome the None guard
+        exists to prevent."""
+        credentials = _Credentials(empty)
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+
+            with pytest.raises(MCPCredentialError, match="empty"):
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    async def test_hostile_mapping_failure_is_wrapped_and_detached(self) -> None:
+        """A lazy secret-backed mapping can raise while it is being merged;
+        that happens after get_auth() returned, and its text needs the same
+        detachment as a provider exception."""
+
+        class _ExplodingMapping(Mapping):
+            def __getitem__(self, key: str) -> str:
+                raise RuntimeError("decrypt failed for MAP-SECRET")
+
+            def __iter__(self) -> Any:
+                return iter(["Authorization"])
+
+            def __len__(self) -> int:
+                return 1
+
+        credentials = _Credentials(_ExplodingMapping())
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+
+            with pytest.raises(MCPCredentialError) as excinfo:
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert str(excinfo.value) == (
+                "Failed to resolve credentials for MCP source 'github' (RuntimeError)."
+            )
+            assert excinfo.value.__context__ is None
+            assert "MAP-SECRET" not in _chain_text(excinfo.value)
+            assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    async def test_hostile_mapping_value_error_is_wrapped_and_detached(self) -> None:
+        """Application-owned mappings do not become trusted merely because
+        they raise the same exception type as MCPSource validation."""
+
+        class _ExplodingMapping(Mapping):
+            def __getitem__(self, key: str) -> str:
+                raise ValueError("decrypt failed for VALUE-SECRET")
+
+            def __iter__(self) -> Any:
+                return iter(["Authorization"])
+
+            def __len__(self) -> int:
+                return 1
+
+        credentials = _Credentials(_ExplodingMapping())
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+
+            with pytest.raises(MCPCredentialError) as excinfo:
+                await Agent(prompt="test", tool_sources=[connection.tools()]).get_tool_lookups()
+
+            assert str(excinfo.value) == (
+                "Failed to resolve credentials for MCP source 'github' (ValueError)."
+            )
+            assert excinfo.value.__context__ is None
+            assert "VALUE-SECRET" not in _chain_text(excinfo.value)
+            assert _InstrumentedAdapter.instances == []
+
+    def test_managed_runtime_rejects_opaque_static_auth(self) -> None:
+        """A managed connection cannot promise output redaction when an auth
+        object's current secret values are unknowable."""
+
+        class _OpaqueAuth:
+            token = "OPAQUE-SECRET"
+
+        runtime = MCPRuntime()
+        source = MCPSource.http(
+            "github",
+            "https://mcp.example.com",
+            auth=_OpaqueAuth(),
+        )
+
+        with pytest.raises(ValueError, match="opaque") as excinfo:
+            runtime.bind(connection_key="github-1", source=source)
+
+        assert "OPAQUE-SECRET" not in str(excinfo.value)
+        assert runtime._registrations == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("signal", [SystemExit(3), KeyboardInterrupt()])
+    async def test_process_exit_signals_pass_through_unwrapped(
+        self,
+        signal: BaseException,
+    ) -> None:
+        """SystemExit and KeyboardInterrupt are process-level control flow,
+        not credential failures; converting them would swallow a shutdown.
+        Exercised at the boundary directly because asyncio deliberately
+        re-raises them from a task into the event loop itself."""
+        credentials = _Credentials()
+        credentials.error = signal
+        source = MCPSource.http("github", "https://mcp.example.com")
+
+        with pytest.raises(type(signal)):
+            await _resolve_source_credentials(source, credentials)
 
 
 class TestLeaseLifecycle:
@@ -757,7 +1165,7 @@ class TestBindingDeterminism:
             source=MCPSource.http(
                 "github",
                 "https://mcp.example.com",
-                auth=object(),
+                auth=["user", "password-one"],
             ),
         )
         agent = Agent(prompt="test", tool_sources=[first.tools()])
@@ -769,7 +1177,7 @@ class TestBindingDeterminism:
                 source=MCPSource.http(
                     "github",
                     "https://mcp.example.com",
-                    auth=object(),
+                    auth=["user", "password-two"],
                 ),
             )
 
@@ -779,7 +1187,7 @@ class TestBindingDeterminism:
 
     @pytest.mark.asyncio
     async def test_same_mutable_auth_object_reuses_live_connection(self) -> None:
-        auth = object()
+        auth = ["user", "mutable-password"]
         runtime = MCPRuntime(shutdown_timeout=0.05)
         first = runtime.bind(
             connection_key="github-1",
@@ -801,6 +1209,131 @@ class TestBindingDeterminism:
         await runtime.close()
 
     @pytest.mark.asyncio
+    async def test_per_request_provider_instances_rebind_freely(self) -> None:
+        """Applications naturally construct a provider per request; without a
+        declared credential identity the newest bind silently becomes
+        canonical instead of conflicting with the live connection."""
+        async with MCPRuntime(idle_timeout=0, shutdown_timeout=0.05) as runtime:
+            first_provider = _Credentials({"Authorization": "Bearer first"})
+            second_provider = _Credentials({"Authorization": "Bearer second"})
+            first = _bind(runtime, credentials=first_provider)
+            first_agent = Agent(prompt="first", tool_sources=[first.tools()])
+            await first_agent.get_tool_lookups()
+
+            second = _bind(runtime, credentials=second_provider)  # no conflict
+            second_agent = Agent(prompt="second", tool_sources=[second.tools()])
+            await second_agent.get_tool_lookups()
+
+            assert _total_connects() == 1  # live reuse, no fresh lookup
+            assert second_provider.calls == 0
+
+            # The first handle stays valid too: no staleness without identity.
+            await first_agent.close()
+            await second_agent.close()
+            await asyncio.sleep(0.05)  # idle_timeout=0 retires the connection
+
+            retry = Agent(prompt="retry", tool_sources=[first.tools()])
+            await retry.get_tool_lookups()
+
+            # The reconnect resolved through the newest bound provider.
+            assert first_provider.calls == 1
+            assert second_provider.calls == 1
+            assert dict(_InstrumentedAdapter.instances[1].source.headers) == {
+                "Authorization": "Bearer second"
+            }
+
+    @pytest.mark.asyncio
+    async def test_live_rebind_cannot_drop_the_credential_provider(self) -> None:
+        credentials = _Credentials({"Authorization": "Bearer live"})
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=credentials)
+            agent = Agent(prompt="authenticated", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+
+            with pytest.raises(MCPBindingConflictError) as excinfo:
+                _bind(runtime)
+
+            assert excinfo.value.mismatch == "configuration"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_idle_rebind_without_credentials_supersedes_authenticated_handle(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            credentials = _Credentials({"Authorization": "Bearer old"})
+            authenticated = _bind(runtime, credentials=credentials)
+            anonymous = _bind(runtime)
+
+            with pytest.raises(MCPStaleConnectionError, match="superseded"):
+                await Agent(
+                    prompt="stale",
+                    tool_sources=[authenticated.tools()],
+                ).get_tool_lookups()
+
+            await Agent(prompt="anonymous", tool_sources=[anonymous.tools()]).get_tool_lookups()
+            assert credentials.calls == 0
+            assert dict(_InstrumentedAdapter.instances[0].source.headers) == {}
+
+    @pytest.mark.asyncio
+    async def test_changed_credential_identity_requires_eviction_while_live(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            first = _bind(runtime, credentials=_Credentials(), credential_identity="cred-v1")
+            agent = Agent(prompt="test", tool_sources=[first.tools()])
+            await agent.get_tool_lookups()
+
+            with pytest.raises(MCPBindingConflictError) as excinfo:
+                _bind(runtime, credentials=_Credentials(), credential_identity="cred-v2")
+
+            assert excinfo.value.mismatch == "configuration"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_same_credential_identity_refreshes_the_provider_in_place(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            first = _bind(runtime, credentials=_Credentials(), credential_identity="cred-v1")
+            first_agent = Agent(prompt="first", tool_sources=[first.tools()])
+            await first_agent.get_tool_lookups()
+
+            rebound = _bind(runtime, credentials=_Credentials(), credential_identity="cred-v1")
+            second_agent = Agent(prompt="second", tool_sources=[rebound.tools()])
+            await second_agent.get_tool_lookups()
+
+            assert _total_connects() == 1
+
+    @pytest.mark.asyncio
+    async def test_same_provider_rebind_reuses_live_connection(self) -> None:
+        credentials = _Credentials()
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            first = _bind(runtime, credentials=credentials)
+            first_agent = Agent(prompt="first", tool_sources=[first.tools()])
+            await first_agent.get_tool_lookups()
+
+            rebound = _bind(runtime, credentials=credentials)
+            second_agent = Agent(prompt="second", tool_sources=[rebound.tools()])
+            await second_agent.get_tool_lookups()
+
+            assert _total_connects() == 1
+            assert credentials.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_idle_credential_identity_rebind_supersedes_old_handle(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            old_credentials = _Credentials({"Authorization": "Bearer old-token"})
+            new_credentials = _Credentials({"Authorization": "Bearer new-token"})
+            stale = _bind(runtime, credentials=old_credentials, credential_identity="cred-v1")
+            current = _bind(runtime, credentials=new_credentials, credential_identity="cred-v2")
+
+            with pytest.raises(RuntimeError, match="superseded"):
+                await Agent(prompt="stale", tool_sources=[stale.tools()]).get_tool_lookups()
+
+            await Agent(prompt="current", tool_sources=[current.tools()]).get_tool_lookups()
+
+            assert old_credentials.calls == 0
+            assert new_credentials.calls == 1
+            assert dict(_InstrumentedAdapter.instances[0].source.headers) == {
+                "Authorization": "Bearer new-token"
+            }
+
+    @pytest.mark.asyncio
     async def test_idle_auth_rebind_supersedes_old_handle(self) -> None:
         runtime = MCPRuntime(shutdown_timeout=0.05)
         stale = runtime.bind(
@@ -808,7 +1341,7 @@ class TestBindingDeterminism:
             source=MCPSource.http(
                 "github",
                 "https://mcp.example.com",
-                auth=object(),
+                auth=["user", "password-one"],
             ),
         )
         current = runtime.bind(
@@ -816,7 +1349,7 @@ class TestBindingDeterminism:
             source=MCPSource.http(
                 "github",
                 "https://mcp.example.com",
-                auth=object(),
+                auth=["user", "password-two"],
             ),
         )
 
@@ -1563,6 +2096,28 @@ class TestTransportMisbehaviour:
         assert _InstrumentedAdapter.instances[0].close_calls == 1
 
     @pytest.mark.asyncio
+    async def test_close_failure_does_not_log_resolved_credentials(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        secret = "RUNTIME-CLOSE-SECRET"
+        runtime = MCPRuntime(shutdown_timeout=0.05)
+        connection = _bind(
+            runtime,
+            credentials=_Credentials({"Authorization": f"Bearer {secret}"}),
+        )
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+        _InstrumentedAdapter.close_error = OSError(f"close echoed {secret}")
+
+        with caplog.at_level("WARNING", logger="dendrux.mcp._runtime"):
+            await runtime.close()
+
+        assert secret not in caplog.text
+        assert "[redacted]" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_close_failure_does_not_break_eviction(self) -> None:
         runtime = MCPRuntime(shutdown_timeout=0.05)
         connection = _bind(runtime)
@@ -1622,6 +2177,25 @@ class TestRuntimeConfigurationValidation:
                 source=MCPSource.http("github", "https://mcp.example.com"),
                 credentials=object(),  # type: ignore[arg-type]
             )
+
+    def test_credential_identity_requires_a_provider_and_valid_text(self) -> None:
+        runtime = MCPRuntime()
+        source = MCPSource.http("github", "https://mcp.example.com")
+
+        with pytest.raises(ValueError, match="requires a credentials provider"):
+            runtime.bind(
+                connection_key="github-1",
+                source=source,
+                credential_identity="cred-v1",
+            )
+        for invalid in ("", "   ", "cred\n1"):
+            with pytest.raises(ValueError, match="credential identity"):
+                runtime.bind(
+                    connection_key="github-1",
+                    source=source,
+                    credentials=_Credentials(),
+                    credential_identity=invalid,
+                )
 
     @pytest.mark.parametrize(
         ("field", "value"),

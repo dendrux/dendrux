@@ -21,6 +21,28 @@ class MCPConnectionError(MCPError):
     transport_detail: str | None = None
 
 
+class MCPCredentialError(MCPConnectionError):
+    """Credentials for an MCP source could not be resolved or applied.
+
+    Raised before anything is sent: the provider failed, timed out, or
+    returned a value the transport cannot use, so no connection attempt was
+    made. Provider exception text is application-authored and may embed the
+    very secret being refreshed, so ``str()`` names only the failure class
+    and the original exception is detached from the chain entirely.
+    """
+
+
+class MCPAuthenticationError(MCPConnectionError):
+    """The MCP server rejected the source's credentials (HTTP 401/403).
+
+    Typed separately from transport failure so applications can refresh or
+    rotate credentials and evict, instead of retrying blindly. Raised from
+    connect and discovery; ``status_code`` carries the rejecting status.
+    """
+
+    status_code: int | None = None
+
+
 class MCPBindingConflictError(MCPError):
     """A runtime connection identity was rebound to a conflicting source."""
 
