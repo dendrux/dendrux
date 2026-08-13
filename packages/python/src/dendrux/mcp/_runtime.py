@@ -18,6 +18,7 @@ from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._errors import (
     MCPBindingConflictError,
     MCPCallCapacityError,
+    MCPCircuitOpenError,
     MCPConnectionCapacityError,
     MCPConnectionError,
     MCPConnectionEvictingError,
@@ -462,6 +463,14 @@ class _ViewToolSource(MCPServer):
                         reporting_permit=permit,
                     )
                     raise unknown_outcome("connection_lost") from exc
+                if isinstance(exc, Exception):
+                    # Any ordinary tool failure arrived over a functioning
+                    # MCP session. Process-level control flow is not a server
+                    # response and must not change health state.
+                    connection.runtime._record_healthy_tool_response(
+                        connection.identity,
+                        entry,
+                    )
                 raise
             else:
                 interruption = permit.interruption
@@ -473,6 +482,10 @@ class _ViewToolSource(MCPServer):
                     # A normal return is a definitive server response. Forced
                     # teardown prevents future work; it does not make this
                     # already-completed call's outcome uncertain.
+                connection.runtime._record_healthy_tool_response(
+                    connection.identity,
+                    entry,
+                )
                 return result
             finally:
                 connection.runtime._end_call(connection.identity, permit)
@@ -511,6 +524,7 @@ class _ConnectionEntry:
         "adapter",
         "broken",
         "call_permits",
+        "circuit",
         "close_started",
         "fenced",
         "force_evicted",
@@ -542,6 +556,10 @@ class _ConnectionEntry:
         self.force_evicted = False
         self.broken = False
         self.close_started = False
+        # The circuit of the registration this entry was opened under. Held
+        # directly so a failure recorded by a slow attempt lands on the
+        # circuit that admitted it, never on one a later rebind reset.
+        self.circuit: _CircuitState | None = None
         # Idle retirement: a pending timer, then the task closing this exact
         # physical entry. Both are scoped to this entry so a stale callback can
         # never touch a replacement connection.
@@ -597,6 +615,31 @@ class _Admission:
         self.waiters = 0
 
 
+class _CircuitState:
+    """Consecutive connection-failure record for one registered identity.
+
+    Owned by the registration, not the physical entry, so it survives the
+    failed entries it is counting. Eviction deletes the registration — and
+    the circuit with it — while a rebind with changed configuration or
+    credential identity replaces it with a fresh one. ``open_until`` is an
+    event-loop timestamp; while it lies in the future, new physical
+    connections for the identity are rejected.
+    """
+
+    __slots__ = (
+        "consecutive_failures",
+        "connection_loss_failures",
+        "last_failure",
+        "open_until",
+    )
+
+    def __init__(self) -> None:
+        self.consecutive_failures = 0
+        self.connection_loss_failures = 0
+        self.last_failure: str | None = None
+        self.open_until: float | None = None
+
+
 @dataclass(slots=True)
 class _Registration:
     """Canonical configuration for one connection identity.
@@ -609,6 +652,7 @@ class _Registration:
     generation: int
     credentials: MCPCredentialProvider | None
     credential_identity: str | None
+    circuit: _CircuitState = field(default_factory=_CircuitState)
 
 
 def _same_connection_config(registered: MCPSource, candidate: MCPSource) -> bool:
@@ -654,6 +698,19 @@ class MCPRuntime:
     is handed to background tracking rather than waited on, so no caller can
     be blocked by a misbehaving server.
 
+    Repeated connection failures open a per-identity **circuit breaker**:
+    once ``circuit_failure_threshold`` failures accumulate — connection
+    attempts and mid-call transport losses alike — new acquisitions fail fast
+    with :class:`MCPCircuitOpenError`, whose ``retry_after`` can be surfaced
+    to users, instead of hammering an unavailable server. After
+    ``circuit_reset_timeout`` seconds the next acquisition becomes a single
+    probe that concurrent callers wait behind. A successful handshake clears
+    connection-attempt failures; mid-call losses remain until a confirmed
+    tool response proves the replacement session healthy. Eviction, or
+    rebinding with changed configuration or ``credential_identity``, resets
+    the circuit explicitly. The breaker gates only new physical connections:
+    live connections, their tool calls, and other identities are unaffected.
+
     Tool calls are bounded separately by ``max_in_flight_calls``, one budget
     shared by every connection: any number of Agents may hold leases, but only
     that many MCP operations are admitted at once. Calls over the limit queue
@@ -671,6 +728,8 @@ class MCPRuntime:
         connection_wait_timeout: float = 10.0,
         call_wait_timeout: float = 10.0,
         shutdown_timeout: float = 30.0,
+        circuit_failure_threshold: int | None = 5,
+        circuit_reset_timeout: float = 30.0,
     ) -> None:
         self.max_connections = _positive_int(max_connections, "max_connections")
         self.max_in_flight_calls = _positive_int(
@@ -693,6 +752,15 @@ class MCPRuntime:
         # itself. 0 sheds load immediately instead of queueing.
         self.call_wait_timeout = _non_negative_float(call_wait_timeout, "call_wait_timeout")
         self.shutdown_timeout = _positive_float(shutdown_timeout, "shutdown_timeout")
+        # Circuit breaker: after this many consecutive connection failures on
+        # one identity, new physical connections are rejected for the reset
+        # timeout, then one probe is admitted. None disables the breaker.
+        self.circuit_failure_threshold: int | None = (
+            None
+            if circuit_failure_threshold is None
+            else _positive_int(circuit_failure_threshold, "circuit_failure_threshold")
+        )
+        self.circuit_reset_timeout = _positive_float(circuit_reset_timeout, "circuit_reset_timeout")
         self._state = MCPRuntimeState.OPEN
         # The registered source is the canonical configuration for an
         # identity. evict() must remove entries here, or an evicted
@@ -1076,6 +1144,113 @@ class MCPRuntime:
                 type(exc).__name__,
             )
 
+    def _circuit_retry_after(self, circuit: _CircuitState, now: float) -> float | None:
+        """Remaining cooldown before this identity may open a connection.
+
+        ``None`` admits the caller: the circuit is closed, or its cooldown
+        has elapsed and this acquisition becomes the probe — single-flight
+        entry creation is what guarantees exactly one physical attempt,
+        however many callers arrive with it. Caller must hold the runtime
+        lock.
+        """
+        if circuit.open_until is None or now >= circuit.open_until:
+            return None
+        return circuit.open_until - now
+
+    def _entry_owns_current_circuit(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+    ) -> bool:
+        """Whether this live entry may mutate its registration's circuit.
+
+        Cancellation-resistant establishment tasks can finish after their
+        entry was retired and a replacement has already changed the circuit.
+        Entry identity and circuit-object identity together prevent those
+        obsolete outcomes from overwriting the current verdict. Caller must
+        hold the runtime lock.
+        """
+        registration = self._registrations.get(identity)
+        return (
+            self._entries.get(identity) is entry
+            and not entry.fenced
+            and registration is not None
+            and registration.circuit is entry.circuit
+        )
+
+    def _record_circuit_failure(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        cause: str,
+        *,
+        connection_lost: bool = False,
+    ) -> None:
+        """Count one connection failure toward the entry's circuit.
+
+        ``cause`` must be value-free (an exception class name or a fixed
+        phrase): it is rendered into rejection messages and logs. Caller
+        must hold the runtime lock.
+        """
+        circuit = entry.circuit
+        threshold = self.circuit_failure_threshold
+        if (
+            circuit is None
+            or threshold is None
+            or not self._entry_owns_current_circuit(identity, entry)
+        ):
+            return
+        circuit.consecutive_failures += 1
+        if connection_lost:
+            circuit.connection_loss_failures += 1
+        circuit.last_failure = cause
+        if circuit.consecutive_failures < threshold or self._loop is None:
+            return
+        circuit.open_until = self._loop.time() + self.circuit_reset_timeout
+        logger.warning(
+            "MCP source '%s' circuit opened after %d consecutive connection "
+            "failures (last: %s); rejecting new connections for %.1fs.",
+            entry.source.name,
+            circuit.consecutive_failures,
+            cause,
+            self.circuit_reset_timeout,
+        )
+
+    def _record_circuit_connection_success(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+    ) -> None:
+        """Record a successful handshake without hiding unstable sessions.
+
+        Establishment clears connection-attempt failures. Mid-call losses
+        survive until a real tool response proves the replacement session is
+        healthy; otherwise a server that accepts discovery but drops every
+        call could reconnect forever without opening its circuit. Caller must
+        hold the runtime lock.
+        """
+        circuit = entry.circuit
+        if circuit is None or not self._entry_owns_current_circuit(identity, entry):
+            return
+        circuit.consecutive_failures = circuit.connection_loss_failures
+        circuit.last_failure = "connection loss" if circuit.connection_loss_failures else None
+        circuit.open_until = None
+
+    def _record_healthy_tool_response(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+    ) -> None:
+        """Reset the circuit after a confirmed response on the live entry."""
+        with self._lock:
+            circuit = entry.circuit
+            if circuit is None or not self._entry_owns_current_circuit(identity, entry):
+                return
+            circuit.consecutive_failures = 0
+            circuit.connection_loss_failures = 0
+            circuit.last_failure = None
+            circuit.open_until = None
+
     def _connection_lost(
         self,
         identity: tuple[str | None, str],
@@ -1099,6 +1274,12 @@ class MCPRuntime:
             if not entry.fenced:
                 if self._state is not MCPRuntimeState.OPEN or self._loop is None:
                     return  # shutdown already tears every transport down
+                self._record_circuit_failure(
+                    identity,
+                    entry,
+                    "connection loss",
+                    connection_lost=True,
+                )
                 entry.broken = True
                 entry.fenced = True
                 self._cancel_idle(entry)
@@ -1203,8 +1384,20 @@ class MCPRuntime:
                             entry.leases += 1
                             task = entry.task
                             break
+                        # Only opening a NEW physical connection consults the
+                        # circuit; a live entry above is reused regardless.
+                        retry_after = self._circuit_retry_after(registration.circuit, loop.time())
+                        if retry_after is not None:
+                            circuit = registration.circuit
+                            raise MCPCircuitOpenError(
+                                identity,
+                                retry_after=retry_after,
+                                failure_count=circuit.consecutive_failures,
+                                last_failure=circuit.last_failure,
+                            )
                         if self._can_admit(admission):
                             entry = _ConnectionEntry(registration.source)
+                            entry.circuit = registration.circuit
                             entry.task = loop.create_task(
                                 self._open_connection(
                                     identity,
@@ -1277,8 +1470,12 @@ class MCPRuntime:
             adapter = MCPClientAdapter(source)
             await adapter.connect()
             raw_tools = await adapter.list_tools()
-        except BaseException:
+        except BaseException as exc:
             with self._lock:
+                # A cancelled attempt is a verdict about this runtime's
+                # teardown, not about the server: only real failures count.
+                if isinstance(exc, Exception) and not isinstance(exc, asyncio.CancelledError):
+                    self._record_circuit_failure(identity, entry, type(exc).__name__)
                 if self._entries.get(identity) is entry and not entry.fenced:
                     # Discard so the identity can be retried with a fresh entry,
                     # freeing its slot and any idle timer a departed waiter armed.
@@ -1295,6 +1492,7 @@ class MCPRuntime:
                     )
             raise
         with self._lock:
+            self._record_circuit_connection_success(identity, entry)
             # A force-closed or evicted entry must never receive a live
             # adapter: a transport that suppressed cancellation could
             # otherwise publish into an already-closed runtime.
@@ -1701,6 +1899,12 @@ class MCPRuntime:
                 registration.source = source
                 registration.credentials = credentials
                 registration.credential_identity = credential_identity
+                if config_changed:
+                    # Rotated credentials or a changed endpoint deserve an
+                    # immediate attempt; the identical per-request rebind
+                    # above keeps its circuit, so a reconnect storm cannot
+                    # reset its own breaker.
+                    registration.circuit = _CircuitState()
 
             return MCPConnection(
                 runtime=self,
