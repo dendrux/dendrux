@@ -24,6 +24,7 @@ from dendrux.mcp._errors import (
     MCPBindingConflictError,
     MCPCallCapacityError,
     MCPCapacityError,
+    MCPCircuitOpenError,
     MCPConnectionCapacityError,
     MCPConnectionEvictingError,
     MCPConnectionLostError,
@@ -37,6 +38,7 @@ from dendrux.mcp._runtime import (
     MCPConnection,
     MCPRuntime,
     MCPRuntimeState,
+    _ConnectionEntry,
     _resolve_source_credentials,
     _ViewToolSource,
 )
@@ -4572,3 +4574,592 @@ class TestBrokenConnectionRecovery:
             await agent_alpha.close()
             await agent_beta.close()
             await replacement.close()
+
+
+class TestCircuitBreaker:
+    """Repeated connection failures open a per-identity circuit.
+
+    An unavailable server must not absorb a reconnect storm: once the
+    threshold of consecutive failures is reached, acquisitions fail fast
+    with a typed error carrying ``retry_after``. After the cooldown exactly
+    one probe connection is attempted — concurrent callers wait behind it —
+    and a successful connection closes the circuit again. The breaker gates
+    only new physical connections; it never retries tool calls.
+    """
+
+    @pytest.mark.asyncio
+    async def test_repeated_connect_failures_open_the_circuit(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=3, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            for _ in range(3):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                with pytest.raises(ConnectionError):
+                    await agent.get_tool_lookups()
+
+            rejected = Agent(prompt="rejected", tool_sources=[connection.tools()])
+            with pytest.raises(MCPCircuitOpenError) as excinfo:
+                # Well under every wait budget: an open circuit never queues.
+                await asyncio.wait_for(rejected.get_tool_lookups(), timeout=1.0)
+
+            error = excinfo.value
+            assert error.identity == (None, "github-1")
+            assert 0 < error.retry_after <= 30.0
+            assert error.failure_count == 3
+            assert error.last_failure == "ConnectionError"
+            assert "circuit is open" in str(error)
+            # Failing fast means the server was never contacted again.
+            assert _total_connects() == 3
+            assert runtime._entries == {}
+
+    @pytest.mark.asyncio
+    async def test_cooldown_admits_exactly_one_probe(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=2, circuit_reset_timeout=0.1, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            for _ in range(2):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                with pytest.raises(ConnectionError):
+                    await agent.get_tool_lookups()
+            await asyncio.sleep(0.15)
+
+            gate = asyncio.Event()
+            _InstrumentedAdapter.connect_gate = gate
+            probers = [
+                Agent(prompt=f"probe-{index}", tool_sources=[connection.tools()])
+                for index in range(3)
+            ]
+            acquisitions = [asyncio.create_task(agent.get_tool_lookups()) for agent in probers]
+            await _wait_until(
+                lambda: (
+                    (None, "github-1") in runtime._entries
+                    and runtime._entries[(None, "github-1")].leases == 3
+                )
+            )
+            # Every concurrent caller shares the single probe connection.
+            assert _total_connects() == 3
+            gate.set()
+
+            results = await asyncio.gather(*acquisitions, return_exceptions=True)
+            assert all(isinstance(result, ConnectionError) for result in results)
+
+            # The failed probe counted one more failure and re-armed the
+            # cooldown, so the circuit is open again.
+            circuit = runtime._registrations[(None, "github-1")].circuit
+            assert circuit.consecutive_failures == 3
+            assert circuit.open_until is not None
+            assert runtime._entries == {}
+
+    @pytest.mark.asyncio
+    async def test_callers_wait_behind_a_successful_probe(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=2, circuit_reset_timeout=0.1, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            for _ in range(2):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                with pytest.raises(ConnectionError):
+                    await agent.get_tool_lookups()
+            await asyncio.sleep(0.15)
+            _InstrumentedAdapter.connect_error = None
+
+            gate = asyncio.Event()
+            _InstrumentedAdapter.connect_gate = gate
+            probers = [
+                Agent(prompt=f"probe-{index}", tool_sources=[connection.tools()])
+                for index in range(3)
+            ]
+            acquisitions = [asyncio.create_task(agent.get_tool_lookups()) for agent in probers]
+            await _wait_until(
+                lambda: (
+                    (None, "github-1") in runtime._entries
+                    and runtime._entries[(None, "github-1")].leases == 3
+                )
+            )
+            gate.set()
+
+            for lookups in await asyncio.gather(*acquisitions):
+                assert await lookups.fn["github__read"](value=1) == "read:ok"
+            # Two failed attempts, then one shared probe connection.
+            assert _total_connects() == 3
+            circuit = runtime._registrations[(None, "github-1")].circuit
+            assert circuit.consecutive_failures == 0
+            assert circuit.open_until is None
+            for agent in probers:
+                await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_a_successful_connection_resets_the_failure_count(self) -> None:
+        async with MCPRuntime(
+            circuit_failure_threshold=2,
+            circuit_reset_timeout=30.0,
+            idle_timeout=0.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+
+            async def failing_acquisition() -> None:
+                agent = Agent(prompt="fail", tool_sources=[connection.tools()])
+                with pytest.raises(ConnectionError):
+                    await agent.get_tool_lookups()
+
+            _InstrumentedAdapter.connect_error = ConnectionError("blip")
+            await failing_acquisition()  # one short of the threshold
+
+            _InstrumentedAdapter.connect_error = None
+            agent = Agent(prompt="ok", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+            await _wait_until(lambda: runtime._entries == {})  # idle retirement
+
+            # The success cleared the count: the threshold must be reached
+            # from scratch before the circuit opens again.
+            _InstrumentedAdapter.connect_error = ConnectionError("blip")
+            await failing_acquisition()
+            await failing_acquisition()
+            blocked = Agent(prompt="blocked", tool_sources=[connection.tools()])
+            with pytest.raises(MCPCircuitOpenError):
+                await blocked.get_tool_lookups()
+            assert _total_connects() == 4
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_counts_toward_the_circuit(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(
+            circuit_failure_threshold=2, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+            await _wait_until(lambda: runtime._entries == {})
+
+            # The mid-call loss (1) plus one failed reconnect (2) reaches the
+            # threshold without a second connect failure.
+            _InstrumentedAdapter.connect_error = ConnectionError("still down")
+            reconnect = Agent(prompt="reconnect", tool_sources=[connection.tools()])
+            with pytest.raises(ConnectionError):
+                await reconnect.get_tool_lookups()
+
+            blocked = Agent(prompt="blocked", tool_sources=[connection.tools()])
+            with pytest.raises(MCPCircuitOpenError) as excinfo:
+                await blocked.get_tool_lookups()
+            assert excinfo.value.failure_count == 2
+            assert _total_connects() == 2
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_repeated_mid_call_losses_open_the_circuit(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        async with MCPRuntime(
+            circuit_failure_threshold=2,
+            circuit_reset_timeout=30.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+
+            for _ in range(2):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                lookups = await agent.get_tool_lookups()
+                with pytest.raises(MCPOutcomeUnknownError):
+                    await lookups.fn["github__write"](value=1)
+                await _wait_until(lambda: runtime._entries == {})
+                await agent.close()
+
+            blocked = Agent(prompt="blocked", tool_sources=[connection.tools()])
+            with pytest.raises(MCPCircuitOpenError) as excinfo:
+                await blocked.get_tool_lookups()
+
+            assert excinfo.value.failure_count == 2
+            assert excinfo.value.last_failure == "connection loss"
+            assert _total_connects() == 2
+
+    @pytest.mark.asyncio
+    async def test_confirmed_tool_response_resets_the_transport_loss_streak(self) -> None:
+        async with MCPRuntime(
+            circuit_failure_threshold=2,
+            circuit_reset_timeout=30.0,
+            idle_timeout=0.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+
+            _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            first_tools = await first.get_tool_lookups()
+            with pytest.raises(MCPOutcomeUnknownError):
+                await first_tools.fn["github__write"](value=1)
+            await _wait_until(lambda: runtime._entries == {})
+            await first.close()
+
+            _InstrumentedAdapter.call_error = None
+            healthy = Agent(prompt="healthy", tool_sources=[connection.tools()])
+            healthy_tools = await healthy.get_tool_lookups()
+            assert await healthy_tools.fn["github__write"](value=2) == "write:ok"
+            await healthy.close()
+            await _wait_until(lambda: runtime._entries == {})
+
+            _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+            third = Agent(prompt="third", tool_sources=[connection.tools()])
+            third_tools = await third.get_tool_lookups()
+            with pytest.raises(MCPOutcomeUnknownError):
+                await third_tools.fn["github__write"](value=3)
+            await _wait_until(lambda: runtime._entries == {})
+            await third.close()
+
+            circuit = runtime._registrations[(None, "github-1")].circuit
+            assert circuit.consecutive_failures == 1
+            assert circuit.open_until is None
+
+    @pytest.mark.asyncio
+    async def test_obsolete_success_cannot_clear_a_newer_failed_attempt(self) -> None:
+        class _LateAdapter:
+            attempts = 0
+            stale_gate = asyncio.Event()
+
+            def __init__(self, source: MCPSource) -> None:
+                self.source = source
+                self.info = None
+                type(self).attempts += 1
+                self.attempt = type(self).attempts
+
+            async def connect(self) -> None:
+                if self.attempt == 1:
+                    while True:
+                        try:
+                            await self.stale_gate.wait()
+                            return
+                        except asyncio.CancelledError:
+                            continue
+                raise ConnectionError("newer attempt failed")
+
+            async def list_tools(self) -> list[Tool]:
+                return []
+
+            async def close(self) -> None:
+                return None
+
+        with patch("dendrux.mcp._runtime.MCPClientAdapter", _LateAdapter):
+            runtime = MCPRuntime(
+                circuit_failure_threshold=1,
+                circuit_reset_timeout=30.0,
+                idle_timeout=0.0,
+                shutdown_timeout=0.01,
+            )
+            connection = _bind(runtime)
+            stale = asyncio.create_task(runtime._lease(connection))
+            await _wait_until(lambda: _LateAdapter.attempts == 1)
+            stale.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stale
+            await _wait_until(lambda: runtime._entries == {})
+
+            with pytest.raises(ConnectionError):
+                await runtime._lease(connection)
+            circuit = runtime._registrations[(None, "github-1")].circuit
+            assert circuit.open_until is not None
+
+            _LateAdapter.stale_gate.set()
+            await _wait_until(lambda: not runtime._abandoned_tasks)
+
+            assert circuit.consecutive_failures == 1
+            assert circuit.open_until is not None
+            await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_obsolete_failure_cannot_poison_a_newer_success(self) -> None:
+        class _LateAdapter:
+            attempts = 0
+            stale_gate = asyncio.Event()
+
+            def __init__(self, source: MCPSource) -> None:
+                self.source = source
+                self.info = None
+                type(self).attempts += 1
+                self.attempt = type(self).attempts
+
+            async def connect(self) -> None:
+                if self.attempt != 1:
+                    return
+                while True:
+                    try:
+                        await self.stale_gate.wait()
+                        raise ConnectionError("obsolete attempt failed")
+                    except asyncio.CancelledError:
+                        continue
+
+            async def list_tools(self) -> list[Tool]:
+                return []
+
+            async def close(self) -> None:
+                return None
+
+        with patch("dendrux.mcp._runtime.MCPClientAdapter", _LateAdapter):
+            runtime = MCPRuntime(
+                circuit_failure_threshold=1,
+                circuit_reset_timeout=30.0,
+                idle_timeout=0.0,
+                shutdown_timeout=0.01,
+            )
+            connection = _bind(runtime)
+            stale = asyncio.create_task(runtime._lease(connection))
+            await _wait_until(lambda: _LateAdapter.attempts == 1)
+            stale.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stale
+            await _wait_until(lambda: runtime._entries == {})
+
+            current = await runtime._lease(connection)
+            circuit = runtime._registrations[(None, "github-1")].circuit
+            assert circuit.consecutive_failures == 0
+
+            _LateAdapter.stale_gate.set()
+            await _wait_until(lambda: not runtime._abandoned_tasks)
+
+            assert circuit.consecutive_failures == 0
+            assert circuit.open_until is None
+            runtime._release((None, "github-1"), current)
+            await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_authentication_rejections_open_the_circuit(self) -> None:
+        _InstrumentedAdapter.connect_error = MCPAuthenticationError(
+            "Failed to connect to MCP source 'github': "
+            "the server rejected its credentials (HTTP 401)."
+        )
+        async with MCPRuntime(
+            circuit_failure_threshold=2, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            for _ in range(2):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                with pytest.raises(MCPAuthenticationError):
+                    await agent.get_tool_lookups()
+
+            # Rejections stop reaching the server: rotating credentials and
+            # rebinding (or evicting) resets, instead of retrying in a loop.
+            blocked = Agent(prompt="blocked", tool_sources=[connection.tools()])
+            with pytest.raises(MCPCircuitOpenError) as excinfo:
+                await blocked.get_tool_lookups()
+            assert excinfo.value.last_failure == "MCPAuthenticationError"
+            assert _total_connects() == 2
+
+    @pytest.mark.asyncio
+    async def test_tenant_partitions_have_independent_circuits(self) -> None:
+        async with MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            alpha = _bind(runtime, tenant_key="tenant-alpha")
+            beta = _bind(runtime, tenant_key="tenant-beta")
+
+            _InstrumentedAdapter.connect_error = ConnectionError("alpha exploded")
+            agent_alpha = Agent(prompt="alpha", tool_sources=[alpha.tools()])
+            with pytest.raises(ConnectionError):
+                await agent_alpha.get_tool_lookups()
+            _InstrumentedAdapter.connect_error = None
+
+            agent_beta = Agent(prompt="beta", tool_sources=[beta.tools()])
+            lookups = await agent_beta.get_tool_lookups()
+            assert await lookups.fn["github__write"](value=1) == "write:ok"
+
+            blocked = Agent(prompt="alpha-blocked", tool_sources=[alpha.tools()])
+            with pytest.raises(MCPCircuitOpenError) as excinfo:
+                await blocked.get_tool_lookups()
+            assert excinfo.value.identity == ("tenant-alpha", "github-1")
+            await agent_beta.close()
+
+    @pytest.mark.asyncio
+    async def test_eviction_resets_the_circuit(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            with pytest.raises(ConnectionError):
+                await agent.get_tool_lookups()
+            blocked = Agent(prompt="blocked", tool_sources=[connection.tools()])
+            with pytest.raises(MCPCircuitOpenError):
+                await blocked.get_tool_lookups()
+
+            await runtime.evict(connection_key="github-1")
+            _InstrumentedAdapter.connect_error = None
+            rebound = _bind(runtime)
+            fresh = Agent(prompt="fresh", tool_sources=[rebound.tools()])
+            lookups = await fresh.get_tool_lookups()  # no cooldown wait
+            assert await lookups.fn["github__write"](value=1) == "write:ok"
+            await fresh.close()
+
+    @pytest.mark.asyncio
+    async def test_credential_rotation_rebind_resets_the_circuit(self) -> None:
+        rejected = _Credentials({"Authorization": "Bearer expired"})
+        _InstrumentedAdapter.connect_error = MCPAuthenticationError(
+            "Failed to connect to MCP source 'github': "
+            "the server rejected its credentials (HTTP 401)."
+        )
+        async with MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            stale = _bind(runtime, credentials=rejected, credential_identity="cred-1")
+            agent = Agent(prompt="test", tool_sources=[stale.tools()])
+            with pytest.raises(MCPAuthenticationError):
+                await agent.get_tool_lookups()
+            blocked = Agent(prompt="blocked", tool_sources=[stale.tools()])
+            with pytest.raises(MCPCircuitOpenError):
+                await blocked.get_tool_lookups()
+
+            # Rotating to new credentials is an explicit operator action; it
+            # earns an immediate retry instead of waiting out the cooldown.
+            _InstrumentedAdapter.connect_error = None
+            rotated = _Credentials({"Authorization": "Bearer rotated"})
+            fresh_handle = _bind(runtime, credentials=rotated, credential_identity="cred-2")
+            fresh = Agent(prompt="fresh", tool_sources=[fresh_handle.tools()])
+            await fresh.get_tool_lookups()
+            assert rotated.calls == 1
+            assert _InstrumentedAdapter.instances[-1].source.headers["Authorization"] == (
+                "Bearer rotated"
+            )
+            await fresh.close()
+
+    @pytest.mark.asyncio
+    async def test_a_same_configuration_rebind_does_not_reset_the_circuit(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            with pytest.raises(ConnectionError):
+                await agent.get_tool_lookups()
+
+            # Applications naturally rebind per request; an identical bind
+            # must not hand a reconnect storm a fresh circuit.
+            rebound = _bind(runtime)
+            blocked = Agent(prompt="blocked", tool_sources=[rebound.tools()])
+            with pytest.raises(MCPCircuitOpenError):
+                await blocked.get_tool_lookups()
+            assert _total_connects() == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_connection_attempts_do_not_count_as_failures(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.connect_gate = gate
+        async with MCPRuntime(
+            circuit_failure_threshold=1,
+            circuit_reset_timeout=30.0,
+            idle_timeout=0.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+            acquisition = asyncio.create_task(runtime._lease(connection))
+            await _wait_until(lambda: _total_connects() == 1)
+            acquisition.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await acquisition
+            # Idle retirement cancels the abandoned connect task; that
+            # cancellation is not a verdict about the server's health.
+            await _wait_until(lambda: runtime._entries == {})
+
+            gate.set()
+            # The threshold is 1: any counted failure would open the circuit.
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            assert await lookups.fn["github__write"](value=1) == "write:ok"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_process_exit_signals_do_not_count_as_connection_failures(self) -> None:
+        _InstrumentedAdapter.connect_error = SystemExit(3)
+        runtime = MCPRuntime(
+            circuit_failure_threshold=1,
+            circuit_reset_timeout=30.0,
+            shutdown_timeout=0.05,
+        )
+        connection = _bind(runtime)
+        entry = _ConnectionEntry(connection.source)
+        registration = runtime._registrations[(None, "github-1")]
+        entry.circuit = registration.circuit
+        runtime._entries[(None, "github-1")] = entry
+        runtime._bind_loop()
+
+        with pytest.raises(SystemExit):
+            await runtime._open_connection(
+                (None, "github-1"),
+                entry,
+                credentials=None,
+            )
+
+        assert registration.circuit.consecutive_failures == 0
+        assert registration.circuit.open_until is None
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_process_exit_signal_during_call_does_not_reset_loss_streak(self) -> None:
+        _InstrumentedAdapter.call_error = SystemExit(3)
+        async with MCPRuntime(
+            circuit_failure_threshold=2,
+            circuit_reset_timeout=30.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            circuit = runtime._registrations[(None, "github-1")].circuit
+            circuit.consecutive_failures = 1
+            circuit.connection_loss_failures = 1
+            circuit.last_failure = "connection loss"
+
+            with pytest.raises(SystemExit):
+                await lookups.fn["github__write"](value=1)
+
+            assert circuit.consecutive_failures == 1
+            assert circuit.connection_loss_failures == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_wins_over_an_open_circuit(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        runtime = MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        )
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+        with pytest.raises(ConnectionError):
+            await agent.get_tool_lookups()
+        await runtime.close()
+
+        blocked = Agent(prompt="blocked", tool_sources=[connection.tools()])
+        with pytest.raises(MCPRuntimeClosedError):
+            await blocked.get_tool_lookups()
+        assert runtime.state is MCPRuntimeState.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_the_circuit_can_be_disabled_entirely(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=None, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            for _ in range(6):
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                with pytest.raises(ConnectionError):
+                    await agent.get_tool_lookups()
+            assert _total_connects() == 6
+            assert runtime._entries == {}
+
+    def test_circuit_configuration_is_validated(self) -> None:
+        with pytest.raises(ValueError, match="circuit_failure_threshold"):
+            MCPRuntime(circuit_failure_threshold=0)
+        with pytest.raises(ValueError, match="circuit_failure_threshold"):
+            MCPRuntime(circuit_failure_threshold=True)
+        with pytest.raises(ValueError, match="circuit_reset_timeout"):
+            MCPRuntime(circuit_reset_timeout=0)
+        with pytest.raises(ValueError, match="circuit_reset_timeout"):
+            MCPRuntime(circuit_reset_timeout=-1.0)

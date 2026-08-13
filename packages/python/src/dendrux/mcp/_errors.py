@@ -145,6 +145,40 @@ class MCPConnectionLostError(MCPConnectionStateError):
     """
 
 
+class MCPCircuitOpenError(MCPConnectionStateError):
+    """The connection's circuit breaker is open after repeated failures.
+
+    Raised before anything is sent: new physical connections for this
+    identity are rejected until the cooldown elapses, so an unavailable
+    server is not hammered by a reconnect storm. ``retry_after`` is the
+    remaining cooldown in seconds and is safe to surface to end users.
+    After the cooldown one probe connection is attempted and concurrent
+    callers share its outcome. Evicting the identity, or rebinding it with
+    changed source configuration or ``credential_identity``, resets the
+    circuit immediately.
+    """
+
+    def __init__(
+        self,
+        identity: tuple[str | None, str],
+        *,
+        retry_after: float,
+        failure_count: int,
+        last_failure: str | None,
+    ) -> None:
+        self.retry_after = retry_after
+        self.failure_count = failure_count
+        self.last_failure = last_failure
+        detail = f" (last failure: {last_failure})" if last_failure else ""
+        super().__init__(
+            identity,
+            f"MCP connection {identity!r} circuit is open after {failure_count} "
+            f"consecutive connection failures{detail}. New connections are "
+            f"rejected for another {retry_after:.1f}s; evict, or rebind with changed "
+            "source configuration or credential_identity, to reset immediately.",
+        )
+
+
 class MCPCallCapacityError(MCPCapacityError):
     """No MCP tool-call slot became free within the wait budget.
 
