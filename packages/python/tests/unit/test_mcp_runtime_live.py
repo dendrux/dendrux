@@ -9,9 +9,10 @@ on Agent.close(), and drain-based runtime shutdown.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections import deque
 from collections.abc import Mapping
-from typing import Any, ClassVar
+from typing import Any, ClassVar, get_type_hints
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -33,6 +34,31 @@ from dendrux.mcp._errors import (
     MCPRuntimeClosedError,
     MCPStaleConnectionError,
     MCPToolCallError,
+)
+from dendrux.mcp._observability import (
+    MCPCallCapacityRejected,
+    MCPCircuitClosed,
+    MCPCircuitOpened,
+    MCPCircuitProbing,
+    MCPConnectionAborted,
+    MCPConnectionCapacityRejected,
+    MCPConnectionClosed,
+    MCPConnectionFailed,
+    MCPConnectionOpened,
+    MCPConnectionOpening,
+    MCPConnectionSnapshot,
+    MCPConnectionStatus,
+    MCPEvictionCompleted,
+    MCPEvictionStarted,
+    MCPRuntimeEvent,
+    MCPRuntimeShutdownCompleted,
+    MCPRuntimeShutdownStarted,
+    MCPRuntimeSnapshot,
+    MCPToolCallCancelled,
+    MCPToolCallCompleted,
+    MCPToolCallFailed,
+    MCPToolCallOutcomeUnknown,
+    MCPToolCallStarted,
 )
 from dendrux.mcp._runtime import (
     MCPConnection,
@@ -5163,3 +5189,823 @@ class TestCircuitBreaker:
             MCPRuntime(circuit_reset_timeout=0)
         with pytest.raises(ValueError, match="circuit_reset_timeout"):
             MCPRuntime(circuit_reset_timeout=-1.0)
+
+
+class _RecordingObserver:
+    """Collects every runtime event; optionally raises to prove isolation."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.events: list[MCPRuntimeEvent] = []
+        self.error = error
+
+    def on_event(self, event: MCPRuntimeEvent) -> None:
+        self.events.append(event)
+        if self.error is not None:
+            raise self.error
+
+    def of(self, event_type: type) -> list[Any]:
+        return [event for event in self.events if isinstance(event, event_type)]
+
+    def kinds(self) -> list[type]:
+        return [type(event) for event in self.events]
+
+
+def _event_text(events: list[MCPRuntimeEvent]) -> str:
+    """Every field value an exporter would read off the events."""
+    return "\n".join(str(value) for event in events for value in dataclasses.asdict(event).values())
+
+
+class TestRuntimeSnapshot:
+    """runtime.snapshot() is an immutable point-in-time operational view.
+
+    The runtime-level equivalent of connection-pool metrics: which
+    connections exist and in what state, how many calls are running or
+    queueing, and which circuits are open. No persistence, no I/O.
+    """
+
+    def test_an_unused_runtime_reports_an_empty_snapshot(self) -> None:
+        runtime = MCPRuntime()
+
+        snapshot = runtime.snapshot()
+
+        assert snapshot.state is MCPRuntimeState.OPEN
+        assert snapshot.connections == ()
+        assert snapshot.in_flight_calls == 0
+        assert snapshot.connection_waiters == 0
+        assert snapshot.call_waiters == 0
+        assert snapshot.open_circuits == ()
+
+    @pytest.mark.asyncio
+    async def test_a_live_connection_reports_status_and_leases(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, tenant_key="tenant-a")
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+
+            snapshot = runtime.snapshot()
+            assert len(snapshot.connections) == 1
+            live = snapshot.connections[0]
+            assert live.tenant_key == "tenant-a"
+            assert live.connection_key == "github-1"
+            assert live.source_name == "github"
+            assert live.status is MCPConnectionStatus.ACTIVE
+            assert live.status == "active"
+            assert live.leases == 1
+            assert live.active_calls == 0
+
+            await agent.close()
+            idle = runtime.snapshot().connections[0]
+            assert idle.status == "idle"
+            assert idle.leases == 0
+
+    @pytest.mark.asyncio
+    async def test_a_connecting_entry_is_reported_before_establishment(self) -> None:
+        gate = asyncio.Event()
+        _InstrumentedAdapter.connect_gate = gate
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            acquisition = asyncio.create_task(agent.get_tool_lookups())
+            await _wait_until(lambda: runtime._entries != {})
+
+            connecting = runtime.snapshot().connections[0]
+            assert connecting.status == "connecting"
+            assert connecting.leases == 1
+
+            gate.set()
+            await acquisition
+            assert runtime.snapshot().connections[0].status == "active"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_and_queued_calls_are_counted(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        async with MCPRuntime(
+            max_in_flight_calls=1, call_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            adapter = _InstrumentedAdapter.instances[0]
+
+            first = asyncio.create_task(lookups.fn["github__write"](value="first"))
+            second = asyncio.create_task(lookups.fn["github__read"](value="second"))
+            await _await_first_call(adapter)
+            await _wait_until(lambda: len(runtime._call_queue) == 1)
+
+            snapshot = runtime.snapshot()
+            assert snapshot.in_flight_calls == 1
+            assert snapshot.call_waiters == 1
+            assert snapshot.connections[0].active_calls == 1
+            assert snapshot.connections[0].status == "active"
+
+            _InstrumentedAdapter.call_gate.set()
+            await asyncio.gather(first, second)
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_callers_waiting_for_connection_capacity_are_counted(self) -> None:
+        async with MCPRuntime(
+            max_connections=1, connection_wait_timeout=5.0, shutdown_timeout=0.05
+        ) as runtime:
+            holder = _bind(runtime, tenant_key="tenant-a")
+            holding_agent = Agent(prompt="hold", tool_sources=[holder.tools()])
+            await holding_agent.get_tool_lookups()
+
+            waiting = _bind(runtime, tenant_key="tenant-b")
+            waiting_agent = Agent(prompt="wait", tool_sources=[waiting.tools()])
+            acquisition = asyncio.create_task(waiting_agent.get_tool_lookups())
+            await _wait_until(lambda: runtime._admissions != {})
+
+            assert runtime.snapshot().connection_waiters == 1
+
+            await holding_agent.close()  # frees the slot via pressure retirement
+            await acquisition
+            assert runtime.snapshot().connection_waiters == 0
+            await waiting_agent.close()
+
+    @pytest.mark.asyncio
+    async def test_open_circuits_are_listed_with_retry_after(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            broken = _bind(runtime, tenant_key="tenant-a")
+            failing = Agent(prompt="fail", tool_sources=[broken.tools()])
+            with pytest.raises(ConnectionError):
+                await failing.get_tool_lookups()
+
+            _InstrumentedAdapter.connect_error = None
+            healthy = _bind(runtime, tenant_key="tenant-b")
+            healthy_agent = Agent(prompt="ok", tool_sources=[healthy.tools()])
+            await healthy_agent.get_tool_lookups()
+
+            snapshot = runtime.snapshot()
+            assert len(snapshot.open_circuits) == 1
+            circuit = snapshot.open_circuits[0]
+            assert circuit.tenant_key == "tenant-a"
+            assert circuit.connection_key == "github-1"
+            assert circuit.source_name == "github"
+            assert circuit.failure_count == 1
+            assert circuit.last_failure == "ConnectionError"
+            assert 0 < circuit.retry_after <= 30.0
+            await healthy_agent.close()
+
+    @pytest.mark.asyncio
+    async def test_snapshots_are_immutable(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        async with MCPRuntime(
+            circuit_failure_threshold=1, circuit_reset_timeout=30.0, shutdown_timeout=0.05
+        ) as runtime:
+            broken = _bind(runtime, tenant_key="tenant-a")
+            failing = Agent(prompt="fail", tool_sources=[broken.tools()])
+            with pytest.raises(ConnectionError):
+                await failing.get_tool_lookups()
+            _InstrumentedAdapter.connect_error = None
+            live = _bind(runtime, tenant_key="tenant-b")
+            agent = Agent(prompt="ok", tool_sources=[live.tools()])
+            await agent.get_tool_lookups()
+
+            snapshot = runtime.snapshot()
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                snapshot.in_flight_calls = 99  # type: ignore[misc]
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                snapshot.connections[0].leases = 99  # type: ignore[misc]
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                snapshot.open_circuits[0].retry_after = 0.0  # type: ignore[misc]
+            await agent.close()
+
+
+class TestRuntimeObserver:
+    """Optional lifecycle events for connecting external monitoring.
+
+    Typed, immutable, value-free events delivered synchronously outside
+    every runtime lock. Observer failures are swallowed and logged without
+    detail: telemetry can never break MCP work.
+    """
+
+    @pytest.mark.asyncio
+    async def test_connection_lifecycle_events_are_emitted(self) -> None:
+        observer = _RecordingObserver()
+        async with MCPRuntime(
+            observer=observer, idle_timeout=0.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime, tenant_key="tenant-a")
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+            await _wait_until(lambda: runtime._entries == {})
+
+        kinds = observer.kinds()
+        assert kinds.index(MCPConnectionOpening) < kinds.index(MCPConnectionOpened)
+        assert kinds.index(MCPConnectionOpened) < kinds.index(MCPConnectionClosed)
+        opened = observer.of(MCPConnectionOpened)[0]
+        assert opened.tenant_key == "tenant-a"
+        assert opened.connection_key == "github-1"
+        assert opened.source_name == "github"
+        assert opened.tool_count == 2
+        assert observer.of(MCPConnectionClosed)[0].reason == "idle"
+
+    @pytest.mark.asyncio
+    async def test_connection_failures_emit_value_free_causes(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("secret detail in transport text")
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            with pytest.raises(ConnectionError):
+                await agent.get_tool_lookups()
+
+        failed = observer.of(MCPConnectionFailed)[0]
+        assert failed.cause == "ConnectionError"
+        assert "secret detail" not in _event_text(observer.events)
+
+    @pytest.mark.asyncio
+    async def test_circuit_lifecycle_events_are_emitted(self) -> None:
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        observer = _RecordingObserver()
+        async with MCPRuntime(
+            observer=observer,
+            circuit_failure_threshold=1,
+            circuit_reset_timeout=0.05,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+            failing = Agent(prompt="fail", tool_sources=[connection.tools()])
+            with pytest.raises(ConnectionError):
+                await failing.get_tool_lookups()
+
+            opened = observer.of(MCPCircuitOpened)[0]
+            assert opened.failure_count == 1
+            assert opened.last_failure == "ConnectionError"
+            assert opened.reset_timeout == 0.05
+
+            await asyncio.sleep(0.1)
+            _InstrumentedAdapter.connect_error = None
+            probe = Agent(prompt="probe", tool_sources=[connection.tools()])
+            await probe.get_tool_lookups()
+
+            kinds = observer.kinds()
+            assert kinds.index(MCPCircuitOpened) < kinds.index(MCPCircuitProbing)
+            assert kinds.index(MCPCircuitProbing) < kinds.index(MCPCircuitClosed)
+            assert len(observer.of(MCPCircuitClosed)) == 1
+            await probe.close()
+
+    @pytest.mark.asyncio
+    async def test_eviction_events_are_emitted(self) -> None:
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+
+            await runtime.evict(connection_key="github-1")
+
+            started = observer.of(MCPEvictionStarted)[0]
+            assert started.mode == "drain"
+            assert started.connection_key == "github-1"
+            assert observer.of(MCPEvictionCompleted)[0].forced is False
+            assert observer.of(MCPConnectionClosed)[0].reason == "evicted"
+            kinds = observer.kinds()
+            assert kinds.index(MCPEvictionStarted) < kinds.index(MCPConnectionClosed)
+            assert kinds.index(MCPConnectionClosed) < kinds.index(MCPEvictionCompleted)
+
+    @pytest.mark.asyncio
+    async def test_forced_eviction_reports_forced_completion(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            call = asyncio.create_task(lookups.fn["github__write"](value="running"))
+            await _await_first_call(_InstrumentedAdapter.instances[0])
+
+            await runtime.evict(connection_key="github-1", mode="force")
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await call
+            assert observer.of(MCPEvictionCompleted)[0].forced is True
+            unknown = observer.of(MCPToolCallOutcomeUnknown)[0]
+            assert unknown.tool == "github__write"
+            assert unknown.reason == "forced"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_tool_call_events_are_emitted(self) -> None:
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            assert await lookups.fn["github__read"](value=1) == "read:ok"
+            started = observer.of(MCPToolCallStarted)[0]
+            assert started.tool == "github__read"
+            completed = observer.of(MCPToolCallCompleted)[0]
+            assert completed.tool == "github__read"
+            assert completed.duration >= 0.0
+
+            _InstrumentedAdapter.call_error = RuntimeError("boom with detail")
+            with pytest.raises(MCPToolCallError):
+                await lookups.fn["github__write"](value=2)
+            failed = observer.of(MCPToolCallFailed)[0]
+            assert failed.tool == "github__write"
+            assert failed.cause == "MCPToolCallError"
+            assert failed.duration >= 0.0
+            assert "boom with detail" not in _event_text(observer.events)
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_transport_loss_emits_outcome_unknown_and_broken_close(self) -> None:
+        _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+            await _wait_until(lambda: runtime._entries == {})
+
+            unknown = observer.of(MCPToolCallOutcomeUnknown)[0]
+            assert unknown.tool == "github__write"
+            assert unknown.reason == "connection_lost"
+            assert observer.of(MCPConnectionClosed)[0].reason == "broken"
+            assert "socket died" not in _event_text(observer.events)
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_call_capacity_rejections_are_emitted(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        observer = _RecordingObserver()
+        async with MCPRuntime(
+            observer=observer,
+            max_in_flight_calls=1,
+            call_wait_timeout=0.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            running = asyncio.create_task(lookups.fn["github__write"](value="running"))
+            await _await_first_call(_InstrumentedAdapter.instances[0])
+
+            with pytest.raises(MCPCallCapacityError):
+                await lookups.fn["github__read"](value="shed")
+
+            rejected = observer.of(MCPCallCapacityRejected)[0]
+            assert rejected.tool == "github__read"
+            assert rejected.limit == 1
+            _InstrumentedAdapter.call_gate.set()
+            await running
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_connection_capacity_rejections_are_emitted(self) -> None:
+        observer = _RecordingObserver()
+        async with MCPRuntime(
+            observer=observer,
+            max_connections=1,
+            connection_wait_timeout=0.0,
+            shutdown_timeout=0.05,
+        ) as runtime:
+            holder = _bind(runtime, tenant_key="tenant-a")
+            holding_agent = Agent(prompt="hold", tool_sources=[holder.tools()])
+            await holding_agent.get_tool_lookups()
+
+            waiting = _bind(runtime, tenant_key="tenant-b")
+            waiting_agent = Agent(prompt="wait", tool_sources=[waiting.tools()])
+            with pytest.raises(MCPConnectionCapacityError):
+                await waiting_agent.get_tool_lookups()
+
+            rejected = observer.of(MCPConnectionCapacityRejected)[0]
+            assert rejected.tenant_key == "tenant-b"
+            assert rejected.limit == 1
+            await holding_agent.close()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_events_are_emitted(self) -> None:
+        observer = _RecordingObserver()
+        runtime = MCPRuntime(observer=observer, shutdown_timeout=0.05)
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+
+        await runtime.close()
+
+        assert observer.of(MCPRuntimeShutdownStarted) != []
+        completed = observer.of(MCPRuntimeShutdownCompleted)[0]
+        assert completed.forced is False
+        assert observer.events[-1] is completed
+        assert observer.of(MCPConnectionClosed)[0].reason == "shutdown"
+
+    @pytest.mark.asyncio
+    async def test_observer_failures_never_break_mcp_work(self, caplog: Any) -> None:
+        observer = _RecordingObserver(error=RuntimeError("observer secret text"))
+        with caplog.at_level("WARNING"):
+            async with MCPRuntime(
+                observer=observer, idle_timeout=0.0, shutdown_timeout=0.05
+            ) as runtime:
+                connection = _bind(runtime)
+                agent = Agent(prompt="test", tool_sources=[connection.tools()])
+                lookups = await agent.get_tool_lookups()
+                assert await lookups.fn["github__read"](value=1) == "read:ok"
+                await agent.close()
+                await _wait_until(lambda: runtime._entries == {})
+
+        assert len(observer.events) >= 4  # every event was still delivered
+        assert "observer secret text" not in caplog.text
+        assert any("observer" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_callbacks_run_outside_the_runtime_lock(self) -> None:
+        class _LockProbingObserver:
+            """Records a violation if an event arrives under the runtime lock."""
+
+            def __init__(self) -> None:
+                self.runtime: MCPRuntime | None = None
+                self.violations: list[str] = []
+                self.snapshots = 0
+
+            def on_event(self, event: MCPRuntimeEvent) -> None:
+                runtime = self.runtime
+                assert runtime is not None
+                if runtime._lock.acquire(blocking=False):
+                    runtime._lock.release()
+                else:
+                    self.violations.append(type(event).__name__)
+                    return
+                runtime.snapshot()  # re-entrancy: snapshot() from a callback
+                self.snapshots += 1
+
+        observer = _LockProbingObserver()
+        runtime = MCPRuntime(
+            observer=observer,
+            circuit_failure_threshold=1,
+            circuit_reset_timeout=0.05,
+            shutdown_timeout=0.05,
+        )
+        observer.runtime = runtime
+        connection = _bind(runtime)
+
+        _InstrumentedAdapter.connect_error = ConnectionError("server down")
+        failing = Agent(prompt="fail", tool_sources=[connection.tools()])
+        with pytest.raises(ConnectionError):
+            await failing.get_tool_lookups()
+        await asyncio.sleep(0.1)
+
+        _InstrumentedAdapter.connect_error = None
+        agent = Agent(prompt="probe", tool_sources=[connection.tools()])
+        lookups = await agent.get_tool_lookups()
+        assert await lookups.fn["github__read"](value=1) == "read:ok"
+        await agent.close()
+        await runtime.evict(connection_key="github-1")
+        await runtime.close()
+
+        assert observer.violations == []
+        assert observer.snapshots >= 8
+
+    @pytest.mark.asyncio
+    async def test_events_never_carry_credentials(self) -> None:
+        provider = _Credentials()  # resolves "Bearer must-not-leak"
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime, credentials=provider)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            _InstrumentedAdapter.call_error = ConnectionResetError(
+                "peer reset during Authorization: Bearer must-not-leak"
+            )
+            with pytest.raises(MCPOutcomeUnknownError):
+                await lookups.fn["github__write"](value=1)
+            await _wait_until(lambda: runtime._entries == {})
+            await agent.close()
+
+        assert observer.events != []
+        assert "must-not-leak" not in _event_text(observer.events)
+
+    def test_the_observer_is_validated_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="observer"):
+            MCPRuntime(observer=object())  # type: ignore[arg-type]
+
+        assert MCPRuntime(observer=None) is not None
+        assert MCPRuntime(observer=_RecordingObserver()) is not None
+
+
+class TestObservabilityHardening:
+    """Review hardening for the observability slice.
+
+    Exact start/terminal event pairing, physical-instance correlation
+    across reconnects, honest close and gauge semantics, Agent-visible
+    canonical tool names, runtime-resolvable annotations, and strict
+    observer validation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_application_cancellation_emits_a_terminal_call_event(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            call = asyncio.create_task(lookups.fn["github__write"](value=1))
+            await _await_first_call(_InstrumentedAdapter.instances[0])
+
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+
+            cancelled = observer.of(MCPToolCallCancelled)[0]
+            assert cancelled.tool == "github__write"
+            assert cancelled.duration >= 0.0
+            # Exactly one terminal event per started call.
+            terminals = (
+                observer.of(MCPToolCallCompleted)
+                + observer.of(MCPToolCallFailed)
+                + observer.of(MCPToolCallOutcomeUnknown)
+                + observer.of(MCPToolCallCancelled)
+            )
+            assert len(observer.of(MCPToolCallStarted)) == len(terminals) == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_establishment_emits_a_terminal_connection_event(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        observer = _RecordingObserver()
+        runtime = MCPRuntime(observer=observer, shutdown_timeout=0.05)
+        connection = _bind(runtime)
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+        acquisition = asyncio.create_task(agent.get_tool_lookups())
+        await _wait_until(lambda: runtime._entries != {})
+
+        await runtime.close()
+        await asyncio.gather(acquisition, return_exceptions=True)
+
+        assert len(observer.of(MCPConnectionOpening)) == 1
+        aborted = observer.of(MCPConnectionAborted)
+        assert len(aborted) == 1
+        assert observer.of(MCPConnectionOpened) == []
+        assert observer.of(MCPConnectionFailed) == []
+        opening = observer.of(MCPConnectionOpening)[0]
+        assert aborted[0].instance_id == opening.instance_id
+
+    @pytest.mark.asyncio
+    async def test_events_carry_the_physical_connection_instance(self) -> None:
+        observer = _RecordingObserver()
+        async with MCPRuntime(
+            observer=observer, idle_timeout=0.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+
+            first = Agent(prompt="first", tool_sources=[connection.tools()])
+            first_tools = await first.get_tool_lookups()
+            await first_tools.fn["github__read"](value=1)
+            await first.close()
+            await _wait_until(lambda: runtime._entries == {})
+
+            second = Agent(prompt="second", tool_sources=[connection.tools()])
+            second_tools = await second.get_tool_lookups()
+            await second_tools.fn["github__read"](value=2)
+
+            opened = observer.of(MCPConnectionOpened)
+            assert len(opened) == 2
+            assert opened[0].instance_id < opened[1].instance_id
+
+            closed = observer.of(MCPConnectionClosed)
+            assert closed[0].instance_id == opened[0].instance_id
+            assert closed[0].clean is True
+
+            started = observer.of(MCPToolCallStarted)
+            assert started[0].instance_id == opened[0].instance_id
+            assert started[1].instance_id == opened[1].instance_id
+
+            live = runtime.snapshot().connections[0]
+            assert live.instance_id == opened[1].instance_id
+            await second.close()
+
+    @pytest.mark.asyncio
+    async def test_unclean_transport_close_is_reported(self) -> None:
+        _InstrumentedAdapter.close_error = RuntimeError("close failed with detail")
+        observer = _RecordingObserver()
+        async with MCPRuntime(
+            observer=observer, idle_timeout=0.0, shutdown_timeout=0.05
+        ) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+            await _wait_until(lambda: runtime._entries == {})
+
+            closed = observer.of(MCPConnectionClosed)[0]
+            assert closed.reason == "idle"
+            assert closed.clean is False
+            assert "close failed" not in _event_text(observer.events)
+
+    @pytest.mark.asyncio
+    async def test_tool_call_events_use_agent_visible_names(self) -> None:
+        _InstrumentedAdapter.tools = [_tool("read.file", read_only=True)]
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            assert await lookups.fn["github__read_file"](value=1) == "read.file:ok"
+
+            assert observer.of(MCPToolCallStarted)[0].tool == "github__read_file"
+            assert observer.of(MCPToolCallCompleted)[0].tool == "github__read_file"
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_detached_calls_are_tracked_until_the_transport_exits(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        _InstrumentedAdapter.suppress_call_cancel = True
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            call = asyncio.create_task(lookups.fn["github__write"](value="hostile"))
+            await _await_first_call(_InstrumentedAdapter.instances[0])
+
+            await runtime.evict(connection_key="github-1", mode="force")
+
+            try:
+                # The permit was reclaimed but the transport operation lives on.
+                snapshot = runtime.snapshot()
+                assert snapshot.in_flight_calls == 0
+                assert snapshot.detached_calls == 1
+            finally:
+                # Always free the hostile call, or a failing assertion would
+                # leave it swallowing cancellation and hang pytest teardown.
+                _InstrumentedAdapter.call_gate.set()
+            with pytest.raises(MCPOutcomeUnknownError):
+                await call
+            assert runtime.snapshot().detached_calls == 0
+            await agent.close()
+
+    def test_snapshot_type_hints_resolve_at_runtime(self) -> None:
+        hints = get_type_hints(MCPRuntimeSnapshot)
+        assert hints["state"] is MCPRuntimeState
+        assert get_type_hints(MCPConnectionSnapshot)["status"] is MCPConnectionStatus
+        assert get_type_hints(MCPToolCallCompleted)["duration"] is float
+
+    def test_unusable_observers_are_rejected(self) -> None:
+        class _NotCallable:
+            on_event = 1
+
+        class _AsyncObserver:
+            async def on_event(self, event: MCPRuntimeEvent) -> None:
+                return None
+
+        class _AsyncCallback:
+            async def __call__(self, event: MCPRuntimeEvent) -> None:
+                return None
+
+        class _WrappedAsyncObserver:
+            on_event = _AsyncCallback()
+
+        with pytest.raises(ValueError, match="observer"):
+            MCPRuntime(observer=_NotCallable())  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="synchronous"):
+            MCPRuntime(observer=_AsyncObserver())
+        with pytest.raises(ValueError, match="synchronous"):
+            MCPRuntime(observer=_WrappedAsyncObserver())
+
+    @pytest.mark.asyncio
+    async def test_observer_base_exceptions_never_break_mcp_work(self) -> None:
+        class _CancellingObserver:
+            def on_event(self, event: MCPRuntimeEvent) -> None:
+                raise asyncio.CancelledError
+
+        async with MCPRuntime(observer=_CancellingObserver(), shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            assert await lookups.fn["github__read"](value=1) == "read:ok"
+            await agent.close()
+
+        assert runtime.snapshot().connections == ()
+        assert runtime.snapshot().in_flight_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_observer_returning_an_awaitable_is_safely_rejected(self) -> None:
+        class _ReturningAwaitableObserver:
+            def __init__(self) -> None:
+                self.returned: list[Any] = []
+
+            async def _handle(self, event: MCPRuntimeEvent) -> None:
+                return None
+
+            def on_event(self, event: MCPRuntimeEvent) -> Any:
+                result = self._handle(event)
+                self.returned.append(result)
+                return result
+
+        observer = _ReturningAwaitableObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+
+            assert await lookups.fn["github__read"](value=1) == "read:ok"
+            await agent.close()
+
+        assert observer.returned
+        assert all(result.cr_frame is None for result in observer.returned)
+
+    @pytest.mark.asyncio
+    async def test_resistant_establishment_is_terminal_before_shutdown_completes(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        _InstrumentedAdapter.suppress_cancel = True
+        observer = _RecordingObserver()
+        runtime = MCPRuntime(observer=observer, shutdown_timeout=0.01)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        acquisition = asyncio.create_task(agent.get_tool_lookups())
+        await _wait_until(lambda: observer.of(MCPConnectionOpening) != [])
+
+        await runtime.close()
+
+        kinds = observer.kinds()
+        assert len(observer.of(MCPConnectionAborted)) == 1
+        assert kinds.index(MCPConnectionAborted) < kinds.index(MCPRuntimeShutdownCompleted)
+        _InstrumentedAdapter.connect_gate.set()
+        await asyncio.gather(acquisition, return_exceptions=True)
+        assert len(observer.of(MCPConnectionAborted)) == 1
+
+    @pytest.mark.asyncio
+    async def test_resistant_close_is_terminal_before_shutdown_completes(self) -> None:
+        observer = _RecordingObserver()
+        runtime = MCPRuntime(observer=observer, idle_timeout=None, shutdown_timeout=0.01)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+        _InstrumentedAdapter.close_gate = asyncio.Event()
+
+        await runtime.close()
+
+        kinds = observer.kinds()
+        closed = observer.of(MCPConnectionClosed)
+        assert len(closed) == 1
+        assert closed[0].clean is False
+        assert kinds.index(MCPConnectionClosed) < kinds.index(MCPRuntimeShutdownCompleted)
+        _InstrumentedAdapter.close_gate.set()
+        await _wait_until(lambda: _InstrumentedAdapter.instances[0].closed)
+        assert len(observer.of(MCPConnectionClosed)) == 1
+
+    @pytest.mark.asyncio
+    async def test_resistant_call_is_terminal_when_forced_capacity_is_reclaimed(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        _InstrumentedAdapter.suppress_call_cancel = True
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+            lookups = await agent.get_tool_lookups()
+            call = asyncio.create_task(lookups.fn["github__write"](value="hostile"))
+            await _await_first_call(_InstrumentedAdapter.instances[0])
+
+            await runtime.evict(connection_key="github-1", mode="force")
+
+            try:
+                assert len(observer.of(MCPToolCallOutcomeUnknown)) == 1
+                assert observer.kinds().index(MCPToolCallOutcomeUnknown) < observer.kinds().index(
+                    MCPEvictionCompleted
+                )
+            finally:
+                _InstrumentedAdapter.call_gate.set()
+            with pytest.raises(MCPOutcomeUnknownError):
+                await call
+            assert len(observer.of(MCPToolCallOutcomeUnknown)) == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_live_rebind_keeps_physical_source_name_stable(self) -> None:
+        observer = _RecordingObserver()
+        async with MCPRuntime(observer=observer, shutdown_timeout=0.05) as runtime:
+            first_connection = _bind(runtime)
+            first = Agent(prompt="first", tool_sources=[first_connection.tools()])
+            await first.get_tool_lookups()
+
+            renamed = runtime.bind(
+                connection_key="github-1",
+                source=MCPSource.http("github_alias", "https://mcp.example.com"),
+            )
+            second = Agent(prompt="second", tool_sources=[renamed.tools()])
+            lookups = await second.get_tool_lookups()
+            assert await lookups.fn["github_alias__read"](value=1) == "read:ok"
+
+            opened = observer.of(MCPConnectionOpened)[0]
+            started = observer.of(MCPToolCallStarted)[0]
+            completed = observer.of(MCPToolCallCompleted)[0]
+            assert started.instance_id == completed.instance_id == opened.instance_id
+            assert started.source_name == completed.source_name == opened.source_name == "github"
+            await second.close()
+            await first.close()

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import math
 import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from enum import StrEnum
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -29,7 +29,40 @@ from dendrux.mcp._errors import (
     MCPStaleConnectionError,
     MCPToolCallError,
 )
-from dendrux.mcp._server import MCPServer, build_mcp_tool_defs, create_mcp_executor
+from dendrux.mcp._observability import (
+    MCPCallCapacityRejected,
+    MCPCircuitClosed,
+    MCPCircuitOpened,
+    MCPCircuitProbing,
+    MCPConnectionAborted,
+    MCPConnectionCapacityRejected,
+    MCPConnectionClosed,
+    MCPConnectionFailed,
+    MCPConnectionOpened,
+    MCPConnectionOpening,
+    MCPConnectionSnapshot,
+    MCPConnectionStatus,
+    MCPEvictionCompleted,
+    MCPEvictionStarted,
+    MCPOpenCircuitSnapshot,
+    MCPRuntimeEvent,
+    MCPRuntimeObserver,
+    MCPRuntimeShutdownCompleted,
+    MCPRuntimeShutdownStarted,
+    MCPRuntimeSnapshot,
+    MCPRuntimeState,
+    MCPToolCallCancelled,
+    MCPToolCallCompleted,
+    MCPToolCallFailed,
+    MCPToolCallOutcomeUnknown,
+    MCPToolCallStarted,
+)
+from dendrux.mcp._server import (
+    MCPServer,
+    _sanitize_tool_name,
+    build_mcp_tool_defs,
+    create_mcp_executor,
+)
 from dendrux.mcp._source import (
     MCPSource,
     safe_source_exception_detail,
@@ -52,14 +85,6 @@ _FORCED_CANCEL_GRACE = 0.05
 
 MCPEvictionMode = Literal["drain", "force"]
 _CallInterruption = Literal["forced", "connection_lost"]
-
-
-class MCPRuntimeState(StrEnum):
-    """Application-owned managed runtime lifecycle state."""
-
-    OPEN = "open"
-    DRAINING = "draining"
-    CLOSED = "closed"
 
 
 @runtime_checkable
@@ -392,7 +417,66 @@ class _ViewToolSource(MCPServer):
             max_result_bytes=self.source.max_result_bytes,
         )
         connection = self._view.connection
-        qualified_name = f"{self.name}__{mcp_tool_name}"
+        # The Agent-visible canonical name: same sanitization as discovery,
+        # so telemetry and error messages match what the model actually calls.
+        qualified_name = f"{self.name}__{_sanitize_tool_name(mcp_tool_name)}"
+        tenant_key, connection_key = connection.identity
+        # Physical telemetry is pinned to the source that opened the entry.
+        # A live rebind may change only the presentation name used as the next
+        # view's default namespace; it must not rename an existing socket.
+        source_name = entry.source.name
+        instance_id = entry.instance_id
+
+        def _started_event() -> MCPToolCallStarted:
+            return MCPToolCallStarted(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+            )
+
+        def _completed_event(duration: float) -> MCPToolCallCompleted:
+            return MCPToolCallCompleted(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+            )
+
+        def _failed_event(duration: float, cause: str) -> MCPToolCallFailed:
+            return MCPToolCallFailed(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+                cause=cause,
+            )
+
+        def _unknown_event(duration: float, reason: _CallInterruption) -> MCPToolCallOutcomeUnknown:
+            return MCPToolCallOutcomeUnknown(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+                reason=reason,
+            )
+
+        def _cancelled_event(duration: float) -> MCPToolCallCancelled:
+            return MCPToolCallCancelled(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+            )
 
         def unknown_outcome(reason: _CallInterruption) -> MCPOutcomeUnknownError:
             if reason == "connection_lost":
@@ -416,33 +500,61 @@ class _ViewToolSource(MCPServer):
                 )
 
         async def guarded_executor(**params: Any) -> Any:
-            permit = await connection.runtime._begin_call(
-                connection.identity,
-                entry,
-                generation=connection.generation,
-                tool=qualified_name,
-                owner=self._call_owner,
-                # Re-checked on every wake, so one message covers both a stale
-                # executor and an Agent that closed while its call was queued.
-                check_lease=check_lease,
-            )
+            try:
+                permit = await connection.runtime._begin_call(
+                    connection.identity,
+                    entry,
+                    generation=connection.generation,
+                    tool=qualified_name,
+                    owner=self._call_owner,
+                    # Re-checked on every wake, so one message covers both a stale
+                    # executor and an Agent that closed while its call was queued.
+                    check_lease=check_lease,
+                )
+            except MCPCallCapacityError:
+                connection.runtime._emit(
+                    MCPCallCapacityRejected(
+                        tenant_key=tenant_key,
+                        connection_key=connection_key,
+                        source_name=source_name,
+                        tool=qualified_name,
+                        limit=connection.runtime.max_in_flight_calls,
+                    )
+                )
+                raise
+            loop = asyncio.get_running_loop()
+            started_at = loop.time()
+            permit.started_at = started_at
+            connection.runtime._emit(_started_event())
             try:
                 result = await executor(**params)
             except asyncio.CancelledError as exc:
                 interruption = permit.interruption
                 if interruption is None:
+                    # Purely application-issued cancellation: the runtime did
+                    # not interrupt this call, but the started operation still
+                    # needs its one terminal event.
+                    connection.runtime._emit_call_terminal(
+                        permit, _cancelled_event(loop.time() - started_at)
+                    )
                     raise
                 # Absorb only the cancellation issued by MCPRuntime. If the
                 # application also cancelled this Agent task, its independent
                 # request remains and cancellation must keep propagating.
                 remaining = permit.task.uncancel()
                 permit.interruption = None
+                connection.runtime._emit_call_terminal(
+                    permit, _unknown_event(loop.time() - started_at, interruption)
+                )
                 if remaining:
                     raise
                 raise unknown_outcome(interruption) from exc
             except BaseException as exc:
                 interruption = permit.interruption
                 if interruption is not None or entry.force_evicted:
+                    connection.runtime._emit_call_terminal(
+                        permit, _unknown_event(loop.time() - started_at, interruption or "forced")
+                    )
                     if interruption is not None:
                         remaining = permit.task.uncancel()
                         permit.interruption = None
@@ -462,6 +574,9 @@ class _ViewToolSource(MCPServer):
                         entry,
                         reporting_permit=permit,
                     )
+                    connection.runtime._emit_call_terminal(
+                        permit, _unknown_event(loop.time() - started_at, "connection_lost")
+                    )
                     raise unknown_outcome("connection_lost") from exc
                 if isinstance(exc, Exception):
                     # Any ordinary tool failure arrived over a functioning
@@ -471,6 +586,15 @@ class _ViewToolSource(MCPServer):
                         connection.identity,
                         entry,
                     )
+                    connection.runtime._emit_call_terminal(
+                        permit, _failed_event(loop.time() - started_at, type(exc).__name__)
+                    )
+                else:
+                    # SystemExit or KeyboardInterrupt unwound the call: no
+                    # server verdict, but the start still gets its terminal.
+                    connection.runtime._emit_call_terminal(
+                        permit, _cancelled_event(loop.time() - started_at)
+                    )
                 raise
             else:
                 interruption = permit.interruption
@@ -478,6 +602,11 @@ class _ViewToolSource(MCPServer):
                     remaining = permit.task.uncancel()
                     permit.interruption = None
                     if remaining:
+                        # The server answered — record that truth before the
+                        # application's own cancellation takes over.
+                        connection.runtime._emit_call_terminal(
+                            permit, _completed_event(loop.time() - started_at)
+                        )
                         raise asyncio.CancelledError
                     # A normal return is a definitive server response. Forced
                     # teardown prevents future work; it does not make this
@@ -485,6 +614,9 @@ class _ViewToolSource(MCPServer):
                 connection.runtime._record_healthy_tool_response(
                     connection.identity,
                     entry,
+                )
+                connection.runtime._emit_call_terminal(
+                    permit, _completed_event(loop.time() - started_at)
                 )
                 return result
             finally:
@@ -525,13 +657,16 @@ class _ConnectionEntry:
         "broken",
         "call_permits",
         "circuit",
+        "close_terminal_emitted",
         "close_started",
         "fenced",
         "force_evicted",
         "idle_handle",
         "idle_seq",
         "info",
+        "instance_id",
         "leases",
+        "opening_terminal_emitted",
         "raw_tools",
         "retire_task",
         "source",
@@ -556,10 +691,15 @@ class _ConnectionEntry:
         self.force_evicted = False
         self.broken = False
         self.close_started = False
+        self.opening_terminal_emitted = False
+        self.close_terminal_emitted = False
         # The circuit of the registration this entry was opened under. Held
         # directly so a failure recorded by a slow attempt lands on the
         # circuit that admitted it, never on one a later rebind reset.
         self.circuit: _CircuitState | None = None
+        # Runtime-wide monotonic id of this exact physical connection, so
+        # telemetry can tell overlapping lifetimes of one identity apart.
+        self.instance_id = 0
         # Idle retirement: a pending timer, then the task closing this exact
         # physical entry. Both are scoped to this entry so a stale callback can
         # never touch a replacement connection.
@@ -574,14 +714,39 @@ class _ConnectionEntry:
 class _CallPermit:
     """Exact-once ownership of one admitted runtime-wide call slot."""
 
-    __slots__ = ("entry", "interruption", "release_event", "released", "task")
+    __slots__ = (
+        "detached",
+        "entry",
+        "identity",
+        "interruption",
+        "release_event",
+        "released",
+        "started_at",
+        "task",
+        "terminal_emitted",
+        "tool",
+    )
 
-    def __init__(self, entry: _ConnectionEntry, task: asyncio.Task[Any]) -> None:
+    def __init__(
+        self,
+        entry: _ConnectionEntry,
+        task: asyncio.Task[Any],
+        identity: tuple[str | None, str],
+        tool: str,
+    ) -> None:
         self.entry = entry
         self.task = task
+        self.identity = identity
+        self.tool = tool
         self.interruption: _CallInterruption | None = None
         self.release_event = asyncio.Event()
         self.released = False
+        self.started_at: float | None = None
+        self.terminal_emitted = False
+        # Capacity was reclaimed while the transport operation kept running;
+        # cleared when the executor finally exits, so reclaimed-but-live
+        # work stays countable.
+        self.detached = False
 
 
 class _CallWaiter:
@@ -717,6 +882,15 @@ class MCPRuntime:
     FIFO for up to ``call_wait_timeout`` and are then shed, having never been
     sent. Forced cleanup releases logical capacity after a bounded grace even
     if a hostile transport keeps its already-started operation alive.
+
+    Operational visibility is process-local, like connection-pool metrics:
+    :meth:`snapshot` returns an immutable point-in-time view (connections
+    and their statuses, in-flight calls, capacity waiters, open circuits),
+    and an optional ``observer`` receives typed lifecycle events —
+    synchronously, outside runtime locks, with failures swallowed and logged
+    value-free. Events carry tenant and connection keys for the application
+    to route, but never credentials, arguments, results, or error text; the
+    runtime's own logs name only validated source labels.
     """
 
     def __init__(
@@ -730,6 +904,7 @@ class MCPRuntime:
         shutdown_timeout: float = 30.0,
         circuit_failure_threshold: int | None = 5,
         circuit_reset_timeout: float = 30.0,
+        observer: MCPRuntimeObserver | None = None,
     ) -> None:
         self.max_connections = _positive_int(max_connections, "max_connections")
         self.max_in_flight_calls = _positive_int(
@@ -761,6 +936,24 @@ class MCPRuntime:
             else _positive_int(circuit_failure_threshold, "circuit_failure_threshold")
         )
         self.circuit_reset_timeout = _positive_float(circuit_reset_timeout, "circuit_reset_timeout")
+        if observer is not None:
+            # A runtime_checkable protocol only proves the attribute exists.
+            # An on_event that is not callable would fail every delivery, and
+            # a coroutine function would return un-awaited coroutines and
+            # silently drop every event.
+            on_event = getattr(observer, "on_event", None)
+            if not callable(on_event):
+                raise ValueError(
+                    "MCPRuntime observer must implement MCPRuntimeObserver.on_event(event)."
+                )
+            if inspect.iscoroutinefunction(on_event) or inspect.iscoroutinefunction(
+                type(on_event).__call__
+            ):
+                raise ValueError(
+                    "MCPRuntime observer on_event must be synchronous; hand events "
+                    "to a queue or task of the application's choosing instead."
+                )
+        self._observer = observer
         self._state = MCPRuntimeState.OPEN
         # The registered source is the canonical configuration for an
         # identity. evict() must remove entries here, or an evicted
@@ -782,11 +975,89 @@ class MCPRuntime:
         # process load without drifting across cancellation and forced cleanup.
         self._active_call_permits: set[_CallPermit] = set()
         self._call_queue: deque[_CallWaiter] = deque()
+        # Monotonic id source for physical connections, and the count of
+        # reclaimed permits whose transport operations are still running.
+        self._connection_seq = 0
+        self._detached_calls = 0
         self._lock = Lock()
 
     @property
     def _in_flight_calls(self) -> int:
         return len(self._active_call_permits)
+
+    def _emit(self, event: MCPRuntimeEvent | None) -> None:
+        """Deliver one event to the observer; never under a runtime lock.
+
+        Accepts ``None`` so helpers that conditionally produce an event can
+        be emitted unconditionally. Observer exceptions are swallowed and
+        logged value-free: telemetry must never break MCP work, and observer
+        errors are application-authored text that could carry anything.
+        """
+        observer = self._observer
+        if event is None or observer is None:
+            return
+        try:
+            callback: Any = observer.on_event
+            result = callback(event)
+            if inspect.isawaitable(result):
+                # A synchronous wrapper can still manufacture an awaitable at
+                # call time. Dispose of it so it cannot leak a coroutine or
+                # run outside the observer contract, then drop the event.
+                try:
+                    if isinstance(result, asyncio.Future):
+                        result.cancel()
+                    else:
+                        close = getattr(result, "close", None)
+                        if callable(close):
+                            close()
+                except BaseException:
+                    pass
+                logger.warning(
+                    "MCP runtime observer returned an awaitable handling %s; event dropped.",
+                    type(event).__name__,
+                )
+        except BaseException as exc:
+            logger.warning(
+                "MCP runtime observer failed handling %s (%s); event dropped.",
+                type(event).__name__,
+                type(exc).__name__,
+            )
+
+    def _emit_opening_terminal(
+        self,
+        entry: _ConnectionEntry,
+        event: MCPRuntimeEvent,
+    ) -> None:
+        """Emit one terminal event for an entry's connection attempt."""
+        with self._lock:
+            if entry.opening_terminal_emitted:
+                return
+            entry.opening_terminal_emitted = True
+        self._emit(event)
+
+    def _emit_close_terminal(
+        self,
+        entry: _ConnectionEntry,
+        event: MCPConnectionClosed,
+    ) -> None:
+        """Emit one close terminal for an opened physical connection."""
+        with self._lock:
+            if entry.close_terminal_emitted:
+                return
+            entry.close_terminal_emitted = True
+        self._emit(event)
+
+    def _emit_call_terminal(
+        self,
+        permit: _CallPermit,
+        event: MCPRuntimeEvent,
+    ) -> None:
+        """Emit one terminal event for an admitted tool call."""
+        with self._lock:
+            if permit.terminal_emitted:
+                return
+            permit.terminal_emitted = True
+        self._emit(event)
 
     def _bind_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1060,8 +1331,10 @@ class MCPRuntime:
             entry.fenced = True
         try:
             await self._teardown_entry(
+                identity,
                 entry,
                 loop=loop,
+                reason="idle",
                 cancel_warning=(
                     "MCP source '%s' connect task ignored idle cancellation; abandoning it."
                 ),
@@ -1082,7 +1355,7 @@ class MCPRuntime:
         *,
         timeout: float,
         warning: str,
-    ) -> None:
+    ) -> set[asyncio.Task[None]]:
         """Await teardown tasks, then hand resistant ones to the background.
 
         Every finished task's result is consumed so a late failure never
@@ -1090,19 +1363,22 @@ class MCPRuntime:
         tracked rather than waited on, keeping every caller bounded.
         """
         if not tasks:
-            return
+            return set()
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         for task in done:
             self._consume_task_exception(task)
         for task in pending:
             logger.warning(warning, tasks[task].source.name)
             self._track_abandoned_task(task)
+        return pending
 
     async def _teardown_entry(
         self,
+        identity: tuple[str | None, str],
         entry: _ConnectionEntry,
         *,
         loop: asyncio.AbstractEventLoop,
+        reason: Literal["idle", "broken", "evicted", "shutdown"],
         cancel_warning: str,
         close_warning: str,
     ) -> None:
@@ -1114,18 +1390,47 @@ class MCPRuntime:
         task = entry.task
         if task is not None and not task.done():
             task.cancel()
-            await self._settle_teardown_tasks(
+            pending = await self._settle_teardown_tasks(
                 {task: entry},
                 timeout=_FORCED_CANCEL_GRACE,
                 warning=cancel_warning,
             )
-        await self._settle_teardown_tasks(
-            {loop.create_task(self._close_adapter(entry)): entry},
+            if task in pending:
+                self._emit_opening_terminal(
+                    entry,
+                    MCPConnectionAborted(
+                        tenant_key=identity[0],
+                        connection_key=identity[1],
+                        source_name=entry.source.name,
+                        instance_id=entry.instance_id,
+                    ),
+                )
+        close_task = loop.create_task(self._close_adapter(identity, entry, reason=reason))
+        pending = await self._settle_teardown_tasks(
+            {close_task: entry},
             timeout=_FORCED_CANCEL_GRACE,
             warning=close_warning,
         )
+        if close_task in pending and entry.adapter is not None:
+            self._emit_close_terminal(
+                entry,
+                MCPConnectionClosed(
+                    tenant_key=identity[0],
+                    connection_key=identity[1],
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                    reason=reason,
+                    clean=False,
+                ),
+            )
 
-    async def _close_adapter(self, entry: _ConnectionEntry) -> None:
+    async def _close_adapter(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        reason: Literal["idle", "broken", "evicted", "shutdown"],
+    ) -> None:
         """Close an entry's transport at most once across all callers."""
         with self._lock:
             adapter = entry.adapter
@@ -1134,6 +1439,7 @@ class MCPRuntime:
             # Guards against runtime shutdown and eviction both closing the
             # same transport when they run concurrently.
             entry.close_started = True
+        clean = False
         try:
             await adapter.close()
         except Exception as exc:
@@ -1142,6 +1448,23 @@ class MCPRuntime:
                 entry.source.name,
                 safe_source_exception_detail(adapter.source, exc),
                 type(exc).__name__,
+            )
+        else:
+            clean = True
+        finally:
+            # Whoever wins the close_started race reports the one close event.
+            # A teardown owner may already have terminalized a resistant close
+            # as unclean before allowing this task to finish in the background.
+            self._emit_close_terminal(
+                entry,
+                MCPConnectionClosed(
+                    tenant_key=identity[0],
+                    connection_key=identity[1],
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                    reason=reason,
+                    clean=clean,
+                ),
             )
 
     def _circuit_retry_after(self, circuit: _CircuitState, now: float) -> float | None:
@@ -1185,12 +1508,13 @@ class MCPRuntime:
         cause: str,
         *,
         connection_lost: bool = False,
-    ) -> None:
+    ) -> MCPCircuitOpened | None:
         """Count one connection failure toward the entry's circuit.
 
         ``cause`` must be value-free (an exception class name or a fixed
         phrase): it is rendered into rejection messages and logs. Caller
-        must hold the runtime lock.
+        must hold the runtime lock; a returned open event must be emitted
+        after releasing it.
         """
         circuit = entry.circuit
         threshold = self.circuit_failure_threshold
@@ -1199,13 +1523,13 @@ class MCPRuntime:
             or threshold is None
             or not self._entry_owns_current_circuit(identity, entry)
         ):
-            return
+            return None
         circuit.consecutive_failures += 1
         if connection_lost:
             circuit.connection_loss_failures += 1
         circuit.last_failure = cause
         if circuit.consecutive_failures < threshold or self._loop is None:
-            return
+            return None
         circuit.open_until = self._loop.time() + self.circuit_reset_timeout
         logger.warning(
             "MCP source '%s' circuit opened after %d consecutive connection "
@@ -1215,26 +1539,45 @@ class MCPRuntime:
             cause,
             self.circuit_reset_timeout,
         )
+        tenant_key, connection_key = identity
+        return MCPCircuitOpened(
+            tenant_key=tenant_key,
+            connection_key=connection_key,
+            source_name=entry.source.name,
+            failure_count=circuit.consecutive_failures,
+            last_failure=circuit.last_failure,
+            reset_timeout=self.circuit_reset_timeout,
+        )
 
     def _record_circuit_connection_success(
         self,
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
-    ) -> None:
+    ) -> MCPCircuitClosed | None:
         """Record a successful handshake without hiding unstable sessions.
 
         Establishment clears connection-attempt failures. Mid-call losses
         survive until a real tool response proves the replacement session is
         healthy; otherwise a server that accepts discovery but drops every
         call could reconnect forever without opening its circuit. Caller must
-        hold the runtime lock.
+        hold the runtime lock; a returned close event must be emitted after
+        releasing it.
         """
         circuit = entry.circuit
         if circuit is None or not self._entry_owns_current_circuit(identity, entry):
-            return
+            return None
+        was_open = circuit.open_until is not None
         circuit.consecutive_failures = circuit.connection_loss_failures
         circuit.last_failure = "connection loss" if circuit.connection_loss_failures else None
         circuit.open_until = None
+        if not was_open:
+            return None
+        tenant_key, connection_key = identity
+        return MCPCircuitClosed(
+            tenant_key=tenant_key,
+            connection_key=connection_key,
+            source_name=entry.source.name,
+        )
 
     def _record_healthy_tool_response(
         self,
@@ -1242,14 +1585,22 @@ class MCPRuntime:
         entry: _ConnectionEntry,
     ) -> None:
         """Reset the circuit after a confirmed response on the live entry."""
+        circuit_closed: MCPCircuitClosed | None = None
         with self._lock:
             circuit = entry.circuit
-            if circuit is None or not self._entry_owns_current_circuit(identity, entry):
-                return
-            circuit.consecutive_failures = 0
-            circuit.connection_loss_failures = 0
-            circuit.last_failure = None
-            circuit.open_until = None
+            if circuit is not None and self._entry_owns_current_circuit(identity, entry):
+                if circuit.open_until is not None:
+                    tenant_key, connection_key = identity
+                    circuit_closed = MCPCircuitClosed(
+                        tenant_key=tenant_key,
+                        connection_key=connection_key,
+                        source_name=entry.source.name,
+                    )
+                circuit.consecutive_failures = 0
+                circuit.connection_loss_failures = 0
+                circuit.last_failure = None
+                circuit.open_until = None
+        self._emit(circuit_closed)
 
     def _connection_lost(
         self,
@@ -1268,13 +1619,14 @@ class MCPRuntime:
         reconnects — resolving fresh credentials — on its next acquisition.
         """
         released = False
+        circuit_opened: MCPCircuitOpened | None = None
         with self._lock:
             if self._entries.get(identity) is not entry:
                 return
             if not entry.fenced:
                 if self._state is not MCPRuntimeState.OPEN or self._loop is None:
                     return  # shutdown already tears every transport down
-                self._record_circuit_failure(
+                circuit_opened = self._record_circuit_failure(
                     identity,
                     entry,
                     "connection loss",
@@ -1292,6 +1644,7 @@ class MCPRuntime:
             # queued for this dead entry, never admit one onto its transport.
             released = self._release_call_permit(identity, reporting_permit)
             self._wake_call_waiters_for_entry(entry)
+        self._emit(circuit_opened)
         if released:
             self._notify_drain()
 
@@ -1315,8 +1668,10 @@ class MCPRuntime:
                 interruption="connection_lost",
             )
             await self._teardown_entry(
+                identity,
                 entry,
                 loop=loop,
+                reason="broken",
                 cancel_warning=(
                     "MCP source '%s' connect task ignored recovery cancellation; abandoning it."
                 ),
@@ -1341,6 +1696,7 @@ class MCPRuntime:
         identity = connection.identity
         admission: _Admission | None = None
         deadline: float | None = None
+        probe_event: MCPCircuitProbing | None = None
         loop = asyncio.get_running_loop()
         try:
             while True:
@@ -1396,8 +1752,18 @@ class MCPRuntime:
                                 last_failure=circuit.last_failure,
                             )
                         if self._can_admit(admission):
+                            if registration.circuit.open_until is not None:
+                                # Cooldown elapsed but not yet cleared: this
+                                # acquisition is the half-open probe.
+                                probe_event = MCPCircuitProbing(
+                                    tenant_key=identity[0],
+                                    connection_key=identity[1],
+                                    source_name=registration.source.name,
+                                )
                             entry = _ConnectionEntry(registration.source)
                             entry.circuit = registration.circuit
+                            self._connection_seq += 1
+                            entry.instance_id = self._connection_seq
                             entry.task = loop.create_task(
                                 self._open_connection(
                                     identity,
@@ -1434,12 +1800,24 @@ class MCPRuntime:
                     await asyncio.wait_for(waiter.wait(), timeout=remaining)
                 except TimeoutError:
                     continue  # re-check under the lock, then raise the capacity error
+        except MCPConnectionCapacityError:
+            # The raise released the lock; the callback must stay outside it.
+            self._emit(
+                MCPConnectionCapacityRejected(
+                    tenant_key=identity[0],
+                    connection_key=identity[1],
+                    source_name=connection.source.name,
+                    limit=self.max_connections,
+                )
+            )
+            raise
         finally:
             if admission is not None:
                 with self._lock:
                     self._release_admission(admission)
 
         assert task is not None
+        self._emit(probe_event)
         try:
             # Shielded: cancelling this caller must not cancel connection
             # establishment for concurrent leases of the same identity.
@@ -1463,6 +1841,15 @@ class MCPRuntime:
         the provider is consulted exactly once per physical connection.
         """
         adapter: MCPClientAdapter | None = None
+        tenant_key, connection_key = identity
+        self._emit(
+            MCPConnectionOpening(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=entry.source.name,
+                instance_id=entry.instance_id,
+            )
+        )
         try:
             source = entry.source
             if credentials is not None:
@@ -1471,15 +1858,43 @@ class MCPRuntime:
             await adapter.connect()
             raw_tools = await adapter.list_tools()
         except BaseException as exc:
+            circuit_opened: MCPCircuitOpened | None = None
+            failure_cause: str | None = None
             with self._lock:
                 # A cancelled attempt is a verdict about this runtime's
                 # teardown, not about the server: only real failures count.
                 if isinstance(exc, Exception) and not isinstance(exc, asyncio.CancelledError):
-                    self._record_circuit_failure(identity, entry, type(exc).__name__)
+                    failure_cause = type(exc).__name__
+                    circuit_opened = self._record_circuit_failure(identity, entry, failure_cause)
                 if self._entries.get(identity) is entry and not entry.fenced:
                     # Discard so the identity can be retried with a fresh entry,
                     # freeing its slot and any idle timer a departed waiter armed.
                     self._discard_entry(identity, entry)
+            if failure_cause is not None:
+                self._emit_opening_terminal(
+                    entry,
+                    MCPConnectionFailed(
+                        tenant_key=tenant_key,
+                        connection_key=connection_key,
+                        source_name=entry.source.name,
+                        instance_id=entry.instance_id,
+                        cause=failure_cause,
+                    ),
+                )
+            else:
+                # Cancelled by teardown or unwound by process control flow:
+                # no server verdict, but the started attempt needs its one
+                # terminal event.
+                self._emit_opening_terminal(
+                    entry,
+                    MCPConnectionAborted(
+                        tenant_key=tenant_key,
+                        connection_key=connection_key,
+                        source_name=entry.source.name,
+                        instance_id=entry.instance_id,
+                    ),
+                )
+            self._emit(circuit_opened)
             if adapter is not None:
                 try:
                     await adapter.close()
@@ -1492,7 +1907,7 @@ class MCPRuntime:
                     )
             raise
         with self._lock:
-            self._record_circuit_connection_success(identity, entry)
+            circuit_closed = self._record_circuit_connection_success(identity, entry)
             # A force-closed or evicted entry must never receive a live
             # adapter: a transport that suppressed cancellation could
             # otherwise publish into an already-closed runtime.
@@ -1501,6 +1916,18 @@ class MCPRuntime:
                 entry.adapter = adapter
                 entry.raw_tools = list(raw_tools)
                 entry.info = adapter.info
+        if still_current:
+            self._emit_opening_terminal(
+                entry,
+                MCPConnectionOpened(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                    tool_count=len(entry.raw_tools),
+                ),
+            )
+            self._emit(circuit_closed)
         if not still_current:
             try:
                 await adapter.close()
@@ -1511,6 +1938,17 @@ class MCPRuntime:
                     safe_source_exception_detail(adapter.source, exc),
                     type(exc).__name__,
                 )
+            # Established, but only after losing its slot: never served and
+            # never published, so the attempt terminates as aborted.
+            self._emit_opening_terminal(
+                entry,
+                MCPConnectionAborted(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                ),
+            )
             raise MCPConnectionError(
                 f"MCP source '{entry.source.name}' connection was released before "
                 "establishment completed."
@@ -1663,7 +2101,7 @@ class MCPRuntime:
                     if self._can_start_call(waiter):
                         task = asyncio.current_task()
                         assert task is not None
-                        permit = _CallPermit(entry, task)
+                        permit = _CallPermit(entry, task, identity, tool)
                         self._active_call_permits.add(permit)
                         entry.call_permits.add(permit)
                         entry.active_calls += 1
@@ -1704,6 +2142,10 @@ class MCPRuntime:
         with self._lock:
             self._bind_loop()
             released = self._release_call_permit(identity, permit)
+            if permit.detached:
+                # The reclaimed call's executor has finally exited.
+                permit.detached = False
+                self._detached_calls -= 1
         if released:
             self._notify_drain()
 
@@ -1780,8 +2222,29 @@ class MCPRuntime:
         released = False
         with self._lock:
             resistant = [permit for _, permit in owned if not permit.released]
+            for permit in resistant:
+                # Capacity is reclaimed below, but the transport operation is
+                # still running; count it as detached until its executor exits.
+                permit.detached = True
+                self._detached_calls += 1
             for identity, permit in owned:
                 released = self._release_call_permit(identity, permit) or released
+        now = asyncio.get_running_loop().time()
+        for permit in resistant:
+            started_at = permit.started_at if permit.started_at is not None else now
+            reason = permit.interruption or interruption
+            self._emit_call_terminal(
+                permit,
+                MCPToolCallOutcomeUnknown(
+                    tenant_key=permit.identity[0],
+                    connection_key=permit.identity[1],
+                    source_name=permit.entry.source.name,
+                    instance_id=permit.entry.instance_id,
+                    tool=permit.tool,
+                    duration=max(now - started_at, 0.0),
+                    reason=reason,
+                ),
+            )
         if released:
             self._notify_drain()
         if resistant:
@@ -1803,6 +2266,66 @@ class MCPRuntime:
         """Return the current application-owned lifecycle state."""
         with self._lock:
             return self._state
+
+    @staticmethod
+    def _entry_status(entry: _ConnectionEntry) -> MCPConnectionStatus:
+        """Classify one entry for a snapshot. Caller must hold the lock."""
+        if entry.broken:
+            return MCPConnectionStatus.BROKEN
+        if entry.fenced or entry.retire_task is not None:
+            return MCPConnectionStatus.CLOSING
+        if entry.adapter is None:
+            return MCPConnectionStatus.CONNECTING
+        if entry.leases or entry.active_calls:
+            return MCPConnectionStatus.ACTIVE
+        return MCPConnectionStatus.IDLE
+
+    def snapshot(self) -> MCPRuntimeSnapshot:
+        """Return an immutable point-in-time view of runtime health.
+
+        Taken atomically under one lock acquisition and safe to call from
+        any thread — a metrics scraper does not need the event loop.
+        ``connections`` lists physical connections; ``open_circuits`` lists
+        registered identities currently rejecting new connections, which
+        typically have no physical connection at all.
+        """
+        with self._lock:
+            now = self._loop.time() if self._loop is not None else 0.0
+            connections = tuple(
+                MCPConnectionSnapshot(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                    status=self._entry_status(entry),
+                    leases=entry.leases,
+                    active_calls=entry.active_calls,
+                )
+                for (tenant_key, connection_key), entry in self._entries.items()
+            )
+            open_circuits = tuple(
+                MCPOpenCircuitSnapshot(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=registration.source.name,
+                    failure_count=registration.circuit.consecutive_failures,
+                    last_failure=registration.circuit.last_failure,
+                    retry_after=max(registration.circuit.open_until - now, 0.0),
+                )
+                for (tenant_key, connection_key), registration in self._registrations.items()
+                if registration.circuit.open_until is not None
+            )
+            return MCPRuntimeSnapshot(
+                state=self._state,
+                connections=connections,
+                in_flight_calls=len(self._active_call_permits),
+                detached_calls=self._detached_calls,
+                connection_waiters=sum(
+                    admission.waiters for admission in self._admissions.values()
+                ),
+                call_waiters=len(self._call_queue),
+                open_circuits=open_circuits,
+            )
 
     def bind(
         self,
@@ -1952,6 +2475,7 @@ class MCPRuntime:
 
         identity = tenant_key, connection_key
         shutdown_task: asyncio.Task[None] | None = None
+        started_event: MCPEvictionStarted | None = None
         with self._lock:
             if self._state is MCPRuntimeState.CLOSED:
                 return
@@ -2006,6 +2530,13 @@ class MCPRuntime:
                         )
                     )
                     self._evictions[identity] = task
+                    started_event = MCPEvictionStarted(
+                        tenant_key=tenant_key,
+                        connection_key=connection_key,
+                        source_name=entry.source.name,
+                        mode=mode,
+                    )
+        self._emit(started_event)
         if escalate:
             # Wake the in-flight drain so it stops waiting for live work.
             self._notify_drain()
@@ -2046,8 +2577,10 @@ class MCPRuntime:
             if entry.force_evicted:
                 await self._interrupt_active_calls({identity: entry})
             await self._teardown_entry(
+                identity,
                 entry,
                 loop=loop,
+                reason="evicted",
                 cancel_warning=(
                     "MCP source '%s' connect task ignored eviction cancellation; abandoning it."
                 ),
@@ -2066,6 +2599,14 @@ class MCPRuntime:
                     del self._registrations[identity]
                 self._evictions.pop(identity, None)
             self._notify_drain()
+            self._emit(
+                MCPEvictionCompleted(
+                    tenant_key=identity[0],
+                    connection_key=identity[1],
+                    source_name=entry.source.name,
+                    forced=entry.force_evicted,
+                )
+            )
 
     async def close(self) -> None:
         """Drain active leases, then start bounded transport cleanup.
@@ -2075,6 +2616,7 @@ class MCPRuntime:
         force-evicted. A transport that resists cancellation or close is
         retained and observed until its cleanup task eventually finishes.
         """
+        started = False
         with self._lock:
             self._bind_loop()
             if self._close_task is None:
@@ -2086,7 +2628,10 @@ class MCPRuntime:
                     admission.event.set()
                 self._wake_all_call_waiters()
                 self._close_task = asyncio.get_running_loop().create_task(self._close_impl())
+                started = True
             task = self._close_task
+        if started:
+            self._emit(MCPRuntimeShutdownStarted())
         # Shielded so one cancelled caller cannot abort the shared shutdown.
         await asyncio.shield(task)
 
@@ -2103,7 +2648,8 @@ class MCPRuntime:
         drained = await self._wait_for_quiet(deadline, quiet)
 
         with self._lock:
-            entries = list(self._entries.values())
+            entry_items = list(self._entries.items())
+            entries = [entry for _, entry in entry_items]
             for entry in entries:
                 self._cancel_idle(entry)
                 entry.fenced = True
@@ -2130,7 +2676,7 @@ class MCPRuntime:
         # Unlike per-entry teardown, shutdown shares one grace window across
         # every connection. Applying it once per entry would make forced
         # shutdown scale linearly with the number of resistant transports.
-        await self._settle_teardown_tasks(
+        pending_connect_tasks = await self._settle_teardown_tasks(
             connect_tasks,
             timeout=max(deadline - loop.time(), _FORCED_CANCEL_GRACE),
             warning=(
@@ -2138,18 +2684,46 @@ class MCPRuntime:
                 "shutdown budget; abandoning it."
             ),
         )
-        await self._settle_teardown_tasks(
-            {
-                loop.create_task(self._close_adapter(entry)): entry
-                for entry in entries
-                if entry.adapter is not None
-            },
+        identity_by_entry = {entry: identity for identity, entry in entry_items}
+        for task in pending_connect_tasks:
+            entry = connect_tasks[task]
+            identity = identity_by_entry[entry]
+            self._emit_opening_terminal(
+                entry,
+                MCPConnectionAborted(
+                    tenant_key=identity[0],
+                    connection_key=identity[1],
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                ),
+            )
+        close_tasks = {
+            loop.create_task(self._close_adapter(identity, entry, reason="shutdown")): entry
+            for identity, entry in entry_items
+            if entry.adapter is not None
+        }
+        pending_close_tasks = await self._settle_teardown_tasks(
+            close_tasks,
             timeout=_FORCED_CANCEL_GRACE,
             warning=(
                 "MCP source '%s' connection cleanup exceeded the shutdown grace; "
                 "allowing it to finish in the background."
             ),
         )
+        for task in pending_close_tasks:
+            entry = close_tasks[task]
+            identity = identity_by_entry[entry]
+            self._emit_close_terminal(
+                entry,
+                MCPConnectionClosed(
+                    tenant_key=identity[0],
+                    connection_key=identity[1],
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                    reason="shutdown",
+                    clean=False,
+                ),
+            )
         if pending_tasks:
             # Evictions and idle retirements own entries too; let them finish
             # before the runtime declares itself closed.
@@ -2169,6 +2743,7 @@ class MCPRuntime:
             self._entries.clear()
             self._registrations.clear()
             self._state = MCPRuntimeState.CLOSED
+        self._emit(MCPRuntimeShutdownCompleted(forced=bool(forced_entries)))
 
     async def __aenter__(self) -> MCPRuntime:
         return self
