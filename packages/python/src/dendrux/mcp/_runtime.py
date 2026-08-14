@@ -9,7 +9,10 @@ import logging
 import math
 import re
 from collections import deque
-from collections.abc import Mapping
+
+# Public method annotations are resolved at runtime by documentation and
+# dependency-injection tooling.
+from collections.abc import Callable, Collection, Mapping  # noqa: TC003
 from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
@@ -70,17 +73,16 @@ from dendrux.mcp._source import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
-
     from dendrux.types import ToolDef
 
 logger = logging.getLogger(__name__)
 
 _NAMESPACE_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-# Post-drain grace for connection and cleanup tasks: enough for cooperative
-# cancellation/close to finish, but bounded when a transport misbehaves.
-_FORCED_CANCEL_GRACE = 0.05
+# Post-drain grace for connection and cleanup tasks: enough for the official
+# SDK to stop a stdio subprocess cleanly, but bounded when a transport
+# misbehaves.
+_FORCED_CANCEL_GRACE = 0.25
 
 
 MCPEvictionMode = Literal["drain", "force"]

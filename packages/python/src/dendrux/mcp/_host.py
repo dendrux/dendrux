@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Sequence  # noqa: TC003
 from typing import TYPE_CHECKING, Any
 
 from dendrux.mcp._server import MCPServer
 from dendrux.mcp._source import MCPSource
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-
     from dendrux.types import ToolDef
 
 

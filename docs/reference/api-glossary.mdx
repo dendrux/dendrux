@@ -75,8 +75,13 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration for `tool_sources=`. See [MCP](/docs/architecture/mcp). |
-| `MCPHost` | `from dendrux.mcp import MCPHost` | Application-owned MCP connections and catalogs shared safely across agents. |
+| `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration. See [MCP](/docs/architecture/mcp). |
+| `MCPRuntime` | `from dendrux.mcp import MCPRuntime` | Process-wide managed owner of MCP connections: tenancy, capacity, circuit breaking, telemetry. Recommended for production. |
+| `MCPConnection` | `runtime.bind(...)` | Lazy handle for one `(tenant_key, connection_key)` identity; `connection.tools()` creates agent views. |
+| `MCPToolView` | `connection.tools(...)` | Namespace and tool policy one agent consumes via `tool_sources=`. |
+| `MCPCredentialProvider` | `from dendrux.mcp import MCPCredentialProvider` | Async protocol returning per-connect authentication (headers or env); resolved lazily, never persisted. |
+| `MCPRuntimeObserver` | `from dendrux.mcp import MCPRuntimeObserver` | Sync callback protocol receiving typed runtime lifecycle events; pair with `runtime.snapshot()`. |
+| `MCPHost` | `from dendrux.mcp import MCPHost` | Application-owned connections shared across a few agents, without tenancy or capacity; prefer `MCPRuntime` in services. |
 | `MCPServer` | `from dendrux.mcp import MCPServer` | Backward-compatible source facade; prefer `MCPSource` in new code. |
 
 ## Result and event types

@@ -1,8 +1,10 @@
-"""MCP + local tools — one agent, one shared production lifecycle.
+"""MCP + local tools — the simple, single-process path.
 
 The agent combines a regular Dendrux ``@tool`` with ``echo`` from the
 official MCP conformance server. ``MCPSource`` describes the external tool
-source; ``MCPHost`` owns its connection and discovered catalog.
+source; ``MCPHost`` owns its connection and discovered catalog. For a
+multi-user service — shared connections, tenants, capacity, telemetry —
+see ``31_mcp_runtime_multi_user.py``.
 
 Prerequisites:
     - Node.js + npx

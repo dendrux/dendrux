@@ -43,6 +43,10 @@ A few related exceptions live on the package root rather than `dendrux.errors`:
 | `StructuredOutputValidationError` | A SingleCall `output_type` fails validation. |
 | `DelegationDepthExceededError` | A sub-agent exceeds `max_delegation_depth`. |
 
+## MCP errors
+
+MCP tool sources raise their own typed hierarchy under `MCPError`, importable from `dendrux.mcp`. The ones an application should be ready to handle — including `MCPCircuitOpenError` (fail-fast with `retry_after`), the capacity errors, and `MCPOutcomeUnknownError` (interrupted call the server may have applied; never retry automatically) — are tabulated with their semantics on the [MCP page](/docs/architecture/mcp#calls-errors-and-result-limits).
+
 ## Example: mapping errors in a write route
 
 ```python
