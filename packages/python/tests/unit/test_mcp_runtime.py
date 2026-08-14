@@ -12,8 +12,11 @@ from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 
 from dendrux.agent import Agent
 from dendrux.mcp import (
+    MCPConnectionClosed,
     MCPHost,
     MCPResultTooLargeError,
+    MCPRuntime,
+    MCPRuntimeEvent,
     MCPServer,
     MCPSource,
     MCPToolCallError,
@@ -275,6 +278,41 @@ class TestMCPToolAdaptation:
             assert await executor(message="hello through MCP") == {"result": "hello through MCP"}
         finally:
             await server.close()
+
+    @pytest.mark.asyncio
+    async def test_managed_real_sdk_stdio_closes_in_its_owner_task(self, caplog: Any) -> None:
+        fixture = Path(__file__).parents[1] / "fixtures" / "mcp_echo_server.py"
+        events: list[MCPRuntimeEvent] = []
+
+        class Observer:
+            def on_event(self, event: MCPRuntimeEvent) -> None:
+                events.append(event)
+
+        runtime = MCPRuntime(observer=Observer(), shutdown_timeout=1.0)
+        connection = runtime.bind(
+            connection_key="echo-1",
+            source=MCPSource.stdio(
+                "echo",
+                [sys.executable, str(fixture)],
+                connect_timeout=10.0,
+                call_timeout=10.0,
+            ),
+        )
+        agent = Agent(prompt="test", tool_sources=[connection.tools()])
+
+        try:
+            lookups = await agent.get_tool_lookups()
+            assert await lookups.fn["echo__echo"](message="managed MCP") == {
+                "result": "managed MCP"
+            }
+        finally:
+            await agent.close()
+            await runtime.close()
+
+        closed = [event for event in events if isinstance(event, MCPConnectionClosed)]
+        assert len(closed) == 1
+        assert closed[0].clean is True
+        assert "cancel scope" not in caplog.text.lower()
 
     @pytest.mark.asyncio
     async def test_discovery_exposes_tools_and_sets_safe_parallelism(self) -> None:

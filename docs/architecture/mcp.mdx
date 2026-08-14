@@ -1,13 +1,13 @@
 ---
 title: MCP
-description: Connect Dendrux agents to remote or subprocess MCP tools with source configuration, shared runtime ownership, policy, and auditable failure handling.
+description: Production MCP for Dendrux agents - a process-wide managed runtime with shared connections, per-tenant credentials, capacity limits, circuit breaking, clean shutdown, and operational telemetry.
 ---
 
 # MCP
 
-Model Context Protocol (MCP) servers expose tools that execute outside the agent. Dendrux is an MCP **client and host**: it discovers those external tools, converts them into normal Dendrux tools, and sends calls through the same deny, approval, guardrail, timeout, and audit pipeline as local `@tool` functions.
+Model Context Protocol (MCP) servers expose tools that execute outside the agent. Dendrux is an MCP **client and managed runtime**: it discovers those external tools, converts them into normal Dendrux tools, and sends calls through the same deny, approval, guardrail, timeout, and audit pipeline as local `@tool` functions.
 
-Dendrux does not help you build MCP servers. Use it to consume existing servers directly or through an MCP gateway.
+The recommended production path is `MCPRuntime`: one process-wide object that owns every physical MCP connection, shares them across agents and requests, isolates tenants, enforces capacity, breaks circuits on failing servers, and shuts down cleanly.
 
 Install the optional integration:
 
@@ -15,59 +15,250 @@ Install the optional integration:
 pip install "dendrux[mcp]"
 ```
 
-## Complete example: local and MCP tools
+## Who hosts the MCP servers
 
-This agent has one local Python tool and one tool from the official MCP conformance server:
+Dendrux runs MCP clients, never remote MCP servers itself:
+
+- **Remote HTTP servers** are hosted by their vendor (a SaaS MCP endpoint), by your platform team, or behind an MCP gateway you deploy. Dendrux connects to them over streamable HTTP.
+- **Stdio servers** are subprocesses that Dendrux spawns on your machine, with your process's operating-system privileges. You own what they can touch. MCP is not a sandbox: run only trusted stdio servers directly, and put untrusted ones in a container or isolated MCP server or gateway reached over HTTP.
+- Dendrux does not help you build MCP servers. Use the official MCP SDKs for that, then consume the result from Dendrux.
+
+Pin subprocess package versions, as these examples do, instead of executing an unreviewed future `latest` release.
+
+## The recommended path
 
 ```python
 import asyncio
 
-from dendrux import Agent, tool
-from dendrux.mcp import MCPHost, MCPSource
-
-
-@tool()
-async def count_words(text: str) -> dict[str, int]:
-    """Count the words in a piece of text."""
-    return {"word_count": len(text.split())}
+from dendrux import Agent
+from dendrux.mcp import MCPRuntime, MCPSource
 
 
 async def main() -> None:
-    everything = MCPSource.stdio(
-        name="everything",
-        command=["npx", "-y", "@modelcontextprotocol/server-everything@2026.7.4"],
-        connect_timeout=60,  # allows a cold first-run npx download
-        call_timeout=30,
-        max_result_bytes=100_000,
+    runtime = MCPRuntime()  # one per worker event loop, at startup
+
+    connection = runtime.bind(
+        connection_key="github-1",
+        source=MCPSource.http(
+            name="github",
+            url="https://mcp.example.com/github",
+            headers={"Authorization": "Bearer ..."},
+        ),
     )
 
-    async with MCPHost([everything]) as mcp_host:
-        async with Agent(
-            provider="anthropic:claude-haiku-4-5",
-            prompt="Use the echo and count_words tools when requested.",
-            tools=[count_words],
-            tool_sources=[mcp_host],
-        ) as agent:
-            result = await agent.run(
-                "Echo 'Dendrux uses MCP tools safely', then count its words."
-            )
-            print(result.answer)
+    async with Agent(
+        provider="anthropic:claude-haiku-4-5",
+        prompt="Help maintain the repository.",
+        tool_sources=[connection.tools()],
+    ) as agent:
+        result = await agent.run("List my open issues.")
+        print(result.answer)
+
+    await runtime.close()  # application shutdown, not per request
 
 
 asyncio.run(main())
 ```
 
-Prerequisites are Node.js with `npx`, an Anthropic API key, and `dendrux[anthropic,mcp]`. The complete runnable version is [`packages/python/examples/30_mcp_agent.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/30_mcp_agent.py).
+Construction, `bind()`, and `tools()` are synchronous, perform no I/O, and resolve no credentials. The physical connection opens lazily on the first tool discovery and is then shared: a second agent bound to the same key reuses the live connection instead of opening its own.
 
-## The three objects
+## The objects
 
 | Object | Responsibility | Typical lifetime |
 | --- | --- | --- |
 | `MCPSource` | Immutable connection, authentication, and limit configuration. | Application configuration. |
-| `MCPHost` | Owns SDK connections and discovered catalogs so multiple agents can share them safely. | One worker, tenant, or credential identity. |
-| `MCPServer` | Backward-compatible facade used by the runtime. Existing `MCPServer(...)` code still works. | Prefer `MCPSource` in new code. |
+| `MCPRuntime` | Event-loop-affine owner of physical connections, capacity, circuits, and telemetry. | Normally one per worker process, closed at shutdown. |
+| `MCPConnection` | Lazy handle for one `(tenant_key, connection_key)` identity returned by `bind()`. | Cheap; re-bind per request if convenient. |
+| `MCPToolView` | Namespace and tool policy one agent consumes via `tool_sources`. | One per agent. |
+| `MCPHost` / `MCPServer` | Simpler facades that predate the runtime. Still supported. | Scripts, notebooks, single-agent tools. |
 
 The official MCP Python SDK owns protocol framing, transport negotiation, and the underlying client session. Dendrux owns agent-facing names, lifecycle policy, result boundaries, governance, and evidence.
+
+## Process-local ownership
+
+`MCPRuntime` is the MCP equivalent of a database connection pool. It is deliberately process-local and event-loop-affine: no database, no coordination between workers, no shared state beyond the process boundary. A conventional async worker has one event loop and creates one runtime at startup. If your process deliberately runs multiple event loops, create one runtime per loop. Capacity limits and telemetry describe that runtime only.
+
+This matches how connection pools are operated: a deployment with four workers and `max_connections=100` can hold up to 400 physical MCP connections in total, and each worker reports its own snapshot. The [RunStore](/docs/architecture/runs) remains the durable, cross-process record of what agents did; the runtime is the live, in-memory record of what connections are doing right now.
+
+```python
+runtime = MCPRuntime(
+    max_connections=100,       # physical connections across all tenants
+    max_in_flight_calls=100,   # concurrently executing MCP tool calls
+    idle_timeout=300.0,        # retire connections unused this long (None keeps them warm)
+    connection_wait_timeout=10.0,  # queue wait for a connection slot; 0 fails fast
+    call_wait_timeout=10.0,        # queue wait for a call slot; 0 sheds load immediately
+    shutdown_timeout=30.0,     # drain budget before close() interrupts work
+    circuit_failure_threshold=5,   # consecutive connect failures before fail-fast (None disables)
+    circuit_reset_timeout=30.0,    # cooldown before one probe connection is allowed
+)
+```
+
+## Identities and tenants
+
+Every managed connection is addressed by `(tenant_key, connection_key)`:
+
+```python
+connection = runtime.bind(
+    connection_key="github-1",
+    tenant_key=user_id,       # omit for single-tenant applications
+    source=github_source,
+    credentials=provider,
+)
+```
+
+Two tenants bound to the same endpoint get two physical connections. The runtime never merges authentication contexts: a tenant's tools always execute over a transport established with that tenant's credentials. Circuit state, eviction, connection identity, and telemetry are partitioned by `(tenant_key, connection_key)`, so one tenant's failing server opens only that tenant's circuit.
+
+Connection and call capacity are intentionally **process-wide budgets**, not per-tenant quotas. FIFO queues and bounded wait timeouts prevent indefinite starvation, but one noisy tenant can still add bounded latency for others. Applications that need contractual per-tenant quotas should enforce them before invoking the runtime.
+
+Binding is cheap and idempotent for equivalent configuration, so a web handler can call `bind()` on every request. Rebinding the same key with a *different* endpoint or transport raises `MCPBindingConflictError`; changing configuration for a live connection requires an eviction first.
+
+## Credentials
+
+Static headers work for shared secrets. For per-tenant or expiring credentials, pass a provider:
+
+```python
+class TenantTokens:
+    def __init__(self, tenant_id: str) -> None:
+        self.tenant_id = tenant_id
+
+    async def get_auth(self) -> dict[str, str]:
+        token = await fetch_token(self.tenant_id)   # your secret store
+        return {"Authorization": f"Bearer {token}"}
+
+
+connection = runtime.bind(
+    connection_key="github-1",
+    tenant_key=tenant_id,
+    source=github_source,
+    credentials=TenantTokens(tenant_id),
+)
+```
+
+The provider is called lazily, once per *physical connection attempt* — never per agent or per tool call. A connection retired between requests may therefore resolve credentials again on the next request. Its result establishes that one transport (request headers for HTTP, environment variables for stdio) and remains only in that connection's in-memory, connect-scoped configuration for the physical connection lifetime; it is never persisted, logged, or rendered into errors. Because the runtime knows the exact secret strings, it scrubs them from any transport or tool error text before that text can reach the run store or the model. Opaque auth objects are rejected at `bind()` for the same reason: their secret values cannot be enumerated for redaction.
+
+To rotate credentials explicitly, pass a stable non-secret `credential_identity` (a credential row id, a rotation counter). Rebinding with a new identity conflicts while the old connection is live — evict first — and supersedes older handles once it is not. Without it, the newest bind's provider is simply consulted at the next physical connect.
+
+## Views and tool policy
+
+`connection.tools()` returns the object an agent consumes. It selects and names tools without touching the network:
+
+```python
+view = connection.tools(
+    namespace="gh",                          # default: the source name
+    allowed_tools=["read_file", "create_issue"],  # default: every server tool
+    force_serial_tools=["create_issue"],     # never run concurrently
+)
+
+agent = Agent(provider=provider, prompt=..., tool_sources=[view])
+```
+
+MCP tools are exposed as `namespace__tool_name` (`gh__create_issue`); characters outside the portable provider subset become `_`, and the final name must be at most 64 characters. Use the namespaced name in deny and approval rules:
+
+```python
+agent = Agent(
+    provider=provider,
+    prompt="Help maintain the repository.",
+    tool_sources=[view],
+    deny=["gh__delete_repo"],
+    require_approval=["gh__create_issue"],
+)
+```
+
+Exposing every server tool (the no-argument default) is an explicit governance decision; prefer `allowed_tools` allowlists in production. MCP tool annotations are advisory: Dendrux schedules an MCP tool concurrently only when it is explicitly marked read-only and not destructive; everything else runs serially.
+
+## Sizing
+
+Size the runtime like a connection pool:
+
+- **`max_connections`** bounds physical connections, which map one-to-one to bound identities in active use. Estimate it as *concurrently active tenants x sources per tenant*, plus headroom. Idle retirement (`idle_timeout`) returns slots from tenants that went quiet; set it to `None` for stdio servers whose subprocess startup costs more than holding the connection warm.
+- **`max_in_flight_calls`** bounds concurrently executing tool calls process-wide, protecting your process and the servers behind it. Agents rarely need more than a few calls in flight each; start near your worker's realistic agent concurrency.
+- **The wait timeouts** decide queueing behaviour at the two capacity boundaries. Non-zero values absorb bursts; `0` fails fast (`MCPConnectionCapacityError`) or sheds load (`MCPCallCapacityError`) immediately. Both errors are transient and never mean the tool call was sent.
+- Multiply everything by worker count when budgeting against server-side rate limits — each process enforces its own limits.
+
+Watch `snapshot().connection_waiters` and `call_waiters` in production: persistent waiters mean the limits are too tight or a server is too slow.
+
+## Failure handling
+
+- **Connect failures** count toward a per-identity circuit breaker. After `circuit_failure_threshold` consecutive failures, new connection attempts fail fast with `MCPCircuitOpenError` (carrying `retry_after`) instead of hammering a dead server. After `circuit_reset_timeout`, one probe connection is allowed through; success closes the circuit, failure re-arms it. A tenant's broken sandbox cannot consume the whole process's capacity retrying.
+- **Transport loss mid-call** fences the dead connection so no new work routes to it, and interrupted calls raise `MCPOutcomeUnknownError`: the server may already have applied the call, so Dendrux never retries it automatically. The next lease opens a fresh connection.
+- **Ordinary tool errors** (`MCPToolCallError`) are just results: the model reads the redacted error text and corrects itself. They never poison the shared connection.
+
+To remove a connection deliberately — a tenant offboarded, credentials revoked, an endpoint migrated:
+
+```python
+await runtime.evict(connection_key="github-1", tenant_key=user_id)          # drain, then close
+await runtime.evict(connection_key="github-1", tenant_key=user_id, mode="force")  # fence immediately
+```
+
+Draining waits for active calls; force interrupts them (`MCPOutcomeUnknownError`). Afterwards the key may be rebound with new configuration.
+
+## Shutdown
+
+```python
+await runtime.close()
+```
+
+`close()` stops new leases and calls, waits up to `shutdown_timeout` for active work to drain, force-evicts whatever remains, and closes every transport. It is idempotent and safe to call concurrently. A transport that resists closing is abandoned to bounded background cleanup rather than hanging your shutdown. `MCPRuntime` is also an async context manager (`async with MCPRuntime() as runtime:`) when your application frame is a single scope.
+
+Closing an *agent* never closes runtime connections — it only releases that agent's lease. The runtime is the single owner of every physical connection.
+
+## Operational telemetry
+
+The runtime answers "what is happening right now" without any storage. `snapshot()` is synchronous, thread-safe, and cheap — call it from a metrics scraper thread on an interval (poll it, don't spin on it):
+
+```python
+snapshot = runtime.snapshot()
+snapshot.connections          # per-connection status, leases, active calls
+snapshot.in_flight_calls      # admitted calls occupying capacity
+snapshot.connection_waiters   # callers queued for a connection slot
+snapshot.call_waiters         # callers queued for a call slot
+snapshot.open_circuits        # identities currently failing fast
+```
+
+For events — connections opening and closing, circuits opening, capacity rejections, tool call outcomes — pass an observer and bridge to Prometheus, OpenTelemetry, Datadog, or logs:
+
+```python
+class Metrics:
+    def on_event(self, event) -> None:   # sync, fast, never raises into the runtime
+        EVENT_COUNTER.labels(type(event).__name__).inc()
+
+runtime = MCPRuntime(observer=Metrics())
+```
+
+Events are immutable, typed, and value-free by construction: identities, class names, counts, and durations — never credentials, URLs, tool arguments, results, or error text. Observer exceptions are swallowed and logged without detail; telemetry can never break MCP work.
+
+## Complete example: multi-user agents on one runtime
+
+One process serves two users. Each gets their own tenant partition, workspace, and credentials over the same runtime:
+
+```python
+runtime = MCPRuntime(max_connections=10, max_in_flight_calls=8)
+
+async def serve(user_id: str, workspace: Path, question: str) -> str:
+    connection = runtime.bind(
+        connection_key="filesystem",
+        tenant_key=user_id,
+        source=MCPSource.stdio(
+            name="filesystem",
+            command=["npx", "-y", "@modelcontextprotocol/server-filesystem@2026.7.4", str(workspace)],
+        ),
+    )
+    async with Agent(
+        provider="anthropic:claude-haiku-4-5",
+        prompt="You are this user's filesystem assistant.",
+        tool_sources=[connection.tools(allowed_tools=["list_directory", "read_text_file"])],
+    ) as agent:
+        result = await agent.run(question)
+        return result.answer
+
+answers = await asyncio.gather(
+    serve("user-a", alice_dir, "What files do I have?"),
+    serve("user-b", bob_dir, "Summarize notes.txt."),
+)
+await runtime.close()
+```
+
+The complete runnable version — concurrent users, fresh agents reusing warm connections, a telemetry observer, a post-request snapshot, and graceful shutdown — is [`packages/python/examples/31_mcp_runtime_multi_user.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/31_mcp_runtime_multi_user.py).
 
 ## Configure an HTTP source
 
@@ -87,7 +278,7 @@ github = MCPSource.http(
 )
 ```
 
-`auth=` accepts an authentication object supported by the MCP SDK's `httpx2.AsyncClient`, including an SDK OAuth provider. Prefer `headers=` or `auth=` over credentials embedded in a URL; Dendrux rejects credential-bearing URLs.
+Prefer `headers=` or a credential provider over credentials embedded in a URL; Dendrux rejects credential-bearing URLs. Unmanaged use (`MCPHost`, direct sources) additionally accepts `auth=` objects supported by the MCP SDK's HTTP client; the managed runtime rejects opaque auth objects because their secrets cannot be redacted.
 
 ## Configure a stdio source
 
@@ -108,58 +299,16 @@ filesystem = MCPSource.stdio(
 )
 ```
 
-The subprocess runs with the Dendrux process's operating-system privileges. MCP is not a sandbox. Only run trusted stdio servers directly; put untrusted servers in a container or isolated MCP runtime and connect over HTTP.
-
-Pin subprocess package versions, as these examples do, instead of executing an unreviewed future `latest` release.
-
-## Simple ownership versus shared ownership
-
-For one short-lived agent, pass a source directly. The agent owns and closes the connection:
-
-```python
-async with Agent(
-    provider=provider,
-    prompt="You are a filesystem assistant.",
-    tool_sources=[filesystem],
-) as agent:
-    result = await agent.run("List the workspace files.")
-```
-
-For a web worker or multiple agents, use `MCPHost`:
-
-```python
-host = MCPHost([github, filesystem])
-
-researcher = Agent(
-    provider=research_provider,
-    prompt="Research the codebase.",
-    tool_sources=[host],
-)
-
-reviewer = Agent(
-    provider=review_provider,
-    prompt="Review code changes.",
-    tool_sources=[host],
-)
-
-await researcher.close()  # does not close host connections
-await reviewer.close()
-await host.close()        # application shutdown
-```
-
-Create separate hosts for different tenants or credential identities. A host deliberately never merges authentication contexts.
+The subprocess runs with the Dendrux process's operating-system privileges — see [who hosts the MCP servers](#who-hosts-the-mcp-servers).
 
 ## Discovery and catalog lifetime
 
-`MCPSource` and `MCPHost` construction perform no network or subprocess I/O. Discovery happens lazily when `agent.run()` or `agent.get_tool_lookups()` first needs the tools.
+Configuration, binding, and view creation perform no network or subprocess I/O. Discovery happens lazily when `agent.run()` or `agent.get_tool_lookups()` first needs the tools:
 
 - Every paginated `tools/list` page is collected.
-- The agent receives a stable catalog for its lifetime.
-- An `MCPHost` caches each source catalog across its agents.
-- `await agent.refresh()` clears a directly owned agent catalog.
-- For a shared host, call `await host.refresh()` between runs, then `await agent.refresh()` for each reused agent that needs the new snapshot.
-
-Do not refresh while a run is active or paused. A run should execute against one stable capability set.
+- The agent receives a stable catalog for its lifetime; a run executes against one capability set.
+- Catalogs belong to the physical connection: agents sharing a live managed connection share its catalog, and a reconnect (after idle retirement, transport loss, or eviction) rediscovers fresh.
+- To force rediscovery of a managed connection deliberately, evict it; the next agent reconnects and rediscovers. For unmanaged owners, `await agent.refresh()` and `await host.refresh()` remain available.
 
 You can force discovery during application startup for a health check:
 
@@ -168,48 +317,9 @@ lookups = await agent.get_tool_lookups()
 print(sorted(lookups.fn))
 ```
 
-## Tool names and policy
-
-MCP tools are exposed as `source_name__tool_name`:
-
-```text
-github + create_issue  -> github__create_issue
-filesystem + read_file -> filesystem__read_file
-```
-
-Namespacing prevents cross-server and local-tool collisions. Characters outside the portable provider subset are converted to `_`; the final name must be at most 64 characters.
-
-Use the namespaced name in Dendrux policy:
-
-```python
-agent = Agent(
-    provider=provider,
-    prompt="Help maintain the repository.",
-    tool_sources=[host],
-    deny=["filesystem__delete_file"],
-    require_approval=["github__create_issue"],
-)
-```
-
-MCP tool annotations are advisory. Dendrux schedules an MCP tool concurrently only when it is explicitly marked read-only and not destructive; tools without those annotations run serially.
-
-## Failure modes
+## Failure modes at discovery
 
 Each source chooses how discovery failure affects the run:
-
-```python
-required = MCPSource.http(
-    "payments",
-    "https://payments.example.com/mcp",
-    failure_mode="strict",
-)
-
-optional = MCPSource.http(
-    "analytics",
-    "https://analytics.example.com/mcp",
-    failure_mode="best_effort",
-)
-```
 
 | Mode | Behaviour |
 | --- | --- |
@@ -220,7 +330,7 @@ A successful source emits `mcp.connected` with its source name, tool count, and 
 
 ## Calls, errors, and result limits
 
-MCP calls pass through the ordinary Dendrux server-tool execution path. That means deny rules, approval pauses, guardrails, call limits, timeouts, persisted tool calls, and completion/error events work the same way as for local tools.
+MCP calls pass through the ordinary Dendrux server-tool execution path: deny rules, approval pauses, guardrails, call limits, timeouts, persisted tool calls, and completion/error events work the same way as for local tools.
 
 The integration preserves:
 
@@ -229,7 +339,33 @@ The integration preserves:
 - image, audio, resource-link, and embedded-resource blocks in a JSON content envelope;
 - negotiated protocol version and server identity in `ToolDef.meta`.
 
-`max_result_bytes` is enforced before a result enters the model conversation. An oversized result raises `MCPResultTooLargeError`; unsuccessful MCP results raise `MCPToolCallError`; connection failures raise `MCPConnectionError`.
+`max_result_bytes` is enforced before a result enters the model conversation. Errors an application should be ready to handle:
+
+| Error | Meaning | Was anything sent? |
+| --- | --- | --- |
+| `MCPToolCallError` | An admitted tool call failed; some local lifecycle rejections also use this base type. | Usually. Do not infer delivery from this base type alone. |
+| `MCPOutcomeUnknownError` | The call was interrupted; the server may have applied it. | Maybe — never retry automatically. |
+| `MCPCircuitOpenError` | Connect attempts are failing fast; carries `retry_after`. | No. |
+| `MCPConnectionCapacityError` / `MCPCallCapacityError` | Capacity limit reached within the wait budget. | No. |
+| `MCPConnectionError` | The connection could not be established. | No. |
+| `MCPResultTooLargeError` | The result exceeded `max_result_bytes`. | Yes — the result was discarded. |
+
+All are subclasses of `MCPError`, importable from `dendrux.mcp`.
+
+## Simple ownership without the runtime
+
+For a script or notebook with one short-lived agent, pass a source directly; the agent owns and closes the connection:
+
+```python
+async with Agent(
+    provider=provider,
+    prompt="You are a filesystem assistant.",
+    tool_sources=[filesystem],
+) as agent:
+    result = await agent.run("List the workspace files.")
+```
+
+`MCPHost` remains a middle ground — application-owned connections shared across a few agents, without tenancy, capacity, circuits, or telemetry — and `MCPServer(...)` code keeps working. New multi-user or long-running services should use `MCPRuntime`.
 
 ## Configuration reference
 
@@ -245,9 +381,11 @@ Common options on `MCPSource.http(...)` and `MCPSource.stdio(...)`:
 
 HTTP-only options are `url`, `headers`, and `auth`. Stdio-only options are `command`, `env`, and `cwd`; mixing transport-specific options raises `ValueError` during construction.
 
+`MCPRuntime` constructor options are listed under [process-local ownership](#process-local-ownership).
+
 ## Where this fits
 
-- [`Agent.tool_sources`](/docs/reference/agent#constructor) attaches sources or hosts.
+- [`Agent.tool_sources`](/docs/reference/agent#constructor) attaches views, sources, or hosts.
 - [Access control](/docs/architecture/access-control) denies namespaced tools deterministically.
 - [Approval](/docs/architecture/approval) pauses before sensitive MCP calls.
-- [Web endpoint recipe](/docs/recipes/web-endpoint) shows worker-scoped host ownership.
+- [Web endpoint recipe](/docs/recipes/web-endpoint) shows runtime ownership in a worker process.

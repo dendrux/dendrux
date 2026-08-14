@@ -31,7 +31,7 @@ Agent(
     prompt: str,
     name: str = ...,                       # defaults to the class name
     tools: list[Callable] = [],
-    tool_sources: list[MCPSource | MCPServer | MCPHost] | None = None,
+    tool_sources: list[MCPToolView | MCPSource | MCPServer | MCPHost] | None = None,
     max_iterations: int = 10,
     max_delegation_depth: int | None = None,
     loop: Loop | None = None,              # defaults to ReActLoop
@@ -153,7 +153,7 @@ Start a fresh run that reuses an existing terminal run's input and approximate p
 async def close() -> None
 ```
 
-Close directly owned MCP sources, the provider, and any agent-owned engine. Called for you by `async with Agent(...)`. `MCPHost` leases do not close the application-owned host; close the host separately at worker shutdown. The shared global engine from `DENDRUX_DATABASE_URL` is not disposed because it is not agent-owned.
+Close directly owned MCP sources, the provider, and any agent-owned engine. Called for you by `async with Agent(...)`. Leases on shared MCP connections (`MCPRuntime` views, `MCPHost`) are released, never closed; the application closes its runtime or host at worker shutdown. The shared global engine from `DENDRUX_DATABASE_URL` is not disposed because it is not agent-owned.
 
 ## Where this fits
 

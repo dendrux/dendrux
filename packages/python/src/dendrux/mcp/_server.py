@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable, Mapping, Sequence  # noqa: TC003
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
-from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
 from dendrux.mcp._errors import MCPToolCallError
 from dendrux.mcp._result import normalize_mcp_result
 from dendrux.mcp._source import (
@@ -19,9 +20,6 @@ from dendrux.mcp._source import (
     source_has_opaque_credentials,
 )
 from dendrux.types import ToolDef, ToolTarget
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +173,11 @@ def create_mcp_executor(
             if opaque
             else redact_source_text(adapter.source, str(failure)) or type(failure).__name__
         )
-        raise MCPToolCallError(
-            f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {detail}"
-        ) from None
+        error = MCPToolCallError(f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {detail}")
+        # The managed runtime consults this to fence a dead transport; a tool
+        # that merely failed must never poison the shared connection.
+        error.connection_lost = is_connection_loss(failure)
+        raise error from None
 
     return executor
 

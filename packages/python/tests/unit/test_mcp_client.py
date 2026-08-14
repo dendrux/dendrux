@@ -5,11 +5,14 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+import anyio
+import httpx2
 import pytest
-from mcp.types import CallToolResult, TextContent
+from mcp.shared.exceptions import MCPError as SDKMCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, CallToolResult, TextContent
 
 from dendrux.mcp import MCPServer
-from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
 from dendrux.mcp._errors import (
     MCPAuthenticationError,
     MCPConnectionError,
@@ -524,3 +527,101 @@ async def test_successful_structured_result_is_recursively_scrubbed() -> None:
         "nested": ["[redacted]", {"[redacted]": "[redacted]"}],
         "safe": 42,
     }
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError("peer reset"),
+        BrokenPipeError("pipe closed"),
+        ConnectionError("connection refused"),
+        EOFError(),
+        httpx2.ReadError("socket closed"),
+        httpx2.ConnectError("no route to host"),
+        httpx2.CloseError("close failed"),
+        httpx2.WriteError("send failed"),
+        httpx2.RemoteProtocolError("server disconnected without response"),
+        anyio.BrokenResourceError(),
+        anyio.ClosedResourceError(),
+        anyio.EndOfStream(),
+    ],
+)
+def test_transport_death_is_classified_as_connection_loss(error: BaseException) -> None:
+    assert is_connection_loss(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("bad arguments"),
+        RuntimeError("tool exploded"),
+        TimeoutError(),
+        httpx2.ReadTimeout("slow server"),
+        httpx2.ConnectTimeout("slow handshake"),
+        httpx2.PoolTimeout("pool exhausted"),
+        httpx2.LocalProtocolError("client-side bug"),
+        _HTTPStatusError("401 Unauthorized", 401),
+        MCPToolCallError("tool failed"),
+    ],
+)
+def test_ordinary_failures_are_not_connection_loss(error: BaseException) -> None:
+    assert not is_connection_loss(error)
+
+
+def test_connection_loss_is_found_through_chains_and_groups() -> None:
+    wrapper = RuntimeError("sdk wrapper")
+    wrapper.__cause__ = httpx2.ReadError("socket closed")
+    assert is_connection_loss(wrapper)
+
+    handling = RuntimeError("raised while handling")
+    handling.__context__ = ConnectionResetError("peer reset")
+    assert is_connection_loss(handling)
+
+    group = BaseExceptionGroup(
+        "task group",
+        [ValueError("unrelated"), ExceptionGroup("inner", [BrokenPipeError("pipe")])],
+    )
+    assert is_connection_loss(group)
+    assert not is_connection_loss(ExceptionGroup("clean", [ValueError("still ordinary")]))
+
+
+def test_official_sdk_connection_closed_is_classified_but_timeout_is_not() -> None:
+    """The SDK normalizes a dead dispatcher to MCPError(CONNECTION_CLOSED),
+    so recovery cannot depend only on its lower-level AnyIO cause."""
+    assert is_connection_loss(SDKMCPError(code=CONNECTION_CLOSED, message="Connection closed"))
+    assert not is_connection_loss(SDKMCPError(code=REQUEST_TIMEOUT, message="Request timed out"))
+
+    wrapped = RuntimeError("SDK wrapper")
+    wrapped.__cause__ = SDKMCPError(code=CONNECTION_CLOSED, message="Connection closed")
+    assert is_connection_loss(wrapped)
+
+
+@pytest.mark.asyncio
+async def test_executor_tags_connection_loss_without_changing_the_error() -> None:
+    source = MCPSource.http("github", "https://mcp.example.com")
+
+    class _DyingClient:
+        error: Exception = httpx2.ReadError("socket closed")
+
+        async def call_tool(self, name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
+            raise type(self).error
+
+    adapter = MCPClientAdapter(source)
+    adapter._client = _DyingClient()  # type: ignore[assignment]
+    executor = create_mcp_executor(
+        adapter,
+        namespace="github",
+        mcp_tool_name="write",
+        max_result_bytes=10_000,
+    )
+
+    with pytest.raises(MCPToolCallError) as lost:
+        await executor()
+    assert lost.value.connection_lost is True
+    assert str(lost.value) == "MCP tool 'github__write' call failed: socket closed"
+    assert lost.value.__cause__ is None and lost.value.__context__ is None
+
+    _DyingClient.error = RuntimeError("tool exploded")
+    with pytest.raises(MCPToolCallError) as ordinary:
+        await executor()
+    assert ordinary.value.connection_lost is False

@@ -134,6 +134,51 @@ class MCPStaleConnectionError(MCPConnectionStateError):
     """
 
 
+class MCPConnectionLostError(MCPConnectionStateError):
+    """The physical transport behind a managed connection died.
+
+    Raised only for calls that were *never sent*: they were queued for, or
+    routed to, an entry another call had already proven broken. Nothing
+    reached the server, so acquiring tools again — which opens a replacement
+    connection with freshly resolved credentials — and retrying is safe.
+    The identity stays registered; only the physical transport is gone.
+    """
+
+
+class MCPCircuitOpenError(MCPConnectionStateError):
+    """The connection's circuit breaker is open after repeated failures.
+
+    Raised before anything is sent: new physical connections for this
+    identity are rejected until the cooldown elapses, so an unavailable
+    server is not hammered by a reconnect storm. ``retry_after`` is the
+    remaining cooldown in seconds and is safe to surface to end users.
+    After the cooldown one probe connection is attempted and concurrent
+    callers share its outcome. Evicting the identity, or rebinding it with
+    changed source configuration or ``credential_identity``, resets the
+    circuit immediately.
+    """
+
+    def __init__(
+        self,
+        identity: tuple[str | None, str],
+        *,
+        retry_after: float,
+        failure_count: int,
+        last_failure: str | None,
+    ) -> None:
+        self.retry_after = retry_after
+        self.failure_count = failure_count
+        self.last_failure = last_failure
+        detail = f" (last failure: {last_failure})" if last_failure else ""
+        super().__init__(
+            identity,
+            f"MCP connection {identity!r} circuit is open after {failure_count} "
+            f"consecutive connection failures{detail}. New connections are "
+            f"rejected for another {retry_after:.1f}s; evict, or rebind with changed "
+            "source configuration or credential_identity, to reset immediately.",
+        )
+
+
 class MCPCallCapacityError(MCPCapacityError):
     """No MCP tool-call slot became free within the wait budget.
 
@@ -163,13 +208,23 @@ class MCPCallCapacityError(MCPCapacityError):
 
 
 class MCPToolCallError(MCPError):
-    """An MCP server returned an unsuccessful tool result."""
+    """An MCP server returned an unsuccessful tool result.
+
+    ``connection_lost`` is True when the failure tree shows the transport or
+    session died mid-call, rather than the tool merely failing over a working
+    connection. The managed runtime consults it to fence the shared physical
+    connection; the message itself is identical either way.
+    """
+
+    connection_lost: bool = False
 
 
 class MCPOutcomeUnknownError(MCPError):
-    """A tool call was interrupted by forced eviction with an unknown outcome.
+    """A tool call was interrupted with an unknown outcome.
 
-    The server may already have applied the effect, so the call must never be
+    Raised when a forced eviction or shutdown tears the transport out from
+    under a running call, and when the transport itself dies mid-call. The
+    server may already have applied the effect, so the call must never be
     retried automatically. It is deliberately not an :class:`MCPToolCallError`
     subclass: handlers that retry failed tool calls must not catch this.
     """

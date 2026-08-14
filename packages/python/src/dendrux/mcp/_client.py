@@ -8,27 +8,46 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import httpx2
 from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError as SDKMCPError
+from mcp.types import CONNECTION_CLOSED
 
 from dendrux.mcp._errors import MCPAuthenticationError, MCPConnectionError
 from dendrux.mcp._source import safe_source_exception_detail, source_has_opaque_credentials
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from dendrux.mcp._source import MCPSource
 
 logger = logging.getLogger(__name__)
 
 _AUTH_REJECTION_STATUSES = (401, 403)
 
+# Failures that mean the transport or session itself died. Timeouts are
+# deliberately absent (a slow server is not a dead one), as are HTTP status
+# errors (a rejection arrives over a working connection) and local protocol
+# errors (a client-side bug does not invalidate the transport).
+_CONNECTION_LOSS_TYPES: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    EOFError,
+    httpx2.NetworkError,
+    httpx2.RemoteProtocolError,
+    anyio.BrokenResourceError,
+    anyio.ClosedResourceError,
+    anyio.EndOfStream,
+)
 
-def _authentication_status(exc: BaseException) -> int | None:
-    """Find a credential-rejection HTTP status anywhere in an error tree.
 
-    SDK and transport layers wrap the original ``httpx`` status error, so the
-    cause/context chain and exception-group branches are all searched.
+def _iter_error_tree(exc: BaseException) -> Iterator[BaseException]:
+    """Yield every distinct exception reachable from one failure.
+
+    SDK and transport layers wrap the original error, so the cause/context
+    chains and exception-group branches are all walked.
     """
     stack: list[BaseException] = [exc]
     seen: set[int] = set()
@@ -37,19 +56,39 @@ def _authentication_status(exc: BaseException) -> int | None:
         if id(node) in seen:
             continue
         seen.add(id(node))
-        response = getattr(node, "response", None)
-        status = getattr(response, "status_code", None)
-        if status is None:
-            status = getattr(node, "status_code", None)
-        if status in _AUTH_REJECTION_STATUSES:
-            return int(status)
+        yield node
         if isinstance(node, BaseExceptionGroup):
             stack.extend(node.exceptions)
         if node.__cause__ is not None:
             stack.append(node.__cause__)
         if node.__context__ is not None:
             stack.append(node.__context__)
+
+
+def _authentication_status(exc: BaseException) -> int | None:
+    """Find a credential-rejection HTTP status anywhere in an error tree."""
+    for node in _iter_error_tree(exc):
+        response = getattr(node, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(node, "status_code", None)
+        if status in _AUTH_REJECTION_STATUSES:
+            return int(status)
     return None
+
+
+def is_connection_loss(exc: BaseException) -> bool:
+    """Whether an error tree shows the physical transport or session died.
+
+    Used by the managed runtime to distinguish a dead connection — which
+    must be fenced and replaced — from a tool that merely failed over a
+    working one, which must never poison the shared connection.
+    """
+    return any(
+        isinstance(node, _CONNECTION_LOSS_TYPES)
+        or (isinstance(node, SDKMCPError) and node.code == CONNECTION_CLOSED)
+        for node in _iter_error_tree(exc)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +106,10 @@ class MCPClientAdapter:
 
     def __init__(self, source: MCPSource) -> None:
         self.source = source
+        self._close_requested = asyncio.Event()
+        self._connect_error: BaseException | None = None
+        self._owner_task: asyncio.Task[None] | None = None
+        self._ready = asyncio.Event()
         self._stack: AsyncExitStack | None = None
         self._client: Client | None = None
         self.info: MCPConnectionInfo | None = None
@@ -76,8 +119,42 @@ class MCPClientAdapter:
         return self._client is not None
 
     async def connect(self) -> None:
-        if self._client is not None:
+        if self._owner_task is not None:
             raise RuntimeError(f"MCP source '{self.source.name}' is already connected.")
+
+        self._owner_task = asyncio.create_task(
+            self._run_lifecycle(),
+            name=f"dendrux-mcp-{self.source.name}",
+        )
+        try:
+            await asyncio.shield(self._ready.wait())
+        except asyncio.CancelledError:
+            self._close_requested.set()
+            self._owner_task.cancel()
+            await asyncio.gather(self._owner_task, return_exceptions=True)
+            raise
+        if self._connect_error is not None:
+            raise self._connect_error from None
+
+    async def _run_lifecycle(self) -> None:
+        """Enter and exit SDK contexts in this one owning task."""
+        try:
+            failure = await self._open()
+        except BaseException as exc:
+            failure = self._safe_error("connect to", exc) if isinstance(exc, Exception) else exc
+        if failure is not None:
+            self._connect_error = failure
+            self._ready.set()
+            return
+
+        self._ready.set()
+        try:
+            await self._close_requested.wait()
+        finally:
+            await self._close_owned_stack()
+
+    async def _open(self) -> BaseException | None:
+        """Open the transport, returning a detached safe failure if needed."""
 
         stack = AsyncExitStack()
         await stack.__aenter__()
@@ -125,7 +202,7 @@ class MCPClientAdapter:
         except BaseException as exc:
             failure: BaseException = exc
         else:
-            return
+            return None
         cleanup_failure: BaseException | None = None
         try:
             await stack.aclose()
@@ -136,9 +213,9 @@ class MCPClientAdapter:
         # wins; ordinary cleanup errors are retained only as redacted debug
         # diagnostics.
         if isinstance(failure, asyncio.CancelledError):
-            raise failure from None
+            return failure
         if cleanup_failure is not None and not isinstance(cleanup_failure, Exception):
-            raise cleanup_failure from None
+            return cleanup_failure
         if cleanup_failure is not None:
             logger.debug(
                 "MCP source '%s' cleanup after connect failure also failed: %s (%s)",
@@ -150,7 +227,7 @@ class MCPClientAdapter:
         # original exception as __context__ even with `from None`, and
         # error-monitoring SDKs walk __context__ regardless of
         # __suppress_context__ — which would republish the endpoint.
-        raise self._safe_error("connect to", failure) from None
+        return self._safe_error("connect to", failure)
 
     async def list_tools(self) -> list[Any]:
         client = self._require_client()
@@ -218,6 +295,18 @@ class MCPClientAdapter:
         )
 
     async def close(self) -> None:
+        owner_task = self._owner_task
+        if owner_task is None:
+            self._client = None
+            self.info = None
+            return
+        self._close_requested.set()
+        if not self._ready.is_set():
+            owner_task.cancel()
+        await asyncio.shield(owner_task)
+
+    async def _close_owned_stack(self) -> None:
+        """Close the SDK stack from the same task that entered it."""
         stack = self._stack
         self._stack = None
         self._client = None

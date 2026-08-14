@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import re
+
+# Public class and factory annotations are resolved at runtime by
+# documentation and dependency-injection tooling.
+from collections.abc import Mapping, Sequence  # noqa: TC003
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
 
 MCPFailureMode = Literal["strict", "best_effort"]
 MCPPhysicalIdentity = (
