@@ -2589,8 +2589,8 @@ class TestIdleRetirement:
 
         # Retirement cannot interrupt the handshake, so it hands the task off
         # rather than blocking: the identity is released either way.
-        await _wait_until(lambda: len(runtime._abandoned_tasks) == 1)
-        assert runtime._entries == {}
+        await _wait_until(lambda: runtime._entries == {})
+        assert len(runtime._abandoned_tasks) == 1
 
         _InstrumentedAdapter.connect_gate.set()
         await _wait_until(lambda: runtime._abandoned_tasks == set())

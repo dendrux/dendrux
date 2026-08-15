@@ -22,7 +22,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.1.0a5` - core API stabilizing, actively developed.
+> `v0.2.0a14` - core API stabilizing, actively developed.
 
 ---
 
@@ -82,8 +82,9 @@ agent = Agent(
 
 ```bash
 pip install "dendrux[all]"            # everything (Anthropic + OpenAI + DB + http)
-pip install "dendrux[anthropic,db]"   # just Anthropic + SQLite
-pip install "dendrux[openai,db]"      # just OpenAI + SQLite
+pip install "dendrux[anthropic]"      # Anthropic + core runtime
+pip install "dendrux[openai]"         # OpenAI + core runtime
+pip install "dendrux[mcp]"            # managed MCP client runtime
 ```
 
 <details>
