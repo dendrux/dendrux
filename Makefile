@@ -1,4 +1,4 @@
-.PHONY: ci ci-python test lint typecheck format clean
+.PHONY: ci ci-python test lint typecheck format package-smoke clean
 
 # Default: run CI for all packages
 ci: ci-python
@@ -19,6 +19,9 @@ typecheck:
 
 format:
 	$(MAKE) -C packages/python format
+
+package-smoke:
+	$(MAKE) -C packages/python package-smoke
 
 clean:
 	$(MAKE) -C packages/python clean

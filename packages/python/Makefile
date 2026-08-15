@@ -1,4 +1,4 @@
-.PHONY: test lint typecheck format ci clean
+.PHONY: test lint typecheck format package-smoke ci clean
 
 test:
 	pytest tests/ -v --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80
@@ -13,6 +13,9 @@ typecheck:
 format:
 	ruff format .
 	ruff check --fix .
+
+package-smoke:
+	python scripts/mcp_distribution_smoke.py
 
 ci: lint typecheck test
 

@@ -260,6 +260,8 @@ await runtime.close()
 
 The complete runnable version — concurrent users, fresh agents reusing warm connections, a telemetry observer, a post-request snapshot, and graceful shutdown — is [`packages/python/examples/31_mcp_runtime_multi_user.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/31_mcp_runtime_multi_user.py).
 
+For a live end-to-end check, [`packages/python/examples/32_mcp_github_remote.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/32_mcp_github_remote.py) connects to GitHub's hosted MCP endpoint and exposes only its read-only `get_me` tool. An Anthropic Agent must select that tool before answering, while runtime lifecycle events print explicit start/completion proof. Set `ANTHROPIC_API_KEY` in the repository-root `.env` and a narrowly scoped `GITHUB_MCP_PAT` in the process environment; never commit either token.
+
 ## Configure an HTTP source
 
 Streamable HTTP is the normal production transport for a separately deployed MCP server or gateway:
