@@ -19,7 +19,7 @@ pip install "dendrux[mcp]"
 
 Dendrux runs MCP clients, never remote MCP servers itself:
 
-- **Remote HTTP servers** are hosted by their vendor (a SaaS MCP endpoint), by your platform team, or behind an MCP gateway you deploy. Dendrux connects to them over streamable HTTP.
+- **Remote HTTP servers** are hosted by their vendor (a SaaS MCP endpoint, such as [GitHub's hosted MCP server](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/32_mcp_github_remote.py)), by your platform team, or behind an MCP gateway you deploy. Dendrux connects to them over streamable HTTP.
 - **Stdio servers** are subprocesses that Dendrux spawns on your machine, with your process's operating-system privileges. You own what they can touch. MCP is not a sandbox: run only trusted stdio servers directly, and put untrusted ones in a container or isolated MCP server or gateway reached over HTTP.
 - Dendrux does not help you build MCP servers. Use the official MCP SDKs for that, then consume the result from Dendrux.
 
