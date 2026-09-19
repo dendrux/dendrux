@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a17 - 2026-09-20
 
 - MCP: require SDK 2.2+, adopting its origin-restricted redirect handling;
   preserve per-source redirects-off behavior and report blocked targets as
