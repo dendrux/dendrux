@@ -286,7 +286,7 @@ async def test_discovery_failure_is_sanitised_like_connect() -> None:
     assert str(error) == "Failed to list tools from MCP source 'remote' (RuntimeError)."
     assert secret not in _rendered_chain(error)
     assert error.__context__ is None
-    assert error.transport_detail == "401 Unauthorized for url 'https://mcp.example.com/c'"
+    assert error.transport_detail == "401 Unauthorized for url '[redacted URL]'"
 
 
 @pytest.mark.asyncio
@@ -317,7 +317,7 @@ async def test_tool_call_failure_keeps_diagnostics_but_drops_credentials() -> No
     assert "HEADER-SECRET" not in rendered
     assert excinfo.value.__context__ is None
     # Unlike connect, the detail is retained: the model reads it to recover.
-    assert "401 for url 'https://mcp.example.com/c'" in str(excinfo.value)
+    assert "401 for url '[redacted URL]'" in str(excinfo.value)
 
 
 class _Response:

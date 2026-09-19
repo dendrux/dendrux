@@ -496,7 +496,7 @@ class TestSkippedSourcesOnResult:
         await agent.close()
 
     @pytest.mark.asyncio
-    async def test_a_run_with_nothing_skipped_has_no_entry(self) -> None:
+    async def test_a_run_with_nothing_skipped_has_empty_list(self) -> None:
         from dendrux.llm.mock import MockLLM
         from dendrux.types import LLMResponse
 
@@ -509,5 +509,174 @@ class TestSkippedSourcesOnResult:
 
         result = await agent.run("hi")
 
-        assert "mcp_skipped_sources" not in result.meta
+        assert result.meta["mcp_skipped_sources"] == []
+        await agent.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_failed_run_keeps_discovery_snapshot(streaming: bool) -> None:
+    from dendrux.llm.mock import MockLLM
+    from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall
+
+    failure = ValueError("provider unavailable")
+    provider = MockLLM(
+        [LLMResponse(tool_calls=[ToolCall(name="local_add", params={"a": 1, "b": 2})])]
+    )
+    source = _make_failing_optional_source("flaky", TimeoutError("slow"))
+    agent = Agent(provider=provider, prompt="test", tools=[local_add], tool_sources=[source])
+    complete = provider.complete
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        if not provider.exhausted:
+            return await complete(*args, **kwargs)
+        # A refresh/close elsewhere must not rewrite this run's discovery snapshot.
+        agent._mcp_skipped_sources.clear()
+        raise failure
+
+    provider.complete = fail  # type: ignore[method-assign]
+    try:
+        if streaming:
+            stream = agent.stream("hi")
+            events = [event async for event in stream]
+            terminal = events[-1]
+            assert terminal.type == RunEventType.RUN_ERROR
+            assert terminal.run_result is not None
+            assert terminal.run_result.status == RunStatus.ERROR
+            assert stream.result is terminal.run_result
+            meta = terminal.run_result.meta
+        else:
+            with pytest.raises(ValueError) as caught:
+                await agent.run("hi")
+            assert caught.value is failure
+            assert failure.run_id
+            meta = failure.run_meta
+        assert meta["mcp_skipped_sources"] == [
+            {
+                "source_name": "flaky",
+                "namespace": "flaky",
+                "error_type": "TimeoutError",
+                "error": "slow",
+            }
+        ]
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_stream_exposes_cancelled_result_with_discovery_snapshot() -> None:
+    from dendrux.llm.mock import MockLLM
+    from dendrux.types import LLMResponse, RunEventType, RunStatus
+
+    agent = Agent(
+        provider=MockLLM([LLMResponse(text="partial")]),
+        prompt="test",
+        tool_sources=[_make_failing_optional_source("flaky", TimeoutError("slow"))],
+    )
+    try:
+        async with agent.stream("hi") as stream:
+            assert stream.result is None
+            async for event in stream:
+                if event.type == RunEventType.TEXT_DELTA:
+                    agent._mcp_skipped_sources.clear()
+                    break
+        assert stream.result is not None
+        assert stream.result.status == RunStatus.CANCELLED
+        assert stream.result.meta["mcp_skipped_sources"][0]["source_name"] == "flaky"
+        result = stream.result
+        await stream.aclose()
+        assert stream.result is result
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_error_metadata_distinguishes_unavailable_discovery(strict, streaming) -> None:
+    from dendrux.llm.mock import MockLLM
+
+    source = _make_failing_optional_source("flaky", TimeoutError("slow"))
+    if strict:
+        source.failure_mode = "strict"
+    agent = Agent(provider=MockLLM([]), prompt="test", tool_sources=[source] if strict else [])
+    try:
+        if streaming:
+            stream = agent.stream("hi")
+            async for _ in stream:
+                pass
+            assert stream.result is not None
+            meta = stream.result.meta
+        else:
+            with pytest.raises((IndexError, TimeoutError)) as caught:
+                await agent.run("hi")
+            assert caught.value.run_id
+            meta = caught.value.run_meta
+        if strict:
+            assert "mcp_skipped_sources" not in meta
+        else:
+            assert meta["mcp_skipped_sources"] == []
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["blocking_error", "stream_error", "stream_closed"])
+async def test_resumed_terminal_metadata_and_lifecycle(mode: str) -> None:
+    from dendrux.llm.mock import MockLLM
+    from dendrux.loops.base import BaseNotifier
+    from dendrux.types import LLMResponse, RunEventType, RunResult, RunStatus, ToolCall, ToolResult
+    from tests.unit.test_resume import RecordingStateStore
+
+    @tool(target="client")
+    def read_data() -> str:
+        """Read client data."""
+        return ""
+
+    class Capture(BaseNotifier):
+        def __init__(self) -> None:
+            self.finished: list[RunResult] = []
+
+        async def on_run_finished(self, run_id: str, result: RunResult) -> None:
+            self.finished.append(result)
+
+    provider = MockLLM([LLMResponse(tool_calls=[ToolCall(name="read_data", params={})])])
+    store = RecordingStateStore()
+    agent = Agent(
+        provider=provider,
+        prompt="test",
+        tools=[read_data],
+        state_store=store,
+        tool_sources=[_make_failing_optional_source("flaky", TimeoutError("slow"))],
+    )
+    capture = Capture()
+    try:
+        paused = await agent.run("hi")
+        assert paused.status == RunStatus.WAITING_CLIENT_TOOL
+        pause = await store.get_pause_state(paused.run_id)
+        results = [
+            ToolResult(name="read_data", call_id=pause["pending_tool_calls"][0]["id"], payload="ok")
+        ]
+        if mode == "blocking_error":
+            with pytest.raises(IndexError) as caught:
+                await agent.resume(paused.run_id, tool_results=results)
+            assert caught.value.run_id == paused.run_id
+            meta = caught.value.run_meta
+        else:
+            async with agent.resume_stream(
+                paused.run_id, tool_results=results, notifier=capture
+            ) as stream:
+                async for event in stream:
+                    if mode == "stream_closed" and event.type == RunEventType.RUN_RESUMED:
+                        agent._mcp_skipped_sources.clear()
+                        break
+            assert stream.result is not None
+            meta = stream.result.meta
+            if mode == "stream_closed":
+                assert stream.result.status == RunStatus.CANCELLED
+                assert capture.finished == [stream.result]
+            else:
+                assert stream.result.status == RunStatus.ERROR
+        assert meta["mcp_skipped_sources"][0]["source_name"] == "flaky"
+    finally:
         await agent.close()

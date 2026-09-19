@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +22,7 @@ from dendrux.mcp._errors import (
     MCPAuthenticationError,
     MCPConnectionError,
     MCPDestinationDeniedError,
+    MCPOrigin,
 )
 from dendrux.mcp._http import create_http_client
 from dendrux.mcp._source import (
@@ -110,6 +113,33 @@ class MCPConnectionInfo:
     instructions: str | None
 
 
+def _diagnostic_origin(url: Any) -> MCPOrigin | None:
+    try:
+        parsed = httpx2.URL(url)
+        if parsed.scheme not in ("http", "https") or not parsed.host:
+            return None
+        return MCPOrigin(
+            parsed.scheme,
+            parsed.host,
+            parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80),
+        )
+    except (TypeError, ValueError, httpx2.InvalidURL):
+        return None
+
+
+@dataclass
+class _ToolHTTPAttempt:
+    adapter: MCPClientAdapter
+    tool: str
+    status: int | None = None
+    destination: MCPOrigin | None = None
+
+
+_tool_http_attempt: ContextVar[_ToolHTTPAttempt | None] = ContextVar(
+    "mcp_tool_http_attempt", default=None
+)
+
+
 class MCPClientAdapter:
     """Own one SDK ``Client`` lifecycle without leaking SDK API publicly."""
 
@@ -122,8 +152,10 @@ class MCPClientAdapter:
         self._stack: AsyncExitStack | None = None
         self._client: Client | None = None
         self.info: MCPConnectionInfo | None = None
+        self._last_redirect_target: MCPOrigin | None = None
         self._last_status: int | None = None
         self._destination_denied = False
+        self._last_destination = _diagnostic_origin(source.url) if source.url else None
 
     @property
     def connected(self) -> bool:
@@ -164,6 +196,9 @@ class MCPClientAdapter:
         finally:
             await self._close_owned_stack()
 
+    async def _observe_request(self, request: httpx2.Request) -> None:
+        self._last_destination = _diagnostic_origin(request.url)
+
     def _observe_destination_denied(self) -> None:
         self._destination_denied = True
 
@@ -176,12 +211,36 @@ class MCPClientAdapter:
         still classify that failure as a credential rejection.
         """
         self._last_status = getattr(response, "status_code", None)
+        if 300 <= (self._last_status or 0) < 400:
+            location = response.headers.get("location")
+            if location:
+                with suppress(ValueError, httpx2.InvalidURL):
+                    self._last_redirect_target = _diagnostic_origin(
+                        response.request.url.join(location)
+                    )
+        attempt = _tool_http_attempt.get()
+        if attempt is None or attempt.adapter is not self:
+            return
+        request = response.request
+        if request.method != "POST":
+            return
+        try:
+            body = json.loads(request.content)
+        except (ValueError, httpx2.RequestNotRead):
+            return
+        if not isinstance(body, dict) or body.get("method") != "tools/call":
+            return
+        if body.get("params", {}).get("name") != attempt.tool:
+            return
+        attempt.destination = _diagnostic_origin(request.url)
+        attempt.status = response.status_code
 
     async def _open(self) -> BaseException | None:
         """Open the transport, returning a detached safe failure if needed."""
 
         self._last_status = None
         self._destination_denied = False
+        self._last_redirect_target = None
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
@@ -190,6 +249,7 @@ class MCPClientAdapter:
                     create_http_client(
                         self.source,
                         response_hook=self._observe_response,
+                        request_hook=self._observe_request,
                         on_denied=self._observe_destination_denied,
                     )
                 )
@@ -224,6 +284,10 @@ class MCPClientAdapter:
             failure: BaseException = exc
         else:
             return None
+        failure_redirect_target = self._last_redirect_target
+        failure_destination = self._last_destination
+        failure_status = self._last_status
+        failure_denied = self._destination_denied
         cleanup_failure: BaseException | None = None
         try:
             await stack.aclose()
@@ -248,6 +312,10 @@ class MCPClientAdapter:
         # original exception as __context__ even with `from None`, and
         # error-monitoring SDKs walk __context__ regardless of
         # __suppress_context__ — which would republish the endpoint.
+        self._last_redirect_target = failure_redirect_target
+        self._last_destination = failure_destination
+        self._last_status = failure_status
+        self._destination_denied = failure_denied
         return self._safe_error("connect to", failure)
 
     async def list_tools(self) -> list[Any]:
@@ -317,15 +385,47 @@ class MCPClientAdapter:
                 f"Failed to {action} MCP source '{self.source.name}' ({failure_class})."
             )
         error.transport_detail = detail
+        error.origin = _diagnostic_origin(self.source.url) if self.source.url else None
+        error.destination = self._last_destination
+        for node in _iter_error_tree(exc):
+            request = None
+            with suppress(RuntimeError):
+                request = getattr(node, "request", None)
+            if request is not None:
+                error.destination = _diagnostic_origin(request.url)
+                break
+        error.redirect_target = self._last_redirect_target
+        if error.redirect_target is None and error.destination != error.origin:
+            error.redirect_target = error.destination
         return error
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         client = self._require_client()
-        return await client.call_tool(
-            name,
-            arguments,
-            read_timeout_seconds=self.source.call_timeout,
-        )
+        attempt = _ToolHTTPAttempt(self, name)
+        token = _tool_http_attempt.set(attempt)
+        try:
+            return await client.call_tool(
+                name,
+                arguments,
+                read_timeout_seconds=self.source.call_timeout,
+            )
+        except Exception as exc:
+            failure = exc
+        finally:
+            _tool_http_attempt.reset(token)
+        if attempt.status in _AUTH_REJECTION_STATUSES:
+            error = MCPAuthenticationError(
+                f"MCP source '{self.source.name}' rejected tool-call credentials "
+                f"(HTTP {attempt.status})."
+            )
+            error.status_code = attempt.status
+            error.request_rejected = attempt.destination == _diagnostic_origin(self.source.url)
+            error.origin = _diagnostic_origin(self.source.url)
+            error.destination = attempt.destination
+            if error.destination != error.origin:
+                error.redirect_target = error.destination
+            raise error from None
+        raise failure
 
     async def close(self) -> None:
         owner_task = self._owner_task

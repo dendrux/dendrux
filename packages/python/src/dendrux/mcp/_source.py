@@ -92,7 +92,12 @@ def safe_source_exception_detail(source: MCPSource, exc: BaseException) -> str:
     """
     if source_has_opaque_credentials(source):
         return "[detail suppressed: opaque auth]"
-    return redact_source_text(source, exception_text(exc)) or exception_class_name(exc)
+    return redact_transport_text(source, exception_text(exc)) or exception_class_name(exc)
+
+
+def redact_transport_text(source: MCPSource, text: str) -> str:
+    """Remove URLs as well as configured secrets from transport diagnostics."""
+    return re.sub(r"(?i)https?://[^\s<>\"']+", "[redacted URL]", redact_source_text(source, text))
 
 
 def redact_source_text(source: MCPSource, text: str) -> str:
@@ -202,6 +207,7 @@ class MCPSource:
     call_timeout: float = 120.0
     max_result_bytes: int = 1_000_000
     failure_mode: MCPFailureMode = "strict"
+    reauthenticate_on_401: bool = False
     follow_redirects: bool = True
     max_redirects: int = 20
     destination_policy: MCPDestinationPolicy | None = field(default=None, repr=False)
@@ -239,6 +245,8 @@ class MCPSource:
                 raise ValueError("MCPSource command must contain only strings.")
             if not self.command[0]:
                 raise ValueError("MCPSource command executable must be non-empty.")
+        if not isinstance(self.reauthenticate_on_401, bool):
+            raise ValueError("MCPSource reauthenticate_on_401 must be a bool.")
         if not isinstance(self.follow_redirects, bool):
             raise ValueError("MCPSource follow_redirects must be a bool.")
         if type(self.max_redirects) is not int or self.max_redirects < 0:
@@ -246,7 +254,8 @@ class MCPSource:
         if self.destination_policy is not None and not callable(self.destination_policy):
             raise ValueError("MCPSource destination_policy must be callable.")
         if self.command is not None and (
-            not self.follow_redirects
+            self.reauthenticate_on_401
+            or not self.follow_redirects
             or self.max_redirects != 20
             or self.destination_policy is not None
         ):
@@ -279,6 +288,7 @@ class MCPSource:
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
         failure_mode: MCPFailureMode = "strict",
+        reauthenticate_on_401: bool = False,
         follow_redirects: bool = True,
         max_redirects: int = 20,
         destination_policy: MCPDestinationPolicy | None = None,
@@ -293,6 +303,7 @@ class MCPSource:
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
             failure_mode=failure_mode,
+            reauthenticate_on_401=reauthenticate_on_401,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             destination_policy=destination_policy,

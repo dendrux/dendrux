@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class MCPOrigin:
+    """Explicit diagnostic origin, without userinfo, path, query, or fragment.
+
+    Hostnames may be private. These fields are opt-in diagnostics and are not
+    included in error messages or the default representation.
+    """
+
+    scheme: str
+    host: str
+    port: int
+
+    def __repr__(self) -> str:
+        return "MCPOrigin()"
 
 
 class MCPError(RuntimeError):
@@ -19,6 +36,15 @@ class MCPConnectionError(MCPError):
     """
 
     transport_detail: str | None = None
+    origin: MCPOrigin | None = None
+    destination: MCPOrigin | None = None
+    redirect_target: MCPOrigin | None = None
+
+    @property
+    def host(self) -> str | None:
+        """Return the attempted hostname for opt-in diagnostics."""
+        target = self.destination or self.origin
+        return target.host if target is not None else None
 
 
 class MCPDestinationDeniedError(MCPConnectionError):
@@ -45,6 +71,7 @@ class MCPAuthenticationError(MCPConnectionError):
     """
 
     status_code: int | None = None
+    request_rejected: bool = False
 
 
 class MCPBindingConflictError(MCPError):

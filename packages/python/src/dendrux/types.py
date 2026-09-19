@@ -765,14 +765,20 @@ class RunStream:
         self,
         run_id: str,
         generator: AsyncGenerator[RunEvent, None],
-        cleanup: Callable[[], Coroutine[Any, Any, None]],
+        cleanup: Callable[[], Coroutine[Any, Any, RunResult | None]],
     ) -> None:
         self.run_id = run_id
         self._gen = generator
         self._cleanup = cleanup
+        self._result: RunResult | None = None
         self._terminated = False
         self._started = False
         self._closed = False
+
+    @property
+    def result(self) -> RunResult | None:
+        """Terminal result after a terminal event or explicit stream closure."""
+        return self._result
 
     def __aiter__(self) -> AsyncGenerator[RunEvent, None]:
         if self._started:
@@ -791,6 +797,7 @@ class RunStream:
             async for event in self._gen:
                 if event.type in _TERMINAL_RUN_EVENTS:
                     self._terminated = True
+                    self._result = event.run_result
                 yield event
         finally:
             await self._finalize()
@@ -813,7 +820,7 @@ class RunStream:
         self._closed = True
         if not self._terminated:
             try:
-                await self._cleanup()
+                self._result = await self._cleanup()
             except Exception:
                 logger.warning("RunStream cleanup failed", exc_info=True)
         await self._gen.aclose()
