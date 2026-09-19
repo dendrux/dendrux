@@ -18,6 +18,7 @@ Sprint 2 adds optional state_store for persistence. When provided:
 from __future__ import annotations
 
 import logging
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
@@ -310,6 +311,23 @@ _WAITING_STATUSES = (
 )
 
 
+def _track_partial_text(shared: dict[str, Any], event: RunEvent) -> None:
+    """Buffer streamed text so an abandoned stream can persist a partial answer.
+
+    The buffer holds the current LLM call's deltas; it resets when a tool
+    result passes, since a new call follows.
+    """
+    if event.type == RunEventType.TEXT_DELTA:
+        shared.setdefault("partial_text", []).append(event.text or "")
+    elif event.type == RunEventType.TOOL_RESULT:
+        shared.pop("partial_text", None)
+
+
+def _partial_answer(shared: dict[str, Any]) -> str | None:
+    parts = shared.get("partial_text")
+    return "".join(parts) if parts else None
+
+
 async def _persist_loop_outcome(
     *,
     state_store: StateStore,
@@ -360,18 +378,17 @@ async def _persist_loop_outcome(
             status=RunStatus.CANCELLED.value,
             allowed_current_statuses=[s.value for s in _WAITING_STATUSES]
             + [RunStatus.RUNNING.value],
+            answer=user_answer,
             iteration_count=result.iteration_count,
             total_usage=result.usage,
             pii_mapping=result.meta.get("pii_mapping"),
         )
         if won:
-            await _emit_event(
-                state_store,
-                run_id,
-                "run.cancelled",
-                sequencer,
-                {"reason": "cancel_requested"},
-            )
+            payload: dict[str, Any] = {"reason": "cancel_requested"}
+            if result.meta.get("interrupted"):
+                payload["interrupted"] = True
+                payload["partial_output"] = bool(result.meta.get("partial_output"))
+            await _emit_event(state_store, run_id, "run.cancelled", sequencer, payload)
         return _wrap(status=RunStatus.CANCELLED, won=won)
 
     if result.status in _WAITING_STATUSES:
@@ -1411,8 +1428,12 @@ def run_stream(
                     0,
                 )
 
-            # 3. Stream the loop
-            async for event in resolved_loop.run_stream(
+            # 3. Stream the loop. The interrupt signal lets cancel_run reach
+            # an in-flight provider stream owned by this process; aclosing
+            # guarantees the loop generator is finalized in this task when
+            # the consumer abandons the stream.
+            interrupt = agent._task_manager.register_interrupt(run_id)
+            loop_stream = resolved_loop.run_stream(
                 agent=agent,
                 provider=provider,
                 strategy=resolved_strategy,
@@ -1424,40 +1445,46 @@ def run_stream(
                 provider_kwargs=provider_kwargs or None,
                 output_type=output_type,
                 state_store=store,
-            ):
-                _terminal_types = (
-                    RunEventType.RUN_COMPLETED,
-                    RunEventType.RUN_PAUSED,
-                    RunEventType.RUN_CANCELLED,
-                )
-                terminal_result = event.run_result if event.type in _terminal_types else None
-                if terminal_result is not None:
-                    if store is not None:
-                        persisted = await _persist_loop_outcome(
-                            state_store=store,
-                            run_id=run_id,
-                            result=terminal_result,
-                            sequencer=sequencer,
-                        )
-                        # Pre-pause checkpoint can flip a PAUSED iteration to
-                        # CANCELLED. Re-derive the event type from the persisted
-                        # status so the consumer sees the correct terminal event.
-                        if persisted.status == RunStatus.CANCELLED:
-                            event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                interrupt=interrupt,
+            )
+            async with aclosing(loop_stream):
+                async for event in loop_stream:
+                    _terminal_types = (
+                        RunEventType.RUN_COMPLETED,
+                        RunEventType.RUN_PAUSED,
+                        RunEventType.RUN_CANCELLED,
+                    )
+                    terminal_result = event.run_result if event.type in _terminal_types else None
+                    if terminal_result is not None:
+                        if store is not None:
+                            persisted = await _persist_loop_outcome(
+                                state_store=store,
+                                run_id=run_id,
+                                result=terminal_result,
+                                sequencer=sequencer,
+                            )
+                            # Pre-pause checkpoint can flip a PAUSED iteration to
+                            # CANCELLED. Re-derive the event type from the persisted
+                            # status so the consumer sees the correct terminal event.
+                            if persisted.status == RunStatus.CANCELLED:
+                                event = RunEvent(
+                                    type=RunEventType.RUN_CANCELLED, run_result=persisted
+                                )
+                            else:
+                                event = RunEvent(type=event.type, run_result=persisted)
+                            await record_run_finished(recorder, run_id, persisted)
+                            await notify_run_finished(extra_notifier, run_id, persisted)
                         else:
-                            event = RunEvent(type=event.type, run_result=persisted)
-                        await record_run_finished(recorder, run_id, persisted)
-                        await notify_run_finished(extra_notifier, run_id, persisted)
+                            # No persistence: skip _persist_loop_outcome but still
+                            # close the lifecycle pair so notifier-side spans
+                            # (OTel root span) don't leak.
+                            await record_run_finished(recorder, run_id, terminal_result)
+                            await notify_run_finished(extra_notifier, run_id, terminal_result)
+                        yield event
                     else:
-                        # No persistence: skip _persist_loop_outcome but still
-                        # close the lifecycle pair so notifier-side spans
-                        # (OTel root span) don't leak.
-                        await record_run_finished(recorder, run_id, terminal_result)
-                        await notify_run_finished(extra_notifier, run_id, terminal_result)
-                    yield event
-                else:
-                    # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
-                    yield event
+                        # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
+                        _track_partial_text(_shared, event)
+                        yield event
 
         except Exception as exc:
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
@@ -1499,6 +1526,7 @@ def run_stream(
             )
 
         finally:
+            agent._task_manager.release_interrupt(run_id)
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
@@ -1525,15 +1553,23 @@ def run_stream(
         sequencer = _shared.get("sequencer")
 
         cancel_won = False
+        partial_answer = _partial_answer(_shared)
         if store is not None:
             try:
                 cancel_won = await store.finalize_run(
                     run_id,
                     status=RunStatus.CANCELLED.value,
+                    answer=partial_answer,
                     expected_current_status="running",
                 )
                 if cancel_won and sequencer:
-                    await _emit_event(store, run_id, "run.cancelled", sequencer, {})
+                    await _emit_event(
+                        store,
+                        run_id,
+                        "run.cancelled",
+                        sequencer,
+                        {"reason": "stream_closed", "partial_output": partial_answer is not None},
+                    )
             except Exception:
                 logger.error("Failed to cancel run %s during stream cleanup", run_id, exc_info=True)
 
@@ -2380,8 +2416,9 @@ def resume_stream(
                     _rejected_data_s,
                 )
 
-            # 9. Stream the loop
-            async for event in ctx.resolved_loop.run_stream(
+            # 9. Stream the loop (see run_stream for interrupt + aclosing notes)
+            interrupt = agent._task_manager.register_interrupt(run_id)
+            loop_stream = ctx.resolved_loop.run_stream(
                 agent=agent,
                 provider=provider,
                 strategy=ctx.resolved_strategy,
@@ -2394,31 +2431,35 @@ def resume_stream(
                 iteration_offset=ctx.pause_state.iteration,
                 initial_usage=ctx.pause_state.usage,
                 state_store=store,
-            ):
-                if (
-                    event.type
-                    in (
-                        RunEventType.RUN_COMPLETED,
-                        RunEventType.RUN_PAUSED,
-                        RunEventType.RUN_CANCELLED,
-                    )
-                    and event.run_result
-                ):
-                    persisted = await _persist_loop_outcome(
-                        state_store=store,
-                        run_id=run_id,
-                        result=event.run_result,
-                        sequencer=ctx.sequencer,
-                    )
-                    if persisted.status == RunStatus.CANCELLED:
-                        event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                interrupt=interrupt,
+            )
+            async with aclosing(loop_stream):
+                async for event in loop_stream:
+                    if (
+                        event.type
+                        in (
+                            RunEventType.RUN_COMPLETED,
+                            RunEventType.RUN_PAUSED,
+                            RunEventType.RUN_CANCELLED,
+                        )
+                        and event.run_result
+                    ):
+                        persisted = await _persist_loop_outcome(
+                            state_store=store,
+                            run_id=run_id,
+                            result=event.run_result,
+                            sequencer=ctx.sequencer,
+                        )
+                        if persisted.status == RunStatus.CANCELLED:
+                            event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
+                        else:
+                            event = RunEvent(type=event.type, run_result=persisted)
+                        await record_run_finished(ctx.recorder, run_id, persisted)
+                        await notify_run_finished(ctx.notifier, run_id, persisted)
+                        yield event
                     else:
-                        event = RunEvent(type=event.type, run_result=persisted)
-                    await record_run_finished(ctx.recorder, run_id, persisted)
-                    await notify_run_finished(ctx.notifier, run_id, persisted)
-                    yield event
-                else:
-                    yield event
+                        _track_partial_text(_shared, event)
+                        yield event
 
         except Exception as exc:
             store = _shared.get("state_store")
@@ -2471,6 +2512,7 @@ def resume_stream(
             )
 
         finally:
+            agent._task_manager.release_interrupt(run_id)
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
@@ -2487,15 +2529,23 @@ def resume_stream(
         sequencer = _shared.get("sequencer")
 
         cancel_won = False
+        partial_answer = _partial_answer(_shared)
         if store is not None:
             try:
                 cancel_won = await store.finalize_run(
                     run_id,
                     status=RunStatus.CANCELLED.value,
+                    answer=partial_answer,
                     expected_current_status="running",
                 )
                 if cancel_won and sequencer:
-                    await _emit_event(store, run_id, "run.cancelled", sequencer, {})
+                    await _emit_event(
+                        store,
+                        run_id,
+                        "run.cancelled",
+                        sequencer,
+                        {"reason": "stream_closed", "partial_output": partial_answer is not None},
+                    )
             except Exception:
                 logger.error(
                     "Failed to cancel run %s during resume stream cleanup",

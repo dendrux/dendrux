@@ -5,7 +5,7 @@ description: How a running or paused dendrux run is cleanly cancelled from any p
 
 # Cancellation
 
-`agent.cancel_run(run_id)` terminates a run. It works whether the run is currently paused in the DB, running on another server, or running inside a task the current process owns. It never kills an in-flight LLM call or a tool execution mid-step. Instead, it uses two mechanisms in parallel: a cooperative flag for running runs, and an atomic CAS for paused ones. Whichever condition applies wins, and the run ends in status `cancelled`.
+`agent.cancel_run(run_id)` terminates a run. It works whether the run is currently paused in the DB, running on another server, or streaming inside a process the current `Agent` owns. It never kills a tool execution mid-step. It uses three mechanisms in parallel: an atomic CAS for paused runs, a cooperative flag for running runs anywhere, and an in-process interrupt for streamed runs this `Agent` instance owns. Whichever condition applies wins, and the run ends in status `cancelled`.
 
 ## Two scenarios, one API
 
@@ -14,10 +14,13 @@ There is one method on `Agent` for cancellation, and its behavior depends on wha
 | Run state at cancel time | What happens |
 | --- | --- |
 | Paused (`waiting_approval`, `waiting_client_tool`, `waiting_human_input`) | CAS finalize from the paused status to `cancelled` in a single `UPDATE`. Wins instantly. |
-| Running (`running`) | Sets `cancel_requested = true` on the row. The runner observes the flag at its next checkpoint and finalizes itself as `cancelled`. |
+| Running (`running`), any process | Sets `cancel_requested = true` on the row. The runner observes the flag at its next checkpoint and finalizes itself as `cancelled`. |
+| Streaming (`running`) via `stream()` / `resume_stream()` on **this** `Agent` instance | Additionally sets an in-process interrupt. The loop abandons the in-flight model stream immediately and yields `RUN_CANCELLED` with the text streamed so far as `answer`. |
 | Terminal (`success`, `error`, `cancelled`, `max_iterations`) | No-op. Returns the current persisted state. Does not raise. |
 
-The caller does not have to know which branch applies. `cancel_run` sets the cooperative flag *and* attempts the paused-state CAS in the same call. Exactly one of them succeeds.
+The caller does not have to know which branch applies. `cancel_run` sets the cooperative flag, attempts the paused-state CAS, and fires the in-process interrupt in the same call. Exactly one path produces the terminal `run.cancelled` event.
+
+`cancel_run` returning is a receipt, not a confirmation. If the returned `RunResult` has a non-terminal `status`, `meta["cancel_requested"]` is `True` and the run is *on its way* to cancelled. Confirmation is the terminal signal: `RUN_CANCELLED` on the stream you are consuming, the `run.cancelled` event in the log, or `status == "cancelled"` from `RunStore.get_run` (which also exposes `cancel_requested`).
 
 ## Cancelling a paused run
 
@@ -102,12 +105,56 @@ Three things worth noting in that diff.
 
 When the run is actively iterating, cancel cannot finalize atomically without fighting the runner. Instead, `cancel_run` sets the `cancel_requested` flag and returns. The runner itself is responsible for seeing the flag and stopping.
 
-The runner observes the flag at exactly two checkpoints:
+The runner observes the durable flag at two checkpoints:
 
 1. **Top of each iteration.** Before building messages or calling the LLM, the loop reads `is_cancel_requested(run_id)`. If true, the loop returns with status `CANCELLED` and the runner finalizes.
 2. **Pre-pause.** If the iteration body decides to pause (a client tool needs running, approval is required, clarification is needed), the runner checks the flag one more time before writing `pause_data`. This prevents a cancel that arrived mid-iteration from settling the run into a paused state with stale `pause_data`.
 
-The current iteration's in-flight LLM call and tool executions are never preempted. A call already in the air finishes normally, its result is recorded, and the cancel is honored at the next checkpoint. That is a deliberate design choice: aborting an LLM call mid-stream leaks tokens and provider state, and aborting a tool call mid-execution leaks side effects. Waiting one iteration boundary is cheaper than cleaning up either of those.
+Tool executions are never preempted. A tool already running finishes normally, its result is recorded, and the cancel is honored at the next checkpoint. Aborting a tool mid-execution leaks side effects, and waiting one boundary is cheaper than cleaning that up.
+
+A non-streamed `agent.run()` call behaves the same way for its LLM calls: a call already in the air completes, and cancel lands at the next checkpoint. Streamed runs get a third checkpoint, described next.
+
+## Interrupting a streamed run
+
+A chat turn is usually one iteration, so "observed at the next iteration" would make `cancel_run` useless for exactly the runs people most want to interrupt. Streamed runs therefore get an in-process interrupt.
+
+When `stream()` or `resume_stream()` starts driving the loop, the runner registers an `asyncio.Event` for that run on the owning `Agent`. `cancel_run` on the same instance sets it. Inside the loop, every pull from the provider stream is raced against that event, so an interrupt is honoured while the model is still silent, not just when the next token arrives. On interrupt the loop:
+
+1. Closes the provider stream (the HTTP connection is dropped; the vendor stops generating).
+2. Reports the abandoned call through `on_llm_call_failed` with a `StreamInterruptedError`, so notifiers can close the span.
+3. Yields `RUN_CANCELLED` whose `run_result.answer` is the text streamed so far, with `meta["interrupted"] = True` and `meta["partial_output"]` saying whether `answer` carries anything.
+
+The runner persists that outcome exactly like any other terminal result: status `cancelled`, `answer` set to the partial text, and a `run.cancelled` event carrying `{"reason": "cancel_requested", "interrupted": true, "partial_output": true}`.
+
+```python
+async with agent.stream("Write me a long essay") as stream:
+    consumer = asyncio.create_task(consume(stream))     # your code reads events
+
+    ...
+    await agent.cancel_run(stream.run_id)               # from anywhere in this process
+    events = await consumer                             # ends with RUN_CANCELLED
+    partial = events[-1].run_result.answer              # what the user already saw
+```
+
+The interrupt lives on the `Agent` instance, so it only reaches streams that instance is driving. `cancel_run` from another process (or another `Agent` object) still sets the durable flag; that run finishes its current model call and cancels at the next checkpoint. If you need cross-process mid-stream interruption, call `cancel_run` on the instance that owns the stream, for example by routing the request to the server that holds the SSE connection.
+
+The abandoned model call reports no usage (providers send token counts only at the end of a stream), so `usage` on the cancelled result covers completed iterations only. The interrupted call is not stored as an `llm_interactions` row; the partial answer on the run row and the `run.cancelled` payload are the audit trail.
+
+## Abandoning a stream
+
+Closing the `RunStream` (`aclose()`, leaving `async with`, or `break` followed by garbage collection) is the other way a streamed run ends early. The runner's cleanup finalizes the row as `cancelled` and persists the same partial answer, with `run.cancelled` carrying `{"reason": "stream_closed", "partial_output": ...}`. The loop's generator is closed deterministically in the same task, so provider connections and telemetry context are released before `aclose()` returns.
+
+Prefer `cancel_run` when the interruption is a product action (a user hit stop, another agent took the floor): it goes through the loop, closes the LLM lifecycle pair, and gives the consumer a terminal `RUN_CANCELLED` event to react to. Closing the stream is for when the consumer itself is going away.
+
+## Which wins: completion or cancellation
+
+Exactly one terminal status is ever written, because every finalize is an atomic compare-and-swap. The rule for what that status is:
+
+- **Cancel arrives before the provider's next event** (including while the model is silent): cancellation wins. The result is `cancelled` with a partial answer.
+- **Cancel arrives after the provider's final event has been received** (the loop is recording the completed call, or executing a tool): the current iteration finishes. If it produces the final answer, the run is `success` and `cancel_requested` is cleared. If it pauses or continues, cancellation is honoured at the pre-pause or top-of-iteration checkpoint.
+- **Cancel arrives after the run is terminal**: no-op.
+
+In other words, a model response that is fully in hand is never thrown away. Partial output is preserved only when there was genuinely more to come.
 
 ## Why the flag is race-safe
 
@@ -144,10 +191,12 @@ If the run is running (not paused), this matches 0 rows and has no effect. The c
 
 The alternative to a flag + checkpoints is to cancel the asyncio task running the loop. Python can raise `CancelledError` into the coroutine, and the runner would stop immediately.
 
-Dendrux does do this for runs it owns an in-process handle to: the `Agent._task_manager.cancel(run_id)` line in `cancel_run` preempts a locally-running `submit_*` task. But that is additive, not primary. The cooperative flag is the source of truth, for three reasons:
+Dendrux does use in-process signals where it owns a handle: `cancel_run` cancels a locally running `submit_*` task and sets the interrupt for a locally streamed run. But those are additive, not primary. The cooperative flag is the source of truth, for three reasons:
 
 1. **Cross-process cancel works at all.** A preemptive asyncio cancel cannot reach a run executing on another server. A flag on the DB row can.
-2. **In-flight provider calls are respected.** A `CancelledError` raised inside a model stream orphans the provider's state. The flag waits until the next natural boundary.
-3. **One code path, one contract.** The runner checks the flag in exactly two places. Anything outside those two points is guaranteed not to observe cancellation, which makes the loop's invariants easy to hold.
+2. **Tool executions are respected.** A `CancelledError` raised inside a tool orphans whatever the tool was doing. The flag waits until the tool returns.
+3. **Bounded observation points.** The loop observes cancellation at the top of an iteration, before pausing, and between provider stream events. Nothing else observes it, which keeps the loop's invariants easy to hold.
 
-The result is a cancel that is deterministic for paused runs, observable-within-one-iteration for running runs, and idempotent for terminal ones. One call, regardless of where the run actually lives.
+The in-process stream interrupt is the one place Dendrux does preempt a provider call, and it does so at a boundary the loop controls: between two stream events, after closing the provider stream, with the partial output captured. That is very different from throwing `CancelledError` into arbitrary code.
+
+The result is a cancel that is deterministic for paused runs, immediate for streams this process owns, observable-within-one-iteration for everything else, and idempotent for terminal ones. One call, regardless of where the run actually lives.

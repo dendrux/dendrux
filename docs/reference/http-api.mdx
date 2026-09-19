@@ -87,7 +87,7 @@ Response:
 
 ### `GET /runs/{run_id}`
 
-Single run detail. Returns the same summary fields plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`.
+Single run detail. Returns the same summary fields plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (true while a cancel has been requested but the run has not yet reached a terminal status).
 
 Errors: `404` if not found.
 
@@ -235,7 +235,7 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval", "pending_tool_calls": [{"id", "name", "target", "params"}]}` |
 | `run.resumed` | Submit method claims a paused run | `{"submitted_results": [...]}` or `{"user_input": str}` |
 | `run.completed` | Terminal success or max_iterations | empty `{}` |
-| `run.cancelled` | Paused-run CAS cancel or in-flight run observes the flag | `{"reason": "cancel_requested"}` |
+| `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, or streamed run interrupted / closed | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when a model stream was abandoned mid-generation; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream |
 | `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars) |
 | `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "cost_usd", "model", "has_tool_calls"}` |
 | `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`, `correlation_id` = tool call id |
@@ -309,7 +309,8 @@ Cooperative cancellation with atomic finalize on the paused path.
 Behavior by current state:
 
 - **Paused** (any process): atomic CAS finalize to `CANCELLED` in one round-trip. Emits `run.cancelled` with `{"reason": "cancel_requested"}` (sequenced after any prior paused event so SSE clients reading by `after_sequence_index` do not miss it).
-- **Running** (any process, persisted): sets `cancel_requested=True`. The runner observes the flag at the top of the next iteration and at the pre-pause checkpoint. The current iteration's LLM and tool calls complete; cancel is observed between steps, not mid-step.
+- **Running** (any process, persisted): sets `cancel_requested=True`. The runner observes the flag at the top of the next iteration and at the pre-pause checkpoint. Tool calls complete; cancel is observed between steps.
+- **Streamed run on this agent instance** (`stream()` / `resume_stream()`): also fires an in-process interrupt. The in-flight model stream is abandoned immediately and the stream yields `RUN_CANCELLED` with the partial `answer` (persisted on the row). Once the model's final event is in hand, completion wins.
 - **In-process submit/resume task on this agent instance**: the asyncio task is also cancelled synchronously.
 - **Terminal**: no-op. Returns current persisted state. Does not raise.
 - **Non-persisted**: unsupported. Raises `PersistenceNotConfiguredError`.

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- `agent.cancel_run()` now interrupts an in-flight model stream for runs
+  driven by `stream()` / `resume_stream()` on the same `Agent` instance,
+  including while waiting for the next token. The stream ends with
+  `RUN_CANCELLED`; `answer` holds the text streamed so far and is persisted
+  on the run row. `run.cancelled` gains `interrupted` / `partial_output`.
+- Closing a `RunStream` early now persists the partial answer
+  (`run.cancelled` with `reason: stream_closed`) and closes the loop
+  generator deterministically in the caller's task.
+- `cancel_run()` returns the state at the time of the request; the result's
+  `meta["cancel_requested"]` and `RunDetail.cancel_requested` distinguish
+  "requested" from "stopped".
+- Loops: `run_stream()` accepts an optional `interrupt: asyncio.Event`.
+  Custom loops that override `run_stream` should accept the kwarg.
+- Fixed a `ValueError` ("Token was created in a different Context") logged
+  when a stream was abandoned mid-provider-call.
+
 ## 0.2.0a14 - 2026-08-15
 
 - Add the production managed MCP client runtime, including lazy shared

@@ -90,6 +90,7 @@ def _record_to_run_result(record: Any) -> RunResult:
         error=record.error,
         iteration_count=record.iteration_count,
         usage=usage,
+        meta={"cancel_requested": bool(record.cancel_requested)},
     )
 
 
@@ -1276,10 +1277,17 @@ class Agent:
           ``cancel_requested=True`` on the DB row. The runner observes
           this flag at the top of the next iteration (and at the
           pre-pause checkpoint after the current iteration's loop body
-          returns) and exits cleanly as ``CANCELLED``. The current
-          iteration's in-flight LLM/tool calls are not preempted —
-          cancellation is observed *before starting the next iteration*,
-          not mid-step.
+          returns) and exits cleanly as ``CANCELLED``. In-flight tool
+          executions are never preempted.
+        - **Streamed run owned by this Agent instance** (``stream()`` /
+          ``resume_stream()``): additionally sets an in-process interrupt
+          signal. The loop races every provider pull against it, so an
+          in-flight model stream is abandoned immediately — even while
+          waiting for the next token. The stream then yields
+          ``RUN_CANCELLED`` whose ``answer`` is the text streamed so far
+          (``meta["interrupted"]`` / ``meta["partial_output"]``). Once the
+          provider's final event has been received, completion wins and
+          the run finishes as ``success``.
         - **In-process submit/resume task on this Agent instance:** the
           asyncio task spawned by :meth:`submit_tool_results`,
           :meth:`submit_input`, or :meth:`submit_approval` is cancelled
@@ -1288,6 +1296,12 @@ class Agent:
           Does not raise.
         - **Non-persisted runs:** unsupported. ``cancel_run`` requires a
           configured DB. Raises ``PersistenceNotConfiguredError``.
+
+        Returning is *not* confirmation that the run stopped. A result
+        with a non-terminal ``status`` and ``meta["cancel_requested"]``
+        set means cancellation was requested; the terminal event
+        (``RUN_CANCELLED`` on the stream, ``run.cancelled`` in the event
+        log, ``status == "cancelled"`` in the store) confirms it.
 
         Returns:
             :class:`RunResult` reflecting the persisted state after the
@@ -1324,7 +1338,6 @@ class Agent:
         # If paused: CAS wins instantly. If running: CAS misses, runner
         # sees the flag at its next checkpoint and finalizes itself.
         await store.request_cancel(run_id)
-        self._task_manager.cancel(run_id)
 
         cancel_won = await store.finalize_run_if_status_in(
             run_id,
@@ -1352,6 +1365,13 @@ class Agent:
         record = await store.get_run(run_id)
         if record is None:  # pragma: no cover — we just preflight-checked
             raise RunNotFoundError(run_id)
+
+        # In-process signals last, after the durable request is recorded and
+        # the returned snapshot is read: a locally owned stream or submit task
+        # is preempted from here on, and the returned RunResult deterministically
+        # reflects "requested" (non-terminal status + meta.cancel_requested)
+        # rather than racing the loop's own finalize.
+        self._task_manager.cancel(run_id)
         return _record_to_run_result(record)
 
     @overload
@@ -1413,9 +1433,13 @@ class Agent:
                 async for event in stream:
                     ...
 
-        After any terminal event (RUN_COMPLETED, RUN_PAUSED, RUN_ERROR),
-        the stream ends. If the consumer breaks early, the run is
-        cancelled via CAS-guarded cleanup.
+        After any terminal event (RUN_COMPLETED, RUN_PAUSED, RUN_ERROR,
+        RUN_CANCELLED), the stream ends. If the consumer breaks early,
+        the run is cancelled via CAS-guarded cleanup and the text streamed
+        so far is persisted as the run's ``answer``. To interrupt from
+        another coroutine, call :meth:`cancel_run` with ``stream.run_id``;
+        the stream then yields ``RUN_CANCELLED`` carrying the partial
+        answer.
 
         Args:
             user_input: The user's input to process.

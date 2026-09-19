@@ -90,7 +90,7 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`.
 
-**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`.
+**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status).
 
 **`StoredEvent`** (from `get_events`): `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data`, `created_at`.
 

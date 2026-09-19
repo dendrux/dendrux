@@ -30,8 +30,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._helpers import (
+    StreamInterruptedError,
     build_cache_key_prefix,
     guardrail_meta,
+    interruptible,
     notify_governance,
     notify_llm,
     notify_llm_failed,
@@ -1042,6 +1044,7 @@ class ReActLoop(Loop):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         state_store: StateStore | None = None,
+        interrupt: asyncio.Event | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 
@@ -1072,7 +1075,12 @@ class ReActLoop(Loop):
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
             # Cooperative cancellation checkpoint (see run() for rationale).
-            if state_store is not None and await state_store.is_cancel_requested(resolved_run_id):
+            # The in-process interrupt is checked first: it is free, and it
+            # lets a cancel that landed during tool execution stop the run
+            # before the next provider call is even started.
+            if (interrupt is not None and interrupt.is_set()) or (
+                state_store is not None and await state_store.is_cancel_requested(resolved_run_id)
+            ):
                 cancel_meta: dict[str, Any] = (
                     {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                 )
@@ -1127,10 +1135,13 @@ class ReActLoop(Loop):
                 cache_key_prefix=cache_key_prefix,
                 **_pkw,
             )
+            partial_text: list[str] = []
+            interrupted = False
             try:
                 try:
-                    async for event in provider_stream:
+                    async for event in interruptible(provider_stream, interrupt):
                         if event.type == StreamEventType.TEXT_DELTA:
+                            partial_text.append(event.text or "")
                             yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
                         elif event.type == StreamEventType.REASONING_DELTA:
                             yield RunEvent(type=RunEventType.REASONING_DELTA, text=event.text)
@@ -1174,11 +1185,34 @@ class ReActLoop(Loop):
                         notifier_warnings,
                         duration_ms=_stream_fail_ms,
                     )
-                    raise
+                    if isinstance(_stream_exc, StreamInterruptedError):
+                        interrupted = True
+                    else:
+                        raise
             finally:
                 await provider_stream.aclose()
                 _stream_telemetry.__exit__(None, None, None)
 
+            if interrupted:
+                # Mid-stream interrupt (cancel_run reached this process). The
+                # interrupted call reported no usage, so total_usage covers
+                # completed iterations only. Partial text becomes the answer.
+                yield RunEvent(
+                    type=RunEventType.RUN_CANCELLED,
+                    run_result=_interrupted_result(
+                        run_id=resolved_run_id,
+                        partial_text=partial_text,
+                        steps=steps,
+                        iteration=iteration,
+                        usage=total_usage,
+                        notifier_warnings=notifier_warnings,
+                    ),
+                )
+                return
+
+            # The try-block raised if no DONE arrived; only the interrupted path
+            # (handled above) leaves this None.
+            assert llm_response is not None
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
             await _record_llm(
@@ -1354,6 +1388,36 @@ class ReActLoop(Loop):
                 meta=meta,
             ),
         )
+
+
+def _interrupted_result(
+    *,
+    run_id: str,
+    partial_text: list[str],
+    steps: list[AgentStep],
+    iteration: int,
+    usage: UsageStats,
+    notifier_warnings: list[str],
+) -> RunResult:
+    """Build the ``RunResult`` for a run whose provider stream was interrupted.
+
+    ``answer`` is the text streamed so far (``None`` if nothing arrived).
+    ``meta.interrupted`` is always True; ``meta.partial_output`` says whether
+    ``answer`` carries anything.
+    """
+    answer = "".join(partial_text) or None
+    meta: dict[str, Any] = {"interrupted": True, "partial_output": answer is not None}
+    if notifier_warnings:
+        meta["notifier_warnings"] = notifier_warnings
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.CANCELLED,
+        answer=answer,
+        steps=steps,
+        iteration_count=iteration,
+        usage=usage,
+        meta=meta,
+    )
 
 
 # Backwards compatibility alias for runner.py's existing import.
