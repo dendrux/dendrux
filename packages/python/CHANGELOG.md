@@ -17,6 +17,12 @@
   Custom loops that override `run_stream` should accept the kwarg.
 - Fixed a `ValueError` ("Token was created in a different Context") logged
   when a stream was abandoned mid-provider-call.
+- The interrupt race keeps the provider generator in the loop's own task
+  (the same cancel-and-uncancel pattern as `asyncio.timeout()`), so
+  ContextVars providers set inside their stream generators reset cleanly.
+  Provider generators are never advanced from a helper task.
+- Closing a `RunStream` never raises out of the loop generator's cleanup;
+  cleanup failures are logged and the run is still finalized `cancelled`.
 
 ## 0.2.0a14 - 2026-08-15
 

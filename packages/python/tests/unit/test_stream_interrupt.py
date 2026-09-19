@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from dendrux import Agent, tool
+from dendrux.llm._retry_telemetry import _attempts
 from dendrux.loops._helpers import StreamInterruptedError, interruptible
+from dendrux.loops.base import Loop
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
 from dendrux.strategies.native import NativeToolCalling
@@ -195,6 +197,69 @@ class TestInterruptible:
             pass
         await asyncio.sleep(0)
         assert len(asyncio.all_tasks()) <= before
+
+    async def test_provider_runs_in_callers_task_and_context(self) -> None:
+        """ContextVars set inside the provider generator must be visible to,
+        and resettable from, the caller — i.e. the pull is not offloaded to
+        a helper task with a copied context."""
+        provider = GatedStreamLLM()
+        provider.gate.set()
+        caller = asyncio.current_task()
+        seen_tasks: set[asyncio.Task[Any] | None] = set()
+
+        async def _spy() -> AsyncGenerator[StreamEvent, None]:
+            async for ev in provider.complete_stream([]):
+                seen_tasks.add(asyncio.current_task())
+                yield ev
+
+        assert _attempts.get() is None
+        events = [ev.type async for ev in interruptible(_spy(), asyncio.Event())]
+        assert events[-1] == StreamEventType.DONE
+        assert seen_tasks == {caller}
+        assert _attempts.get() is None  # reset succeeded in the same context
+
+    async def test_interrupt_restores_provider_contextvars(self) -> None:
+        provider = GatedStreamLLM()
+        interrupt = asyncio.Event()
+
+        async def _fire() -> None:
+            await provider.first_sent.wait()
+            interrupt.set()
+
+        firer = asyncio.create_task(_fire())
+        with pytest.raises(StreamInterruptedError):
+            async for _ in interruptible(provider.complete_stream([]), interrupt):
+                pass
+        await firer
+        assert _attempts.get() is None
+        assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
+
+    async def test_external_cancellation_still_propagates(self) -> None:
+        """A real cancel of the consuming task is not swallowed as an interrupt."""
+        provider = GatedStreamLLM()
+        interrupt = asyncio.Event()
+
+        async def _consume() -> None:
+            async for _ in interruptible(provider.complete_stream([]), interrupt):
+                pass
+
+        task = asyncio.create_task(_consume())
+        await provider.first_sent.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert provider.cancelled is True
+
+    async def test_signal_set_while_consumer_holds_event_is_seen_on_next_pull(self) -> None:
+        provider = GatedStreamLLM()
+        interrupt = asyncio.Event()
+        seen: list[str] = []
+        with pytest.raises(StreamInterruptedError):
+            async for ev in interruptible(provider.complete_stream([]), interrupt):
+                seen.append(ev.text or "")
+                interrupt.set()  # set between pulls, no watcher armed
+        assert seen == [provider.first]
+        assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
 
 
 # ------------------------------------------------------------------
@@ -426,3 +491,35 @@ class TestSingleCallStreamInterrupt:
         assert events[-1].type == RunEventType.RUN_COMPLETED
         assert events[-1].run_result is not None
         assert events[-1].run_result.status == RunStatus.SUCCESS
+
+
+# ------------------------------------------------------------------
+# Runner: closing the loop generator must never raise to the consumer
+# ------------------------------------------------------------------
+
+
+class _CleanupRaisesLoop(Loop):
+    """Loop whose stream cleanup fails — like a provider whose close() throws."""
+
+    async def run(self, **kwargs: Any) -> Any:  # pragma: no cover — not used
+        raise NotImplementedError
+
+    async def run_stream(self, **kwargs: Any) -> AsyncGenerator[RunEvent, None]:
+        try:
+            yield RunEvent(type=RunEventType.TEXT_DELTA, text="partial")
+            yield RunEvent(type=RunEventType.TEXT_DELTA, text=" more")
+        finally:
+            raise RuntimeError("provider close exploded")
+
+
+class TestRunnerCloseRobustness:
+    async def test_aclose_swallows_loop_cleanup_errors(self) -> None:
+        provider = GatedStreamLLM()
+        agent = Agent(prompt="Test.", provider=provider, loop=_CleanupRaisesLoop())
+        stream = agent.stream("go")
+        async with stream as s:
+            async for event in s:
+                if event.type == RunEventType.TEXT_DELTA:
+                    break
+        # Reaching here without RuntimeError / "ignored GeneratorExit" is the test.
+        assert stream.run_id

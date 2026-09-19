@@ -18,7 +18,7 @@ Sprint 2 adds optional state_store for persistence. When provided:
 from __future__ import annotations
 
 import logging
-from contextlib import aclosing
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
@@ -58,7 +58,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable
 
     from dendrux.agent import Agent
     from dendrux.chat import ChatMessage
@@ -309,6 +309,29 @@ _WAITING_STATUSES = (
     RunStatus.WAITING_HUMAN_INPUT,
     RunStatus.WAITING_APPROVAL,
 )
+
+
+@asynccontextmanager
+async def _closing_loop_stream(
+    loop_stream: AsyncGenerator[RunEvent, None], run_id: str
+) -> AsyncIterator[AsyncGenerator[RunEvent, None]]:
+    """Close the loop generator in this task, never raising out of the close.
+
+    When the consumer abandons the stream, ``GeneratorExit`` is travelling
+    through the runner generator. An exception escaping the loop's cleanup
+    (a provider's close failing, say) would land in the runner's
+    ``except Exception`` and make it *yield* while closing — which Python
+    reports to the consumer as ``async generator ignored GeneratorExit``.
+    Cleanup failures are logged instead; the run is still finalized by the
+    stream's cleanup callback.
+    """
+    try:
+        yield loop_stream
+    finally:
+        try:
+            await loop_stream.aclose()
+        except Exception:
+            logger.warning("Loop stream cleanup raised for run %s", run_id, exc_info=True)
 
 
 def _track_partial_text(shared: dict[str, Any], event: RunEvent) -> None:
@@ -1429,9 +1452,9 @@ def run_stream(
                 )
 
             # 3. Stream the loop. The interrupt signal lets cancel_run reach
-            # an in-flight provider stream owned by this process; aclosing
-            # guarantees the loop generator is finalized in this task when
-            # the consumer abandons the stream.
+            # an in-flight provider stream owned by this process; the closing
+            # wrapper guarantees the loop generator is finalized in this task
+            # when the consumer abandons the stream.
             interrupt = agent._task_manager.register_interrupt(run_id)
             loop_stream = resolved_loop.run_stream(
                 agent=agent,
@@ -1447,7 +1470,7 @@ def run_stream(
                 state_store=store,
                 interrupt=interrupt,
             )
-            async with aclosing(loop_stream):
+            async with _closing_loop_stream(loop_stream, run_id):
                 async for event in loop_stream:
                     _terminal_types = (
                         RunEventType.RUN_COMPLETED,
@@ -2416,7 +2439,7 @@ def resume_stream(
                     _rejected_data_s,
                 )
 
-            # 9. Stream the loop (see run_stream for interrupt + aclosing notes)
+            # 9. Stream the loop (see run_stream for interrupt + closing notes)
             interrupt = agent._task_manager.register_interrupt(run_id)
             loop_stream = ctx.resolved_loop.run_stream(
                 agent=agent,
@@ -2433,7 +2456,7 @@ def resume_stream(
                 state_store=store,
                 interrupt=interrupt,
             )
-            async with aclosing(loop_stream):
+            async with _closing_loop_stream(loop_stream, run_id):
                 async for event in loop_stream:
                     if (
                         event.type

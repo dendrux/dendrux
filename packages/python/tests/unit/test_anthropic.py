@@ -771,6 +771,43 @@ class TestCompleteStream:
         assert llm_response.tool_calls is None
         assert llm_response.usage.input_tokens == 100
 
+    async def test_stream_through_agent_completes(self, provider: AnthropicProvider) -> None:
+        """The provider generator is driven by the runner (with its interrupt
+        registered) inside the consumer's task: the ContextVar attempt
+        counter it sets on entry must reset cleanly at the end. Guards the
+        regression where every live streamed run ended in RUN_ERROR."""
+        from dendrux import Agent, SingleCall
+        from dendrux.types import RunEventType, RunStatus
+
+        final_msg = _make_anthropic_response([TextBlock(type="text", text="Hello world")])
+        fake_stream = _FakeStream(self._text_events(["Hello", " world"]), final_msg)
+        provider._client.messages.stream = MagicMock(return_value=fake_stream)
+
+        agent = Agent(prompt="Test.", provider=provider, loop=SingleCall())
+        async with agent.stream("Hi") as s:
+            events = [e async for e in s]
+
+        assert events[-1].type == RunEventType.RUN_COMPLETED
+        assert events[-1].run_result is not None
+        assert events[-1].run_result.status == RunStatus.SUCCESS
+        assert events[-1].run_result.answer == "Hello world"
+
+    async def test_stream_through_agent_aclose_does_not_raise(
+        self, provider: AnthropicProvider
+    ) -> None:
+        final_msg = _make_anthropic_response([TextBlock(type="text", text="Hello world")])
+        fake_stream = _FakeStream(self._text_events(["Hello", " world"]), final_msg)
+        provider._client.messages.stream = MagicMock(return_value=fake_stream)
+
+        from dendrux import Agent, SingleCall
+        from dendrux.types import RunEventType
+
+        agent = Agent(prompt="Test.", provider=provider, loop=SingleCall())
+        async with agent.stream("Hi") as s:
+            async for e in s:
+                if e.type == RunEventType.TEXT_DELTA:
+                    break
+
     async def test_tool_call_stream(self, provider: AnthropicProvider) -> None:
         """Tool call response yields TOOL_USE_START + TOOL_USE_END + DONE."""
         final_msg = _make_anthropic_response(
