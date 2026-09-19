@@ -227,6 +227,7 @@ class _ScopedAuth(httpx2.Auth):
 def create_http_client(
     source: MCPSource,
     *,
+    request_hook: Callable[[httpx2.Request], Awaitable[None]] | None = None,
     response_hook: Callable[[httpx2.Response], Awaitable[None]] | None = None,
     transport: httpx2.AsyncBaseTransport | None = None,
     on_denied: Callable[[], None] | None = None,
@@ -238,6 +239,8 @@ def create_http_client(
     sensitive.update({"authorization", "proxy-authorization", "cookie"})
 
     async def scope_credentials(request: httpx2.Request) -> None:
+        if request_hook is not None:
+            await request_hook(request)
         if request.url.scheme not in ("http", "https") or request.url.userinfo:
             if on_denied is not None:
                 on_denied()

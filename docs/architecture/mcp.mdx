@@ -201,7 +201,86 @@ connection = runtime.bind(
 
 The provider is called lazily, once per *physical connection attempt* — never per agent or per tool call. A connection retired between requests may therefore resolve credentials again on the next request. Its result establishes that one transport (request headers for HTTP, environment variables for stdio) and remains only in that connection's in-memory, connect-scoped configuration for the physical connection lifetime; it is never persisted, logged, or rendered into errors. Because the runtime knows the exact secret strings, it scrubs them from any transport or tool error text before that text can reach the run store or the model. Opaque auth objects are rejected at `bind()` for the same reason: their secret values cannot be enumerated for redaction.
 
-To rotate credentials explicitly, pass a stable non-secret `credential_identity` (a credential row id, a rotation counter). Rebinding with a new identity conflicts while the old connection is live — evict first — and supersedes older handles once it is not. Without it, the newest bind's provider is simply consulted at the next physical connect.
+Use a stable non-secret `credential_identity` (a credential row id or rotation
+counter) to distinguish credential versions. `bind()` still rejects changes to
+live configuration. For routine HTTP credential rotation, use:
+
+```python
+connection = await runtime.rotate_credentials(
+    connection_key="github-1",
+    tenant_key=tenant_id,
+    credentials=TenantTokens(tenant_id),
+    credential_identity="version-2",
+    timeout=10.0,
+    preserve_catalog=False,
+)
+```
+
+Rotation pauses new calls, drains admitted calls, closes the old transport, and
+reconnects lazily on the next call or discovery. Existing handles and leased
+views remain usable. The drain timeout defaults to `connection_wait_timeout`;
+if it expires, the old transport and credentials remain intact. Cancellation of
+one waiting caller does not cancel shared rotation. A close failure prevents a
+replacement from being published and requires reacquiring a connection.
+
+The previous catalog stays in memory. By default it is revalidated after the
+new handshake, and existing executors reject changed or removed tool definitions
+before sending. Set `preserve_catalog=True` only when you can assert unchanged
+principal and permissions: it skips `tools/list` after reconnect. Changes to
+endpoint, source headers, transport policy, or other configuration still use
+`rebind()`.
+
+### Recovering from expired access tokens
+
+Opt in with `MCPSource.http(..., reauthenticate_on_401=True)` and a provider
+implementing the public `MCPRefreshingCredentialProvider` protocol:
+
+```python
+class RefreshingTokens(TenantTokens):
+    async def on_auth_rejected(self) -> None:
+        await invalidate_cached_access_token(self.tenant_id)  # application-owned
+```
+
+After a correlated HTTP 401 rejects a tool POST at the source origin, the runtime
+drains other calls, invokes `on_auth_rejected()`, and opens a fresh transport
+through `get_auth()`.
+Concurrent rejections of the same credential generation share one recovery.
+The rejected call is retried at most once; a second 401 raises
+`MCPAuthenticationError`. 403s, background SSE failures, arbitrary tool error
+text, timeouts, and uncertain outcomes do not trigger replay. Recovery
+revalidates the catalog before retrying. The existing destination and credential
+origin policies apply to the replacement transport.
+
+`on_auth_rejected()` has a `connect_timeout` budget. Callback exceptions become
+value-free `MCPCredentialError`s. A failed rejection callback is shared for that
+credential generation; explicitly rotate credentials or rebind to try again.
+One logical call emits one start and one terminal event, even if it recovers;
+those events retain the first attempt's connection instance ID. Physical
+rotation emits a connection-close event with `reason="credentials_rotated"`.
+
+Dendrux does not implement OAuth exchanges, persist refresh tokens, or coordinate
+rotation across workers. The provider owns those operations. Without the
+opt-in flag, a live 401 is typed but is not automatically recovered.
+
+### Safe connection diagnostics
+
+Adapter-generated `MCPConnectionError` messages contain no URLs. Optional
+`origin`, `destination`, and `redirect_target` attributes are `MCPOrigin` values
+with only `scheme`, `host`, and effective `port`; `error.host` is a convenience
+for the attempted host. They exclude userinfo, paths, queries, and fragments.
+Origins are omitted from their default representation and from runtime events.
+Hostnames can still identify private infrastructure, so persist these fields
+only under your application's diagnostic policy. Diagnostics unavailable for a
+particular failure remain `None`.
+
+`transport_detail` and wrapped transport tool-error messages remove URLs as well
+as configured secrets. Real server-authored tool results retain the existing
+credential-redaction behavior. `MCPAuthenticationError.status_code` identifies
+401/403; `request_rejected=True` identifies an HTTP rejection attributed to the
+specific tool POST at the original source origin rather than an unrelated
+response. A cross-origin redirect challenge is typed but never refreshes the
+original source's credentials.
+
 
 ## Views and tool policy
 

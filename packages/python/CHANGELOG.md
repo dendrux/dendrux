@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- MCP: opt-in `reauthenticate_on_401` with `MCPRefreshingCredentialProvider`
+  rejection notification, shared refresh/reconnect, and one retry of a
+  definitively rejected tool POST. Live 401/403 errors are typed per request.
+- MCP: `MCPRuntime.rotate_credentials()` drains calls and replaces credentials
+  without invalidating handles, reconnecting lazily with catalog revalidation
+  or explicit same-permissions catalog preservation.
+- MCP: structured `MCPOrigin` diagnostics on connection errors; URL-free
+  transport diagnostics and wrapped transport tool errors.
+
 ## 0.2.0a16 - 2026-09-19
 
 - MCP HTTP: per-source `follow_redirects` and `max_redirects` settings on

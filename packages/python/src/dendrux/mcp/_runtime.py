@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from dendrux.mcp._client import MCPClientAdapter
 from dendrux.mcp._discovery import MCPDiscovery, build_discovery
 from dendrux.mcp._errors import (
+    MCPAuthenticationError,
     MCPBindingConflictError,
     MCPCallCapacityError,
     MCPCircuitOpenError,
@@ -108,6 +109,20 @@ class MCPCredentialProvider(Protocol):
 
     async def get_auth(self) -> Mapping[str, str]:
         """Return authentication suitable for the configured MCP transport."""
+        ...
+
+
+@runtime_checkable
+class MCPRefreshingCredentialProvider(MCPCredentialProvider, Protocol):
+    """Credential provider supporting explicit rejection of a cached token.
+
+    The runtime calls this once for concurrent rejected calls, then calls
+    ``get_auth()`` while reconnecting. The application owns refresh-token
+    exchange, durable storage, and synchronization across worker processes.
+    """
+
+    async def on_auth_rejected(self) -> None:
+        """Invalidate or refresh rejected credentials before the next get_auth."""
         ...
 
 
@@ -400,6 +415,7 @@ class _ViewToolSource(MCPServer):
                     raise RuntimeError(f"MCP tool view '{self.name}' was closed during discovery.")
             entry = self._entry
             assert entry is not None
+            await connection.runtime._ready_entry(connection.identity, entry)
             policy = self._view.policy
             available = {tool.name for tool in entry.raw_tools}
             for field_name, requested in (
@@ -431,14 +447,9 @@ class _ViewToolSource(MCPServer):
 
     def _create_executor(self, mcp_tool_name: str) -> Callable[..., Any]:
         entry = self._entry
-        if not self._leased or entry is None or entry.adapter is None:
+        if not self._leased or entry is None:
             raise RuntimeError("Cannot create an MCP executor before discovery.")
-        executor = create_mcp_executor(
-            entry.adapter,
-            namespace=self.name,
-            mcp_tool_name=mcp_tool_name,
-            max_result_bytes=self.source.max_result_bytes,
-        )
+        original_tool = next(tool for tool in entry.raw_tools if tool.name == mcp_tool_name)
         connection = self._view.connection
         # The Agent-visible canonical name: same sanitization as discovery,
         # so telemetry and error messages match what the model actually calls.
@@ -448,9 +459,8 @@ class _ViewToolSource(MCPServer):
         # A live rebind may change only the presentation name used as the next
         # view's default namespace; it must not rename an existing socket.
         source_name = entry.source.name
-        instance_id = entry.instance_id
 
-        def _started_event() -> MCPToolCallStarted:
+        def _started_event(instance_id: int) -> MCPToolCallStarted:
             return MCPToolCallStarted(
                 tenant_key=tenant_key,
                 connection_key=connection_key,
@@ -459,7 +469,7 @@ class _ViewToolSource(MCPServer):
                 tool=qualified_name,
             )
 
-        def _completed_event(duration: float) -> MCPToolCallCompleted:
+        def _completed_event(duration: float, instance_id: int) -> MCPToolCallCompleted:
             return MCPToolCallCompleted(
                 tenant_key=tenant_key,
                 connection_key=connection_key,
@@ -469,7 +479,7 @@ class _ViewToolSource(MCPServer):
                 duration=duration,
             )
 
-        def _failed_event(duration: float, cause: str) -> MCPToolCallFailed:
+        def _failed_event(duration: float, cause: str, instance_id: int) -> MCPToolCallFailed:
             return MCPToolCallFailed(
                 tenant_key=tenant_key,
                 connection_key=connection_key,
@@ -480,7 +490,9 @@ class _ViewToolSource(MCPServer):
                 cause=cause,
             )
 
-        def _unknown_event(duration: float, reason: _CallInterruption) -> MCPToolCallOutcomeUnknown:
+        def _unknown_event(
+            duration: float, reason: _CallInterruption, instance_id: int
+        ) -> MCPToolCallOutcomeUnknown:
             return MCPToolCallOutcomeUnknown(
                 tenant_key=tenant_key,
                 connection_key=connection_key,
@@ -491,7 +503,7 @@ class _ViewToolSource(MCPServer):
                 reason=reason,
             )
 
-        def _cancelled_event(duration: float) -> MCPToolCallCancelled:
+        def _cancelled_event(duration: float, instance_id: int) -> MCPToolCallCancelled:
             return MCPToolCallCancelled(
                 tenant_key=tenant_key,
                 connection_key=connection_key,
@@ -546,11 +558,51 @@ class _ViewToolSource(MCPServer):
                 )
                 raise
             loop = asyncio.get_running_loop()
+            instance_id = entry.instance_id
             started_at = loop.time()
             permit.started_at = started_at
-            connection.runtime._emit(_started_event())
+            connection.runtime._emit(_started_event(instance_id))
             try:
-                result = await executor(**params)
+                for attempt in range(2):
+                    current_tool = next(
+                        (tool for tool in entry.raw_tools if tool.name == mcp_tool_name), None
+                    )
+                    if current_tool != original_tool:
+                        raise MCPStaleConnectionError(
+                            connection.identity,
+                            "MCP tool definition changed; discover a new view before calling.",
+                        )
+                    adapter = entry.adapter
+                    assert adapter is not None
+                    epoch = entry.credential_epoch
+                    executor = create_mcp_executor(
+                        adapter,
+                        namespace=self.name,
+                        mcp_tool_name=mcp_tool_name,
+                        max_result_bytes=self.source.max_result_bytes,
+                    )
+                    try:
+                        result = await executor(**params)
+                        break
+                    except MCPAuthenticationError as auth_error:
+                        if (
+                            attempt
+                            or not self.source.reauthenticate_on_401
+                            or auth_error.status_code != 401
+                            or not auth_error.request_rejected
+                        ):
+                            raise
+                    connection.runtime._end_call(connection.identity, permit)
+                    await connection.runtime._reauthenticate(connection.identity, entry, epoch)
+                    permit = await connection.runtime._begin_call(
+                        connection.identity,
+                        entry,
+                        generation=connection.generation,
+                        tool=qualified_name,
+                        owner=self._call_owner,
+                        check_lease=check_lease,
+                    )
+                    permit.started_at = started_at
             except asyncio.CancelledError as exc:
                 interruption = permit.interruption
                 if interruption is None:
@@ -558,7 +610,7 @@ class _ViewToolSource(MCPServer):
                     # not interrupt this call, but the started operation still
                     # needs its one terminal event.
                     connection.runtime._emit_call_terminal(
-                        permit, _cancelled_event(loop.time() - started_at)
+                        permit, _cancelled_event(loop.time() - started_at, instance_id)
                     )
                     raise
                 # Absorb only the cancellation issued by MCPRuntime. If the
@@ -567,7 +619,7 @@ class _ViewToolSource(MCPServer):
                 remaining = permit.task.uncancel()
                 permit.interruption = None
                 connection.runtime._emit_call_terminal(
-                    permit, _unknown_event(loop.time() - started_at, interruption)
+                    permit, _unknown_event(loop.time() - started_at, interruption, instance_id)
                 )
                 if remaining:
                     raise
@@ -576,7 +628,10 @@ class _ViewToolSource(MCPServer):
                 interruption = permit.interruption
                 if interruption is not None or entry.force_evicted:
                     connection.runtime._emit_call_terminal(
-                        permit, _unknown_event(loop.time() - started_at, interruption or "forced")
+                        permit,
+                        _unknown_event(
+                            loop.time() - started_at, interruption or "forced", instance_id
+                        ),
                     )
                     if interruption is not None:
                         remaining = permit.task.uncancel()
@@ -598,7 +653,8 @@ class _ViewToolSource(MCPServer):
                         reporting_permit=permit,
                     )
                     connection.runtime._emit_call_terminal(
-                        permit, _unknown_event(loop.time() - started_at, "connection_lost")
+                        permit,
+                        _unknown_event(loop.time() - started_at, "connection_lost", instance_id),
                     )
                     raise unknown_outcome("connection_lost") from exc
                 if isinstance(exc, Exception):
@@ -610,13 +666,14 @@ class _ViewToolSource(MCPServer):
                         entry,
                     )
                     connection.runtime._emit_call_terminal(
-                        permit, _failed_event(loop.time() - started_at, type(exc).__name__)
+                        permit,
+                        _failed_event(loop.time() - started_at, type(exc).__name__, instance_id),
                     )
                 else:
                     # SystemExit or KeyboardInterrupt unwound the call: no
                     # server verdict, but the start still gets its terminal.
                     connection.runtime._emit_call_terminal(
-                        permit, _cancelled_event(loop.time() - started_at)
+                        permit, _cancelled_event(loop.time() - started_at, instance_id)
                     )
                 raise
             else:
@@ -628,7 +685,7 @@ class _ViewToolSource(MCPServer):
                         # The server answered — record that truth before the
                         # application's own cancellation takes over.
                         connection.runtime._emit_call_terminal(
-                            permit, _completed_event(loop.time() - started_at)
+                            permit, _completed_event(loop.time() - started_at, instance_id)
                         )
                         raise asyncio.CancelledError
                     # A normal return is a definitive server response. Forced
@@ -639,7 +696,7 @@ class _ViewToolSource(MCPServer):
                     entry,
                 )
                 connection.runtime._emit_call_terminal(
-                    permit, _completed_event(loop.time() - started_at)
+                    permit, _completed_event(loop.time() - started_at, instance_id)
                 )
                 return result
             finally:
@@ -675,12 +732,18 @@ class _ConnectionEntry:
     """
 
     __slots__ = (
+        "rotation_task",
+        "reconnect_pending",
+        "preserve_catalog",
+        "credential_epoch",
+        "refresh_failed",
         "active_calls",
         "adapter",
         "broken",
         "call_permits",
         "circuit",
         "close_terminal_emitted",
+        "close_succeeded",
         "close_started",
         "fenced",
         "force_evicted",
@@ -698,6 +761,11 @@ class _ConnectionEntry:
 
     def __init__(self, source: MCPSource) -> None:
         self.source = source
+        self.rotation_task: asyncio.Task[None] | None = None
+        self.reconnect_pending = False
+        self.preserve_catalog = False
+        self.credential_epoch = 0
+        self.refresh_failed = False
         self.adapter: MCPClientAdapter | None = None
         self.raw_tools: list[Any] = []
         self.info: Any = None
@@ -713,6 +781,7 @@ class _ConnectionEntry:
         self.fenced = False
         self.force_evicted = False
         self.broken = False
+        self.close_succeeded = False
         self.close_started = False
         self.opening_terminal_emitted = False
         self.close_terminal_emitted = False
@@ -1288,7 +1357,8 @@ class MCPRuntime:
         the runtime lock.
         """
         return (
-            self._state is MCPRuntimeState.OPEN
+            entry.rotation_task is None
+            and self._state is MCPRuntimeState.OPEN
             and self._entries.get(identity) is entry
             and not entry.fenced
             and not entry.leases
@@ -1410,7 +1480,7 @@ class MCPRuntime:
         entry: _ConnectionEntry,
         *,
         loop: asyncio.AbstractEventLoop,
-        reason: Literal["idle", "broken", "evicted", "shutdown"],
+        reason: Literal["idle", "broken", "evicted", "shutdown", "credentials_rotated"],
         cancel_warning: str,
         close_warning: str,
     ) -> None:
@@ -1461,7 +1531,7 @@ class MCPRuntime:
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
         *,
-        reason: Literal["idle", "broken", "evicted", "shutdown"],
+        reason: Literal["idle", "broken", "evicted", "shutdown", "credentials_rotated"],
     ) -> None:
         """Close an entry's transport at most once across all callers."""
         with self._lock:
@@ -1484,6 +1554,7 @@ class MCPRuntime:
         else:
             clean = True
         finally:
+            entry.close_succeeded = clean
             # Whoever wins the close_started race reports the one close event.
             # A teardown owner may already have terminalized a resistant close
             # as unclean before allowing this task to finish in the background.
@@ -1754,8 +1825,6 @@ class MCPRuntime:
                     if (
                         registration.generation != connection.generation
                         or not _same_connection_config(registration.source, connection.source)
-                        or (registration.credentials is None) != (connection.credentials is None)
-                        or registration.credential_identity != connection.credential_identity
                     ):
                         raise MCPStaleConnectionError(
                             identity,
@@ -1854,6 +1923,7 @@ class MCPRuntime:
             # Shielded: cancelling this caller must not cancel connection
             # establishment for concurrent leases of the same identity.
             await asyncio.shield(task)
+            await self._ready_entry(identity, entry)
         except BaseException:
             self._release(identity, entry)
             raise
@@ -1865,6 +1935,7 @@ class MCPRuntime:
         entry: _ConnectionEntry,
         *,
         credentials: MCPCredentialProvider | None,
+        reuse_catalog: bool = False,
     ) -> None:
         """Connect and discover once for an entry; owns cleanup on failure.
 
@@ -1888,7 +1959,7 @@ class MCPRuntime:
                 source = await _resolve_source_credentials(source, credentials)
             adapter = MCPClientAdapter(source)
             await adapter.connect()
-            raw_tools = await adapter.list_tools()
+            raw_tools = entry.raw_tools if reuse_catalog else await adapter.list_tools()
         except BaseException as exc:
             circuit_opened: MCPCircuitOpened | None = None
             failure_cause: str | None = None
@@ -2127,6 +2198,7 @@ class MCPRuntime:
         deadline: float | None = None
         try:
             while True:
+                await self._ready_entry(identity, entry)
                 with self._lock:
                     self._bind_loop()
                     self._check_call_state(identity, entry, generation, check_lease)
@@ -2304,7 +2376,7 @@ class MCPRuntime:
         """Classify one entry for a snapshot. Caller must hold the lock."""
         if entry.broken:
             return MCPConnectionStatus.BROKEN
-        if entry.fenced or entry.retire_task is not None:
+        if entry.fenced or entry.retire_task is not None or entry.rotation_task is not None:
             return MCPConnectionStatus.CLOSING
         if entry.adapter is None:
             return MCPConnectionStatus.CONNECTING
@@ -2431,6 +2503,9 @@ class MCPRuntime:
                         else "endpoint"
                     )
                     raise MCPBindingConflictError(identity, mismatch=mismatch)
+                current_entry = self._entries.get(identity)
+                if current_entry is not None and current_entry.rotation_task is not None:
+                    raise MCPBindingConflictError(identity, mismatch="configuration")
                 config_changed = (
                     not _same_connection_config(registration.source, source)
                     or (registration.credentials is None) != (credentials is None)
@@ -2444,11 +2519,14 @@ class MCPRuntime:
                 # Provider objects are never compared — applications construct
                 # one per request — so only a declared credential_identity
                 # change counts as changed configuration.
-                # The generation is unchanged, so existing handles stay valid.
+                # Equivalent binds preserve handles. Changed configuration
+                # gets a new generation, so an old handle can never revive.
                 registration.source = source
                 registration.credentials = credentials
                 registration.credential_identity = credential_identity
                 if config_changed:
+                    self._generation_seq += 1
+                    registration.generation = self._generation_seq
                     # Rotated credentials or a changed endpoint deserve an
                     # immediate attempt; the identical per-request rebind
                     # above keeps its circuit, so a reconnect storm cannot
@@ -2483,6 +2561,10 @@ class MCPRuntime:
                 "MCPRuntime source auth cannot be opaque because its secret values "
                 "cannot be redacted. Use static headers or a credentials provider."
             )
+        if source.reauthenticate_on_401 and not isinstance(
+            credentials, MCPRefreshingCredentialProvider
+        ):
+            raise ValueError("reauthenticate_on_401 requires MCPRefreshingCredentialProvider.")
         if credentials is not None and not isinstance(credentials, MCPCredentialProvider):
             raise ValueError(
                 "MCPRuntime credentials must implement MCPCredentialProvider.get_auth()."
@@ -2492,6 +2574,291 @@ class MCPRuntime:
                 raise ValueError("MCPRuntime credential_identity requires a credentials provider.")
             _validate_identity_key(credential_identity, "credential identity", optional=False)
         _validate_namespace(source.name)
+
+    async def rotate_credentials(
+        self,
+        *,
+        connection_key: str,
+        credentials: MCPCredentialProvider,
+        credential_identity: str | None = None,
+        tenant_key: str | None = None,
+        preserve_catalog: bool = False,
+        timeout: float | None = None,
+    ) -> MCPConnection:
+        """Drain calls, replace HTTP credentials, and reconnect lazily.
+
+        Existing handles and views remain valid. New calls wait for rotation;
+        cancellation of one waiter does not cancel the bounded shared work.
+        A drain timeout leaves the current credentials and transport intact.
+        ``preserve_catalog=True`` asserts that the principal and permissions
+        are unchanged; otherwise discovery is repeated before the next call.
+        Existing executors reject changed tool definitions before sending.
+        Token storage and coordination across processes belong to the provider.
+        """
+        if not isinstance(credentials, MCPCredentialProvider):
+            raise ValueError("rotate_credentials requires an MCPCredentialProvider.")
+        identity = tenant_key, connection_key
+        budget = (
+            self.connection_wait_timeout if timeout is None else _positive_float(timeout, "timeout")
+        )
+        if not isinstance(preserve_catalog, bool):
+            raise ValueError("preserve_catalog must be a bool.")
+        while True:
+            with self._lock:
+                self._bind_loop()
+                registration = self._rotation_registration(identity)
+                self._validate_binding(
+                    connection_key=connection_key,
+                    tenant_key=tenant_key,
+                    source=registration.source,
+                    credentials=credentials,
+                    credential_identity=credential_identity,
+                )
+                if registration.source.url is None:
+                    raise ValueError("Credential rotation requires an HTTP source.")
+                entry = self._entries.get(identity)
+                wait = None
+                if entry is not None:
+                    if entry.fenced or entry.retire_task is not None:
+                        raise MCPConnectionEvictingError(identity, "MCP connection is retiring.")
+                    if entry.rotation_task is not None:
+                        wait = entry.rotation_task
+                    elif entry.task is not None and not entry.task.done():
+                        wait = entry.task
+                if wait is None:
+                    if entry is None:
+                        self._replace_credentials(registration, credentials, credential_identity)
+                        task = None
+                    else:
+                        task = self._start_rotation(
+                            identity,
+                            entry,
+                            registration,
+                            credentials,
+                            credential_identity,
+                            preserve_catalog=preserve_catalog,
+                            timeout=budget,
+                            rejected=False,
+                        )
+                    break
+            await asyncio.shield(wait)
+        if task is not None:
+            await asyncio.shield(task)
+        return MCPConnection(
+            runtime=self,
+            tenant_key=tenant_key,
+            connection_key=connection_key,
+            source=registration.source,
+            credentials=credentials,
+            credential_identity=credential_identity,
+            generation=registration.generation,
+        )
+
+    def _rotation_registration(self, identity: tuple[str | None, str]) -> _Registration:
+        if self._state is not MCPRuntimeState.OPEN:
+            raise MCPRuntimeClosedError("MCPRuntime is closed and cannot rotate credentials.")
+        if identity in self._evictions:
+            raise MCPConnectionEvictingError(identity, "MCP connection is being evicted.")
+        registration = self._registrations.get(identity)
+        if registration is None:
+            raise MCPStaleConnectionError(identity, "MCP connection is no longer registered.")
+        return registration
+
+    @staticmethod
+    def _replace_credentials(
+        registration: _Registration,
+        credentials: MCPCredentialProvider,
+        credential_identity: str | None,
+    ) -> None:
+        registration.credentials = credentials
+        registration.credential_identity = credential_identity
+        registration.circuit = _CircuitState()
+
+    def _start_rotation(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        registration: _Registration,
+        credentials: MCPCredentialProvider,
+        credential_identity: str | None,
+        *,
+        preserve_catalog: bool,
+        timeout: float,
+        rejected: bool,
+    ) -> asyncio.Task[None]:
+        self._cancel_idle(entry)
+        previous_task = entry.task
+        task = asyncio.create_task(
+            self._rotate_entry(
+                identity,
+                entry,
+                registration,
+                credentials,
+                credential_identity,
+                preserve_catalog=preserve_catalog,
+                timeout=timeout,
+                rejected=rejected,
+                previous_task=previous_task,
+            )
+        )
+        entry.rotation_task = task
+        entry.task = task
+        task.add_done_callback(self._consume_task_exception)
+        return task
+
+    async def _rotate_entry(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        registration: _Registration,
+        credentials: MCPCredentialProvider,
+        credential_identity: str | None,
+        *,
+        preserve_catalog: bool,
+        timeout: float,
+        rejected: bool,
+        previous_task: asyncio.Task[None] | None,
+    ) -> None:
+        try:
+            quiet = await self._wait_for_quiet(
+                asyncio.get_running_loop().time() + timeout,
+                lambda: entry.active_calls == 0 or entry.fenced,
+            )
+            if not quiet:
+                raise TimeoutError("MCP credential rotation timed out waiting for active calls.")
+            with self._lock:
+                if self._rotation_registration(identity) is not registration or entry.fenced:
+                    raise MCPStaleConnectionError(
+                        identity, "MCP connection changed during rotation."
+                    )
+            if rejected:
+                assert isinstance(credentials, MCPRefreshingCredentialProvider)
+                failed = False
+                try:
+                    async with asyncio.timeout(entry.source.connect_timeout):
+                        await credentials.on_auth_rejected()
+                except Exception:
+                    failed = True
+                if failed:
+                    raise MCPCredentialError("MCP credential rejection callback failed.")
+            adapter = entry.adapter
+            if adapter is not None:
+                close_task = asyncio.create_task(
+                    self._close_adapter(identity, entry, reason="credentials_rotated")
+                )
+                pending = await self._settle_teardown_tasks(
+                    {close_task: entry},
+                    timeout=self.close_timeout,
+                    warning="MCP source '%s' credential-rotation close exceeded its grace.",
+                )
+                if pending or not entry.close_succeeded:
+                    with self._lock:
+                        entry.fenced = True
+                        self._discard_entry(identity, entry)
+                    raise MCPConnectionError(
+                        "MCP credential rotation could not close the old transport."
+                    )
+            with self._lock:
+                if self._rotation_registration(identity) is not registration or entry.fenced:
+                    raise MCPStaleConnectionError(
+                        identity, "MCP connection changed during rotation."
+                    )
+                self._replace_credentials(registration, credentials, credential_identity)
+                entry.circuit = registration.circuit
+                entry.adapter = None
+                entry.credential_epoch += 1
+                entry.refresh_failed = False
+                entry.reconnect_pending = True
+                entry.preserve_catalog = preserve_catalog
+        except Exception:
+            if rejected:
+                entry.refresh_failed = True
+            raise
+        finally:
+            with self._lock:
+                entry.rotation_task = None
+                if not entry.reconnect_pending:
+                    entry.task = previous_task
+                self._wake_call_waiters_for_entry(entry)
+                self._maybe_schedule_idle(identity, entry)
+            self._notify_drain()
+
+    async def _ready_entry(self, identity: tuple[str | None, str], entry: _ConnectionEntry) -> None:
+        while True:
+            with self._lock:
+                if (
+                    entry.rotation_task is None
+                    and not entry.reconnect_pending
+                    and entry.adapter is not None
+                ):
+                    return
+                registration = self._rotation_registration(identity)
+                if self._entries.get(identity) is not entry or entry.fenced:
+                    return  # The caller's normal lease/state check reports the specific failure.
+                task = entry.rotation_task
+                if task is None and entry.reconnect_pending:
+                    self._cancel_idle(entry)
+                    entry.reconnect_pending = False
+                    entry.close_started = False
+                    entry.close_succeeded = False
+                    entry.close_terminal_emitted = False
+                    entry.opening_terminal_emitted = False
+                    self._connection_seq += 1
+                    entry.instance_id = self._connection_seq
+                    task = asyncio.create_task(
+                        self._open_connection(
+                            identity,
+                            entry,
+                            credentials=registration.credentials,
+                            reuse_catalog=entry.preserve_catalog,
+                        )
+                    )
+                    entry.task = task
+                    task.add_done_callback(self._consume_task_exception)
+                elif task is None and entry.adapter is None:
+                    task = entry.task
+                if task is None:
+                    return
+            await asyncio.shield(task)
+            if entry.adapter is not None and entry.rotation_task is None:
+                return
+
+    async def _reauthenticate(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        epoch: int,
+    ) -> None:
+        with self._lock:
+            registration = self._rotation_registration(identity)
+            if self._entries.get(identity) is not entry or entry.fenced:
+                raise MCPStaleConnectionError(
+                    identity, "MCP connection changed during authentication."
+                )
+            if entry.credential_epoch != epoch:
+                return
+            if entry.refresh_failed:
+                raise MCPCredentialError(
+                    "MCP credential recovery failed; rotate credentials or rebind before retrying."
+                )
+            task = entry.rotation_task
+            if task is None:
+                credentials = registration.credentials
+                if not isinstance(credentials, MCPRefreshingCredentialProvider):
+                    raise MCPCredentialError(
+                        "MCP credentials do not support rejection notification."
+                    )
+                task = self._start_rotation(
+                    identity,
+                    entry,
+                    registration,
+                    credentials,
+                    registration.credential_identity,
+                    preserve_catalog=False,
+                    timeout=self.connection_wait_timeout,
+                    rejected=True,
+                )
+        await asyncio.shield(task)
 
     async def rebind(
         self,

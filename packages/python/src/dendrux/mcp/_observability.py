@@ -187,7 +187,7 @@ class MCPConnectionClosed(MCPPhysicalConnectionEvent):
     only to value-free logs. Emitted exactly once per opened connection.
     """
 
-    reason: Literal["idle", "broken", "evicted", "shutdown"]
+    reason: Literal["idle", "broken", "evicted", "shutdown", "credentials_rotated"]
     clean: bool
 
 
