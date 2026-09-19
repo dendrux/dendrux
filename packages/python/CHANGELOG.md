@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- MCP: a server that rejects the source's credentials with HTTP 401/403
+  now raises `MCPAuthenticationError` (with `status_code`) on SDK 2.x
+  Streamable HTTP, where the SDK reports the rejected initialize as a
+  generic JSON-RPC error. The adapter classifies from the HTTP response it
+  observed. `transport_detail` for a task-group failure now names the
+  wrapped error instead of "unhandled errors in a TaskGroup".
+- MCP: `MCPRuntime(close_timeout=2.0)` bounds transport close separately
+  from `shutdown_timeout`. A Streamable HTTP close sends a
+  session-terminating `DELETE`, which routinely exceeded the previous fixed
+  250 ms grace and was logged as "exceeded the shutdown grace".
 - `agent.cancel_run()` now interrupts an in-flight model stream for runs
   driven by `stream()` / `resume_stream()` on the same `Agent` instance,
   including while waiting for the next token. The stream ends with

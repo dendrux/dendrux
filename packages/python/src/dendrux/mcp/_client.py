@@ -17,7 +17,11 @@ from mcp.shared.exceptions import MCPError as SDKMCPError
 from mcp.types import CONNECTION_CLOSED
 
 from dendrux.mcp._errors import MCPAuthenticationError, MCPConnectionError
-from dendrux.mcp._source import safe_source_exception_detail, source_has_opaque_credentials
+from dendrux.mcp._source import (
+    exception_class_name,
+    safe_source_exception_detail,
+    source_has_opaque_credentials,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -113,6 +117,7 @@ class MCPClientAdapter:
         self._stack: AsyncExitStack | None = None
         self._client: Client | None = None
         self.info: MCPConnectionInfo | None = None
+        self._last_status: int | None = None
 
     @property
     def connected(self) -> bool:
@@ -153,9 +158,20 @@ class MCPClientAdapter:
         finally:
             await self._close_owned_stack()
 
+    async def _observe_response(self, response: Any) -> None:
+        """Remember the status of the latest HTTP response.
+
+        The SDK turns a non-2xx reply to the initialize POST into a JSON-RPC
+        error that carries no status, so the exception tree alone cannot show
+        a 401/403. The status recorded here is what lets ``_safe_error``
+        still classify that failure as a credential rejection.
+        """
+        self._last_status = getattr(response, "status_code", None)
+
     async def _open(self) -> BaseException | None:
         """Open the transport, returning a detached safe failure if needed."""
 
+        self._last_status = None
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
@@ -170,6 +186,7 @@ class MCPClientAdapter:
                         auth=self.source.auth,
                         timeout=timeout,
                         follow_redirects=True,
+                        event_hooks={"response": [self._observe_response]},
                     )
                 )
                 transport = streamable_http_client(
@@ -231,6 +248,7 @@ class MCPClientAdapter:
 
     async def list_tools(self) -> list[Any]:
         client = self._require_client()
+        self._last_status = None
         try:
             tools: list[Any] = []
             cursor: str | None = None
@@ -256,21 +274,25 @@ class MCPClientAdapter:
         left with an undiagnosable failure — except when the source carries an
         opaque auth object, whose secrets cannot be enumerated, so its
         transport text cannot be proven clean and is suppressed outright.
-        A recognisable 401/403 becomes a typed authentication failure.
+        A recognisable 401/403 becomes a typed authentication failure, whether
+        it is carried by the exception tree or was the last response seen.
         """
         detail: str | None
         if source_has_opaque_credentials(self.source):
             detail = None
         else:
             detail = safe_source_exception_detail(self.source, exc)
+        failure_class = exception_class_name(exc)
         logger.debug(
             "MCP source '%s' failed to %s: %s (%s)",
             self.source.name,
             action,
             detail if detail is not None else "[detail suppressed: opaque auth]",
-            type(exc).__name__,
+            failure_class,
         )
         status = _authentication_status(exc)
+        if status is None and self._last_status in _AUTH_REJECTION_STATUSES:
+            status = self._last_status
         error: MCPConnectionError
         if status is not None:
             auth_error = MCPAuthenticationError(
@@ -281,7 +303,7 @@ class MCPClientAdapter:
             error = auth_error
         else:
             error = MCPConnectionError(
-                f"Failed to {action} MCP source '{self.source.name}' ({type(exc).__name__})."
+                f"Failed to {action} MCP source '{self.source.name}' ({failure_class})."
             )
         error.transport_detail = detail
         return error

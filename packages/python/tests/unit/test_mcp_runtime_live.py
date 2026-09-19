@@ -1595,7 +1595,7 @@ class TestExplicitEviction:
 
     @pytest.mark.asyncio
     async def test_force_returns_after_fencing_when_transport_close_resists(self) -> None:
-        runtime = MCPRuntime()
+        runtime = MCPRuntime(close_timeout=0.05)
         stale = _bind(runtime)
         agent = Agent(prompt="test", tool_sources=[stale.tools()])
         await agent.get_tool_lookups()
@@ -1691,7 +1691,7 @@ class TestExplicitEviction:
     ) -> None:
         _InstrumentedAdapter.connect_gate = asyncio.Event()  # never released
         _InstrumentedAdapter.close_gate = asyncio.Event()  # hold cancelled-task cleanup open
-        runtime = MCPRuntime()
+        runtime = MCPRuntime(close_timeout=0.05)
         stale = _bind(runtime)
         agent = Agent(prompt="test", tool_sources=[stale.tools()])
 
@@ -2234,6 +2234,8 @@ class TestRuntimeConfigurationValidation:
             ("shutdown_timeout", None),
             ("max_connections", 1.5),
             ("max_in_flight_calls", True),
+            ("close_timeout", 0),
+            ("close_timeout", "2"),
         ],
     )
     def test_non_numeric_tuning_is_rejected(self, field: str, value: Any) -> None:
@@ -2440,7 +2442,9 @@ class TestIdleRetirement:
     @pytest.mark.asyncio
     async def test_a_lease_racing_retirement_reconnects_transparently(self) -> None:
         _InstrumentedAdapter.close_gate = asyncio.Event()  # retirement stalls mid-close
-        async with MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05) as runtime:
+        async with MCPRuntime(
+            close_timeout=0.05, idle_timeout=0.01, shutdown_timeout=0.05
+        ) as runtime:
             connection = _bind(runtime)
             first = Agent(prompt="first", tool_sources=[connection.tools()])
             await first.get_tool_lookups()
@@ -2460,7 +2464,9 @@ class TestIdleRetirement:
     @pytest.mark.asyncio
     async def test_eviction_during_retirement_still_invalidates_the_handle(self) -> None:
         _InstrumentedAdapter.close_gate = asyncio.Event()
-        async with MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05) as runtime:
+        async with MCPRuntime(
+            close_timeout=0.05, idle_timeout=0.01, shutdown_timeout=0.05
+        ) as runtime:
             stale = _bind(runtime)
             agent = Agent(prompt="test", tool_sources=[stale.tools()])
             await agent.get_tool_lookups()
@@ -2498,7 +2504,7 @@ class TestIdleRetirement:
     @pytest.mark.asyncio
     async def test_resistant_retirement_stays_bounded_and_tracked(self) -> None:
         _InstrumentedAdapter.close_gate = asyncio.Event()  # never released here
-        runtime = MCPRuntime(idle_timeout=0.01, shutdown_timeout=0.05)
+        runtime = MCPRuntime(close_timeout=0.05, idle_timeout=0.01, shutdown_timeout=0.05)
         agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
         await agent.get_tool_lookups()
         await agent.close()
@@ -3138,6 +3144,7 @@ class TestConnectionCapacity:
     async def test_resistant_cleanup_releases_logical_capacity(self) -> None:
         _InstrumentedAdapter.close_gate = asyncio.Event()  # never released
         runtime = MCPRuntime(
+            close_timeout=0.05,
             max_connections=1,
             connection_wait_timeout=5.0,
             idle_timeout=None,
@@ -3163,6 +3170,7 @@ class TestConnectionCapacity:
     async def test_pressure_retirement_does_not_arm_an_idle_timer_too(self) -> None:
         _InstrumentedAdapter.close_gate = asyncio.Event()
         runtime = MCPRuntime(
+            close_timeout=0.05,
             max_connections=1,
             connection_wait_timeout=5.0,
             idle_timeout=300.0,
@@ -4552,7 +4560,7 @@ class TestBrokenConnectionRecovery:
         close_gate = asyncio.Event()
         _InstrumentedAdapter.close_gate = close_gate
         _InstrumentedAdapter.call_error = ConnectionResetError("socket died")
-        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+        async with MCPRuntime(close_timeout=0.05, shutdown_timeout=0.05) as runtime:
             connection = _bind(runtime)
             first = Agent(prompt="first", tool_sources=[connection.tools()])
             lookups = await first.get_tool_lookups()
@@ -5943,7 +5951,9 @@ class TestObservabilityHardening:
     @pytest.mark.asyncio
     async def test_resistant_close_is_terminal_before_shutdown_completes(self) -> None:
         observer = _RecordingObserver()
-        runtime = MCPRuntime(observer=observer, idle_timeout=None, shutdown_timeout=0.01)
+        runtime = MCPRuntime(
+            close_timeout=0.05, observer=observer, idle_timeout=None, shutdown_timeout=0.01
+        )
         agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
         await agent.get_tool_lookups()
         await agent.close()
@@ -6009,3 +6019,81 @@ class TestObservabilityHardening:
             assert started.source_name == completed.source_name == opened.source_name == "github"
             await second.close()
             await first.close()
+
+
+class TestCloseGrace:
+    """Transport close gets ``close_timeout``, independent of the drain budget.
+
+    A Streamable HTTP close is a network round trip (the SDK sends a
+    session-terminating DELETE), so it must be allowed more than the
+    sub-second grace that suits a stdio subprocess.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_slow_close_inside_the_grace_is_awaited_and_clean(self) -> None:
+        events: list[MCPRuntimeEvent] = []
+
+        class Observer:
+            def on_event(self, event: MCPRuntimeEvent) -> None:
+                events.append(event)
+
+        _InstrumentedAdapter.close_gate = asyncio.Event()
+        runtime = MCPRuntime(observer=Observer(), close_timeout=1.0, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+
+        close_task = asyncio.create_task(runtime.close())
+        await asyncio.sleep(0.3)  # longer than the old fixed 250 ms grace
+        assert not close_task.done()
+
+        _InstrumentedAdapter.close_gate.set()
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+        closed = [event for event in events if isinstance(event, MCPConnectionClosed)]
+        assert len(closed) == 1
+        assert closed[0].clean is True
+        assert runtime._abandoned_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_a_close_beyond_the_grace_finishes_in_the_background(self) -> None:
+        events: list[MCPRuntimeEvent] = []
+
+        class Observer:
+            def on_event(self, event: MCPRuntimeEvent) -> None:
+                events.append(event)
+
+        _InstrumentedAdapter.close_gate = asyncio.Event()
+        runtime = MCPRuntime(observer=Observer(), close_timeout=0.05, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+
+        await asyncio.wait_for(runtime.close(), timeout=1.0)
+
+        closed = [event for event in events if isinstance(event, MCPConnectionClosed)]
+        assert len(closed) == 1
+        assert closed[0].clean is False
+        assert len(runtime._abandoned_tasks) == 1
+
+        _InstrumentedAdapter.close_gate.set()
+        await _wait_until(lambda: runtime._abandoned_tasks == set())
+        assert _InstrumentedAdapter.instances[0].closed is True
+
+    @pytest.mark.asyncio
+    async def test_eviction_waits_for_a_slow_close_inside_the_grace(self) -> None:
+        _InstrumentedAdapter.close_gate = asyncio.Event()
+        runtime = MCPRuntime(close_timeout=1.0, shutdown_timeout=0.05)
+        agent = Agent(prompt="test", tool_sources=[_bind(runtime).tools()])
+        await agent.get_tool_lookups()
+        await agent.close()
+
+        evicting = asyncio.create_task(runtime.evict(connection_key="github-1"))
+        await asyncio.sleep(0.3)
+        assert not evicting.done()
+
+        _InstrumentedAdapter.close_gate.set()
+        await asyncio.wait_for(evicting, timeout=1.0)
+        assert _InstrumentedAdapter.instances[0].closed is True
+        assert runtime._abandoned_tasks == set()
+        await runtime.close()
