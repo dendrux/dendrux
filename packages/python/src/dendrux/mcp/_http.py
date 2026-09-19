@@ -256,7 +256,9 @@ def create_http_client(
         auth=source.auth,
         timeout=httpx2.Timeout(source.connect_timeout, read=source.call_timeout),
         follow_redirects=source.follow_redirects,
-        max_redirects=source.max_redirects,
+        # MCP 2.2 follows same-origin redirects itself; its loop uses this
+        # budget even when the HTTP client has follow_redirects disabled.
+        max_redirects=source.max_redirects if source.follow_redirects else 0,
         trust_env=source.destination_policy is None,
         transport=transport,
         event_hooks={

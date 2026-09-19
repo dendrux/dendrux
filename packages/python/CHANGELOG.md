@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- MCP: require SDK 2.2+, adopting its origin-restricted redirect handling;
+  preserve per-source redirects-off behavior and report blocked targets as
+  structured origins without contacting them.
+
+- Runs: preserve discovery metadata on errors and stream-closed cancellations,
+  expose `RunStream.result` after closure and `run_id`/`run_meta` on blocking
+  execution errors. An empty skipped-source list means discovery completed;
+  an absent key means its outcome is unavailable.
+
 - MCP: opt-in `reauthenticate_on_401` with `MCPRefreshingCredentialProvider`
   rejection notification, shared refresh/reconnect, and one retry of a
   definitively rejected tool POST. Live 401/403 errors are typed per request.

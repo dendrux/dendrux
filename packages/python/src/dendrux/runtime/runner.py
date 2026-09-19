@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
@@ -105,15 +106,19 @@ def _cause_type(error: BaseException) -> str | None:
     return type(cause).__name__ if cause is not None else None
 
 
-def _attach_mcp_meta(result: RunResult, agent: Agent) -> None:
-    """Name optional MCP sources skipped at discovery on the run's result.
-
-    Applied to the loop's result before any persistence branch, so it is
-    present with and without a run store.
-    """
+def _snapshot_mcp_meta(agent: Agent) -> dict[str, Any]:
     skipped = agent._mcp_skipped_sources
-    if skipped:
-        result.meta["mcp_skipped_sources"] = [dict(entry) for entry in skipped]
+    return {"mcp_skipped_sources": deepcopy(skipped)}
+
+
+def _attach_mcp_meta(result: RunResult, mcp_meta: dict[str, Any]) -> None:
+    result.meta.update(deepcopy(mcp_meta))
+
+
+def _attach_run_error_meta(exc: Exception, run_id: str, mcp_meta: dict[str, Any]) -> None:
+    # Preserve provider exception identity and catch compatibility, including
+    # exceptions whose __setattr__ disallows assigning new attributes.
+    exc.__dict__.update(run_id=run_id, run_meta=deepcopy(mcp_meta))
 
 
 class _MCPDiscoveryError(Exception):
@@ -145,6 +150,7 @@ async def _emit_init_events(
     run_id: str,
     *,
     resolved_loop: Loop | None = None,
+    mcp_meta: dict[str, Any] | None = None,
 ) -> None:
     """Emit skill and MCP init governance events.
 
@@ -183,12 +189,18 @@ async def _emit_init_events(
                 {"skill_name": name, "reason": "denied_by_policy"},
             )
 
+    if not agent._tool_sources and mcp_meta is not None:
+        mcp_meta["mcp_skipped_sources"] = []
+
     # MCP events — only when tool_sources exist
     if agent._tool_sources:
         try:
             await agent.get_tool_lookups(loop=resolved_loop)  # force discovery
         except Exception as exc:
             raise _MCPDiscoveryError(str(exc)) from exc
+
+        if mcp_meta is not None:
+            mcp_meta.update(_snapshot_mcp_meta(agent))
 
         # Initialize from all sources so zero-tool and failed optional sources
         # still produce explicit, auditable events. Tools are grouped by the
@@ -798,6 +810,7 @@ async def run(
         max_delegation_depth=effective_max_depth,
     )
     ctx_token = set_delegation_context(this_ctx)
+    mcp_meta: dict[str, Any] = {}
 
     try:
         # Emit init governance events (skills + MCP) inside the try block
@@ -806,7 +819,12 @@ async def run(
         # original cause is re-raised for the outer except Exception.
         try:
             await _emit_init_events(
-                agent, recorder, extra_notifier, run_id, resolved_loop=resolved_loop
+                agent,
+                recorder,
+                extra_notifier,
+                run_id,
+                resolved_loop=resolved_loop,
+                mcp_meta=mcp_meta,
             )
         except _MCPDiscoveryError as mcp_exc:
             try:
@@ -849,7 +867,7 @@ async def run(
             state_store=state_store,
         )
 
-        _attach_mcp_meta(result, agent)
+        _attach_mcp_meta(result, mcp_meta)
         if state_store is not None:
             result = await _persist_loop_outcome(
                 state_store=state_store,
@@ -864,6 +882,7 @@ async def run(
         return result
 
     except Exception as exc:
+        _attach_run_error_meta(exc, run_id, mcp_meta)
         # Persist ERROR status before re-raising.
         # Conditional: only if still running (prevents cancel race).
         if state_store is not None:
@@ -1159,11 +1178,17 @@ async def retry(
         max_delegation_depth=effective_max_depth,
     )
     ctx_token = set_delegation_context(this_ctx)
+    mcp_meta: dict[str, Any] = {}
 
     try:
         try:
             await _emit_init_events(
-                agent, recorder, extra_notifier, run_id, resolved_loop=resolved_loop
+                agent,
+                recorder,
+                extra_notifier,
+                run_id,
+                resolved_loop=resolved_loop,
+                mcp_meta=mcp_meta,
             )
         except _MCPDiscoveryError as mcp_exc:
             try:
@@ -1191,7 +1216,7 @@ async def retry(
             state_store=state_store,
         )
 
-        _attach_mcp_meta(result, agent)
+        _attach_mcp_meta(result, mcp_meta)
         result = await _persist_loop_outcome(
             state_store=state_store,
             run_id=run_id,
@@ -1205,6 +1230,7 @@ async def retry(
         return result
 
     except Exception as exc:
+        _attach_run_error_meta(exc, run_id, mcp_meta)
         error_won = False
         try:
             error_won = await state_store.finalize_run(
@@ -1342,6 +1368,8 @@ def run_stream(
     # cleanup reads if the consumer abandons after setup.
     _shared: dict[str, Any] = {"state_store": state_store, "sequencer": EventSequencer()}
 
+    mcp_meta: dict[str, Any] = {}
+
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         """Inner generator — lazy async setup, then loop stream with lifecycle.
 
@@ -1444,7 +1472,12 @@ def run_stream(
             # Emit init governance events (skills + MCP)
             try:
                 await _emit_init_events(
-                    agent, recorder, extra_notifier, run_id, resolved_loop=resolved_loop
+                    agent,
+                    recorder,
+                    extra_notifier,
+                    run_id,
+                    resolved_loop=resolved_loop,
+                    mcp_meta=mcp_meta,
                 )
             except _MCPDiscoveryError as mcp_exc:
                 try:
@@ -1502,7 +1535,7 @@ def run_stream(
                     )
                     terminal_result = event.run_result if event.type in _terminal_types else None
                     if terminal_result is not None:
-                        _attach_mcp_meta(terminal_result, agent)
+                        _attach_mcp_meta(terminal_result, mcp_meta)
                         if store is not None:
                             persisted = await _persist_loop_outcome(
                                 state_store=store,
@@ -1568,6 +1601,7 @@ def run_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
+                    meta=deepcopy(mcp_meta),
                 ),
                 error=str(exc),
             )
@@ -1577,7 +1611,7 @@ def run_stream(
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
-    async def _cleanup() -> None:
+    async def _cleanup() -> RunResult | None:
         """CAS-guarded cancellation + local lifecycle close.
 
         Two responsibilities:
@@ -1631,7 +1665,9 @@ def run_stream(
                         terminal_status = RunStatus(run_record.status)
                 except Exception:
                     pass  # CANCELLED is a safe fallback
-            cancelled_result = RunResult(run_id=run_id, status=terminal_status)
+            cancelled_result = RunResult(
+                run_id=run_id, status=terminal_status, meta=deepcopy(mcp_meta)
+            )
             try:
                 await record_run_finished(cleanup_recorder, run_id, cancelled_result)
                 await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
@@ -1641,6 +1677,9 @@ def run_stream(
                     run_id,
                     exc_info=True,
                 )
+
+            return cancelled_result
+        return None
 
     return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
 
@@ -2045,6 +2084,7 @@ async def _resume_core(
     #       pair on any failure (including injected-history replay errors).
     ctx: _ResumeContext | None = None
     ctx_token = None
+    mcp_meta: dict[str, Any] = {}
 
     try:
         # 4-8. Prepare history, notifier, sequencer (shared with resume_stream).
@@ -2072,7 +2112,10 @@ async def _resume_core(
             ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
         )
 
-        # 8b. Replay injected tool/user-input history. Inside the try so
+        await agent.get_tool_lookups(loop=ctx.resolved_loop)
+        mcp_meta.update(_snapshot_mcp_meta(agent))
+
+        # 8b. tool/user-input history. Inside the try so
         #     a recorder failure here fires on_run_failed.
         await _replay_resume_injected_history(
             ctx, run_id, tool_results=tool_results, user_input=user_input
@@ -2188,7 +2231,7 @@ async def _resume_core(
             state_store=state_store,
         )
 
-        _attach_mcp_meta(result, agent)
+        _attach_mcp_meta(result, mcp_meta)
         result = await _persist_loop_outcome(
             state_store=state_store,
             run_id=run_id,
@@ -2202,6 +2245,7 @@ async def _resume_core(
         return result
 
     except Exception as exc:
+        _attach_run_error_meta(exc, run_id, mcp_meta)
         error_won = False
         try:
             error_won = await state_store.finalize_run(
@@ -2265,6 +2309,8 @@ def resume_stream(
     from dendrux.types import RunStream as _RunStream
 
     _shared: dict[str, Any] = {"state_store": state_store, "sequencer": None, "ctx": None}
+
+    mcp_meta: dict[str, Any] = {}
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
@@ -2361,7 +2407,10 @@ def resume_stream(
             _shared["recorder"] = ctx.recorder
             _shared["notifier"] = ctx.notifier
 
-            # 5b. Replay injected tool/user-input history. Inside the try
+            await agent.get_tool_lookups(loop=ctx.resolved_loop)
+            mcp_meta.update(_snapshot_mcp_meta(agent))
+
+            # 5b. tool/user-input history. Inside the try
             #     so a recorder failure here fires on_run_failed.
             await _replay_resume_injected_history(
                 ctx, run_id, tool_results=tool_results, user_input=user_input
@@ -2492,7 +2541,7 @@ def resume_stream(
                         )
                         and event.run_result
                     ):
-                        _attach_mcp_meta(event.run_result, agent)
+                        _attach_mcp_meta(event.run_result, mcp_meta)
                         persisted = await _persist_loop_outcome(
                             state_store=store,
                             run_id=run_id,
@@ -2556,6 +2605,7 @@ def resume_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
+                    meta=deepcopy(mcp_meta),
                 ),
                 error=str(exc),
             )
@@ -2565,7 +2615,7 @@ def resume_stream(
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
-    async def _cleanup() -> None:
+    async def _cleanup() -> RunResult | None:
         """CAS-guarded cancellation + local lifecycle close.
 
         Mirrors run_stream._cleanup. The lifecycle close fires whether or
@@ -2612,7 +2662,9 @@ def resume_stream(
                         terminal_status = RunStatus(run_record.status)
                 except Exception:
                     pass  # CANCELLED is a safe fallback
-            cancelled_result = RunResult(run_id=run_id, status=terminal_status)
+            cancelled_result = RunResult(
+                run_id=run_id, status=terminal_status, meta=deepcopy(mcp_meta)
+            )
             try:
                 await record_run_finished(cleanup_recorder, run_id, cancelled_result)
                 await notify_run_finished(_shared.get("notifier"), run_id, cancelled_result)
@@ -2622,6 +2674,9 @@ def resume_stream(
                     run_id,
                     exc_info=True,
                 )
+
+            return cancelled_result
+        return None
 
     return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
 

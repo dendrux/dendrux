@@ -76,8 +76,12 @@ effective port. Authentication-generated headers, Authorization, and Cookie are
 also stripped before requests to another origin. This applies on every redirect
 hop and authentication retry. Same-origin redirects retain credentials; even an
 HTTP-to-HTTPS upgrade is a different origin. Redirect URLs containing userinfo
-are rejected. Cross-origin redirects may therefore fail authentication at the
-target; configure that target as a separate source with its own credentials.
+are rejected. MCP 2.2 or newer follows only method-preserving redirects within
+the endpoint origin (also allowing the SDK's default-port HTTP-to-HTTPS upgrade).
+Other cross-origin redirects are blocked before contacting the target; configure
+that target as a separate source with its own credentials. The blocked target
+is available as `MCPConnectionError.redirect_target`, while `destination` names
+the origin actually contacted.
 
 Applications own the destination policy. Dendrux calls the async policy before
 opening each TCP socket, with an immutable `MCPDestination(host, port, ip)`:
@@ -510,6 +514,43 @@ result = await agent.run("...")
 for skipped in result.meta.get("mcp_skipped_sources", []):
     skipped["source_name"], skipped["error_type"], skipped["error"]
 ```
+
+Discovery metadata is a snapshot taken before execution, including resumed execution.
+`mcp_skipped_sources: []` means discovery completed with nothing skipped. An absent
+key means the outcome is unavailable (for example, initialization failed before
+discovery completed, or an idempotent result was reconstructed from storage).
+Error handling never repeats discovery to populate this metadata.
+
+Stream error events include the snapshot in `event.run_result.meta`. After a
+terminal event or client closure, read `stream.result`; closure does not yield
+an additional event. The `on_run_finished(run_id, result)` lifecycle hook also
+receives the cancellation result with the same metadata:
+
+```python
+async with agent.stream("...") as stream:
+    async for event in stream:
+        if should_stop(event):
+            break
+if stream.result is not None:
+    skipped = stream.result.meta.get("mcp_skipped_sources")
+```
+
+Blocking execution failures preserve their original exception type and identity.
+Once execution has entered the runner's error-handling scope, the exception
+exposes `run_id` and `run_meta`, including the discovery snapshot when available:
+
+```python
+try:
+    result = await agent.run("...")
+except Exception as error:
+    run_id = getattr(error, "run_id", None)
+    meta = getattr(error, "run_meta", {})
+    skipped = meta.get("mcp_skipped_sources")
+```
+
+Pre-execution validation errors can occur before a run exists and therefore
+need not have these attributes. `stream.result` is `None` before a terminal
+outcome, including a stream closed before its first iteration.
 
 An Agent caches discovery for its lifetime, so a source skipped once stays skipped for that Agent until `agent.refresh()`; a fresh Agent retries.
 

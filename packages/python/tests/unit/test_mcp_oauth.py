@@ -804,10 +804,15 @@ def test_invalid_url_diagnostics_do_not_mask_connection_failure():
     assert "example.com" not in str(error)
 
 
-async def test_redirect_failure_reports_attempted_origin_on_real_sdk():
+async def test_cross_origin_redirect_is_blocked_and_reports_target_on_real_sdk():
+    from dendrux.mcp import MCPConnectionError
+
+    reached = []
+
     async def target(scope, receive, send):
         if scope["type"] != "http":
             return
+        reached.append(scope)
         await send({"type": "http.response.start", "status": 401, "headers": []})
         await send({"type": "http.response.body", "body": b"rejected"})
 
@@ -827,12 +832,38 @@ async def test_redirect_failure_reports_attempted_origin_on_real_sdk():
 
         async with _serve(redirect) as source_url:
             adapter = MCPClientAdapter(MCPSource.http("demo", source_url))
-            with pytest.raises(MCPAuthenticationError) as caught:
+            with pytest.raises(MCPConnectionError) as caught:
                 await adapter.connect()
             await adapter.close()
     error = caught.value
     assert error.origin.port == httpx2.URL(source_url).port
-    assert error.destination.port == httpx2.URL(target_url).port
-    assert error.redirect_target == error.destination
+    assert not reached
+    assert error.destination == error.origin
+    assert error.redirect_target.port == httpx2.URL(target_url).port
     assert "127.0.0.1" not in str(error)
     assert "unknown-secret" not in (error.transport_detail or "")
+
+
+@pytest.mark.parametrize("follow", [False, True])
+async def test_sdk_same_origin_redirect_respects_source_setting(follow):
+    from dendrux.mcp import MCPConnectionError
+
+    reached = []
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        if scope["path"] == "/next":
+            reached.append(scope["path"])
+            status, headers = 401, []
+        else:
+            status, headers = 307, [(b"location", b"/next")]
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
+
+    async with _serve(app) as url:
+        adapter = MCPClientAdapter(MCPSource.http("demo", url, follow_redirects=follow))
+        with pytest.raises(MCPAuthenticationError if follow else MCPConnectionError):
+            await adapter.connect()
+        await adapter.close()
+    assert bool(reached) is follow

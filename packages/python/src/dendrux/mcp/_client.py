@@ -152,6 +152,7 @@ class MCPClientAdapter:
         self._stack: AsyncExitStack | None = None
         self._client: Client | None = None
         self.info: MCPConnectionInfo | None = None
+        self._last_redirect_target: MCPOrigin | None = None
         self._last_status: int | None = None
         self._destination_denied = False
         self._last_destination = _diagnostic_origin(source.url) if source.url else None
@@ -210,6 +211,13 @@ class MCPClientAdapter:
         still classify that failure as a credential rejection.
         """
         self._last_status = getattr(response, "status_code", None)
+        if 300 <= (self._last_status or 0) < 400:
+            location = response.headers.get("location")
+            if location:
+                with suppress(ValueError, httpx2.InvalidURL):
+                    self._last_redirect_target = _diagnostic_origin(
+                        response.request.url.join(location)
+                    )
         attempt = _tool_http_attempt.get()
         if attempt is None or attempt.adapter is not self:
             return
@@ -232,6 +240,7 @@ class MCPClientAdapter:
 
         self._last_status = None
         self._destination_denied = False
+        self._last_redirect_target = None
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
@@ -275,6 +284,7 @@ class MCPClientAdapter:
             failure: BaseException = exc
         else:
             return None
+        failure_redirect_target = self._last_redirect_target
         failure_destination = self._last_destination
         failure_status = self._last_status
         failure_denied = self._destination_denied
@@ -302,6 +312,7 @@ class MCPClientAdapter:
         # original exception as __context__ even with `from None`, and
         # error-monitoring SDKs walk __context__ regardless of
         # __suppress_context__ — which would republish the endpoint.
+        self._last_redirect_target = failure_redirect_target
         self._last_destination = failure_destination
         self._last_status = failure_status
         self._destination_denied = failure_denied
@@ -383,7 +394,8 @@ class MCPClientAdapter:
             if request is not None:
                 error.destination = _diagnostic_origin(request.url)
                 break
-        if error.destination != error.origin:
+        error.redirect_target = self._last_redirect_target
+        if error.redirect_target is None and error.destination != error.origin:
             error.redirect_target = error.destination
         return error
 
