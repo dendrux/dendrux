@@ -36,6 +36,8 @@ def _assert_artifact_contents(wheel: Path, sdist: Path) -> None:
         "dendrux/mcp/__init__.py",
         "dendrux/mcp/_client.py",
         "dendrux/mcp/_discovery.py",
+        "dendrux/mcp/_destination.py",
+        "dendrux/mcp/_http.py",
         "dendrux/mcp/_errors.py",
         "dendrux/mcp/_observability.py",
         "dendrux/mcp/_runtime.py",

@@ -16,7 +16,12 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKMCPError
 from mcp.types import CONNECTION_CLOSED
 
-from dendrux.mcp._errors import MCPAuthenticationError, MCPConnectionError
+from dendrux.mcp._errors import (
+    MCPAuthenticationError,
+    MCPConnectionError,
+    MCPDestinationDeniedError,
+)
+from dendrux.mcp._http import create_http_client
 from dendrux.mcp._source import (
     exception_class_name,
     safe_source_exception_detail,
@@ -118,6 +123,7 @@ class MCPClientAdapter:
         self._client: Client | None = None
         self.info: MCPConnectionInfo | None = None
         self._last_status: int | None = None
+        self._destination_denied = False
 
     @property
     def connected(self) -> bool:
@@ -158,6 +164,9 @@ class MCPClientAdapter:
         finally:
             await self._close_owned_stack()
 
+    def _observe_destination_denied(self) -> None:
+        self._destination_denied = True
+
     async def _observe_response(self, response: Any) -> None:
         """Remember the status of the latest HTTP response.
 
@@ -172,21 +181,16 @@ class MCPClientAdapter:
         """Open the transport, returning a detached safe failure if needed."""
 
         self._last_status = None
+        self._destination_denied = False
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
             if self.source.url is not None:
-                timeout = httpx2.Timeout(
-                    self.source.connect_timeout,
-                    read=self.source.call_timeout,
-                )
                 http_client = await stack.enter_async_context(
-                    httpx2.AsyncClient(
-                        headers=dict(self.source.headers),
-                        auth=self.source.auth,
-                        timeout=timeout,
-                        follow_redirects=True,
-                        event_hooks={"response": [self._observe_response]},
+                    create_http_client(
+                        self.source,
+                        response_hook=self._observe_response,
+                        on_denied=self._observe_destination_denied,
                     )
                 )
                 transport = streamable_http_client(
@@ -294,7 +298,14 @@ class MCPClientAdapter:
         if status is None and self._last_status in _AUTH_REJECTION_STATUSES:
             status = self._last_status
         error: MCPConnectionError
-        if status is not None:
+        if self._destination_denied or any(
+            isinstance(node, MCPDestinationDeniedError) for node in _iter_error_tree(exc)
+        ):
+            error = MCPDestinationDeniedError(
+                f"Failed to {action} MCP source '{self.source.name}': destination denied."
+            )
+            detail = None
+        elif status is not None:
             auth_error = MCPAuthenticationError(
                 f"Failed to {action} MCP source '{self.source.name}': "
                 f"the server rejected its credentials (HTTP {status})."
