@@ -57,7 +57,7 @@ class MCPBindingConflictError(MCPError):
         if mismatch == "configuration":
             message = (
                 f"MCP binding {identity!r} has a live connection with a different "
-                "configuration. Evict or close it before rebinding with new settings."
+                "configuration. Use MCPRuntime.rebind() to replace it, or evict first."
             )
         else:
             message = (

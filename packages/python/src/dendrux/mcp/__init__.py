@@ -34,6 +34,7 @@ except ModuleNotFoundError as err:
         ) from None
     raise  # Real import error from within the mcp package
 
+from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo  # noqa: E402
 from dendrux.mcp._errors import (  # noqa: E402
     MCPAuthenticationError,
     MCPBindingConflictError,
@@ -122,6 +123,7 @@ __all__ = [
     "MCPConnectionStatus",
     "MCPCredentialError",
     "MCPCredentialProvider",
+    "MCPDiscovery",
     "MCPError",
     "MCPEvictionCompleted",
     "MCPEvictionMode",
@@ -149,6 +151,7 @@ __all__ = [
     "MCPToolCallFailed",
     "MCPToolCallOutcomeUnknown",
     "MCPToolCallStarted",
+    "MCPToolInfo",
     "MCPToolPolicy",
     "MCPToolView",
 ]

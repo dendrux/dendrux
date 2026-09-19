@@ -18,6 +18,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._discovery import MCPDiscovery, build_discovery
 from dendrux.mcp._errors import (
     MCPBindingConflictError,
     MCPCallCapacityError,
@@ -299,6 +300,27 @@ class MCPConnection:
                 force_serial_tools=force_serial_tools,
             ),
         )
+
+    async def discover(self) -> MCPDiscovery:
+        """Connect if needed and return the server's advertised catalog.
+
+        For settings pages and health checks: test a connection and show
+        its tools before any Agent exists. This takes exactly the path an
+        Agent lease takes — credential resolution, circuit breaker, capacity,
+        single-flight connect and discovery — and raises the same errors
+        (:class:`MCPAuthenticationError`, :class:`MCPCircuitOpenError`,
+        :class:`MCPStaleConnectionError`, ...). The lease is released before
+        returning, so the connection stays warm for ``idle_timeout`` and the
+        next Agent reuses it without reconnecting; calling this ahead of a
+        user's first turn is therefore also a warm-up. The catalog belongs
+        to the live physical connection; to force rediscovery, evict.
+        """
+        runtime = self.runtime
+        entry = await runtime._lease(self)
+        try:
+            return build_discovery(entry.info, entry.raw_tools)
+        finally:
+            runtime._release(self.identity, entry)
 
     def __repr__(self) -> str:
         return (
@@ -2359,30 +2381,24 @@ class MCPRuntime:
         credential row id or rotation counter) makes rotation explicit: a
         rebind with a different identity conflicts while the connection is
         live — evict first — and supersedes older handles once it is not.
+
+        Every ``MCPSource`` field except ``name`` is connection
+        configuration: endpoint, headers, ``connect_timeout``,
+        ``call_timeout``, ``max_result_bytes`` and ``failure_mode`` alike.
+        Binding a live identity with any of them changed raises
+        :class:`MCPBindingConflictError`; use :meth:`rebind` to replace the
+        live connection in one step.
         """
         with self._lock:
             if self._state is not MCPRuntimeState.OPEN:
                 raise MCPRuntimeClosedError("MCPRuntime is closed and cannot bind new connections.")
-            _validate_identity_key(tenant_key, "tenant", optional=True)
-            _validate_identity_key(connection_key, "connection", optional=False)
-            if not isinstance(source, MCPSource):
-                raise ValueError("MCPRuntime source must be an MCPSource instance.")
-            if source_has_opaque_credentials(source):
-                raise ValueError(
-                    "MCPRuntime source auth cannot be opaque because its secret values "
-                    "cannot be redacted. Use static headers or a credentials provider."
-                )
-            if credentials is not None and not isinstance(credentials, MCPCredentialProvider):
-                raise ValueError(
-                    "MCPRuntime credentials must implement MCPCredentialProvider.get_auth()."
-                )
-            if credential_identity is not None:
-                if credentials is None:
-                    raise ValueError(
-                        "MCPRuntime credential_identity requires a credentials provider."
-                    )
-                _validate_identity_key(credential_identity, "credential identity", optional=False)
-            _validate_namespace(source.name)
+            self._validate_binding(
+                connection_key=connection_key,
+                source=source,
+                tenant_key=tenant_key,
+                credentials=credentials,
+                credential_identity=credential_identity,
+            )
 
             identity = tenant_key, connection_key
             if identity in self._evictions:
@@ -2446,6 +2462,86 @@ class MCPRuntime:
                 credential_identity=credential_identity,
                 generation=registration.generation,
             )
+
+    @staticmethod
+    def _validate_binding(
+        *,
+        connection_key: str,
+        source: MCPSource,
+        tenant_key: str | None,
+        credentials: MCPCredentialProvider | None,
+        credential_identity: str | None,
+    ) -> None:
+        _validate_identity_key(tenant_key, "tenant", optional=True)
+        _validate_identity_key(connection_key, "connection", optional=False)
+        if not isinstance(source, MCPSource):
+            raise ValueError("MCPRuntime source must be an MCPSource instance.")
+        if source_has_opaque_credentials(source):
+            raise ValueError(
+                "MCPRuntime source auth cannot be opaque because its secret values "
+                "cannot be redacted. Use static headers or a credentials provider."
+            )
+        if credentials is not None and not isinstance(credentials, MCPCredentialProvider):
+            raise ValueError(
+                "MCPRuntime credentials must implement MCPCredentialProvider.get_auth()."
+            )
+        if credential_identity is not None:
+            if credentials is None:
+                raise ValueError("MCPRuntime credential_identity requires a credentials provider.")
+            _validate_identity_key(credential_identity, "credential identity", optional=False)
+        _validate_namespace(source.name)
+
+    async def rebind(
+        self,
+        *,
+        connection_key: str,
+        source: MCPSource,
+        tenant_key: str | None = None,
+        credentials: MCPCredentialProvider | None = None,
+        credential_identity: str | None = None,
+        mode: MCPEvictionMode = "drain",
+        timeout: float | None = None,
+    ) -> MCPConnection:
+        """Replace a connection identity's configuration, live or not.
+
+        The settings-save path: :meth:`evict` followed by :meth:`bind` in
+        one call, so an application never writes that dance itself. A live
+        connection is drained (or, with ``mode="force"``, interrupted —
+        see :meth:`evict` for the outcome semantics) and closed, its
+        registration and circuit are forgotten, and the new configuration is
+        bound with a fresh generation. Handles issued before the call are
+        invalid afterwards; use the returned one. When nothing is live, or
+        the identity was never bound, this is simply a bind.
+
+        The new arguments are validated before anything is evicted, so a
+        rejected configuration leaves the existing binding untouched. The
+        two steps are not atomic against a concurrent ``bind`` of the same
+        key from another task; serialise settings writes per key if that
+        can happen in your application.
+        """
+        with self._lock:
+            if self._state is not MCPRuntimeState.OPEN:
+                raise MCPRuntimeClosedError("MCPRuntime is closed and cannot bind new connections.")
+            self._validate_binding(
+                connection_key=connection_key,
+                source=source,
+                tenant_key=tenant_key,
+                credentials=credentials,
+                credential_identity=credential_identity,
+            )
+        await self.evict(
+            connection_key=connection_key,
+            tenant_key=tenant_key,
+            mode=mode,
+            timeout=timeout,
+        )
+        return self.bind(
+            connection_key=connection_key,
+            source=source,
+            tenant_key=tenant_key,
+            credentials=credentials,
+            credential_identity=credential_identity,
+        )
 
     async def evict(
         self,

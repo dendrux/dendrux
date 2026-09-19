@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- MCP: `await connection.discover()` returns an `MCPDiscovery` (server
+  facts plus the raw `MCPToolInfo` catalog) through the managed runtime's
+  normal lease path, without an Agent. The connection stays warm for
+  `idle_timeout` afterwards.
+- MCP: `await runtime.rebind(...)` replaces a live connection's
+  configuration in one step (validate, evict, bind). `bind()` documents that
+  every `MCPSource` field except `name` — timeouts, `max_result_bytes`,
+  `failure_mode` included — is configuration.
+- MCP: the `mcp.error` governance event gains `error_type`; best-effort
+  runs list skipped sources on `RunResult.meta["mcp_skipped_sources"]`
+  (`source_name`, `namespace`, `error_type`, `error`).
 - MCP: a server that rejects the source's credentials with HTTP 401/403
   now raises `MCPAuthenticationError` (with `status_code`) on SDK 2.x
   Streamable HTTP, where the SDK reports the rejected initialize as a

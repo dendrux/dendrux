@@ -58,6 +58,7 @@ EXPECTED_ALL = (
     "MCPConnectionStatus",
     "MCPCredentialError",
     "MCPCredentialProvider",
+    "MCPDiscovery",
     "MCPError",
     "MCPEvictionCompleted",
     "MCPEvictionMode",
@@ -85,6 +86,7 @@ EXPECTED_ALL = (
     "MCPToolCallFailed",
     "MCPToolCallOutcomeUnknown",
     "MCPToolCallStarted",
+    "MCPToolInfo",
     "MCPToolPolicy",
     "MCPToolView",
 )
