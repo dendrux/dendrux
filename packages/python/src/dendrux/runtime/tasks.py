@@ -5,6 +5,10 @@ the task is tracked at spawn, cancel() is best-effort cooperative
 cancellation against an in-flight run, and finished tasks are removed
 from tracking automatically.
 
+It also holds one interrupt signal per streamed run owned by this
+process. :meth:`cancel` sets the signal so the loop driving the stream
+can abandon an in-flight provider call between tokens.
+
 Cross-process cancellation is not handled here — that requires the run
 to be executing in this process. Runs on other workers can still be
 CAS-finalized in the DB; they just won't be preempted mid-call.
@@ -36,6 +40,7 @@ class RunTaskManager:
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
+        self._interrupts: dict[str, asyncio.Event] = {}
 
     def spawn(self, run_id: str, coro: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
         """Spawn a background task for ``run_id`` and track it.
@@ -63,18 +68,42 @@ class RunTaskManager:
             self._tasks.pop(run_id, None)
 
     def cancel(self, run_id: str) -> bool:
-        """Cancel the tracked task for ``run_id``.
+        """Cancel the tracked task and/or set the interrupt signal for ``run_id``.
 
-        Returns True if a task was tracked and the cancel signal was
-        delivered; False if no task is currently tracked for this run
-        (either it was never spawned in this process or it already
-        finished).
+        Returns True if at least one signal was delivered (a background
+        task was cancelled or a streamed run's interrupt was set); False
+        if nothing is tracked for this run in this process.
         """
+        delivered = False
         task = self._tasks.get(run_id)
-        if task is None:
-            return False
-        task.cancel()
-        return True
+        if task is not None:
+            task.cancel()
+            delivered = True
+        signal = self._interrupts.get(run_id)
+        if signal is not None:
+            signal.set()
+            delivered = True
+        return delivered
+
+    def register_interrupt(self, run_id: str) -> asyncio.Event:
+        """Return the interrupt signal for a streamed run, creating it if needed.
+
+        The runner registers before driving the loop and releases in its
+        cleanup; :meth:`cancel` sets it.
+        """
+        signal = self._interrupts.get(run_id)
+        if signal is None:
+            signal = asyncio.Event()
+            self._interrupts[run_id] = signal
+        return signal
+
+    def release_interrupt(self, run_id: str) -> None:
+        """Forget the interrupt signal for ``run_id``. No-op if unknown."""
+        self._interrupts.pop(run_id, None)
+
+    def has_interrupt(self, run_id: str) -> bool:
+        """Return True if a streamed run's interrupt is registered here."""
+        return run_id in self._interrupts
 
     def is_running(self, run_id: str) -> bool:
         """Return True if ``run_id`` has a tracked task in this process."""

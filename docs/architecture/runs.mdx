@@ -103,7 +103,7 @@ Two things to notice.
 
 **Pauses aren't errors.** A run that's `waiting_client_tool` is a successful, in-progress run that happens to be paused. Your code shouldn't treat pause statuses as failures; they're the contract between the agent and your application.
 
-**Cancellation is cooperative, not preemptive.** When you call `cancel_run`, dendrux sets a flag in the database and emits a `run.cancelled` event. The runner observes that flag at two safe checkpoints: the top of every iteration, and right before pausing. The current LLM call and any in-flight tool calls finish first. Worst case: one more iteration's worth of work happens after you call cancel. This keeps cancellation simple and avoids leaving the agent in a half-torn-down state. See [Cancellation](/docs/architecture/cancellation) for the full story.
+**Cancellation is cooperative, with one controlled exception.** When you call `cancel_run`, dendrux sets a flag in the database. The runner observes that flag at two safe checkpoints: the top of every iteration, and right before pausing. In-flight tool calls always finish first. For a streamed run owned by the same `Agent` instance, `cancel_run` also interrupts the in-flight model stream between tokens and keeps the partial text as the run's `answer`, so a one-turn chat reply can be stopped mid-sentence. Either way the run ends with a `run.cancelled` event. See [Cancellation](/docs/architecture/cancellation) for the full story.
 
 ## Verified end-to-end
 

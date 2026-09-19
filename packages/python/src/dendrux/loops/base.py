@@ -28,6 +28,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import AsyncGenerator
 
     from pydantic import BaseModel
@@ -582,6 +583,7 @@ class Loop(ABC):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         state_store: StateStore | None = None,
+        interrupt: asyncio.Event | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream agent execution as RunEvents.
 
@@ -593,7 +595,10 @@ class Loop(ABC):
         intermediate events (TEXT_DELTA, TOOL_USE_*, TOOL_RESULT).
 
         Args:
-            Same as run().
+            Same as run(), plus ``interrupt``: an in-process signal set by
+            ``Agent.cancel_run``. Streaming loops race each provider pull
+            against it and yield ``RUN_CANCELLED`` (with the partial answer)
+            when it fires. The default implementation ignores it.
 
         Yields:
             RunEvent objects. Terminal event is RUN_COMPLETED or RUN_PAUSED.

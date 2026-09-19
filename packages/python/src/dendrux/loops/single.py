@@ -20,8 +20,10 @@ from typing import TYPE_CHECKING, Any
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._helpers import (
+    StreamInterruptedError,
     build_cache_key_prefix,
     guardrail_meta,
+    interruptible,
     notify_governance,
     notify_llm,
     notify_llm_failed,
@@ -34,7 +36,7 @@ from dendrux.loops._helpers import (
     record_message,
 )
 from dendrux.loops.base import Loop
-from dendrux.loops.react import _check_budget
+from dendrux.loops.react import _check_budget, _interrupted_result
 from dendrux.types import (
     Message,
     Role,
@@ -48,6 +50,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import AsyncGenerator
 
     from pydantic import BaseModel
@@ -484,6 +487,7 @@ class SingleCall(Loop):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         state_store: StateStore | None = None,  # noqa: ARG002 — SingleCall has no checkpoints
+        interrupt: asyncio.Event | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream a single LLM call as RunEvents.
 
@@ -530,6 +534,20 @@ class SingleCall(Loop):
             tool_defs=[],
         )
 
+        if interrupt is not None and interrupt.is_set():
+            # cancel_run landed before the provider call started — don't spend it.
+            yield RunEvent(
+                type=RunEventType.RUN_CANCELLED,
+                run_result=RunResult(
+                    run_id=resolved_run_id,
+                    status=RunStatus.CANCELLED,
+                    iteration_count=0,
+                    usage=UsageStats(),
+                    meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                ),
+            )
+            return
+
         # LLM call (lifecycle: started → completed/failed)
         await record_llm_started(
             recorder,
@@ -562,10 +580,13 @@ class SingleCall(Loop):
             cache_key_prefix=cache_key_prefix,
             **_pkw,
         )
+        partial_text: list[str] = []
+        interrupted = False
         try:
             try:
-                async for event in provider_stream:
+                async for event in interruptible(provider_stream, interrupt):
                     if event.type == StreamEventType.TEXT_DELTA:
+                        partial_text.append(event.text or "")
                         yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
                     elif event.type == StreamEventType.REASONING_DELTA:
                         yield RunEvent(type=RunEventType.REASONING_DELTA, text=event.text)
@@ -610,11 +631,31 @@ class SingleCall(Loop):
                     notifier_warnings,
                     duration_ms=_stream_fail_ms,
                 )
-                raise
+                if isinstance(_stream_exc, StreamInterruptedError):
+                    interrupted = True
+                else:
+                    raise
         finally:
             await provider_stream.aclose()
             _stream_telemetry.__exit__(None, None, None)
 
+        if interrupted:
+            yield RunEvent(
+                type=RunEventType.RUN_CANCELLED,
+                run_result=_interrupted_result(
+                    run_id=resolved_run_id,
+                    partial_text=partial_text,
+                    steps=[],
+                    iteration=1,
+                    usage=UsageStats(),
+                    notifier_warnings=notifier_warnings,
+                ),
+            )
+            return
+
+        # The try-block raised if no DONE arrived; only the interrupted path
+        # (handled above) leaves this None.
+        assert llm_response is not None
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
 
         await record_llm(

@@ -101,7 +101,7 @@ def stream(
 ) -> RunStream
 ```
 
-Same inputs as `run`, but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. Guardrails are not supported on the streaming path.
+Same inputs as `run`, but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. To interrupt from another coroutine, call `cancel_run(stream.run_id)`; the stream ends with `RUN_CANCELLED` carrying the partial answer. Closing the stream early also cancels the run and persists the text streamed so far. Guardrails are not supported on the streaming path.
 
 ## `resume`, `submit_tool_results`, `submit_input`, `submit_approval`
 
@@ -137,7 +137,7 @@ Streaming variant of resume: returns a `RunStream` for the resumed run.
 async def cancel_run(run_id: str) -> RunResult
 ```
 
-Request cancellation. Works for paused runs (atomic CAS to `cancelled`), running runs (cooperative flag), and terminal runs (no-op, never raises). Returns the persisted state. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
+Request cancellation. Works for paused runs (atomic CAS to `cancelled`), running runs (cooperative flag), streamed runs this instance owns (in-process interrupt: the model stream is abandoned immediately and `RUN_CANCELLED` carries the partial `answer`), and terminal runs (no-op, never raises). Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped". Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
 
 ## `retry`
 

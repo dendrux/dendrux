@@ -90,9 +90,34 @@ STATE AFTER CANCEL
 
 Sets `cancel_requested=True` on the row. The runner observes the flag at two checkpoints: the top of the next iteration, and the pre-pause boundary after the current iteration's loop body returns.
 
-The current iteration's LLM and tool calls are **not preempted**. Cancellation is observed *between steps*, never mid-step. That is intentional: an LLM call you preempted has already cost money and an interrupted tool can leave external systems in a partial state. Cooperative beats preemptive when the unit of work is unbounded. See [Cancellation](/docs/architecture/cancellation) for the design tradeoffs.
+Tool calls are **not preempted**, and for a non-streamed `agent.run()` neither is the in-flight LLM call. Cancellation is observed *between steps*. An interrupted tool can leave external systems in a partial state, so cooperative beats preemptive there. See [Cancellation](/docs/architecture/cancellation) for the design tradeoffs.
 
 When the runner observes the flag, it finalizes the run as `CANCELLED` and emits `run.cancelled`. Whichever party wins the atomic CAS owns the event.
+
+The returned `RunResult` is a receipt: `status` is still `running` and `meta["cancel_requested"]` is `True`. Confirmation is the terminal event (or `status == "cancelled"` from `RunStore.get_run`, which also exposes `cancel_requested`).
+
+### Streamed run on this `Agent` instance
+
+If the run was started with `stream()` or `resume_stream()` on the same `Agent` object, `cancel_run` also fires an in-process interrupt. The loop abandons the in-flight model stream immediately, even while waiting for the next token, closes the provider connection, and yields `RUN_CANCELLED` whose `answer` is the text streamed so far:
+
+```python
+async with agent.stream("Draft the announcement") as stream:
+    consumer = asyncio.create_task(read_events(stream))   # forwards TEXT_DELTA to the UI
+
+    await user_pressed_stop.wait()
+    await agent.cancel_run(stream.run_id)
+
+    events = await consumer
+    final = events[-1]                       # RunEventType.RUN_CANCELLED
+    kept = final.run_result.answer           # partial text, also persisted as the run's answer
+    assert final.run_result.meta["interrupted"] is True
+```
+
+`run.cancelled` then carries `{"reason": "cancel_requested", "interrupted": true, "partial_output": true}`. If the model's final event had already arrived when the cancel landed, the run completes as `success` instead: a finished answer is never thrown away.
+
+The interrupt only reaches streams driven by this `Agent` instance in this process. From another process, `cancel_run` sets the durable flag and the run cancels at its next checkpoint. Route interruption requests to the server that holds the stream.
+
+Closing the stream yourself (`aclose()` / leaving `async with`) also ends the run as `cancelled` and persists the partial answer, with `{"reason": "stream_closed"}`.
 
 ### In-process submit/resume task
 
@@ -143,11 +168,12 @@ es.addEventListener("message", (e) => {
 });
 ```
 
-`run.cancelled` carries `{"reason": "cancel_requested"}`. Other terminal events (`run.completed`, `run.error`) close the conversation just the same.
+`run.cancelled` carries `{"reason": "cancel_requested"}`, plus `"interrupted": true` and `"partial_output": true|false` when a streamed run was interrupted mid-generation, or `{"reason": "stream_closed", "partial_output": ...}` when the consumer closed the stream. Other terminal events (`run.completed`, `run.error`) close the conversation just the same. Refetch run detail to read the partial `answer`.
 
 ## Notes
 
 - **Cancellation is not retroactive.** Tokens spent before the runner observes the flag have been billed. Side effects from tools that already executed are not undone. The cancel is forward-looking: stop further iterations, do not roll back.
+- **Interrupted model calls report no usage.** Providers send token counts at the end of a stream. A call abandoned mid-stream contributes nothing to `usage`; only completed iterations are counted.
 - **Cancellation does not require holding the agent instance that started the run.** Any process with a DB handle and the same agent class can cancel. A dashboard, a webhook, an admin script — they all work.
 - **`cancel_run` is the only sanctioned way to stop a run.** Do not delete the row, do not edit the status by hand, do not kill the asyncio task in isolation. The CAS / flag dance encodes the safety properties.
 

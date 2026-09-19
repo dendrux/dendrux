@@ -15,10 +15,14 @@ shared instance can disambiguate concurrent runs.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, AsyncIterator
+
     from dendrux.agent import Agent
     from dendrux.guardrails._engine import GuardrailEngine
     from dendrux.loops.base import LoopNotifier, LoopRecorder
@@ -26,12 +30,97 @@ if TYPE_CHECKING:
         LLMResponse,
         Message,
         RunResult,
+        StreamEvent,
         ToolCall,
         ToolDef,
         ToolResult,
     )
 
 logger = logging.getLogger(__name__)
+
+
+class StreamInterruptedError(Exception):
+    """Raised inside a loop when an in-flight provider stream is interrupted.
+
+    Carries no payload. The loop that catches it owns the partial output
+    (the text deltas it already yielded) and turns the interruption into
+    a ``RUN_CANCELLED`` outcome.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("provider stream interrupted by cancel_run")
+
+
+_END = object()
+
+
+class _InterruptibleStream:
+    """Async iterator racing each provider pull against an interrupt signal.
+
+    Not an async generator on purpose: it holds no state that needs
+    finalizing, so closing the loop generator around it (GeneratorExit)
+    leaves nothing behind — no dependency on asyncio's async-generator
+    finalizer hooks, which run in another task and break ContextVar resets.
+    """
+
+    def __init__(
+        self,
+        stream: AsyncGenerator[StreamEvent, None],
+        interrupt: asyncio.Event,
+    ) -> None:
+        self._stream = stream
+        self._interrupt = interrupt
+
+    def __aiter__(self) -> _InterruptibleStream:
+        return self
+
+    async def _pull(self) -> StreamEvent | object:
+        try:
+            return await self._stream.__anext__()
+        except StopAsyncIteration:
+            return _END
+
+    async def __anext__(self) -> StreamEvent:
+        # Always race, even when the signal is already set: an event (or
+        # end-of-stream) that is available without blocking is delivered,
+        # so a call whose output is complete is never reported as interrupted.
+        pull = asyncio.ensure_future(self._pull())
+        wait = asyncio.ensure_future(self._interrupt.wait())
+        try:
+            done, _ = await asyncio.wait({pull, wait}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            pull.cancel()
+            raise
+        finally:
+            wait.cancel()
+
+        if pull in done:
+            item = pull.result()
+            if item is _END:
+                raise StopAsyncIteration
+            return cast("StreamEvent", item)
+
+        pull.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await pull
+        raise StreamInterruptedError()
+
+
+def interruptible(
+    stream: AsyncGenerator[StreamEvent, None],
+    interrupt: asyncio.Event | None,
+) -> AsyncIterator[StreamEvent]:
+    """Iterate ``stream``, raising :class:`StreamInterruptedError` when ``interrupt`` fires.
+
+    With ``interrupt=None`` the stream is returned unchanged (zero overhead).
+    Otherwise each pull races against the signal, so an interrupt arriving
+    while the provider is silent is honoured immediately rather than at the
+    next token. Anything the provider can hand over without blocking (an
+    event or end-of-stream) is always delivered, even after the signal fired.
+    """
+    if interrupt is None:
+        return stream
+    return _InterruptibleStream(stream, interrupt)
 
 
 def guardrail_meta(

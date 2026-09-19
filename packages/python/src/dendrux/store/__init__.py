@@ -102,6 +102,7 @@ class RunDetail:
     error: str | None
     failure_reason: str | None
     total_reasoning_tokens: int = 0
+    cancel_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +491,7 @@ def _run_to_detail(record: Any) -> RunDetail:
         error=record.error,
         failure_reason=record.failure_reason,
         total_reasoning_tokens=record.total_reasoning_tokens,
+        cancel_requested=bool(getattr(record, "cancel_requested", False)),
     )
 
 

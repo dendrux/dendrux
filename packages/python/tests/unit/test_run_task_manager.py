@@ -82,3 +82,58 @@ class TestCancel:
         await task
         # Task already removed; subsequent cancel should report False, not raise.
         assert mgr.cancel("r1") is False
+
+
+class TestInterruptSignals:
+    async def test_register_returns_unset_event(self) -> None:
+        mgr = RunTaskManager()
+        signal = mgr.register_interrupt("r1")
+        assert isinstance(signal, asyncio.Event)
+        assert not signal.is_set()
+        assert mgr.has_interrupt("r1")
+
+    async def test_register_is_idempotent_per_run(self) -> None:
+        mgr = RunTaskManager()
+        first = mgr.register_interrupt("r1")
+        second = mgr.register_interrupt("r1")
+        assert first is second
+
+    async def test_cancel_sets_registered_interrupt(self) -> None:
+        mgr = RunTaskManager()
+        signal = mgr.register_interrupt("r1")
+        assert mgr.cancel("r1") is True
+        assert signal.is_set()
+
+    async def test_cancel_returns_false_when_nothing_tracked(self) -> None:
+        mgr = RunTaskManager()
+        assert mgr.cancel("ghost") is False
+
+    async def test_release_removes_interrupt(self) -> None:
+        mgr = RunTaskManager()
+        mgr.register_interrupt("r1")
+        mgr.release_interrupt("r1")
+        assert not mgr.has_interrupt("r1")
+        assert mgr.cancel("r1") is False
+
+    async def test_release_unknown_is_noop(self) -> None:
+        mgr = RunTaskManager()
+        mgr.release_interrupt("ghost")
+        assert not mgr.has_interrupt("ghost")
+
+    async def test_cancel_sets_interrupt_and_cancels_task_together(self) -> None:
+        mgr = RunTaskManager()
+        started = asyncio.Event()
+
+        async def work() -> None:
+            started.set()
+            await asyncio.sleep(10)
+
+        task = mgr.spawn("r1", work())
+        signal = mgr.register_interrupt("r1")
+        await started.wait()
+
+        assert mgr.cancel("r1") is True
+        assert signal.is_set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
