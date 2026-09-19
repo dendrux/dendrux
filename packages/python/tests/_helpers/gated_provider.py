@@ -8,8 +8,10 @@ provider stream deterministically: the provider emits ``first``, sets
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any
 
+from dendrux.llm._retry_telemetry import begin_call_attempt_tracking, end_call_attempt_tracking
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -31,6 +33,11 @@ class GatedStreamLLM(LLMProvider):
 
     ``closed`` flips when the gated stream's generator is finalized;
     ``cancelled`` flips if a ``CancelledError`` was thrown into it.
+
+    Like the real providers, the stream sets a ContextVar-based attempt
+    counter on entry and resets it in ``finally`` — so any harness that
+    advances the generator in a different context than it finalizes it
+    fails loudly here instead of only against a live API.
     """
 
     capabilities = ProviderCapabilities(supports_native_tools=True, supports_streaming=True)
@@ -65,6 +72,15 @@ class GatedStreamLLM(LLMProvider):
         self, messages: Any, tools: Any = None, **kwargs: Any
     ) -> AsyncGenerator[StreamEvent, None]:
         self.call_count += 1
+        attempt_token = begin_call_attempt_tracking()
+        try:
+            async with aclosing(self._events()) as events:
+                async for event in events:
+                    yield event
+        finally:
+            end_call_attempt_tracking(attempt_token)
+
+    async def _events(self) -> AsyncGenerator[StreamEvent, None]:
         if self._before:
             resp = self._before.pop(0)
             if resp.text:

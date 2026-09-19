@@ -16,9 +16,8 @@ shared instance can disambiguate concurrent runs.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
@@ -51,16 +50,20 @@ class StreamInterruptedError(Exception):
         super().__init__("provider stream interrupted by cancel_run")
 
 
-_END = object()
-
-
 class _InterruptibleStream:
-    """Async iterator racing each provider pull against an interrupt signal.
+    """Async iterator that lets an interrupt signal abort a pending provider pull.
+
+    The provider generator is always advanced *in the caller's task* (never
+    in a helper task), so ContextVars a provider sets inside its generator —
+    retry attempt counters, telemetry bindings — live in the same context
+    they are later reset in. To interrupt a pull that is blocked on the
+    network, a watcher task cancels the caller's task, exactly the way
+    ``asyncio.timeout()`` does; the cancellation is absorbed here with
+    ``Task.uncancel()`` and surfaced as :class:`StreamInterruptedError`.
 
     Not an async generator on purpose: it holds no state that needs
-    finalizing, so closing the loop generator around it (GeneratorExit)
-    leaves nothing behind — no dependency on asyncio's async-generator
-    finalizer hooks, which run in another task and break ContextVar resets.
+    finalizing, so closing the loop generator around it leaves nothing
+    behind for asyncio's async-generator finalizer hooks.
     """
 
     def __init__(
@@ -74,36 +77,37 @@ class _InterruptibleStream:
     def __aiter__(self) -> _InterruptibleStream:
         return self
 
-    async def _pull(self) -> StreamEvent | object:
+    async def __anext__(self) -> StreamEvent:
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover — always inside a task under asyncio
+            return await self._stream.__anext__()
+
+        armed = True
+        fired = False
+
+        def _on_signal(waiter: asyncio.Future[Any]) -> None:
+            nonlocal fired
+            if armed and not waiter.cancelled():
+                fired = True
+                task.cancel()
+
+        # Always race, even when the signal is already set: the pull below
+        # runs first and anything the provider hands over without blocking
+        # (an event or end-of-stream) is delivered. The watcher only bites
+        # once the pull actually suspends.
+        watcher: asyncio.Future[Any] = asyncio.ensure_future(self._interrupt.wait())
+        watcher.add_done_callback(_on_signal)
         try:
             return await self._stream.__anext__()
-        except StopAsyncIteration:
-            return _END
-
-    async def __anext__(self) -> StreamEvent:
-        # Always race, even when the signal is already set: an event (or
-        # end-of-stream) that is available without blocking is delivered,
-        # so a call whose output is complete is never reported as interrupted.
-        pull = asyncio.ensure_future(self._pull())
-        wait = asyncio.ensure_future(self._interrupt.wait())
-        try:
-            done, _ = await asyncio.wait({pull, wait}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
-            pull.cancel()
+            if fired:
+                task.uncancel()
+                if task.cancelling() == 0:
+                    raise StreamInterruptedError() from None
             raise
         finally:
-            wait.cancel()
-
-        if pull in done:
-            item = pull.result()
-            if item is _END:
-                raise StopAsyncIteration
-            return cast("StreamEvent", item)
-
-        pull.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await pull
-        raise StreamInterruptedError()
+            armed = False
+            watcher.cancel()
 
 
 def interruptible(
@@ -117,6 +121,7 @@ def interruptible(
     while the provider is silent is honoured immediately rather than at the
     next token. Anything the provider can hand over without blocking (an
     event or end-of-stream) is always delivered, even after the signal fired.
+    The provider generator always runs in the caller's task and context.
     """
     if interrupt is None:
         return stream
