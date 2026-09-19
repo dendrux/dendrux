@@ -79,9 +79,8 @@ logger = logging.getLogger(__name__)
 
 _NAMESPACE_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-# Post-drain grace for connection and cleanup tasks: enough for the official
-# SDK to stop a stdio subprocess cleanly, but bounded when a transport
-# misbehaves.
+# Grace for a cancelled connect task to unwind. Closing an established
+# transport is bounded separately by ``MCPRuntime.close_timeout``.
 _FORCED_CANCEL_GRACE = 0.25
 
 
@@ -861,9 +860,11 @@ class MCPRuntime:
       registration, permanently invalidating every handle issued for it.
     * **Shutdown** — :meth:`close` drains, then tears everything down.
 
-    All three are bounded: a transport that resists cancellation or closing
-    is handed to background tracking rather than waited on, so no caller can
-    be blocked by a misbehaving server.
+    All of these are bounded. Closing a transport is given ``close_timeout``
+    seconds — enough for a Streamable HTTP client to send its session
+    termination request over the network — after which the close continues
+    in background tracking rather than being waited on, so no caller can be
+    blocked by a misbehaving server.
 
     Repeated connection failures open a per-identity **circuit breaker**:
     once ``circuit_failure_threshold`` failures accumulate — connection
@@ -904,6 +905,7 @@ class MCPRuntime:
         connection_wait_timeout: float = 10.0,
         call_wait_timeout: float = 10.0,
         shutdown_timeout: float = 30.0,
+        close_timeout: float = 2.0,
         circuit_failure_threshold: int | None = 5,
         circuit_reset_timeout: float = 30.0,
         observer: MCPRuntimeObserver | None = None,
@@ -929,6 +931,10 @@ class MCPRuntime:
         # itself. 0 sheds load immediately instead of queueing.
         self.call_wait_timeout = _non_negative_float(call_wait_timeout, "call_wait_timeout")
         self.shutdown_timeout = _positive_float(shutdown_timeout, "shutdown_timeout")
+        # Grace for one transport close, separate from the drain budget. A
+        # Streamable HTTP close is a network round trip (the SDK sends a
+        # session-terminating DELETE), so it needs more than a stdio close.
+        self.close_timeout = _positive_float(close_timeout, "close_timeout")
         # Circuit breaker: after this many consecutive connection failures on
         # one identity, new physical connections are rejected for the reset
         # timeout, then one probe is admitted. None disables the breaker.
@@ -1410,7 +1416,7 @@ class MCPRuntime:
         close_task = loop.create_task(self._close_adapter(identity, entry, reason=reason))
         pending = await self._settle_teardown_tasks(
             {close_task: entry},
-            timeout=_FORCED_CANCEL_GRACE,
+            timeout=self.close_timeout,
             warning=close_warning,
         )
         if close_task in pending and entry.adapter is not None:
@@ -2454,9 +2460,10 @@ class MCPRuntime:
         ``mode="drain"`` stops new leases and calls, waits up to ``timeout``
         seconds for active ones to finish, then starts transport cleanup.
         ``mode="force"`` fences the connection immediately and starts bounded
-        best-effort cleanup. If a transport resists closing, cleanup continues
-        in the background and a replacement connection may open after this
-        method returns; Dendrux will not route new work to the fenced transport.
+        best-effort cleanup. Closing the transport is bounded by the runtime's
+        ``close_timeout``; if it resists, cleanup continues in the background
+        and a replacement connection may open after this method returns.
+        Dendrux will not route new work to the fenced transport.
         Interrupted tool calls raise :class:`MCPOutcomeUnknownError` because
         the server may already have applied their effect, and they must never
         be retried automatically.
@@ -2615,8 +2622,9 @@ class MCPRuntime:
 
         Idempotent and safe to call concurrently: every caller awaits the
         same shutdown task. Leases still held after ``shutdown_timeout`` are
-        force-evicted. A transport that resists cancellation or close is
-        retained and observed until its cleanup task eventually finishes.
+        force-evicted, and every transport then gets ``close_timeout`` to
+        close. A transport that resists cancellation or close is retained
+        and observed until its cleanup task eventually finishes.
         """
         started = False
         with self._lock:
@@ -2704,9 +2712,12 @@ class MCPRuntime:
             for identity, entry in entry_items
             if entry.adapter is not None
         }
+        # One close window shared by every transport, like the connect grace
+        # above: they close concurrently, so shutdown never scales with the
+        # number of slow servers.
         pending_close_tasks = await self._settle_teardown_tasks(
             close_tasks,
-            timeout=_FORCED_CANCEL_GRACE,
+            timeout=self.close_timeout,
             warning=(
                 "MCP source '%s' connection cleanup exceeded the shutdown grace; "
                 "allowing it to finish in the background."

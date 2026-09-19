@@ -9,7 +9,13 @@ import anyio
 import httpx2
 import pytest
 from mcp.shared.exceptions import MCPError as SDKMCPError
-from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, CallToolResult, TextContent
+from mcp.types import (
+    CONNECTION_CLOSED,
+    INTERNAL_ERROR,
+    REQUEST_TIMEOUT,
+    CallToolResult,
+    TextContent,
+)
 
 from dendrux.mcp import MCPServer
 from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
@@ -20,7 +26,12 @@ from dendrux.mcp._errors import (
 )
 from dendrux.mcp._runtime import MCPRuntime, _ViewToolSource
 from dendrux.mcp._server import create_mcp_executor
-from dendrux.mcp._source import MCPSource
+from dendrux.mcp._source import (
+    MCPSource,
+    exception_class_name,
+    exception_text,
+    safe_source_exception_detail,
+)
 
 
 class _FailingClient:
@@ -625,3 +636,122 @@ async def test_executor_tags_connection_loss_without_changing_the_error() -> Non
     with pytest.raises(MCPToolCallError) as ordinary:
         await executor()
     assert ordinary.value.connection_lost is False
+
+
+def _sdk_rejected_initialize() -> BaseExceptionGroup[Exception]:
+    """The failure shape SDK 2.x raises for a non-2xx initialize reply.
+
+    The status is translated into a JSON-RPC internal error before it
+    reaches the client, and the transport task group wraps that.
+    """
+    inner = SDKMCPError(INTERNAL_ERROR, "Server returned an error response")
+    return ExceptionGroup(
+        "unhandled errors in a TaskGroup",
+        [ExceptionGroup("unhandled errors in a TaskGroup", [inner])],
+    )
+
+
+class _ObservedClient:
+    """Fake SDK client that reports responses to the adapter, then fails."""
+
+    adapter: MCPClientAdapter
+    statuses: tuple[int, ...] = ()
+    failure: BaseException = RuntimeError("boom")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> _ObservedClient:
+        for status in type(self).statuses:
+            await type(self).adapter._observe_response(_Response(status))
+        raise type(self).failure
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
+def _observed_sdk(adapter: MCPClientAdapter, *statuses: int, failure: BaseException) -> Any:
+    _ObservedClient.adapter = adapter
+    _ObservedClient.statuses = statuses
+    _ObservedClient.failure = failure
+    return (
+        patch("dendrux.mcp._client.Client", _ObservedClient),
+        patch("dendrux.mcp._client.streamable_http_client", return_value=object()),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_rejection_seen_on_the_wire_types_an_sdk_wrapped_failure(status: int) -> None:
+    """A rejected initialize carries no status in its exception tree; the
+    response the adapter observed must classify it anyway."""
+    source = MCPSource.http(
+        "remote",
+        "https://mcp.example.com/c",
+        headers={"Authorization": "Bearer HEADER-SECRET"},
+    )
+    adapter = MCPClientAdapter(source)
+    patches = _observed_sdk(adapter, status, failure=_sdk_rejected_initialize())
+
+    with patches[0], patches[1], pytest.raises(MCPAuthenticationError) as excinfo:
+        await adapter.connect()
+
+    error = excinfo.value
+    assert error.status_code == status
+    assert str(error) == (
+        f"Failed to connect to MCP source 'remote': "
+        f"the server rejected its credentials (HTTP {status})."
+    )
+    assert error.transport_detail == "MCPError: Server returned an error response"
+    assert "HEADER-SECRET" not in _rendered_chain(error)
+    assert "TaskGroup" not in _rendered_chain(error)
+
+
+@pytest.mark.asyncio
+async def test_only_the_latest_response_status_counts() -> None:
+    """A 401 answered by a later 2xx (an auth handshake) must not turn an
+    unrelated failure into a credential rejection."""
+    source = MCPSource.http("remote", "https://mcp.example.com/c")
+    adapter = MCPClientAdapter(source)
+    failure = ExceptionGroup("unhandled errors in a TaskGroup", [ConnectionError("reset")])
+    patches = _observed_sdk(adapter, 401, 200, failure=failure)
+
+    with patches[0], patches[1], pytest.raises(MCPConnectionError) as excinfo:
+        await adapter.connect()
+
+    error = excinfo.value
+    assert not isinstance(error, MCPAuthenticationError)
+    assert str(error) == "Failed to connect to MCP source 'remote' (ConnectionError)."
+    assert error.transport_detail == "ConnectionError: reset"
+
+
+@pytest.mark.asyncio
+async def test_discovery_does_not_inherit_a_status_recorded_at_connect() -> None:
+    source = MCPSource.http("remote", "https://mcp.example.com/c")
+    adapter = _connected_adapter(source, "tools/list exploded")
+    adapter._last_status = 401  # stale: recorded by an earlier request
+
+    with pytest.raises(MCPConnectionError) as excinfo:
+        await adapter.list_tools()
+
+    assert not isinstance(excinfo.value, MCPAuthenticationError)
+    assert excinfo.value.transport_detail == "tools/list exploded"
+
+
+def test_exception_group_detail_names_the_wrapped_failure() -> None:
+    """``str()`` of a task-group failure hides the transport error inside."""
+    source = MCPSource.http("remote", "https://mcp.example.com/c?access_token=QUERY-SECRET")
+    group = _sdk_rejected_initialize()
+
+    assert exception_text(group) == "MCPError: Server returned an error response"
+    assert exception_class_name(group) == "MCPError"
+    assert safe_source_exception_detail(source, group) == (
+        "MCPError: Server returned an error response"
+    )
+
+    several = ExceptionGroup("g", [ValueError("QUERY-SECRET leaked"), KeyError()])
+    assert exception_text(several) == "ValueError: QUERY-SECRET leaked; KeyError"
+    assert exception_class_name(several) == "ExceptionGroup"
+    assert (
+        safe_source_exception_detail(source, several) == "ValueError: [redacted] leaked; KeyError"
+    )

@@ -88,6 +88,7 @@ runtime = MCPRuntime(
     connection_wait_timeout=10.0,  # queue wait for a connection slot; 0 fails fast
     call_wait_timeout=10.0,        # queue wait for a call slot; 0 sheds load immediately
     shutdown_timeout=30.0,     # drain budget before close() interrupts work
+    close_timeout=2.0,         # grace for one transport to close before cleanup goes to the background
     circuit_failure_threshold=5,   # consecutive connect failures before fail-fast (None disables)
     circuit_reset_timeout=30.0,    # cooldown before one probe connection is allowed
 )
@@ -179,6 +180,7 @@ Watch `snapshot().connection_waiters` and `call_waiters` in production: persiste
 
 ## Failure handling
 
+- **Rejected credentials** (HTTP 401 or 403 from the server) raise `MCPAuthenticationError`, a subclass of `MCPConnectionError` carrying `status_code`, so an application can tell "your token was rejected" from "the URL is wrong" without parsing transport text. The SDK itself reports a rejected handshake as a generic JSON-RPC error; Dendrux classifies it from the HTTP response it observed.
 - **Connect failures** count toward a per-identity circuit breaker. After `circuit_failure_threshold` consecutive failures, new connection attempts fail fast with `MCPCircuitOpenError` (carrying `retry_after`) instead of hammering a dead server. After `circuit_reset_timeout`, one probe connection is allowed through; success closes the circuit, failure re-arms it. A tenant's broken sandbox cannot consume the whole process's capacity retrying.
 - **Transport loss mid-call** fences the dead connection so no new work routes to it, and interrupted calls raise `MCPOutcomeUnknownError`: the server may already have applied the call, so Dendrux never retries it automatically. The next lease opens a fresh connection.
 - **Ordinary tool errors** (`MCPToolCallError`) are just results: the model reads the redacted error text and corrects itself. They never poison the shared connection.
@@ -198,7 +200,7 @@ Draining waits for active calls; force interrupts them (`MCPOutcomeUnknownError`
 await runtime.close()
 ```
 
-`close()` stops new leases and calls, waits up to `shutdown_timeout` for active work to drain, force-evicts whatever remains, and closes every transport. It is idempotent and safe to call concurrently. A transport that resists closing is abandoned to bounded background cleanup rather than hanging your shutdown. `MCPRuntime` is also an async context manager (`async with MCPRuntime() as runtime:`) when your application frame is a single scope.
+`close()` stops new leases and calls, waits up to `shutdown_timeout` for active work to drain, force-evicts whatever remains, and closes every transport. It is idempotent and safe to call concurrently. Each transport gets `close_timeout` to close; a Streamable HTTP close is a network round trip because the SDK sends a session-terminating `DELETE`, which is why the default is seconds rather than milliseconds. A transport still closing after that is abandoned to background cleanup (logged as "exceeded the shutdown grace") rather than hanging your shutdown. The same grace applies to eviction and idle retirement. `MCPRuntime` is also an async context manager (`async with MCPRuntime() as runtime:`) when your application frame is a single scope.
 
 Closing an *agent* never closes runtime connections — it only releases that agent's lease. The runtime is the single owner of every physical connection.
 
@@ -350,6 +352,7 @@ The integration preserves:
 | `MCPCircuitOpenError` | Connect attempts are failing fast; carries `retry_after`. | No. |
 | `MCPConnectionCapacityError` / `MCPCallCapacityError` | Capacity limit reached within the wait budget. | No. |
 | `MCPConnectionError` | The connection could not be established. | No. |
+| `MCPAuthenticationError` | The server rejected the source's credentials (HTTP 401/403). Subclass of `MCPConnectionError`; carries `status_code`. | No — refresh or rotate the credential, then evict and rebind. |
 | `MCPResultTooLargeError` | The result exceeded `max_result_bytes`. | Yes — the result was discarded. |
 
 All are subclasses of `MCPError`, importable from `dendrux.mcp`.

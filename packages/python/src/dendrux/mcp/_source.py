@@ -56,6 +56,31 @@ def source_has_opaque_credentials(source: MCPSource) -> bool:
     return _auth_secret_values(source.auth) is None
 
 
+def exception_text(exc: BaseException) -> str:
+    """Render an exception, flattening groups to their leaf messages.
+
+    ``str()`` of an exception group is only "unhandled errors in a TaskGroup",
+    which hides the transport failure the SDK wrapped inside it.
+    """
+    if not isinstance(exc, BaseExceptionGroup):
+        return str(exc)
+    parts: list[str] = []
+    for inner in exc.exceptions:
+        text = exception_text(inner)
+        if isinstance(inner, BaseExceptionGroup):
+            parts.append(text)
+        else:
+            parts.append(f"{type(inner).__name__}: {text}" if text else type(inner).__name__)
+    return "; ".join(parts) or str(exc)
+
+
+def exception_class_name(exc: BaseException) -> str:
+    """Name the failure class, looking through single-leaf exception groups."""
+    while isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
+        exc = exc.exceptions[0]
+    return type(exc).__name__
+
+
 def safe_source_exception_detail(source: MCPSource, exc: BaseException) -> str:
     """Return credential-safe diagnostic text for a source exception.
 
@@ -65,7 +90,7 @@ def safe_source_exception_detail(source: MCPSource, exc: BaseException) -> str:
     """
     if source_has_opaque_credentials(source):
         return "[detail suppressed: opaque auth]"
-    return redact_source_text(source, str(exc)) or type(exc).__name__
+    return redact_source_text(source, exception_text(exc)) or exception_class_name(exc)
 
 
 def redact_source_text(source: MCPSource, text: str) -> str:
