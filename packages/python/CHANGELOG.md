@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0a16 - 2026-09-19
+
+- MCP HTTP: per-source `follow_redirects` and `max_redirects` settings on
+  `MCPSource.http()` and `MCPServer()`; redirects can be disabled entirely.
+- MCP HTTP: configured headers and authentication-generated credential headers
+  are scoped to the original scheme, hostname, and effective port before every
+  request, including redirect hops and authentication retries.
+- MCP HTTP: public async `MCPDestinationPolicy` and immutable `MCPDestination`
+  allow application-owned IP policy to be enforced before every new TCP socket.
+  Approved numeric IPs are dialed directly while preserving TLS hostname
+  verification. DNS changes, redirects, and reconnects cannot bypass the check.
+- MCP HTTP: `MCPDestinationDeniedError` distinguishes denied destinations during
+  connect/discovery. Policy exceptions fail closed without leaking callback text.
+  Policy-enabled connections disable environment proxies and TLS overrides.
+- MCP runtime: destination policy identity participates in connection configuration
+  checks; use `rebind()` to replace policy and retire existing sockets.
+- Regression coverage includes real HTTP redirects, DNS changes between pooled
+  connections, denied private IPs, SDK reconnects, and real TLS hostname verification.
+
 ## 0.2.0a15 - 2026-09-19
 
 - MCP: `await connection.discover()` returns an `MCPDiscovery` (server

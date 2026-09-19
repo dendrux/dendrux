@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
+from dendrux.mcp._destination import MCPDestinationPolicy  # noqa: TC001
 from dendrux.mcp._errors import MCPToolCallError
 from dendrux.mcp._result import normalize_mcp_result
 from dendrux.mcp._source import (
@@ -210,6 +211,9 @@ class MCPServer:
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
         failure_mode: MCPFailureMode = "strict",
+        follow_redirects: bool = True,
+        max_redirects: int = 20,
+        destination_policy: MCPDestinationPolicy | None = None,
     ) -> None:
         # Keep the legacy error wording and private transport attributes while
         # all real configuration lives in the immutable MCPSource.
@@ -230,6 +234,9 @@ class MCPServer:
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
             failure_mode=failure_mode,
+            follow_redirects=follow_redirects,
+            max_redirects=max_redirects,
+            destination_policy=destination_policy,
         )
         self._configure(source)
 

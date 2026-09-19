@@ -62,6 +62,70 @@ asyncio.run(main())
 
 Construction, `bind()`, and `tools()` are synchronous, perform no I/O, and resolve no credentials. The physical connection opens lazily on the first tool discovery and is then shared: a second agent bound to the same key reuses the live connection instead of opening its own.
 
+## User-supplied HTTP destinations
+
+`MCPSource.http()` and `MCPServer()` expose per-source `follow_redirects`
+(default `True`), `max_redirects` (default `20`), and `destination_policy`
+(default `None`). Set `follow_redirects=False` to stop at the first redirect;
+there is no connection to its target. The SDK can report the unfollowed response
+as a connection error during initialization.
+
+All configured headers, including custom API-key headers and headers supplied by
+credential providers, are scoped to the source's original scheme, hostname, and
+effective port. Authentication-generated headers, Authorization, and Cookie are
+also stripped before requests to another origin. This applies on every redirect
+hop and authentication retry. Same-origin redirects retain credentials; even an
+HTTP-to-HTTPS upgrade is a different origin. Redirect URLs containing userinfo
+are rejected. Cross-origin redirects may therefore fail authentication at the
+target; configure that target as a separate source with its own credentials.
+
+Applications own the destination policy. Dendrux calls the async policy before
+opening each TCP socket, with an immutable `MCPDestination(host, port, ip)`:
+
+```python
+from dendrux.mcp import MCPDestination, MCPSource
+
+
+async def destination_policy(destination: MCPDestination) -> bool:
+    # Example baseline; extend with your application's network and tenant rules.
+    return destination.port == 443 and destination.ip.is_global
+
+
+source = MCPSource.http(
+    "customer_server",
+    "https://mcp.example.com/mcp",
+    headers={"X-API-Key": "..."},
+    follow_redirects=False,
+    destination_policy=destination_policy,
+)
+```
+
+Only an explicit `True` permits an address. Denied candidates are skipped;
+callback exceptions abort the connection without exposing their text. If no
+candidate is permitted, connection and discovery raise
+`MCPDestinationDeniedError`, a subclass of `MCPConnectionError`.
+
+Dendrux resolves each new connection, checks each candidate before attempting
+it, and dials the approved numeric IP without resolving the hostname again.
+IPv4-mapped IPv6 addresses are normalized to IPv4 before policy evaluation and
+dialing. The original hostname remains the HTTP Host and TLS verification name.
+DNS, policy evaluation, and TCP attempts share the connect timeout. Redirect
+targets, new sockets after disconnect, and runtime reconnects use the same path.
+
+With a policy configured, environment proxies and environment TLS overrides
+are disabled; connections go directly to approved destinations using normal
+certificate verification. There is no implicit private-network deny list when
+`destination_policy=None`. The hook controls Dendrux's MCP HTTP connections;
+HTTP clients independently created inside application credential callbacks or
+custom authentication implementations remain application-owned.
+
+Existing pooled sockets retain the approval from when they were opened. To
+change or revoke policy for a live source, call `await runtime.rebind(...)` to
+retire the existing connection and install the replacement policy. Use force
+mode when active calls must be interrupted. Do not mutate a policy in place
+and expect it to close already-open sockets. Each distinct policy object is
+part of the runtime's connection configuration.
+
 ## The objects
 
 | Object | Responsibility | Typical lifetime |
@@ -390,6 +454,7 @@ The integration preserves:
 | `MCPCircuitOpenError` | Connect attempts are failing fast; carries `retry_after`. | No. |
 | `MCPConnectionCapacityError` / `MCPCallCapacityError` | Capacity limit reached within the wait budget. | No. |
 | `MCPConnectionError` | The connection could not be established. | No. |
+| `MCPDestinationDeniedError` | Destination policy denied a connection or a redirect URL was rejected. Subclass of `MCPConnectionError`. | No — correct the destination or policy. |
 | `MCPAuthenticationError` | The server rejected the source's credentials (HTTP 401/403). Subclass of `MCPConnectionError`; carries `status_code`. | No — refresh or rotate the credential, then evict and rebind. |
 | `MCPResultTooLargeError` | The result exceeded `max_result_bytes`. | Yes — the result was discarded. |
 

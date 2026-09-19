@@ -851,7 +851,9 @@ def _same_connection_config(registered: MCPSource, candidate: MCPSource) -> bool
     provider requires eviction before an authenticated session can be reused.
     """
     return (
-        registered.auth is candidate.auth and replace(registered, name=candidate.name) == candidate
+        registered.auth is candidate.auth
+        and registered.destination_policy is candidate.destination_policy
+        and replace(registered, name=candidate.name) == candidate
     )
 
 

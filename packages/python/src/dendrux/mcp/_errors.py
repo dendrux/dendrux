@@ -21,6 +21,10 @@ class MCPConnectionError(MCPError):
     transport_detail: str | None = None
 
 
+class MCPDestinationDeniedError(MCPConnectionError):
+    """A destination was denied before connecting or sending credentials."""
+
+
 class MCPCredentialError(MCPConnectionError):
     """Credentials for an MCP source could not be resolved or applied.
 

@@ -161,3 +161,32 @@ async def test_managed_runtime_surfaces_the_rejection_to_the_agent() -> None:
 
         assert excinfo.value.status_code == 401
         await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_destination_policy_through_real_sdk_and_reconnect() -> None:
+    from dendrux.mcp import MCPDestinationDeniedError
+
+    permitted = True
+    destinations = []
+
+    async def policy(destination):
+        destinations.append(destination)
+        return permitted
+
+    async with _serve(_bearer_app(401)) as url:
+        source = MCPSource.http(
+            "demo", url, headers={"Authorization": f"Bearer {TOKEN}"}, destination_policy=policy
+        )
+        adapter = MCPClientAdapter(source)
+        await adapter.connect()
+        assert [tool.name for tool in await adapter.list_tools()] == ["echo"]
+        await adapter.close()
+        assert destinations and all(d.ip.is_loopback for d in destinations)
+        permitted = False
+        previous = len(destinations)
+        adapter = MCPClientAdapter(source)
+        with pytest.raises(MCPDestinationDeniedError):
+            await adapter.connect()
+        assert len(destinations) > previous
+        await adapter.close()

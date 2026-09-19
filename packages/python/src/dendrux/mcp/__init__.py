@@ -34,6 +34,7 @@ except ModuleNotFoundError as err:
         ) from None
     raise  # Real import error from within the mcp package
 
+from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy  # noqa: E402
 from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo  # noqa: E402
 from dendrux.mcp._errors import (  # noqa: E402
     MCPAuthenticationError,
@@ -47,6 +48,7 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPConnectionLostError,
     MCPConnectionStateError,
     MCPCredentialError,
+    MCPDestinationDeniedError,
     MCPError,
     MCPOutcomeUnknownError,
     MCPResultTooLargeError,
@@ -123,6 +125,9 @@ __all__ = [
     "MCPConnectionStatus",
     "MCPCredentialError",
     "MCPCredentialProvider",
+    "MCPDestination",
+    "MCPDestinationDeniedError",
+    "MCPDestinationPolicy",
     "MCPDiscovery",
     "MCPError",
     "MCPEvictionCompleted",

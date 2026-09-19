@@ -13,6 +13,8 @@ from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
+from dendrux.mcp._destination import MCPDestinationPolicy  # noqa: TC001
+
 MCPFailureMode = Literal["strict", "best_effort"]
 MCPPhysicalIdentity = (
     tuple[Literal["http"], str] | tuple[Literal["stdio"], tuple[str, ...], Path | None]
@@ -200,6 +202,9 @@ class MCPSource:
     call_timeout: float = 120.0
     max_result_bytes: int = 1_000_000
     failure_mode: MCPFailureMode = "strict"
+    follow_redirects: bool = True
+    max_redirects: int = 20
+    destination_policy: MCPDestinationPolicy | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.name or not _SOURCE_NAME_RE.fullmatch(self.name):
@@ -234,6 +239,18 @@ class MCPSource:
                 raise ValueError("MCPSource command must contain only strings.")
             if not self.command[0]:
                 raise ValueError("MCPSource command executable must be non-empty.")
+        if not isinstance(self.follow_redirects, bool):
+            raise ValueError("MCPSource follow_redirects must be a bool.")
+        if type(self.max_redirects) is not int or self.max_redirects < 0:
+            raise ValueError("MCPSource max_redirects must be a non-negative integer.")
+        if self.destination_policy is not None and not callable(self.destination_policy):
+            raise ValueError("MCPSource destination_policy must be callable.")
+        if self.command is not None and (
+            not self.follow_redirects
+            or self.max_redirects != 20
+            or self.destination_policy is not None
+        ):
+            raise ValueError("MCPSource HTTP security settings are only valid for HTTP sources.")
         if self.connect_timeout <= 0:
             raise ValueError("MCPSource connect_timeout must be greater than zero.")
         if self.call_timeout <= 0:
@@ -262,6 +279,9 @@ class MCPSource:
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
         failure_mode: MCPFailureMode = "strict",
+        follow_redirects: bool = True,
+        max_redirects: int = 20,
+        destination_policy: MCPDestinationPolicy | None = None,
     ) -> MCPSource:
         """Configure a production Streamable HTTP MCP source."""
         return cls(
@@ -273,6 +293,9 @@ class MCPSource:
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
             failure_mode=failure_mode,
+            follow_redirects=follow_redirects,
+            max_redirects=max_redirects,
+            destination_policy=destination_policy,
         )
 
     @classmethod
