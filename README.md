@@ -22,7 +22,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.2.0a14` - core API stabilizing, actively developed.
+> `v0.2.0a15` - core API stabilizing, actively developed.
 
 ---
 

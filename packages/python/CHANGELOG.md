@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a15 - 2026-09-19
 
 - MCP: `await connection.discover()` returns an `MCPDiscovery` (server
   facts plus the raw `MCPToolInfo` catalog) through the managed runtime's
