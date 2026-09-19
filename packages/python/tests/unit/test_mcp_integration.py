@@ -412,3 +412,102 @@ class TestMultiSourceDiscovery:
         lookups = await agent.get_tool_lookups()
         assert "src__tool" in lookups.fn
         assert "src2__tool" in lookups.fn
+
+
+# ---------------------------------------------------------------------------
+# 7. Best-effort sources skipped at discovery are visible on the result
+# ---------------------------------------------------------------------------
+
+
+def _make_failing_optional_source(name: str, error: Exception) -> MagicMock:
+    from dendrux.mcp._server import MCPServer
+
+    source = MagicMock(spec=MCPServer)
+    source.name = name
+    source.failure_mode = "best_effort"
+    source.last_error = None
+
+    async def failing_discover() -> list[ToolDef]:
+        source.last_error = str(error)
+        raise error
+
+    source._discover = failing_discover
+    source.close = AsyncMock()
+    return source
+
+
+class TestSkippedSourcesOnResult:
+    """An application must be able to tell the user which optional tools
+    were missing for an answer, without parsing logs."""
+
+    @pytest.mark.asyncio
+    async def test_run_result_lists_skipped_best_effort_sources(self) -> None:
+        from dendrux.llm.mock import MockLLM
+        from dendrux.types import LLMResponse
+
+        good = _make_mock_source("good", [{"name": "tool1"}])
+        flaky = _make_failing_optional_source("flaky", ConnectionError("unreachable"))
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="done")]),
+            prompt="test",
+            tool_sources=[good, flaky],
+        )
+
+        result = await agent.run("hi")
+
+        assert result.answer == "done"
+        assert result.meta["mcp_skipped_sources"] == [
+            {
+                "source_name": "flaky",
+                "namespace": "flaky",
+                "error_type": "ConnectionError",
+                "error": "unreachable",
+            }
+        ]
+        await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_streamed_terminal_result_lists_skipped_sources(self) -> None:
+        from dendrux.llm.mock import MockLLM
+        from dendrux.types import LLMResponse
+
+        flaky = _make_failing_optional_source("flaky", TimeoutError("slow"))
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="done")]),
+            prompt="test",
+            tool_sources=[flaky],
+        )
+
+        terminal = None
+        async with agent.stream("hi") as events:
+            async for event in events:
+                if event.run_result is not None:
+                    terminal = event.run_result
+
+        assert terminal is not None
+        assert terminal.meta["mcp_skipped_sources"] == [
+            {
+                "source_name": "flaky",
+                "namespace": "flaky",
+                "error_type": "TimeoutError",
+                "error": "slow",
+            }
+        ]
+        await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_a_run_with_nothing_skipped_has_no_entry(self) -> None:
+        from dendrux.llm.mock import MockLLM
+        from dendrux.types import LLMResponse
+
+        good = _make_mock_source("good", [{"name": "tool1"}])
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="done")]),
+            prompt="test",
+            tool_sources=[good],
+        )
+
+        result = await agent.run("hi")
+
+        assert "mcp_skipped_sources" not in result.meta
+        await agent.close()

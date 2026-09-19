@@ -194,6 +194,19 @@ await runtime.evict(connection_key="github-1", tenant_key=user_id, mode="force")
 
 Draining waits for active calls; force interrupts them (`MCPOutcomeUnknownError`). Afterwards the key may be rebound with new configuration.
 
+To change a live connection's configuration in one step — a rotated token, a new endpoint, a different timeout — use `rebind()`, the settings-save path:
+
+```python
+connection = await runtime.rebind(
+    connection_key="github-1",
+    tenant_key=user_id,
+    source=MCPSource.http("github", new_url, call_timeout=30.0),
+    credentials=UserToken(user_id),
+)
+```
+
+`rebind()` validates the new arguments, drains (or with `mode="force"` interrupts) the live connection, forgets its registration and circuit, and binds the new configuration. Handles issued before the call are stale; use the returned one. When nothing is live it is simply a bind. Every `MCPSource` field except `name` counts as configuration — endpoint, headers, `connect_timeout`, `call_timeout`, `max_result_bytes`, and `failure_mode` — so a plain `bind()` with any of them changed raises `MCPBindingConflictError` while the connection is live.
+
 ## Shutdown
 
 ```python
@@ -321,6 +334,21 @@ lookups = await agent.get_tool_lookups()
 print(sorted(lookups.fn))
 ```
 
+## Discovery without an Agent
+
+A settings page needs "test this connection and show me its tools" before any chat exists. `discover()` on a managed connection does exactly that:
+
+```python
+connection = runtime.bind(connection_key="github-1", tenant_key=user_id, source=source, credentials=UserToken(user_id))
+discovery = await connection.discover()
+
+discovery.server_name, discovery.server_version, discovery.protocol_version, discovery.instructions
+for tool in discovery.tools:          # raw server names, before namespacing or policy
+    tool.name, tool.description, tool.input_schema, tool.annotations
+```
+
+It takes the same path an Agent lease takes — credential resolution, circuit breaker, capacity, single-flight connect — and raises the same errors, so `MCPAuthenticationError` here means the same thing it means at run time. The lease is released before it returns, which leaves the connection warm for `idle_timeout`: the next Agent reuses it without reconnecting. Calling `discover()` ahead of a user's first turn is therefore also the warm-up for first-connect latency, including after idle retirement. The returned catalog is the live physical connection's; to force rediscovery, evict.
+
 ## Failure modes at discovery
 
 Each source chooses how discovery failure affects the run:
@@ -331,6 +359,16 @@ Each source chooses how discovery failure affects the run:
 | `best_effort` | Records `mcp.error` for that source and continues with the remaining local and MCP tools. |
 
 A successful source emits `mcp.connected` with its source name, tool count, and namespaced tool list. Zero-tool sources still emit `mcp.connected` with `tool_count=0`.
+
+`mcp.error` carries `source_name`, `namespace`, `error`, `error_type` (the exception class, such as `MCPAuthenticationError` or `MCPCircuitOpenError`), and `failure_mode`. For a `best_effort` run the same facts are on the result, so an application can tell the user which optional tools were missing for an answer:
+
+```python
+result = await agent.run("...")
+for skipped in result.meta.get("mcp_skipped_sources", []):
+    skipped["source_name"], skipped["error_type"], skipped["error"]
+```
+
+An Agent caches discovery for its lifetime, so a source skipped once stays skipped for that Agent until `agent.refresh()`; a fresh Agent retries.
 
 ## Calls, errors, and result limits
 

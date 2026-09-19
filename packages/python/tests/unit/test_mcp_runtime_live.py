@@ -6097,3 +6097,217 @@ class TestCloseGrace:
         assert _InstrumentedAdapter.instances[0].closed is True
         assert runtime._abandoned_tasks == set()
         await runtime.close()
+
+
+class TestDiscovery:
+    """``connection.discover()`` serves settings pages without an Agent."""
+
+    @pytest.mark.asyncio
+    async def test_discover_returns_server_facts_and_the_raw_catalog(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+
+            discovery = await connection.discover()
+
+            assert discovery.server_name == "fake-server"
+            assert discovery.server_version == "1.0.0"
+            assert discovery.protocol_version == "2026-07-28"
+            assert discovery.instructions is None
+            assert discovery.tool_names == ("read", "write")
+            read = discovery.tools[0]
+            assert read.description == "read tool"
+            assert read.input_schema == {"type": "object"}
+            assert read.annotations == {"readOnlyHint": True, "destructiveHint": False}
+            # The lease is released, but the connection stays warm.
+            entry = runtime._entries[(None, "github-1")]
+            assert entry.leases == 0
+            assert _total_connects() == 1
+
+    @pytest.mark.asyncio
+    async def test_discover_warms_the_connection_the_next_agent_reuses(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            await connection.discover()
+
+            agent = Agent(prompt="test", tool_sources=[connection.tools(allowed_tools=["read"])])
+            lookups = await agent.get_tool_lookups()
+            await agent.close()
+
+            assert sorted(lookups.fn) == ["github__read"]
+            assert _total_connects() == 1
+
+    @pytest.mark.asyncio
+    async def test_discover_shares_the_single_flight_connect_with_agents(self) -> None:
+        _InstrumentedAdapter.connect_gate = asyncio.Event()
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[connection.tools()])
+
+            discovering = asyncio.create_task(connection.discover())
+            leasing = asyncio.create_task(agent.get_tool_lookups())
+            await asyncio.sleep(0.05)
+            assert len(_InstrumentedAdapter.instances) == 1
+
+            _InstrumentedAdapter.connect_gate.set()
+            discovery = await asyncio.wait_for(discovering, timeout=1.0)
+            await asyncio.wait_for(leasing, timeout=1.0)
+            await agent.close()
+
+            assert discovery.tool_names == ("read", "write")
+            assert _total_connects() == 1
+
+    @pytest.mark.asyncio
+    async def test_discover_raises_the_same_typed_errors_as_a_lease(self) -> None:
+        rejected = MCPAuthenticationError("rejected")
+        rejected.status_code = 401
+        _InstrumentedAdapter.connect_error = rejected
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+
+            with pytest.raises(MCPAuthenticationError) as excinfo:
+                await connection.discover()
+
+            assert excinfo.value.status_code == 401
+            assert runtime._entries == {}  # nothing left half-open
+
+    @pytest.mark.asyncio
+    async def test_discover_on_a_stale_handle_is_refused(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            connection = _bind(runtime)
+            await runtime.evict(connection_key="github-1")
+
+            with pytest.raises(MCPStaleConnectionError):
+                await connection.discover()
+
+
+class TestRebind:
+    """``runtime.rebind()`` is the settings-save path: validate, evict, bind."""
+
+    @pytest.mark.asyncio
+    async def test_rebind_replaces_a_live_connection_and_invalidates_old_handles(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            old = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[old.tools()])
+            await agent.get_tool_lookups()
+            await agent.close()
+
+            changed = MCPSource.http("github", "https://mcp.example.com", call_timeout=5.0)
+            with pytest.raises(MCPBindingConflictError, match="rebind"):
+                runtime.bind(connection_key="github-1", source=changed)
+
+            fresh = await asyncio.wait_for(
+                runtime.rebind(connection_key="github-1", source=changed), timeout=1.0
+            )
+
+            assert fresh.generation != old.generation
+            assert fresh.source == changed
+            assert _InstrumentedAdapter.instances[0].closed is True
+            with pytest.raises(MCPStaleConnectionError):
+                await old.discover()
+            assert (await fresh.discover()).tool_names == ("read", "write")
+            assert _total_connects() == 2
+
+    @pytest.mark.asyncio
+    async def test_rebind_drains_active_work_before_replacing(self) -> None:
+        _InstrumentedAdapter.call_gate = asyncio.Event()
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            old = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[old.tools()])
+            lookups = await agent.get_tool_lookups()
+            call = asyncio.create_task(lookups.fn["github__read"]())
+            await _await_first_call(_InstrumentedAdapter.instances[0])
+
+            changed = MCPSource.http("github", "https://mcp.example.com", call_timeout=5.0)
+            rebinding = asyncio.create_task(
+                runtime.rebind(connection_key="github-1", source=changed, timeout=1.0)
+            )
+            await asyncio.sleep(0.05)
+            assert not rebinding.done()  # draining behind the in-flight call
+
+            _InstrumentedAdapter.call_gate.set()
+            result = await asyncio.wait_for(call, timeout=1.0)
+            fresh = await asyncio.wait_for(rebinding, timeout=1.0)
+            await agent.close()
+
+            assert result == "read:ok"
+            assert fresh.generation != old.generation
+            assert _InstrumentedAdapter.instances[0].closed is True
+
+    @pytest.mark.asyncio
+    async def test_rebind_without_a_live_connection_is_a_bind(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            source = MCPSource.http("github", "https://mcp.example.com")
+
+            fresh = await runtime.rebind(connection_key="github-1", source=source)
+
+            assert isinstance(fresh, MCPConnection)
+            assert (None, "github-1") in runtime._registrations
+            assert _InstrumentedAdapter.instances == []
+
+    @pytest.mark.asyncio
+    async def test_rebind_validates_before_touching_the_live_connection(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            old = _bind(runtime)
+            agent = Agent(prompt="test", tool_sources=[old.tools()])
+            await agent.get_tool_lookups()
+
+            with pytest.raises(ValueError, match="must be an MCPSource"):
+                await runtime.rebind(connection_key="github-1", source="nope")  # type: ignore[arg-type]
+
+            assert (None, "github-1") in runtime._entries
+            assert (await old.discover()).tool_names == ("read", "write")
+            assert _total_connects() == 1
+            await agent.close()
+
+    @pytest.mark.asyncio
+    async def test_rebind_on_a_closed_runtime_is_refused(self) -> None:
+        runtime = MCPRuntime(shutdown_timeout=0.05)
+        await runtime.close()
+
+        with pytest.raises(MCPRuntimeClosedError):
+            await runtime.rebind(
+                connection_key="github-1",
+                source=MCPSource.http("github", "https://mcp.example.com"),
+            )
+
+
+class TestSkippedSourceVisibility:
+    @pytest.mark.asyncio
+    async def test_best_effort_failure_names_its_error_class(self) -> None:
+        from dendrux.runtime.runner import _emit_init_events
+
+        _InstrumentedAdapter.fail_urls = {"https://mcp.example.com"}
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            optional = runtime.bind(
+                connection_key="github-1",
+                source=MCPSource.http(
+                    "github", "https://mcp.example.com", failure_mode="best_effort"
+                ),
+            )
+            agent = Agent(prompt="test", tool_sources=[optional.tools(namespace="gh")])
+
+            with patch(
+                "dendrux.runtime.runner._emit_init_governance_event",
+                new_callable=AsyncMock,
+            ) as emitted:
+                await _emit_init_events(agent, None, None, "run-1")
+
+            errors = [call.args[4] for call in emitted.await_args_list if "error" in call.args[4]]
+            assert errors == [
+                {
+                    "source_name": "github",
+                    "namespace": "gh",
+                    "error": "refused: https://mcp.example.com",
+                    "error_type": "ConnectionError",
+                    "failure_mode": "best_effort",
+                }
+            ]
+            assert agent._mcp_skipped_sources == [
+                {
+                    "source_name": "github",
+                    "namespace": "gh",
+                    "error_type": "ConnectionError",
+                    "error": "refused: https://mcp.example.com",
+                }
+            ]
+            await agent.close()

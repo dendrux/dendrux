@@ -99,6 +99,23 @@ def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
         )
 
 
+def _cause_type(error: BaseException) -> str | None:
+    """Class name of the wrapped discovery failure, for governance payloads."""
+    cause = error.__cause__
+    return type(cause).__name__ if cause is not None else None
+
+
+def _attach_mcp_meta(result: RunResult, agent: Agent) -> None:
+    """Name optional MCP sources skipped at discovery on the run's result.
+
+    Applied to the loop's result before any persistence branch, so it is
+    present with and without a run store.
+    """
+    skipped = agent._mcp_skipped_sources
+    if skipped:
+        result.meta["mcp_skipped_sources"] = [dict(entry) for entry in skipped]
+
+
 class _MCPDiscoveryError(Exception):
     """Wrapper raised only when MCP discovery fails inside _emit_init_events.
 
@@ -182,6 +199,9 @@ async def _emit_init_events(
             group = td.meta.get("namespace") or td.meta.get("source_name", "unknown")
             source_tools.setdefault(group, []).append(td.name)
 
+        skipped_types = {
+            entry["namespace"]: entry["error_type"] for entry in agent._mcp_skipped_sources
+        }
         for source in agent._tool_sources:
             configured_name = getattr(getattr(source, "source", None), "name", None)
             source_name = configured_name if isinstance(configured_name, str) else source.name
@@ -196,6 +216,7 @@ async def _emit_init_events(
                         "source_name": source_name,
                         "namespace": source.name,
                         "error": source_error,
+                        "error_type": skipped_types.get(source.name),
                         "failure_mode": getattr(source, "failure_mode", "strict"),
                     },
                 )
@@ -794,7 +815,7 @@ async def run(
                     extra_notifier,
                     run_id,
                     GovernanceEventType.MCP_ERROR,
-                    {"error": str(mcp_exc)[:500]},
+                    {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
                 )
             except Exception:
                 logger.warning("Failed to emit mcp.error event", exc_info=True)
@@ -828,6 +849,7 @@ async def run(
             state_store=state_store,
         )
 
+        _attach_mcp_meta(result, agent)
         if state_store is not None:
             result = await _persist_loop_outcome(
                 state_store=state_store,
@@ -1150,7 +1172,7 @@ async def retry(
                     extra_notifier,
                     run_id,
                     GovernanceEventType.MCP_ERROR,
-                    {"error": str(mcp_exc)[:500]},
+                    {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
                 )
             except Exception:
                 logger.warning("Failed to emit mcp.error event", exc_info=True)
@@ -1169,6 +1191,7 @@ async def retry(
             state_store=state_store,
         )
 
+        _attach_mcp_meta(result, agent)
         result = await _persist_loop_outcome(
             state_store=state_store,
             run_id=run_id,
@@ -1430,7 +1453,7 @@ def run_stream(
                         extra_notifier,
                         run_id,
                         GovernanceEventType.MCP_ERROR,
-                        {"error": str(mcp_exc)[:500]},
+                        {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
                     )
                 except Exception:
                     logger.warning("Failed to emit mcp.error event", exc_info=True)
@@ -1479,6 +1502,7 @@ def run_stream(
                     )
                     terminal_result = event.run_result if event.type in _terminal_types else None
                     if terminal_result is not None:
+                        _attach_mcp_meta(terminal_result, agent)
                         if store is not None:
                             persisted = await _persist_loop_outcome(
                                 state_store=store,
@@ -2164,6 +2188,7 @@ async def _resume_core(
             state_store=state_store,
         )
 
+        _attach_mcp_meta(result, agent)
         result = await _persist_loop_outcome(
             state_store=state_store,
             run_id=run_id,
@@ -2467,6 +2492,7 @@ def resume_stream(
                         )
                         and event.run_result
                     ):
+                        _attach_mcp_meta(event.run_result, agent)
                         persisted = await _persist_loop_outcome(
                             state_store=store,
                             run_id=run_id,

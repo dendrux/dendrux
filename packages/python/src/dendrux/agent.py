@@ -382,6 +382,10 @@ class Agent:
                 self._tool_sources.append(src)
         self._discovered_tool_defs: list[ToolDef] | None = None
         self._mcp_executors: dict[str, Callable[..., Any]] | None = None
+        # Optional (best_effort) sources skipped at the last discovery, each
+        # as {source_name, namespace, error_type, error}. Surfaced on the
+        # mcp.error governance event and RunResult.meta["mcp_skipped_sources"].
+        self._mcp_skipped_sources: list[dict[str, Any]] = []
         self._discovery_lock = asyncio.Lock()
 
         # --- Skills ---
@@ -1587,6 +1591,7 @@ class Agent:
             # No MCP sources — set empty cache so fast path works
             self._discovered_tool_defs = []
             self._mcp_executors = {}
+            self._mcp_skipped_sources = []
             return
 
         async with self._discovery_lock:
@@ -1596,6 +1601,7 @@ class Agent:
             discovered_defs: list[ToolDef] = []
             executors: dict[str, Callable[..., Any]] = {}
             opened_sources: list[MCPServer] = []
+            skipped: list[dict[str, Any]] = []
 
             # Hoist local tool info — computed once, not per-tool
             local_defs = {get_tool_def(fn).name: get_tool_def(fn) for fn in self.tools}
@@ -1604,13 +1610,24 @@ class Agent:
                 for source in self._tool_sources:
                     try:
                         tool_defs = await source._discover()
-                    except Exception:
+                    except Exception as exc:
                         if getattr(source, "failure_mode", "strict") != "best_effort":
                             raise
                         _agent_logger.warning(
                             "Optional MCP source '%s' is unavailable; continuing without it",
                             source.name,
                             exc_info=True,
+                        )
+                        configured = getattr(getattr(source, "source", None), "name", None)
+                        skipped.append(
+                            {
+                                "source_name": configured
+                                if isinstance(configured, str)
+                                else source.name,
+                                "namespace": source.name,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            }
                         )
                         continue
                     opened_sources.append(source)
@@ -1662,6 +1679,7 @@ class Agent:
             # everywhere, not just at the cache-facing getters.
             self._discovered_tool_defs = sorted(discovered_defs, key=lambda td: td.name)
             self._mcp_executors = executors
+            self._mcp_skipped_sources = skipped
 
     async def get_tool_lookups(self, loop: Loop | None = None) -> ToolLookups:
         """Build ToolLookups for local + MCP + use_skill tools.
@@ -1928,6 +1946,7 @@ class Agent:
         # Clear all caches
         self._discovered_tool_defs = None
         self._mcp_executors = None
+        self._mcp_skipped_sources = []
         self._loaded_skills = None
         self._denied_skill_names = None
         self._inline_skill_warning_emitted = False
@@ -1951,6 +1970,7 @@ class Agent:
         # Clear all caches so stale executors/skills are not reused.
         self._discovered_tool_defs = None
         self._mcp_executors = None
+        self._mcp_skipped_sources = []
         self._loaded_skills = None
         self._denied_skill_names = None
         if self._provider is not None:

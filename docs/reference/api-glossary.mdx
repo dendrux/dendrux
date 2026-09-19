@@ -77,7 +77,8 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | --- | --- | --- |
 | `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration. See [MCP](/docs/architecture/mcp). |
 | `MCPRuntime` | `from dendrux.mcp import MCPRuntime` | Process-wide managed owner of MCP connections: tenancy, capacity, circuit breaking, telemetry. Recommended for production. |
-| `MCPConnection` | `runtime.bind(...)` | Lazy handle for one `(tenant_key, connection_key)` identity; `connection.tools()` creates agent views. |
+| `MCPConnection` | `runtime.bind(...)` / `await runtime.rebind(...)` | Lazy handle for one `(tenant_key, connection_key)` identity; `connection.tools()` creates agent views, `await connection.discover()` returns the server's catalog without an Agent. |
+| `MCPDiscovery` | `await connection.discover()` | Server name, version, protocol version, instructions, and the raw `MCPToolInfo` catalog of one connection. |
 | `MCPToolView` | `connection.tools(...)` | Namespace and tool policy one agent consumes via `tool_sources=`. |
 | `MCPCredentialProvider` | `from dendrux.mcp import MCPCredentialProvider` | Async protocol returning per-connect authentication (headers or env); resolved lazily, never persisted. |
 | `MCPRuntimeObserver` | `from dendrux.mcp import MCPRuntimeObserver` | Sync callback protocol receiving typed runtime lifecycle events; pair with `runtime.snapshot()`. |
