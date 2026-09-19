@@ -35,6 +35,7 @@ def _assert_artifact_contents(wheel: Path, sdist: Path) -> None:
     required_wheel_suffixes = {
         "dendrux/mcp/__init__.py",
         "dendrux/mcp/_client.py",
+        "dendrux/mcp/_discovery.py",
         "dendrux/mcp/_errors.py",
         "dendrux/mcp/_observability.py",
         "dendrux/mcp/_runtime.py",
