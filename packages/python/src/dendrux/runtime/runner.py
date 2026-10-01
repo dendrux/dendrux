@@ -17,6 +17,7 @@ Sprint 2 adds optional state_store for persistence. When provided:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -47,6 +48,7 @@ from dendrux.runtime.context import (
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
+    IdempotencyConflictError,
     Message,
     PauseState,
     Role,
@@ -722,192 +724,287 @@ async def run(
     # failures don't leave a DB row stuck in running.
     _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-    if state_store is not None:
-        # Create the run record before the loop starts
-        # Merge loop type + depth limit into developer metadata
-        run_meta = dict(metadata) if metadata else {}
-        run_meta["dendrux.loop"] = type(resolved_loop).__name__
-        if effective_max_depth is not None:
-            run_meta["dendrux.max_delegation_depth"] = effective_max_depth
-        if output_type is not None:
-            run_meta["dendrux.output_type"] = f"{output_type.__module__}.{output_type.__qualname__}"
-
-        # Compute idempotency fingerprint if key is provided
-        idem_fingerprint: str | None = None
-        if idempotency_key is not None:
-            output_type_name = (
-                f"{output_type.__module__}.{output_type.__qualname__}"
-                if output_type is not None
-                else None
-            )
-            idem_fingerprint = compute_idempotency_fingerprint(
-                agent.name,
-                user_input,
-                output_type_name=output_type_name,
-                history=normalized_history or None,
-                context=context or None,
-            )
-
-        create_result = await state_store.create_run(
-            run_id,
-            agent.name,
-            input_data={"input": user_input},
-            model=provider.model,
-            strategy=type(resolved_strategy).__name__,
-            parent_run_id=parent_run_id,
-            delegation_level=delegation_level,
-            tenant_id=tenant_id,
-            meta=run_meta,
-            idempotency_key=idempotency_key,
-            idempotency_fingerprint=idem_fingerprint,
-        )
-
-        # Handle idempotency outcomes
-        if create_result.outcome == "existing_terminal":
-            return await _build_cached_result(state_store, create_result.run_id, output_type)
-        if create_result.outcome == "existing_active":
-            raise RunAlreadyActiveError(create_result.run_id, create_result.status)
-
-        # "created" — use the run_id from the result (same as generated)
-        run_id = create_result.run_id
-
-        # Create persistence recorder with shared sequencer
-        from dendrux.runtime.persistence import PersistenceRecorder
-        from dendrux.tool import get_tool_def
-
-        target_lookup = {}
-        for fn in agent.tools:
-            td = get_tool_def(fn)
-            target_lookup[td.name] = td.target
-        recorder = PersistenceRecorder(
-            state_store,
-            run_id,
-            model=provider.model,
-            provider_name=type(provider).__name__,
-            target_lookup=target_lookup,
-            event_sequencer=sequencer,
-        )
-
-    await _emit_event(
-        state_store,
-        run_id,
-        "run.started",
-        sequencer,
-        {"agent_name": agent.name, "system_prompt": _system_prompt},
-    )
-    await record_run_started(recorder, run_id, agent_name=agent.name, agent_model=provider.model)
-    await notify_run_started(
-        extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
-    )
-
-    # Set delegation context for the duration of this run so nested
-    # agent.run() calls inside tools inherit the parent link.
-    this_ctx = DelegationContext(
-        run_id=run_id,
-        delegation_level=delegation_level,
-        persisted=state_store is not None,
-        store_identity=get_store_identity(state_store),
-        max_delegation_depth=effective_max_depth,
-    )
-    ctx_token = set_delegation_context(this_ctx)
+    ctx_token = None
     mcp_meta: dict[str, Any] = {}
+    lifecycle_started = False
+    recorder_closed = False
+    notifier_closed = False
+    result: RunResult | None = None
 
     try:
-        # Emit init governance events (skills + MCP) inside the try block
-        # so discovery failures flow through the error cleanup path.
-        # _MCPDiscoveryError is caught here, mcp.error emitted, then the
-        # original cause is re-raised for the outer except Exception.
         try:
-            await _emit_init_events(
-                agent,
-                recorder,
-                extra_notifier,
+            if state_store is not None:
+                # Create the run record before the loop starts
+                # Merge loop type + depth limit into developer metadata
+                run_meta = dict(metadata) if metadata else {}
+                run_meta["dendrux.loop"] = type(resolved_loop).__name__
+                if effective_max_depth is not None:
+                    run_meta["dendrux.max_delegation_depth"] = effective_max_depth
+                if output_type is not None:
+                    run_meta["dendrux.output_type"] = (
+                        f"{output_type.__module__}.{output_type.__qualname__}"
+                    )
+
+                # Compute idempotency fingerprint if key is provided
+                idem_fingerprint: str | None = None
+                if idempotency_key is not None:
+                    output_type_name = (
+                        f"{output_type.__module__}.{output_type.__qualname__}"
+                        if output_type is not None
+                        else None
+                    )
+                    idem_fingerprint = compute_idempotency_fingerprint(
+                        agent.name,
+                        user_input,
+                        output_type_name=output_type_name,
+                        history=normalized_history or None,
+                        context=context or None,
+                    )
+
+                create_result = await state_store.create_run(
+                    run_id,
+                    agent.name,
+                    input_data={"input": user_input},
+                    model=provider.model,
+                    strategy=type(resolved_strategy).__name__,
+                    parent_run_id=parent_run_id,
+                    delegation_level=delegation_level,
+                    tenant_id=tenant_id,
+                    meta=run_meta,
+                    idempotency_key=idempotency_key,
+                    idempotency_fingerprint=idem_fingerprint,
+                )
+
+                # Handle idempotency outcomes
+                if create_result.outcome == "existing_terminal":
+                    return await _build_cached_result(
+                        state_store, create_result.run_id, output_type
+                    )
+                if create_result.outcome == "existing_active":
+                    raise RunAlreadyActiveError(create_result.run_id, create_result.status)
+
+                # "created" — use the run_id from the result (same as generated)
+                run_id = create_result.run_id
+
+                # Create persistence recorder with shared sequencer
+                from dendrux.runtime.persistence import PersistenceRecorder
+                from dendrux.tool import get_tool_def
+
+                target_lookup = {}
+                for fn in agent.tools:
+                    td = get_tool_def(fn)
+                    target_lookup[td.name] = td.target
+                recorder = PersistenceRecorder(
+                    state_store,
+                    run_id,
+                    model=provider.model,
+                    provider_name=type(provider).__name__,
+                    target_lookup=target_lookup,
+                    event_sequencer=sequencer,
+                )
+
+            await _emit_event(
+                state_store,
                 run_id,
-                resolved_loop=resolved_loop,
-                mcp_meta=mcp_meta,
+                "run.started",
+                sequencer,
+                {"agent_name": agent.name, "system_prompt": _system_prompt},
             )
-        except _MCPDiscoveryError as mcp_exc:
+            lifecycle_started = True
+            await record_run_started(
+                recorder, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+            await notify_run_started(
+                extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+
+            # Set delegation context for the duration of this run so nested
+            # agent.run() calls inside tools inherit the parent link.
+            this_ctx = DelegationContext(
+                run_id=run_id,
+                delegation_level=delegation_level,
+                persisted=state_store is not None,
+                store_identity=get_store_identity(state_store),
+                max_delegation_depth=effective_max_depth,
+            )
+            ctx_token = set_delegation_context(this_ctx)
+
+            # Emit init governance events (skills + MCP) inside the try block
+            # so discovery failures flow through the error cleanup path.
+            # _MCPDiscoveryError is caught here, mcp.error emitted, then the
+            # original cause is re-raised for the outer except Exception.
             try:
-                await _emit_init_governance_event(
+                await _emit_init_events(
+                    agent,
                     recorder,
                     extra_notifier,
                     run_id,
-                    GovernanceEventType.MCP_ERROR,
-                    {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
+                    resolved_loop=resolved_loop,
+                    mcp_meta=mcp_meta,
                 )
-            except Exception:
-                logger.warning("Failed to emit mcp.error event", exc_info=True)
-            raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+            except _MCPDiscoveryError as mcp_exc:
+                try:
+                    await _emit_init_governance_event(
+                        recorder,
+                        extra_notifier,
+                        run_id,
+                        GovernanceEventType.MCP_ERROR,
+                        {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
+                    )
+                except Exception:
+                    logger.warning("Failed to emit mcp.error event", exc_info=True)
+                raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
-        # When chat history was provided, the loop receives a complete
-        # message list as initial_history and skips its own user-message
-        # recording. The runner records the new user_input itself so it
-        # still lands in react_traces (seeded prior turns are NOT recorded
-        # — they live in the dev's chat DB).
-        if seeded_history is not None:
-            await record_message(recorder, run_id, Message(role=Role.USER, content=user_input), 0)
-            await notify_message(
-                extra_notifier,
-                run_id,
-                Message(role=Role.USER, content=user_input),
-                0,
-            )
-
-        result = await resolved_loop.run(
-            agent=agent,
-            provider=provider,
-            strategy=resolved_strategy,
-            user_input=user_input,
-            run_id=run_id,
-            recorder=recorder,
-            notifier=extra_notifier,
-            initial_history=seeded_history,
-            provider_kwargs=provider_kwargs or None,
-            output_type=output_type,
-            state_store=state_store,
-        )
-
-        _attach_mcp_meta(result, mcp_meta)
-        if state_store is not None:
-            result = await _persist_loop_outcome(
-                state_store=state_store,
-                run_id=run_id,
-                result=result,
-                sequencer=sequencer,
-            )
-
-        await record_run_finished(recorder, run_id, result)
-        await notify_run_finished(extra_notifier, run_id, result)
-
-        return result
-
-    except Exception as exc:
-        _attach_run_error_meta(exc, run_id, mcp_meta)
-        # Persist ERROR status before re-raising.
-        # Conditional: only if still running (prevents cancel race).
-        if state_store is not None:
-            error_won = False
-            try:
-                error_won = await state_store.finalize_run(
+            # When chat history was provided, the loop receives a complete
+            # message list as initial_history and skips its own user-message
+            # recording. The runner records the new user_input itself so it
+            # still lands in react_traces (seeded prior turns are NOT recorded
+            # — they live in the dev's chat DB).
+            if seeded_history is not None:
+                await record_message(
+                    recorder, run_id, Message(role=Role.USER, content=user_input), 0
+                )
+                await notify_message(
+                    extra_notifier,
                     run_id,
-                    status=RunStatus.ERROR.value,
-                    error=str(exc),
-                    total_usage=None,
-                    expected_current_status="running",
+                    Message(role=Role.USER, content=user_input),
+                    0,
                 )
-            except Exception:
-                logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
-            # Only the CAS winner emits the error event
-            if error_won:
-                await _emit_event(
-                    state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+
+            result = await resolved_loop.run(
+                agent=agent,
+                provider=provider,
+                strategy=resolved_strategy,
+                user_input=user_input,
+                run_id=run_id,
+                recorder=recorder,
+                notifier=extra_notifier,
+                initial_history=seeded_history,
+                provider_kwargs=provider_kwargs or None,
+                output_type=output_type,
+                state_store=state_store,
+            )
+
+            _attach_mcp_meta(result, mcp_meta)
+            if state_store is not None:
+                result = await _persist_loop_outcome(
+                    state_store=state_store,
+                    run_id=run_id,
+                    result=result,
+                    sequencer=sequencer,
                 )
-        await record_run_failed(recorder, run_id, exc)
-        await notify_run_failed(extra_notifier, run_id, exc)
+
+            recorder_closed = True
+            await record_run_finished(recorder, run_id, result)
+            notifier_closed = True
+            await notify_run_finished(extra_notifier, run_id, result)
+
+            return result
+
+        except Exception as exc:
+            if not lifecycle_started and isinstance(
+                exc, (RunAlreadyActiveError, IdempotencyConflictError)
+            ):
+                raise
+            _attach_run_error_meta(exc, run_id, mcp_meta)
+            # Persist ERROR status before re-raising.
+            # Conditional: only if still running (prevents cancel race).
+            if state_store is not None:
+                error_won = False
+                try:
+                    error_won = await state_store.finalize_run(
+                        run_id,
+                        status=RunStatus.ERROR.value,
+                        error=str(exc),
+                        total_usage=None,
+                        expected_current_status="running",
+                    )
+                except Exception:
+                    logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+                # Only the CAS winner emits the error event
+                if error_won:
+                    await _emit_event(
+                        state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                    )
+            if lifecycle_started:
+                if not recorder_closed:
+                    recorder_closed = True
+                    await record_run_failed(recorder, run_id, exc)
+                if not notifier_closed:
+                    notifier_closed = True
+                    await notify_run_failed(extra_notifier, run_id, exc)
+            raise
+
+    except asyncio.CancelledError:
+        # Retain and drain the write task: shielding alone would let run()
+        # return while cleanup is still pending after another cancellation.
+        cleanup_task = asyncio.create_task(
+            _persist_task_cancellation(state_store, run_id, sequencer),
+            name=f"cancel-run:{run_id}",
+        )
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        cancelled_result = cleanup_task.result()
+        if result is not None and (
+            state_store is None
+            or (result.status == cancelled_result.status and result.meta.get("_finalize_won"))
+        ):
+            cancelled_result = result
+        _attach_mcp_meta(cancelled_result, mcp_meta)
+
+        # Keep callbacks in the run task so notifier ContextVar tokens remain
+        # valid. Mark each sink before awaiting it to prevent duplicate hooks.
+        if lifecycle_started:
+            if not recorder_closed:
+                recorder_closed = True
+                try:
+                    await record_run_finished(recorder, run_id, cancelled_result)
+                except Exception:
+                    logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
+            if not notifier_closed:
+                notifier_closed = True
+                await notify_run_finished(extra_notifier, run_id, cancelled_result)
         raise
 
     finally:
-        reset_delegation_context(ctx_token)
+        if ctx_token is not None:
+            reset_delegation_context(ctx_token)
+
+
+async def _persist_task_cancellation(
+    state_store: StateStore | None,
+    run_id: str,
+    sequencer: EventSequencer,
+) -> RunResult:
+    from dendrux.types import RunResult
+
+    result = RunResult(run_id=run_id, status=RunStatus.CANCELLED)
+    if state_store is None:
+        return result
+    try:
+        won = await state_store.finalize_run(
+            run_id,
+            status=RunStatus.CANCELLED.value,
+            expected_current_status="running",
+        )
+        if won:
+            await _emit_event(
+                state_store,
+                run_id,
+                "run.cancelled",
+                sequencer,
+                {"reason": "task_cancelled"},
+            )
+        elif await state_store.get_run(run_id) is not None:
+            result = await _build_cached_result(state_store, run_id)
+        # No row: cancelled before create_run committed, or while resolving an
+        # idempotent hit under the provisional id. Nothing to finalize.
+    except Exception:
+        logger.error("Failed to cancel run %s during task cleanup", run_id, exc_info=True)
+    return result
 
 
 async def _raise_resume_claim_failure(
@@ -1270,6 +1367,7 @@ def run_stream(
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
     max_delegation_depth: int | None,
+    idempotency_key: str | None = ...,
     output_type: type | None = ...,
     **kwargs: Any,
 ) -> RunStream: ...
@@ -1290,6 +1388,7 @@ def run_stream(
     tenant_id: str | None = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
+    idempotency_key: str | None = ...,
     output_type: type | None = ...,
     **kwargs: Any,
 ) -> RunStream: ...
@@ -1310,13 +1409,17 @@ def run_stream(
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
+    idempotency_key: str | None = None,
     output_type: type | None = None,
     **kwargs: Any,
 ) -> RunStream:
     """Stream an agent run as RunEvents, returning a RunStream.
 
     Synchronous — returns immediately with run_id available. All async
-    setup (DB row, notifiers) runs lazily on first iteration.
+    setup (DB row, notifiers) runs lazily on first iteration. With
+    ``idempotency_key``, the initial run_id is provisional until that setup
+    resolves the key. A cached outcome yields one terminal event, without
+    replaying text or tool events. Read its answer from ``stream.result``.
 
     Accepts either an already-resolved ``state_store`` or an async
     ``state_store_resolver`` callable. The resolver is called once in
@@ -1379,7 +1482,9 @@ def run_stream(
         """
         # store is captured in the closure for the error handler.
         # Starts as the pre-provided value (often None for the lazy path).
+        nonlocal run_id
         store = state_store
+        recorder: LoopRecorder | None = None
         sequencer = _shared["sequencer"]
         ctx_token = None
 
@@ -1398,7 +1503,11 @@ def run_stream(
             # failures don't leave a DB row stuck in running.
             _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-            recorder: LoopRecorder | None = None
+            if idempotency_key is not None and store is None:
+                raise ValueError(
+                    "idempotency_key requires persistence (database_url, state_store, "
+                    "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
+                )
 
             if store is not None:
                 run_meta = dict(metadata) if metadata else {}
@@ -1409,17 +1518,57 @@ def run_stream(
                     run_meta["dendrux.output_type"] = (
                         f"{output_type.__module__}.{output_type.__qualname__}"
                     )
-                await store.create_run(
-                    run_id,
-                    agent.name,
-                    input_data={"input": user_input},
-                    model=provider.model,
-                    strategy=type(resolved_strategy).__name__,
-                    parent_run_id=parent_run_id,
-                    delegation_level=delegation_level,
-                    tenant_id=tenant_id,
-                    meta=run_meta,
-                )
+                fingerprint = None
+                if idempotency_key is not None:
+                    fingerprint = compute_idempotency_fingerprint(
+                        agent.name,
+                        user_input,
+                        output_type_name=(
+                            f"{output_type.__module__}.{output_type.__qualname__}"
+                            if output_type is not None
+                            else None
+                        ),
+                        history=normalized_history or None,
+                        context=context or None,
+                    )
+                try:
+                    create_result = await store.create_run(
+                        run_id,
+                        agent.name,
+                        input_data={"input": user_input},
+                        model=provider.model,
+                        strategy=type(resolved_strategy).__name__,
+                        parent_run_id=parent_run_id,
+                        delegation_level=delegation_level,
+                        tenant_id=tenant_id,
+                        meta=run_meta,
+                        idempotency_key=idempotency_key,
+                        idempotency_fingerprint=fingerprint,
+                    )
+                except IdempotencyConflictError:
+                    # No row was created and no lifecycle opened; the error
+                    # handler must not fire failure hooks for a run that
+                    # never started (mirrors run(), which re-raises bare).
+                    _shared["existing_run"] = True
+                    raise
+                _shared["existing_run"] = create_result.outcome != "created"
+                run_id = create_result.run_id
+                stream.run_id = run_id
+                if create_result.outcome == "existing_terminal":
+                    cached = await _build_cached_result(store, run_id, output_type)
+                    event_type = {
+                        RunStatus.ERROR: RunEventType.RUN_ERROR,
+                        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+                    }.get(cached.status, RunEventType.RUN_COMPLETED)
+                    yield RunEvent(
+                        type=event_type,
+                        run_id=run_id,
+                        run_result=cached,
+                        error=cached.error if event_type == RunEventType.RUN_ERROR else None,
+                    )
+                    return
+                if create_result.outcome == "existing_active":
+                    raise RunAlreadyActiveError(run_id, create_result.status)
 
                 from dendrux.runtime.persistence import PersistenceRecorder
                 from dendrux.tool import get_tool_def
@@ -1569,7 +1718,7 @@ def run_stream(
         except Exception as exc:
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
             # Covers both setup failures and loop execution errors.
-            if store is not None:
+            if store is not None and not _shared.get("existing_run"):
                 error_won = False
                 try:
                     error_won = await store.finalize_run(
@@ -1585,15 +1734,16 @@ def run_stream(
                     await _emit_event_safe(
                         store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
                     )
-            try:
-                await record_run_failed(recorder, run_id, exc)
-                await notify_run_failed(extra_notifier, run_id, exc)
-            except Exception:
-                logger.warning(
-                    "Lifecycle hooks failed during stream error handler for run %s",
-                    run_id,
-                    exc_info=True,
-                )
+            if not _shared.get("existing_run"):
+                try:
+                    await record_run_failed(recorder, run_id, exc)
+                    await notify_run_failed(extra_notifier, run_id, exc)
+                except Exception:
+                    logger.warning(
+                        "Lifecycle hooks failed during stream error handler for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
 
             yield RunEvent(
                 type=RunEventType.RUN_ERROR,
@@ -1601,13 +1751,15 @@ def run_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
-                    meta=deepcopy(mcp_meta),
+                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
                 ),
+                run_id=run_id,
                 error=str(exc),
             )
 
         finally:
-            agent._task_manager.release_interrupt(run_id)
+            if not _shared.get("existing_run"):
+                agent._task_manager.release_interrupt(run_id)
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
@@ -1630,6 +1782,8 @@ def run_stream(
           - CAS lost + store available → query store for actual status.
           - No store → CANCELLED (best-effort fallback).
         """
+        if _shared.get("existing_run"):
+            return None
         store = _shared.get("state_store")
         sequencer = _shared.get("sequencer")
 
@@ -1681,7 +1835,8 @@ def run_stream(
             return cancelled_result
         return None
 
-    return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    stream = _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    return stream
 
 
 async def resume(

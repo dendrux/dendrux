@@ -86,7 +86,19 @@ async def run(
 ) -> RunResult
 ```
 
-Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence.
+Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence.
+
+On success, `RunResult.answer` contains only the final answer turn after tool
+use, not all assistant text produced during the run. Earlier commentary and
+inline content must be collected from streamed `TEXT_DELTA` events or
+`RunStore.get_traces()`. A paused run may instead carry a clarification question.
+
+Cancelling the coroutine awaiting `run()` (including via `asyncio.wait_for`)
+atomically finalizes a still-running persisted run as `cancelled`, emits
+`run.cancelled`, and re-raises `CancelledError` (`wait_for` raises `TimeoutError`).
+It returns no `RunResult` and captures no in-flight model text. Existing paused
+or terminal outcomes are preserved. Stream cancellation has the partial-answer
+semantics described below.
 
 ## `stream`
 
@@ -98,10 +110,36 @@ def stream(
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     notifier: LoopNotifier | None = None,
+    idempotency_key: str | None = None,
 ) -> RunStream
 ```
 
-Same inputs as `run`, but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. To interrupt from another coroutine, call `cancel_run(stream.run_id)`; the stream ends with `RUN_CANCELLED` carrying the partial answer. Closing the stream early also cancels the run and persists the text streamed so far. Guardrails are not supported on the streaming path.
+Same inputs as `run`, but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration; with an idempotency key it is provisional until first iteration resolves the key. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. To interrupt from another coroutine, call `cancel_run(stream.run_id)`; the stream ends with `RUN_CANCELLED` carrying the partial answer. Closing the stream early also cancels the run and persists its current partial answer. Guardrails are not supported on the streaming path.
+
+The final `RunResult.answer` contains the final answer turn only. On cancellation,
+the partial answer contains only the current text buffer, which resets at every
+`TOOL_RESULT`. It can be `None` even if earlier text was streamed. For example,
+`"Checking…" → tool result → "The answer is 42"` yields an answer of
+`"The answer is 42"`; cancellation immediately after the tool result can yield
+`None`. To retain the full transcript, accumulate `TEXT_DELTA` events (or `.text()`)
+across all turns, or read persisted assistant messages with `RunStore.get_traces()`.
+Traces contain recorded messages, not every delta from an interrupted model call.
+
+`idempotency_key` uses the same persistence requirement and request fingerprint
+as `run()` (agent name, input, history, context, and output type). A matching
+terminal run yields **one terminal event** with its original ID and cached summary
+result, without calling the provider or replaying text/tool events. Read
+`stream.result.answer` after iteration; `.text()` yields nothing on a cache hit.
+Cached `error` and `cancelled` outcomes use `RUN_ERROR` and `RUN_CANCELLED`;
+`success` and `max_iterations` use `RUN_COMPLETED` with their original status.
+
+Active-run matches and fingerprint conflicts yield `RUN_ERROR`, with
+`stream.result.meta["error_type"]` equal to `RunAlreadyActiveError` or
+`IdempotencyConflictError`. Missing persistence yields `RUN_ERROR` during setup.
+These errors do not change the original run or its event log. Before using the
+ID for cancellation or correlation, consume the first event so the key has been
+resolved. The cached result is a summary, like `run()`'s cached result; it does
+not reconstruct the original steps.
 
 ## `resume`, `submit_tool_results`, `submit_input`, `submit_approval`
 
