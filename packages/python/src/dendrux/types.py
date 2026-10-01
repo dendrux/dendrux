@@ -379,7 +379,21 @@ class GovernanceEventType(StrEnum):
 
 @dataclass
 class RunResult:
-    """The final output of an agent run."""
+    """The outcome of an agent run.
+
+    On success, ``answer`` contains the final answer turn, not all assistant
+    text produced across tool calls. Earlier commentary and inline content
+    are available through streamed TEXT_DELTA events or persisted traces
+    (``RunStore.get_traces()``).
+
+    On stream interruption via cancel_run(), the partial answer contains
+    only the current text buffer, which resets at each TOOL_RESULT. Closing
+    a stream early persists that buffer as the run's answer. It can be None
+    even if earlier turns produced text. Cancelling the coroutine awaiting run()
+    re-raises CancelledError rather than returning a RunResult; it does not
+    capture in-flight model text. Paused runs may carry a clarification
+    question in ``answer``.
+    """
 
     run_id: str
     status: RunStatus
@@ -739,6 +753,11 @@ class RunStream:
     """Async iterable of RunEvents with lifecycle management.
 
     Single-use: iterating twice raises RuntimeError.
+
+    With an idempotency key, ``run_id`` is provisional before iteration and
+    resolves to the existing run's ID during setup if the key matches.
+    Cached outcomes yield one terminal event; ``result`` holds the cached
+    summary, and no text or tool events are replayed.
 
     Cleanup: ``__aiter__`` returns an async generator wrapper whose
     ``finally`` block runs CAS-guarded cancellation if no terminal event

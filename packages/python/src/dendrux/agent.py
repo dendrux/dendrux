@@ -860,7 +860,14 @@ class Agent:
                 per LLM call (see ``RunStore.get_llm_calls``).
 
         Returns:
-            RunResult with status, answer, steps, and usage stats.
+            RunResult with status, answer, steps, and usage stats. On success,
+            ``answer`` is the final answer turn, not the concatenation of text
+            across tool calls. Collect stream deltas or use RunStore.get_traces()
+            for earlier assistant text. Stream cancellation preserves only the
+            current text buffer (reset at each TOOL_RESULT), possibly None.
+            Cancelling this coroutine finalizes a still-running persisted run
+            as cancelled and re-raises CancelledError; no RunResult or in-flight
+            model text is returned.
 
         Raises:
             ValueError: If no provider is configured, or if idempotency_key
@@ -1388,6 +1395,7 @@ class Agent:
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
+        idempotency_key: str | None = ...,
         max_delegation_depth: int | None,
         **kwargs: Any,
     ) -> RunStream: ...
@@ -1402,6 +1410,7 @@ class Agent:
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
+        idempotency_key: str | None = ...,
         **kwargs: Any,
     ) -> RunStream: ...
 
@@ -1414,14 +1423,16 @@ class Agent:
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
+        idempotency_key: str | None = None,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         **kwargs: Any,
     ) -> RunStream:
         """Stream an agent run as RunEvents.
 
         Same parameters as run(). Returns a RunStream immediately —
-        no ``await`` needed. The run_id is available before iteration.
-        Async setup (DB row, notifiers) runs lazily on first iteration.
+        no ``await`` needed. The run_id is available before iteration; with
+        idempotency_key it is provisional until lazy setup resolves the key.
+        Async setup (DB row, notifiers) runs on first iteration.
 
         Usage:
             # Full event stream
@@ -1439,9 +1450,13 @@ class Agent:
 
         After any terminal event (RUN_COMPLETED, RUN_PAUSED, RUN_ERROR,
         RUN_CANCELLED), the stream ends. If the consumer breaks early,
-        the run is cancelled via CAS-guarded cleanup and the text streamed
-        so far is persisted as the run's ``answer``. To interrupt from
-        another coroutine, call :meth:`cancel_run` with ``stream.run_id``;
+        the run is cancelled via CAS-guarded cleanup. The persisted partial
+        ``answer`` contains the current text buffer, reset at each TOOL_RESULT;
+        it can be None even if earlier turns produced text. On success,
+        ``answer`` contains the final answer turn only. Collect TEXT_DELTA
+        events (or .text()) across turns, or use RunStore.get_traces(), for
+        earlier assistant text. To interrupt from another coroutine, call
+        :meth:`cancel_run` with ``stream.run_id`` after the first event;
         the stream then yields ``RUN_CANCELLED`` carrying the partial
         answer.
 
@@ -1459,6 +1474,15 @@ class Agent:
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
             notifier: Optional notifier for lifecycle events.
+            idempotency_key: Duplicate prevention using run()'s fingerprint
+                (agent name, input, history, context, and output type). Requires
+                persistence. A terminal match yields one cached terminal event
+                with the existing run_id and summary result; no text/tool events
+                are replayed, so .text() yields nothing on a cache hit. An active
+                match or input conflict yields RUN_ERROR with
+                result.meta["error_type"] of RunAlreadyActiveError or
+                IdempotencyConflictError. Missing persistence also yields
+                RUN_ERROR during lazy setup. Existing runs are never modified.
             max_delegation_depth: Maximum allowed delegation depth for the run
                 tree. Default 10. None means unbounded.
             **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
@@ -1509,6 +1533,7 @@ class Agent:
             tenant_id=tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
+            idempotency_key=idempotency_key,
             **stream_kwargs,
             **kwargs,
         )

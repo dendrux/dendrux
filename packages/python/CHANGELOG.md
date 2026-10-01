@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Runs: task cancellation of `agent.run()` now CAS-finalizes a running row as
+  cancelled, emits `run.cancelled`, closes run lifecycle hooks, and re-raises
+  cancellation, including timeouts during startup and error handling. Durable
+  cancellation cleanup survives repeated cancellation; closing lifecycle hooks
+  are invoked at most once per recorder/notifier, in the original run task.
+- Streams: accept `idempotency_key` with the same request fingerprint as `run()`.
+  Cached outcomes emit one terminal event without replaying text or tool events;
+  active matches and conflicts emit `RUN_ERROR` without modifying existing runs.
+  The stream ID resolves during first iteration when a key matches an existing run.
+- Docs: clarify final-turn `RunResult.answer` and the partial-answer buffer reset
+  at each `TOOL_RESULT` on stream cancellation.
+
 ## 0.2.0a17 - 2026-09-20
 
 - MCP: require SDK 2.2+, adopting its origin-restricted redirect handling;

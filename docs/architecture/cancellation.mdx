@@ -15,7 +15,7 @@ There is one method on `Agent` for cancellation, and its behavior depends on wha
 | --- | --- |
 | Paused (`waiting_approval`, `waiting_client_tool`, `waiting_human_input`) | CAS finalize from the paused status to `cancelled` in a single `UPDATE`. Wins instantly. |
 | Running (`running`), any process | Sets `cancel_requested = true` on the row. The runner observes the flag at its next checkpoint and finalizes itself as `cancelled`. |
-| Streaming (`running`) via `stream()` / `resume_stream()` on **this** `Agent` instance | Additionally sets an in-process interrupt. The loop abandons the in-flight model stream immediately and yields `RUN_CANCELLED` with the text streamed so far as `answer`. |
+| Streaming (`running`) via `stream()` / `resume_stream()` on **this** `Agent` instance | Additionally sets an in-process interrupt. The loop abandons the in-flight model stream immediately and yields `RUN_CANCELLED` with the current turn’s partial text as `answer`. |
 | Terminal (`success`, `error`, `cancelled`, `max_iterations`) | No-op. Returns the current persisted state. Does not raise. |
 
 The caller does not have to know which branch applies. `cancel_run` sets the cooperative flag, attempts the paused-state CAS, and fires the in-process interrupt in the same call. Exactly one path produces the terminal `run.cancelled` event.
@@ -114,6 +114,21 @@ Tool executions are never preempted. A tool already running finishes normally, i
 
 A non-streamed `agent.run()` call behaves the same way for its LLM calls: a call already in the air completes, and cancel lands at the next checkpoint. Streamed runs get a third checkpoint, described next.
 
+## Cancelling the `run()` coroutine
+
+Task cancellation, including `asyncio.wait_for(agent.run(...), timeout)`, is
+handled separately from `cancel_run()`. The runner catches `CancelledError`,
+atomically transitions a persisted `running` row to `cancelled`, emits
+`run.cancelled` with reason `task_cancelled` if that transition wins, closes
+run lifecycle hooks, and re-raises. `wait_for` exposes this as `TimeoutError`.
+Startup hooks after run creation and error handling are covered too. The runner
+waits for the cancellation status/event writes even if another cancellation
+arrives during cleanup. Each recorder/notifier receives at most one closing hook;
+callbacks stay in the original run task. Already paused or terminal
+rows are preserved. No `RunResult` is returned and in-flight model text is not
+captured. Unlike cooperative `cancel_run()`, cancelling an asyncio task can
+interrupt awaited tool execution.
+
 ## Interrupting a streamed run
 
 A chat turn is usually one iteration, so "observed at the next iteration" would make `cancel_run` useless for exactly the runs people most want to interrupt. Streamed runs therefore get an in-process interrupt.
@@ -122,7 +137,7 @@ When `stream()` or `resume_stream()` starts driving the loop, the runner registe
 
 1. Closes the provider stream (the HTTP connection is dropped; the vendor stops generating).
 2. Reports the abandoned call through `on_llm_call_failed` with a `StreamInterruptedError`, so notifiers can close the span.
-3. Yields `RUN_CANCELLED` whose `run_result.answer` is the text streamed so far, with `meta["interrupted"] = True` and `meta["partial_output"]` saying whether `answer` carries anything.
+3. Yields `RUN_CANCELLED` whose `run_result.answer` is the current turn’s partial text, with `meta["interrupted"] = True` and `meta["partial_output"]` saying whether `answer` carries anything.
 
 The runner persists that outcome exactly like any other terminal result: status `cancelled`, `answer` set to the partial text, and a `run.cancelled` event carrying `{"reason": "cancel_requested", "interrupted": true, "partial_output": true}`.
 
@@ -133,12 +148,18 @@ async with agent.stream("Write me a long essay") as stream:
     ...
     await agent.cancel_run(stream.run_id)               # from anywhere in this process
     events = await consumer                             # ends with RUN_CANCELLED
-    partial = events[-1].run_result.answer              # what the user already saw
+    partial = events[-1].run_result.answer              # partial text from the current turn
 ```
 
 The interrupt lives on the `Agent` instance, so it only reaches streams that instance is driving. `cancel_run` from another process (or another `Agent` object) still sets the durable flag; that run finishes its current model call and cancels at the next checkpoint. If you need cross-process mid-stream interruption, call `cancel_run` on the instance that owns the stream, for example by routing the request to the server that holds the SSE connection.
 
 The abandoned model call reports no usage (providers send token counts only at the end of a stream), so `usage` on the cancelled result covers completed iterations only. The interrupted call is not stored as an `llm_interactions` row; the partial answer on the run row and the `run.cancelled` payload are the audit trail.
+
+The partial `answer` is not the full transcript. The buffer resets at each
+`TOOL_RESULT`, so earlier assistant commentary is excluded and the answer may
+be `None` immediately after a tool result. On success, `answer` likewise contains
+only the final answer turn. Accumulate stream deltas across turns for the full
+live transcript, or use `RunStore.get_traces()` for recorded assistant messages.
 
 ## Abandoning a stream
 
