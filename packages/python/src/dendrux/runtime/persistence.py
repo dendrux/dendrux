@@ -204,6 +204,7 @@ class PersistenceRecorder(BaseRecorder):
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
                 "cost_usd": response.usage.cost_usd,
+                "cost_source": response.usage.cost_source,
                 "cache_read_input_tokens": response.usage.cache_read_input_tokens,
                 "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
                 "reasoning_tokens": response.usage.reasoning_tokens,
@@ -246,6 +247,11 @@ class PersistenceRecorder(BaseRecorder):
                 usage=response.usage,
                 model=response.model or self._model,
                 provider=self._provider_name,
+                meta=(
+                    {"cost_source": response.usage.cost_source}
+                    if response.usage.cost_source is not None
+                    else None
+                ),
             )
         except Exception:
             logger.warning(
@@ -267,6 +273,7 @@ class PersistenceRecorder(BaseRecorder):
                 "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
                 "reasoning_tokens": response.usage.reasoning_tokens,
                 "cost_usd": response.usage.cost_usd,
+                "cost_source": response.usage.cost_source,
                 "model": response.model or self._model,
                 "has_tool_calls": bool(response.tool_calls),
             },

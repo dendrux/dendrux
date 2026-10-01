@@ -21,6 +21,7 @@ from dendrux.errors import (
     SchemaNotInitializedError,
 )
 from dendrux.loops.single import SingleCall
+from dendrux.pricing import ModelPricing, PriceTable
 from dendrux.runtime.context import DelegationDepthExceededError
 from dendrux.runtime.runner import run
 from dendrux.runtime.sweep import sweep
@@ -43,8 +44,10 @@ __all__ = [
     "GovernanceEventType",
     "IdempotencyConflictError",
     "InvalidToolResultError",
+    "ModelPricing",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
+    "PriceTable",
     "RunAlreadyActiveError",
     "RunAlreadyClaimedError",
     "RunAlreadyTerminalError",

@@ -13,6 +13,14 @@
   The stream ID resolves during first iteration when a key matches an existing run.
 - Docs: clarify final-turn `RunResult.answer` and the partial-answer buffer reset
   at each `TOOL_RESULT` on stream cancellation.
+- Pricing: `Agent(pricing=PriceTable({...}))` fills `cost_usd` for providers
+  that report tokens only (Anthropic, OpenAI). Rates are developer-owned, USD
+  per million tokens, keyed by model id or glob; a provider-reported cost
+  (OpenRouter) always wins. `UsageStats.cost_source` says whether a cost is
+  `"provider"`, `"table"`, or `"mixed"`; it rides `llm.completed` events and
+  `token_usage.meta`, no migration.
+- Usage: a run total `cost_usd` is now `None` when any step is unpriced,
+  instead of silently summing only the priced steps.
 
 ## 0.2.0a17 - 2026-09-20
 

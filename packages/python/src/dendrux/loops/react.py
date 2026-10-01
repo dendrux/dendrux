@@ -41,6 +41,7 @@ from dendrux.loops._helpers import (
     notify_message,
     notify_tool,
     notify_tool_started,
+    price_response,
     record_governance,
     record_llm,
     record_llm_failed,
@@ -124,13 +125,26 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
     Cache fields treat None as 0 in summation so providers that don't
     report them don't poison the rollup. Once any step reports a value,
     the running total carries it.
+
+    Cost is the opposite: a run total only means something if every step
+    was priced, so one unpriced step (``cost_usd is None``) makes the total
+    ``None`` and keeps it there. A ``None`` total that already carries
+    tokens is such an unknown, which is how a resumed run stays honest
+    about steps priced before the pause.
     """
+    cost_unknown = total.cost_usd is None and (total.input_tokens > 0 or total.output_tokens > 0)
     total.input_tokens += step_usage.input_tokens
     total.output_tokens += step_usage.output_tokens
     total.total_tokens += step_usage.total_tokens
-    if step_usage.cost_usd is not None:
+    if cost_unknown or step_usage.cost_usd is None:
+        total.cost_usd = None
+        total.cost_source = None
+    else:
         if total.cost_usd is None:
             total.cost_usd = 0.0
+            total.cost_source = step_usage.cost_source
+        elif total.cost_source != step_usage.cost_source:
+            total.cost_source = "mixed"
         total.cost_usd += step_usage.cost_usd
     if step_usage.cache_read_input_tokens is not None:
         total.cache_read_input_tokens = (
@@ -250,6 +264,7 @@ def _snapshot_usage(usage: UsageStats) -> UsageStats:
         cache_read_input_tokens=usage.cache_read_input_tokens,
         cache_creation_input_tokens=usage.cache_creation_input_tokens,
         reasoning_tokens=usage.reasoning_tokens,
+        cost_source=usage.cost_source,
     )
 
 
@@ -327,6 +342,7 @@ async def _init_loop_state(
             initial_usage.cache_creation_input_tokens if initial_usage else None
         ),
         reasoning_tokens=(initial_usage.reasoning_tokens if initial_usage else None),
+        cost_source=(initial_usage.cost_source if initial_usage else None),
     )
 
     return _LoopState(
@@ -768,6 +784,7 @@ class ReActLoop(Loop):
                 )
                 raise
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
+            response = price_response(response, pricing=agent.pricing, default_model=provider.model)
 
             # Output guardrail — detection-only. Persistence stores raw
             # (DB is ground truth); the next scan_incoming redacts for
@@ -1214,6 +1231,9 @@ class ReActLoop(Loop):
             # (handled above) leaves this None.
             assert llm_response is not None
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
+            llm_response = price_response(
+                llm_response, pricing=agent.pricing, default_model=provider.model
+            )
 
             await _record_llm(
                 recorder,

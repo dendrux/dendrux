@@ -227,6 +227,14 @@ class UsageStats:
     ``reasoning_tokens`` is the count of internal reasoning/thinking tokens
     the model billed within ``output_tokens`` (Anthropic thinking, OpenAI
     reasoning). ``None`` when the provider did not report it.
+
+    ``cost_usd`` is ``None`` when nothing priced the call: the provider did
+    not report a cost and no :class:`~dendrux.pricing.PriceTable` covered the
+    model. A run total is ``None`` as soon as any step is unpriced, so a
+    partial sum never reads as the whole run's spend. ``cost_source`` says
+    where a non-``None`` cost came from: ``"provider"`` (reported on the
+    response, e.g. OpenRouter), ``"table"`` (computed from the developer's
+    price table), or ``"mixed"`` (a run total whose steps differ).
     """
 
     input_tokens: int = 0
@@ -236,6 +244,7 @@ class UsageStats:
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     reasoning_tokens: int | None = None
+    cost_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -617,6 +626,7 @@ def _usage_to_dict(u: UsageStats) -> dict[str, Any]:
         "cost_usd": u.cost_usd,
         "cache_read_input_tokens": u.cache_read_input_tokens,
         "cache_creation_input_tokens": u.cache_creation_input_tokens,
+        "cost_source": u.cost_source,
     }
 
 
@@ -628,6 +638,7 @@ def _usage_from_dict(d: dict[str, Any]) -> UsageStats:
         cost_usd=d.get("cost_usd"),
         cache_read_input_tokens=d.get("cache_read_input_tokens"),
         cache_creation_input_tokens=d.get("cache_creation_input_tokens"),
+        cost_source=d.get("cost_source"),
     )
 
 
