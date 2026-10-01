@@ -446,6 +446,8 @@ class SingleCall(Loop):
             cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
             reasoning_tokens=response.usage.reasoning_tokens,
             cost_source=response.usage.cost_source,
+            usage_reported=response.usage.usage_reported,
+            cost_unknown=response.usage.cost_usd is None,
         )
 
         await _check_budget(
@@ -698,6 +700,8 @@ class SingleCall(Loop):
             cache_creation_input_tokens=llm_response.usage.cache_creation_input_tokens,
             reasoning_tokens=llm_response.usage.reasoning_tokens,
             cost_source=llm_response.usage.cost_source,
+            usage_reported=llm_response.usage.usage_reported,
+            cost_unknown=llm_response.usage.cost_usd is None,
         )
 
         await _check_budget(

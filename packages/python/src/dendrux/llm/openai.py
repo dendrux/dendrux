@@ -514,7 +514,7 @@ class OpenAIProvider(LLMProvider):
         tool_calls: list[ToolCall] = []
         reasoning_parts: list[str] = []
         reasoning_block_acc: list[Any] = []
-        usage = UsageStats()
+        usage = UsageStats(usage_reported=False)
         finish_reason: str | None = None
 
         # Tool call buffers keyed by chunk index — no ordering assumptions.
@@ -779,7 +779,7 @@ class OpenAIProvider(LLMProvider):
                 )
 
         # Extract usage
-        usage = UsageStats()
+        usage = UsageStats(usage_reported=False)
         if response.usage:
             usage = self._normalize_usage(response.usage)
 

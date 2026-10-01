@@ -242,7 +242,9 @@ class TestFinalizeRun:
         assert record is not None
         assert record.status == "success"
         assert record.answer == "42"
-        assert record.output_data == {"answer": "42"}
+        from dataclasses import asdict
+
+        assert record.output_data == {"answer": "42", "usage": asdict(usage)}
         assert record.iteration_count == 3
         assert record.total_input_tokens == 300
         assert record.total_output_tokens == 80

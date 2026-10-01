@@ -464,7 +464,7 @@ class OpenAIResponsesProvider(LLMProvider):
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        usage = UsageStats()
+        usage = UsageStats(usage_reported=False)
 
         # Track active function calls: item_id → (name, call_id)
         _active_calls: dict[str, tuple[str, str]] = {}
@@ -697,7 +697,7 @@ class OpenAIResponsesProvider(LLMProvider):
                         reasoning_parts.append(part_text)
 
         # Extract usage
-        usage = UsageStats()
+        usage = UsageStats(usage_reported=False)
         if hasattr(response, "usage") and response.usage:
             usage = _build_usage_with_cache(response.usage)
 

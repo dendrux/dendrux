@@ -21,6 +21,9 @@
   `token_usage.meta`, no migration.
 - Usage: a run total `cost_usd` is now `None` when any step is unpriced,
   instead of silently summing only the priced steps.
+- Preserve unknown pricing when providers omit usage or unpriced calls report
+  no fresh tokens, including across pause/resume. Idempotent retries now retain
+  the final usage summary and its cost source on SQLite and PostgreSQL.
 
 ## 0.2.0a17 - 2026-09-20
 

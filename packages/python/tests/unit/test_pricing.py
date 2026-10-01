@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -476,3 +477,69 @@ class TestSerialization:
     def test_legacy_dict_without_cost_source(self) -> None:
         restored = _usage_from_dict({"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.1})
         assert restored.cost_source is None
+
+
+class TestUnknownUsage:
+    @pytest.mark.parametrize("responses_api", [False, True])
+    def test_provider_missing_usage_is_not_free(self, responses_api):
+        from dendrux.llm.openai import OpenAIProvider
+        from dendrux.llm.openai_responses import OpenAIResponsesProvider
+        from dendrux.loops._helpers import price_response
+
+        provider_cls = OpenAIResponsesProvider if responses_api else OpenAIProvider
+        provider = provider_cls(model="test", api_key="unused")
+        raw = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="answer", tool_calls=None))],
+            output=[],
+            usage=None,
+        )
+        response = provider._normalize_response(raw)
+        priced = price_response(response, default_model="test", pricing=PriceTable({"test": GPT}))
+        assert priced.usage.cost_usd is None
+        assert not priced.usage.usage_reported
+
+    @pytest.mark.parametrize("loop", [ReActLoop(), SingleCall()])
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_custom_provider_missing_usage_is_not_free(self, loop, stream):
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="answer")]),
+            prompt="test",
+            loop=loop,
+            pricing=PriceTable({"mock": GPT}),
+        )
+        if stream:
+            async with agent.stream("hi") as running:
+                async for _ in running:
+                    pass
+            result = running.result
+        else:
+            result = await agent.run("hi")
+        assert result.usage.cost_usd is None
+        assert result.usage.cost_source is None
+        assert not result.usage.usage_reported
+
+    def test_explicit_zero_usage_is_priced(self):
+        result = price_usage(UsageStats(), model="test", pricing=PriceTable({"test": GPT}))
+        assert result.cost_usd == 0
+        assert result.cost_source == "table"
+
+    def test_provider_cost_wins_even_without_usage(self):
+        result = price_usage(
+            UsageStats(cost_usd=0, usage_reported=False),
+            model="test",
+            pricing=PriceTable({"test": GPT}),
+        )
+        assert result.cost_usd == 0
+        assert result.cost_source == "provider"
+
+    @pytest.mark.parametrize("cache_tokens", [None, 100])
+    def test_unknown_cost_survives_serialization(self, cache_tokens):
+        total = UsageStats()
+        _accumulate_usage(
+            total, UsageStats(cache_read_input_tokens=cache_tokens, usage_reported=False)
+        )
+        total = _usage_from_dict(_usage_to_dict(total))
+        _accumulate_usage(total, _usage(10, 5, cost=0.1, source="provider"))
+        assert total.cost_usd is None
+        assert total.cost_unknown
+        assert not total.usage_reported

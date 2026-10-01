@@ -128,14 +128,27 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
 
     Cost is the opposite: a run total only means something if every step
     was priced, so one unpriced step (``cost_usd is None``) makes the total
-    ``None`` and keeps it there. A ``None`` total that already carries
-    tokens is such an unknown, which is how a resumed run stays honest
-    about steps priced before the pause.
+    ``None`` and keeps it there. ``cost_unknown`` preserves this even if
+    the unpriced call reported no tokens. Token counts also identify
+    unknown totals restored from older pause snapshots without that flag.
     """
-    cost_unknown = total.cost_usd is None and (total.input_tokens > 0 or total.output_tokens > 0)
+    cost_unknown = total.cost_unknown or (
+        total.cost_usd is None
+        and any(
+            (
+                total.input_tokens,
+                total.output_tokens,
+                total.total_tokens,
+                total.cache_read_input_tokens,
+                total.cache_creation_input_tokens,
+            )
+        )
+    )
     total.input_tokens += step_usage.input_tokens
     total.output_tokens += step_usage.output_tokens
     total.total_tokens += step_usage.total_tokens
+    total.usage_reported = total.usage_reported and step_usage.usage_reported
+    total.cost_unknown = cost_unknown or step_usage.cost_usd is None
     if cost_unknown or step_usage.cost_usd is None:
         total.cost_usd = None
         total.cost_source = None
@@ -265,6 +278,8 @@ def _snapshot_usage(usage: UsageStats) -> UsageStats:
         cache_creation_input_tokens=usage.cache_creation_input_tokens,
         reasoning_tokens=usage.reasoning_tokens,
         cost_source=usage.cost_source,
+        usage_reported=usage.usage_reported,
+        cost_unknown=usage.cost_unknown,
     )
 
 
@@ -343,6 +358,10 @@ async def _init_loop_state(
         ),
         reasoning_tokens=(initial_usage.reasoning_tokens if initial_usage else None),
         cost_source=(initial_usage.cost_source if initial_usage else None),
+        usage_reported=(initial_usage.usage_reported if initial_usage else True),
+        cost_unknown=(
+            initial_usage.cost_unknown or initial_usage.cost_usd is None if initial_usage else False
+        ),
     )
 
     return _LoopState(

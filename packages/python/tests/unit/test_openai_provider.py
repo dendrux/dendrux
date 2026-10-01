@@ -1510,3 +1510,34 @@ class TestReasoningReplay:
         out = provider._convert_messages([Message(role=Role.ASSISTANT, content="ans")])
         assert "reasoning_details" not in out[0]
         assert "reasoning" not in out[0]
+
+
+@pytest.mark.parametrize("reported", [False, True])
+async def test_stream_distinguishes_missing_usage_from_reported_zero(provider, reported):
+    from dendrux import ModelPricing, PriceTable
+    from dendrux.loops._helpers import price_response
+
+    chunks = [
+        FakeChunk(
+            choices=[FakeStreamChoice(delta=FakeDelta(content="answer"), finish_reason="stop")]
+        )
+    ]
+    if reported:
+        chunks.append(
+            FakeChunk(
+                choices=[],
+                usage=FakeChunkUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+            )
+        )
+    provider._client.chat.completions.create = AsyncMock(return_value=MockAsyncStream(chunks))
+    events = [
+        event async for event in provider.complete_stream([Message(role=Role.USER, content="hi")])
+    ]
+    done = next(event for event in events if event.type == StreamEventType.DONE)
+    response = price_response(
+        done.raw,
+        default_model=provider.model,
+        pricing=PriceTable({provider.model: ModelPricing(input=1, output=2)}),
+    )
+    assert response.usage.usage_reported is reported
+    assert response.usage.cost_usd == (0 if reported else None)

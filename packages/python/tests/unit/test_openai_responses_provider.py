@@ -995,3 +995,30 @@ class TestReasoning:
         assert result.reasoning is None
         assert result.reasoning_blocks is None
         assert result.usage.reasoning_tokens is None
+
+
+@pytest.mark.parametrize("reported", [False, True])
+async def test_stream_distinguishes_missing_usage_from_reported_zero(provider, reported):
+    from dendrux import ModelPricing, PriceTable
+    from dendrux.loops._helpers import price_response
+
+    completed = FakeCompletedResponse()
+    completed.usage = (
+        FakeUsage(input_tokens=0, output_tokens=0, total_tokens=0) if reported else None
+    )
+    events = [
+        FakeStreamEvent(type="response.output_text.delta", delta="answer"),
+        FakeStreamEvent(type="response.completed", response=completed),
+    ]
+    provider._client.responses.create = AsyncMock(return_value=MockAsyncStream(events))
+    received = [
+        event async for event in provider.complete_stream([Message(role=Role.USER, content="hi")])
+    ]
+    done = next(event for event in received if event.type == StreamEventType.DONE)
+    response = price_response(
+        done.raw,
+        default_model=provider.model,
+        pricing=PriceTable({provider.model: ModelPricing(input=1, output=2)}),
+    )
+    assert response.usage.usage_reported is reported
+    assert response.usage.cost_usd == (0 if reported else None)

@@ -235,6 +235,14 @@ class UsageStats:
     where a non-``None`` cost came from: ``"provider"`` (reported on the
     response, e.g. OpenRouter), ``"table"`` (computed from the developer's
     price table), or ``"mixed"`` (a run total whose steps differ).
+
+    ``usage_reported`` is false when token counts were unavailable. Such
+    usage cannot be priced by a table, even though its counters default to
+    zero. Explicitly constructed usage defaults to reported; providers must
+    set this flag to false when the API omits usage.
+
+    ``cost_unknown`` tracks whether an aggregate includes an unpriced call,
+    independently of token counts. It survives pause/resume serialization.
     """
 
     input_tokens: int = 0
@@ -245,6 +253,8 @@ class UsageStats:
     cache_creation_input_tokens: int | None = None
     reasoning_tokens: int | None = None
     cost_source: str | None = None
+    usage_reported: bool = True
+    cost_unknown: bool = False
 
 
 @dataclass(frozen=True)
@@ -291,7 +301,7 @@ class LLMResponse:
     text: str | None = None
     tool_calls: list[ToolCall] | None = None
     raw: Any = None  # Full provider response for debugging
-    usage: UsageStats = field(default_factory=UsageStats)
+    usage: UsageStats = field(default_factory=lambda: UsageStats(usage_reported=False))
     # Adapter-boundary payloads — set by each provider, persisted as opaque JSON.
     # provider_request: the exact kwargs sent to the vendor API (e.g. Anthropic api_kwargs).
     # provider_response: the raw vendor response dict (e.g. response.model_dump()).
@@ -627,6 +637,9 @@ def _usage_to_dict(u: UsageStats) -> dict[str, Any]:
         "cache_read_input_tokens": u.cache_read_input_tokens,
         "cache_creation_input_tokens": u.cache_creation_input_tokens,
         "cost_source": u.cost_source,
+        "reasoning_tokens": u.reasoning_tokens,
+        "usage_reported": u.usage_reported,
+        "cost_unknown": u.cost_unknown,
     }
 
 
@@ -639,6 +652,9 @@ def _usage_from_dict(d: dict[str, Any]) -> UsageStats:
         cache_read_input_tokens=d.get("cache_read_input_tokens"),
         cache_creation_input_tokens=d.get("cache_creation_input_tokens"),
         cost_source=d.get("cost_source"),
+        reasoning_tokens=d.get("reasoning_tokens"),
+        usage_reported=d.get("usage_reported", True),
+        cost_unknown=d.get("cost_unknown", False),
     )
 
 

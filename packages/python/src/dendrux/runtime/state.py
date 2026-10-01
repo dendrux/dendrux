@@ -25,6 +25,7 @@ from dendrux.types import (
     IdempotencyConflictError,
     RunStatus,
     UsageStats,
+    _usage_to_dict,
     generate_ulid,
 )
 
@@ -942,8 +943,10 @@ class SQLAlchemyStateStore:
                 }
                 if iteration_count is not None:
                     values["iteration_count"] = iteration_count
-                if answer is not None:
-                    values["output_data"] = {"answer": answer}
+                if answer is not None or total_usage is not None:
+                    values["output_data"] = await _finalized_output_data(
+                        session, run_id, answer, total_usage
+                    )
                 if error is not None:
                     values["error"] = error
                 if total_usage is not None:
@@ -1018,8 +1021,10 @@ class SQLAlchemyStateStore:
                 }
                 if iteration_count is not None:
                     values["iteration_count"] = iteration_count
-                if answer is not None:
-                    values["output_data"] = {"answer": answer}
+                if answer is not None or total_usage is not None:
+                    values["output_data"] = await _finalized_output_data(
+                        session, run_id, answer, total_usage
+                    )
                 if error is not None:
                     values["error"] = error
                 if total_usage is not None:
@@ -2063,3 +2068,23 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         created_at=_to_aware_utc(row.created_at),
         updated_at=_to_aware_utc(row.updated_at),
     )
+
+
+async def _finalized_output_data(
+    session: AsyncSession,
+    run_id: str,
+    answer: str | None,
+    usage: UsageStats | None,
+) -> dict[str, Any]:
+    from sqlalchemy import select
+
+    from dendrux.db.models import AgentRun
+
+    if answer is not None:
+        output: dict[str, Any] = {"answer": answer}
+    else:
+        existing = await session.scalar(select(AgentRun.output_data).where(AgentRun.id == run_id))
+        output = dict(existing or {})
+    if usage is not None:
+        output["usage"] = _usage_to_dict(usage)
+    return output

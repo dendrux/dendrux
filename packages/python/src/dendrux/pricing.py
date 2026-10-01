@@ -173,7 +173,7 @@ def price_usage(
         if usage.cost_source is not None:
             return usage
         return replace(usage, cost_source="provider")
-    if pricing is None:
+    if pricing is None or not usage.usage_reported:
         return usage
     cost = pricing.cost_for(model, usage)
     if cost is None:

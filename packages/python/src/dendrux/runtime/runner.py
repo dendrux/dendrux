@@ -56,6 +56,7 @@ from dendrux.types import (
     RunEventType,
     RunStatus,
     UsageStats,
+    _usage_from_dict,
     compute_idempotency_fingerprint,
     generate_ulid,
 )
@@ -1081,12 +1082,16 @@ async def _build_cached_result(
         output=output,
         steps=[],
         iteration_count=run.iteration_count,
-        usage=UsageStats(
-            input_tokens=run.total_input_tokens,
-            output_tokens=run.total_output_tokens,
-            total_tokens=run.total_input_tokens + run.total_output_tokens,
-            cost_usd=run.total_cost_usd,
-            reasoning_tokens=run.total_reasoning_tokens,
+        usage=(
+            _usage_from_dict(run.output_data["usage"])
+            if run.output_data and isinstance(run.output_data.get("usage"), dict)
+            else UsageStats(
+                input_tokens=run.total_input_tokens,
+                output_tokens=run.total_output_tokens,
+                total_tokens=run.total_input_tokens + run.total_output_tokens,
+                cost_usd=run.total_cost_usd,
+                reasoning_tokens=run.total_reasoning_tokens,
+            )
         ),
         error=run.error,
     )

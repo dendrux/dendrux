@@ -78,6 +78,18 @@ The run total's `cost_source` follows the same idea:
 
 A new model id that is missing from your table is the usual way a run goes unpriced. Add the entry, or a glob that covers it, and the next run is priced.
 
+Missing token usage also leaves a call unpriced. `usage_reported=False` means
+the provider omitted token counts; the zero counters in that case do not mean
+the call was free. A provider-reported cost still takes precedence, including
+an explicit zero. Custom providers should set `usage_reported=False` when
+counts are unavailable; omitting `LLMResponse.usage` does this automatically.
+
+Run totals retain `cost_unknown=True` after any unpriced call, including calls
+with no reported tokens or only cache tokens. This state survives pause/resume.
+Final usage, including `cost_source`, is stored in the run's `output_data.usage`
+and restored on idempotent retries. Older records without that summary retain
+their stored cost but may have no source information.
+
 ## Where cost shows up
 
 `cost_source` is carried everywhere `cost_usd` already was, with no schema change:
