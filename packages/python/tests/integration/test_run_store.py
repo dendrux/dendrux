@@ -14,6 +14,7 @@ here, not SQLAlchemyStateStore.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -284,7 +285,22 @@ class TestGetEvents:
 # ------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 class TestStreamEvents:
+    async def test_polling_does_not_rollback_writer(self, store, internal_store, session_factory):
+        from dendrux.db.models import RunEvent
+
+        await internal_store.create_run("r1", "Agent")
+        async with session_factory() as writer:
+            writer.add(
+                RunEvent(id="e1", agent_run_id="r1", event_type="run.completed", sequence_index=0)
+            )
+            await writer.flush()
+            assert await store.get_events("r1") == []
+            await writer.commit()
+
+        assert [e.event_type for e in await store.get_events("r1")] == ["run.completed"]
+
     async def test_yields_existing_then_new(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
         await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
@@ -292,18 +308,19 @@ class TestStreamEvents:
         collected: list[StoredEvent] = []
 
         async def _consume() -> None:
-            stream = store.stream_events("r1", poll_interval_s=0.01)
-            async for ev in stream:
-                collected.append(ev)
-                if ev.sequence_index == 1:
-                    await stream.aclose()
-                    return
+            async with contextlib.aclosing(
+                store.stream_events("r1", poll_interval_s=0.01)
+            ) as stream:
+                async for ev in stream:
+                    collected.append(ev)
+                    if ev.sequence_index == 1:
+                        return
 
         async def _write_later() -> None:
             await asyncio.sleep(0.05)
             await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=1)
 
-        await asyncio.gather(_consume(), _write_later())
+        await asyncio.wait_for(asyncio.gather(_consume(), _write_later()), timeout=10.0)
 
         assert [e.sequence_index for e in collected] == [0, 1]
 
