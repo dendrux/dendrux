@@ -143,6 +143,8 @@ ID for cancellation or correlation, consume the first event so the key has been
 resolved. The cached result is a summary, like `run()`'s cached result; it does
 not reconstruct the original steps.
 
+[`examples/33_cost_cancel_idempotency.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/33_cost_cancel_idempotency.py) exercises the cache hit and the conflict path against a persisted store.
+
 ## `resume`, `submit_tool_results`, `submit_input`, `submit_approval`
 
 The submit family resumes a paused run. Each one matches a pause status (see [Pause and resume](/docs/architecture/pause-resume)). All require persistence and the run to exist.

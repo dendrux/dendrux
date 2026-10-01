@@ -129,6 +129,8 @@ rows are preserved. No `RunResult` is returned and in-flight model text is not
 captured. Unlike cooperative `cancel_run()`, cancelling an asyncio task can
 interrupt awaited tool execution.
 
+[`examples/33_cost_cancel_idempotency.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/33_cost_cancel_idempotency.py) demonstrates this live: a `wait_for` timeout on `run()` leaves the row `cancelled` with a single `run.cancelled` event, and the same script covers stream idempotency and the final-turn `answer` contract.
+
 ## Interrupting a streamed run
 
 A chat turn is usually one iteration, so "observed at the next iteration" would make `cancel_run` useless for exactly the runs people most want to interrupt. Streamed runs therefore get an in-process interrupt.

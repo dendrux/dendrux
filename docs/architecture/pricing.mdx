@@ -111,3 +111,4 @@ their stored cost but may have no source information.
 - [Models and providers](/docs/architecture/models): what each provider reports in `UsageStats`.
 - [OpenRouter recipe](/docs/recipes/openrouter): provider-reported cost, which takes precedence over the table.
 - [Agent reference](/docs/reference/agent): the `pricing=` constructor argument.
+- [`examples/33_cost_cancel_idempotency.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/33_cost_cancel_idempotency.py) runs a table-priced ReAct run against the live Anthropic API and prints per-call and run-level `cost_usd` with `cost_source`, alongside the unpriced contrast.
