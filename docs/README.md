@@ -23,7 +23,8 @@ docs/
 │   ├── approval.mdx
 │   ├── notifier.mdx
 │   ├── recorder.mdx
-│   └── loops.mdx
+│   ├── loops.mdx
+│   └── pricing.mdx
 ├── recipes/                → /docs/recipes/*
 └── reference/              → /docs/reference/*
 ```

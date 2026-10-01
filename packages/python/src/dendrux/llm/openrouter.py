@@ -576,6 +576,7 @@ class OpenRouterProvider(OpenAIProvider):
         return replace(
             base,
             cost_usd=float(cost) if cost is not None else base.cost_usd,
+            cost_source="provider" if cost is not None else base.cost_source,
             cache_creation_input_tokens=(
                 int(cache_write) if cache_write is not None else base.cache_creation_input_tokens
             ),

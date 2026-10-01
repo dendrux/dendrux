@@ -29,6 +29,7 @@ from dendrux.loops._helpers import (
     notify_llm_failed,
     notify_llm_started,
     notify_message,
+    price_response,
     record_governance,
     record_llm,
     record_llm_failed,
@@ -302,6 +303,7 @@ class SingleCall(Loop):
             raise
 
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
+        response = price_response(response, pricing=agent.pricing, default_model=provider.model)
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
@@ -443,6 +445,9 @@ class SingleCall(Loop):
             cache_read_input_tokens=response.usage.cache_read_input_tokens,
             cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
             reasoning_tokens=response.usage.reasoning_tokens,
+            cost_source=response.usage.cost_source,
+            usage_reported=response.usage.usage_reported,
+            cost_unknown=response.usage.cost_usd is None,
         )
 
         await _check_budget(
@@ -657,6 +662,9 @@ class SingleCall(Loop):
         # (handled above) leaves this None.
         assert llm_response is not None
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
+        llm_response = price_response(
+            llm_response, pricing=agent.pricing, default_model=provider.model
+        )
 
         await record_llm(
             recorder,
@@ -691,6 +699,9 @@ class SingleCall(Loop):
             cache_read_input_tokens=llm_response.usage.cache_read_input_tokens,
             cache_creation_input_tokens=llm_response.usage.cache_creation_input_tokens,
             reasoning_tokens=llm_response.usage.reasoning_tokens,
+            cost_source=llm_response.usage.cost_source,
+            usage_reported=llm_response.usage.usage_reported,
+            cost_unknown=llm_response.usage.cost_usd is None,
         )
 
         await _check_budget(

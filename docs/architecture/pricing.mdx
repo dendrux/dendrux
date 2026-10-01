@@ -1,0 +1,113 @@
+---
+title: Cost and pricing
+description: How cost_usd gets filled in — provider-reported spend where the vendor returns it, a developer-owned PriceTable everywhere else — and why a run with one unpriced step reports no total rather than a partial one.
+---
+
+# Cost and pricing
+
+Every LLM call dendrux makes produces a `UsageStats` with token counts. Whether it also carries `cost_usd` depends on who priced the call:
+
+| Source | When | `cost_source` |
+| --- | --- | --- |
+| The provider | The vendor returns spend on the response. OpenRouter does. | `"provider"` |
+| Your `PriceTable` | The vendor returns tokens only (Anthropic, OpenAI) and you declared rates for that model. | `"table"` |
+| Nobody | Neither of the above. | `None`, and `cost_usd` is `None` |
+
+dendrux does not ship vendor price lists. Prices change without notice, differ by contract and tier, and a stale number shown as a dollar figure is worse than no number. You own the rates; dendrux owns the arithmetic.
+
+## Declaring a price table
+
+Rates are **USD per million tokens**, the unit every vendor publishes, so you copy them straight off the pricing page.
+
+```python
+from dendrux import Agent, ModelPricing, PriceTable
+
+pricing = PriceTable({
+    "claude-sonnet-4-6": ModelPricing(input=3.0, output=15.0, cache_read=0.30, cache_write=3.75),
+    "claude-haiku-4-5*": ModelPricing(input=1.0, output=5.0, cache_read=0.10, cache_write=1.25),
+    "gpt-5*":            ModelPricing(input=1.25, output=10.0, cache_read=0.125),
+})
+
+agent = Agent(
+    provider="anthropic:claude-sonnet-4-6",
+    prompt="Answer briefly.",
+    pricing=pricing,
+)
+result = await agent.run("What is the capital of France?")
+print(result.usage.cost_usd)      # e.g. 0.000312
+print(result.usage.cost_source)   # "table"
+```
+
+`ModelPricing` takes four rates. `cache_read` and `cache_write` default to the `input` rate when omitted, which is correct for a vendor that does not discount cached tokens.
+
+Keys are exact model ids or `fnmatch`-style globs. Lookup prefers an exact match, then the longest matching glob, so `"gpt-5-pro"` beats `"gpt-5*"` and `"gpt-5-mini*"` beats `"gpt-*"`. Matching is case-sensitive, like model ids.
+
+The table lives on the `Agent`, not the provider. That means it works the same with a provider instance, a `"vendor:model"` recipe string, a custom provider, and a per-turn `model=` override: each call is priced by the model that actually served it (`LLMResponse.model`), falling back to the provider's configured model.
+
+## The formula
+
+Provider adapters normalize usage before it reaches the loop. `input_tokens` is **fresh** input only, with cached tokens reported separately on both Anthropic and OpenAI, and reasoning tokens are billed inside `output_tokens` by both vendors. One formula therefore works for every provider:
+
+```
+cost = input_tokens               × input
+     + cache_read_input_tokens     × cache_read
+     + cache_creation_input_tokens × cache_write
+     + output_tokens               × output
+```
+
+Resolution order per call:
+
+1. A cost the provider reported is kept and tagged `"provider"`. The table is never consulted.
+2. Otherwise, if the table covers the model, the cost is computed and tagged `"table"`.
+3. Otherwise the call stays unpriced: `cost_usd=None`, `cost_source=None`.
+
+## Run totals: unknown beats partial
+
+A run's `usage.cost_usd` is the sum of its calls **only if every call was priced**. One unpriced call makes the run total `None`, and it stays `None` for the rest of the run, including after a pause and resume.
+
+This is deliberate. Before this rule, a run with three unpriced Anthropic calls and one priced call reported the one call's cost as if it were the whole run. Showing "cost unavailable" is honest; showing a quarter of the spend as the total is not.
+
+The run total's `cost_source` follows the same idea:
+
+| `cost_source` on a run total | Meaning |
+| --- | --- |
+| `"provider"` | Every call's cost came from the vendor. |
+| `"table"` | Every call's cost came from your table. An estimate, not a bill. |
+| `"mixed"` | Calls were priced by different sources. |
+| `None` | At least one call was unpriced. `cost_usd` is `None`. |
+
+A new model id that is missing from your table is the usual way a run goes unpriced. Add the entry, or a glob that covers it, and the next run is priced.
+
+Missing token usage also leaves a call unpriced. `usage_reported=False` means
+the provider omitted token counts; the zero counters in that case do not mean
+the call was free. A provider-reported cost still takes precedence, including
+an explicit zero. Custom providers should set `usage_reported=False` when
+counts are unavailable; omitting `LLMResponse.usage` does this automatically.
+
+Run totals retain `cost_unknown=True` after any unpriced call, including calls
+with no reported tokens or only cache tokens. This state survives pause/resume.
+Final usage, including `cost_source`, is stored in the run's `output_data.usage`
+and restored on idempotent retries. Older records without that summary retain
+their stored cost but may have no source information.
+
+## Where cost shows up
+
+`cost_source` is carried everywhere `cost_usd` already was, with no schema change:
+
+- `RunResult.usage` and `RunEvent.run_result.usage` on the terminal event.
+- The `llm.completed` run event's data, per call. Trace views that render cost per step can read both fields from one place.
+- `RunStore` run and interaction records (`total_cost_usd`, `cost_usd`), with `cost_source` in each `token_usage` row's `meta`.
+- Delegation subtrees: `SubtreeSummary.subtree_cost_usd` sums child runs and reports `unknown_cost_count` for children with no total.
+
+## What is not covered
+
+- **Bundled prices.** None, by design. Nothing is fetched at runtime either.
+- **Batch and long-context tiers.** If you use them, key separate table entries for the model ids involved; dendrux does not pick a tier for you.
+- **Images, audio, and per-request surcharges.** The table prices tokens only.
+- **Budget.** `cost_usd` is for reporting. `Budget` thresholds are still in tokens. See [Budget](/docs/architecture/budget).
+
+## Where this fits
+
+- [Models and providers](/docs/architecture/models): what each provider reports in `UsageStats`.
+- [OpenRouter recipe](/docs/recipes/openrouter): provider-reported cost, which takes precedence over the table.
+- [Agent reference](/docs/reference/agent): the `pricing=` constructor argument.

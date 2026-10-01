@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
+
+from dendrux.pricing import price_usage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
@@ -25,6 +28,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.guardrails._engine import GuardrailEngine
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.pricing import PriceTable
     from dendrux.types import (
         LLMResponse,
         Message,
@@ -235,6 +239,29 @@ async def record_llm_started(
         semantic_messages=semantic_messages,
         semantic_tools=semantic_tools,
     )
+
+
+def price_response(
+    response: LLMResponse,
+    *,
+    pricing: PriceTable | None,
+    default_model: str | None,
+) -> LLMResponse:
+    """Resolve ``response.usage.cost_usd`` from the agent's price table.
+
+    Applied once per LLM call, before the response is recorded, so the
+    persisted usage, the ``llm.completed`` event, the budget check and the
+    run-level rollup all see the same number. A provider-reported cost is
+    kept as-is; see :func:`dendrux.pricing.price_usage`.
+    """
+    priced = price_usage(
+        response.usage,
+        model=response.model or default_model,
+        pricing=pricing,
+    )
+    if priced is response.usage:
+        return response
+    return replace(response, usage=priced)
 
 
 async def record_llm(

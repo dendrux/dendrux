@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from dendrux.mcp._runtime import MCPToolView
     from dendrux.mcp._server import MCPServer
     from dendrux.mcp._source import MCPSource
+    from dendrux.pricing import PriceTable
     from dendrux.runtime.state import StateStore
     from dendrux.skills._loader import Skill
     from dendrux.tools import ToolLookups
@@ -209,6 +210,7 @@ class Agent:
         deny: list[str] | None = ...,
         require_approval: list[str] | None = ...,
         budget: Budget | None = ...,
+        pricing: PriceTable | None = ...,
         guardrails: list[Guardrail] | None = ...,
         skills_dir: str | Path | None = ...,
         skills: list[Skill] | None = ...,
@@ -234,6 +236,7 @@ class Agent:
         deny: list[str] | None = ...,
         require_approval: list[str] | None = ...,
         budget: Budget | None = ...,
+        pricing: PriceTable | None = ...,
         guardrails: list[Guardrail] | None = ...,
         skills_dir: str | Path | None = ...,
         skills: list[Skill] | None = ...,
@@ -258,6 +261,7 @@ class Agent:
         deny: list[str] | None = None,
         require_approval: list[str] | None = None,
         budget: Budget | None = None,
+        pricing: PriceTable | None = None,
         guardrails: list[Guardrail] | None = None,
         skills_dir: str | Path | None = None,
         skills: list[Skill] | None = None,
@@ -325,6 +329,7 @@ class Agent:
             frozenset(require_approval) if require_approval else frozenset()
         )
         self._budget: Budget | None = budget
+        self._pricing: PriceTable | None = pricing
         self._guardrails: list[Guardrail] | None = guardrails if guardrails else None
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
@@ -450,6 +455,11 @@ class Agent:
     def budget(self) -> Budget | None:
         """Advisory token budget, or None."""
         return self._budget
+
+    @property
+    def pricing(self) -> PriceTable | None:
+        """Developer-supplied price table used to fill ``cost_usd``, or None."""
+        return self._pricing
 
     @property
     def guardrails(self) -> list[Guardrail] | None:

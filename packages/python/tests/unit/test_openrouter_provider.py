@@ -646,6 +646,12 @@ class TestUsageAccounting:
         stats = _provider()._normalize_usage(_usage(cost=0.0))
         assert stats.cost_usd == 0.0
 
+    def test_reported_cost_tagged_as_provider_source(self) -> None:
+        """A cost OpenRouter billed is labelled ``provider`` so it is never
+        mistaken for a table estimate; an absent cost carries no label."""
+        assert _provider()._normalize_usage(_usage(cost=0.000123)).cost_source == "provider"
+        assert _provider()._normalize_usage(_usage()).cost_source is None
+
     def test_base_reasoning_tokens_preserved_through_override(self) -> None:
         stats = _provider()._normalize_usage(
             _usage(completion_tokens_details={"reasoning_tokens": 5})

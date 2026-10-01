@@ -136,7 +136,7 @@ run = await store.get_run(resp.run_id)
 print(run.total_cost_usd)
 ```
 
-A model that reports no cost (a rare compatible backend) leaves `cost_usd` as `None`; a free model reporting `0.0` keeps the `0.0` — "didn't report" stays distinct from "reported zero." OpenRouter's `cost_details.upstream_inference_cost` (the underlying provider's cost, distinct from what OpenRouter billed you) isn't mapped to a first-class field in v1 — it's available on the raw response for anyone who needs the margin.
+A model that reports no cost (a rare compatible backend) leaves `cost_usd` as `None`; a free model reporting `0.0` keeps the `0.0` — "didn't report" stays distinct from "reported zero." A provider-reported cost is tagged `cost_source="provider"` and always takes precedence over an agent's `PriceTable`; see [Cost and pricing](/docs/architecture/pricing) for pricing Anthropic- and OpenAI-direct models, which return tokens only. OpenRouter's `cost_details.upstream_inference_cost` (the underlying provider's cost, distinct from what OpenRouter billed you) isn't mapped to a first-class field in v1 — it's available on the raw response for anyone who needs the margin.
 
 ## Reasoning controls
 

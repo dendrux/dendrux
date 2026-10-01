@@ -700,8 +700,8 @@ class TestReActLoopCostAccumulation:
 
         assert result.usage.cost_usd is None
 
-    async def test_cost_usd_partial_reporting(self) -> None:
-        """If only some calls report cost, sum only those."""
+    async def test_cost_usd_partial_reporting_is_unknown(self) -> None:
+        """One unpriced call makes the run total None — never a partial sum."""
         tc = ToolCall(name="add", params={"a": 1, "b": 2}, provider_tool_call_id="t_p")
         llm = MockLLM(
             [
@@ -726,7 +726,8 @@ class TestReActLoopCostAccumulation:
             user_input="1+2?",
         )
 
-        assert result.usage.cost_usd == pytest.approx(0.005)
+        assert result.usage.cost_usd is None
+        assert result.usage.cost_source is None
 
 
 # ------------------------------------------------------------------
