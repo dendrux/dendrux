@@ -5,6 +5,9 @@ Two backends are exposed via the ``engine`` fixture:
 - ``sqlite``: in-memory SQLite (default; always runs).
 - ``postgres``: real Postgres at ``DENDRUX_TEST_PG_URL`` (skipped if unset).
 
+Concurrent reader/writer tests can explicitly request ``sqlite_file`` instead
+of ``sqlite`` to get a temporary database with independent connections.
+
 Each test sees a clean schema. The two backends are reset differently:
 
 - SQLite is per-test (in-memory engine, cheap to create/destroy).
@@ -229,7 +232,7 @@ async def _pg_schema_setup() -> AsyncIterator[None]:
 
 
 @pytest_asyncio.fixture(params=_engine_params(), loop_scope="function")
-async def engine(request, _pg_schema_setup) -> AsyncIterator[AsyncEngine]:
+async def engine(request, _pg_schema_setup, tmp_path) -> AsyncIterator[AsyncEngine]:
     """Async engine parametrized across the backend matrix."""
     backend = request.param
 
@@ -248,9 +251,15 @@ async def engine(request, _pg_schema_setup) -> AsyncIterator[AsyncEngine]:
             await eng.dispose()
         return
 
-    # SQLite: fresh in-memory engine per test (cheap).
+    # Concurrent sessions require separate connections: an in-memory database
+    # shares one connection and lets reader rollbacks undo pending writes.
+    sqlite_url = (
+        f"sqlite+aiosqlite:///{tmp_path / 'integration.db'}"
+        if backend == "sqlite_file"
+        else "sqlite+aiosqlite:///:memory:"
+    )
     eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
+        sqlite_url,
         connect_args={"check_same_thread": False},
     )
 

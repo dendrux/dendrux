@@ -1,6 +1,6 @@
 """Tests for ``make_read_router`` — the public mountable read router.
 
-Exercises the HTTP contract over a real RunStore + in-memory SQLite,
+Exercises the HTTP contract over a real RunStore + temporary SQLite database,
 with a small auth dependency injected by the test.
 """
 
@@ -27,9 +27,11 @@ from dendrux.types import UsageStats
 
 
 @pytest.fixture
-async def engine():
+async def engine(tmp_path):
+    # Polling and writing need separate transactions. In-memory SQLite's
+    # shared connection lets a reader's rollback discard a pending write.
     eng = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
+        f"sqlite+aiosqlite:///{tmp_path / 'read-router.db'}",
         connect_args={"check_same_thread": False},
     )
 
@@ -334,6 +336,22 @@ class TestSseGenerator:
     """Unit tests for the SSE generator function — decoupled from HTTP
     transport so timing is deterministic."""
 
+    async def test_polling_does_not_rollback_writer(self, engine, store, internal_store) -> None:
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from dendrux.db.models import RunEvent
+
+        await internal_store.create_run("r1", "Agent")
+        async with AsyncSession(engine) as writer:
+            writer.add(
+                RunEvent(id="e1", agent_run_id="r1", event_type="run.completed", sequence_index=0)
+            )
+            await writer.flush()
+            assert await store.get_events("r1") == []
+            await writer.commit()
+
+        assert [e.event_type for e in await store.get_events("r1")] == ["run.completed"]
+
     async def test_yields_existing_events(self, store, internal_store, monkeypatch) -> None:
         import dendrux.http.read_router as _rr
 
@@ -385,13 +403,10 @@ class TestSseGenerator:
             await asyncio.sleep(0.05)
             await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=0)
 
-        write_task = asyncio.create_task(_write_later())
-        # 10s timeout (not 2s) — CI runners have asyncio scheduling jitter
-        # that occasionally pushes the poll-write race past a tight budget.
-        # The test still proves liveness; the deadline is just headroom.
-        frame = await asyncio.wait_for(gen.__anext__(), timeout=10.0)
-        await write_task
-        await gen.aclose()
+        async with contextlib.aclosing(gen):
+            frame, _ = await asyncio.wait_for(
+                asyncio.gather(gen.__anext__(), _write_later()), timeout=10.0
+            )
 
         assert '"event_type": "run.completed"' in frame
 
