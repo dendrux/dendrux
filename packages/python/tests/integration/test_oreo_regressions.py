@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextvars import ContextVar
 from unittest.mock import AsyncMock
 
@@ -77,6 +78,17 @@ async def test_cancellation_during_startup_preserves_existing_outcomes(store, ex
     events = await store.get_run_events(run_id)
     assert [e.event_type for e in events].count("run.cancelled") == (existing_status is None)
     assert provider.calls_made == 0
+
+
+async def test_cancellation_before_row_exists_is_quiet(store, monkeypatch, caplog):
+    async def cancelled_create(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(store, "create_run", cancelled_create)
+    agent = Agent(provider=MockLLM([]), prompt="test", state_store=store)
+    with caplog.at_level(logging.ERROR, logger="dendrux"), pytest.raises(asyncio.CancelledError):
+        await agent.run("hello")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 async def test_cancellation_cleanup_failure_does_not_mask_cancellation(store, monkeypatch):
@@ -340,12 +352,19 @@ async def test_stream_idempotency_conflicts(store, change):
         kwargs["history"] = [ChatMessage.user("hi"), ChatMessage.assistant("hello")]
     elif change == "context":
         kwargs["context"] = [ContextBlock(content="new context")]
+    notifier = AsyncMock()
     stream = agent.stream(
-        "changed" if change == "input" else "hello", idempotency_key="request", **kwargs
+        "changed" if change == "input" else "hello",
+        idempotency_key="request",
+        notifier=notifier,
+        **kwargs,
     )
     events = [event async for event in stream]
     assert events[-1].type == RunEventType.RUN_ERROR
     assert stream.result.meta["error_type"] == "IdempotencyConflictError"
+    notifier.on_run_started.assert_not_awaited()
+    notifier.on_run_failed.assert_not_awaited()
+    notifier.on_run_finished.assert_not_awaited()
     assert (await store.get_run(result.run_id)).status == "success"
     assert provider.calls_made == 1
 

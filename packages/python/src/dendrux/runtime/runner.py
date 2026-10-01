@@ -998,8 +998,10 @@ async def _persist_task_cancellation(
                 sequencer,
                 {"reason": "task_cancelled"},
             )
-        else:
+        elif await state_store.get_run(run_id) is not None:
             result = await _build_cached_result(state_store, run_id)
+        # No row: cancelled before create_run committed, or while resolving an
+        # idempotent hit under the provisional id. Nothing to finalize.
     except Exception:
         logger.error("Failed to cancel run %s during task cleanup", run_id, exc_info=True)
     return result
@@ -1529,19 +1531,26 @@ def run_stream(
                         history=normalized_history or None,
                         context=context or None,
                     )
-                create_result = await store.create_run(
-                    run_id,
-                    agent.name,
-                    input_data={"input": user_input},
-                    model=provider.model,
-                    strategy=type(resolved_strategy).__name__,
-                    parent_run_id=parent_run_id,
-                    delegation_level=delegation_level,
-                    tenant_id=tenant_id,
-                    meta=run_meta,
-                    idempotency_key=idempotency_key,
-                    idempotency_fingerprint=fingerprint,
-                )
+                try:
+                    create_result = await store.create_run(
+                        run_id,
+                        agent.name,
+                        input_data={"input": user_input},
+                        model=provider.model,
+                        strategy=type(resolved_strategy).__name__,
+                        parent_run_id=parent_run_id,
+                        delegation_level=delegation_level,
+                        tenant_id=tenant_id,
+                        meta=run_meta,
+                        idempotency_key=idempotency_key,
+                        idempotency_fingerprint=fingerprint,
+                    )
+                except IdempotencyConflictError:
+                    # No row was created and no lifecycle opened; the error
+                    # handler must not fire failure hooks for a run that
+                    # never started (mirrors run(), which re-raises bare).
+                    _shared["existing_run"] = True
+                    raise
                 _shared["existing_run"] = create_result.outcome != "created"
                 run_id = create_result.run_id
                 stream.run_id = run_id
