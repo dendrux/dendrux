@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a18 - 2026-10-01
 
 - Runs: task cancellation of `agent.run()` now CAS-finalizes a running row as
   cancelled, emits `run.cancelled`, closes run lifecycle hooks, and re-raises
