@@ -112,6 +112,7 @@ class RunRecord:
     cancel_requested: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    tenant_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +1087,28 @@ class SQLAlchemyStateStore:
                 return bool(result.rowcount and result.rowcount > 0)
 
         return await retry_transient_db(_attempt, label="request_cancel", run_id=run_id)
+
+    async def update_run_meta(self, run_id: str, patch: dict[str, Any]) -> None:
+        """Shallow-merge ``patch`` into ``agent_runs.meta`` for ``run_id``.
+
+        Read-modify-write in one transaction; only Dendrux-owned keys
+        (``dendrux.*``) are written through here. No-op for missing runs.
+        """
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> None:
+            async with self._session_factory() as session:
+                row = (
+                    await session.execute(select(AgentRun).where(AgentRun.id == run_id))
+                ).scalar_one_or_none()
+                if row is None:
+                    return
+                row.meta = {**(row.meta or {}), **patch}
+                await session.commit()
+
+        await retry_transient_db(_attempt, label="update_run_meta", run_id=run_id)
 
     async def is_cancel_requested(self, run_id: str) -> bool:
         """Read ``cancel_requested`` flag. False for missing runs."""
@@ -2067,6 +2090,7 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         cancel_requested=bool(row.cancel_requested),
         created_at=_to_aware_utc(row.created_at),
         updated_at=_to_aware_utc(row.updated_at),
+        tenant_id=row.tenant_id,
     )
 
 

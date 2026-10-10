@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import normalize_chat_history
-from dendrux.context_blocks import ContextBlock, fold_context
+from dendrux.context_blocks import ContextBlock, fold_context, render_band, validate_context
 from dendrux.loops._helpers import (
     notify_message,
     notify_run_failed,
@@ -45,13 +45,27 @@ from dendrux.runtime.context import (
     resolve_parent_link,
     set_delegation_context,
 )
+from dendrux.runtime.replay import (
+    REPLAY_META_KEY,
+    ReplayLast,
+    ReplayPlan,
+    ReplayRequest,
+    build_seed,
+    current_prefix,
+    expand_replay,
+    load_replay_runs,
+    rebuild_messages,
+    record_run_prefix,
+    user_trace_message,
+    validate_replay_args,
+)
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
     IdempotencyConflictError,
     Message,
     PauseState,
-    Role,
+    ReplaySummary,
     RunAlreadyActiveError,
     RunEventType,
     RunStatus,
@@ -430,6 +444,7 @@ async def _persist_loop_outcome(
             usage=result.usage,
             meta={**result.meta, "_finalize_won": won},
             commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
+            replay=result.replay,
         )
 
     if result.status == RunStatus.CANCELLED:
@@ -597,6 +612,9 @@ async def run(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    runs: list[str] | None = ...,
+    replay_last: ReplayLast = ...,
+    replay_reasoning: bool = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -618,6 +636,9 @@ async def run(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    runs: list[str] | None = ...,
+    replay_last: ReplayLast = ...,
+    replay_reasoning: bool = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -637,6 +658,9 @@ async def run(
     user_input: str,
     history: list[ChatMessage] | None = None,
     context: list[ContextBlock] | None = None,
+    runs: list[str] | None = None,
+    replay_last: ReplayLast = 0,
+    replay_reasoning: bool = True,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
@@ -706,12 +730,31 @@ async def run(
     # Validate + normalize chat history before any side effects.
     # Raises ValueError on bad input so no DB row is created.
     normalized_history = normalize_chat_history(history)
+    replay_req = validate_replay_args(
+        runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
+    )
     # When chat history is provided, the loop expects initial_history to
     # be the COMPLETE message list (loops use initial_history as-is and
     # do not separately append user_input — same contract as resume).
     # The runner will record the new user_input itself (after the recorder
     # is constructed) so seeded prior turns stay out of react_traces.
-    seeded_history = fold_context(normalized_history, context, user_input)
+    # With runs=, the replayed prefix is folded in after expansion.
+    if replay_req is None:
+        seeded_history = fold_context(normalized_history, context, user_input)
+    else:
+        validate_context(context)
+        seeded_history = None
+        if state_store is None:
+            raise ValueError(
+                "runs= requires persistence (database_url, state_store, or "
+                "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+            )
+    replay_runs = (
+        await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
+        if replay_req is not None and state_store is not None
+        else []
+    )
+    replay_plan: ReplayPlan | None = None
 
     provider_kwargs = dict(kwargs) if kwargs else {}
 
@@ -761,6 +804,7 @@ async def run(
                         output_type_name=output_type_name,
                         history=normalized_history or None,
                         context=context or None,
+                        replay=replay_req.fingerprint() if replay_req else None,
                     )
 
                 create_result = await state_store.create_run(
@@ -857,21 +901,32 @@ async def run(
                     logger.warning("Failed to emit mcp.error event", exc_info=True)
                 raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
+            replay_plan, seeded_history = await _apply_replay(
+                agent,
+                provider,
+                resolved_loop,
+                provider_kwargs,
+                state_store=state_store,
+                run_id=run_id,
+                replay_req=replay_req,
+                replay_runs=replay_runs,
+                normalized_history=normalized_history,
+                context=context,
+                user_input=user_input,
+                seeded_history=seeded_history,
+            )
+
             # When chat history was provided, the loop receives a complete
             # message list as initial_history and skips its own user-message
             # recording. The runner records the new user_input itself so it
             # still lands in react_traces (seeded prior turns are NOT recorded
             # — they live in the dev's chat DB).
             if seeded_history is not None:
-                await record_message(
-                    recorder, run_id, Message(role=Role.USER, content=user_input), 0
+                user_msg = user_trace_message(
+                    user_input, seeded_history, render_band(context, "stable")
                 )
-                await notify_message(
-                    extra_notifier,
-                    run_id,
-                    Message(role=Role.USER, content=user_input),
-                    0,
-                )
+                await record_message(recorder, run_id, user_msg, 0)
+                await notify_message(extra_notifier, run_id, user_msg, 0)
 
             result = await resolved_loop.run(
                 agent=agent,
@@ -887,6 +942,8 @@ async def run(
                 state_store=state_store,
             )
 
+            if replay_plan is not None:
+                result.replay = replay_plan.summary
             _attach_mcp_meta(result, mcp_meta)
             if state_store is not None:
                 result = await _persist_loop_outcome(
@@ -974,6 +1031,45 @@ async def run(
     finally:
         if ctx_token is not None:
             reset_delegation_context(ctx_token)
+
+
+async def _apply_replay(
+    agent: Agent,
+    provider: LLMProvider,
+    loop: Loop,
+    provider_kwargs: dict[str, Any],
+    *,
+    state_store: StateStore | None,
+    run_id: str,
+    replay_req: ReplayRequest | None,
+    replay_runs: list[Any],
+    normalized_history: list[Message],
+    context: list[ContextBlock] | None,
+    user_input: str,
+    seeded_history: list[Message] | None,
+) -> tuple[ReplayPlan | None, list[Message] | None]:
+    """Expand ``runs=`` into the seeded history and record the prefix descriptor.
+
+    Runs after MCP discovery so the tools hash covers the full tool set.
+    Without persistence nothing is recorded and nothing is replayed.
+    """
+    if state_store is None:
+        return None, seeded_history
+    current = current_prefix(agent, provider, loop, provider_kwargs)
+    plan: ReplayPlan | None = None
+    if replay_req is not None:
+        plan = expand_replay(
+            replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
+        )
+        seeded_history = fold_context([*plan.messages, *normalized_history], context, user_input)
+    await record_run_prefix(
+        state_store,
+        run_id,
+        current=current,
+        seed=build_seed(plan, normalized_history),
+        plan=plan,
+    )
+    return plan, seeded_history
 
 
 async def _persist_task_cancellation(
@@ -1095,7 +1191,13 @@ async def _build_cached_result(
             )
         ),
         error=run.error,
+        replay=_replay_from_meta(run.meta),
     )
+
+
+def _replay_from_meta(meta: dict[str, Any] | None) -> ReplaySummary | None:
+    data = (meta or {}).get(REPLAY_META_KEY)
+    return ReplaySummary.from_dict(data) if isinstance(data, dict) else None
 
 
 async def retry(
@@ -1144,8 +1246,6 @@ async def retry(
         ValueError: If the source run is not terminal, if the source
             run was SingleCall, or if no traces exist.
     """
-    from dendrux.types import REASONING_MODEL_META_KEY, Message, Role
-
     # 1. Validate source run is terminal
     source_run = await state_store.get_run(original_run_id)
     if source_run is None:
@@ -1169,60 +1269,37 @@ async def retry(
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
 
-    # 3. Read traces and reconstruct approximate history
+    # 3. Read traces and reconstruct approximate history. Reasoning replay
+    #    blocks only seed a retry on the model that made them.
     traces = await state_store.get_traces(original_run_id)
     retry_model = (kwargs or {}).get("model") or provider.model
-    initial_history: list[Message] = []
-    for trace in sorted(traces, key=lambda t: t.order_index):
-        try:
-            role = Role(trace.role)
-        except ValueError:
-            continue  # skip unknown roles
-
-        meta = trace.meta or {}
-        msg_kwargs: dict[str, Any] = {"role": role, "content": trace.content}
-
-        # Reconstruct TOOL message fields from trace meta
-        if role == Role.TOOL:
-            msg_kwargs["name"] = meta.get("tool_name", "unknown")
-            msg_kwargs["call_id"] = meta.get("call_id", generate_ulid())
-
-        # Reconstruct ASSISTANT tool_calls from trace meta
-        if role == Role.ASSISTANT and "tool_calls" in meta:
-            from dendrux.types import ToolCall
-
-            msg_kwargs["tool_calls"] = [
-                ToolCall(
-                    name=tc["name"],
-                    params=tc.get("params"),
-                    id=tc.get("id", generate_ulid()),
-                    provider_tool_call_id=tc.get("provider_tool_call_id"),
-                )
-                for tc in meta["tool_calls"]
-            ]
-
-        # Reasoning replay blocks only seed a retry on the model that made them.
-        if (
-            role == Role.ASSISTANT
-            and meta.get("reasoning_blocks")
-            and meta.get(REASONING_MODEL_META_KEY) in (None, retry_model)
-        ):
-            msg_kwargs["reasoning_blocks"] = meta["reasoning_blocks"]
-            if meta.get(REASONING_MODEL_META_KEY):
-                msg_kwargs["meta"] = {REASONING_MODEL_META_KEY: meta[REASONING_MODEL_META_KEY]}
-
-        initial_history.append(Message(**msg_kwargs))
+    initial_history = rebuild_messages(traces, reasoning_for=retry_model)
 
     if not initial_history:
         raise ValueError(
             f"Run '{original_run_id}' has no persisted traces. Cannot retry without prior context."
         )
 
-    # 4. Extract the original user input from the first USER message
+    # 4. Extract the original user input from the first USER trace
     user_input = next(
-        (m.content for m in initial_history if m.role == Role.USER),
+        (t.content for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"),
         "Continue from previous attempt.",
     )
+
+    # 4a. A source run that used runs= re-expands the same runs, same knobs.
+    replay_req: ReplayRequest | None = None
+    replay_runs: list[Any] = []
+    source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
+    if isinstance(source_replay, dict) and source_replay.get("runs"):
+        replay_req = validate_replay_args(
+            list(source_replay["runs"]),
+            source_replay.get("replay_last", 0),
+            bool(source_replay.get("replay_reasoning", True)),
+            loop=resolved_loop,
+            context=None,
+        )
+        if replay_req is not None:
+            replay_runs = await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
 
     # 5. Create the retry run
     resolved_strategy = strategy or NativeToolCalling()
@@ -1317,6 +1394,21 @@ async def retry(
                 logger.warning("Failed to emit mcp.error event", exc_info=True)
             raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
+        current = current_prefix(agent, provider, resolved_loop, provider_kwargs)
+        replay_plan: ReplayPlan | None = None
+        if replay_req is not None:
+            replay_plan = expand_replay(
+                replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
+            )
+            initial_history = [*replay_plan.messages, *initial_history]
+        await record_run_prefix(
+            state_store,
+            run_id,
+            current=current,
+            seed={"retry_of": original_run_id},
+            plan=replay_plan,
+        )
+
         result = await resolved_loop.run(
             agent=agent,
             provider=provider,
@@ -1330,6 +1422,8 @@ async def retry(
             state_store=state_store,
         )
 
+        if replay_plan is not None:
+            result.replay = replay_plan.summary
         _attach_mcp_meta(result, mcp_meta)
         result = await _persist_loop_outcome(
             state_store=state_store,
@@ -1376,6 +1470,9 @@ def run_stream(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    runs: list[str] | None = ...,
+    replay_last: ReplayLast = ...,
+    replay_reasoning: bool = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -1398,6 +1495,9 @@ def run_stream(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    runs: list[str] | None = ...,
+    replay_last: ReplayLast = ...,
+    replay_reasoning: bool = ...,
     strategy: Strategy | None = ...,
     loop: Loop | None = ...,
     state_store: StateStore | None = ...,
@@ -1418,6 +1518,9 @@ def run_stream(
     user_input: str,
     history: list[ChatMessage] | None = None,
     context: list[ContextBlock] | None = None,
+    runs: list[str] | None = None,
+    replay_last: ReplayLast = 0,
+    replay_reasoning: bool = True,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
@@ -1471,15 +1574,22 @@ def run_stream(
     # Validate + normalize chat history synchronously so ValueError surfaces
     # to the caller immediately, not as a RUN_ERROR event.
     normalized_history = normalize_chat_history(history)
-    # When chat history is provided, build the complete starting message list
-    # (loops use initial_history as-is and do not separately append user_input).
-    # The new user_input is recorded by the runner itself inside _generate()
-    # so seeded prior turns stay out of react_traces.
-    seeded_history = fold_context(normalized_history, context, user_input)
-
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
+    replay_req = validate_replay_args(
+        runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
+    )
+    # When chat history is provided, build the complete starting message list
+    # (loops use initial_history as-is and do not separately append user_input).
+    # The new user_input is recorded by the runner itself inside _generate()
+    # so seeded prior turns stay out of react_traces. With runs=, the replayed
+    # prefix is folded in after expansion.
+    if replay_req is None:
+        initial_seeded = fold_context(normalized_history, context, user_input)
+    else:
+        validate_context(context)
+        initial_seeded = None
     provider_kwargs = dict(kwargs) if kwargs else {}
 
     run_id = generate_ulid()
@@ -1502,6 +1612,8 @@ def run_stream(
         nonlocal run_id
         store = state_store
         recorder: LoopRecorder | None = None
+        seeded_history = initial_seeded
+        replay_plan: ReplayPlan | None = None
         sequencer = _shared["sequencer"]
         ctx_token = None
 
@@ -1526,6 +1638,18 @@ def run_stream(
                     "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
                 )
 
+            replay_runs: list[Any] = []
+            if replay_req is not None:
+                # Rejected before any row exists: no lifecycle hooks fire.
+                _shared["existing_run"] = True
+                if store is None:
+                    raise ValueError(
+                        "runs= requires persistence (database_url, state_store, or "
+                        "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+                    )
+                replay_runs = await load_replay_runs(store, replay_req, tenant_id=tenant_id)
+                _shared["existing_run"] = False
+
             if store is not None:
                 run_meta = dict(metadata) if metadata else {}
                 run_meta["dendrux.loop"] = type(resolved_loop).__name__
@@ -1547,6 +1671,7 @@ def run_stream(
                         ),
                         history=normalized_history or None,
                         context=context or None,
+                        replay=replay_req.fingerprint() if replay_req else None,
                     )
                 try:
                     create_result = await store.create_run(
@@ -1659,20 +1784,31 @@ def run_stream(
                     logger.warning("Failed to emit mcp.error event", exc_info=True)
                 raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
+            replay_plan, seeded_history = await _apply_replay(
+                agent,
+                provider,
+                resolved_loop,
+                provider_kwargs,
+                state_store=store,
+                run_id=run_id,
+                replay_req=replay_req,
+                replay_runs=replay_runs,
+                normalized_history=normalized_history,
+                context=context,
+                user_input=user_input,
+                seeded_history=seeded_history,
+            )
+
             # When chat history was provided, the loop receives a complete
             # message list as initial_history and skips its own user-message
             # recording. Record the new user_input here so it still lands in
             # react_traces (seeded prior turns are NOT recorded).
             if seeded_history is not None:
-                await record_message(
-                    recorder, run_id, Message(role=Role.USER, content=user_input), 0
+                user_msg = user_trace_message(
+                    user_input, seeded_history, render_band(context, "stable")
                 )
-                await notify_message(
-                    extra_notifier,
-                    run_id,
-                    Message(role=Role.USER, content=user_input),
-                    0,
-                )
+                await record_message(recorder, run_id, user_msg, 0)
+                await notify_message(extra_notifier, run_id, user_msg, 0)
 
             # 3. Stream the loop. The interrupt signal lets cancel_run reach
             # an in-flight provider stream owned by this process; the closing
@@ -1702,6 +1838,8 @@ def run_stream(
                     )
                     terminal_result = event.run_result if event.type in _terminal_types else None
                     if terminal_result is not None:
+                        if replay_plan is not None:
+                            terminal_result.replay = replay_plan.summary
                         _attach_mcp_meta(terminal_result, mcp_meta)
                         if store is not None:
                             persisted = await _persist_loop_outcome(

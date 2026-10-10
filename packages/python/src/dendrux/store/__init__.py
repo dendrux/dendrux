@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from dendrux.runtime.state import SQLAlchemyStateStore, StateStore
+from dendrux.types import ReplaySummary
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -59,7 +60,12 @@ class RunNotFoundError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class RunSummary:
-    """A run row suitable for list views."""
+    """A run row suitable for list views.
+
+    ``replay`` is set on runs created with ``agent.run(runs=...)``: which
+    earlier runs were replayed (``runs_full`` + ``runs_text``, in order),
+    and what reasoning was kept or dropped.
+    """
 
     run_id: str
     agent_name: str
@@ -76,6 +82,7 @@ class RunSummary:
     parent_run_id: str | None
     delegation_level: int
     total_reasoning_tokens: int = 0
+    replay: ReplaySummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +110,7 @@ class RunDetail:
     failure_reason: str | None
     total_reasoning_tokens: int = 0
     cancel_requested: bool = False
+    replay: ReplaySummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,7 +479,15 @@ def _run_to_summary(record: Any) -> RunSummary:
         parent_run_id=record.parent_run_id,
         delegation_level=record.delegation_level,
         total_reasoning_tokens=record.total_reasoning_tokens,
+        replay=_replay_of(record),
     )
+
+
+def _replay_of(record: Any) -> ReplaySummary | None:
+    from dendrux.runtime.replay import REPLAY_META_KEY
+
+    data = (getattr(record, "meta", None) or {}).get(REPLAY_META_KEY)
+    return ReplaySummary.from_dict(data) if isinstance(data, dict) else None
 
 
 def _run_to_detail(record: Any) -> RunDetail:
@@ -497,6 +513,7 @@ def _run_to_detail(record: Any) -> RunDetail:
         failure_reason=record.failure_reason,
         total_reasoning_tokens=record.total_reasoning_tokens,
         cancel_requested=bool(getattr(record, "cancel_requested", False)),
+        replay=_replay_of(record),
     )
 
 

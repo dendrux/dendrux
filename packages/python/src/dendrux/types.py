@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 # ``reasoning_blocks``. Providers replay the blocks only to that same model.
 REASONING_MODEL_META_KEY = "reasoning_model"
 
+# ``Message.meta`` flag on messages replayed from an earlier run via
+# ``agent.run(runs=...)``. Providers use it to opt replayed reasoning into
+# vendor-side prefix-binding safety nets.
+REPLAYED_META_KEY = "dendrux.replayed"
+
 
 def generate_ulid() -> str:
     """Generate a new ULID string for Dendrux-owned correlation IDs."""
@@ -466,6 +471,46 @@ class RunResult:
     error: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     commentary: list[str] = field(default_factory=list)
+    replay: ReplaySummary | None = None
+
+
+@dataclass(frozen=True)
+class ReplaySummary:
+    """What ``agent.run(runs=...)`` replayed from earlier runs, and what it dropped.
+
+    ``runs_full`` / ``runs_text`` list the run ids replayed in full (text,
+    tool calls, results) and as question + answer only. ``reasoning_kept`` /
+    ``reasoning_dropped`` list full-replay runs whose stored reasoning blocks
+    were sent / withheld (runs with no reasoning appear in neither).
+    ``warnings`` are human-readable notes: which run, what was dropped, why.
+    """
+
+    runs_full: list[str] = field(default_factory=list)
+    runs_text: list[str] = field(default_factory=list)
+    reasoning_kept: list[str] = field(default_factory=list)
+    reasoning_dropped: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe dict (the shape mirrored into ``agent_runs.meta["replay"]``)."""
+        return {
+            "runs_full": list(self.runs_full),
+            "runs_text": list(self.runs_text),
+            "reasoning_kept": list(self.reasoning_kept),
+            "reasoning_dropped": list(self.reasoning_dropped),
+            "warnings": list(self.warnings),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReplaySummary:
+        """Rebuild from :meth:`to_dict` output; unknown keys are ignored."""
+        return cls(
+            runs_full=list(data.get("runs_full") or []),
+            runs_text=list(data.get("runs_text") or []),
+            reasoning_kept=list(data.get("reasoning_kept") or []),
+            reasoning_dropped=list(data.get("reasoning_dropped") or []),
+            warnings=list(data.get("warnings") or []),
+        )
 
 
 @dataclass
@@ -1006,6 +1051,7 @@ def compute_idempotency_fingerprint(
     output_type_name: str | None = None,
     history: list[Message] | None = None,
     context: list[Any] | None = None,
+    replay: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic SHA-256 fingerprint for idempotency conflict detection.
 
@@ -1020,7 +1066,9 @@ def compute_idempotency_fingerprint(
     the normalized Message objects — different construction paths producing
     equivalent normalized history hash identically. Context blocks are hashed
     by (kind, placement, source, content) so the same input with different
-    context is treated as a different request.
+    context is treated as a different request. ``replay`` carries the
+    ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs when ``runs=`` is
+    used; omitted otherwise so existing fingerprints are unchanged.
     """
     data: dict[str, Any] = {"agent_name": agent_name, "user_input": user_input}
     if output_type_name is not None:
@@ -1037,5 +1085,7 @@ def compute_idempotency_fingerprint(
             }
             for b in context
         ]
+    if replay:
+        data["replay"] = replay
     payload = json.dumps(data, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

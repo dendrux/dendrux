@@ -34,6 +34,7 @@ from dendrux.llm._retry_telemetry import (
 )
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
+    REPLAYED_META_KEY,
     LLMResponse,
     ProviderCapabilities,
     Role,
@@ -62,6 +63,11 @@ _EFFORT_ALIASES = {"extra": "xhigh"}
 # Content block types replayed verbatim on assistant turns, and never given a
 # cache_control marker.
 _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+# Sent when thinking blocks replayed from an earlier run are on the wire, so an
+# account enforcing preserved-thinking prefix binding drops a mismatched block
+# instead of failing the request.
+_THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 
 def _normalize_effort(effort: str) -> str:
@@ -202,6 +208,7 @@ class AnthropicProvider(LLMProvider):
         api_messages: list[dict[str, Any]],
         *,
         mark_first: bool = False,
+        mark_indices: list[int] | None = None,
     ) -> tuple[Any, list[dict[str, Any]]]:
         """Apply cache_control to system block and selected messages.
 
@@ -209,7 +216,10 @@ class AnthropicProvider(LLMProvider):
         call that writes it pays full creation, the next reads it). When
         ``mark_first`` is set (a stable context head is present), also marks the
         first user message so the frozen ``tools+system+stable`` prefix is
-        cached across runs.
+        cached across runs. ``mark_indices`` names further messages to mark
+        (the stable head and the end of a replayed run prefix); at most the
+        first and last of them are used, keeping within Anthropic's four
+        breakpoints.
 
         Returns ``(system, messages)`` where ``system`` is a block list with
         cache_control (or ``NOT_GIVEN``) and ``messages`` is a fresh list with
@@ -229,6 +239,8 @@ class AnthropicProvider(LLMProvider):
         indices = {len(new_messages) - 1}
         if mark_first:
             indices.add(0)
+        if mark_indices:
+            indices.update({min(mark_indices), max(mark_indices)})
         for i in indices:
             marked = copy.deepcopy(new_messages[i])
             self._mark_last_block(marked, marker)
@@ -263,15 +275,17 @@ class AnthropicProvider(LLMProvider):
         # blocks may be replayed on assistant turns.
         model = kwargs.pop("model", self._model)
         thinking_on = kwargs.pop("thinking", self._thinking)
+        stable_indices: list[int] = []
         system_prompt, api_messages = self._convert_messages(
-            messages, replay_reasoning_for=model if thinking_on else None
+            messages,
+            replay_reasoning_for=model if thinking_on else None,
+            stable_indices=stable_indices,
         )
         api_tools = self._convert_tools(tools) if tools else anthropic.NOT_GIVEN
-        # A stable context head (folded into the first user message) gets its own
-        # cross-run cache breakpoint at api_messages[0].
-        has_stable_head = any(m.placement == "stable" for m in messages)
+        # Messages tagged placement="stable" (a stable context head, the end of
+        # a replayed run prefix) get their own cross-run cache breakpoints.
         system_blocks, cached_messages = self._apply_cache_control(
-            system_prompt, api_messages, mark_first=has_stable_head
+            system_prompt, api_messages, mark_indices=stable_indices
         )
 
         api_kwargs: dict[str, Any] = {
@@ -288,6 +302,9 @@ class AnthropicProvider(LLMProvider):
         thinking_budget = kwargs.pop("thinking_budget", self._thinking_budget)
         if thinking_on:
             self._apply_thinking(api_kwargs, effort, show_thinking, thinking_budget)
+            if self._replays_run_reasoning(messages, model):
+                api_kwargs["thinking"]["block_binding"] = {"prefix_mismatch_behavior": "drop_block"}
+                api_kwargs["extra_headers"] = {"anthropic-beta": _THINKING_BINDING_BETA}
 
         # Temperature is incompatible with thinking — only send it when off.
         if thinking_on:
@@ -303,6 +320,15 @@ class AnthropicProvider(LLMProvider):
 
         captured_request = {k: v for k, v in api_kwargs.items() if v is not anthropic.NOT_GIVEN}
         return api_kwargs, captured_request
+
+    @staticmethod
+    def _replays_run_reasoning(messages: list[Message], model: str) -> bool:
+        """True when thinking blocks replayed from an earlier run go on the wire."""
+        return any(
+            m.meta.get(REPLAYED_META_KEY)
+            and replayable_reasoning_blocks(m, model=model, block_types=_THINKING_BLOCK_TYPES)
+            for m in messages
+        )
 
     def _apply_thinking(
         self,
@@ -535,6 +561,7 @@ class AnthropicProvider(LLMProvider):
         messages: list[Message],
         *,
         replay_reasoning_for: str | None = None,
+        stable_indices: list[int] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Convert Dendrux messages to Anthropic format.
 
@@ -549,6 +576,9 @@ class AnthropicProvider(LLMProvider):
         - ASSISTANT ``reasoning_blocks`` (thinking/redacted_thinking) lead the
           content array, unmodified, when ``replay_reasoning_for`` names the
           request model and it matches the model that produced them
+
+        When ``stable_indices`` is given, the API-message index of every
+        ``placement="stable"`` message is appended to it.
         """
         system_parts: list[str] = []
         api_messages: list[dict[str, Any]] = []
@@ -604,6 +634,9 @@ class AnthropicProvider(LLMProvider):
                     # Emit as plain user message so the strategy's text
                     # formatting is preserved.
                     api_messages.append({"role": "user", "content": msg.content})
+
+            if stable_indices is not None and msg.placement == "stable" and api_messages:
+                stable_indices.append(len(api_messages) - 1)
 
         system_prompt = "\n\n".join(system_parts)
         return system_prompt, api_messages

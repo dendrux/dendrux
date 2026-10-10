@@ -52,6 +52,16 @@ async def _count_pauses_per_run(state_store: StateStore, run_ids: list[str]) -> 
     return result
 
 
+def _continued_from(meta: dict[str, Any] | None) -> list[str]:
+    """Run ids a run replayed via ``runs=`` (empty when it replayed none)."""
+    from dendrux.runtime.replay import REPLAY_META_KEY
+
+    replay = (meta or {}).get(REPLAY_META_KEY)
+    if not isinstance(replay, dict):
+        return []
+    return [r for r in replay.get("runs") or [] if isinstance(r, str)]
+
+
 def _utc_iso(ts: datetime | None) -> str | None:
     """Format a naive UTC datetime as ISO 8601 with Z suffix.
 
@@ -206,6 +216,7 @@ def create_dashboard_api(
                 "parent_run_id": r.parent_run_id,
                 "delegation_level": r.delegation_level,
                 "pause_count": pause_counts.get(r.id, 0),
+                "continued_from": _continued_from(r.meta),
                 "created_at": _utc_iso(r.created_at),
                 "updated_at": _utc_iso(r.updated_at),
             }
