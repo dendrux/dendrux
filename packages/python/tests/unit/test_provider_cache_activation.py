@@ -168,8 +168,9 @@ class _FakeChatCompletion:
 
 
 class TestOpenAIChatCacheActivation:
-    """OpenAIProvider passes prompt_cache_key (from agent_name:model prefix
-    or run_id fallback) and optional prompt_cache_retention."""
+    """OpenAIProvider passes prompt_cache_key (constructor prefix, else the
+    per-call agent_name:model prefix; never run_id) and optional
+    prompt_cache_retention."""
 
     async def test_passes_prompt_cache_key_from_prefix(self) -> None:
         provider = OpenAIProvider(model="gpt-4o", api_key="test")
@@ -186,7 +187,7 @@ class TestOpenAIChatCacheActivation:
         )
         assert captured.get("prompt_cache_key") == "dendrux:myagent:gpt-4o"
 
-    async def test_falls_back_to_run_id_when_no_prefix(self) -> None:
+    async def test_run_id_alone_sends_no_key(self) -> None:
         provider = OpenAIProvider(model="gpt-4o", api_key="test")
         captured: dict[str, Any] = {}
 
@@ -199,7 +200,34 @@ class TestOpenAIChatCacheActivation:
             [Message(role=Role.USER, content="hi")],
             run_id="run_abc",
         )
-        assert captured.get("prompt_cache_key") == "dendrux:run_abc"
+        assert "prompt_cache_key" not in captured
+
+    async def test_constructor_prefix_sends_key(self) -> None:
+        provider = OpenAIProvider(model="gpt-4o", api_key="test", cache_key_prefix="customer-42")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeChatCompletion:
+            captured.update(kwargs)
+            return _FakeChatCompletion()
+
+        provider._client.chat.completions.create = capture
+        await provider.complete([Message(role=Role.USER, content="hi")], run_id="run_abc")
+        assert captured.get("prompt_cache_key") == "dendrux:customer-42"
+
+    async def test_constructor_prefix_wins_over_loop_prefix(self) -> None:
+        provider = OpenAIProvider(model="gpt-4o", api_key="test", cache_key_prefix="customer-42")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeChatCompletion:
+            captured.update(kwargs)
+            return _FakeChatCompletion()
+
+        provider._client.chat.completions.create = capture
+        await provider.complete(
+            [Message(role=Role.USER, content="hi")],
+            cache_key_prefix="myagent:gpt-4o",
+        )
+        assert captured.get("prompt_cache_key") == "dendrux:customer-42"
 
     async def test_no_cache_key_when_neither_provided(self) -> None:
         provider = OpenAIProvider(model="gpt-4o", api_key="test")
@@ -295,7 +323,9 @@ class TestOpenAIResponsesCacheActivation:
         )
         assert captured.get("prompt_cache_key") == "dendrux:myagent:gpt-5"
 
-    async def test_falls_back_to_run_id(self) -> None:
+    async def test_run_id_alone_sends_no_key(self) -> None:
+        # A per-run key scatters one conversation's runs across cache lanes;
+        # OpenAI wants the key per user/customer, so run_id is never a key.
         provider = OpenAIResponsesProvider(model="gpt-5", api_key="test")
         captured: dict[str, Any] = {}
 
@@ -308,7 +338,55 @@ class TestOpenAIResponsesCacheActivation:
             [Message(role=Role.USER, content="hi")],
             run_id="r_xyz",
         )
-        assert captured.get("prompt_cache_key") == "dendrux:r_xyz"
+        assert "prompt_cache_key" not in captured
+
+    async def test_constructor_prefix_sends_key(self) -> None:
+        provider = OpenAIResponsesProvider(
+            model="gpt-5", api_key="test", cache_key_prefix="customer-42"
+        )
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeResponsesResponse:
+            captured.update(kwargs)
+            return _FakeResponsesResponse()
+
+        provider._client.responses.create = capture
+        await provider.complete([Message(role=Role.USER, content="hi")], run_id="r_xyz")
+        assert captured.get("prompt_cache_key") == "dendrux:customer-42"
+
+    async def test_constructor_prefix_wins_over_loop_prefix(self) -> None:
+        # The agent loop always passes "{agent}:{model}"; a dev-chosen
+        # per-customer key on the provider must not be overridden by it.
+        provider = OpenAIResponsesProvider(
+            model="gpt-5", api_key="test", cache_key_prefix="customer-42"
+        )
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _FakeResponsesResponse:
+            captured.update(kwargs)
+            return _FakeResponsesResponse()
+
+        provider._client.responses.create = capture
+        await provider.complete(
+            [Message(role=Role.USER, content="hi")],
+            cache_key_prefix="myagent:gpt-5",
+        )
+        assert captured.get("prompt_cache_key") == "dendrux:customer-42"
+
+    async def test_stream_run_id_alone_sends_no_key(self) -> None:
+        provider = OpenAIResponsesProvider(model="gpt-5", api_key="test")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _EmptyStream:
+            captured.update(kwargs)
+            return _EmptyStream()
+
+        provider._client.responses.create = capture
+        async for _ in provider.complete_stream(
+            [Message(role=Role.USER, content="hi")], run_id="r_xyz"
+        ):
+            pass
+        assert "prompt_cache_key" not in captured
 
     async def test_retention_passes_through(self) -> None:
         provider = OpenAIResponsesProvider(
@@ -557,6 +635,36 @@ class TestOpenAIStreamForwardsCacheKey:
         ):
             pass
         assert captured.get("prompt_cache_key") == "dendrux:agent:model"
+
+    async def test_complete_stream_run_id_alone_sends_no_key(self) -> None:
+        provider = OpenAIProvider(model="gpt-4o", api_key="test")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _EmptyStream:
+            captured.update(kwargs)
+            return _EmptyStream()
+
+        provider._client.chat.completions.create = capture
+        async for _ in provider.complete_stream(
+            [Message(role=Role.USER, content="hi")], run_id="run_abc"
+        ):
+            pass
+        assert "prompt_cache_key" not in captured
+
+    async def test_complete_stream_constructor_prefix_wins(self) -> None:
+        provider = OpenAIProvider(model="gpt-4o", api_key="test", cache_key_prefix="customer-42")
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> _EmptyStream:
+            captured.update(kwargs)
+            return _EmptyStream()
+
+        provider._client.chat.completions.create = capture
+        async for _ in provider.complete_stream(
+            [Message(role=Role.USER, content="hi")], cache_key_prefix="agent:model"
+        ):
+            pass
+        assert captured.get("prompt_cache_key") == "dendrux:customer-42"
 
     async def test_complete_stream_skips_on_custom_base_url(self) -> None:
         provider = OpenAIProvider(

@@ -202,6 +202,20 @@ OpenRouterProvider(
 
 `extra_body` passes any OpenRouter request extension; your `provider` entries merge over the default `require_parameters: true`.
 
+## Prompt caching and context compression
+
+Two request defaults keep long conversations cheap and replay-safe:
+
+- **Context compression is off.** OpenRouter's `context-compression` plugin (middle-out) is on by default for endpoints with 8k context or less, and silently removes or truncates messages from the middle of the prompt. That breaks byte-identical history replay — preserved reasoning and prompt caching both depend on it — so dendrux sends `plugins: [{"id": "context-compression", "enabled": false}]` on every request. Pass your own `plugins` in the constructor `extra_body` and it replaces that default entirely (dev wins), e.g. `extra_body={"plugins": [{"id": "context-compression"}]}` to opt back in.
+- **Anthropic models cache automatically.** For `anthropic/…` slugs, dendrux adds OpenRouter's top-level automatic caching field, `cache_control: {"type": "ephemeral"}`. OpenRouter places the breakpoint on the last cacheable block and moves it forward as the conversation grows, so each turn reads the previous turn's prefix from cache. Without it, Anthropic models through OpenRouter get no caching at all. Other models are left untouched. Turn it off with `anthropic_cache=False`, or set your own `cache_control` in `extra_body` (constructor or per call) — for example `{"type": "ephemeral", "ttl": "1h"}` for the one-hour TTL — and yours is sent instead.
+
+```python
+OpenRouterProvider(model="anthropic/claude-sonnet-4.6")                      # cached
+OpenRouterProvider(model="anthropic/claude-sonnet-4.6", anthropic_cache=False)  # not cached
+```
+
+Cache reads and writes show up on usage as `cache_read_input_tokens` and `cache_creation_input_tokens` (see [Usage and cost accounting](#usage-and-cost-accounting)). Anthropic only caches prefixes above a model-specific minimum length, so short prompts report zero either way.
+
 ## Models without native tools
 
 For now, non-tool models are **text-only** through dendrux — the guard makes that boundary explicit instead of silent. A prompt-based tool-call shim (tool definitions serialized into the system prompt, calls parsed from text) is a planned extension reached via `require_native_tools=False`. Most models people reach for through OpenRouter — DeepSeek, Llama 3.3, Qwen, Mistral Large, Gemini — support native tools today.

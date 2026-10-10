@@ -11,6 +11,10 @@ no extra SDK. It adds:
     ``tools`` — the same model slug fans out to upstreams with different
     tool fidelity)
   - A call-time native-tools capability guard (see below)
+  - Context compression (``middle-out``) disabled by default, so history
+    replay stays byte-identical
+  - Top-level automatic ``cache_control`` for Anthropic models
+    (``anthropic_cache=True``)
 
 **The native-tools guard.** A model that lacks native function calling does
 not error when handed tools — it returns text and silently never calls them.
@@ -42,6 +46,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# OpenRouter's context-compression plugin (middle-out) is on by default for
+# endpoints with <=8k context and silently drops/truncates mid-prompt
+# messages — that breaks byte-identical history replay and prompt caching.
+_DISABLE_CONTEXT_COMPRESSION: list[dict[str, Any]] = [
+    {"id": "context-compression", "enabled": False}
+]
+
+# Top-level automatic caching: OpenRouter places the breakpoint on the last
+# cacheable block and advances it as the conversation grows.
+_AUTOMATIC_CACHE_CONTROL: dict[str, Any] = {"type": "ephemeral"}
+
+
+def _is_anthropic_model(model: str) -> bool:
+    """True for Anthropic slugs, including ``~anthropic/...`` aliases."""
+    return model.lstrip("~").startswith("anthropic/")
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +318,7 @@ class OpenRouterProvider(OpenAIProvider):
         require_native_tools: bool = True,
         thinking: bool | None = None,
         effort: str | None = None,
+        anthropic_cache: bool = True,
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -330,9 +351,20 @@ class OpenRouterProvider(OpenAIProvider):
                 accepts ``minimal`` and ``none``. Sent as ``reasoning={"effort":
                 ...}``; OpenRouter cross-converts effort↔max_tokens, so it works
                 on budget-based models too. Overridable per call.
+            anthropic_cache: When True (default), requests to Anthropic models
+                (``anthropic/...``) carry OpenRouter's top-level automatic
+                ``cache_control={"type": "ephemeral"}``, so the conversation
+                prefix is cached and the breakpoint advances as it grows.
+                Other models are left untouched. A ``cache_control`` you set
+                in ``extra_body`` (constructor or per call, e.g. with
+                ``"ttl": "1h"``) wins.
             extra_body: Extra JSON fields for the request body. Merged with the
                 default ``provider`` routing block; keys you set win, and your
                 ``provider`` entries merge over ``require_parameters=True``.
+                Context compression is disabled by default
+                (``plugins=[{"id": "context-compression", "enabled": False}]``)
+                so OpenRouter never drops mid-prompt messages; a ``plugins``
+                entry of your own replaces that default entirely.
             **kwargs: Passed through to :class:`OpenAIProvider` (max_tokens,
                 temperature, timeout, max_retries, ...).
         """
@@ -357,6 +389,8 @@ class OpenRouterProvider(OpenAIProvider):
             **(extra_body or {}),
             "provider": {"require_parameters": True, **user_provider_block},
         }
+        if "plugins" not in merged_extra_body:
+            merged_extra_body["plugins"] = [dict(p) for p in _DISABLE_CONTEXT_COMPRESSION]
 
         base_url = kwargs.pop("base_url", OPENROUTER_BASE_URL)
         super().__init__(
@@ -376,6 +410,7 @@ class OpenRouterProvider(OpenAIProvider):
         # reasoning through its unified `reasoning` request block.
         self._default_thinking = thinking
         self._default_effort = effort
+        self._anthropic_cache = anthropic_cache
         self._models_url = base_url.rstrip("/") + "/models"
         self._tools_verified: set[str] = set()
         self._tool_warnings_emitted: set[tuple[str, str]] = set()
@@ -552,6 +587,20 @@ class OpenRouterProvider(OpenAIProvider):
             return
         kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "reasoning": reasoning}
 
+    def _apply_cache_control(self, kwargs: dict[str, Any], model: str) -> None:
+        """Add top-level automatic ``cache_control`` for Anthropic models.
+
+        Decided per call because the model can be overridden per call. A
+        ``cache_control`` the dev already set (constructor or per-call
+        ``extra_body``) is left alone.
+        """
+        if not self._anthropic_cache or not _is_anthropic_model(model):
+            return
+        call_extra_body = kwargs.get("extra_body") or {}
+        if "cache_control" in call_extra_body or "cache_control" in (self._extra_body or {}):
+            return
+        kwargs["extra_body"] = {**call_extra_body, "cache_control": dict(_AUTOMATIC_CACHE_CONTROL)}
+
     def _normalize_usage(self, usage: Any) -> UsageStats:
         """Enrich base usage with OpenRouter's cost and cache-write fields.
 
@@ -599,6 +648,7 @@ class OpenRouterProvider(OpenAIProvider):
             await self._ensure_native_tool_support(model)
         await self._ensure_reasoning_allowed(model, thinking)
         self._apply_reasoning(kwargs, reasoning)
+        self._apply_cache_control(kwargs, model)
         return await super().complete(
             messages,
             tools,
@@ -625,6 +675,7 @@ class OpenRouterProvider(OpenAIProvider):
             await self._ensure_native_tool_support(model)
         await self._ensure_reasoning_allowed(model, thinking)
         self._apply_reasoning(kwargs, reasoning)
+        self._apply_cache_control(kwargs, model)
         async for event in super().complete_stream(
             messages,
             tools,
