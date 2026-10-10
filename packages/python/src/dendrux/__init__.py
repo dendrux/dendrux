@@ -33,6 +33,8 @@ from dendrux.types import (
     IdempotencyConflictError,
     RunAlreadyActiveError,
     StructuredOutputValidationError,
+    ToolResultContext,
+    ToolResultTransform,
 )
 
 __all__ = [
@@ -56,6 +58,8 @@ __all__ = [
     "SchemaNotInitializedError",
     "SingleCall",
     "StructuredOutputValidationError",
+    "ToolResultContext",
+    "ToolResultTransform",
     "run",
     "sweep",
     "tool",

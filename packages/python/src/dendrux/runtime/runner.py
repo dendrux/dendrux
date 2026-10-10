@@ -2155,7 +2155,7 @@ async def _execute_approved_tools(
     for tc in pause_state.pending_tool_calls:
         await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
         await _ntfy_tool_started(notifier, run_id, tc, pause_state.iteration)
-        tr = await _execute_tool(tc, lookups)
+        tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
         await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
         await _ntfy_tool(notifier, run_id, tc, tr, pause_state.iteration)
         result_msg = Message(

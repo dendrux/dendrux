@@ -94,6 +94,7 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
 | `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |
+| `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
 | `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 15 governance event types. See [Governance](/docs/architecture/governance). |
 | `CreateRunResult` | `from dendrux import CreateRunResult` | Idempotent-create outcome. |
 

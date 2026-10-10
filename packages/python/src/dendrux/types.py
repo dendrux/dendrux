@@ -15,12 +15,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Coroutine
+    from collections.abc import AsyncGenerator, Coroutine
 
 from ulid import ULID
 
@@ -216,6 +217,33 @@ class ToolResult:
     success: bool = True
     error: str | None = None
     duration_ms: int = 0
+
+
+@dataclass(frozen=True)
+class ToolResultContext:
+    """What a ``tool_result_transform`` sees for one successful tool call.
+
+    ``result`` is the raw Python value the tool returned, before JSON
+    serialization. ``meta`` is the tool's ``ToolDef.meta`` — for MCP
+    tools it carries ``source_name``, ``namespace``, ``mcp_tool_name``, etc.;
+    for local ``@tool`` functions it is empty.
+    """
+
+    tool_name: str
+    call_id: str
+    params: dict[str, Any]
+    result: Any
+    target: ToolTarget
+    meta: dict[str, Any]
+
+
+ToolResultTransform: TypeAlias = Callable[[ToolResultContext], Any | Awaitable[Any]]
+"""Hook that rewrites a server tool's result before it is persisted or sent to the model.
+
+The return value ALWAYS replaces the result — return ``ctx.result`` to leave
+it unchanged (``None`` is a legitimate new result, not "unchanged"). Sync and
+async callables are both accepted. See ``Agent(tool_result_transform=...)``.
+"""
 
 
 @dataclass

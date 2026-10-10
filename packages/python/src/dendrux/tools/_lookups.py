@@ -26,6 +26,7 @@ class ToolLookups(NamedTuple):
     explicit_timeout: dict[str, bool]
     max_calls: dict[str, int | None]
     parallel: dict[str, bool]
+    meta: dict[str, dict[str, Any]]
 
 
 def build_tool_lookups(
@@ -49,6 +50,7 @@ def build_tool_lookups(
     explicit_timeout: dict[str, bool] = {}
     max_calls: dict[str, int | None] = {}
     parallel: dict[str, bool] = {}
+    meta: dict[str, dict[str, Any]] = {}
 
     # Local tools
     for func in tools:
@@ -64,6 +66,7 @@ def build_tool_lookups(
         explicit_timeout[td.name] = td.has_explicit_timeout
         max_calls[td.name] = td.max_calls_per_run
         parallel[td.name] = td.parallel
+        meta[td.name] = td.meta
 
     # MCP tools (if any)
     has_executors = mcp_executors is not None
@@ -93,5 +96,6 @@ def build_tool_lookups(
             explicit_timeout[td.name] = td.has_explicit_timeout
             max_calls[td.name] = td.max_calls_per_run
             parallel[td.name] = td.parallel
+            meta[td.name] = td.meta
 
-    return ToolLookups(fn, target, timeout, explicit_timeout, max_calls, parallel)
+    return ToolLookups(fn, target, timeout, explicit_timeout, max_calls, parallel, meta)
