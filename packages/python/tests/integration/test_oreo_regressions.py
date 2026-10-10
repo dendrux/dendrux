@@ -14,6 +14,7 @@ from dendrux.chat import ChatMessage
 from dendrux.context_blocks import ContextBlock
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.context import get_delegation_context
+from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunEventType, RunStatus, ToolCall
 from tests._helpers.gated_provider import GatedStreamLLM
 
@@ -480,6 +481,38 @@ async def test_run_answer_contains_only_final_turn(store):
     result = await agent.run("hello")
     assert result.answer == "final turn"
     assert (await store.get_run(result.run_id)).answer == "final turn"
+
+
+async def test_stream_separates_commentary_from_answer(store):
+    provider = MockLLM(
+        [
+            LLMResponse(text="I'll check first.", tool_calls=[ToolCall("echo", {"text": "ok"})]),
+            LLMResponse(text="final turn"),
+        ]
+    )
+    agent = Agent(provider=provider, prompt="test", tools=[echo], state_store=store)
+    buckets: dict[int, list[str]] = {}
+    commentary_iterations: set[int] = set()
+    terminal = None
+    async for event in agent.stream("hello"):
+        if event.type == RunEventType.TEXT_DELTA:
+            buckets.setdefault(event.iteration, []).append(event.text)
+        elif event.phase == "commentary":
+            commentary_iterations.add(event.iteration)
+        elif event.type == RunEventType.RUN_COMPLETED:
+            terminal = event
+
+    assert terminal is not None and terminal.phase == "final_answer"
+    commentary = ["".join(buckets[i]) for i in sorted(commentary_iterations)]
+    answer = "".join(buckets[max(buckets)])
+    assert commentary == terminal.run_result.commentary == ["I'll check first."]
+    assert answer == terminal.run_result.answer == "final turn"
+
+    traces = await RunStore(store).get_traces(terminal.run_result.run_id)
+    assert [(t.content, t.phase) for t in traces if t.role == "assistant"] == [
+        ("I'll check first.", "commentary"),
+        ("final turn", "final_answer"),
+    ]
 
 
 @pytest.mark.parametrize("stop_at", [None, RunEventType.TOOL_RESULT, RunEventType.TEXT_DELTA])

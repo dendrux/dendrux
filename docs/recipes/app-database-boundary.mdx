@@ -145,19 +145,27 @@ async def post_message(chat_id: str, body: NewMessage, user: User = Depends(auth
         status="streaming", dendrux_run_id=stream.run_id,
     )
 
-    # 5. Stream tokens to the client, accumulating the final answer.
+    # 5. Stream tokens to the client. Text written before a tool call
+    #    ("Let me look that up...") is commentary, not the answer.
     async def emit():
-        answer = []
         async with stream:
             async for event in stream:
                 if event.type == RunEventType.TEXT_DELTA:
-                    answer.append(event.text)
-                    yield sse(event.text)
-        # 6. Persist the final answer back to YOUR db.
-        await db.update_message(assistant_id, content="".join(answer), status="complete")
+                    yield sse({"iteration": event.iteration, "text": event.text})
+                elif event.phase == "commentary":
+                    yield sse({"iteration": event.iteration, "phase": "commentary"})
+        # 6. Persist the final answer (never the concatenated deltas) to YOUR db.
+        result = stream.result
+        await db.update_message(
+            assistant_id,
+            content=result.answer if result else None,
+            status="complete" if result and result.status == "success" else "failed",
+        )
 
     return StreamingResponse(emit(), media_type="text/event-stream")
 ```
+
+Do not build the stored answer by concatenating every `TEXT_DELTA`: a tool-using run streams narration from earlier steps too, and that text would end up in the saved message. `stream.result.answer` is the final answer only; `stream.result.commentary` holds the narration if you want to store it separately. The client can use the `iteration` / `phase` fields the same way to render narration as progress (see [Commentary vs final answer](/docs/reference/agent#commentary-vs-final-answer)).
 
 The non-streaming version is the same shape with `await agent.run(...)` in place of the stream, saving `result.answer` and `result.run_id` after it returns.
 

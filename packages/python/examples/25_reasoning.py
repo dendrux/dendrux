@@ -7,6 +7,8 @@ as a first-class feature:
   - per step:   ``RunResult.steps[i].meta["reasoning"]`` (the model's thinking)
   - rolled up:  ``RunResult.usage.reasoning_tokens``
   - streamed:   ``RunEventType.REASONING_DELTA`` events (live, before the answer)
+  - commentary: pre-tool narration is kept out of ``answer`` (``RunResult.commentary``,
+                ``RunEvent.iteration`` / ``RunEvent.phase`` on the stream)
   - persisted:  reasoning text + token counts land in the DB (see RunStore)
 
 Run with:
@@ -59,6 +61,7 @@ async def main() -> None:
         result = await agent.run("Which has more people, Paris or Tokyo? Use the tool for both.")
 
     print("=== agent.run() (ReAct + tools + thinking + persistence) ===")
+    print("commentary:", result.commentary)
     print("answer:", (result.answer or "").strip())
     print(f"iterations={result.iteration_count}  reasoning_tokens={result.usage.reasoning_tokens}")
     for i, step in enumerate(result.steps):
@@ -75,25 +78,32 @@ async def main() -> None:
     print("per-call reasoning_tokens:", [c.reasoning_tokens for c in calls])
     print("per-call reasoning text present:", [bool(c.reasoning) for c in calls])
 
-    # --- agent.stream(): reasoning streams live, before the answer ---
+    # --- agent.stream(): reasoning streams live; text is bucketed per step ---
+    # Text written before a tool call is commentary, not the answer. Its phase
+    # is only known once the step's tool event arrives, so buffer by iteration.
     print("\n=== agent.stream() ===")
     async with _agent() as agent:
         stream = agent.stream("What is Tokyo's population? Use the tool.")
         async with stream:
-            in_reasoning = in_answer = False
+            thinking_step = None
+            text: dict[int, list[str]] = {}
+            shown: set[int] = set()
             async for ev in stream:
                 if ev.type == RunEventType.REASONING_DELTA:
-                    if not in_reasoning:
-                        print("[thinking] ", end="", flush=True)
-                        in_reasoning = True
+                    if ev.iteration != thinking_step:
+                        print(f"[thinking step {ev.iteration}] ", end="", flush=True)
+                        thinking_step = ev.iteration
                     print(ev.text, end="", flush=True)
                 elif ev.type == RunEventType.TEXT_DELTA:
-                    if not in_answer:
-                        print("\n[answer] ", end="", flush=True)
-                        in_answer = True
-                    print(ev.text, end="", flush=True)
+                    text.setdefault(ev.iteration, []).append(ev.text or "")
+                elif ev.phase == "commentary" and ev.iteration not in shown:
+                    shown.add(ev.iteration)
+                    narration = "".join(text.get(ev.iteration, [])).strip()
+                    if narration:
+                        print(f"\n[commentary] {narration}")
                 elif ev.type == RunEventType.RUN_COMPLETED:
-                    print(f"\n\nreasoning_tokens={ev.run_result.usage.reasoning_tokens}")
+                    print(f"\n[answer] {(ev.run_result.answer or '').strip()}")
+                    print(f"\nreasoning_tokens={ev.run_result.usage.reasoning_tokens}")
 
 
 if __name__ == "__main__":

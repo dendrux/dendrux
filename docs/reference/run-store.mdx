@@ -98,7 +98,7 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`ToolInvocation`** (from `get_tool_invocations`): `iteration`, `tool_name`, `tool_call_id`, `provider_tool_call_id`, `target`, `params`, `result`, `success`, `error`, `duration_ms`, `created_at`.
 
-**`TraceEntry`** (from `get_traces`): `role`, `content`, `order_index`, `meta`, `created_at`.
+**`TraceEntry`** (from `get_traces`): `role`, `content`, `order_index`, `meta`, `created_at`, `phase` (`"commentary"` for an assistant message that ended in tool calls, `"final_answer"` for the answer turn, `None` for other roles and rows written before phases were recorded).
 
 **`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`.
 

@@ -122,9 +122,12 @@ async def run(
 Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence.
 
 On success, `RunResult.answer` contains only the final answer turn after tool
-use, not all assistant text produced during the run. Earlier commentary and
-inline content must be collected from streamed `TEXT_DELTA` events or
-`RunStore.get_traces()`. A paused run may instead carry a clarification question.
+use, not all assistant text produced during the run. `RunResult.commentary` is
+the ordered list of non-empty assistant text from every step that ended in tool
+calls (narration such as "Let me look that up"); it is `[]` for `SingleCall`,
+for runs with no narration, and for idempotent cached results. Persisted traces
+carry the same split as `TraceEntry.phase`. A paused run may instead carry a
+clarification question.
 
 Cancelling the coroutine awaiting `run()` (including via `asyncio.wait_for`)
 atomically finalizes a still-running persisted run as `cancelled`, emits
@@ -154,9 +157,50 @@ the partial answer contains only the current text buffer, which resets at every
 `TOOL_RESULT`. It can be `None` even if earlier text was streamed. For example,
 `"Checking…" → tool result → "The answer is 42"` yields an answer of
 `"The answer is 42"`; cancellation immediately after the tool result can yield
-`None`. To retain the full transcript, accumulate `TEXT_DELTA` events (or `.text()`)
-across all turns, or read persisted assistant messages with `RunStore.get_traces()`.
-Traces contain recorded messages, not every delta from an interrupted model call.
+`None`. `RunResult.commentary` holds the text of the tool steps that completed
+before the cancellation. To retain the full transcript, accumulate `TEXT_DELTA`
+events (or `.text()`) across all turns, or read persisted assistant messages with
+`RunStore.get_traces()`. Traces contain recorded messages, not every delta from an
+interrupted model call.
+
+### Commentary vs final answer
+
+Text a model writes before a tool call ("I'll start by exploring the
+database…") streams as ordinary `TEXT_DELTA` events, so concatenating every
+delta mixes narration into the answer. Each LLM-output and tool event carries
+`iteration` (the loop step it belongs to; `None` on lifecycle events) and some
+carry `phase`:
+
+| Event | `iteration` | `phase` |
+| --- | --- | --- |
+| `TEXT_DELTA` | step number | Usually `None`. `"commentary"` when the text follows a tool block in the same step, or the provider's own label when it sends one (OpenAI Responses `phase`). Always `"final_answer"` for `SingleCall`. |
+| `REASONING_DELTA` | step number | `None` |
+| `TOOL_USE_START`, `TOOL_USE_END`, `TOOL_RESULT` | step number | `"commentary"`: the text of this step was narration. |
+| `RUN_COMPLETED` | `None` | `"final_answer"` on success; `None` for `max_iterations`. |
+
+A text block streams before the tool call that makes it commentary, so the
+phase of a delta is usually unknown when it arrives. Clients buffer instead:
+
+```python
+buckets: dict[int, list[str]] = {}
+commentary: set[int] = set()
+async with agent.stream("...") as stream:
+    async for event in stream:
+        if event.type == RunEventType.TEXT_DELTA:
+            buckets.setdefault(event.iteration, []).append(event.text)
+        elif event.phase == "commentary":
+            commentary.add(event.iteration)       # that step's text was narration
+        elif event.type == RunEventType.RUN_COMPLETED:
+            answer = event.run_result.answer       # authoritative final answer
+            narration = event.run_result.commentary
+```
+
+Render a bucket provisionally as it streams, restyle it as progress when a
+commentary event arrives for its step, and treat the remaining bucket as the
+answer when `RUN_COMPLETED` carries `phase="final_answer"`. Persist
+`run_result.answer`, not the concatenated deltas. After the fact the same
+split is on `TraceEntry.phase` (`RunStore.get_traces()`) and on the
+`phase` field of each `llm.completed` event in the durable event log.
 
 `idempotency_key` uses the same persistence requirement and request fingerprint
 as `run()` (agent name, input, history, context, and output type). A matching

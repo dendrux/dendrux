@@ -432,7 +432,9 @@ class SingleCall(Loop):
             guardrail_findings=_sc_findings or None,
         )
 
-        assistant_msg = Message(role=Role.ASSISTANT, content=response.text or "")
+        assistant_msg = Message(
+            role=Role.ASSISTANT, content=response.text or "", meta={"phase": "final_answer"}
+        )
         history.append(assistant_msg)
         await record_message(recorder, resolved_run_id, assistant_msg, 1)
         await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
@@ -592,9 +594,16 @@ class SingleCall(Loop):
                 async for event in interruptible(provider_stream, interrupt):
                     if event.type == StreamEventType.TEXT_DELTA:
                         partial_text.append(event.text or "")
-                        yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                        yield RunEvent(
+                            type=RunEventType.TEXT_DELTA,
+                            text=event.text,
+                            iteration=1,
+                            phase="final_answer",
+                        )
                     elif event.type == StreamEventType.REASONING_DELTA:
-                        yield RunEvent(type=RunEventType.REASONING_DELTA, text=event.text)
+                        yield RunEvent(
+                            type=RunEventType.REASONING_DELTA, text=event.text, iteration=1
+                        )
                     elif event.type in (
                         StreamEventType.TOOL_USE_START,
                         StreamEventType.TOOL_USE_END,
@@ -686,7 +695,11 @@ class SingleCall(Loop):
             duration_ms=llm_duration_ms,
         )
 
-        assistant_msg = Message(role=Role.ASSISTANT, content=llm_response.text or "")
+        assistant_msg = Message(
+            role=Role.ASSISTANT,
+            content=llm_response.text or "",
+            meta={"phase": "final_answer"},
+        )
         history.append(assistant_msg)
         await record_message(recorder, resolved_run_id, assistant_msg, 1)
         await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
@@ -720,6 +733,7 @@ class SingleCall(Loop):
             sc_stream_meta["reasoning"] = llm_response.reasoning
         yield RunEvent(
             type=RunEventType.RUN_COMPLETED,
+            phase="final_answer",
             run_result=RunResult(
                 run_id=resolved_run_id,
                 status=RunStatus.SUCCESS,

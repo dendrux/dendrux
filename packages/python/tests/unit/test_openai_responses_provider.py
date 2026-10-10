@@ -585,6 +585,38 @@ class TestCompleteStream:
         assert len(done_events) == 1
         assert done_events[0].raw.text == "Hello"
 
+    async def test_text_delta_carries_native_message_phase(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
+        """The output message's ``phase`` is copied onto its text deltas."""
+
+        @dataclass
+        class PhasedItem:
+            id: str
+            phase: str | None
+            type: str = "message"
+
+        stream_events = [
+            FakeStreamEvent(type="response.output_item.added", item=PhasedItem("m1", "commentary")),
+            FakeStreamEvent(type="response.output_text.delta", delta="Checking", item_id="m1"),
+            FakeStreamEvent(type="response.output_item.added", item=PhasedItem("m2", None)),
+            FakeStreamEvent(type="response.output_text.delta", delta="Plain", item_id="m2"),
+            FakeStreamEvent(type="response.output_text.delta", delta="Unknown", item_id="m9"),
+            FakeStreamEvent(type="response.completed", response=FakeCompletedResponse()),
+        ]
+        provider._client.responses.create = AsyncMock(return_value=MockAsyncStream(stream_events))
+
+        events = [
+            e
+            async for e in provider.complete_stream([Message(role=Role.USER, content="Hi")])
+            if e.type == StreamEventType.TEXT_DELTA
+        ]
+        assert [(e.text, e.phase) for e in events] == [
+            ("Checking", "commentary"),
+            ("Plain", None),
+            ("Unknown", None),
+        ]
+
     async def test_single_tool_call_stream(self, provider: OpenAIResponsesProvider) -> None:
         """Single tool call: TOOL_USE_START → TOOL_USE_END → DONE."""
         stream_events = _tool_call_stream_events(

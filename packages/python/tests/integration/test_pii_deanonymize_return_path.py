@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import pytest
 
+from dendrux import tool
 from dendrux.agent import Agent
 from dendrux.guardrails import PII
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.state import SQLAlchemyStateStore
-from dendrux.types import LLMResponse, RunStatus, UsageStats
+from dendrux.types import LLMResponse, RunStatus, ToolCall, UsageStats
 
 
 def _resp(text: str) -> LLMResponse:
@@ -46,6 +47,36 @@ class TestReturnPathDeanonymize:
         # The user-facing answer has the original name, not the placeholder.
         assert "Anmol Gautam" in result.answer
         assert "<<PERSON_1>>" not in result.answer
+
+    async def test_runresult_commentary_is_deanonymized(self, db_store) -> None:
+        """Tool-step narration gets the same return-path reversal as the answer."""
+
+        @tool()
+        async def greet_lookup(name: str) -> str:
+            """Look up a greeting."""
+            return "hi"
+
+        llm = MockLLM(
+            [
+                LLMResponse(
+                    text="Looking up <<PERSON_1>>.",
+                    tool_calls=[ToolCall("greet_lookup", {"name": "<<PERSON_1>>"})],
+                ),
+                _resp("Hello <<PERSON_1>>!"),
+            ]
+        )
+        agent = Agent(
+            provider=llm,
+            prompt="Greeter.",
+            tools=[greet_lookup],
+            state_store=db_store,
+            guardrails=[PII(engine="presidio")],
+        )
+
+        result = await agent.run("I am Anmol Gautam")
+
+        assert result.status == RunStatus.SUCCESS
+        assert result.commentary == ["Looking up Anmol Gautam."]
 
     async def test_db_row_keeps_raw_placeholder(self, db_store) -> None:
         """DB persists the LLM's raw output (placeholder); only the return value
