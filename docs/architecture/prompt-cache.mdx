@@ -133,6 +133,14 @@ Two things to notice:
 1. **Only applied to the real OpenAI base URL.** Compatible providers (Groq, Together, vLLM, etc.) reject unknown OpenAI-specific fields. The check keeps dendrux portable to those endpoints without a flag.
 2. **Prefix preferred, run_id as fallback.** The runner supplies `cache_key_prefix` as `{agent_name}:{model}` by default, which means runs sharing an agent and model route to the same lane. That maximizes cross-run hit rates. When no prefix is set, `run_id` is used as a last resort; per-run lanes get no cross-run benefit but are still predictable.
 
+`OpenAIResponsesProvider` never keys on `run_id`. A per-run key sends each run of one conversation to a potentially different cache lane, which defeats cross-run hits. It sends `prompt_cache_key` only when a prefix is known: the constructor `cache_key_prefix=` first, otherwise the per-call prefix the runner passes. OpenAI recommends one key per user or customer, not per request, so for multi-tenant apps set it per customer:
+
+```python
+OpenAIResponsesProvider(model="gpt-5.5", cache_key_prefix=f"customer:{customer_id}")
+```
+
+The constructor value wins over the runner's `{agent_name}:{model}` prefix. On GPT-5.6 and later the key is unnecessary: OpenAI routes for cache hits without it.
+
 OpenAI's telemetry populates `cache_read_input_tokens` (from the `usage.prompt_tokens_details.cached_tokens` field on the response). `cache_creation_input_tokens` is always `None` on OpenAI responses because the provider does not separate creation from reads in its reporting; they bill creation and reads at the same rate on the same model.
 
 ## Why activate caching by default

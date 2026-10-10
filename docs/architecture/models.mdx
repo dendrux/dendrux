@@ -36,6 +36,11 @@ There are two OpenAI providers because OpenAI runs two different request/respons
 
 The Responses API is OpenAI-only. Pointing `OpenAIResponsesProvider` at a non-OpenAI backend will not work — that is exactly the case `OpenAIProvider` covers.
 
+### Responses: phase replay and cache keys
+
+- **Assistant `phase` is replayed.** Every assistant message dendrux records carries a phase (`"commentary"` for text alongside tool calls, `"final_answer"` otherwise; see `Message.meta["phase"]`). When history goes back to the Responses API, each assistant input item carries that `phase`, as OpenAI asks for manual history replay (from gpt-5.3-codex on, dropping it can degrade performance). User items never get a phase.
+- **`prompt_cache_key` is per customer, not per run.** The provider sends a key only when it has a prefix: the constructor `cache_key_prefix=` (OpenAI recommends one per user or customer), otherwise the runner's `{agent_name}:{model}`. It never falls back to the run id. On GPT-5.6 and later the key is unnecessary. See [Prompt caching](/docs/architecture/prompt-cache).
+
 ## OpenAI-compatible backends
 
 `OpenAIProvider` speaks plain Chat Completions, so it drives any server that implements that wire format — vLLM, SGLang, Groq, Together, Ollama, LM Studio — by setting `base_url`. There is no separate provider class per backend.

@@ -1173,3 +1173,67 @@ async def test_stream_distinguishes_missing_usage_from_reported_zero(provider, r
     )
     assert response.usage.usage_reported is reported
     assert response.usage.cost_usd == (0 if reported else None)
+
+
+# ---------------------------------------------------------------------------
+# Assistant ``phase`` replay — OpenAI asks callers replaying history to
+# resend each assistant message's original phase.
+# ---------------------------------------------------------------------------
+class TestPhaseReplay:
+    def test_text_only_assistant_carries_phase(self, provider: OpenAIResponsesProvider) -> None:
+        msgs = [Message(role=Role.ASSISTANT, content="Done.", meta={"phase": "final_answer"})]
+        _, items = provider._convert_messages(msgs)
+        assert items == [{"role": "assistant", "content": "Done.", "phase": "final_answer"}]
+
+    def test_tool_call_turn_text_part_carries_phase(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
+        tc = ToolCall(name="add", params={"a": 1}, provider_tool_call_id="call_1")
+        msgs = [
+            Message(
+                role=Role.ASSISTANT,
+                content="Adding.",
+                tool_calls=[tc],
+                meta={"phase": "commentary"},
+            )
+        ]
+        _, items = provider._convert_messages(msgs)
+        assert items[0] == {"role": "assistant", "content": "Adding.", "phase": "commentary"}
+        assert items[1]["type"] == "function_call"
+        assert "phase" not in items[1]
+
+    def test_no_phase_when_meta_lacks_it(self, provider: OpenAIResponsesProvider) -> None:
+        msgs = [Message(role=Role.ASSISTANT, content="Hi")]
+        _, items = provider._convert_messages(msgs)
+        assert "phase" not in items[0]
+
+    def test_unknown_phase_value_is_dropped(self, provider: OpenAIResponsesProvider) -> None:
+        msgs = [Message(role=Role.ASSISTANT, content="Hi", meta={"phase": "thinking"})]
+        _, items = provider._convert_messages(msgs)
+        assert "phase" not in items[0]
+
+    def test_never_on_user_items(self, provider: OpenAIResponsesProvider) -> None:
+        msgs = [Message(role=Role.USER, content="Hello", meta={"phase": "final_answer"})]
+        _, items = provider._convert_messages(msgs)
+        assert items == [{"role": "user", "content": "Hello"}]
+
+    async def test_phase_reaches_request_input(self, provider: OpenAIResponsesProvider) -> None:
+        captured: dict[str, Any] = {}
+
+        async def capture(**kwargs: Any) -> FakeResponse:
+            captured.update(kwargs)
+            return FakeResponse()
+
+        provider._client.responses.create = capture  # type: ignore[method-assign]
+        await provider.complete(
+            [
+                Message(role=Role.USER, content="hi"),
+                Message(role=Role.ASSISTANT, content="hello", meta={"phase": "final_answer"}),
+                Message(role=Role.USER, content="again"),
+            ]
+        )
+        assert captured["input"] == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello", "phase": "final_answer"},
+            {"role": "user", "content": "again"},
+        ]

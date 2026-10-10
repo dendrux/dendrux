@@ -58,6 +58,22 @@ _EFFORT_ALIASES = {"extra": "xhigh"}
 
 _REASONING_ITEM_TYPES = frozenset({"reasoning"})
 
+# Assistant message phases the Responses API accepts on input items.
+_REPLAYABLE_PHASES = frozenset({"commentary", "final_answer"})
+
+
+def _assistant_item(msg: Message) -> dict[str, Any]:
+    """Build an assistant message input item, resending its recorded phase.
+
+    OpenAI asks callers replaying history to preserve each assistant
+    message's original ``phase``; dropping it can degrade later turns.
+    """
+    item: dict[str, Any] = {"role": "assistant", "content": msg.content}
+    phase = msg.meta.get("phase")
+    if phase in _REPLAYABLE_PHASES:
+        item["phase"] = phase
+    return item
+
 
 def _normalize_effort(effort: str) -> str:
     """Map a Dendrux effort alias to OpenAI's vocabulary."""
@@ -172,6 +188,7 @@ class OpenAIResponsesProvider(LLMProvider):
         timeout: float = 120.0,
         max_retries: int = 3,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
+        cache_key_prefix: str | None = None,
     ) -> None:
         """Create an OpenAI Responses API provider.
 
@@ -196,6 +213,13 @@ class OpenAIResponsesProvider(LLMProvider):
                 ``None`` (default) omits the field so OpenAI uses its in-memory
                 default. Set ``"24h"`` for long-running workflows on supported
                 models. Hyphenated literal per the SDK.
+            cache_key_prefix: Stable cache-routing identifier, sent as
+                ``prompt_cache_key="dendrux:{cache_key_prefix}"``. OpenAI
+                recommends one key per user/customer (not per request); on
+                GPT-5.6+ the key is unnecessary. Takes precedence over the
+                per-call prefix the agent loop derives (``"{agent}:{model}"``).
+                ``None`` (default) leaves routing to the per-call prefix, and
+                sends no key when there is none.
         """
         for t in builtin_tools or []:
             if t not in _BUILTIN_TOOL_TYPES:
@@ -225,6 +249,7 @@ class OpenAIResponsesProvider(LLMProvider):
         self._show_thinking = show_thinking
         self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
+        self._cache_key_prefix = cache_key_prefix
 
     @property
     def model(self) -> str:
@@ -261,9 +286,10 @@ class OpenAIResponsesProvider(LLMProvider):
         Returns (api_kwargs, captured_request) where captured_request is the
         serializable subset for the evidence layer.
 
-        Cache routing follows the same rule as the Chat Completions adapter:
-        ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``) takes
-        priority over ``run_id``.
+        Cache routing: ``prompt_cache_key`` is sent only when a prefix is
+        known — the constructor ``cache_key_prefix`` first, then the per-call
+        one (the agent loop passes ``"{agent_name}:{model}"``). ``run_id`` is
+        accepted for interface compatibility and never used as a key.
         """
         model = kwargs.pop("model", self._model)
         instructions, input_items = self._convert_messages(messages, replay_reasoning_for=model)
@@ -329,8 +355,9 @@ class OpenAIResponsesProvider(LLMProvider):
             if key in kwargs:
                 api_kwargs[key] = kwargs.pop(key)
 
-        # Cache routing — derive key from prefix or run_id
-        cache_key_source = cache_key_prefix or run_id
+        # Cache routing — never keyed on run_id: a per-run key scatters one
+        # conversation's runs across cache lanes and defeats cross-run hits.
+        cache_key_source = self._cache_key_prefix or cache_key_prefix
         if cache_key_source:
             api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
         if self._prompt_cache_retention is not None:
@@ -376,8 +403,9 @@ class OpenAIResponsesProvider(LLMProvider):
         kwargs override constructor defaults (e.g. model, max_output_tokens).
         Only supported kwargs are forwarded; unknown keys are ignored.
 
-        ``cache_key_prefix`` / ``run_id`` route requests to the same OpenAI
-        cache pool — prefix preferred, run_id as fallback.
+        ``cache_key_prefix`` routes requests to an OpenAI cache pool via
+        ``prompt_cache_key`` (a constructor ``cache_key_prefix`` takes
+        precedence). ``run_id`` is never used as a key.
 
         When output_schema is provided, sets text.format to json_schema
         with strict mode.
@@ -422,8 +450,9 @@ class OpenAIResponsesProvider(LLMProvider):
         (content deltas, function call starts/args/done), making the mapping
         to StreamEvent straightforward.
 
-        ``cache_key_prefix`` / ``run_id`` route requests to the same OpenAI
-        cache pool — prefix preferred, run_id as fallback.
+        ``cache_key_prefix`` routes requests to an OpenAI cache pool via
+        ``prompt_cache_key`` (a constructor ``cache_key_prefix`` takes
+        precedence). ``run_id`` is never used as a key.
 
         At stream end, yields a DONE event carrying the full LLMResponse.
 
@@ -598,7 +627,8 @@ class OpenAIResponsesProvider(LLMProvider):
         Returns (instructions, input_items) where:
           - SYSTEM messages → joined into instructions string
           - USER → {role: "user", content: ...}
-          - ASSISTANT → {role: "assistant", content: ...}
+          - ASSISTANT → {role: "assistant", content: ..., phase?: ...} — the
+            ``meta["phase"]`` recorded for the message is resent when set
           - ASSISTANT with tool_calls → function_call items
           - TOOL → function_call_output items
           - ASSISTANT ``reasoning_blocks`` → reasoning items ahead of that
@@ -626,7 +656,7 @@ class OpenAIResponsesProvider(LLMProvider):
                 if msg.tool_calls:
                     # Emit text content if present
                     if msg.content:
-                        input_items.append({"role": "assistant", "content": msg.content})
+                        input_items.append(_assistant_item(msg))
                     # Emit function_call items
                     for tc in msg.tool_calls:
                         input_items.append(
@@ -638,7 +668,7 @@ class OpenAIResponsesProvider(LLMProvider):
                             }
                         )
                 else:
-                    input_items.append({"role": "assistant", "content": msg.content})
+                    input_items.append(_assistant_item(msg))
 
             elif msg.role == Role.TOOL:
                 original_call = resolve_tool_message_call(msg, call_index)

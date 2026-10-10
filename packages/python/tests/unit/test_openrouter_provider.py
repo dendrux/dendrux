@@ -55,6 +55,8 @@ def _model(
     )
 
 
+NO_COMPRESSION = [{"id": "context-compression", "enabled": False}]
+
 CATALOG = {
     "deepseek/deepseek-chat": _model(
         "deepseek/deepseek-chat", ("tools", "tool_choice", "temperature")
@@ -111,13 +113,33 @@ class TestConstruction:
 
     def test_require_parameters_routing_default(self) -> None:
         provider = _provider()
-        assert provider._extra_body == {"provider": {"require_parameters": True}}
+        assert provider._extra_body == {
+            "provider": {"require_parameters": True},
+            "plugins": NO_COMPRESSION,
+        }
 
     def test_user_provider_block_merges_over_default(self) -> None:
         provider = _provider(extra_body={"provider": {"order": ["deepseek"]}})
         assert provider._extra_body == {
-            "provider": {"require_parameters": True, "order": ["deepseek"]}
+            "provider": {"require_parameters": True, "order": ["deepseek"]},
+            "plugins": NO_COMPRESSION,
         }
+
+    def test_context_compression_disabled_by_default(self) -> None:
+        provider = _provider()
+        assert provider._extra_body is not None
+        assert provider._extra_body["plugins"] == [{"id": "context-compression", "enabled": False}]
+
+    def test_user_plugins_win(self) -> None:
+        plugins = [{"id": "context-compression", "engine": "middle-out"}]
+        provider = _provider(extra_body={"plugins": plugins})
+        assert provider._extra_body is not None
+        assert provider._extra_body["plugins"] == plugins
+
+    def test_user_empty_plugins_win(self) -> None:
+        provider = _provider(extra_body={"plugins": []})
+        assert provider._extra_body is not None
+        assert provider._extra_body["plugins"] == []
 
     def test_user_extra_body_keys_preserved(self) -> None:
         provider = _provider(extra_body={"transforms": ["middle-out"]})
@@ -358,7 +380,10 @@ class TestExtraBodyPassthrough:
         api_kwargs, captured = provider._build_api_kwargs(
             [Message(role=Role.USER, content="hi")], None, {}
         )
-        assert api_kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+        assert api_kwargs["extra_body"] == {
+            "provider": {"require_parameters": True},
+            "plugins": NO_COMPRESSION,
+        }
         assert captured["extra_body"] == api_kwargs["extra_body"]
 
     def test_per_call_extra_body_merges_over_constructor(self) -> None:
@@ -370,6 +395,7 @@ class TestExtraBodyPassthrough:
         )
         assert api_kwargs["extra_body"] == {
             "provider": {"require_parameters": True},
+            "plugins": NO_COMPRESSION,
             "transforms": ["middle-out"],
         }
 
@@ -943,3 +969,78 @@ class TestMandatoryReasoningGuard:
         with caplog.at_level(logging.WARNING):
             result = await provider.complete([Message(role=Role.USER, content="hi")])
         assert result is not None  # never breaks a run on a metadata hiccup
+
+
+# ---------------------------------------------------------------------------
+# Anthropic automatic prompt caching (top-level cache_control)
+# ---------------------------------------------------------------------------
+async def _captured_complete(provider: OpenRouterProvider, **call_kwargs: Any) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    async def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _FakeCompletion(usage=_usage())
+
+    provider._client.chat.completions.create = fake_create  # type: ignore[method-assign]
+    await provider.complete([Message(role=Role.USER, content="hi")], **call_kwargs)
+    return captured
+
+
+async def _captured_stream(provider: OpenRouterProvider, **call_kwargs: Any) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    async def fake_create(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _astream([_FakeChunk(usage=_usage())])
+
+    provider._client.chat.completions.create = fake_create  # type: ignore[method-assign]
+    async for _ in provider.complete_stream([Message(role=Role.USER, content="hi")], **call_kwargs):
+        pass
+    return captured
+
+
+class TestAnthropicCache:
+    async def test_anthropic_model_gets_top_level_cache_control(self) -> None:
+        provider = _provider(model="anthropic/claude-sonnet-4.6")
+        captured = await _captured_complete(provider)
+        assert captured["extra_body"]["cache_control"] == {"type": "ephemeral"}
+        assert captured["extra_body"]["plugins"] == NO_COMPRESSION
+        assert captured["extra_body"]["provider"]["require_parameters"] is True
+
+    async def test_tilde_alias_counts_as_anthropic(self) -> None:
+        provider = _provider(model="~anthropic/claude-sonnet-latest")
+        captured = await _captured_complete(provider)
+        assert captured["extra_body"]["cache_control"] == {"type": "ephemeral"}
+
+    async def test_stream_path_also_sends_cache_control(self) -> None:
+        provider = _provider(model="anthropic/claude-sonnet-4.6")
+        captured = await _captured_stream(provider)
+        assert captured["extra_body"]["cache_control"] == {"type": "ephemeral"}
+
+    async def test_non_anthropic_model_has_no_cache_control(self) -> None:
+        captured = await _captured_complete(_provider(model="deepseek/deepseek-chat"))
+        assert "cache_control" not in captured["extra_body"]
+
+    async def test_per_call_model_decides(self) -> None:
+        provider = _provider(model="deepseek/deepseek-chat")
+        captured = await _captured_complete(provider, model="anthropic/claude-sonnet-4.6")
+        assert captured["extra_body"]["cache_control"] == {"type": "ephemeral"}
+
+    async def test_opt_out(self) -> None:
+        provider = _provider(model="anthropic/claude-sonnet-4.6", anthropic_cache=False)
+        captured = await _captured_complete(provider)
+        assert "cache_control" not in captured["extra_body"]
+
+    async def test_constructor_extra_body_cache_control_wins(self) -> None:
+        mine = {"type": "ephemeral", "ttl": "1h"}
+        provider = _provider(
+            model="anthropic/claude-sonnet-4.6", extra_body={"cache_control": mine}
+        )
+        captured = await _captured_complete(provider)
+        assert captured["extra_body"]["cache_control"] == mine
+
+    async def test_per_call_extra_body_cache_control_wins(self) -> None:
+        mine = {"type": "ephemeral", "ttl": "1h"}
+        provider = _provider(model="anthropic/claude-sonnet-4.6")
+        captured = await _captured_complete(provider, extra_body={"cache_control": mine})
+        assert captured["extra_body"]["cache_control"] == mine
