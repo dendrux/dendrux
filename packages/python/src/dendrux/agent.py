@@ -1793,6 +1793,7 @@ class Agent:
             lookups.max_calls[td.name] = td.max_calls_per_run
             lookups.parallel[td.name] = td.parallel
             lookups.meta[td.name] = td.meta
+            lookups.defs[td.name] = td
 
         return lookups
 

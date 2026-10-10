@@ -2161,6 +2161,7 @@ async def _execute_approved_tools(
     from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
     from dendrux.loops._helpers import record_tool_started as _rec_tool_started
     from dendrux.loops.react import _execute_tool
+    from dendrux.tools._validate import check_tool_call
     from dendrux.types import Message, Role
 
     target_history = history if history is not None else pause_state.history
@@ -2168,9 +2169,13 @@ async def _execute_approved_tools(
     results: list[tuple[ToolCall, ToolResult]] = []
 
     for tc in pause_state.pending_tool_calls:
-        await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
-        await _ntfy_tool_started(notifier, run_id, tc, pause_state.iteration)
-        tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
+        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
+        if invalid_result is None:
+            await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
+            await _ntfy_tool_started(notifier, run_id, tc, pause_state.iteration)
+            tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
+        else:
+            tr = invalid_result
         await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
         await _ntfy_tool(notifier, run_id, tc, tr, pause_state.iteration)
         result_msg = Message(
