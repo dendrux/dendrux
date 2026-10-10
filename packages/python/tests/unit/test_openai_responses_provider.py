@@ -212,6 +212,22 @@ class TestBuildTools:
         assert result[1]["type"] == "function"
         assert result[1]["name"] == "custom"
 
+    def test_strict_tool_emits_strict_flag(self, provider: OpenAIResponsesProvider) -> None:
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+            "additionalProperties": False,
+        }
+        tools = [
+            ToolDef(name="s", description="S", parameters=params, strict=True),
+            ToolDef(name="n", description="N", parameters={"type": "object", "properties": {}}),
+        ]
+        result = provider._build_tools(tools)
+        assert result[0]["strict"] is True
+        assert result[0]["parameters"] == params
+        assert "strict" not in result[1]
+
 
 # ---------------------------------------------------------------------------
 # Response normalization tests

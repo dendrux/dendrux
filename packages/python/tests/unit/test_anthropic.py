@@ -301,6 +301,17 @@ class TestConvertTools:
         assert result[0]["name"] == "a"
         assert result[1]["name"] == "b"
 
+    def test_strict_flag_not_sent(self, provider: AnthropicProvider) -> None:
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": ["string", "null"]}},
+            "required": ["q"],
+            "additionalProperties": False,
+        }
+        tools = [ToolDef(name="s", description="S", parameters=params, strict=True)]
+        result = provider._convert_tools(tools)
+        assert result[0] == {"name": "s", "description": "S", "input_schema": params}
+
 
 # ------------------------------------------------------------------
 # Inbound: _normalize_response

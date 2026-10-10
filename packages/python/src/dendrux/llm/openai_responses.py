@@ -642,14 +642,15 @@ class OpenAIResponsesProvider(LLMProvider):
         # Add Dendrux function tools (flatter format than Chat Completions)
         if dendrux_tools:
             for td in dendrux_tools:
-                api_tools.append(
-                    {
-                        "type": "function",
-                        "name": td.name,
-                        "description": td.description,
-                        "parameters": td.parameters,
-                    }
-                )
+                function_tool: dict[str, Any] = {
+                    "type": "function",
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": td.parameters,
+                }
+                if td.strict:
+                    function_tool["strict"] = True
+                api_tools.append(function_tool)
 
         return api_tools
 

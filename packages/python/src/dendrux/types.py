@@ -181,6 +181,13 @@ class ToolDef:
 
     Created by the @tool decorator. Used by strategies to describe tools
     to the LLM, and by the executor to dispatch tool calls.
+
+    ``strict`` opts into OpenAI strict function calling. Normalization
+    happens once, at decoration time: when ``strict`` is True, ``parameters``
+    already holds the strict-mode schema (every property required, objects
+    closed with ``additionalProperties: false``), so every provider sees the
+    same stored schema. OpenAI Chat and Responses providers additionally send
+    ``"strict": true``; Anthropic ignores the flag and sends the schema as-is.
     """
 
     name: str
@@ -192,6 +199,7 @@ class ToolDef:
     timeout_seconds: float = 120.0  # Enforced by ReActLoop via asyncio.wait_for
     has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
     meta: dict[str, Any] = field(default_factory=dict)  # MCP source info, annotations, etc.
+    strict: bool = False
 
 
 @dataclass(frozen=True)
