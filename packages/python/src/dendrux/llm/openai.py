@@ -721,17 +721,17 @@ class OpenAIProvider(LLMProvider):
 
     def _convert_tools(self, tools: list[ToolDef]) -> list[dict[str, Any]]:
         """Convert Dendrux ToolDefs to OpenAI function tool format."""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": td.name,
-                    "description": td.description,
-                    "parameters": td.parameters,
-                },
+        converted: list[dict[str, Any]] = []
+        for td in tools:
+            function: dict[str, Any] = {
+                "name": td.name,
+                "description": td.description,
+                "parameters": td.parameters,
             }
-            for td in tools
-        ]
+            if td.strict:
+                function["strict"] = True
+            converted.append({"type": "function", "function": function})
+        return converted
 
     # ------------------------------------------------------------------
     # Inbound conversions: OpenAI → Dendrux

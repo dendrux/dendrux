@@ -1,8 +1,12 @@
 """Tests for @tool decorator and schema generation."""
 
-from typing import Optional
+import dataclasses
+import enum
+import json
+from typing import Annotated, Any, Literal, NotRequired, Optional, TypedDict
 
 import pytest
+from pydantic import BaseModel, Field
 
 from dendrux.tool import get_tool_def, is_tool, tool
 from dendrux.types import ToolTarget
@@ -269,7 +273,7 @@ class TestSchemaGeneration:
             return str(x)
 
         schema = get_tool_def(fn).parameters
-        assert schema["properties"]["x"]["type"] == "string"
+        assert schema["properties"]["x"]["type"] == ["string", "null"]
 
     def test_non_json_serializable_default_raises(self) -> None:
         """A-02: Defaults that can't be JSON-serialized raise at decoration time."""
@@ -291,3 +295,558 @@ class TestSchemaGeneration:
         fn.__annotations__ = {"return": str}
         with pytest.raises(ValueError, match="not a valid Python identifier"):
             tool()(fn)
+
+
+# ---------------------------------------------------------------------------
+# Rich schema types
+# ---------------------------------------------------------------------------
+
+
+class Color(enum.Enum):
+    RED = "red"
+    GREEN = "green"
+
+
+class Priority(enum.IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+class Node(BaseModel):
+    id: str = Field(description="Node identifier")
+    label: str | None = None
+
+
+class Graph(BaseModel):
+    nodes: list[Node]
+    root: Node
+
+
+class TreeNode(BaseModel):
+    name: str
+    children: list["TreeNode"] = []  # noqa: UP037
+
+
+@dataclasses.dataclass
+class Point:
+    x: float
+    y: float = 0.0
+    tag: str | None = None
+
+
+@dataclasses.dataclass
+class Segment:
+    start: Point
+    end: Point
+
+
+class Series(TypedDict):
+    name: str
+    values: list[float]
+    color: NotRequired[str]
+
+
+@dataclasses.dataclass
+class Loop:
+    next: "Loop | None" = None  # noqa: UP037
+
+
+class TestLiteralAndEnum:
+    def test_literal_strings(self) -> None:
+        @tool()
+        async def fn(kind: Literal["chart", "table"]) -> str:
+            """Test."""
+            return kind
+
+        prop = get_tool_def(fn).parameters["properties"]["kind"]
+        assert prop == {"type": "string", "enum": ["chart", "table"]}
+
+    def test_literal_ints(self) -> None:
+        @tool()
+        async def fn(n: Literal[1, 2, 3]) -> int:
+            """Test."""
+            return n
+
+        assert get_tool_def(fn).parameters["properties"]["n"] == {
+            "type": "integer",
+            "enum": [1, 2, 3],
+        }
+
+    def test_literal_bools(self) -> None:
+        @tool()
+        async def fn(flag: Literal[True]) -> bool:
+            """Test."""
+            return flag
+
+        assert get_tool_def(fn).parameters["properties"]["flag"] == {
+            "type": "boolean",
+            "enum": [True],
+        }
+
+    def test_literal_mixed_types_raises(self) -> None:
+        with pytest.raises(TypeError, match="mixed value types"):
+
+            @tool()
+            async def fn(x: Literal["a", 1]) -> str:
+                """Test."""
+                return str(x)
+
+    def test_literal_with_default(self) -> None:
+        @tool()
+        async def fn(kind: Literal["a", "b"] = "a") -> str:
+            """Test."""
+            return kind
+
+        schema = get_tool_def(fn).parameters
+        assert schema["properties"]["kind"] == {
+            "type": "string",
+            "enum": ["a", "b"],
+            "default": "a",
+        }
+        assert schema["required"] == []
+
+    def test_str_enum(self) -> None:
+        @tool()
+        async def fn(color: Color) -> str:
+            """Test."""
+            return str(color)
+
+        assert get_tool_def(fn).parameters["properties"]["color"] == {
+            "type": "string",
+            "enum": ["red", "green"],
+        }
+
+    def test_int_enum(self) -> None:
+        @tool()
+        async def fn(p: Priority) -> str:
+            """Test."""
+            return str(p)
+
+        assert get_tool_def(fn).parameters["properties"]["p"] == {
+            "type": "integer",
+            "enum": [1, 2],
+        }
+
+    def test_mixed_enum_raises(self) -> None:
+        class Mixed(enum.Enum):
+            A = "a"
+            B = 2
+
+        with pytest.raises(TypeError, match="mixed value types"):
+
+            @tool()
+            async def fn(m: Mixed) -> str:
+                """Test."""
+                return str(m)
+
+    def test_optional_literal_includes_null_in_enum(self) -> None:
+        @tool()
+        async def fn(kind: Literal["a", "b"] | None = None) -> str:
+            """Test."""
+            return str(kind)
+
+        assert get_tool_def(fn).parameters["properties"]["kind"] == {
+            "type": ["string", "null"],
+            "enum": ["a", "b", None],
+            "default": None,
+        }
+
+
+class TestDescriptions:
+    def test_annotated_pydantic_field(self) -> None:
+        @tool()
+        async def fn(q: Annotated[str, Field(description="Search query")]) -> str:
+            """Test."""
+            return q
+
+        schema = get_tool_def(fn).parameters
+        assert schema["properties"]["q"] == {"type": "string", "description": "Search query"}
+        assert schema["required"] == ["q"]
+
+    def test_annotated_plain_string(self) -> None:
+        @tool()
+        async def fn(n: Annotated[int, "How many"] = 3) -> int:
+            """Test."""
+            return n
+
+        assert get_tool_def(fn).parameters["properties"]["n"] == {
+            "type": "integer",
+            "description": "How many",
+            "default": 3,
+        }
+
+    def test_annotated_without_description_is_plain(self) -> None:
+        @tool()
+        async def fn(n: Annotated[int, 42]) -> int:
+            """Test."""
+            return n
+
+        assert get_tool_def(fn).parameters["properties"]["n"] == {"type": "integer"}
+
+    def test_annotated_optional_stays_optional(self) -> None:
+        @tool()
+        async def fn(x: Annotated[str | None, "Maybe"]) -> str:
+            """Test."""
+            return str(x)
+
+        schema = get_tool_def(fn).parameters
+        assert schema["required"] == []
+        assert schema["properties"]["x"]["description"] == "Maybe"
+
+    def test_annotated_inside_list(self) -> None:
+        @tool()
+        async def fn(ids: list[Annotated[int, "An id"]]) -> int:
+            """Test."""
+            return 0
+
+        assert get_tool_def(fn).parameters["properties"]["ids"]["items"] == {
+            "type": "integer",
+            "description": "An id",
+        }
+
+    def test_docstring_args_section(self) -> None:
+        @tool()
+        async def fn(query: str, limit: int = 5) -> str:
+            """Search things.
+
+            Args:
+                query: What to search for.
+                limit (int): Max results
+                    to return.
+
+            Returns:
+                Results.
+            """
+            return query
+
+        td = get_tool_def(fn)
+        props = td.parameters["properties"]
+        assert props["query"]["description"] == "What to search for."
+        assert props["limit"]["description"] == "Max results to return."
+        assert td.description.startswith("Search things.")
+        assert "Args:" in td.description
+
+    def test_annotated_wins_over_docstring(self) -> None:
+        @tool()
+        async def fn(q: Annotated[str, "From annotation"]) -> str:
+            """Test.
+
+            Args:
+                q: From docstring.
+            """
+            return q
+
+        assert get_tool_def(fn).parameters["properties"]["q"]["description"] == "From annotation"
+
+    def test_docstring_unknown_args_ignored(self) -> None:
+        @tool()
+        async def fn(q: str) -> str:
+            """Test.
+
+            Args:
+                other: Not a parameter.
+                garbage line without colon
+            """
+            return q
+
+        assert get_tool_def(fn).parameters["properties"]["q"] == {"type": "string"}
+
+    def test_docstring_without_args_section(self) -> None:
+        @tool()
+        async def fn(q: str) -> str:
+            """Just a description: with a colon."""
+            return q
+
+        assert get_tool_def(fn).parameters["properties"]["q"] == {"type": "string"}
+
+
+class TestNestedObjects:
+    def test_pydantic_model_inlined(self) -> None:
+        @tool()
+        async def fn(node: Node) -> str:
+            """Test."""
+            return node.id
+
+        prop = get_tool_def(fn).parameters["properties"]["node"]
+        assert prop["type"] == "object"
+        assert prop["properties"]["id"]["type"] == "string"
+        assert prop["properties"]["id"]["description"] == "Node identifier"
+        assert prop["required"] == ["id"]
+
+    def test_pydantic_nested_refs_resolved(self) -> None:
+        @tool()
+        async def fn(graph: Graph) -> str:
+            """Test."""
+            return "ok"
+
+        prop = get_tool_def(fn).parameters["properties"]["graph"]
+        assert "$ref" not in json.dumps(prop)
+        assert "$defs" not in prop
+        assert prop["properties"]["nodes"]["items"]["properties"]["id"]["type"] == "string"
+        assert prop["properties"]["root"]["type"] == "object"
+
+    def test_list_of_models(self) -> None:
+        @tool()
+        async def fn(nodes: list[Node]) -> str:
+            """Test."""
+            return "ok"
+
+        prop = get_tool_def(fn).parameters["properties"]["nodes"]
+        assert prop["type"] == "array"
+        assert prop["items"]["type"] == "object"
+        assert "id" in prop["items"]["properties"]
+
+    def test_recursive_model_raises(self) -> None:
+        with pytest.raises(TypeError, match="[Rr]ecursive"):
+
+            @tool()
+            async def fn(tree: TreeNode) -> str:
+                """Test."""
+                return "ok"
+
+    def test_dataclass(self) -> None:
+        @tool()
+        async def fn(seg: Segment) -> str:
+            """Test."""
+            return "ok"
+
+        prop = get_tool_def(fn).parameters["properties"]["seg"]
+        assert prop["type"] == "object"
+        assert prop["required"] == ["start", "end"]
+        assert prop["properties"]["start"] == {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number", "default": 0.0},
+                "tag": {"type": ["string", "null"], "default": None},
+            },
+            "required": ["x"],
+        }
+
+    def test_recursive_dataclass_raises(self) -> None:
+        with pytest.raises(TypeError, match="[Rr]ecursive"):
+
+            @tool()
+            async def fn(loop: Loop) -> str:
+                """Test."""
+                return "ok"
+
+    def test_typeddict(self) -> None:
+        @tool()
+        async def fn(series: list[Series]) -> str:
+            """Test."""
+            return "ok"
+
+        assert get_tool_def(fn).parameters["properties"]["series"]["items"] == {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "values": {"type": "array", "items": {"type": "number"}},
+                "color": {"type": "string"},
+            },
+            "required": ["name", "values"],
+        }
+
+    def test_dict_with_value_type(self) -> None:
+        @tool()
+        async def fn(scores: dict[str, int]) -> str:
+            """Test."""
+            return "ok"
+
+        assert get_tool_def(fn).parameters["properties"]["scores"] == {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+
+    def test_dict_str_any_is_plain_object(self) -> None:
+        @tool()
+        async def fn(data: dict[str, Any]) -> str:
+            """Test."""
+            return "ok"
+
+        assert get_tool_def(fn).parameters["properties"]["data"] == {"type": "object"}
+
+    def test_dict_non_str_key_raises(self) -> None:
+        with pytest.raises(TypeError, match="keys must be str"):
+
+            @tool()
+            async def fn(data: dict[int, str]) -> str:
+                """Test."""
+                return "ok"
+
+    def test_unsupported_type_raises(self) -> None:
+        class Opaque:
+            pass
+
+        with pytest.raises(TypeError, match="not supported"):
+
+            @tool()
+            async def fn(x: Opaque) -> str:
+                """Test."""
+                return "ok"
+
+
+class TestNullable:
+    def test_optional_str_is_nullable(self) -> None:
+        @tool()
+        async def fn(title: str | None = None) -> str:
+            """Test."""
+            return str(title)
+
+        schema = get_tool_def(fn).parameters
+        assert schema["properties"]["title"] == {"type": ["string", "null"], "default": None}
+        assert schema["required"] == []
+
+    def test_optional_without_default_not_required(self) -> None:
+        @tool()
+        async def fn(x: Optional[int]) -> str:  # noqa: UP045
+            """Test."""
+            return str(x)
+
+        schema = get_tool_def(fn).parameters
+        assert schema["properties"]["x"] == {"type": ["integer", "null"]}
+        assert schema["required"] == []
+
+    def test_optional_model_is_nullable_object(self) -> None:
+        @tool()
+        async def fn(node: Node | None = None) -> str:
+            """Test."""
+            return "ok"
+
+        prop = get_tool_def(fn).parameters["properties"]["node"]
+        assert prop["type"] == ["object", "null"]
+        assert "id" in prop["properties"]
+
+    def test_optional_list(self) -> None:
+        @tool()
+        async def fn(tags: list[str] | None = None) -> str:
+            """Test."""
+            return "ok"
+
+        assert get_tool_def(fn).parameters["properties"]["tags"] == {
+            "type": ["array", "null"],
+            "items": {"type": "string"},
+            "default": None,
+        }
+
+    def test_simple_tool_schema_unchanged(self) -> None:
+        @tool()
+        async def read_range(sheet: str, rows: list[int], include_headers: bool = True) -> list:
+            """Read cells."""
+            return []
+
+        assert get_tool_def(read_range).parameters == {
+            "type": "object",
+            "properties": {
+                "sheet": {"type": "string"},
+                "rows": {"type": "array", "items": {"type": "integer"}},
+                "include_headers": {"type": "boolean", "default": True},
+            },
+            "required": ["sheet", "rows"],
+        }
+
+
+class TestExplicitParameters:
+    def test_parameters_override_bypasses_generation(self) -> None:
+        params = {
+            "type": "object",
+            "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+            "required": ["x"],
+        }
+
+        @tool(parameters=params)
+        async def fn(x) -> str:  # noqa: ANN001
+            """Test."""
+            return str(x)
+
+        td = get_tool_def(fn)
+        assert td.parameters == params
+        assert td.parameters is not params
+
+    def test_parameters_must_be_dict(self) -> None:
+        with pytest.raises(TypeError, match="must be a dict"):
+
+            @tool(parameters=["nope"])  # type: ignore[arg-type]
+            async def fn() -> str:
+                """Test."""
+                return ""
+
+    def test_parameters_must_be_object_type(self) -> None:
+        with pytest.raises(ValueError, match='"type": "object"'):
+
+            @tool(parameters={"type": "string"})
+            async def fn() -> str:
+                """Test."""
+                return ""
+
+
+class TestStrict:
+    def test_strict_default_false(self) -> None:
+        @tool()
+        async def fn(x: str) -> str:
+            """Test."""
+            return x
+
+        assert get_tool_def(fn).strict is False
+
+    def test_strict_normalizes_schema(self) -> None:
+        @tool(strict=True)
+        async def fn(
+            kind: Literal["chart", "table"],
+            nodes: list[Node],
+            title: str | None = None,
+        ) -> str:
+            """Test."""
+            return kind
+
+        td = get_tool_def(fn)
+        assert td.strict is True
+        schema = td.parameters
+        assert schema["additionalProperties"] is False
+        assert schema["required"] == ["kind", "nodes", "title"]
+        assert schema["properties"]["title"]["type"] == ["string", "null"]
+        node = schema["properties"]["nodes"]["items"]
+        assert node["additionalProperties"] is False
+        assert node["required"] == ["id", "label"]
+
+    def test_strict_nullable_object_gets_additional_properties(self) -> None:
+        @tool(strict=True)
+        async def fn(p: Point | None = None) -> str:
+            """Test."""
+            return "ok"
+
+        prop = get_tool_def(fn).parameters["properties"]["p"]
+        assert prop["additionalProperties"] is False
+        assert prop["required"] == ["x", "y", "tag"]
+
+    def test_strict_rejects_open_dict(self) -> None:
+        with pytest.raises(TypeError, match="strict"):
+
+            @tool(strict=True)
+            async def fn(data: dict[str, int]) -> str:
+                """Test."""
+                return "ok"
+
+    def test_strict_rejects_bare_dict(self) -> None:
+        with pytest.raises(TypeError, match="strict"):
+
+            @tool(strict=True)
+            async def fn(data: dict) -> str:
+                """Test."""
+                return "ok"
+
+    def test_strict_with_explicit_parameters(self) -> None:
+        @tool(
+            strict=True,
+            parameters={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+        async def fn(q: str) -> str:
+            """Test."""
+            return q
+
+        assert get_tool_def(fn).parameters == {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+            "additionalProperties": False,
+        }

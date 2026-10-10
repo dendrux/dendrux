@@ -206,6 +206,22 @@ class TestConvertTools:
         assert result[0]["function"]["name"] == "a"
         assert result[1]["function"]["name"] == "b"
 
+    def test_strict_tool_emits_strict_flag(self, provider: OpenAIProvider) -> None:
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+            "additionalProperties": False,
+        }
+        tools = [
+            ToolDef(name="s", description="S", parameters=params, strict=True),
+            ToolDef(name="n", description="N", parameters={"type": "object", "properties": {}}),
+        ]
+        result = provider._convert_tools(tools)
+        assert result[0]["function"]["strict"] is True
+        assert result[0]["function"]["parameters"] == params
+        assert "strict" not in result[1]["function"]
+
 
 # ---------------------------------------------------------------------------
 # Response normalization tests

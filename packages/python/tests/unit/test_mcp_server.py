@@ -526,3 +526,36 @@ class TestAgentMCPGovernance:
 
         assert agent._discovered_tool_defs is None
         assert agent._mcp_executors is None
+
+
+class TestMCPToolSchemaPassthrough:
+    """MCP server schemas bypass @tool schema generation and strict mode."""
+
+    def test_input_schema_passed_through_verbatim(self) -> None:
+        from types import SimpleNamespace
+
+        from dendrux.mcp._server import build_mcp_tool_defs
+
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string"},
+                "opts": {"$ref": "#/$defs/Opts"},
+                "extra": {"type": "object"},
+            },
+            "$defs": {"Opts": {"type": "object", "properties": {"n": {"type": "integer"}}}},
+        }
+        source = SimpleNamespace(name="srv", transport="stdio", call_timeout=30.0)
+        mcp_tool = SimpleNamespace(
+            name="search", description="Search", input_schema=input_schema, annotations=None
+        )
+
+        (td,) = build_mcp_tool_defs(
+            source=source,  # type: ignore[arg-type]
+            namespace="srv",
+            tools=[mcp_tool],
+            connection_info=None,
+        )
+
+        assert td.parameters is input_schema
+        assert td.strict is False

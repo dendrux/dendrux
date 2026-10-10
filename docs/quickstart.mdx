@@ -90,7 +90,7 @@ def build_agent() -> Agent:
 
 Three things worth noticing:
 
-1. The tool is just a Python function. No registry, no schema. Dendrux reads the type hints and docstring.
+1. The tool is just a Python function. No registry, no schema. Dendrux reads the type hints and docstring (see [Tools](/docs/reference/tools) for supported types, descriptions, and strict mode).
 2. `require_approval=["refund"]` tells dendrux: when the LLM tries to call `refund`, pause the run and wait for a human to approve or reject.
 3. `database_url` is what makes the run survive a process exit. Three options:
    - **Omit it** → in-memory only. Fine for one-shot scripts and tests; the run dies with the process.

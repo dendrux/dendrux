@@ -1,0 +1,135 @@
+---
+title: Tools
+description: How @tool turns a typed Python function into a tool schema, which types are supported, how to describe parameters, and when to use parameters= or strict=.
+---
+
+# Tools
+
+A tool is a plain Python function decorated with `@tool()`. Dendrux reads the signature, type hints, and docstring once, at decoration time, and stores the result on a `ToolDef`. The function stays callable as normal.
+
+```python
+from typing import Literal
+
+from dendrux import tool
+
+
+@tool()
+async def show(kind: Literal["chart", "table"], title: str | None = None) -> str:
+    """Render a chart or table in the UI.
+
+    Args:
+        kind: Which widget to render.
+        title: Optional heading shown above the widget.
+    """
+    return f"rendered {kind}"
+```
+
+The tool's `description` is the full docstring. The arguments schema is generated from the type hints.
+
+## Decorator options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `target` | `"server"` | `"server"` runs the function in your process; `"client"` pauses the run and hands the call to your client. |
+| `parallel` | `True` | Whether calls to this tool may run concurrently with others. |
+| `max_calls_per_run` | `None` | Limit on calls per run. `None` = unlimited. |
+| `timeout_seconds` | `120.0` | Execution timeout for server tools. |
+| `parameters` | `None` | Explicit JSON Schema for the arguments. Skips generation from type hints. |
+| `strict` | `False` | Opt into OpenAI strict function calling. See [Strict mode](#strict-mode). |
+
+## Supported parameter types
+
+| Python type | JSON Schema |
+| --- | --- |
+| `str`, `int`, `float`, `bool` | `string`, `integer`, `number`, `boolean` |
+| `list[T]` | `{"type": "array", "items": <T>}` |
+| `dict`, `dict[str, Any]` | `{"type": "object"}` |
+| `dict[str, T]` | `{"type": "object", "additionalProperties": <T>}` |
+| `Literal["a", "b"]` | `{"type": "string", "enum": ["a", "b"]}`. The type is taken from the values, and all values must share one JSON type. |
+| `enum.Enum` subclass | An enum of the member **values**, typed like `Literal`. |
+| pydantic `BaseModel` | The model's `model_json_schema()`, with `$defs` / `$ref` inlined so the schema is self-contained. |
+| `@dataclass` | A nested object. Fields without defaults are required. |
+| `TypedDict` | A nested object. Keys in `__required_keys__` are required, so `NotRequired[...]` is honored. |
+| `T \| None` / `Optional[T]` | A nullable `T`, for example `{"type": ["string", "null"]}`. For an `enum`, `null` is added to the values. |
+| `Annotated[T, ...]` | The schema for `T`, plus a description (see below). |
+
+Nested types compose. For example, `list[Node]` where `Node` is a `BaseModel` becomes an array of typed objects.
+
+A parameter is **required** when it has no default and is not `Optional`. Defaults must be JSON-serializable and are emitted as `"default"`.
+
+Some types are rejected at decoration time with a `TypeError` that names the parameter:
+
+- Unions other than `T | None`, for example `str | int`
+- `Literal` or `Enum` values of mixed types, for example `Literal["a", 1]`
+- `dict` with non-`str` keys
+- Recursive models, dataclasses, or TypedDicts, because they cannot be inlined
+- Any other custom class
+
+For any of these, pass the schema yourself with `parameters=`.
+
+<Callout type="info">
+Arguments reach your function as JSON-decoded values. A `BaseModel`, dataclass, or `TypedDict` parameter receives a `dict`, and an `Enum` parameter receives the raw value. Validate the input yourself, for example with `Node.model_validate(raw)` or `Unit(raw)`.
+</Callout>
+
+## Parameter descriptions
+
+There are two ways to describe a parameter. If both are present for the same parameter, `Annotated` wins.
+
+**`Annotated` metadata**: use either a pydantic `Field(description=...)` or a plain string.
+
+```python
+from typing import Annotated
+from pydantic import Field
+
+
+@tool()
+async def search(
+    query: Annotated[str, Field(description="Full-text search query")],
+    limit: Annotated[int, "Maximum number of results"] = 10,
+) -> list[str]:
+    """Search the catalog."""
+    ...
+```
+
+**Google-style docstring `Args:` section**: Dendrux reads lines of the form `name: text` and `name (type): text`. Indented continuation lines are joined to the line above. Entries for names that are not parameters are ignored. The docstring itself stays unchanged as the tool's `description`.
+
+## Explicit schema: `parameters=`
+
+When the generated schema does not fit, pass your own JSON Schema. Generation is skipped entirely and the schema is stored as given. The root must be a dict with `"type": "object"`.
+
+```python
+@tool(parameters={
+    "type": "object",
+    "properties": {"value": {"anyOf": [{"type": "string"}, {"type": "number"}]}},
+    "required": ["value"],
+})
+async def record(value) -> str:
+    """Record a value."""
+    ...
+```
+
+## Strict mode
+
+`@tool(strict=True)` opts the tool into [OpenAI strict function calling](https://platform.openai.com/docs/guides/function-calling#strict-mode). With strict mode on, OpenAI guarantees that the arguments match the schema.
+
+The schema is normalized once, at decoration time, and stored on `ToolDef.parameters`, so every provider sees the same schema:
+
+- Every object gets `additionalProperties: false`.
+- Every property becomes required. `Optional` parameters are already nullable, so the model can still pass `null`.
+- A parameter that has a non-`None` default, such as `limit: int = 10`, also becomes required. The model must then supply a value, and the default appears only as a `"default"` hint in the schema.
+
+On the wire:
+
+| Provider | Behavior |
+| --- | --- |
+| `OpenAIProvider`, `OpenRouterProvider` (Chat Completions) | Sends `"strict": true` on the function. |
+| `OpenAIResponsesProvider` | Sends `"strict": true` on the function tool. |
+| `AnthropicProvider` | Ignores the flag and sends the normalized schema. |
+
+OpenAI strict mode requires every object to declare its properties. If a strict tool has a free-form `dict` or `dict[str, T]` parameter, the decorator raises `TypeError`. Use a `BaseModel`, dataclass, or `TypedDict` instead.
+
+`strict=True` combines with `parameters=`: your explicit schema is normalized the same way.
+
+## MCP tools
+
+Tools discovered from MCP servers do not go through `@tool`. Their server-provided `inputSchema` is passed to the model unchanged, and strict mode does not apply to them.

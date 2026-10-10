@@ -36,12 +36,14 @@ def _normalize_object(node: dict[str, Any]) -> None:
         return
 
     # Handle object types: add additionalProperties and required
-    if node.get("type") == "object" and "properties" in node:
+    node_type = node.get("type")
+    is_object = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
+    if is_object and "properties" in node:
         node["additionalProperties"] = False
-        # Ensure all properties are in required
+        # Every property required, in declaration order (stable for prompt caching)
         props = node.get("properties", {})
-        existing_required = set(node.get("required", []))
-        node["required"] = list(existing_required | set(props.keys()))
+        extra = [name for name in node.get("required", []) if name not in props]
+        node["required"] = [*props, *extra]
 
     # Recurse into properties
     for prop_schema in node.get("properties", {}).values():
