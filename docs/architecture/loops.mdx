@@ -174,6 +174,29 @@ When the LLM emits a tool call that runs in the browser (target `client`), or on
 
 `iteration_count` on a paused run is the iteration the pause happened in. On resume, the loop's `iteration_offset` is set to that value and counting picks up where it left off. See [Pause and resume](/docs/architecture/pause-resume) for the resume mechanics.
 
+### Tool argument validation
+
+Before any tool runs, `ReActLoop` checks the call's arguments against the tool's JSON schema (`ToolDef.parameters`). This applies to every tool: local `@tool` functions, MCP tools (using the schema the server published), client tools (checked before the run pauses), and approval-gated tools (checked again when the run resumes after approval). The checks are:
+
+- **Unknown argument names.** Any name not in `properties` is rejected, unless the schema sets `additionalProperties` to something other than `false`.
+- **Missing required arguments.** Anything listed in `required`.
+- **Basic types and `enum`.** Top-level arguments are checked against `string`, `integer`, `number`, `boolean`, `array`, `object` and `null`, including type arrays like `["string", "null"]`. `integer` rejects booleans. Optional arguments may be `null`.
+
+The validator only rejects what it understands. A property that uses `anyOf`, `oneOf`, `allOf`, `$ref`, or an unknown type is not type-checked, and nested objects are not checked.
+
+If the arguments fail validation, the tool's code does not run. The model gets one failed tool result that lists every problem it found:
+
+```json
+{"error": "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result.", "code": "invalid_params"}
+```
+
+```text
+show is missing required argument(s): kind. Valid arguments: kind, title, result.
+show argument 'limit' must be integer, got string.
+```
+
+When a call has more than one problem, the messages are joined with `; `. The call is stored as a failed tool invocation (`success=False`, with `error` set to the message) and emits `tool.completed`, but no `tool.started`. Calls that fail validation do not count toward `max_calls_per_run`. Other calls in the same batch run normally. Small open-weight models are the most likely to produce malformed calls, and a short error that names the valid arguments lets them correct the call on the next turn.
+
 ## `SingleCall`: one LLM call, no tools
 
 `SingleCall` is a specialized loop for agents that do exactly one thing in one LLM turn: classification, summarization, extraction, one-shot Q&A. The source comment puts it plainly:

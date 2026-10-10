@@ -1,8 +1,9 @@
-"""Cancellation, stream idempotency, and answer contracts reported by Oreo."""
+"""Cancellation, stream idempotency, answer, and tool-param contracts reported by Oreo."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextvars import ContextVar
 from unittest.mock import AsyncMock
@@ -541,3 +542,33 @@ async def test_answer_is_final_turn_and_cancel_buffer_resets(store, stop_at):
     assert record.answer == (None if stop_at == RunEventType.TOOL_RESULT else "final turn")
     assert text[0] == "before tool"
     assert record.status == ("success" if stop_at is None else "cancelled")
+
+
+async def test_leaked_tool_syntax_argument_is_rejected_before_tool_runs(store):
+    """Gemma via OpenRouter emitted an argument named 'r4<|"|>,split'."""
+    from dendrux.store import RunStore
+
+    calls = []
+
+    @tool()
+    async def show(kind: str, title: str = "", result: str = "") -> str:
+        """Show a result."""
+        calls.append(kind)
+        return "shown"
+
+    leaked = ToolCall(name="show", params={"kind": "table", 'r4<|"|>,split': "x"})
+    provider = MockLLM([LLMResponse(tool_calls=[leaked]), LLMResponse(text="retried")])
+    agent = Agent(provider=provider, prompt="test", tools=[show], state_store=store)
+
+    result = await agent.run("hello")
+
+    expected = "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result."
+    assert result.status == RunStatus.SUCCESS
+    assert calls == []
+    tool_msg = [m for m in provider.call_history[1]["messages"] if m.role.value == "tool"][0]
+    assert "unexpected keyword argument" not in tool_msg.content
+    assert json.loads(tool_msg.content) == {"error": expected, "code": "invalid_params"}
+    (invocation,) = await RunStore(store).get_tool_invocations(result.run_id)
+    assert invocation.success is False
+    assert invocation.error == expected
+    assert invocation.params == {"kind": "table", 'r4<|"|>,split': "x"}

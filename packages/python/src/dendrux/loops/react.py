@@ -53,6 +53,7 @@ from dendrux.loops._helpers import (
 from dendrux.loops.base import Loop
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
+from dendrux.tools._validate import check_tool_call
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     AgentStep,
@@ -511,10 +512,25 @@ async def _process_tool_calls(
             pending_approval=True,
         )
 
+    # --- Phase 1.5: Validate params against each tool's schema ---
+    valid_calls: list[ToolCall] = []
+    for tc in non_denied:
+        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
+        if invalid_result is None:
+            valid_calls.append(tc)
+            continue
+        await _record_tool(recorder, run_id, tc, invalid_result, iteration)
+        await _notify_tool(notifier, run_id, tc, invalid_result, iteration, warnings)
+        result_msg = strategy.format_tool_result(invalid_result)
+        history.append(result_msg)
+        await _record_message(recorder, run_id, result_msg, iteration)
+        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
+        all_results.append((tc, invalid_result))
+
     # --- Phase 1: Enforce max_calls_per_run ---
     allowed_calls: list[ToolCall] = []
     batch_counts: dict[str, int] = {}
-    for tc in non_denied:
+    for tc in valid_calls:
         max_calls = lookups.max_calls.get(tc.name)
         current = call_counts.get(tc.name, 0) + batch_counts.get(tc.name, 0)
         if max_calls is not None and current >= max_calls:
