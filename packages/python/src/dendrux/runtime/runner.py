@@ -1143,7 +1143,7 @@ async def retry(
         ValueError: If the source run is not terminal, if the source
             run was SingleCall, or if no traces exist.
     """
-    from dendrux.types import Message, Role
+    from dendrux.types import REASONING_MODEL_META_KEY, Message, Role
 
     # 1. Validate source run is terminal
     source_run = await state_store.get_run(original_run_id)
@@ -1170,6 +1170,7 @@ async def retry(
 
     # 3. Read traces and reconstruct approximate history
     traces = await state_store.get_traces(original_run_id)
+    retry_model = (kwargs or {}).get("model") or provider.model
     initial_history: list[Message] = []
     for trace in sorted(traces, key=lambda t: t.order_index):
         try:
@@ -1198,6 +1199,16 @@ async def retry(
                 )
                 for tc in meta["tool_calls"]
             ]
+
+        # Reasoning replay blocks only seed a retry on the model that made them.
+        if (
+            role == Role.ASSISTANT
+            and meta.get("reasoning_blocks")
+            and meta.get(REASONING_MODEL_META_KEY) in (None, retry_model)
+        ):
+            msg_kwargs["reasoning_blocks"] = meta["reasoning_blocks"]
+            if meta.get(REASONING_MODEL_META_KEY):
+                msg_kwargs["meta"] = {REASONING_MODEL_META_KEY: meta[REASONING_MODEL_META_KEY]}
 
         initial_history.append(Message(**msg_kwargs))
 

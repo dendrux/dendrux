@@ -54,6 +54,7 @@ from dendrux.loops.base import Loop
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
 from dendrux.types import (
+    REASONING_MODEL_META_KEY,
     AgentStep,
     Budget,
     Clarification,
@@ -254,10 +255,18 @@ async def _append_assistant(
     warnings: list[str],
 ) -> Message:
     """Create assistant message, append to history, record then notify."""
+    # Tag replay blocks with their producing model so providers never send
+    # them to a different model (per-turn ``model=`` / retry on another model).
+    meta = (
+        {REASONING_MODEL_META_KEY: response.model}
+        if response.reasoning_blocks and response.model
+        else {}
+    )
     msg = Message(
         role=Role.ASSISTANT,
         content=response.text or "",
         tool_calls=response.tool_calls,
+        meta=meta,
         reasoning=response.reasoning,
         reasoning_blocks=response.reasoning_blocks,
     )

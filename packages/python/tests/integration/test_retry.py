@@ -261,3 +261,84 @@ class TestAgentRetryMethod:
 
         retry_run = await store.get_run(result2.run_id)
         assert retry_run.retry_of_run_id == result1.run_id
+
+
+_BLOCKS = [{"type": "thinking", "thinking": "plan", "signature": "sig-1"}]
+
+
+class TestRetryReasoningBlocks:
+    """Reasoning replay blocks round-trip through react_traces into retry()."""
+
+    async def _source_run(self, store, model: str = "model-a"):
+        from dendrux import tool
+        from dendrux.agent import Agent
+        from dendrux.runtime.runner import run
+
+        @tool()
+        async def greet(name: str) -> str:
+            """Greet someone."""
+            return f"Hi {name}"
+
+        mock = MockLLM(
+            [
+                LLMResponse(
+                    text=None,
+                    tool_calls=[ToolCall(name="greet", params={"name": "W"})],
+                    reasoning_blocks=_BLOCKS,
+                ),
+                LLMResponse(text="done"),
+            ],
+            model=model,
+        )
+        agent = Agent(provider=mock, prompt="test", tools=[greet])
+        result = await run(agent, provider=mock, user_input="hi", state_store=store)
+        assert result.status == RunStatus.SUCCESS
+        return agent, result
+
+    async def test_trace_meta_carries_blocks_and_model(self, store):
+        from dendrux.types import REASONING_MODEL_META_KEY
+
+        _, result = await self._source_run(store)
+        traces = await store.get_traces(result.run_id)
+        tool_turn = next(t for t in traces if t.role == "assistant" and "tool_calls" in t.meta)
+        assert tool_turn.meta["reasoning_blocks"] == _BLOCKS
+        assert tool_turn.meta[REASONING_MODEL_META_KEY] == "model-a"
+        final = [t for t in traces if t.role == "assistant"][-1]
+        assert "reasoning_blocks" not in final.meta
+
+    async def test_retry_restores_blocks_for_same_model(self, store):
+        from dendrux.runtime.runner import retry
+        from dendrux.types import REASONING_MODEL_META_KEY, Role
+
+        agent, result = await self._source_run(store)
+        mock2 = MockLLM([LLMResponse(text="again")], model="model-a")
+        await retry(result.run_id, agent=agent, provider=mock2, state_store=store)
+
+        seen = mock2.call_history[0]["messages"]
+        tool_turn = next(m for m in seen if m.role == Role.ASSISTANT and m.tool_calls)
+        assert tool_turn.reasoning_blocks == _BLOCKS
+        assert tool_turn.meta[REASONING_MODEL_META_KEY] == "model-a"
+
+    async def test_retry_drops_blocks_for_other_model(self, store):
+        from dendrux.runtime.runner import retry
+        from dendrux.types import Role
+
+        agent, result = await self._source_run(store)
+        mock2 = MockLLM([LLMResponse(text="again")], model="model-b")
+        await retry(result.run_id, agent=agent, provider=mock2, state_store=store)
+
+        seen = mock2.call_history[0]["messages"]
+        tool_turn = next(m for m in seen if m.role == Role.ASSISTANT and m.tool_calls)
+        assert tool_turn.reasoning_blocks is None
+
+    async def test_retry_honors_per_call_model_override(self, store):
+        from dendrux.runtime.runner import retry
+        from dendrux.types import Role
+
+        agent, result = await self._source_run(store)
+        mock2 = MockLLM([LLMResponse(text="again")], model="model-b")
+        await retry(result.run_id, agent=agent, provider=mock2, state_store=store, model="model-a")
+
+        seen = mock2.call_history[0]["messages"]
+        tool_turn = next(m for m in seen if m.role == Role.ASSISTANT and m.tool_calls)
+        assert tool_turn.reasoning_blocks == _BLOCKS

@@ -22,6 +22,7 @@ from dendrux.llm._helpers import (
     build_call_index,
     connection_error,
     parse_tool_json_lossy,
+    replayable_reasoning_blocks,
     resolve_tool_message_call,
     timeout_error,
 )
@@ -57,6 +58,10 @@ _SUPPORTED_KWARGS = frozenset(
 # Dendrux effort vocabulary → Anthropic. "extra" is the consumer label for
 # "xhigh"; every other value passes through (Anthropic validates it).
 _EFFORT_ALIASES = {"extra": "xhigh"}
+
+# Content block types replayed verbatim on assistant turns, and never given a
+# cache_control marker.
+_THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 
 
 def _normalize_effort(effort: str) -> str:
@@ -235,8 +240,13 @@ class AnthropicProvider(LLMProvider):
         content = message["content"]
         if isinstance(content, str):
             message["content"] = [{"type": "text", "text": content, "cache_control": marker}]
-        elif isinstance(content, list) and content:
-            content[-1]["cache_control"] = marker
+        elif isinstance(content, list):
+            # Thinking blocks are replayed unmodified, so the marker goes on
+            # the last block that may carry one.
+            for block in reversed(content):
+                if block.get("type") not in _THINKING_BLOCK_TYPES:
+                    block["cache_control"] = marker
+                    return
 
     def _build_api_kwargs(
         self,
@@ -249,7 +259,13 @@ class AnthropicProvider(LLMProvider):
         Returns (api_kwargs, captured_request) where captured_request is the
         serializable subset for the evidence layer.
         """
-        system_prompt, api_messages = self._convert_messages(messages)
+        # Model + thinking resolve first: they decide whether stored thinking
+        # blocks may be replayed on assistant turns.
+        model = kwargs.pop("model", self._model)
+        thinking_on = kwargs.pop("thinking", self._thinking)
+        system_prompt, api_messages = self._convert_messages(
+            messages, replay_reasoning_for=model if thinking_on else None
+        )
         api_tools = self._convert_tools(tools) if tools else anthropic.NOT_GIVEN
         # A stable context head (folded into the first user message) gets its own
         # cross-run cache breakpoint at api_messages[0].
@@ -259,7 +275,7 @@ class AnthropicProvider(LLMProvider):
         )
 
         api_kwargs: dict[str, Any] = {
-            "model": kwargs.pop("model", self._model),
+            "model": model,
             "max_tokens": kwargs.pop("max_tokens", self._max_tokens),
             "messages": cached_messages,
             "system": system_blocks,
@@ -267,7 +283,6 @@ class AnthropicProvider(LLMProvider):
         }
 
         # Resolve thinking controls — per-call kwargs override constructor.
-        thinking_on = kwargs.pop("thinking", self._thinking)
         effort = kwargs.pop("effort", self._effort)
         show_thinking = kwargs.pop("show_thinking", self._show_thinking)
         thinking_budget = kwargs.pop("thinking_budget", self._thinking_budget)
@@ -515,7 +530,12 @@ class AnthropicProvider(LLMProvider):
     # Outbound conversions: Dendrux → Anthropic
     # ------------------------------------------------------------------
 
-    def _convert_messages(self, messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:
+    def _convert_messages(
+        self,
+        messages: list[Message],
+        *,
+        replay_reasoning_for: str | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Convert Dendrux messages to Anthropic format.
 
         Returns (system_prompt, api_messages) where:
@@ -526,6 +546,9 @@ class AnthropicProvider(LLMProvider):
         - TOOL messages without native correlation become plain user messages
           (strategy is responsible for formatting these as text observations)
         - USER/ASSISTANT (text-only) pass through normally
+        - ASSISTANT ``reasoning_blocks`` (thinking/redacted_thinking) lead the
+          content array, unmodified, when ``replay_reasoning_for`` names the
+          request model and it matches the model that produced them
         """
         system_parts: list[str] = []
         api_messages: list[dict[str, Any]] = []
@@ -539,9 +562,12 @@ class AnthropicProvider(LLMProvider):
                 api_messages.append({"role": "user", "content": msg.content})
 
             elif msg.role == Role.ASSISTANT:
+                thinking = replayable_reasoning_blocks(
+                    msg, model=replay_reasoning_for, block_types=_THINKING_BLOCK_TYPES
+                )
                 if msg.tool_calls:
                     # Assistant with tool calls → content blocks
-                    content: list[dict[str, Any]] = []
+                    content: list[dict[str, Any]] = list(thinking)
                     if msg.content:
                         content.append({"type": "text", "text": msg.content})
                     for tc in msg.tool_calls:
@@ -554,6 +580,10 @@ class AnthropicProvider(LLMProvider):
                             }
                         )
                     api_messages.append({"role": "assistant", "content": content})
+                elif thinking:
+                    if msg.content:
+                        thinking.append({"type": "text", "text": msg.content})
+                    api_messages.append({"role": "assistant", "content": thinking})
                 else:
                     api_messages.append({"role": "assistant", "content": msg.content})
 
