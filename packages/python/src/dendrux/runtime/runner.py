@@ -429,6 +429,7 @@ async def _persist_loop_outcome(
             iteration_count=result.iteration_count,
             usage=result.usage,
             meta={**result.meta, "_finalize_won": won},
+            commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
         )
 
     if result.status == RunStatus.CANCELLED:
@@ -1581,6 +1582,7 @@ def run_stream(
                         run_id=run_id,
                         run_result=cached,
                         error=cached.error if event_type == RunEventType.RUN_ERROR else None,
+                        phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
                     )
                     return
                 if create_result.outcome == "existing_active":
@@ -1716,7 +1718,9 @@ def run_stream(
                                     type=RunEventType.RUN_CANCELLED, run_result=persisted
                                 )
                             else:
-                                event = RunEvent(type=event.type, run_result=persisted)
+                                event = RunEvent(
+                                    type=event.type, run_result=persisted, phase=event.phase
+                                )
                             await record_run_finished(recorder, run_id, persisted)
                             await notify_run_finished(extra_notifier, run_id, persisted)
                         else:
@@ -2629,6 +2633,8 @@ def resume_stream(
                         type=RunEventType.TOOL_RESULT,
                         tool_call=tc,
                         tool_result=tr,
+                        iteration=pause_state.iteration,
+                        phase="commentary",
                     )
 
                 from dendrux.loops._helpers import (
@@ -2722,7 +2728,9 @@ def resume_stream(
                         if persisted.status == RunStatus.CANCELLED:
                             event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
                         else:
-                            event = RunEvent(type=event.type, run_result=persisted)
+                            event = RunEvent(
+                                type=event.type, run_result=persisted, phase=event.phase
+                            )
                         await record_run_finished(ctx.recorder, run_id, persisted)
                         await notify_run_finished(ctx.notifier, run_id, persisted)
                         yield event

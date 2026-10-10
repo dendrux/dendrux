@@ -255,15 +255,18 @@ async def _append_assistant(
     run_id: str,
     iteration: int,
     warnings: list[str],
+    *,
+    phase: str,
 ) -> Message:
-    """Create assistant message, append to history, record then notify."""
+    """Create assistant message, append to history, record then notify.
+
+    ``phase`` lands in ``Message.meta`` and from there in the persisted trace.
+    """
     # Tag replay blocks with their producing model so providers never send
     # them to a different model (per-turn ``model=`` / retry on another model).
-    meta = (
-        {REASONING_MODEL_META_KEY: response.model}
-        if response.reasoning_blocks and response.model
-        else {}
-    )
+    meta: dict[str, Any] = {"phase": phase}
+    if response.reasoning_blocks and response.model:
+        meta[REASONING_MODEL_META_KEY] = response.model
     msg = Message(
         role=Role.ASSISTANT,
         content=response.text or "",
@@ -276,6 +279,15 @@ async def _append_assistant(
     await _record_message(recorder, run_id, msg, iteration)
     await _notify_message(notifier, run_id, msg, iteration, warnings)
     return msg
+
+
+def _commentary(steps: list[AgentStep]) -> list[str]:
+    """Non-empty assistant text from steps that ended in tool calls, in order."""
+    return [
+        s.raw_response
+        for s in steps
+        if isinstance(s.action, ToolCall) and s.raw_response and s.raw_response.strip()
+    ]
 
 
 def _snapshot_usage(usage: UsageStats) -> UsageStats:
@@ -668,6 +680,7 @@ class ReActLoop(Loop):
                     run_id=resolved_run_id,
                     status=RunStatus.CANCELLED,
                     steps=steps,
+                    commentary=_commentary(steps),
                     iteration_count=iteration - 1,
                     usage=total_usage,
                     meta=guardrail_meta(g_engine, notifier_warnings),
@@ -711,6 +724,7 @@ class ReActLoop(Loop):
                             status=RunStatus.ERROR,
                             error=block_err,
                             steps=steps,
+                            commentary=_commentary(steps),
                             iteration_count=iteration,
                             usage=total_usage,
                             meta=guardrail_meta(g_engine, notifier_warnings),
@@ -919,6 +933,7 @@ class ReActLoop(Loop):
                         status=RunStatus.ERROR,
                         error=out_block,
                         steps=steps,
+                        commentary=_commentary(steps),
                         iteration_count=iteration,
                         usage=total_usage,
                         meta=guardrail_meta(g_engine, notifier_warnings),
@@ -973,12 +988,14 @@ class ReActLoop(Loop):
                     resolved_run_id,
                     iteration,
                     notifier_warnings,
+                    phase="final_answer",
                 )
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.SUCCESS,
                     answer=step.action.answer,
                     steps=steps,
+                    commentary=_commentary(steps),
                     iteration_count=iteration,
                     usage=total_usage,
                     meta=guardrail_meta(g_engine, notifier_warnings),
@@ -993,6 +1010,7 @@ class ReActLoop(Loop):
                     resolved_run_id,
                     iteration,
                     notifier_warnings,
+                    phase="final_answer",
                 )
                 pause = _build_pause(
                     agent_name=agent.name,
@@ -1012,6 +1030,7 @@ class ReActLoop(Loop):
                     status=RunStatus.WAITING_HUMAN_INPUT,
                     answer=step.action.question,
                     steps=steps,
+                    commentary=_commentary(steps),
                     iteration_count=iteration,
                     usage=total_usage,
                     meta=meta,
@@ -1026,6 +1045,7 @@ class ReActLoop(Loop):
                     resolved_run_id,
                     iteration,
                     notifier_warnings,
+                    phase="commentary",
                 )
                 outcome = await _process_tool_calls(
                     step=step,
@@ -1063,6 +1083,7 @@ class ReActLoop(Loop):
                         run_id=resolved_run_id,
                         status=pause_status,
                         steps=steps,
+                        commentary=_commentary(steps),
                         iteration_count=iteration,
                         usage=total_usage,
                         meta=meta,
@@ -1072,6 +1093,7 @@ class ReActLoop(Loop):
             run_id=resolved_run_id,
             status=RunStatus.MAX_ITERATIONS,
             steps=steps,
+            commentary=_commentary(steps),
             iteration_count=agent.max_iterations,
             usage=total_usage,
             meta=guardrail_meta(g_engine, notifier_warnings),
@@ -1140,6 +1162,7 @@ class ReActLoop(Loop):
                         run_id=resolved_run_id,
                         status=RunStatus.CANCELLED,
                         steps=steps,
+                        commentary=_commentary(steps),
                         iteration_count=iteration - 1,
                         usage=total_usage,
                         meta=cancel_meta,
@@ -1186,27 +1209,44 @@ class ReActLoop(Loop):
                 **_pkw,
             )
             partial_text: list[str] = []
+            # Text after a tool block in the same call is known commentary.
+            saw_tool_use = False
             interrupted = False
             try:
                 try:
                     async for event in interruptible(provider_stream, interrupt):
                         if event.type == StreamEventType.TEXT_DELTA:
                             partial_text.append(event.text or "")
-                            yield RunEvent(type=RunEventType.TEXT_DELTA, text=event.text)
+                            yield RunEvent(
+                                type=RunEventType.TEXT_DELTA,
+                                text=event.text,
+                                iteration=iteration,
+                                phase=event.phase or ("commentary" if saw_tool_use else None),
+                            )
                         elif event.type == StreamEventType.REASONING_DELTA:
-                            yield RunEvent(type=RunEventType.REASONING_DELTA, text=event.text)
+                            yield RunEvent(
+                                type=RunEventType.REASONING_DELTA,
+                                text=event.text,
+                                iteration=iteration,
+                            )
                         elif event.type == StreamEventType.TOOL_USE_START:
+                            saw_tool_use = True
                             yield RunEvent(
                                 type=RunEventType.TOOL_USE_START,
                                 tool_name=event.tool_name,
                                 tool_call_id=event.tool_call_id,
+                                iteration=iteration,
+                                phase="commentary",
                             )
                         elif event.type == StreamEventType.TOOL_USE_END:
+                            saw_tool_use = True
                             yield RunEvent(
                                 type=RunEventType.TOOL_USE_END,
                                 tool_call=event.tool_call,
                                 tool_name=event.tool_name,
                                 tool_call_id=event.tool_call_id,
+                                iteration=iteration,
+                                phase="commentary",
                             )
                         elif event.type == StreamEventType.DONE:
                             llm_response = event.raw
@@ -1313,17 +1353,20 @@ class ReActLoop(Loop):
                     resolved_run_id,
                     iteration,
                     notifier_warnings,
+                    phase="final_answer",
                 )
                 meta: dict[str, Any] = (
                     {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                 )
                 yield RunEvent(
                     type=RunEventType.RUN_COMPLETED,
+                    phase="final_answer",
                     run_result=RunResult(
                         run_id=resolved_run_id,
                         status=RunStatus.SUCCESS,
                         answer=step.action.answer,
                         steps=steps,
+                        commentary=_commentary(steps),
                         iteration_count=iteration,
                         usage=total_usage,
                         meta=meta,
@@ -1340,6 +1383,7 @@ class ReActLoop(Loop):
                     resolved_run_id,
                     iteration,
                     notifier_warnings,
+                    phase="final_answer",
                 )
                 pause = _build_pause(
                     agent_name=agent.name,
@@ -1360,6 +1404,7 @@ class ReActLoop(Loop):
                         status=RunStatus.WAITING_HUMAN_INPUT,
                         answer=step.action.question,
                         steps=steps,
+                        commentary=_commentary(steps),
                         iteration_count=iteration,
                         usage=total_usage,
                         meta=meta,
@@ -1376,6 +1421,7 @@ class ReActLoop(Loop):
                     resolved_run_id,
                     iteration,
                     notifier_warnings,
+                    phase="commentary",
                 )
                 outcome = await _process_tool_calls(
                     step=step,
@@ -1398,6 +1444,8 @@ class ReActLoop(Loop):
                         type=RunEventType.TOOL_RESULT,
                         tool_call=tc,
                         tool_result=tool_result,
+                        iteration=iteration,
+                        phase="commentary",
                     )
                 if outcome.pending_calls:
                     pause_status = (
@@ -1423,6 +1471,7 @@ class ReActLoop(Loop):
                             run_id=resolved_run_id,
                             status=pause_status,
                             steps=steps,
+                            commentary=_commentary(steps),
                             iteration_count=iteration,
                             usage=total_usage,
                             meta=meta,
@@ -1437,6 +1486,7 @@ class ReActLoop(Loop):
                 run_id=resolved_run_id,
                 status=RunStatus.MAX_ITERATIONS,
                 steps=steps,
+                commentary=_commentary(steps),
                 iteration_count=agent.max_iterations,
                 usage=total_usage,
                 meta=meta,
@@ -1468,6 +1518,7 @@ def _interrupted_result(
         status=RunStatus.CANCELLED,
         answer=answer,
         steps=steps,
+        commentary=_commentary(steps),
         iteration_count=iteration,
         usage=usage,
         meta=meta,

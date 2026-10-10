@@ -468,6 +468,8 @@ class OpenAIResponsesProvider(LLMProvider):
 
         # Track active function calls: item_id → (name, call_id)
         _active_calls: dict[str, tuple[str, str]] = {}
+        # Native message phase ("commentary" | "final_answer"): item_id → phase
+        _message_phase: dict[str, str | None] = {}
         _completed_response: Any = None
 
         async for event in stream:
@@ -478,7 +480,11 @@ class OpenAIResponsesProvider(LLMProvider):
                 delta_text = event.delta
                 if delta_text:
                     text_parts.append(delta_text)
-                    yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=delta_text)
+                    yield StreamEvent(
+                        type=StreamEventType.TEXT_DELTA,
+                        text=delta_text,
+                        phase=_message_phase.get(getattr(event, "item_id", "")),
+                    )
 
             # --- Reasoning summary deltas (arrive before output text) ---
             elif event_type == "response.reasoning_summary_text.delta":
@@ -490,7 +496,9 @@ class OpenAIResponsesProvider(LLMProvider):
             # --- Function call lifecycle (ordered: added → delta → done) ---
             elif event_type == "response.output_item.added":
                 item = event.item
-                if getattr(item, "type", None) == "function_call":
+                if getattr(item, "type", None) == "message":
+                    _message_phase[item.id] = getattr(item, "phase", None)
+                elif getattr(item, "type", None) == "function_call":
                     item_id = item.id
                     name = item.name
                     call_id = getattr(item, "call_id", item_id)

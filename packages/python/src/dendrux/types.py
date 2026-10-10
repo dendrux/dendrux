@@ -441,9 +441,11 @@ class RunResult:
     """The outcome of an agent run.
 
     On success, ``answer`` contains the final answer turn, not all assistant
-    text produced across tool calls. Earlier commentary and inline content
-    are available through streamed TEXT_DELTA events or persisted traces
-    (``RunStore.get_traces()``).
+    text produced across tool calls. ``commentary`` lists, in order, the
+    non-empty assistant text of every step that ended in tool calls (progress
+    narration such as "Let me look that up"). It is empty for SingleCall and
+    for idempotent cached results. Persisted traces tag the same split with
+    ``phase`` (``RunStore.get_traces()``).
 
     On stream interruption via cancel_run(), the partial answer contains
     only the current text buffer, which resets at each TOOL_RESULT. Closing
@@ -463,6 +465,7 @@ class RunResult:
     usage: UsageStats = field(default_factory=UsageStats)
     error: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    commentary: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -730,6 +733,9 @@ class StreamEvent:
     tool_name: str | None = None
     tool_call_id: str | None = None
     raw: Any = None
+    # Provider-native answer phase on TEXT_DELTA ("commentary" | "final_answer"),
+    # set only when the vendor labels it (OpenAI Responses message ``phase``).
+    phase: str | None = None
 
 
 # ------------------------------------------------------------------
@@ -794,15 +800,26 @@ class RunEvent:
     """A single event from agent.stream() or agent.resume_stream().
 
     Carries data relevant to its type:
-        RUN_STARTED:   run_id (first event for new runs)
-        RUN_RESUMED:   run_id (first event for resumed runs)
-        TEXT_DELTA:     text
-        TOOL_USE_START: tool_name, tool_call_id
-        TOOL_USE_END:   tool_call, tool_name, tool_call_id
-        TOOL_RESULT:    tool_call, tool_result
-        RUN_COMPLETED:  run_result
-        RUN_PAUSED:     run_result (pause state in run_result.meta)
-        RUN_ERROR:      run_result, error
+        RUN_STARTED:     run_id (first event for new runs)
+        RUN_RESUMED:     run_id (first event for resumed runs)
+        TEXT_DELTA:      text, iteration, phase (when already known)
+        REASONING_DELTA: text, iteration
+        TOOL_USE_START:  tool_name, tool_call_id, iteration, phase="commentary"
+        TOOL_USE_END:    tool_call, tool_name, tool_call_id, iteration, phase="commentary"
+        TOOL_RESULT:     tool_call, tool_result, iteration, phase="commentary"
+        RUN_COMPLETED:   run_result, phase="final_answer" on success
+        RUN_PAUSED:      run_result (pause state in run_result.meta)
+        RUN_ERROR:       run_result, error
+
+    ``iteration`` is the loop step (one LLM call) an LLM-output or tool event
+    belongs to; it is None on lifecycle events. ``phase`` labels assistant
+    text as ``"commentary"`` (narration in a step that ends in tool calls) or
+    ``"final_answer"``. A text block usually streams before the tool call
+    that makes it commentary, so TEXT_DELTA.phase is often None. Clients
+    bucket TEXT_DELTA by ``iteration``, mark a bucket commentary when a tool
+    event with that iteration arrives, and treat the last unmarked bucket as
+    the answer once RUN_COMPLETED carries ``phase="final_answer"``
+    (``run_result.answer`` stays authoritative).
     """
 
     type: RunEventType
@@ -814,6 +831,8 @@ class RunEvent:
     run_result: RunResult | None = None
     run_id: str | None = None
     error: str | None = None
+    iteration: int | None = None
+    phase: str | None = None
 
 
 class RunStream:

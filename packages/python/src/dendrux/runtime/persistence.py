@@ -282,6 +282,7 @@ class PersistenceRecorder(BaseRecorder):
                 "usage_reported": response.usage.usage_reported,
                 "model": response.model or self._model,
                 "has_tool_calls": bool(response.tool_calls),
+                "phase": "commentary" if response.tool_calls else "final_answer",
             },
             correlation_id=interaction_id,
         )

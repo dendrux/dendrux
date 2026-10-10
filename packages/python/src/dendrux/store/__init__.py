@@ -165,13 +165,18 @@ class ToolInvocation:
 
 @dataclass(frozen=True, slots=True)
 class TraceEntry:
-    """One entry in the conversation trace — user / assistant / tool message."""
+    """One entry in the conversation trace — user / assistant / tool message.
+
+    ``phase`` is ``"commentary"`` or ``"final_answer"`` on assistant entries
+    (None for other roles and for rows written before phases were recorded).
+    """
 
     role: str
     content: str
     order_index: int
     meta: dict[str, Any] | None
     created_at: datetime | None
+    phase: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +539,7 @@ def _trace_to_public(record: Any) -> TraceEntry:
         order_index=record.order_index,
         meta=record.meta,
         created_at=record.created_at,
+        phase=(record.meta or {}).get("phase"),
     )
 
 
