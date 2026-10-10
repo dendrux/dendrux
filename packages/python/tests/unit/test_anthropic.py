@@ -17,6 +17,7 @@ from anthropic.types import (
 
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.types import (
+    REASONING_MODEL_META_KEY,
     Message,
     Role,
     StreamEventType,
@@ -1351,3 +1352,136 @@ class TestStableHeadCacheBreakpoint:
         assert isinstance(msgs[0]["content"], str)
         # Last message still marked (unchanged behavior).
         assert msgs[-1]["content"][-1].get("cache_control") is not None
+
+
+# ------------------------------------------------------------------
+# Reasoning replay — thinking blocks round-trip across tool-loop steps
+# ------------------------------------------------------------------
+
+_THINK = {"type": "thinking", "thinking": "plan: call lookup", "signature": "sig-1"}
+_REDACTED = {"type": "redacted_thinking", "data": "opaque"}
+
+
+class TestReasoningReplay:
+    @staticmethod
+    def _tool_loop(
+        blocks: list | None = None,
+        *,
+        producer: str | None = "claude-sonnet-4-6",
+        text: str = "Checking.",
+    ) -> list[Message]:
+        tc = ToolCall(name="lookup", params={"q": "x"}, provider_tool_call_id="toolu_1")
+        meta = {REASONING_MODEL_META_KEY: producer} if producer else {}
+        return [
+            Message(role=Role.SYSTEM, content="sys"),
+            Message(role=Role.USER, content="go"),
+            Message(
+                role=Role.ASSISTANT,
+                content=text,
+                tool_calls=[tc],
+                reasoning_blocks=blocks if blocks is not None else [_THINK, _REDACTED],
+                meta=meta,
+            ),
+            Message(role=Role.TOOL, content="42", name="lookup", call_id=tc.id),
+        ]
+
+    @staticmethod
+    def _assistant(api_kwargs: dict) -> dict:
+        return next(m for m in api_kwargs["messages"] if m["role"] == "assistant")
+
+    def test_thinking_blocks_lead_tool_use_content(self, provider: AnthropicProvider) -> None:
+        api_kwargs, captured = provider._build_api_kwargs(
+            self._tool_loop(), None, {"thinking": True}
+        )
+        content = self._assistant(api_kwargs)["content"]
+        assert [b["type"] for b in content] == [
+            "thinking",
+            "redacted_thinking",
+            "text",
+            "tool_use",
+        ]
+        assert content[0] == _THINK
+        assert content[1] == _REDACTED
+        assert self._assistant(captured)["content"][0]["signature"] == "sig-1"
+
+    def test_blocks_replayed_without_text(self, provider: AnthropicProvider) -> None:
+        api_kwargs, _ = provider._build_api_kwargs(
+            self._tool_loop(text=""), None, {"thinking": True}
+        )
+        content = self._assistant(api_kwargs)["content"]
+        assert [b["type"] for b in content] == ["thinking", "redacted_thinking", "tool_use"]
+
+    def test_text_only_assistant_gets_blocks(self, provider: AnthropicProvider) -> None:
+        msgs = [
+            Message(role=Role.USER, content="q"),
+            Message(
+                role=Role.ASSISTANT,
+                content="answer",
+                reasoning_blocks=[_THINK],
+                meta={REASONING_MODEL_META_KEY: "claude-sonnet-4-6"},
+            ),
+            Message(role=Role.USER, content="next"),
+        ]
+        api_kwargs, _ = provider._build_api_kwargs(msgs, None, {"thinking": True})
+        assert self._assistant(api_kwargs)["content"] == [
+            _THINK,
+            {"type": "text", "text": "answer"},
+        ]
+
+    def test_omitted_when_thinking_off(self, provider: AnthropicProvider) -> None:
+        api_kwargs, _ = provider._build_api_kwargs(self._tool_loop(), None, {})
+        types = [b["type"] for b in self._assistant(api_kwargs)["content"]]
+        assert types == ["text", "tool_use"]
+
+    def test_omitted_on_model_mismatch(self, provider: AnthropicProvider) -> None:
+        api_kwargs, _ = provider._build_api_kwargs(
+            self._tool_loop(), None, {"thinking": True, "model": "claude-opus-4-8"}
+        )
+        types = [b["type"] for b in self._assistant(api_kwargs)["content"]]
+        assert types == ["text", "tool_use"]
+
+    def test_per_call_model_matching_producer_replays(self) -> None:
+        p = AnthropicProvider(api_key="sk-test", model="claude-haiku-4-5", thinking=True)
+        api_kwargs, _ = p._build_api_kwargs(self._tool_loop(), None, {"model": "claude-sonnet-4-6"})
+        assert self._assistant(api_kwargs)["content"][0] == _THINK
+
+    def test_unmarked_blocks_replay(self, provider: AnthropicProvider) -> None:
+        api_kwargs, _ = provider._build_api_kwargs(
+            self._tool_loop(producer=None), None, {"thinking": True}
+        )
+        assert self._assistant(api_kwargs)["content"][0] == _THINK
+
+    def test_foreign_vendor_blocks_skipped(self, provider: AnthropicProvider) -> None:
+        foreign = [{"type": "reasoning", "id": "rs_1", "summary": []}]
+        api_kwargs, _ = provider._build_api_kwargs(
+            self._tool_loop(blocks=foreign, producer=None), None, {"thinking": True}
+        )
+        types = [b["type"] for b in self._assistant(api_kwargs)["content"]]
+        assert types == ["text", "tool_use"]
+
+    def test_cache_marker_never_on_thinking_block(self, provider: AnthropicProvider) -> None:
+        msgs = [
+            Message(role=Role.USER, content="q"),
+            Message(
+                role=Role.ASSISTANT,
+                content="",
+                reasoning_blocks=[dict(_THINK)],
+                meta={REASONING_MODEL_META_KEY: "claude-sonnet-4-6"},
+            ),
+        ]
+        api_kwargs, _ = provider._build_api_kwargs(msgs, None, {"thinking": True})
+        assert api_kwargs["messages"][-1]["content"] == [_THINK]
+        assert "cache_control" not in msgs[1].reasoning_blocks[0]
+
+    def test_cache_marker_lands_on_tool_use(self, provider: AnthropicProvider) -> None:
+        msgs = self._tool_loop()[:3]
+        api_kwargs, _ = provider._build_api_kwargs(msgs, None, {"thinking": True})
+        content = api_kwargs["messages"][-1]["content"]
+        assert "cache_control" in content[-1]
+        assert all("cache_control" not in b for b in content[:2])
+
+    def test_replayed_blocks_are_copies(self, provider: AnthropicProvider) -> None:
+        msgs = self._tool_loop()
+        api_kwargs, _ = provider._build_api_kwargs(msgs, None, {"thinking": True})
+        self._assistant(api_kwargs)["content"][0]["thinking"] = "edited"
+        assert msgs[2].reasoning_blocks[0]["thinking"] == "plan: call lookup"

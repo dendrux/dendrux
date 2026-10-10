@@ -5,13 +5,17 @@ that all three providers (Anthropic, OpenAI, OpenAI Responses) share:
   - Tool call JSON parsing (lossy for streams, strict for batch)
   - Error factories for timeout and connection failures
   - Message history helpers (call index, tool message resolution)
+  - Reasoning replay selection (which stored blocks go back on the wire)
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from typing import TYPE_CHECKING, Any
+
+from dendrux.types import REASONING_MODEL_META_KEY
 
 if TYPE_CHECKING:
     from dendrux.types import Message, ToolCall
@@ -159,3 +163,28 @@ def resolve_tool_message_call(msg: Message, call_index: dict[str, ToolCall]) -> 
             f"but no matching ToolCall found in conversation history."
         )
     return original_call
+
+
+def replayable_reasoning_blocks(
+    msg: Message,
+    *,
+    model: str | None,
+    block_types: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Return deep copies of ``msg.reasoning_blocks`` safe to send to ``model``.
+
+    Empty when replay is disabled (``model`` is None), when the blocks were
+    produced by a different model (per ``REASONING_MODEL_META_KEY``), or for
+    blocks whose ``type`` this provider does not accept. Unmarked blocks are
+    trusted, so developer-supplied history still replays.
+    """
+    if model is None or not msg.reasoning_blocks:
+        return []
+    producer = msg.meta.get(REASONING_MODEL_META_KEY)
+    if producer is not None and producer != model:
+        return []
+    return [
+        copy.deepcopy(block)
+        for block in msg.reasoning_blocks
+        if isinstance(block, dict) and block.get("type") in block_types
+    ]

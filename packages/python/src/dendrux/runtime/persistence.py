@@ -132,6 +132,10 @@ class PersistenceRecorder(BaseRecorder):
             meta["call_id"] = message.call_id
         if message.name:
             meta["tool_name"] = message.name
+        if message.reasoning_blocks:
+            # Opaque replay blocks (producing model is already in message.meta)
+            # so retry() can rebuild a tool loop with its reasoning intact.
+            meta["reasoning_blocks"] = message.reasoning_blocks
 
         content = message.content
         order_idx = self._order_index

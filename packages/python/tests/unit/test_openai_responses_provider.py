@@ -13,6 +13,7 @@ openai = pytest.importorskip("openai", reason="openai extra not installed")
 
 from dendrux.llm.openai_responses import OpenAIResponsesProvider  # noqa: E402
 from dendrux.types import (  # noqa: E402
+    REASONING_MODEL_META_KEY,
     Message,
     Role,
     StreamEventType,
@@ -1011,6 +1012,108 @@ class TestReasoning:
         assert result.reasoning is None
         assert result.reasoning_blocks is None
         assert result.usage.reasoning_tokens is None
+
+
+_RS_ITEM = {
+    "id": "rs_1",
+    "summary": [{"text": "plan", "type": "summary_text"}],
+    "type": "reasoning",
+    "content": [],
+    "encrypted_content": "gAAA-opaque",
+    "status": None,
+}
+
+
+class TestReasoningReplay:
+    @staticmethod
+    def _tool_loop(
+        blocks: list | None = None,
+        *,
+        producer: str | None = "gpt-5.5",
+        text: str = "Checking.",
+    ) -> list[Message]:
+        tc = ToolCall(name="lookup", params={"q": "x"}, provider_tool_call_id="call_1")
+        meta = {REASONING_MODEL_META_KEY: producer} if producer else {}
+        return [
+            Message(role=Role.USER, content="go"),
+            Message(
+                role=Role.ASSISTANT,
+                content=text,
+                tool_calls=[tc],
+                reasoning_blocks=blocks if blocks is not None else [dict(_RS_ITEM)],
+                meta=meta,
+            ),
+            Message(role=Role.TOOL, content="42", name="lookup", call_id=tc.id),
+        ]
+
+    @staticmethod
+    def _input(messages: list[Message], provider_model: str = "gpt-5.5", **kwargs: Any) -> list:
+        p = OpenAIResponsesProvider(model=provider_model, api_key="t")
+        api_kwargs, captured = p._build_api_kwargs(messages, None, dict(kwargs))
+        assert captured["input"] == api_kwargs["input"]
+        return api_kwargs["input"]
+
+    def test_reasoning_item_precedes_function_call(self) -> None:
+        items = self._input(self._tool_loop())
+        kinds = [i.get("type", i.get("role")) for i in items]
+        assert kinds == ["user", "reasoning", "assistant", "function_call", "function_call_output"]
+
+    def test_item_replayed_without_null_fields(self) -> None:
+        item = self._input(self._tool_loop())[1]
+        assert item == {
+            "id": "rs_1",
+            "summary": [{"text": "plan", "type": "summary_text"}],
+            "type": "reasoning",
+            "content": [],
+            "encrypted_content": "gAAA-opaque",
+        }
+
+    def test_no_text_reasoning_then_function_call(self) -> None:
+        items = self._input(self._tool_loop(text=""))
+        assert [i.get("type") for i in items[1:]] == [
+            "reasoning",
+            "function_call",
+            "function_call_output",
+        ]
+
+    def test_text_only_assistant_gets_reasoning(self) -> None:
+        msgs = [
+            Message(role=Role.USER, content="q"),
+            Message(
+                role=Role.ASSISTANT,
+                content="answer",
+                reasoning_blocks=[dict(_RS_ITEM)],
+                meta={REASONING_MODEL_META_KEY: "gpt-5.5"},
+            ),
+        ]
+        items = self._input(msgs)
+        assert items[1]["type"] == "reasoning"
+        assert items[2] == {"role": "assistant", "content": "answer"}
+
+    def test_omitted_on_model_mismatch(self) -> None:
+        items = self._input(self._tool_loop(), provider_model="gpt-5-mini")
+        assert all(i.get("type") != "reasoning" for i in items)
+
+    def test_per_call_model_override_checked(self) -> None:
+        items = self._input(self._tool_loop(), provider_model="gpt-5.5", model="gpt-4.1")
+        assert all(i.get("type") != "reasoning" for i in items)
+        items = self._input(self._tool_loop(), provider_model="gpt-4.1", model="gpt-5.5")
+        assert items[1]["type"] == "reasoning"
+
+    def test_unmarked_items_replay(self) -> None:
+        items = self._input(self._tool_loop(producer=None))
+        assert items[1]["type"] == "reasoning"
+
+    def test_foreign_vendor_blocks_skipped(self) -> None:
+        anthropic_block = {"type": "thinking", "thinking": "x", "signature": "s"}
+        items = self._input(self._tool_loop(blocks=[anthropic_block], producer=None))
+        assert all(i.get("type") not in ("reasoning", "thinking") for i in items)
+
+    def test_caller_blocks_not_mutated(self) -> None:
+        msgs = self._tool_loop()
+        self._input(msgs)[1]["id"] = "changed"
+        assert msgs[1].reasoning_blocks[0]["id"] == "rs_1"
+        assert "status" in msgs[1].reasoning_blocks[0]
 
 
 @pytest.mark.parametrize("reported", [False, True])

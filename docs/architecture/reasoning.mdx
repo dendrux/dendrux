@@ -78,6 +78,10 @@ async for event in agent.stream("…"):
 
 These are backed by three nullable columns added without breaking the schema — `llm_interactions.reasoning_tokens`, `token_usage.reasoning_tokens`, and `agent_runs.total_reasoning_tokens` (see [State persistence](/docs/architecture/state-persistence)). The [dashboard](/docs/recipes/observability) surfaces the same numbers: a run-header total, a per-call stat, and the summary text in the payload inspector.
 
+## Reasoning across tool calls
+
+In a ReAct tool loop, the model's reasoning from one step is sent back on the next, so it continues from its own plan instead of starting over after each tool result. dendrux stores the vendor's opaque reasoning artifacts on the assistant message and replays them unmodified: on Anthropic, the `thinking` / `redacted_thinking` blocks (with their `signature`) lead the assistant turn's content, ahead of its text and `tool_use` blocks; on `OpenAIResponsesProvider`, the `reasoning` items go back ahead of that turn's `function_call` items. Replay applies only to the model that produced the blocks: if a later request targets a different model (a per-call `model=` override, or `agent.retry()` on another model), the blocks are left out of the request. Anthropic also leaves them out when thinking is off for that request. The blocks are saved with the run's traces and pause state, so they survive a pause/resume and seed `agent.retry()`.
+
 ## Reasoning tokens and your budget
 
 Reasoning tokens are billed **inside** `output_tokens` — the provider already counts them there. dendrux reports `reasoning_tokens` as an informational breakdown and never adds it on top of the output total, so a [budget](/docs/architecture/budget) is not double-charged. Turning thinking on will raise output-token spend (that is the point); the budget sees that spend through the normal output count, with the reasoning portion broken out so you can see how much of it was thinking.

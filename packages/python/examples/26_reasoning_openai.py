@@ -5,9 +5,9 @@ OpenAI counterpart to 25_reasoning.py — same PUBLIC runtime API
 OpenAI path that returns reasoning *text* (a summary); the Chat provider
 reports ``reasoning_tokens`` only.
 
-No tools here: OpenAI reasoning items aren't yet round-tripped across tool
-turns, so this keeps to a single reasoning turn (see 25_reasoning.py for the
-tool-using, per-step variant on Anthropic).
+This keeps to a single reasoning turn. With tools, reasoning items are
+replayed ahead of their function calls on the next step, exactly like the
+thinking blocks in 25_reasoning.py.
 
 Run with:
     OPENAI_API_KEY=sk-... python examples/26_reasoning_openai.py

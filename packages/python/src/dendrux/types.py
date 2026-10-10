@@ -27,6 +27,10 @@ from ulid import ULID
 
 logger = logging.getLogger(__name__)
 
+# ``Message.meta`` key naming the model that produced an ASSISTANT message's
+# ``reasoning_blocks``. Providers replay the blocks only to that same model.
+REASONING_MODEL_META_KEY = "reasoning_model"
+
 
 def generate_ulid() -> str:
     """Generate a new ULID string for Dendrux-owned correlation IDs."""

@@ -25,6 +25,7 @@ from dendrux.llm._helpers import (
     connection_error,
     parse_tool_json_lossy,
     parse_tool_json_strict,
+    replayable_reasoning_blocks,
     resolve_tool_message_call,
     timeout_error,
 )
@@ -54,6 +55,8 @@ logger = logging.getLogger(__name__)
 
 
 _EFFORT_ALIASES = {"extra": "xhigh"}
+
+_REASONING_ITEM_TYPES = frozenset({"reasoning"})
 
 
 def _normalize_effort(effort: str) -> str:
@@ -122,14 +125,10 @@ class OpenAIResponsesProvider(LLMProvider):
     For standard function calling without built-in tools, use
     OpenAIProvider (Chat Completions) instead.
 
-    Limitation — reasoning models with tool calling:
-        Reasoning models (o-series, GPT-5) may return internal reasoning
-        items alongside function calls. Dendrux's Message type does not
-        preserve these items between turns, so multi-turn tool calling
-        with reasoning models may lose context. For reasoning models
-        without tool calling, or for non-reasoning models with tools,
-        this provider works correctly. This will be fixed when Dendrux
-        adds first-class thinking/reasoning support.
+    Reasoning models with tool calling:
+        Reasoning items returned alongside function calls are stored on the
+        assistant message and replayed before its function_call items on the
+        next request, but only to the same model that produced them.
 
     Usage:
         # With built-in web search + custom tools
@@ -266,7 +265,8 @@ class OpenAIResponsesProvider(LLMProvider):
         ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``) takes
         priority over ``run_id``.
         """
-        instructions, input_items = self._convert_messages(messages)
+        model = kwargs.pop("model", self._model)
+        instructions, input_items = self._convert_messages(messages, replay_reasoning_for=model)
         api_tools = self._build_tools(tools)
 
         max_output_tokens = kwargs.pop(
@@ -275,7 +275,7 @@ class OpenAIResponsesProvider(LLMProvider):
         )
 
         api_kwargs: dict[str, Any] = {
-            "model": kwargs.pop("model", self._model),
+            "model": model,
             "input": input_items,
             "max_output_tokens": max_output_tokens,
         }
@@ -579,7 +579,12 @@ class OpenAIResponsesProvider(LLMProvider):
     # Outbound conversions: Dendrux → OpenAI Responses API
     # ------------------------------------------------------------------
 
-    def _convert_messages(self, messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:
+    def _convert_messages(
+        self,
+        messages: list[Message],
+        *,
+        replay_reasoning_for: str | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Convert Dendrux messages to Responses API input format.
 
         Returns (instructions, input_items) where:
@@ -588,6 +593,9 @@ class OpenAIResponsesProvider(LLMProvider):
           - ASSISTANT → {role: "assistant", content: ...}
           - ASSISTANT with tool_calls → function_call items
           - TOOL → function_call_output items
+          - ASSISTANT ``reasoning_blocks`` → reasoning items ahead of that
+            message's text/function_call items, when ``replay_reasoning_for``
+            names the request model and it matches the producing model
         """
         instructions_parts: list[str] = []
         input_items: list[dict[str, Any]] = []
@@ -601,6 +609,12 @@ class OpenAIResponsesProvider(LLMProvider):
                 input_items.append({"role": "user", "content": msg.content})
 
             elif msg.role == Role.ASSISTANT:
+                # The API rejects null-valued fields (e.g. ``status: None``
+                # from the SDK's model_dump), so only those are dropped.
+                for item in replayable_reasoning_blocks(
+                    msg, model=replay_reasoning_for, block_types=_REASONING_ITEM_TYPES
+                ):
+                    input_items.append({k: v for k, v in item.items() if v is not None})
                 if msg.tool_calls:
                     # Emit text content if present
                     if msg.content:
