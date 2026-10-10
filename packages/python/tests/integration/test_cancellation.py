@@ -315,6 +315,11 @@ class TestCancelRunEvent:
         assert cancelled.sequence_index > max_other
 
 
+# Two cancel_run() calls open concurrent sessions. The in-memory ``sqlite``
+# backend shares one connection, so a reader session's pool-reset ROLLBACK
+# can discard the other task's uncommitted CAS UPDATE (see conftest) — run on
+# backends with independent connections only.
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 class TestCancelRunIdempotent:
     async def test_concurrent_cancel_both_succeed(self, db_store) -> None:
         tc = ToolCall(name="client_read", params={"sheet": "S1"}, provider_tool_call_id="t1")

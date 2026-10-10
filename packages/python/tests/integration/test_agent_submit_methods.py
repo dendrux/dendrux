@@ -367,6 +367,10 @@ class TestCancelRun:
 # ---------------------------------------------------------------------------
 
 
+# Concurrent sessions need independent connections (see conftest): the
+# in-memory ``sqlite`` backend shares one, so one task's session close can
+# roll back the other's in-flight CAS.
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 class TestConcurrentSubmits:
     async def test_concurrent_submits_one_wins(self, db_store) -> None:
         tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
