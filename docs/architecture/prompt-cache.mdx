@@ -119,21 +119,22 @@ OpenAI's cache is not byte-prefix-based; it is key-based. Calls that carry the s
 Dendrux derives the key automatically. From `dendrux/llm/openai.py`:
 
 ```python
-# Cache routing — derive key from prefix or run_id.
+# Cache routing — never keyed on run_id.
 if str(self._client.base_url) == _OPENAI_DEFAULT_BASE_URL:
-    cache_key_source = cache_key_prefix or run_id
+    cache_key_source = self._cache_key_prefix or cache_key_prefix
     if cache_key_source:
         api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
     if self._prompt_cache_retention is not None:
         api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
 ```
 
-Two things to notice:
+Three things to notice:
 
-1. **Only applied to the real OpenAI base URL.** Compatible providers (Groq, Together, vLLM, etc.) reject unknown OpenAI-specific fields. The check keeps dendrux portable to those endpoints without a flag.
-2. **Prefix preferred, run_id as fallback.** The runner supplies `cache_key_prefix` as `{agent_name}:{model}` by default, which means runs sharing an agent and model route to the same lane. That maximizes cross-run hit rates. When no prefix is set, `run_id` is used as a last resort; per-run lanes get no cross-run benefit but are still predictable.
+1. **Only applied to the real OpenAI base URL.** Compatible providers (Groq, Together, vLLM, OpenRouter, etc.) reject or ignore OpenAI-specific fields. The check keeps dendrux portable to those endpoints without a flag. (`OpenAIResponsesProvider` is OpenAI-only, so it always applies the rule.)
+2. **A key is sent only when a prefix is known.** The runner supplies `cache_key_prefix` as `{agent_name}:{model}` by default, so runs sharing an agent and model route to the same lane. With no prefix, no key is sent.
+3. **Never keyed on `run_id`.** A per-run key sends each run of one conversation to a potentially different cache lane, which defeats cross-run hits.
 
-`OpenAIResponsesProvider` never keys on `run_id`. A per-run key sends each run of one conversation to a potentially different cache lane, which defeats cross-run hits. It sends `prompt_cache_key` only when a prefix is known: the constructor `cache_key_prefix=` first, otherwise the per-call prefix the runner passes. OpenAI recommends one key per user or customer, not per request, so for multi-tenant apps set it per customer:
+OpenAI recommends one key per user or customer, not per request. For multi-tenant apps, set it per customer on the provider. This works on both `OpenAIProvider` and `OpenAIResponsesProvider`:
 
 ```python
 OpenAIResponsesProvider(model="gpt-5.5", cache_key_prefix=f"customer:{customer_id}")

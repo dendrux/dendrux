@@ -223,6 +223,7 @@ class OpenAIProvider(LLMProvider):
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache_key_prefix: str | None = None,
     ) -> None:
         """Create an OpenAI Chat Completions provider.
 
@@ -251,6 +252,14 @@ class OpenAIProvider(LLMProvider):
                 OpenRouter's ``provider`` routing block). A per-call
                 ``extra_body`` kwarg shallow-merges over this, per-call keys
                 winning.
+            cache_key_prefix: Stable cache-routing identifier, sent as
+                ``prompt_cache_key="dendrux:{cache_key_prefix}"`` on the
+                official OpenAI endpoint only. OpenAI recommends one key per
+                user/customer (not per request); on GPT-5.6+ the key is
+                unnecessary. Takes precedence over the per-call prefix the
+                agent loop derives (``"{agent}:{model}"``). ``None`` (default)
+                leaves routing to the per-call prefix, and sends no key when
+                there is none.
         """
         if api_key is None and not os.getenv("OPENAI_API_KEY"):
             raise ValueError(
@@ -274,6 +283,7 @@ class OpenAIProvider(LLMProvider):
         self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
         self._extra_body = extra_body
+        self._cache_key_prefix = cache_key_prefix
 
     @property
     def model(self) -> str:
@@ -310,10 +320,12 @@ class OpenAIProvider(LLMProvider):
         Returns (api_kwargs, captured_request) where captured_request is the
         serializable subset for the evidence layer.
 
-        Cache routing: ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``)
-        takes priority; ``run_id`` is the fallback. The provider's
-        ``prompt_cache_retention`` is forwarded only when set, so vendor
-        defaults apply otherwise.
+        Cache routing: ``prompt_cache_key`` is sent only when a prefix is
+        known — the constructor ``cache_key_prefix`` first, then the per-call
+        one (the agent loop passes ``"{agent_name}:{model}"``). ``run_id`` is
+        accepted for interface compatibility and never used as a key. The
+        provider's ``prompt_cache_retention`` is forwarded only when set, so
+        vendor defaults apply otherwise.
         """
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools) if tools else openai.NOT_GIVEN
@@ -369,11 +381,12 @@ class OpenAIProvider(LLMProvider):
             if key in kwargs:
                 api_kwargs[key] = kwargs.pop(key)
 
-        # Cache routing — derive key from prefix or run_id.
+        # Cache routing — never keyed on run_id: a per-run key scatters one
+        # conversation's runs across cache lanes and defeats cross-run hits.
         # Skip on non-OpenAI base_urls (Groq/Together/vLLM/etc.) since some
         # compatible backends reject unknown OpenAI-specific request fields.
         if is_openai_endpoint:
-            cache_key_source = cache_key_prefix or run_id
+            cache_key_source = self._cache_key_prefix or cache_key_prefix
             if cache_key_source:
                 api_kwargs["prompt_cache_key"] = f"dendrux:{cache_key_source}"
             if self._prompt_cache_retention is not None:
@@ -426,9 +439,10 @@ class OpenAIProvider(LLMProvider):
         kwargs override constructor defaults (e.g. model, max_tokens, temperature).
         Only supported kwargs are forwarded; unknown keys are ignored.
 
-        ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``) and
-        ``run_id`` together drive the ``prompt_cache_key`` sent to OpenAI —
-        prefix preferred, run_id as fallback.
+        ``cache_key_prefix`` (typically ``"{agent_name}:{model}"``) drives the
+        ``prompt_cache_key`` sent to OpenAI (a constructor
+        ``cache_key_prefix`` takes precedence). ``run_id`` is never used as
+        a key.
 
         When output_schema is provided, sets response_format to json_schema
         with strict mode. The response is a JSON string in message.content.
@@ -473,8 +487,9 @@ class OpenAIProvider(LLMProvider):
         Tool call arguments are buffered by index and flushed as complete
         TOOL_USE_END events when the terminal finish_reason arrives.
 
-        ``cache_key_prefix`` / ``run_id`` drive ``prompt_cache_key`` for
-        OpenAI cache pool routing.
+        ``cache_key_prefix`` drives ``prompt_cache_key`` for OpenAI cache
+        pool routing (a constructor ``cache_key_prefix`` takes precedence).
+        ``run_id`` is never used as a key.
 
         At stream end, yields a DONE event carrying the full LLMResponse.
 

@@ -1039,6 +1039,20 @@ class TestAnthropicCache:
         captured = await _captured_complete(provider)
         assert captured["extra_body"]["cache_control"] == mine
 
+    async def test_never_sends_openai_prompt_cache_key(self) -> None:
+        # prompt_cache_key is OpenAI-endpoint-only; OpenRouter never gets it,
+        # whether from run_id, the loop prefix, or a constructor prefix.
+        captured = await _captured_complete(
+            _provider(model="anthropic/claude-sonnet-4.6"),
+            run_id="run_abc",
+            cache_key_prefix="agent:model",
+        )
+        assert "prompt_cache_key" not in captured
+        captured = await _captured_complete(
+            _provider(cache_key_prefix="customer-42"), run_id="run_abc"
+        )
+        assert "prompt_cache_key" not in captured
+
     async def test_per_call_extra_body_cache_control_wins(self) -> None:
         mine = {"type": "ephemeral", "ttl": "1h"}
         provider = _provider(model="anthropic/claude-sonnet-4.6")
