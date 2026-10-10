@@ -27,7 +27,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.tool import get_tool_def, is_tool
@@ -824,6 +824,9 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        runs: list[str] | None = ...,
+        replay_last: int | Literal["all"] = ...,
+        replay_reasoning: bool = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -840,6 +843,9 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        runs: list[str] | None = ...,
+        replay_last: int | Literal["all"] = ...,
+        replay_reasoning: bool = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -854,6 +860,9 @@ class Agent:
         *,
         history: list[ChatMessage] | None = None,
         context: list[ContextBlock] | None = None,
+        runs: list[str] | None = None,
+        replay_last: int | Literal["all"] = 0,
+        replay_reasoning: bool = True,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
@@ -885,6 +894,26 @@ class Agent:
                 ``"dynamic"`` (default) fold into the current user message
                 (volatile tail). Read-only, never persisted as forward state;
                 the idempotency hash includes it. See ``dendrux.context_blocks``.
+            runs: Optional ordered run ids of this conversation branch (the
+                app owns the thread; Dendrux has no thread concept). Each run
+                is rebuilt from its own persisted traces and replayed ahead of
+                ``history`` and the new input, so the model remembers its
+                earlier tool work. Requires persistence. Runs must exist,
+                belong to ``tenant_id``, and be terminal, else
+                ``ReplayRunError`` is raised before anything is created.
+                Cannot be combined with ``placement="stable"`` context blocks
+                (the first replayed run already carries its stable band).
+            replay_last: How many of the most recent ``runs`` replay in full
+                (text + tool calls + results); older ones replay as question +
+                answer only. ``0`` (default) = all text-only; ``"all"`` = all
+                full. SingleCall agents accept only ``0``.
+            replay_reasoning: Also replay stored reasoning blocks for runs in
+                the full window (default True). Kept only while a run's
+                recorded prefix (provider, model, rendered system prompt,
+                tools, and what preceded it) matches the current request;
+                from the first mismatch onward reasoning is dropped with a
+                warning. Forced off when guardrails are configured. What was
+                replayed and dropped is reported on ``RunResult.replay``.
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
             notifier: Optional notifier for lifecycle events (e.g. ConsoleNotifier
@@ -898,8 +927,9 @@ class Agent:
                 returned. If still active, RunAlreadyActiveError is raised. If the
                 same key is reused with different input, IdempotencyConflictError
                 is raised. Requires persistence (database_url, state_store, or
-                DENDRUX_DATABASE_URL). The hash includes ``history`` — same input
-                with different history is treated as a different request.
+                DENDRUX_DATABASE_URL). The hash includes ``history``, ``context``
+                and the ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs —
+                same input with a different prefix is a different request.
             **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
                 the provider's configured model for this call only (e.g.
                 ``model="claude-opus-4-1"``) — useful for per-turn model selection
@@ -918,8 +948,9 @@ class Agent:
             model text is returned.
 
         Raises:
-            ValueError: If no provider is configured, or if idempotency_key
-                is provided without persistence.
+            ValueError: If no provider is configured, if idempotency_key
+                is provided without persistence, or if the replay knobs are
+                invalid (``ReplayRunError`` for a bad run id).
             RunAlreadyActiveError: If idempotency_key matches an active run.
             IdempotencyConflictError: If idempotency_key is reused with
                 different request parameters.
@@ -972,6 +1003,9 @@ class Agent:
             user_input=user_input,
             history=history,
             context=context,
+            runs=runs,
+            replay_last=replay_last,
+            replay_reasoning=replay_reasoning,
             state_store=store,
             tenant_id=tenant_id,
             metadata=metadata,
@@ -1440,6 +1474,9 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        runs: list[str] | None = ...,
+        replay_last: int | Literal["all"] = ...,
+        replay_reasoning: bool = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -1455,6 +1492,9 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        runs: list[str] | None = ...,
+        replay_last: int | Literal["all"] = ...,
+        replay_reasoning: bool = ...,
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
@@ -1468,6 +1508,9 @@ class Agent:
         *,
         history: list[ChatMessage] | None = None,
         context: list[ContextBlock] | None = None,
+        runs: list[str] | None = None,
+        replay_last: int | Literal["all"] = 0,
+        replay_reasoning: bool = True,
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
@@ -1519,11 +1562,19 @@ class Agent:
                 with ASSISTANT, no consecutive same-role messages, no empty
                 content. Invalid history raises ``ValueError`` synchronously
                 (before the stream begins).
+            context: Optional per-run context blocks — see :meth:`run`.
+            runs: Earlier run ids to replay — see :meth:`run`. Invalid knobs
+                raise synchronously; run-id problems (missing, other tenant,
+                not terminal) arrive as ``RUN_ERROR`` with
+                ``result.meta["error_type"] == "ReplayRunError"``.
+            replay_last: Full-replay window — see :meth:`run`.
+            replay_reasoning: Reasoning replay — see :meth:`run`.
             tenant_id: Optional tenant ID for multi-tenant isolation.
             metadata: Optional developer linking data (thread_id, user_id, etc.).
             notifier: Optional notifier for lifecycle events.
             idempotency_key: Duplicate prevention using run()'s fingerprint
-                (agent name, input, history, context, and output type). Requires
+                (agent name, input, history, context, replay knobs, and output
+                type). Requires
                 persistence. A terminal match yields one cached terminal event
                 with the existing run_id and summary result; no text/tool events
                 are replayed, so .text() yields nothing on a cache hit. An active
@@ -1577,6 +1628,9 @@ class Agent:
             user_input=user_input,
             history=history,
             context=context,
+            runs=runs,
+            replay_last=replay_last,
+            replay_reasoning=replay_reasoning,
             state_store_resolver=self._resolve_state_store,
             tenant_id=tenant_id,
             metadata=metadata,

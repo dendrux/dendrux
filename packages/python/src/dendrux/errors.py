@@ -14,6 +14,7 @@ Suggested HTTP mappings:
     RunAlreadyClaimedError      -> 409
     RunAlreadyTerminalError     -> 409
     InvalidToolResultError      -> 400
+    ReplayRunError              -> 400 (404 when reason == "not_found")
     PersistenceNotConfiguredError -> 500
     SchemaNotInitializedError   -> 500
 """
@@ -151,10 +152,25 @@ class SchemaNotInitializedError(RuntimeError):
         )
 
 
+class ReplayRunError(ValueError):
+    """Raised when a run passed via ``agent.run(runs=...)`` cannot be replayed.
+
+    ``reason`` is one of ``"not_found"``, ``"tenant_mismatch"``,
+    ``"not_terminal"``, ``"duplicate"``. Raised before any run is created
+    or any model is called.
+    """
+
+    def __init__(self, run_id: str, reason: str, detail: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        super().__init__(f"Cannot replay run '{run_id}': {detail}")
+
+
 __all__ = [
     "InvalidToolResultError",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
+    "ReplayRunError",
     "RunAlreadyClaimedError",
     "RunAlreadyTerminalError",
     "RunNotFoundError",

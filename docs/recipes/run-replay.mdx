@@ -1,0 +1,91 @@
+---
+title: Memory across runs — replay earlier turns with runs=
+description: Pass the run ids of a conversation and Dendrux replays its own traces — tool calls, results and reasoning — so the model stops re-exploring what it already learned. Three knobs, one summary, prompt-cache friendly.
+---
+
+# Memory across runs — replay earlier turns with `runs=`
+
+## The problem
+
+`history=` carries text only: the question and the answer of each earlier turn. For a tool-using chat that is not enough. On turn 2 the model has forgotten the schema it explored, the rows it read and the reasoning that connected them, so it explores again — the same `list_tables`, the same `describe_table`, the same queries — sometimes until it hits `max_iterations`. Every major vendor now recommends replaying earlier turns verbatim, tool calls and reasoning included.
+
+Your app already stores something Dendrux does not: the order of runs in a conversation. Dendrux already stores something your app does not: what each run actually did. `runs=` joins the two.
+
+```python
+result = await agent.run(
+    user_text,
+    runs=thread.run_ids,        # ordered run ids of this conversation (yours)
+    replay_last="all",          # replay every one of them in full
+    replay_reasoning=True,      # and their reasoning, while the prefix allows
+)
+thread.run_ids.append(result.run_id)
+```
+
+Dendrux rebuilds each run from its own `react_traces` (user message as it was sent, assistant text, tool calls, tool results, reasoning blocks) and puts them ahead of the new input. Nothing is re-persisted; the exact prompt is in `llm_interactions.provider_request` as always. `agent.stream()` takes the same three arguments.
+
+## The three knobs
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `runs` | `None` | Ordered run ids of this conversation branch. You own the thread; Dendrux has no thread concept. Runs must exist, belong to the same `tenant_id`, and be terminal. |
+| `replay_last` | `0` | How many of the most recent runs replay in **full** (text + tool calls + results). Older runs replay as question + answer only. `0` = all text-only, `"all"` = all full. |
+| `replay_reasoning` | `True` | Also replay stored reasoning blocks of the full runs — subject to the prefix rule below. |
+
+`history=` still works alongside `runs=`: runs expand first, your `history` messages come after (useful for app-side markers), then the new input. `context=` dynamic blocks fold into the new input as usual; `placement="stable"` blocks are rejected with `runs=`, because the first replayed run already carries the stable band it was created with.
+
+Validation happens before anything is created: unknown run, another tenant's run, a run still running or paused, duplicates → `ReplayRunError` (a `ValueError`). On `stream()` those arrive as a `RUN_ERROR` event with `meta["error_type"] == "ReplayRunError"`. SingleCall agents accept only `replay_last=0`. `retry()` of a run that used `runs=` re-expands the same runs with the same knobs. The idempotency fingerprint includes all three knobs.
+
+## Which setting to pick
+
+Measured on `claude-sonnet-4-6` with thinking on, a 5-turn database chat with a ~2.7k-token prefix (turn 4 shown):
+
+| Setting | Turn-4 cache read | Turn-4 cache write | What the model remembers |
+| --- | ---: | ---: | --- |
+| `replay_last="all"`, reasoning on | 6223 | 473 | everything: tools, results, reasoning |
+| `replay_last="all"`, `replay_reasoning=False` | 3210 | 1818 | tools and results; previous turn is rewritten each turn |
+| thinking off | 4286 | 166 | tools and results |
+| a tool added mid-conversation | 0 | 6938 | everything — at full price, once |
+
+OpenAI and OpenRouter (`google/gemma-4-31b-it`) show the same shape. Rules of thumb:
+
+- **Tool-heavy chat, short to medium threads:** `replay_last="all"`. Cheapest *and* smartest — every turn reads the whole earlier conversation from cache.
+- **Long threads:** a window (`replay_last=3`) keeps the prompt bounded. Older turns collapse to question + answer. Reasoning continuity is lost from the run where the window first moved (see below); tools and results inside the window still replay.
+- **Plain Q&A without tools:** `history=` or `replay_last=0` is enough.
+
+## Reasoning and the prefix rule
+
+Reasoning blocks are bound to the exact prefix they were produced under: system prompt, tools, every earlier message. Anthropic rejects a mismatched block (enforced by default for accounts created on or after 2026-08-31 on the newest models), OpenAI silently ignores reasoning from another model family, and a different vendor cannot read another's blocks at all.
+
+So Dendrux records a **prefix descriptor** on every run (`agent_runs.meta["dendrux.prefix"]`: provider, model, a hash of the rendered system prompt including skills, a hash of the tool definitions, and what preceded the run). On replay, a run's reasoning is kept only if its descriptor matches what precedes it in the current request. From the first mismatch onward reasoning is dropped for that run and every later one — a trailing strip, which every vendor accepts — with one warning per run naming what changed: `model`, `system`, `tools`, `seed` (what preceded it changed, e.g. the window moved), `cross-vendor`, or `predates-metadata` (runs created before this feature). Tool calls and text always replay; only reasoning is dropped.
+
+The plain consequence: **reasoning continuity across turns needs `replay_last="all"` and an unchanged prompt and tool set for the life of the conversation.** A sliding window drops reasoning for every run after the shift. With guardrails configured, reasoning is forced off (re-anonymisation changes the prefix) and the summary says so.
+
+On Anthropic, when replayed thinking is on the wire Dendrux also sends the `thinking-binding-controls-2026-08-01` beta with `prefix_mismatch_behavior: "drop_block"`, so an edge the descriptor missed degrades instead of returning a 400.
+
+## Three rules of the road
+
+1. **Freeze the tools and the prompt for the conversation.** Any change rewrites the cache from that point on (the "tool added" row above) and drops replayed reasoning. Declare every tool the conversation may need on turn 1.
+2. **Say up front that tools can disappear.** Replayed tool calls are sent verbatim even when that tool is no longer offered (Dendrux warns, and the unknown-tool error plus parameter validation are the safety net). Put a static line in the system prompt *from turn 1*, e.g. "Tools used in earlier turns may no longer be available; only call tools offered in this request." Adding it later is itself a prompt edit.
+3. **Use a 1-hour cache TTL for chat.** Users pause longer than five minutes. `AnthropicProvider(..., cache_ttl="1h")`.
+
+Dendrux adds one extra Anthropic cache breakpoint at the end of the replayed region (system, stable head, last replayed message, last message — four of four), so a long replayed turn never falls outside the 20-block lookback.
+
+## Provider notes
+
+- **Anthropic:** full prefix hits from turn 2. Replayed thinking is accepted across turns on the same model.
+- **OpenAI Responses:** cache reads lag and are best-effort — a hit can arrive a turn late even with an identical prefix. Note that "thinking off" still reasons on GPT-5 models; you just don't get the items back to replay. Set `cache_key_prefix` per user or customer, not per run.
+- **OpenRouter:** cache hits depend on which upstream serves the request; pin a provider in routing preferences for steady hits. Dendrux turns off OpenRouter's `context-compression` plugin, which would otherwise silently trim replayed history on small-context endpoints.
+- Replaying a tool call whose tool is absent from the current `tools` was accepted by every vendor we tested.
+
+## Observability
+
+```python
+result.replay
+# ReplaySummary(runs_full=[...], runs_text=[...],
+#               reasoning_kept=[...], reasoning_dropped=[...],
+#               warnings=["run 01J…: reasoning dropped (seed changed since the run was created)"])
+```
+
+`result.replay` is `None` when `runs=` was not used. The same summary, plus the knobs, is stored in `agent_runs.meta["dendrux.replay"]` and surfaced on `RunStore.list_runs()` / `get_run()` as `RunSummary.replay` / `RunDetail.replay`; the dashboard run list carries `continued_from`. Warnings are also logged on the `dendrux.runtime.replay` logger.
+
+A runnable walkthrough printing per-turn cache reads and writes is in `examples/34_run_replay.py`.
