@@ -47,6 +47,7 @@ Agent(
     skills_dir: str | Path | None = None,
     skills: list[Skill] | None = None,
     deny_skills: list[str] | None = None,
+    tool_result_transform: ToolResultTransform | None = None,
 )
 ```
 
@@ -70,8 +71,38 @@ Agent(
 | `pricing` | A `PriceTable` of USD-per-million-token rates used to fill `cost_usd` for providers that report tokens only. See [Cost and pricing](/docs/architecture/pricing). |
 | `guardrails` | List of guardrails scanned each turn. See [Guardrails](/docs/architecture/guardrails). |
 | `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. See [Skills](/docs/architecture/skills). |
+| `tool_result_transform` | Callable that rewrites a server tool's result before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
 
 Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, and tools with `SingleCall` all raise `ValueError`.
+
+### Transforming tool results
+
+`tool_result_transform` runs after every successful server-executed tool call — local `@tool` functions and MCP tools alike — and before the result is serialized. Whatever it returns becomes the result: the persisted `ToolInvocation.result`, the `TOOL` message the model sees, and the notifier/stream events all carry the transformed value.
+
+```python
+from dendrux import Agent, ToolResultContext
+
+counter = 0
+
+def tag_tables(ctx: ToolResultContext):
+    global counter
+    if not isinstance(ctx.result, list):
+        return ctx.result            # always return something: ctx.result keeps it unchanged
+    counter += 1
+    return {"result_id": f"r{counter}", "rows": ctx.result}
+
+agent = Agent(provider=provider, prompt="...", tools=[query_sales],
+              tool_sources=[warehouse_view], tool_result_transform=tag_tables)
+```
+
+`ToolResultContext` is frozen and carries `tool_name`, `call_id`, `params`, `result` (the raw Python return value), `target`, and `meta` (the tool's `ToolDef.meta`; for MCP tools it includes `source_name`, `namespace`, and `mcp_tool_name`). Sync and async callables are both accepted.
+
+- The return value always replaces the result. Return `ctx.result` to leave it unchanged — `None` is a real result, not "no change".
+- If the transform raises, the tool call fails (`success=False`) with an error naming `tool_result_transform`; the model sees it as a tool error.
+- It is not applied to failed tool calls, nor to results your client submits via `submit_tool_results`.
+- It also runs for tools executed on resume after `submit_approval`.
+- It runs on the raw result; guardrails scan the serialized tool message afterwards. MCP results arrive in their adapted form (e.g. `structuredContent` as `{"result": ...}`).
+- Sync transforms run on the event loop, so keep them cheap.
 
 ## `run`
 

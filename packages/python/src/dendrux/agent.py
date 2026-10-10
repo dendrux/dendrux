@@ -51,7 +51,14 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
     from dendrux.skills._loader import Skill
     from dendrux.tools import ToolLookups
-    from dendrux.types import Budget, RunResult, RunStream, ToolDef, ToolResult
+    from dendrux.types import (
+        Budget,
+        RunResult,
+        RunStream,
+        ToolDef,
+        ToolResult,
+        ToolResultTransform,
+    )
 
 _agent_logger = logging.getLogger(__name__)
 
@@ -215,6 +222,7 @@ class Agent:
         skills_dir: str | Path | None = ...,
         skills: list[Skill] | None = ...,
         deny_skills: list[str] | None = ...,
+        tool_result_transform: ToolResultTransform | None = ...,
     ) -> None: ...
 
     @overload
@@ -241,6 +249,7 @@ class Agent:
         skills_dir: str | Path | None = ...,
         skills: list[Skill] | None = ...,
         deny_skills: list[str] | None = ...,
+        tool_result_transform: ToolResultTransform | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -266,6 +275,7 @@ class Agent:
         skills_dir: str | Path | None = None,
         skills: list[Skill] | None = None,
         deny_skills: list[str] | None = None,
+        tool_result_transform: ToolResultTransform | None = None,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -331,6 +341,12 @@ class Agent:
         self._budget: Budget | None = budget
         self._pricing: PriceTable | None = pricing
         self._guardrails: list[Guardrail] | None = guardrails if guardrails else None
+        if tool_result_transform is not None and not callable(tool_result_transform):
+            raise ValueError(
+                f"Agent '{self.name}' tool_result_transform must be callable, "
+                f"got {type(tool_result_transform).__name__}."
+            )
+        self._tool_result_transform: ToolResultTransform | None = tool_result_transform
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
 
@@ -465,6 +481,28 @@ class Agent:
     def guardrails(self) -> list[Guardrail] | None:
         """Content guardrails, or None."""
         return self._guardrails
+
+    @property
+    def tool_result_transform(self) -> ToolResultTransform | None:
+        """Hook that rewrites server tool results, or None.
+
+        Called with a :class:`~dendrux.types.ToolResultContext` after every
+        successful server-executed tool call (local ``@tool`` and MCP alike,
+        including tools run on resume after ``submit_approval``) and before
+        the result is JSON-serialized. Its return value always replaces the
+        result — return ``ctx.result`` to keep it. The transformed value is
+        what gets persisted, notified and sent to the model.
+
+        - Not applied to failed tool calls or to client-submitted results
+          (``submit_tool_results``). The built-in ``use_skill`` tool is a
+          server tool too; check ``ctx.tool_name`` to skip it.
+        - If the transform raises, the tool call fails (``success=False``)
+          with an error naming the transform.
+        - Runs on the raw result; guardrail scans of tool messages happen
+          afterwards, on the serialized content.
+        - Sync transforms run inline on the event loop — keep them cheap.
+        """
+        return self._tool_result_transform
 
     @property
     def provider(self) -> LLMProvider | None:
@@ -1754,6 +1792,7 @@ class Agent:
             lookups.explicit_timeout[td.name] = td.has_explicit_timeout
             lookups.max_calls[td.name] = td.max_calls_per_run
             lookups.parallel[td.name] = td.parallel
+            lookups.meta[td.name] = td.meta
 
         return lookups
 

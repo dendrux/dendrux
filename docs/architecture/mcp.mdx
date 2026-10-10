@@ -556,7 +556,7 @@ An Agent caches discovery for its lifetime, so a source skipped once stays skipp
 
 ## Calls, errors, and result limits
 
-MCP calls pass through the ordinary Dendrux server-tool execution path: deny rules, approval pauses, guardrails, call limits, timeouts, persisted tool calls, and completion/error events work the same way as for local tools.
+MCP calls pass through the ordinary Dendrux server-tool execution path: deny rules, approval pauses, guardrails, call limits, timeouts, persisted tool calls, [`tool_result_transform`](/docs/reference/agent#transforming-tool-results), and completion/error events work the same way as for local tools.
 
 The integration preserves:
 

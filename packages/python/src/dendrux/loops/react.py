@@ -70,6 +70,7 @@ from dendrux.types import (
     StreamEventType,
     ToolCall,
     ToolResult,
+    ToolResultContext,
     ToolTarget,
     UsageStats,
     generate_ulid,
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
+    from dendrux.types import ToolResultTransform
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +390,7 @@ async def _process_tool_calls(
     deny: frozenset[str] | None = None,
     require_approval: frozenset[str] | None = None,
     guardrail_engine: GuardrailEngine | None = None,
+    tool_result_transform: ToolResultTransform | None = None,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -540,6 +543,7 @@ async def _process_tool_calls(
                         run_id,
                         iteration,
                         warnings,
+                        tool_result_transform,
                     )
                     for tc in group
                 ]
@@ -549,7 +553,7 @@ async def _process_tool_calls(
             for tc in group:
                 await _record_tool_started(recorder, run_id, tc, iteration)
                 await _notify_tool_started(notifier, run_id, tc, iteration, warnings)
-                tool_result = await _execute_tool(tc, lookups)
+                tool_result = await _execute_tool(tc, lookups, tool_result_transform)
                 await _record_tool(recorder, run_id, tc, tool_result, iteration)
                 await _notify_tool(notifier, run_id, tc, tool_result, iteration, warnings)
                 executed.append((tc, tool_result))
@@ -1027,6 +1031,7 @@ class ReActLoop(Loop):
                     warnings=notifier_warnings,
                     deny=agent.deny,
                     require_approval=agent.require_approval,
+                    tool_result_transform=agent.tool_result_transform,
                     guardrail_engine=g_engine,
                 )
                 if outcome.pending_calls:
@@ -1376,6 +1381,7 @@ class ReActLoop(Loop):
                     warnings=notifier_warnings,
                     deny=agent.deny,
                     require_approval=agent.require_approval,
+                    tool_result_transform=agent.tool_result_transform,
                     guardrail_engine=None,  # streaming + guardrails banned at Agent level
                 )
                 for tc, tool_result in outcome.all_results:
@@ -1511,6 +1517,7 @@ async def _execute_record_notify(
     run_id: str,
     iteration: int,
     notifier_warnings: list[str],
+    transform: ToolResultTransform | None = None,
 ) -> tuple[ToolCall, ToolResult]:
     """Execute a tool, record, then notify — for parallel execution.
 
@@ -1519,7 +1526,7 @@ async def _execute_record_notify(
     """
     await _record_tool_started(recorder, run_id, tool_call, iteration)
     await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
-    result = await _execute_tool(tool_call, lookups)
+    result = await _execute_tool(tool_call, lookups, transform)
     await _record_tool(recorder, run_id, tool_call, result, iteration)
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
     return tool_call, result
@@ -1528,11 +1535,17 @@ async def _execute_record_notify(
 async def _execute_tool(
     tool_call: ToolCall,
     lookups: ToolLookups,
+    transform: ToolResultTransform | None = None,
 ) -> ToolResult:
     """Execute a server tool function and return a ToolResult.
 
     Non-server tools are filtered out by the loop before reaching this
     function. They trigger a pause instead of execution.
+
+    ``transform`` (``Agent.tool_result_transform``) rewrites the raw
+    return value of a successful call before serialization, so the
+    store, notifiers and the model all see the transformed result.
+    A transform that raises fails the call.
     """
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
@@ -1556,6 +1569,23 @@ async def _execute_tool(
         result = await asyncio.wait_for(coro, timeout=timeout_s)
 
         duration_ms = int((time.monotonic() - start) * 1000)
+        if transform is not None:
+            try:
+                result = await _apply_result_transform(transform, tool_call, lookups, result)
+            except Exception as transform_err:
+                error_msg = (
+                    f"tool_result_transform failed for tool '{tool_call.name}': "
+                    f"{type(transform_err).__name__}: {transform_err}"
+                )
+                logger.warning("%s", error_msg)
+                return ToolResult(
+                    name=tool_call.name,
+                    call_id=tool_call.id,
+                    payload=json.dumps({"error": error_msg}),
+                    success=False,
+                    error=error_msg,
+                    duration_ms=duration_ms,
+                )
         try:
             payload = json.dumps(result)
         except (TypeError, ValueError) as ser_err:
@@ -1600,3 +1630,23 @@ async def _execute_tool(
             error=str(e),
             duration_ms=duration_ms,
         )
+
+
+async def _apply_result_transform(
+    transform: ToolResultTransform,
+    tool_call: ToolCall,
+    lookups: ToolLookups,
+    result: Any,
+) -> Any:
+    ctx = ToolResultContext(
+        tool_name=tool_call.name,
+        call_id=tool_call.id,
+        params=tool_call.params,
+        result=result,
+        target=lookups.target.get(tool_call.name, ToolTarget.SERVER),
+        meta=lookups.meta.get(tool_call.name, {}),
+    )
+    out = transform(ctx)
+    if inspect.isawaitable(out):
+        out = await out
+    return out

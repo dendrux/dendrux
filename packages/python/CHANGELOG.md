@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Tools: `Agent(tool_result_transform=...)` rewrites the result of every
+  successful server-executed tool call (local `@tool` and MCP alike, including
+  tools run after `submit_approval`) before it is serialized. The transformed
+  value is what gets persisted, notified, and sent to the model. Receives a
+  frozen `ToolResultContext` (tool name, call id, params, raw result, target,
+  `ToolDef.meta`); sync or async. A raising transform fails the call. Not
+  applied to failed calls or to `submit_tool_results`.
+
 ## 0.2.0a18 - 2026-10-01
 
 - Runs: task cancellation of `agent.run()` now CAS-finalizes a running row as
