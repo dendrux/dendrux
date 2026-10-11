@@ -1,7 +1,51 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a19 - 2026-10-11
 
+- Runs: `agent.run()` / `agent.stream()` accept `runs=[...]` (ordered run ids
+  of the conversation branch), `replay_last=0 | N | "all"` and
+  `replay_reasoning=True` to replay earlier runs into the new request: text
+  only by default, or tool calls + results (+ reasoning) for the most recent
+  runs. Reasoning replays only when a run's recorded prefix (provider, model,
+  system prompt, tools, seed) matches what precedes it now; from the first
+  mismatch onward it is dropped with a warning. Tool calls replay verbatim even
+  when the tool is no longer offered (warning). `RunResult.replay`
+  (`ReplaySummary`) and `agent_runs.meta["dendrux.replay"]` record what was
+  replayed and why; `ReplayRunError` is raised before any model call for
+  unknown, foreign-tenant or non-terminal run ids. `retry()` re-expands the
+  same runs. Guardrails force reasoning replay off.
+- Anthropic: thinking / redacted_thinking blocks are replayed on assistant
+  turns across tool-loop steps (only when thinking is on for the request);
+  replayed thinking sends `thinking.block_binding.prefix_mismatch_behavior=
+  "drop_block"` with the `thinking-binding-controls-2026-08-01` beta header;
+  an extra cache breakpoint lands on the last replayed message.
+- OpenAI Responses: reasoning items are replayed before that turn's
+  function calls (null fields dropped); `phase` ("commentary" |
+  "final_answer") is resent on assistant input items. Both OpenAI providers
+  take a constructor `cache_key_prefix`; `prompt_cache_key` is sent only when a
+  prefix is known and is never derived from the run id.
+- OpenRouter: the context-compression plugin is disabled by default (a dev
+  `plugins` entry wins); `anthropic_cache=True` sends OpenRouter's top-level
+  automatic `cache_control` for `anthropic/` models.
+- Reasoning blocks and the producing model are persisted in
+  `react_traces.meta`, so `retry()` keeps a tool loop's reasoning.
+- Streams / results: assistant text is tagged `commentary` (narration in a
+  step that ended in tool calls) or `final_answer`. `RunResult.commentary`
+  lists the narration per step; `RunEvent` carries `iteration` and `phase`
+  (`phase` is set on tool events, on `RUN_COMPLETED`, and on `TEXT_DELTA` when
+  the provider labels it natively); `TraceEntry.phase` on persisted traces.
+- Tools: schema generation supports `Literal` / `Enum` (→ `enum`),
+  `Annotated[T, Field(description=...)]` and Google-style `Args:` docstrings
+  (per-parameter descriptions), pydantic models / dataclasses / `TypedDict`
+  (nested objects, `$defs` inlined), `dict[str, T]`, and nullable optionals
+  (`["string", "null"]`). `@tool(parameters=...)` passes an explicit schema;
+  `@tool(strict=True)` normalizes it for OpenAI strict function calling and
+  OpenAI providers send `"strict": true`.
+- Tools: tool-call arguments are validated against the tool's schema before
+  execution (unknown names, missing required, basic types, `enum`, nullable
+  type arrays; tolerant of `anyOf` / `$ref`). Invalid calls never run the tool
+  and return a model-facing error (`code: "invalid_params"`), recorded as a
+  failed invocation. Applies to local, MCP and approval-resumed calls.
 - Tools: `Agent(tool_result_transform=...)` rewrites the result of every
   successful server-executed tool call (local `@tool` and MCP alike, including
   tools run after `submit_approval`) before it is serialized. The transformed
@@ -9,6 +53,12 @@
   frozen `ToolResultContext` (tool name, call id, params, raw result, target,
   `ToolDef.meta`); sync or async. A raising transform fails the call. Not
   applied to failed calls or to `submit_tool_results`.
+- Runs: concurrent `cancel_run()` calls on the same paused run both report
+  `cancelled` (idempotent-cancel race fixed).
+- Docs: "Memory across runs" recipe, "Tools" reference, commentary / phase
+  contract, OpenRouter caching + compression notes; the app-database-boundary
+  recipe now stores `result.answer` instead of concatenating every
+  `TEXT_DELTA`.
 
 ## 0.2.0a18 - 2026-10-01
 
