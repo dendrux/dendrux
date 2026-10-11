@@ -84,7 +84,18 @@ async def test_approval_resume_valid_call_still_executes(store):
 
 
 BAD_REFUND_ARGS = '{"order_id": 7,}'
-BAD_REFUND_ERROR = "Expecting property name enclosed in double quotes at char 15"
+
+
+def _decoder_error(raw: str) -> str:
+    """The parser's message for ``raw`` on this interpreter (wording varies by Python version)."""
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return f"{exc.msg} at char {exc.pos}"
+    raise AssertionError(f"expected invalid JSON: {raw!r}")
+
+
+BAD_REFUND_ERROR = _decoder_error(BAD_REFUND_ARGS)
 
 
 def _bad_refund() -> ToolCall:
