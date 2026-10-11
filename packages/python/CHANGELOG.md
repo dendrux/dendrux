@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a20 - 2026-10-12
 
 - Tools: a tool call whose arguments are not valid JSON (or are JSON but not
   an object) is now a failed tool call, not a failed run, in both
