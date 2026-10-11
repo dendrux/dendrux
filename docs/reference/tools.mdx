@@ -67,9 +67,7 @@ Some types are rejected at decoration time with a `TypeError` that names the par
 
 For any of these, pass the schema yourself with `parameters=`.
 
-<Callout type="info">
-Arguments reach your function as JSON-decoded values. A `BaseModel`, dataclass, or `TypedDict` parameter receives a `dict`, and an `Enum` parameter receives the raw value. Validate the input yourself, for example with `Node.model_validate(raw)` or `Unit(raw)`.
-</Callout>
+> **Arguments arrive as JSON-decoded values.** A `BaseModel`, dataclass, or `TypedDict` parameter receives a `dict`, and an `Enum` parameter receives the raw value. Validate the input yourself, for example with `Node.model_validate(raw)` or `Unit(raw)`.
 
 ## Parameter descriptions
 
