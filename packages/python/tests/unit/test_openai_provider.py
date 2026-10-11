@@ -375,8 +375,8 @@ class TestProviderConstruction:
 # Edge cases and error handling
 # ---------------------------------------------------------------------------
 class TestEdgeCases:
-    def test_malformed_json_arguments_raises_helpful_error(self, provider: OpenAIProvider) -> None:
-        """Compatible APIs may return truncated JSON — error should identify the tool."""
+    def test_malformed_json_arguments_become_failed_parse(self, provider: OpenAIProvider) -> None:
+        """Truncated JSON yields a ToolCall with parse_error instead of raising."""
         response = FakeChatCompletion(
             choices=[
                 FakeChoice(
@@ -392,8 +392,14 @@ class TestEdgeCases:
                 )
             ],
         )
-        with pytest.raises(ValueError, match="broken.*invalid JSON"):
-            provider._normalize_response(response)
+        result = provider._normalize_response(response)
+        assert result.tool_calls is not None
+        tc = result.tool_calls[0]
+        assert tc.name == "broken"
+        assert tc.params == {}
+        assert tc.raw_arguments == '{"a": 1, "b":'
+        assert tc.parse_error == "Expecting value at char 13"
+        assert tc.provider_tool_call_id == "call_1"
 
     def test_duplicate_call_id_raises(self, provider: OpenAIProvider) -> None:
         """Duplicate Dendrux call_id should raise, not silently overwrite."""
@@ -1067,6 +1073,8 @@ class TestCompleteStream:
 
         end = next(e for e in events if e.type == StreamEventType.TOOL_USE_END)
         assert end.tool_call.params == {}
+        assert end.tool_call.raw_arguments == "{bad json"
+        assert end.tool_call.parse_error is not None
 
     async def test_stream_args_before_name(self, provider: OpenAIProvider) -> None:
         """Arguments arriving before name for the same index are not dropped."""

@@ -22,9 +22,8 @@ import openai
 
 from dendrux.llm._helpers import (
     build_call_index,
+    build_tool_call,
     connection_error,
-    parse_tool_json_lossy,
-    parse_tool_json_strict,
     replayable_reasoning_blocks,
     resolve_tool_message_call,
     timeout_error,
@@ -555,17 +554,12 @@ class OpenAIResponsesProvider(LLMProvider):
                         self._model,
                         item_id,
                     )
-                params = parse_tool_json_lossy(
+                tc = build_tool_call(
+                    name,
                     raw_args or "",
+                    provider_tool_call_id=call_id,
                     provider="openai_responses",
                     model=self._model,
-                    tool_name=name,
-                    call_id=call_id,
-                )
-                tc = ToolCall(
-                    name=name,
-                    params=params,
-                    provider_tool_call_id=call_id,
                 )
                 tool_calls.append(tc)
                 yield StreamEvent(
@@ -728,16 +722,13 @@ class OpenAIResponsesProvider(LLMProvider):
         for item in response.output:
             item_type = getattr(item, "type", None)
             if item_type == "function_call":
-                params = parse_tool_json_strict(
-                    item.arguments or "",
-                    tool_name=item.name,
-                    call_id=item.call_id,
-                )
                 tool_calls.append(
-                    ToolCall(
-                        name=item.name,
-                        params=params,
+                    build_tool_call(
+                        item.name,
+                        item.arguments or "",
                         provider_tool_call_id=item.call_id,
+                        provider="openai_responses",
+                        model=self._model,
                     )
                 )
             elif item_type == "reasoning":

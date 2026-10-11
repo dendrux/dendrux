@@ -971,6 +971,10 @@ class TestCompleteStream:
         tool_end = [e for e in collected if e.type == StreamEventType.TOOL_USE_END][0]
         assert tool_end.tool_call.params == {}
         assert tool_end.tool_call.name == "broken"
+        assert tool_end.tool_call.raw_arguments == '{"a": INVALID'
+        assert tool_end.tool_call.parse_error == "Expecting value at char 6"
+        done = [e for e in collected if e.type == StreamEventType.DONE][0]
+        assert done.raw.tool_calls[0].parse_error == "Expecting value at char 6"
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1029,7 @@ class TestBoundaryHardening:
 
         assert any("Malformed tool call JSON" in r.message for r in caplog.records)
         assert any("provider=anthropic" in r.message for r in caplog.records)
+        assert not any("{bad" in r.getMessage() for r in caplog.records)
         tool_end = [e for e in collected if e.type == StreamEventType.TOOL_USE_END][0]
         assert tool_end.tool_call.params == {}
 

@@ -197,6 +197,14 @@ show argument 'limit' must be integer, got string.
 
 When a call has more than one problem, the messages are joined with `; `. The call is stored as a failed tool invocation (`success=False`, with `error` set to the message) and emits `tool.completed`, but no `tool.started`. Calls that fail validation do not count toward `max_calls_per_run`. Other calls in the same batch run normally. Small open-weight models are the most likely to produce malformed calls, and a short error that names the valid arguments lets them correct the call on the next turn.
 
+Arguments that are not valid JSON are rejected before any of these checks, and before deny and approval, so a malformed call never pauses a run. This happens the same way in `agent.run()` and `agent.stream()`. The model gets the decoder's error and is asked to send the call again:
+
+```json
+{"error": "Your arguments for `write_file` were not valid JSON (Expecting ',' delimiter at char 1234). Send the call again with valid JSON; for long content, write it in smaller pieces.", "code": "invalid_json"}
+```
+
+The call is recorded like any other rejected call (`success=False`, `tool.completed` without `tool.started`). Its `tool.completed` event and trace carry `parse_error` and `raw_length`. The raw argument text is never stored in traces, events, or tool invocations, and it never appears in an exception or log message. `max_iterations` bounds a model that keeps sending bad JSON.
+
 ## `SingleCall`: one LLM call, no tools
 
 `SingleCall` is a specialized loop for agents that do exactly one thing in one LLM turn: classification, summarization, extraction, one-shot Q&A. The source comment puts it plainly:

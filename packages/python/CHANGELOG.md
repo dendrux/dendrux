@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Tools: a tool call whose arguments are not valid JSON (or are JSON but not
+  an object) is now a failed tool call, not a failed run, in both
+  `agent.run()` and `agent.stream()`. The call is rejected before deny,
+  approval and parameter validation, with `code: "invalid_json"` and the
+  decoder error in the message, so the model can retry. Previously batch runs
+  raised `ValueError` (with the raw arguments in the message) and streams
+  passed `{}` on to a misleading "missing required argument(s)" error.
+  `ToolCall` gains `raw_arguments` (in memory only) and `parse_error`; traces,
+  pause state and the `tool.completed` event record `parse_error` and
+  `raw_length`, never the raw text.
+
 ## 0.2.0a19 - 2026-10-11
 
 - Runs: `agent.run()` / `agent.stream()` accept `runs=[...]` (ordered run ids

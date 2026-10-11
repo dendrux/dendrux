@@ -20,8 +20,8 @@ import httpx
 
 from dendrux.llm._helpers import (
     build_call_index,
+    build_tool_call,
     connection_error,
-    parse_tool_json_lossy,
     replayable_reasoning_blocks,
     resolve_tool_message_call,
     timeout_error,
@@ -492,17 +492,12 @@ class AnthropicProvider(LLMProvider):
                     elif event.type == "content_block_stop":
                         if _current_tool_name is not None:
                             raw_json = "".join(_current_tool_json_parts)
-                            params = parse_tool_json_lossy(
+                            tc = build_tool_call(
+                                _current_tool_name,
                                 raw_json,
+                                provider_tool_call_id=_current_tool_id,
                                 provider="anthropic",
                                 model=self._model,
-                                tool_name=_current_tool_name,
-                                call_id=_current_tool_id or "",
-                            )
-                            tc = ToolCall(
-                                name=_current_tool_name,
-                                params=params,
-                                provider_tool_call_id=_current_tool_id,
                             )
                             tool_calls.append(tc)
                             yield StreamEvent(

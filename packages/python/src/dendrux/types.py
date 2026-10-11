@@ -57,12 +57,21 @@ class ToolCall:
 
     Carries both a Dendrux-owned ID (stable across pause/resume/replay)
     and the provider's native ID (for building API requests back).
+
+    When the model's arguments were not a valid JSON object, ``params`` is
+    ``{}``, ``parse_error`` holds a short description of the problem and
+    ``raw_arguments`` the original string. The loop rejects such a call
+    without running the tool. ``raw_arguments`` is in-memory only and is
+    never persisted; persisted records carry ``parse_error`` and the raw
+    length instead.
     """
 
     name: str
     params: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=generate_ulid)
     provider_tool_call_id: str | None = None
+    raw_arguments: str | None = field(default=None, repr=False)
+    parse_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -582,12 +591,26 @@ class PauseState:
 # ------------------------------------------------------------------
 
 
+def tool_call_parse_meta(tc: ToolCall) -> dict[str, Any]:
+    """Persistable parse-failure fields of a tool call; empty when it parsed.
+
+    Returns ``parse_error`` and ``raw_length`` only, never the raw text.
+    """
+    if tc.parse_error is None:
+        return {}
+    return {
+        "parse_error": tc.parse_error,
+        "raw_length": len(tc.raw_arguments) if tc.raw_arguments is not None else None,
+    }
+
+
 def _tool_call_to_dict(tc: ToolCall) -> dict[str, Any]:
     return {
         "name": tc.name,
         "params": tc.params,
         "id": tc.id,
         "provider_tool_call_id": tc.provider_tool_call_id,
+        **tool_call_parse_meta(tc),
     }
 
 
@@ -597,6 +620,7 @@ def _tool_call_from_dict(d: dict[str, Any]) -> ToolCall:
         params=d.get("params", {}),
         id=d["id"],
         provider_tool_call_id=d.get("provider_tool_call_id"),
+        parse_error=d.get("parse_error"),
     )
 
 

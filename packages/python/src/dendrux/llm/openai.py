@@ -23,9 +23,8 @@ import openai
 
 from dendrux.llm._helpers import (
     build_call_index,
+    build_tool_call,
     connection_error,
-    parse_tool_json_lossy,
-    parse_tool_json_strict,
     resolve_tool_message_call,
     timeout_error,
 )
@@ -604,13 +603,6 @@ class OpenAIProvider(LLMProvider):
                     for flush_idx in sorted(_tool_buffers):
                         buf = _tool_buffers[flush_idx]
                         raw_json = "".join(buf.json_parts)
-                        params = parse_tool_json_lossy(
-                            raw_json,
-                            provider="openai",
-                            model=self._model,
-                            tool_name=buf.name or "",
-                            call_id=buf.tool_call_id or "",
-                        )
 
                         # Ensure START was emitted even if name arrived late
                         if buf.name and not buf.start_emitted:
@@ -630,10 +622,12 @@ class OpenAIProvider(LLMProvider):
                                 buf.tool_call_id,
                             )
 
-                        tc = ToolCall(
-                            name=buf.name or "unknown",
-                            params=params,
+                        tc = build_tool_call(
+                            buf.name or "unknown",
+                            raw_json,
                             provider_tool_call_id=buf.tool_call_id,
+                            provider="openai",
+                            model=self._model,
                         )
                         tool_calls.append(tc)
                         yield StreamEvent(
@@ -780,16 +774,13 @@ class OpenAIProvider(LLMProvider):
         if message.tool_calls:
             tool_calls = []
             for tc in message.tool_calls:
-                params = parse_tool_json_strict(
-                    tc.function.arguments or "",
-                    tool_name=tc.function.name,
-                    call_id=tc.id,
-                )
                 tool_calls.append(
-                    ToolCall(
-                        name=tc.function.name,
-                        params=params,
+                    build_tool_call(
+                        tc.function.name,
+                        tc.function.arguments or "",
                         provider_tool_call_id=tc.id,
+                        provider="openai",
+                        model=self._model,
                     )
                 )
 

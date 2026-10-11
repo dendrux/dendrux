@@ -23,6 +23,7 @@ from typing import Any
 from dendrux.types import ToolCall, ToolDef, ToolResult
 
 INVALID_PARAMS_CODE = "invalid_params"
+INVALID_JSON_CODE = "invalid_json"
 
 _COMPOSITE_KEYWORDS = frozenset(
     {"anyOf", "oneOf", "allOf", "$ref", "not", "if", "then", "else", "$dynamicRef"}
@@ -96,11 +97,41 @@ def format_invalid_params(
     return message
 
 
+def format_invalid_json(tool_name: str, parse_error: str) -> str:
+    """Build the standard model-facing message for unparseable arguments."""
+    return (
+        f"Your arguments for `{tool_name}` were not valid JSON ({parse_error}). "
+        "Send the call again with valid JSON; for long content, write it in smaller pieces."
+    )
+
+
+def check_tool_json(tool_call: ToolCall) -> ToolResult | None:
+    """Return a failed ``ToolResult`` if the call's arguments did not parse, else ``None``.
+
+    The payload carries ``code: "invalid_json"`` and the parse error only,
+    never the raw arguments.
+    """
+    if tool_call.parse_error is None:
+        return None
+    message = format_invalid_json(tool_call.name, tool_call.parse_error)
+    return ToolResult(
+        name=tool_call.name,
+        call_id=tool_call.id,
+        payload=json.dumps({"error": message, "code": INVALID_JSON_CODE}),
+        success=False,
+        error=message,
+    )
+
+
 def check_tool_call(tool_call: ToolCall, tool_def: ToolDef | None) -> ToolResult | None:
     """Validate a tool call; return a failed ``ToolResult`` if invalid, else ``None``.
 
-    Unknown tools (no ``ToolDef``) pass through so the executor reports them.
+    Unparseable arguments are rejected first (``invalid_json``). Unknown
+    tools (no ``ToolDef``) otherwise pass through so the executor reports them.
     """
+    json_result = check_tool_json(tool_call)
+    if json_result is not None:
+        return json_result
     if tool_def is None:
         return None
     problems, names_wrong = _collect_problems(tool_def, tool_call.params or {})
