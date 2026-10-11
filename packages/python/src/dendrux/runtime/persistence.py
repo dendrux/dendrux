@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime.durability import retry_critical
-from dendrux.types import generate_ulid
+from dendrux.types import generate_ulid, tool_call_parse_meta
 
 if TYPE_CHECKING:
     from dendrux.runtime.state import StateStore
@@ -32,19 +32,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _tool_call_evidence(tc: ToolCall) -> dict[str, Any]:
+    """Persisted shape of a tool call; never includes the raw argument text."""
+    return {
+        "id": tc.id,
+        "provider_tool_call_id": tc.provider_tool_call_id,
+        "name": tc.name,
+        "params": tc.params,
+        **tool_call_parse_meta(tc),
+    }
+
+
 def _serialize_message(m: Message) -> dict[str, Any]:
     """Full-fidelity serialization of a Message for the evidence layer."""
     d: dict[str, Any] = {"role": m.role.value, "content": m.content}
     if m.tool_calls is not None:
-        d["tool_calls"] = [
-            {
-                "id": tc.id,
-                "provider_tool_call_id": tc.provider_tool_call_id,
-                "name": tc.name,
-                "params": tc.params,
-            }
-            for tc in m.tool_calls
-        ]
+        d["tool_calls"] = [_tool_call_evidence(tc) for tc in m.tool_calls]
     if m.call_id is not None:
         d["call_id"] = m.call_id
     if m.name is not None:
@@ -118,15 +121,7 @@ class PersistenceRecorder(BaseRecorder):
         meta["iteration"] = iteration
 
         if message.tool_calls:
-            meta["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "provider_tool_call_id": tc.provider_tool_call_id,
-                    "name": tc.name,
-                    "params": tc.params,
-                }
-                for tc in message.tool_calls
-            ]
+            meta["tool_calls"] = [_tool_call_evidence(tc) for tc in message.tool_calls]
 
         if message.call_id:
             meta["call_id"] = message.call_id
@@ -195,13 +190,7 @@ class PersistenceRecorder(BaseRecorder):
                 semantic_response["text"] = response.text
             if response.tool_calls is not None:
                 semantic_response["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "provider_tool_call_id": tc.provider_tool_call_id,
-                        "name": tc.name,
-                        "params": tc.params,
-                    }
-                    for tc in response.tool_calls
+                    _tool_call_evidence(tc) for tc in response.tool_calls
                 ]
             semantic_response["usage"] = {
                 "input_tokens": response.usage.input_tokens,
@@ -331,6 +320,7 @@ class PersistenceRecorder(BaseRecorder):
                 "target": target,
                 "success": tool_result.success,
                 "duration_ms": tool_result.duration_ms,
+                **tool_call_parse_meta(tool_call),
             },
             correlation_id=tool_call.id,
         )

@@ -257,12 +257,18 @@ class TestNormalizeResponse:
         assert result.tool_calls[0].params == {"a": 1}
         assert result.tool_calls[0].provider_tool_call_id == "call_1"
 
-    def test_malformed_arguments_raises(self, provider: OpenAIResponsesProvider) -> None:
+    def test_malformed_arguments_become_failed_parse(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
         response = FakeResponse(
             output=[FakeFunctionCall(arguments='{"bad":')],
         )
-        with pytest.raises(ValueError, match="invalid JSON"):
-            provider._normalize_response(response)
+        result = provider._normalize_response(response)
+        assert result.tool_calls is not None
+        tc = result.tool_calls[0]
+        assert tc.params == {}
+        assert tc.raw_arguments == '{"bad":'
+        assert tc.parse_error == "Expecting value at char 7"
 
     def test_empty_arguments(self, provider: OpenAIResponsesProvider) -> None:
         response = FakeResponse(
@@ -808,7 +814,7 @@ class TestCompleteStream:
         self,
         provider: OpenAIResponsesProvider,
     ) -> None:
-        """Malformed JSON in tool arguments defaults to empty dict."""
+        """Malformed JSON in tool arguments yields empty params plus a parse error."""
         stream_events = [
             FakeStreamEvent(
                 type="response.output_item.added",
@@ -836,6 +842,11 @@ class TestCompleteStream:
 
         end = next(e for e in events if e.type == StreamEventType.TOOL_USE_END)
         assert end.tool_call.params == {}
+        assert end.tool_call.raw_arguments == "{bad json"
+        assert (
+            end.tool_call.parse_error
+            == "Expecting property name enclosed in double quotes at char 1"
+        )
 
     async def test_stream_provider_response_populated(
         self, provider: OpenAIResponsesProvider
@@ -896,6 +907,7 @@ class TestBoundaryHardening:
 
         assert any("Malformed tool call JSON" in r.message for r in caplog.records)
         assert any("provider=openai_responses" in r.message for r in caplog.records)
+        assert not any("bad json" in r.getMessage() for r in caplog.records)
         end = next(e for e in events if e.type == StreamEventType.TOOL_USE_END)
         assert end.tool_call.params == {}
 

@@ -572,3 +572,167 @@ async def test_leaked_tool_syntax_argument_is_rejected_before_tool_runs(store):
     assert invocation.success is False
     assert invocation.error == expected
     assert invocation.params == {"kind": "table", 'r4<|"|>,split': "x"}
+
+
+_DRAFT_MARKER = "draft one"
+_MALFORMED_WRITE_ARGS = (
+    '{"path": "build_deck.py", "content": "#!/usr/bin/env python3\\n"""Build the deck '
+    + _DRAFT_MARKER
+    + '"""\\n"}'
+)
+_MALFORMED_ERROR = "Expecting ',' delimiter at char 63"
+_VALID_WRITE_PARAMS = {
+    "path": "build_deck.py",
+    "content": '#!/usr/bin/env python3\n"""Build the deck"""\n',
+}
+
+
+def _chat_completion(*, tool_args: str | None = None, text: str | None = None):
+    openai = pytest.importorskip("openai")
+    message: dict = {"role": "assistant", "content": text}
+    if tool_args is not None:
+        message["tool_calls"] = [
+            {
+                "id": f"call_{len(tool_args)}",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": tool_args},
+            }
+        ]
+    return openai.types.chat.ChatCompletion.model_validate(
+        {
+            "id": "cmpl",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek/deepseek-chat",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_args else "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+    )
+
+
+async def test_malformed_tool_json_is_a_failed_tool_call_not_a_failed_run(store):
+    """DeepSeek via OpenRouter escaped a docstring wrongly in write_file arguments."""
+    pytest.importorskip("openai")
+    from dendrux.llm.openai import OpenAIProvider
+
+    writes = []
+
+    @tool()
+    async def write_file(path: str, content: str) -> str:
+        """Write a file."""
+        writes.append({"path": path, "content": content})
+        return f"wrote {path}"
+
+    provider = OpenAIProvider(model="deepseek/deepseek-chat", api_key="sk-test")
+    provider._client.chat.completions.create = AsyncMock(
+        side_effect=[
+            _chat_completion(tool_args=_MALFORMED_WRITE_ARGS),
+            _chat_completion(tool_args=json.dumps(_VALID_WRITE_PARAMS)),
+            _chat_completion(text="Wrote build_deck.py."),
+        ]
+    )
+    agent = Agent(provider=provider, prompt="test", tools=[write_file], state_store=store)
+
+    result = await agent.run("write the deck builder")
+
+    assert result.status == RunStatus.SUCCESS
+    assert result.answer == "Wrote build_deck.py."
+    assert writes == [_VALID_WRITE_PARAMS]
+
+    run_store = RunStore(store)
+    first, second = await run_store.get_tool_invocations(result.run_id)
+    expected = (
+        f"Your arguments for `write_file` were not valid JSON ({_MALFORMED_ERROR}). "
+        "Send the call again with valid JSON; for long content, write it in smaller pieces."
+    )
+    assert first.success is False
+    assert first.error == expected
+    assert first.result == {"error": expected, "code": "invalid_json"}
+    assert first.params is None
+    assert second.success is True
+
+    events = await store.get_run_events(result.run_id)
+    types = [e.event_type for e in events]
+    assert "run.error" not in types
+    rejected = next(
+        e
+        for e in events
+        if e.event_type == "tool.completed" and e.correlation_id == first.tool_call_id
+    )
+    assert rejected.data["success"] is False
+    assert rejected.data["parse_error"] == _MALFORMED_ERROR
+    assert rejected.data["raw_length"] == len(_MALFORMED_WRITE_ARGS)
+
+    traces = await store.get_traces(result.run_id)
+    assistant_calls = [tc for t in traces for tc in (t.meta or {}).get("tool_calls", [])]
+    assert assistant_calls[0]["parse_error"] == _MALFORMED_ERROR
+    assert assistant_calls[0]["raw_length"] == len(_MALFORMED_WRITE_ARGS)
+    assert "parse_error" not in assistant_calls[1]
+
+    # provider_response is the verbatim wire payload (forensics) and is the
+    # one record that keeps what the model sent; every derived record does not.
+    interactions = await store.get_llm_interactions(result.run_id)
+    persisted = repr(
+        (
+            await run_store.get_run(result.run_id),
+            events,
+            traces,
+            await run_store.get_tool_invocations(result.run_id),
+            [i.semantic_request for i in interactions],
+            [i.semantic_response for i in interactions],
+            [i.provider_request for i in interactions],
+        )
+    )
+    assert _DRAFT_MARKER not in persisted
+
+
+async def test_malformed_tool_json_stream_completes(store):
+    """The streaming path rejects the bad call the same way and never emits RUN_ERROR."""
+    from dendrux.llm._helpers import build_tool_call
+
+    writes = []
+
+    @tool()
+    async def write_file(path: str, content: str) -> str:
+        """Write a file."""
+        writes.append(path)
+        return "ok"
+
+    bad = build_tool_call(
+        "write_file",
+        _MALFORMED_WRITE_ARGS,
+        provider_tool_call_id="t1",
+        provider="test",
+        model="m",
+    )
+    good = ToolCall(name="write_file", params=_VALID_WRITE_PARAMS, provider_tool_call_id="t2")
+    provider = MockLLM(
+        [
+            LLMResponse(tool_calls=[bad]),
+            LLMResponse(tool_calls=[good]),
+            LLMResponse(text="done"),
+        ]
+    )
+    agent = Agent(provider=provider, prompt="test", tools=[write_file], state_store=store)
+
+    stream = agent.stream("write it")
+    events = [e async for e in stream]
+
+    assert RunEventType.RUN_ERROR not in [e.type for e in events]
+    assert events[-1].type == RunEventType.RUN_COMPLETED
+    results = [e.tool_result for e in events if e.type == RunEventType.TOOL_RESULT]
+    assert [r.success for r in results] == [False, True]
+    assert writes == ["build_deck.py"]
+    assert (await store.get_run(stream.run_id)).status == "success"
+    (stored,) = [
+        e
+        for e in await store.get_run_events(stream.run_id)
+        if e.event_type == "tool.completed" and not e.data["success"]
+    ]
+    assert stored.data["parse_error"] == _MALFORMED_ERROR

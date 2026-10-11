@@ -20,10 +20,7 @@ import pytest
 openai = pytest.importorskip("openai", reason="openai extra not installed")
 
 import dendrux.llm.openrouter as openrouter_mod  # noqa: E402
-from dendrux.llm._helpers import (  # noqa: E402
-    parse_tool_json_lossy,
-    parse_tool_json_strict,
-)
+from dendrux.llm._helpers import parse_tool_json  # noqa: E402
 from dendrux.llm.openai import OpenAIProvider  # noqa: E402
 from dendrux.llm.openrouter import (  # noqa: E402
     OPENROUTER_BASE_URL,
@@ -411,22 +408,47 @@ class TestExtraBodyPassthrough:
 # Parser hardening — dict-typed `arguments` from some upstreams
 # ---------------------------------------------------------------------------
 class TestDictArguments:
-    def test_strict_accepts_dict(self) -> None:
-        params = parse_tool_json_strict({"a": 1}, tool_name="add", call_id="c1")
-        assert params == {"a": 1}
+    def test_accepts_dict(self) -> None:
+        assert parse_tool_json({"a": 1}) == ({"a": 1}, None)
 
-    def test_lossy_accepts_dict(self) -> None:
-        params = parse_tool_json_lossy(
-            {"a": 1}, provider="openrouter", model="m", tool_name="add", call_id="c1"
+    def test_still_parses_strings(self) -> None:
+        assert parse_tool_json('{"a": 1}') == ({"a": 1}, None)
+
+    def test_malformed_string_returns_parse_error(self) -> None:
+        params, error = parse_tool_json("{broken")
+        assert params == {}
+        assert error is not None
+        assert "broken" not in error
+
+    def test_batch_malformed_arguments_do_not_raise(self) -> None:
+        """OpenRouter batch normalization (via OpenAIProvider) never raises on bad JSON."""
+        from types import SimpleNamespace
+
+        raw = '{"path": "a.py", "content": "#!/usr/bin/env python3\n\\"""Doc"""\n"}'
+        completion = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_1",
+                                function=SimpleNamespace(name="write_file", arguments=raw),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=None,
+            model="deepseek/deepseek-chat",
         )
-        assert params == {"a": 1}
-
-    def test_strict_still_parses_strings(self) -> None:
-        assert parse_tool_json_strict('{"a": 1}', tool_name="add", call_id="c1") == {"a": 1}
-
-    def test_strict_still_raises_on_malformed_string(self) -> None:
-        with pytest.raises(ValueError, match="invalid JSON"):
-            parse_tool_json_strict("{broken", tool_name="add", call_id="c1")
+        result = _provider()._normalize_response(completion)
+        assert result.tool_calls is not None
+        tc = result.tool_calls[0]
+        assert tc.params == {}
+        assert tc.raw_arguments == raw
+        assert tc.parse_error is not None
 
 
 # ---------------------------------------------------------------------------

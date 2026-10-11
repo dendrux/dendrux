@@ -53,7 +53,7 @@ from dendrux.loops._helpers import (
 from dendrux.loops.base import Loop
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
-from dendrux.tools._validate import check_tool_call
+from dendrux.tools._validate import check_tool_call, check_tool_json
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     AgentStep,
@@ -426,9 +426,27 @@ async def _process_tool_calls(
     all_results: list[tuple[ToolCall, ToolResult]] = []
     deny_set = deny or frozenset()
 
+    # --- Phase -1: Reject calls whose arguments were not valid JSON ---
+    # Runs before deny/approval: such a call has no usable arguments, so
+    # pausing it for approval would ask a human to approve "{}", and the
+    # model needs the parse error (not a policy message) to repair the call.
+    parsed_calls: list[ToolCall] = []
+    for tc in all_calls:
+        json_result = check_tool_json(tc)
+        if json_result is None:
+            parsed_calls.append(tc)
+            continue
+        await _record_tool(recorder, run_id, tc, json_result, iteration)
+        await _notify_tool(notifier, run_id, tc, json_result, iteration, warnings)
+        result_msg = strategy.format_tool_result(json_result)
+        history.append(result_msg)
+        await _record_message(recorder, run_id, result_msg, iteration)
+        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
+        all_results.append((tc, json_result))
+
     # --- Phase 0: Deny check (governance) ---
     non_denied: list[ToolCall] = []
-    for tc in all_calls:
+    for tc in parsed_calls:
         if tc.name in deny_set:
             deny_msg = f"Tool '{tc.name}' is denied by policy."
             deny_result = ToolResult(

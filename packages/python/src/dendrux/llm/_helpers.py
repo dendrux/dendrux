@@ -2,7 +2,7 @@
 
 Internal module — not part of the public API. Contains small, pure functions
 that all three providers (Anthropic, OpenAI, OpenAI Responses) share:
-  - Tool call JSON parsing (lossy for streams, strict for batch)
+  - Tool call JSON parsing (one never-raising parser for batch and stream)
   - Error factories for timeout and connection failures
   - Message history helpers (call index, tool message resolution)
   - Reasoning replay selection (which stored blocks go back on the wire)
@@ -15,10 +15,10 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux.types import REASONING_MODEL_META_KEY
+from dendrux.types import REASONING_MODEL_META_KEY, ToolCall
 
 if TYPE_CHECKING:
-    from dendrux.types import Message, ToolCall
+    from dendrux.types import Message
 
 logger = logging.getLogger(__name__)
 
@@ -28,73 +28,71 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 
 
-def parse_tool_json_lossy(
-    raw_json: str | dict[str, Any],
-    *,
-    provider: str,
-    model: str,
-    tool_name: str,
-    call_id: str,
-) -> dict[str, Any]:
-    """Parse tool call JSON from a stream, falling back to ``{}`` on failure.
-
-    Used in streaming paths where a malformed tool call should be logged
-    and degraded gracefully rather than crashing the stream.
-
-    Accepts an already-parsed dict as-is: some OpenAI-compatible backends
-    (a few OpenRouter upstreams) return ``arguments`` as an object instead
-    of a JSON string.
-    """
-    if isinstance(raw_json, dict):
-        return raw_json
-    if not raw_json:
-        return {}
-    try:
-        params = json.loads(raw_json)
-    except json.JSONDecodeError:
-        logger.warning(
-            "Malformed tool call JSON in stream — "
-            "provider=%s model=%s tool=%s call_id=%s raw_len=%d",
-            provider,
-            model,
-            tool_name,
-            call_id,
-            len(raw_json),
-        )
-        return {}
-    if not isinstance(params, dict):
-        return {}
-    return params
+NOT_AN_OBJECT_ERROR = "arguments must be a JSON object"
 
 
-def parse_tool_json_strict(
-    raw_json: str | dict[str, Any],
-    *,
-    tool_name: str,
-    call_id: str,
-) -> dict[str, Any]:
-    """Parse tool call JSON from a batch response, raising on failure.
+def parse_tool_json(raw_json: str | dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Parse a tool call's arguments into ``(params, parse_error)``.
 
-    Used in batch (non-streaming) normalization where invalid JSON
-    indicates a provider-side issue that should surface immediately.
+    Never raises. On failure ``params`` is ``{}`` and ``parse_error`` is a
+    short, model-readable description built from the decoder error (for
+    example ``"Expecting ',' delimiter at char 1234"``); it never contains
+    the raw text. Empty or whitespace-only input and JSON ``null`` (sent by
+    some backends for argument-less calls) are ``{}`` with no error.
 
     Accepts an already-parsed dict as-is: some OpenAI-compatible backends
     (a few OpenRouter upstreams) return ``arguments`` as an object instead
     of a JSON string.
     """
     if isinstance(raw_json, dict):
-        return raw_json
-    if not raw_json:
-        return {}
+        return raw_json, None
+    if not raw_json or not raw_json.strip():
+        return {}, None
     try:
         params = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Tool call '{tool_name}' (id={call_id}) returned invalid JSON arguments: {raw_json!r}"
-        ) from exc
+        return {}, f"{exc.msg} at char {exc.pos}"
+    if params is None:
+        return {}, None
     if not isinstance(params, dict):
-        return {}
-    return params
+        return {}, NOT_AN_OBJECT_ERROR
+    return params, None
+
+
+def build_tool_call(
+    name: str,
+    raw_json: str | dict[str, Any],
+    *,
+    provider_tool_call_id: str | None,
+    provider: str,
+    model: str,
+) -> ToolCall:
+    """Build a ``ToolCall`` from raw provider arguments, never raising.
+
+    Malformed arguments yield ``params == {}`` with ``parse_error`` and
+    ``raw_arguments`` set, so the loop can reject the call and let the model
+    retry. The warning logged here carries the raw length, never the text.
+    """
+    params, parse_error = parse_tool_json(raw_json)
+    if parse_error is None:
+        return ToolCall(name=name, params=params, provider_tool_call_id=provider_tool_call_id)
+    raw = raw_json if isinstance(raw_json, str) else ""
+    logger.warning(
+        "Malformed tool call JSON — provider=%s model=%s tool=%s call_id=%s raw_len=%d error=%s",
+        provider,
+        model,
+        name,
+        provider_tool_call_id,
+        len(raw),
+        parse_error,
+    )
+    return ToolCall(
+        name=name,
+        params={},
+        provider_tool_call_id=provider_tool_call_id,
+        raw_arguments=raw,
+        parse_error=parse_error,
+    )
 
 
 # ------------------------------------------------------------------

@@ -69,6 +69,8 @@ For any of these, pass the schema yourself with `parameters=`.
 
 > **Arguments arrive as JSON-decoded values.** A `BaseModel`, dataclass, or `TypedDict` parameter receives a `dict`, and an `Enum` parameter receives the raw value. Validate the input yourself, for example with `Node.model_validate(raw)` or `Unit(raw)`.
 
+> **Malformed arguments never reach your tool.** If the model's arguments are not valid JSON, the call is rejected before parameter validation with `code: "invalid_json"`. The model sees the parse error and retries; the run does not fail, and the raw arguments are never persisted. See [Tool argument validation](/docs/architecture/loops#tool-argument-validation).
+
 ## Parameter descriptions
 
 There are two ways to describe a parameter. If both are present for the same parameter, `Annotated` wins.

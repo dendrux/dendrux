@@ -320,6 +320,7 @@ def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) ->
                         params=tc.get("params") or {},
                         id=tc.get("id", generate_ulid()),
                         provider_tool_call_id=tc.get("provider_tool_call_id"),
+                        parse_error=tc.get("parse_error"),
                     )
                     for tc in meta["tool_calls"]
                 ]
