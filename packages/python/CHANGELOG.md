@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a21 - 2026-10-13
 
 - MCP: OAuth 2.1 sign-in for remote MCP servers. `MCPOAuth` runs discovery
   (RFC 9728, RFC 8414 / OpenID), client resolution (pre-registered, client ID
