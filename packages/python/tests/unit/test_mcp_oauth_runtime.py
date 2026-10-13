@@ -837,3 +837,68 @@ async def test_non_oauth_401_stays_an_authentication_error() -> None:
         with pytest.raises(MCPAuthenticationError) as caught:
             await connection.discover()
         assert not isinstance(caught.value, MCPAuthorizationRequired)
+
+
+async def test_idle_retirement_during_opening_leaves_the_refresh_to_finish() -> None:
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    async with OAuthHarness(config=ASConfig(refresh_gate=gate, refresh_entered=entered)) as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        await sign_in(harness, oauth)
+        before = await store.load(KEY)
+        shift(oauth, LATER)
+        recorder = Recorder()
+        async with MCPRuntime(observer=recorder, idle_timeout=0) as runtime:
+            connection = bind(runtime, harness, oauth)
+            task = asyncio.create_task(connection.discover())
+            await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            for _ in range(100):
+                if (TENANT, CONNECTION) not in runtime._entries:
+                    break
+                await asyncio.sleep(0.01)
+            assert (TENANT, CONNECTION) not in runtime._entries
+            gate.set()
+            await oauth.aclose()
+            after = await store.load(KEY)
+            assert after is not None and after.status == "active"
+            assert after.credential.publication_id != before.credential.publication_id  # type: ignore[union-attr]
+        openings = recorder.of(MCPConnectionOpening)
+        aborted = recorder.of(MCPConnectionAborted)
+        assert len(openings) == 1 and len(aborted) == 1
+
+
+class _FailingRevokeStore(MCPOAuthMemoryStore):
+    fail = True
+
+    async def save(self, key, record, *, expected):  # type: ignore[no-untyped-def]
+        if self.fail and record.status == "signed_out":
+            raise RuntimeError("SENTINEL-store-down")
+        return await super().save(key, record, expected=expected)
+
+
+async def test_store_failure_in_phase_one_keeps_the_fence_and_a_retry_completes() -> None:
+    from dendrux.mcp import MCPOAuthError
+
+    async with OAuthHarness() as harness:
+        store = _FailingRevokeStore()
+        oauth = make_oauth(store)
+        await sign_in(harness, oauth)
+        async with MCPRuntime() as runtime:
+            connection = bind(runtime, harness, oauth)
+            await connection.discover()
+            with pytest.raises(MCPOAuthError) as caught:
+                await runtime.revoke_authorization(connection_key=CONNECTION, tenant_key=TENANT)
+            assert "SENTINEL" not in str(caught.value)
+            assert runtime._registrations[(TENANT, CONNECTION)].revoking
+            assert (await required(connection.discover())).reason == "revoked"
+            store.fail = False
+            revocation = await runtime.revoke_authorization(
+                connection_key=CONNECTION, tenant_key=TENANT
+            )
+            assert revocation.local == "signed_out"
+            assert (TENANT, CONNECTION) not in runtime._registrations
+        await oauth.aclose()
