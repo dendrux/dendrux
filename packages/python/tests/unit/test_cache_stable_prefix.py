@@ -57,7 +57,7 @@ def _make_mock_source(name: str, tool_names: list[str]) -> MagicMock:
         return tool_defs
 
     source._discover = mock_discover
-    source._create_executor = lambda mcp_tool_name: AsyncMock(return_value="ok")
+    source._create_executor = lambda mcp_tool_name, exposed_name=None: AsyncMock(return_value="ok")
     source.close = AsyncMock()
     return source
 

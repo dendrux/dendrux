@@ -399,3 +399,36 @@ class MCPOutcomeUnknownError(MCPError):
 
 class MCPResultTooLargeError(MCPError):
     """An MCP result exceeded the configured output boundary."""
+
+
+def error_code_for(exc: BaseException) -> str:
+    """Return the stable machine code for an MCP discovery failure.
+
+    Hosts branch on this instead of matching error text. The code depends on
+    the exception class alone, most specific first, and is one of
+    ``authorization_required``, ``authentication_failed``, ``credential_error``,
+    ``destination_denied``, ``circuit_open``, ``capacity``,
+    ``connection_failed``, ``connection_state``, ``invalid_tool_names`` or
+    ``unknown``.
+    """
+    if isinstance(exc, MCPAuthorizationRequired):
+        return "authorization_required"
+    if isinstance(exc, MCPAuthenticationError):
+        return "authentication_failed"
+    if isinstance(exc, MCPCredentialError):
+        return "credential_error"
+    if isinstance(exc, MCPDestinationDeniedError):
+        return "destination_denied"
+    if isinstance(exc, MCPCircuitOpenError):
+        return "circuit_open"
+    if isinstance(exc, MCPCapacityError):
+        return "capacity"
+    if isinstance(exc, (MCPConnectionLostError, MCPConnectionError)):
+        return "connection_failed"
+    if isinstance(exc, MCPConnectionStateError):
+        return "connection_state"
+    # Strict view naming and the Agent's tool-name collision checks raise
+    # plain ValueError; MCP failures never do.
+    if isinstance(exc, ValueError):
+        return "invalid_tool_names"
+    return "unknown"

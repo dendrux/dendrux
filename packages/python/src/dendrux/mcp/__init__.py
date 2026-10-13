@@ -66,6 +66,7 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPRuntimeClosedError,
     MCPStaleConnectionError,
     MCPToolCallError,
+    error_code_for,
 )
 from dendrux.mcp._host import MCPHost  # noqa: E402
 from dendrux.mcp._oauth import (  # noqa: E402
@@ -124,7 +125,7 @@ from dendrux.mcp._runtime import (  # noqa: E402
     MCPToolPolicy,
     MCPToolView,
 )
-from dendrux.mcp._server import MCPServer  # noqa: E402
+from dendrux.mcp._server import MCPServer, MCPSkippedTool  # noqa: E402
 from dendrux.mcp._source import MCPFailureMode, MCPSource  # noqa: E402
 
 __all__ = [
@@ -201,6 +202,7 @@ __all__ = [
     "MCPRuntimeSnapshot",
     "MCPRuntimeState",
     "MCPServer",
+    "MCPSkippedTool",
     "MCPSource",
     "MCPStaleConnectionError",
     "MCPToolCallCancelled",
@@ -213,4 +215,5 @@ __all__ = [
     "MCPToolPolicy",
     "MCPToolView",
     "check_oauth_store",
+    "error_code_for",
 ]

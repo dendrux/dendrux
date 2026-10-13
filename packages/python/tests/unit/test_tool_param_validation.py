@@ -535,7 +535,7 @@ def _mock_mcp_source(parameters: dict[str, Any], counter: dict[str, int]) -> Any
         return [td]
 
     source._discover = discover
-    source._create_executor = lambda name: executor
+    source._create_executor = lambda name, exposed_name=None: executor
     source.close = AsyncMock()
     return source
 

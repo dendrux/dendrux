@@ -550,7 +550,7 @@ class TestMCPToolSchemaPassthrough:
             name="search", description="Search", input_schema=input_schema, annotations=None
         )
 
-        (td,) = build_mcp_tool_defs(
+        (td,), _ = build_mcp_tool_defs(
             source=source,  # type: ignore[arg-type]
             namespace="srv",
             tools=[mcp_tool],

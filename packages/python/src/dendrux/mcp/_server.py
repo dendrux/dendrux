@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence  # noqa: TC003
+from collections.abc import Callable, Collection, Mapping, Sequence  # noqa: TC003
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
 from dendrux.mcp._destination import MCPDestinationPolicy  # noqa: TC001
@@ -77,6 +78,39 @@ def _tool_meta(tool: Any) -> dict[str, Any] | None:
     return dict(value) if value else None
 
 
+MCPSkipReason = Literal["name_unsafe", "duplicate_name", "unknown_tool"]
+
+
+@dataclass(frozen=True, slots=True)
+class MCPSkippedTool:
+    """One server tool a view left out instead of failing its whole source.
+
+    ``reason`` is ``name_unsafe`` (the exposed name is not provider-safe),
+    ``duplicate_name`` (an earlier tool in server order already produced the
+    exposed name) or ``unknown_tool`` (the view's ``allowed_tools``,
+    ``force_serial_tools`` or ``rename`` names a tool the server does not
+    list). ``tool`` is the server's tool name, or the requested name for
+    ``unknown_tool``.
+    """
+
+    source_name: str
+    namespace: str
+    tool: str
+    reason: MCPSkipReason
+
+
+def exposed_tool_name(
+    mcp_name: str,
+    *,
+    namespace: str,
+    prefix: bool = True,
+    rename: Mapping[str, str] | None = None,
+) -> str:
+    """Return the Agent-visible name of one server tool under a view's policy."""
+    base = (rename or {}).get(mcp_name) or _sanitize_tool_name(mcp_name)
+    return f"{namespace}__{base}" if prefix else base
+
+
 def build_mcp_tool_defs(
     *,
     source: MCPSource,
@@ -84,20 +118,68 @@ def build_mcp_tool_defs(
     tools: Sequence[Any],
     connection_info: Any,
     force_serial_tools: frozenset[str] = frozenset(),
-) -> list[ToolDef]:
-    """Adapt raw MCP tools to namespaced ToolDefs for one Agent view."""
+    allowed_tools: Collection[str] | None = None,
+    prefix: bool = True,
+    rename: Mapping[str, str] | None = None,
+    strict: bool = False,
+) -> tuple[list[ToolDef], list[MCPSkippedTool]]:
+    """Adapt raw MCP tools to ToolDefs for one Agent view.
+
+    Returns ``(tool_defs, skipped)``. Names in ``allowed_tools``,
+    ``force_serial_tools`` or ``rename`` that the server does not list are
+    reported first; then tools outside ``allowed_tools`` are dropped; then each
+    remaining tool whose exposed name is unsafe or already taken is skipped.
+    With ``strict=True`` the first such problem raises ``ValueError`` instead.
+    """
+    rename = rename or {}
+    skipped: list[MCPSkippedTool] = []
+
+    def skip(tool_name: str, reason: MCPSkipReason) -> None:
+        skipped.append(
+            MCPSkippedTool(
+                source_name=source.name, namespace=namespace, tool=tool_name, reason=reason
+            )
+        )
+
+    available = {tool.name for tool in tools}
+    reported: set[str] = set()
+    for field_name, requested in (
+        ("allowed_tools", allowed_tools),
+        ("force_serial_tools", force_serial_tools),
+        ("rename", rename.keys()),
+    ):
+        unknown = sorted(set(requested or ()) - available)
+        if unknown and strict:
+            raise ValueError(
+                f"MCP tool view '{namespace}' {field_name} references tools "
+                f"unknown to source '{source.name}': {', '.join(unknown)}."
+            )
+        for name in unknown:
+            if name not in reported:
+                reported.add(name)
+                skip(name, "unknown_tool")
+
+    if allowed_tools is not None:
+        tools = [tool for tool in tools if tool.name in allowed_tools]
+
     tool_defs: list[ToolDef] = []
     seen_names: set[str] = set()
     for tool in tools:
-        sanitized = _sanitize_tool_name(tool.name)
-        canonical = f"{namespace}__{sanitized}"
-        _validate_canonical_name(canonical, source.name, tool.name)
+        canonical = exposed_tool_name(tool.name, namespace=namespace, prefix=prefix, rename=rename)
+        if not _PROVIDER_SAFE_RE.fullmatch(canonical):
+            if strict:
+                _validate_canonical_name(canonical, source.name, tool.name)
+            skip(tool.name, "name_unsafe")
+            continue
         if canonical in seen_names:
-            raise ValueError(
-                f"MCP source '{source.name}' has duplicate tool names after "
-                f"sanitization: '{tool.name}' → '{canonical}'. "
-                "Two tools cannot share the same canonical name."
-            )
+            if strict:
+                raise ValueError(
+                    f"MCP source '{source.name}' has duplicate tool names after "
+                    f"sanitization: '{tool.name}' → '{canonical}'. "
+                    "Two tools cannot share the same canonical name."
+                )
+            skip(tool.name, "duplicate_name")
+            continue
         seen_names.add(canonical)
 
         annotations = _annotation_dict(tool.annotations)
@@ -105,6 +187,7 @@ def build_mcp_tool_defs(
             "source_name": source.name,
             "namespace": namespace,
             "mcp_tool_name": tool.name,
+            "exposed_name": canonical,
             "transport": source.transport,
             "annotations": annotations,
             "title": getattr(tool, "title", None),
@@ -134,7 +217,7 @@ def build_mcp_tool_defs(
                 meta=meta,
             )
         )
-    return tool_defs
+    return tool_defs, skipped
 
 
 def create_mcp_executor(
@@ -143,8 +226,15 @@ def create_mcp_executor(
     namespace: str,
     mcp_tool_name: str,
     max_result_bytes: int,
+    exposed_name: str | None = None,
 ) -> Callable[..., Any]:
-    """Create an async Dendrux executor bound to one live MCP adapter."""
+    """Create an async Dendrux executor bound to one live MCP adapter.
+
+    ``exposed_name`` is the Agent-visible name used in error text; it defaults
+    to ``<namespace>__<mcp_tool_name>``. The server is always called with
+    ``mcp_tool_name``.
+    """
+    display_name = exposed_name or f"{namespace}__{mcp_tool_name}"
 
     async def executor(**params: Any) -> Any:
         # With an opaque auth object even server-authored error text could
@@ -184,7 +274,7 @@ def create_mcp_executor(
             if opaque
             else redact_transport_text(adapter.source, str(failure)) or type(failure).__name__
         )
-        error = MCPToolCallError(f"MCP tool '{namespace}__{mcp_tool_name}' call failed: {detail}")
+        error = MCPToolCallError(f"MCP tool '{display_name}' call failed: {detail}")
         # The managed runtime consults this to fence a dead transport; a tool
         # that merely failed must never poison the shared connection.
         error.connection_lost = is_connection_loss(failure)
@@ -268,6 +358,7 @@ class MCPServer:
         self._exit_stack: Any = None
         self._session: Any = None
         self.last_error: str | None = None
+        self._skipped_tools: list[MCPSkippedTool] = []
 
     async def _discover(self) -> list[ToolDef]:
         """Connect once, discover all allowed tools, and adapt them to ToolDef."""
@@ -292,18 +383,23 @@ class MCPServer:
                     self.name,
                 )
 
-            return build_mcp_tool_defs(
+            # The legacy facade has no view options and keeps failing loudly.
+            tool_defs, _ = build_mcp_tool_defs(
                 source=self.source,
                 namespace=self.name,
                 tools=all_tools,
                 connection_info=adapter.info,
+                strict=True,
             )
+            return tool_defs
         except BaseException as exc:
             self.last_error = str(exc)
             await self.close()
             raise
 
-    def _create_executor(self, mcp_tool_name: str) -> Callable[..., Any]:
+    def _create_executor(
+        self, mcp_tool_name: str, exposed_name: str | None = None
+    ) -> Callable[..., Any]:
         """Create an async Dendrux executor bound to this MCP connection."""
         adapter = self._client
         if adapter is None:
@@ -313,6 +409,7 @@ class MCPServer:
             namespace=self.name,
             mcp_tool_name=mcp_tool_name,
             max_result_bytes=self.source.max_result_bytes,
+            exposed_name=exposed_name,
         )
 
     async def close(self) -> None:

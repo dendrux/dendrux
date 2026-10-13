@@ -67,7 +67,7 @@ def _make_mock_source(
 
     source._discover = mock_discover
 
-    def mock_create_executor(mcp_tool_name: str) -> Any:
+    def mock_create_executor(mcp_tool_name: str, exposed_name: str | None = None) -> Any:
         canonical = f"{name}__{mcp_tool_name}"
         return executors[canonical]
 
@@ -462,6 +462,7 @@ class TestSkippedSourcesOnResult:
                 "namespace": "flaky",
                 "error_type": "ConnectionError",
                 "error": "unreachable",
+                "code": "unknown",
             }
         ]
         await agent.close()
@@ -491,6 +492,7 @@ class TestSkippedSourcesOnResult:
                 "namespace": "flaky",
                 "error_type": "TimeoutError",
                 "error": "slow",
+                "code": "unknown",
             }
         ]
         await agent.close()
@@ -557,6 +559,7 @@ async def test_failed_run_keeps_discovery_snapshot(streaming: bool) -> None:
                 "namespace": "flaky",
                 "error_type": "TimeoutError",
                 "error": "slow",
+                "code": "unknown",
             }
         ]
     finally:

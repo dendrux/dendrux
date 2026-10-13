@@ -36,7 +36,10 @@ class _HostedMCPServer(MCPServer):
     async def _discover(self) -> list[ToolDef]:
         return await self._host._discover(self.name)
 
-    def _create_executor(self, mcp_tool_name: str) -> Callable[..., Any]:
+    def _create_executor(
+        self, mcp_tool_name: str, exposed_name: str | None = None
+    ) -> Callable[..., Any]:
+        # Hosted sources have no view options; they keep their legacy naming.
         return self._host._create_executor(self.name, mcp_tool_name)
 
     async def close(self) -> None:

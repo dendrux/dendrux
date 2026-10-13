@@ -328,7 +328,7 @@ class TestConnectionReuse:
     @pytest.mark.asyncio
     async def test_unknown_allowed_tool_names_fail_discovery(self) -> None:
         async with MCPRuntime(shutdown_timeout=0.05) as runtime:
-            view = _bind(runtime).tools(allowed_tools=["read", "no_such_tool"])
+            view = _bind(runtime).tools(allowed_tools=["read", "no_such_tool"], strict=True)
             agent = Agent(prompt="test", tool_sources=[view])
 
             with pytest.raises(ValueError, match="no_such_tool"):
@@ -6299,6 +6299,7 @@ class TestSkippedSourceVisibility:
                     "namespace": "gh",
                     "error": "refused: https://mcp.example.com",
                     "error_type": "ConnectionError",
+                    "code": "unknown",
                     "failure_mode": "best_effort",
                 }
             ]
@@ -6308,6 +6309,7 @@ class TestSkippedSourceVisibility:
                     "namespace": "gh",
                     "error_type": "ConnectionError",
                     "error": "refused: https://mcp.example.com",
+                    "code": "unknown",
                 }
             ]
             await agent.close()

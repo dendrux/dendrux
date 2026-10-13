@@ -105,6 +105,7 @@ EXPECTED_ALL = (
     "MCPRuntimeSnapshot",
     "MCPRuntimeState",
     "MCPServer",
+    "MCPSkippedTool",
     "MCPSource",
     "MCPStaleConnectionError",
     "MCPToolCallCancelled",
@@ -117,6 +118,7 @@ EXPECTED_ALL = (
     "MCPToolPolicy",
     "MCPToolView",
     "check_oauth_store",
+    "error_code_for",
 )
 
 
