@@ -8,13 +8,14 @@ import inspect
 import logging
 import math
 import re
-from collections import deque
+from collections import Counter, deque
 
 # Public method annotations are resolved at runtime by documentation and
 # dependency-injection tooling.
 from collections.abc import Callable, Collection, Mapping  # noqa: TC003
 from dataclasses import dataclass, field, replace
 from threading import Lock
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.mcp._client import MCPClientAdapter
@@ -75,10 +76,12 @@ from dendrux.mcp._observability import (
     MCPToolCallStarted,
 )
 from dendrux.mcp._server import (
+    _PROVIDER_SAFE_RE,
     MCPServer,
-    _sanitize_tool_name,
+    MCPSkippedTool,
     build_mcp_tool_defs,
     create_mcp_executor,
+    exposed_tool_name,
 )
 from dendrux.mcp._source import (
     MCPSource,
@@ -284,13 +287,7 @@ def _copy_tool_names(
         raise ValueError(f"MCPToolPolicy {field_name} must be a collection of tool names.")
 
     copied = frozenset(value)
-    valid = all(
-        isinstance(name, str)
-        and bool(name.strip())
-        and not any(ord(char) < 32 or ord(char) == 127 for char in name)
-        for name in copied
-    )
-    if not valid:
+    if not all(_is_remote_tool_name(name) for name in copied):
         raise ValueError(
             f"MCPToolPolicy {field_name} must contain non-empty tool names "
             "without control characters."
@@ -298,18 +295,73 @@ def _copy_tool_names(
     return copied
 
 
+def _is_remote_tool_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name.strip())
+        and not any(ord(char) < 32 or ord(char) == 127 for char in name)
+    )
+
+
+def _copy_rename(value: Mapping[str, str] | None) -> Mapping[str, str]:
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "MCPToolPolicy rename must be a mapping of server tool name to exposed name."
+        )
+    copied = dict(value)
+    for key, exposed in copied.items():
+        if not _is_remote_tool_name(key):
+            raise ValueError(
+                "MCPToolPolicy rename keys must be non-empty tool names without control characters."
+            )
+        if not isinstance(exposed, str) or not _PROVIDER_SAFE_RE.fullmatch(exposed):
+            raise ValueError(
+                f"MCPToolPolicy rename value for '{key}' is not provider-safe. "
+                "Exposed names must match [a-zA-Z0-9_-] and be <= 64 chars."
+            )
+    duplicates = sorted(name for name, count in Counter(copied.values()).items() if count > 1)
+    if duplicates:
+        raise ValueError(
+            f"MCPToolPolicy rename maps several tools to the same name: {', '.join(duplicates)}."
+        )
+    return MappingProxyType(copied)
+
+
+def _require_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"MCPToolPolicy {field_name} must be a bool.")
+    return value
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class MCPToolPolicy:
-    """Immutable tool exposure and safety policy for one Agent view."""
+    """Immutable tool exposure and safety policy for one Agent view.
+
+    ``prefix`` exposes ``<namespace>__<name>`` when True and the bare name when
+    False. ``rename`` maps a server tool name to the exposed base name; each
+    value must be provider-safe and unique. ``strict`` raises ``ValueError``
+    at discovery instead of skipping a tool whose name is unsafe, duplicated,
+    or unknown to the server.
+    """
 
     allowed_tools: frozenset[str] | None
     force_serial_tools: frozenset[str]
+    prefix: bool
+    # Read-only mapping view: excluded from the hash because it is unhashable;
+    # equality still compares it.
+    rename: Mapping[str, str] = field(hash=False)
+    strict: bool
 
     def __init__(
         self,
         *,
         allowed_tools: Collection[str] | None = None,
         force_serial_tools: Collection[str] = (),
+        prefix: bool = True,
+        rename: Mapping[str, str] | None = None,
+        strict: bool = False,
     ) -> None:
         object.__setattr__(
             self,
@@ -321,6 +373,9 @@ class MCPToolPolicy:
             "force_serial_tools",
             _copy_tool_names(force_serial_tools, "force_serial_tools") or frozenset(),
         )
+        object.__setattr__(self, "prefix", _require_bool(prefix, "prefix"))
+        object.__setattr__(self, "rename", _copy_rename(rename))
+        object.__setattr__(self, "strict", _require_bool(strict, "strict"))
 
 
 def _validate_identity_key(value: str | None, field_name: str, *, optional: bool) -> None:
@@ -375,12 +430,28 @@ class MCPConnection:
         namespace: str | None = None,
         allowed_tools: Collection[str] | None = None,
         force_serial_tools: Collection[str] = (),
+        prefix: bool = True,
+        rename: Mapping[str, str] | None = None,
+        strict: bool = False,
     ) -> MCPToolView:
         """Return an Agent-consumable tool view over this connection.
 
         Creating a view performs no connection or discovery work. Calling
         with no arguments exposes every server tool under the source-name
         namespace; that is an explicit governance decision.
+
+        ``namespace`` stays the view's identity for governance and telemetry
+        even when ``prefix=False`` exposes bare tool names. ``rename`` maps a
+        server tool name to the exposed base name. By default a tool whose
+        exposed name is unsafe or duplicated, and a policy name the server
+        does not list, is skipped and reported in
+        ``RunResult.meta["mcp_skipped_tools"]``; ``strict=True`` raises
+        ``ValueError`` at discovery instead.
+
+        A ``rename`` value equal to another tool's sanitized name makes
+        whichever of the two comes later in server order the
+        ``duplicate_name`` skip, which may be the renamed tool itself. Pick a
+        value no other tool sanitizes to.
         """
         resolved_namespace = self.source.name if namespace is None else namespace
         _validate_namespace(resolved_namespace)
@@ -390,6 +461,9 @@ class MCPConnection:
             policy=MCPToolPolicy(
                 allowed_tools=allowed_tools,
                 force_serial_tools=force_serial_tools,
+                prefix=prefix,
+                rename=rename,
+                strict=strict,
             ),
         )
 
@@ -437,6 +511,17 @@ class MCPToolView:
     namespace: str
     policy: MCPToolPolicy
 
+    def __post_init__(self) -> None:
+        if not self.policy.prefix:
+            return
+        for mcp_name, exposed in self.policy.rename.items():
+            if not _PROVIDER_SAFE_RE.fullmatch(f"{self.namespace}__{exposed}"):
+                raise ValueError(
+                    f"MCPToolPolicy rename value for '{mcp_name}' produces "
+                    f"'{self.namespace}__{exposed}', which is not provider-safe. "
+                    "Exposed names must be <= 64 chars; shorten it or use prefix=False."
+                )
+
     @property
     def identity(self) -> tuple[str | None, str]:
         """Return the registry identity of the underlying connection."""
@@ -468,6 +553,7 @@ class _ViewToolSource(MCPServer):
         self._url = self.source.url
         self._command = list(self.source.command) if self.source.command is not None else None
         self.last_error: str | None = None
+        self._skipped_tools: list[MCPSkippedTool] = []
         self._entry: _ConnectionEntry | None = None
         self._leased = False
         self._close_generation = 0
@@ -494,27 +580,19 @@ class _ViewToolSource(MCPServer):
             assert entry is not None
             await connection.runtime._ready_entry(connection.identity, entry)
             policy = self._view.policy
-            available = {tool.name for tool in entry.raw_tools}
-            for field_name, requested in (
-                ("allowed_tools", policy.allowed_tools),
-                ("force_serial_tools", policy.force_serial_tools),
-            ):
-                unknown = sorted(set(requested or ()) - available)
-                if unknown:
-                    raise ValueError(
-                        f"MCP tool view '{self.name}' {field_name} references tools "
-                        f"unknown to source '{self.source.name}': {', '.join(unknown)}."
-                    )
-            exposed = entry.raw_tools
-            if policy.allowed_tools is not None:
-                exposed = [tool for tool in exposed if tool.name in policy.allowed_tools]
-            return build_mcp_tool_defs(
+            tool_defs, skipped = build_mcp_tool_defs(
                 source=self.source,
                 namespace=self.name,
-                tools=exposed,
+                tools=entry.raw_tools,
                 connection_info=entry.info,
                 force_serial_tools=policy.force_serial_tools,
+                allowed_tools=policy.allowed_tools,
+                prefix=policy.prefix,
+                rename=policy.rename,
+                strict=policy.strict,
             )
+            self._skipped_tools = skipped
+            return tool_defs
         except BaseException as exc:
             self.last_error = str(exc)
             # Agent cleanup only closes sources that discovered successfully,
@@ -522,15 +600,20 @@ class _ViewToolSource(MCPServer):
             await self.close()
             raise
 
-    def _create_executor(self, mcp_tool_name: str) -> Callable[..., Any]:
+    def _create_executor(
+        self, mcp_tool_name: str, exposed_name: str | None = None
+    ) -> Callable[..., Any]:
         entry = self._entry
         if not self._leased or entry is None:
             raise RuntimeError("Cannot create an MCP executor before discovery.")
         original_tool = next(tool for tool in entry.raw_tools if tool.name == mcp_tool_name)
         connection = self._view.connection
-        # The Agent-visible canonical name: same sanitization as discovery,
-        # so telemetry and error messages match what the model actually calls.
-        qualified_name = f"{self.name}__{_sanitize_tool_name(mcp_tool_name)}"
+        # The Agent-visible name the model calls, so telemetry and error
+        # messages match it; the server is always called by mcp_tool_name.
+        policy = self._view.policy
+        qualified_name = exposed_name or exposed_tool_name(
+            mcp_tool_name, namespace=self.name, prefix=policy.prefix, rename=policy.rename
+        )
         tenant_key, connection_key = connection.identity
         # Physical telemetry is pinned to the source that opened the entry.
         # A live rebind may change only the presentation name used as the next
@@ -659,6 +742,7 @@ class _ViewToolSource(MCPServer):
                         namespace=self.name,
                         mcp_tool_name=mcp_tool_name,
                         max_result_bytes=self.source.max_result_bytes,
+                        exposed_name=qualified_name,
                     )
                     rejection: MCPAuthenticationError | None = None
                     try:

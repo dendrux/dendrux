@@ -323,6 +323,12 @@ class ConsoleNotifier(BaseNotifier):
             _console.print(
                 f"  [bright_red]  mcp[/bright_red]    [bold]error[/bold] [dim]{error}[/dim]"
             )
+        elif event_type == _GovType.MCP_TOOLS_SKIPPED:
+            skipped = data.get("skipped", [])
+            _console.print(
+                f"  [bright_yellow]  mcp[/bright_yellow]    "
+                f"[bold]{len(skipped)} tool(s)[/bold] [dim]skipped[/dim]"
+            )
         elif event_type == _GovType.POLICY_DENIED:
             tool_name = data.get("tool_name", "")
             reason = data.get("reason", "denied by policy")

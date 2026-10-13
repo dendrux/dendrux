@@ -123,9 +123,28 @@ def _cause_type(error: BaseException) -> str | None:
     return type(cause).__name__ if cause is not None else None
 
 
+def _mcp_error_payload(error: _MCPDiscoveryError) -> dict[str, Any]:
+    """Payload of the run-fatal mcp.error event, with a stable ``code``."""
+    # Deferred: dendrux.mcp needs the optional mcp extra, and discovery only
+    # fails when the Agent has MCP tool sources.
+    from dendrux.mcp._errors import MCPAuthorizationRequired, error_code_for
+
+    cause = error.__cause__ or error
+    payload: dict[str, Any] = {
+        "error": str(error)[:500],
+        "error_type": _cause_type(error),
+        "code": error_code_for(cause),
+    }
+    if isinstance(cause, MCPAuthorizationRequired):
+        payload["reason"] = cause.reason
+    return payload
+
+
 def _snapshot_mcp_meta(agent: Agent) -> dict[str, Any]:
-    skipped = agent._mcp_skipped_sources
-    return {"mcp_skipped_sources": deepcopy(skipped)}
+    return {
+        "mcp_skipped_sources": deepcopy(agent._mcp_skipped_sources),
+        "mcp_skipped_tools": deepcopy(agent._mcp_skipped_tools),
+    }
 
 
 def _attach_mcp_meta(result: RunResult, mcp_meta: dict[str, Any]) -> None:
@@ -208,6 +227,7 @@ async def _emit_init_events(
 
     if not agent._tool_sources and mcp_meta is not None:
         mcp_meta["mcp_skipped_sources"] = []
+        mcp_meta["mcp_skipped_tools"] = []
 
     # MCP events — only when tool_sources exist
     if agent._tool_sources:
@@ -228,26 +248,29 @@ async def _emit_init_events(
             group = td.meta.get("namespace") or td.meta.get("source_name", "unknown")
             source_tools.setdefault(group, []).append(td.name)
 
-        skipped_types = {
-            entry["namespace"]: entry["error_type"] for entry in agent._mcp_skipped_sources
-        }
+        skipped_sources = {entry["namespace"]: entry for entry in agent._mcp_skipped_sources}
         for source in agent._tool_sources:
             configured_name = getattr(getattr(source, "source", None), "name", None)
             source_name = configured_name if isinstance(configured_name, str) else source.name
             source_error = getattr(source, "last_error", None)
             if isinstance(source_error, str) and source_error:
+                skipped_source = skipped_sources.get(source.name, {})
+                payload: dict[str, Any] = {
+                    "source_name": source_name,
+                    "namespace": source.name,
+                    "error": source_error,
+                    "error_type": skipped_source.get("error_type"),
+                    "code": skipped_source.get("code", "unknown"),
+                    "failure_mode": getattr(source, "failure_mode", "strict"),
+                }
+                if "reason" in skipped_source:
+                    payload["reason"] = skipped_source["reason"]
                 await _emit_init_governance_event(
                     recorder,
                     notifier,
                     run_id,
                     GovernanceEventType.MCP_ERROR,
-                    {
-                        "source_name": source_name,
-                        "namespace": source.name,
-                        "error": source_error,
-                        "error_type": skipped_types.get(source.name),
-                        "failure_mode": getattr(source, "failure_mode", "strict"),
-                    },
+                    payload,
                 )
                 continue
 
@@ -263,6 +286,15 @@ async def _emit_init_events(
                     "tool_count": len(tool_names),
                     "tool_names": tool_names,
                 },
+            )
+
+        if agent._mcp_skipped_tools:
+            await _emit_init_governance_event(
+                recorder,
+                notifier,
+                run_id,
+                GovernanceEventType.MCP_TOOLS_SKIPPED,
+                {"skipped": deepcopy(agent._mcp_skipped_tools)},
             )
 
 
@@ -895,7 +927,7 @@ async def run(
                         extra_notifier,
                         run_id,
                         GovernanceEventType.MCP_ERROR,
-                        {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
+                        _mcp_error_payload(mcp_exc),
                     )
                 except Exception:
                     logger.warning("Failed to emit mcp.error event", exc_info=True)
@@ -1388,7 +1420,7 @@ async def retry(
                     extra_notifier,
                     run_id,
                     GovernanceEventType.MCP_ERROR,
-                    {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
+                    _mcp_error_payload(mcp_exc),
                 )
             except Exception:
                 logger.warning("Failed to emit mcp.error event", exc_info=True)
@@ -1778,7 +1810,7 @@ def run_stream(
                         extra_notifier,
                         run_id,
                         GovernanceEventType.MCP_ERROR,
-                        {"error": str(mcp_exc)[:500], "error_type": _cause_type(mcp_exc)},
+                        _mcp_error_payload(mcp_exc),
                     )
                 except Exception:
                     logger.warning("Failed to emit mcp.error event", exc_info=True)

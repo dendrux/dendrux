@@ -26,7 +26,7 @@ Guardrails, approval, and access control are independent. You can use any one, a
 
 Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
 
-All 14 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+All 15 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
 
 ```text
 POLICY_DENIED           = 'policy.denied'
@@ -42,6 +42,7 @@ SKILL_DENIED            = 'skill.denied'
 SKILL_INVOKED           = 'skill.invoked'
 MCP_CONNECTED           = 'mcp.connected'
 MCP_ERROR               = 'mcp.error'
+MCP_TOOLS_SKIPPED       = 'mcp.tools_skipped'
 PROVIDER_RETRY          = 'provider.retry'
 ```
 

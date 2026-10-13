@@ -186,6 +186,7 @@ GOVERNANCE_EVENT_META: dict[str, tuple[str, str]] = {
     _GovType.SKILL_INVOKED: ("info", "Skill invoked"),
     _GovType.MCP_CONNECTED: ("info", "MCP connected"),
     _GovType.MCP_ERROR: ("error", "MCP error"),
+    _GovType.MCP_TOOLS_SKIPPED: ("warning", "MCP tools skipped"),
 }
 
 _GOVERNANCE_EVENT_TYPES = frozenset(GOVERNANCE_EVENT_META)

@@ -401,7 +401,7 @@ class TestMCPHost:
         async def execute(**params: Any) -> dict[str, Any]:
             return params
 
-        def create_executor(name: str) -> Any:
+        def create_executor(name: str, exposed_name: str | None = None) -> Any:
             return execute
 
         runtime._create_executor = create_executor  # type: ignore[assignment]

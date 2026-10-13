@@ -445,6 +445,7 @@ class GovernanceEventType(StrEnum):
     SKILL_INVOKED = "skill.invoked"
     MCP_CONNECTED = "mcp.connected"
     MCP_ERROR = "mcp.error"
+    MCP_TOOLS_SKIPPED = "mcp.tools_skipped"
 
     # Provider transport: vendor-SDK retry observability
     PROVIDER_RETRY = "provider.retry"

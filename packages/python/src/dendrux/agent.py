@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import warnings
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -77,6 +78,25 @@ def _validate_max_delegation_depth(value: int | None | _UnsetType) -> None:
         raise ValueError(
             f"max_delegation_depth must be a non-negative integer or None, got {value!r}"
         )
+
+
+def _skipped_source_entry(source: Any, exc: Exception) -> dict[str, Any]:
+    """Describe a best_effort MCP source skipped at discovery."""
+    # Deferred: dendrux.mcp needs the optional mcp extra, and an Agent only
+    # reaches here when it has MCP tool sources.
+    from dendrux.mcp._errors import MCPAuthorizationRequired, error_code_for
+
+    configured = getattr(getattr(source, "source", None), "name", None)
+    entry: dict[str, Any] = {
+        "source_name": configured if isinstance(configured, str) else source.name,
+        "namespace": source.name,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "code": error_code_for(exc),
+    }
+    if isinstance(exc, MCPAuthorizationRequired):
+        entry["reason"] = exc.reason
+    return entry
 
 
 def _record_to_run_result(record: Any) -> RunResult:
@@ -404,9 +424,14 @@ class Agent:
         self._discovered_tool_defs: list[ToolDef] | None = None
         self._mcp_executors: dict[str, Callable[..., Any]] | None = None
         # Optional (best_effort) sources skipped at the last discovery, each
-        # as {source_name, namespace, error_type, error}. Surfaced on the
-        # mcp.error governance event and RunResult.meta["mcp_skipped_sources"].
+        # as {source_name, namespace, error_type, error, code[, reason]}.
+        # Surfaced on the mcp.error governance event and
+        # RunResult.meta["mcp_skipped_sources"].
         self._mcp_skipped_sources: list[dict[str, Any]] = []
+        # Individual tools views left out at the last discovery, each as
+        # {source_name, namespace, tool, reason}. Surfaced on the
+        # mcp.tools_skipped event and RunResult.meta["mcp_skipped_tools"].
+        self._mcp_skipped_tools: list[dict[str, Any]] = []
         self._discovery_lock = asyncio.Lock()
 
         # --- Skills ---
@@ -1719,6 +1744,7 @@ class Agent:
             self._discovered_tool_defs = []
             self._mcp_executors = {}
             self._mcp_skipped_sources = []
+            self._mcp_skipped_tools = []
             return
 
         async with self._discovery_lock:
@@ -1729,6 +1755,10 @@ class Agent:
             executors: dict[str, Callable[..., Any]] = {}
             opened_sources: list[MCPServer] = []
             skipped: list[dict[str, Any]] = []
+            skipped_tools: list[dict[str, Any]] = []
+
+            # Deferred: dendrux.mcp needs the optional mcp extra.
+            from dendrux.mcp._errors import MCPToolNameCollisionError
 
             # Hoist local tool info — computed once, not per-tool
             local_defs = {get_tool_def(fn).name: get_tool_def(fn) for fn in self.tools}
@@ -1745,42 +1775,37 @@ class Agent:
                             source.name,
                             exc_info=True,
                         )
-                        configured = getattr(getattr(source, "source", None), "name", None)
-                        skipped.append(
-                            {
-                                "source_name": configured
-                                if isinstance(configured, str)
-                                else source.name,
-                                "namespace": source.name,
-                                "error_type": type(exc).__name__,
-                                "error": str(exc),
-                            }
-                        )
+                        skipped.append(_skipped_source_entry(source, exc))
                         continue
                     opened_sources.append(source)
+                    source_skips = getattr(source, "_skipped_tools", None)
+                    if isinstance(source_skips, list):
+                        skipped_tools.extend(asdict(entry) for entry in source_skips)
                     for td in tool_defs:
                         # Collision check against reserved name
                         if td.name == "use_skill" and (self._skills_dir or self._explicit_skills):
-                            raise ValueError(
+                            raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' from source "
                                 f"'{td.meta.get('source_name')}' collides with "
                                 f"the reserved 'use_skill' meta-tool."
                             )
                         # Collision check against local tools
                         if td.name in local_defs:
-                            raise ValueError(
+                            raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' from source "
                                 f"'{td.meta.get('source_name')}' collides with "
                                 f"a local tool of the same name."
                             )
                         # Collision check against other MCP tools
                         if td.name in executors:
-                            raise ValueError(
+                            raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' collides with a tool from "
                                 f"another MCP source."
                             )
                         discovered_defs.append(td)
-                        executors[td.name] = source._create_executor(td.meta["mcp_tool_name"])
+                        executors[td.name] = source._create_executor(
+                            td.meta["mcp_tool_name"], exposed_name=td.name
+                        )
 
                 # Build merged name→ToolDef map for full governance validation
                 all_tool_defs = dict(local_defs)
@@ -1807,6 +1832,7 @@ class Agent:
             self._discovered_tool_defs = sorted(discovered_defs, key=lambda td: td.name)
             self._mcp_executors = executors
             self._mcp_skipped_sources = skipped
+            self._mcp_skipped_tools = skipped_tools
 
     async def get_tool_lookups(self, loop: Loop | None = None) -> ToolLookups:
         """Build ToolLookups for local + MCP + use_skill tools.
@@ -2076,6 +2102,7 @@ class Agent:
         self._discovered_tool_defs = None
         self._mcp_executors = None
         self._mcp_skipped_sources = []
+        self._mcp_skipped_tools = []
         self._loaded_skills = None
         self._denied_skill_names = None
         self._inline_skill_warning_emitted = False
@@ -2100,6 +2127,7 @@ class Agent:
         self._discovered_tool_defs = None
         self._mcp_executors = None
         self._mcp_skipped_sources = []
+        self._mcp_skipped_tools = []
         self._loaded_skills = None
         self._denied_skill_names = None
         if self._provider is not None:

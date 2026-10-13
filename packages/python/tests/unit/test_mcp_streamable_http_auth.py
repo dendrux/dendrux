@@ -190,3 +190,45 @@ async def test_destination_policy_through_real_sdk_and_reconnect() -> None:
             await adapter.connect()
         assert len(destinations) > previous
         await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_bare_tool_view_is_called_end_to_end_by_its_server_name() -> None:
+    from dendrux.llm.mock import MockLLM
+    from dendrux.types import LLMResponse, ToolCall
+
+    received: list[str] = []
+    server = SDKServer(name="bare-demo")
+
+    @server.tool(name="get.echo")
+    def echo(text: str) -> str:
+        received.append(text)
+        return f"echo:{text}"
+
+    async with (
+        _serve(server.streamable_http_app()) as url,
+        MCPRuntime(shutdown_timeout=1.0) as runtime,
+    ):
+        connection = runtime.bind(connection_key="demo", source=MCPSource.http("demo", url))
+        agent = Agent(
+            provider=MockLLM(
+                [
+                    LLMResponse(tool_calls=[ToolCall(name="get_echo", params={"text": "hi"})]),
+                    LLMResponse(text="done"),
+                ]
+            ),
+            prompt="test",
+            tool_sources=[connection.tools(prefix=False)],
+        )
+        try:
+            lookups = await agent.get_tool_lookups()
+            assert sorted(lookups.fn) == ["get_echo"]
+            (tool_def,) = agent.get_all_tool_defs()
+            assert tool_def.meta["mcp_tool_name"] == "get.echo"
+            result = await agent.run("hi")
+        finally:
+            await agent.close()
+
+    assert result.answer == "done"
+    assert received == ["hi"]
+    assert result.meta["mcp_skipped_tools"] == []

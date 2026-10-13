@@ -462,6 +462,33 @@ agent = Agent(
 
 Exposing every server tool (the no-argument default) is an explicit governance decision; prefer `allowed_tools` allowlists in production. MCP tool annotations are advisory: Dendrux schedules an MCP tool concurrently only when it is explicitly marked read-only and not destructive; everything else runs serially.
 
+Three more options control naming and how a view treats tools it cannot expose. They apply to runtime views (`connection.tools()`); `MCPServer` and `MCPHost` keep the prefixed, fail-loudly behaviour.
+
+**`prefix=False`** exposes bare tool names. The prefix costs tokens, means nothing to the model, and counts against the 64-character limit. `namespace` remains the view's identity for governance events, telemetry, and `ToolDef.meta["namespace"]`:
+
+```python
+view = connection.tools(namespace="gh", prefix=False)
+# the model sees create_issue, read_file, ...
+agent = Agent(provider=provider, prompt=..., tool_sources=[view], deny=["delete_repo"])
+```
+
+**`rename`** maps a server tool name to the exposed base name, in either mode. Use it to resolve a clash between two sources, or to shorten a name that would exceed 64 characters with the prefix:
+
+```python
+view = connection.tools(prefix=False, rename={"search_code": "gh_search"})
+# prefixed mode would expose gh__gh_search
+```
+
+Rename values must match `[a-zA-Z0-9_-]` and be at most 64 characters, including the `namespace__` prefix when `prefix=True`, and must be unique; a bad value raises `ValueError` when the view is created. A rename value that equals another tool's sanitized name makes whichever of the two comes later in server order the `duplicate_name` skip, which may be the renamed tool itself; pick a value no other tool sanitizes to. Rules (`deny`, `require_approval`) and telemetry use the exposed name; the server is always called by its own name, which stays in `ToolDef.meta["mcp_tool_name"]` next to `meta["exposed_name"]`.
+
+**`strict=True`** restores raising at discovery. By default one bad tool no longer drops its whole source: a tool whose exposed name is not provider-safe or whose base name is empty (`name_unsafe`), a tool whose exposed name an earlier tool in server order already took (`duplicate_name`), and a name in `allowed_tools`, `force_serial_tools`, or `rename` that the server does not list (`unknown_tool`) are skipped and reported in `RunResult.meta["mcp_skipped_tools"]` (see [Failure modes at discovery](#failure-modes-at-discovery)). With `strict=True` the first of these raises `ValueError` instead:
+
+```python
+view = connection.tools(allowed_tools=["read_file", "create_issue"], strict=True)
+```
+
+Clashes between a view and anything else — another MCP source, a local tool, or the reserved `use_skill` — always raise `MCPToolNameCollisionError` (a `ValueError`) when the agent discovers its tools, whatever `strict` says: a cross-source clash nobody renamed fails loudly.
+
 ## Sizing
 
 Size the runtime like a connection pool:
@@ -655,13 +682,41 @@ Each source chooses how discovery failure affects the run:
 
 A successful source emits `mcp.connected` with its source name, tool count, and namespaced tool list. Zero-tool sources still emit `mcp.connected` with `tool_count=0`.
 
-`mcp.error` carries `source_name`, `namespace`, `error`, `error_type` (the exception class, such as `MCPAuthenticationError` or `MCPCircuitOpenError`), and `failure_mode`. For a `best_effort` run the same facts are on the result, so an application can tell the user which optional tools were missing for an answer:
+`mcp.error` carries `source_name`, `namespace`, `error`, `error_type` (the exception class, such as `MCPAuthenticationError` or `MCPCircuitOpenError`), `code`, and `failure_mode`. For a `best_effort` run the same facts are on the result, so an application can tell the user which optional tools were missing for an answer:
 
 ```python
 result = await agent.run("...")
 for skipped in result.meta.get("mcp_skipped_sources", []):
-    skipped["source_name"], skipped["error_type"], skipped["error"]
+    skipped["source_name"], skipped["code"], skipped["error_type"], skipped["error"]
 ```
+
+Branch on `code`, never on `error` text. It is derived from the exception class (the most specific match wins), and `error_code_for(exc)` from `dendrux.mcp` returns the same value for an exception you caught yourself:
+
+| Exception | `code` |
+| --- | --- |
+| `MCPAuthorizationRequired` | `authorization_required`, plus `reason` (`not_signed_in`, `expired`, `revoked`, `insufficient_scope`, `resource_mismatch`) |
+| `MCPAuthenticationError` | `authentication_failed` |
+| `MCPCredentialError`, including `MCPOAuthRefreshError` | `credential_error` |
+| `MCPDestinationDeniedError` | `destination_denied` |
+| `MCPCircuitOpenError` | `circuit_open` |
+| `MCPConnectionCapacityError`, `MCPCallCapacityError` | `capacity` |
+| `MCPConnectionLostError`, any other `MCPConnectionError` | `connection_failed` |
+| `MCPStaleConnectionError`, `MCPConnectionEvictingError`, any other `MCPConnectionStateError` | `connection_state` |
+| `MCPToolNameCollisionError` (an exposed name equals another source's tool, a local tool, or `use_skill`) | `tool_name_collision` |
+| `ValueError` from tool naming with `strict=True` | `invalid_tool_names` |
+| anything else | `unknown` |
+
+The run-fatal `mcp.error` (a `strict` source, or a collision) carries `code` too, and `reason` for an OAuth verdict.
+
+Individual tools a view skipped (see [Views and tool policy](#views-and-tool-policy)) are listed separately. `RunResult.meta["mcp_skipped_tools"]` is present whenever `mcp_skipped_sources` is, each entry naming the source, namespace, server tool, and reason:
+
+```python
+for skipped in result.meta.get("mcp_skipped_tools", []):
+    skipped["source_name"], skipped["namespace"], skipped["tool"], skipped["reason"]
+    # reason: "name_unsafe" | "duplicate_name" | "unknown_tool"
+```
+
+When the list is non-empty the run also records one `mcp.tools_skipped` governance event at initialization, with the same entries under `skipped`. Entries hold names only, never arguments or results.
 
 Discovery metadata is a snapshot taken before execution, including resumed execution.
 `mcp_skipped_sources: []` means discovery completed with nothing skipped. An absent
