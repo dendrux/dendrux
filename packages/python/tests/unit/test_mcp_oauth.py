@@ -1148,3 +1148,68 @@ async def test_eviction_during_connect_recovery_never_publishes(adapters, monkey
         assert provider.rejections == 1
         assert all(adapter.closed for adapter in adapters.instances)
         assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+
+
+class CountingProvider:
+    """Each rejection moves to the next token; every token is rejected."""
+
+    def __init__(self):
+        self.generation = 1
+        self.gets = 0
+        self.rejections = 0
+
+    async def get_auth(self):
+        self.gets += 1
+        return {"Authorization": f"Bearer gen-{self.generation}"}
+
+    async def on_auth_rejected(self):
+        self.rejections += 1
+        self.generation += 1
+
+
+async def test_call_rejection_then_reconnect_rejection_notifies_provider_once(
+    adapters, monkeypatch
+):
+    """One rejected operation spends one on_auth_rejected(), call path included."""
+
+    async def connect(self):
+        if self.source.headers["Authorization"] != "Bearer gen-1":
+            raise rejected()
+
+    monkeypatch.setattr(adapters, "connect", connect)
+    monkeypatch.setattr(adapters, "call_tool", AsyncMock(side_effect=rejected()))
+    recorder = Recorder()
+    provider = CountingProvider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        view = _ViewToolSource(connection.tools())
+        await view._discover()
+        executor = view._create_executor("echo")
+        with pytest.raises(MCPAuthenticationError):
+            await executor()
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert len(adapters.instances) == 2
+        assert recorder.names().count("MCPConnectionOpening") == 2
+        assert recorder.names().count("MCPConnectionFailed") == 1
+        await view.close()
+
+
+async def test_explicit_rotation_reconnect_keeps_connect_time_recovery(adapters, monkeypatch):
+    """Only a rejection rotation spends the budget; a manual rotation does not."""
+    provider = CountingProvider()
+    async with MCPRuntime() as runtime:
+        connection = _bind(runtime, Provider())
+        view = _ViewToolSource(connection.tools())
+        await view._discover()
+        await runtime.rotate_credentials(connection_key="demo", credentials=provider)
+
+        async def connect(self):
+            if self.source.headers["Authorization"] == "Bearer gen-1":
+                raise rejected()
+
+        monkeypatch.setattr(adapters, "connect", connect)
+        await view._create_executor("echo")()
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        await view.close()

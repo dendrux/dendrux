@@ -734,6 +734,7 @@ class _ConnectionEntry:
     __slots__ = (
         "rotation_task",
         "reconnect_pending",
+        "rejection_reconnect",
         "preserve_catalog",
         "credential_epoch",
         "refresh_failed",
@@ -763,6 +764,9 @@ class _ConnectionEntry:
         self.source = source
         self.rotation_task: asyncio.Task[None] | None = None
         self.reconnect_pending = False
+        # The pending reconnect follows a rejection rotation that already
+        # spent this operation's one on_auth_rejected() call.
+        self.rejection_reconnect = False
         self.preserve_catalog = False
         self.credential_epoch = 0
         self.refresh_failed = False
@@ -1936,12 +1940,16 @@ class MCPRuntime:
         *,
         credentials: MCPCredentialProvider | None,
         reuse_catalog: bool = False,
+        auth_recovery: bool = True,
     ) -> None:
         """Connect and discover once for an entry; owns cleanup on failure.
 
         Runs as the entry's single shared task, which is what makes credential
         resolution single-flight: however many Agents race for this identity,
         the provider is consulted exactly once per physical connection.
+        ``auth_recovery=False`` disables the connect-time 401 recovery when the
+        rejected operation that scheduled this open already notified the
+        provider, so ``on_auth_rejected()`` runs at most once per rejection.
         """
         adapter: MCPClientAdapter | None = None
         tenant_key, connection_key = identity
@@ -1967,6 +1975,7 @@ class MCPRuntime:
                 except MCPAuthenticationError as auth_error:
                     if (
                         recovered
+                        or not auth_recovery
                         or not entry.source.reauthenticate_on_401
                         or not isinstance(credentials, MCPRefreshingCredentialProvider)
                         or auth_error.status_code != 401
@@ -2826,6 +2835,7 @@ class MCPRuntime:
                 entry.credential_epoch += 1
                 entry.refresh_failed = False
                 entry.reconnect_pending = True
+                entry.rejection_reconnect = rejected
                 entry.preserve_catalog = preserve_catalog
         except Exception:
             if rejected:
@@ -2862,12 +2872,15 @@ class MCPRuntime:
                     entry.opening_terminal_emitted = False
                     self._connection_seq += 1
                     entry.instance_id = self._connection_seq
+                    auth_recovery = not entry.rejection_reconnect
+                    entry.rejection_reconnect = False
                     task = asyncio.create_task(
                         self._open_connection(
                             identity,
                             entry,
                             credentials=registration.credentials,
                             reuse_catalog=entry.preserve_catalog,
+                            auth_recovery=auth_recovery,
                         )
                     )
                     entry.task = task
