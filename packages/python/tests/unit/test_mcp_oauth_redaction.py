@@ -41,6 +41,7 @@ from dendrux.mcp._observability import (
     MCPOAuthRevoked,
 )
 from tests.unit.mcp_oauth_harness import (
+    RS_SENTINEL,
     ASConfig,
     OAuthHarness,
     RawHTTPServer,
@@ -171,10 +172,34 @@ class Collected:
         parts.extend(
             record.getMessage() + " " + str(record.exc_text or "")
             for record in caplog.records
-            if record.levelno >= logging.INFO
+            if _scanned(record)
         )
         parts.extend(self.texts)
         return "\n".join(parts)
+
+
+# Third-party loggers whose DEBUG output is documented as out of scope.
+_THIRD_PARTY_DEBUG = ("httpcore2", "httpx2", "mcp")
+
+
+def _scanned(record: logging.LogRecord) -> bool:
+    """Every Dendrux record at any level; everything else at INFO and above,
+    except the documented third-party DEBUG loggers."""
+    if record.name == "dendrux" or record.name.startswith("dendrux."):
+        return True
+    if record.levelno >= logging.INFO:
+        return True
+    return not any(
+        record.name == name or record.name.startswith(f"{name}.") for name in _THIRD_PARTY_DEBUG
+    )
+
+
+def _assert_detached(errors: list[BaseException]) -> None:
+    """Every Dendrux-translated error carries no implicit or explicit chain."""
+    for error in errors:
+        if isinstance(error, (MCPAuthorizationRequired, MCPOAuthError, MCPCredentialError)):
+            assert error.__cause__ is None, type(error).__name__
+            assert error.__context__ is None, type(error).__name__
 
 
 def _secrets_of(store: MCPOAuthMemoryStore) -> list[str]:
@@ -282,6 +307,7 @@ async def test_sentinel_scan_across_sign_in_refresh_runtime_and_failures(
         await oauth.aclose()
 
     rendered = collected.rendered(caplog)
+    _assert_detached(collected.errors)
     assert collected.errors, "the scan must cover failures"
     assert collected.events, "the scan must cover events"
     for needle in {s for s in seen_secrets if s}:
@@ -328,9 +354,8 @@ async def test_hostile_reason_phrase_on_the_token_endpoint_is_never_logged(
             error = exc
         await oauth.aclose()
     assert error is not None and echoed and all(echoed)
-    logged = "\n".join(
-        record.getMessage() for record in caplog.records if record.levelno >= logging.INFO
-    )
+    logged = "\n".join(record.getMessage() for record in caplog.records if _scanned(record))
+    _assert_detached([error])
     for needle in [*echoed, HOSTILE]:
         assert needle not in logged
         assert needle not in scan_chain(error)
@@ -475,6 +500,10 @@ async def test_tool_call_authorization_error_has_no_cause_chain() -> None:
             await view.close()
         error = caught.value
         assert error.__cause__ is None
+        assert error.__context__ is None
+        # The resource server's 403 carried RS_SENTINEL in its challenge and
+        # body; an implicit context would have dragged that text along.
+        assert RS_SENTINEL not in scan_chain(error)
         for needle in _secrets_of(store):
             assert needle not in scan_chain(error)
         await oauth.aclose()

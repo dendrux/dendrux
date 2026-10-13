@@ -26,6 +26,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx2
 from pydantic import AnyHttpUrl
 
+# Server-authored text on every resource-server rejection.
+RS_SENTINEL = "SENTINEL-rs-rejection-5e2a"
+
 Handler = Callable[["RawRequest", asyncio.StreamWriter], Awaitable[None]]
 
 
@@ -706,12 +709,12 @@ class OAuthHarness:
                         await _send_json(
                             send,
                             403,
-                            {"error": "insufficient_scope"},
+                            {"error": "insufficient_scope", "error_description": RS_SENTINEL},
                             [
                                 (
                                     b"www-authenticate",
                                     b'Bearer error="insufficient_scope", scope="admin", '
-                                    b'error_description="needs admin"',
+                                    b'error_description="' + RS_SENTINEL.encode() + b'"',
                                 )
                             ],
                         )
