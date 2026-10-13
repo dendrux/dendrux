@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from contextlib import AsyncExitStack, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -14,16 +13,12 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import httpx2
 from mcp import Client, StdioServerParameters
-from mcp.client.auth.utils import (
-    extract_field_from_www_auth,
-    extract_resource_metadata_from_www_auth,
-    extract_scope_from_www_auth,
-)
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKMCPError
 from mcp.types import CONNECTION_CLOSED
 
+from dendrux.mcp._challenge import parse_auth_challenge
 from dendrux.mcp._errors import (
     MCPAuthChallenge,
     MCPAuthenticationError,
@@ -98,48 +93,6 @@ def _authentication_status(exc: BaseException) -> tuple[int, Any] | None:
         if status in _AUTH_REJECTION_STATUSES:
             return int(status), response
     return None
-
-
-# RFC 9110 token: the auth-scheme that opens a challenge.
-_AUTH_SCHEME = re.compile(r"\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)(?:\s|$)")
-
-
-def _challenge_value(value: str | None) -> str | None:
-    if value is None:
-        return None
-    value = value.strip('"')
-    return value or None
-
-
-def parse_auth_challenge(response: Any) -> MCPAuthChallenge | None:
-    """Parse a 401/403 response's ``WWW-Authenticate`` header.
-
-    Returns None when the response carries no such header. A header that
-    cannot be parsed yields a challenge with every field empty: the parse is
-    diagnostic and must never turn a rejection into a different failure.
-    """
-    try:
-        header = response.headers.get("www-authenticate")
-    except Exception:
-        return None
-    if not isinstance(header, str) or not header:
-        return None
-    try:
-        scheme_match = _AUTH_SCHEME.match(header)
-        scope = _challenge_value(extract_scope_from_www_auth(response))
-        return MCPAuthChallenge(
-            scheme=scheme_match.group(1) if scheme_match else None,
-            error=_challenge_value(extract_field_from_www_auth(response, "error")),
-            error_description=_challenge_value(
-                extract_field_from_www_auth(response, "error_description")
-            ),
-            scope=tuple(scope.split()) if scope else (),
-            resource_metadata_url=_challenge_value(
-                extract_resource_metadata_from_www_auth(response)
-            ),
-        )
-    except Exception:
-        return MCPAuthChallenge()
 
 
 def _response_destination(response: Any) -> MCPOrigin | None:

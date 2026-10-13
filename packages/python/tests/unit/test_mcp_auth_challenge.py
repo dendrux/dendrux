@@ -6,6 +6,7 @@ raise site (connect, discovery, tool call) and never enters the message.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import patch
 
@@ -14,7 +15,8 @@ import pytest
 from mcp.server.mcpserver import MCPServer as SDKServer
 
 from dendrux.mcp import MCPAuthChallenge, MCPAuthenticationError, MCPSource
-from dendrux.mcp._client import MCPClientAdapter, parse_auth_challenge
+from dendrux.mcp._challenge import challenge_from_headers, parse_auth_challenge
+from dendrux.mcp._client import MCPClientAdapter
 from tests.unit.test_mcp_streamable_http_auth import _serve
 
 SOURCE_URL = "https://mcp.example.com/mcp"
@@ -47,31 +49,136 @@ def _rendered(error: BaseException) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Parsing
+# Parsing and validation
 # ---------------------------------------------------------------------------
 
 
-def test_full_challenge_is_parsed() -> None:
+def _parse(*values: str) -> MCPAuthChallenge:
+    return challenge_from_headers(values)
+
+
+def test_full_challenge_is_parsed_without_free_text() -> None:
     challenge = parse_auth_challenge(_response(403, FULL_HEADER))
     assert challenge == MCPAuthChallenge(
         scheme="Bearer",
         error="insufficient_scope",
-        error_description="needs HEADER-DESCRIPTION",
         scope=("files:read", "files:write"),
         resource_metadata_url="https://mcp.example.com/.well-known/oauth-protected-resource",
     )
+    assert not hasattr(challenge, "error_description")
+    assert "HEADER-DESCRIPTION" not in repr(challenge)
 
 
 def test_unquoted_fields_and_bare_scheme() -> None:
-    challenge = parse_auth_challenge(_response(401, "Bearer error=invalid_token, scope=read"))
-    assert challenge is not None
+    challenge = _parse("Bearer error=invalid_token, scope=read")
     assert challenge.scheme == "Bearer"
     assert challenge.error == "invalid_token"
     assert challenge.scope == ("read",)
     assert challenge.resource_metadata_url is None
+    assert _parse("Bearer") == MCPAuthChallenge(scheme="Bearer")
+    assert _parse("bearer error=invalid_token").error == "invalid_token"
 
-    bare = parse_auth_challenge(_response(401, "Bearer"))
-    assert bare == MCPAuthChallenge(scheme="Bearer")
+
+def test_bearer_is_selected_among_several_challenges_in_one_header() -> None:
+    challenge = _parse('Basic realm="x", Bearer error="insufficient_scope", scope="a b"')
+    assert challenge == MCPAuthChallenge(
+        scheme="Bearer", error="insufficient_scope", scope=("a", "b")
+    )
+    # Parameters of a preceding challenge never leak into the Bearer one.
+    assert _parse('Basic error="from_basic", Bearer').error is None
+
+
+def test_bearer_is_selected_across_several_headers() -> None:
+    response = httpx2.Response(
+        401,
+        headers=[
+            ("www-authenticate", 'Basic realm="x", error="from_basic"'),
+            ("www-authenticate", 'Bearer error="invalid_token", scope="read"'),
+        ],
+        request=httpx2.Request("POST", SOURCE_URL),
+    )
+    challenge = parse_auth_challenge(response)
+    assert challenge == MCPAuthChallenge(scheme="Bearer", error="invalid_token", scope=("read",))
+
+
+def test_without_bearer_only_the_first_scheme_is_kept() -> None:
+    assert _parse('Basic realm="x", error="nope"') == MCPAuthChallenge(scheme="Basic")
+    assert _parse('Basic realm="x"', 'Digest realm="y"') == MCPAuthChallenge(scheme="Basic")
+
+
+def test_parameter_names_inside_quoted_values_are_not_parameters() -> None:
+    challenge = _parse('Bearer realm="x scope=admin error=bad", error="invalid_token"')
+    assert challenge.scope == ()
+    assert challenge.error == "invalid_token"
+
+
+def test_quoted_string_unescaping() -> None:
+    challenge = _parse(r'Bearer realm="a \"quoted\" b", scope="a\:b c", error="invalid\_token"')
+    assert challenge.scope == ("a:b", "c")
+    assert challenge.error == "invalid_token"
+
+
+def test_first_occurrence_of_a_parameter_wins() -> None:
+    assert _parse("Bearer error=invalid_token, error=insufficient_scope").error == "invalid_token"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "invalid_token\r\nX-Injected: 1",
+        "<script>alert(1)</script>",
+        "invalid token",
+        "a" * 65,
+        "",
+        "inválido",
+    ],
+)
+def test_error_with_unexpected_characters_is_dropped(error: str) -> None:
+    value = error.replace("\\", "\\\\").replace('"', '\\"')
+    assert _parse(f'Bearer error="{value}"').error is None
+
+
+def test_scope_items_are_filtered_individually_and_bounded() -> None:
+    long_item = "x" * 129
+    raw = f'read "quoted" back\\slash {long_item} write  café ok:1'
+    escaped = raw.replace("\\", "\\\\").replace('"', '\\"')
+    challenge = _parse(f'Bearer scope="{escaped}"')
+    assert challenge.scope == ("read", "write", "ok:1")
+    many = " ".join(f"s{i}" for i in range(40))
+    assert _parse(f'Bearer scope="{many}"').scope == tuple(f"s{i}" for i in range(32))
+    assert _parse('Bearer scope=""').scope == ()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://mcp.example.com/" + "a" * 3000,
+        "javascript:alert(1)",
+        "https://user:pass@mcp.example.com/prm",
+        "https://token@mcp.example.com/prm",
+        "https://mcp.example.com/prm#frag",
+        "ftp://mcp.example.com/prm",
+        "/relative/prm",
+        "https:///nohost",
+        "https://mcp.example.com:99999/prm",
+        "https://mcp.example.com/a b",
+        "https://mcp.exämple.com/prm",
+    ],
+)
+def test_unsafe_resource_metadata_url_is_dropped(url: str) -> None:
+    challenge = _parse(f'Bearer error="invalid_token", resource_metadata="{url}"')
+    assert challenge.resource_metadata_url is None
+    assert challenge.error == "invalid_token"
+
+
+def test_safe_resource_metadata_url_is_kept() -> None:
+    url = "http://127.0.0.1:8080/.well-known/oauth-protected-resource/mcp?x=1"
+    assert _parse(f'Bearer resource_metadata="{url}"').resource_metadata_url == url
+
+
+@pytest.mark.parametrize("scheme", ["B" * 33, "Bear!er"])
+def test_scheme_is_validated(scheme: str) -> None:
+    assert _parse(f"{scheme} realm=x").scheme is None
 
 
 def test_missing_header_has_no_challenge() -> None:
@@ -79,18 +186,33 @@ def test_missing_header_has_no_challenge() -> None:
     assert parse_auth_challenge(object()) is None
 
 
-@pytest.mark.parametrize("header", ['"=,,', 'error=""', "=", '   , scope="" '])
+@pytest.mark.parametrize(
+    "header",
+    [
+        '"=,,',
+        'error=""',
+        "=",
+        '   , scope="" ',
+        'Bearer error="unterminated',
+        "Bearer error==",
+        'Bearer error="trailing-escape\\',
+    ],
+)
 def test_malformed_header_yields_empty_fields(header: str) -> None:
     challenge = parse_auth_challenge(_response(401, header))
     assert challenge is not None
-    assert challenge.scheme is None
     assert challenge.error is None
     assert challenge.scope == ()
     assert challenge.resource_metadata_url is None
 
 
+def test_oversized_header_is_ignored() -> None:
+    header = 'Bearer error="invalid_token", realm="' + "x" * 20000 + '"'
+    assert _parse(header) == MCPAuthChallenge()
+
+
 def test_parser_failure_is_never_an_exception() -> None:
-    with patch("dendrux.mcp._client.extract_field_from_www_auth", side_effect=ValueError("boom")):
+    with patch("dendrux.mcp._challenge._parse_challenges", side_effect=ValueError("boom")):
         challenge = parse_auth_challenge(_response(401, FULL_HEADER))
     assert challenge == MCPAuthChallenge()
 
@@ -107,6 +229,30 @@ def test_unreadable_or_non_text_header_has_no_challenge() -> None:
     assert parse_auth_challenge(Fake(RaisingHeaders())) is None
     assert parse_auth_challenge(Fake({"www-authenticate": b"Bearer"})) is None
     assert parse_auth_challenge(Fake({"www-authenticate": ""})) is None
+    assert parse_auth_challenge(Fake({"www-authenticate": "Bearer"})) == MCPAuthChallenge(
+        scheme="Bearer"
+    )
+
+
+def test_repr_never_renders_server_chosen_values() -> None:
+    token = "eyJhbGciOiJIUzI1NiJ9tok"
+    challenge = MCPAuthChallenge(
+        scheme=token,
+        error=token,
+        scope=(token, "read"),
+        resource_metadata_url=f"https://{token}.example/prm",
+    )
+    assert token not in repr(challenge)
+    assert token not in str(challenge)
+    assert repr(challenge) == (
+        "MCPAuthChallenge(scheme='<other>', error='<other>', scope=<2 items>, "
+        "resource_metadata_url='<set>')"
+    )
+    known = MCPAuthChallenge(scheme="Bearer", error="insufficient_scope")
+    assert repr(known) == (
+        "MCPAuthChallenge(scheme='Bearer', error='insufficient_scope', scope=<0 items>, "
+        "resource_metadata_url=None)"
+    )
 
 
 async def test_response_without_a_request_is_not_request_rejected() -> None:
@@ -310,6 +456,48 @@ async def test_real_sdk_connect_rejection_carries_the_challenge(status: int) -> 
     assert "HEADER-DESCRIPTION" not in str(error)
 
 
+@pytest.mark.parametrize("status", [401, 403])
+async def test_real_sdk_discovery_rejection_carries_the_challenge(status: int) -> None:
+    state = {"token": "one", "status": status, "challenge": FULL_HEADER}
+    async with _serve(_challenging_app(state)) as url:
+        adapter = MCPClientAdapter(
+            MCPSource.http("demo", url, headers={"Authorization": "Bearer one"})
+        )
+        await adapter.connect()
+        try:
+            state["token"] = "two"
+            with pytest.raises(MCPAuthenticationError) as caught:
+                await adapter.list_tools()
+        finally:
+            await adapter.close()
+    error = caught.value
+    assert error.status_code == status
+    assert error.request_rejected
+    assert error.challenge == MCPAuthChallenge(
+        scheme="Bearer",
+        error="insufficient_scope",
+        scope=("files:read", "files:write"),
+        resource_metadata_url="https://mcp.example.com/.well-known/oauth-protected-resource",
+    )
+
+
+async def test_discovery_403_carries_the_challenge() -> None:
+    adapter = MCPClientAdapter(MCPSource.http("demo", SOURCE_URL))
+
+    class Client:
+        async def list_tools(self, **kwargs: Any) -> Any:
+            await adapter._observe_response(_response(403, FULL_HEADER))
+            raise RuntimeError("Server returned an error response")
+
+    adapter._client = Client()
+    with pytest.raises(MCPAuthenticationError) as caught:
+        await adapter.list_tools()
+    assert caught.value.status_code == 403
+    assert caught.value.challenge is not None
+    assert caught.value.challenge.error == "insufficient_scope"
+    assert caught.value.challenge.scope == ("files:read", "files:write")
+
+
 @pytest.mark.parametrize(
     ("status", "header", "expected_error"),
     [
@@ -344,10 +532,12 @@ async def test_real_sdk_tool_call_rejection_carries_the_challenge(
 # No response header or body text escapes into messages, events, or logs
 # ---------------------------------------------------------------------------
 
-SENTINEL = "SENTINEL-7f3a"
+# Shaped like a bearer token so it passes every field validator: a hostile
+# server echoing a token must still not reach any rendering.
+SENTINEL = "SENTINELtok7f3a"
 SENTINEL_HEADER = (
-    f'Bearer realm="{SENTINEL}-realm", error="insufficient_scope", '
-    f'error_description="{SENTINEL}-description", scope="{SENTINEL}-scope", '
+    f'{SENTINEL} realm="{SENTINEL}", Bearer realm="{SENTINEL}-realm", error="{SENTINEL}", '
+    f'error_description="{SENTINEL}-description", scope="read {SENTINEL}", '
     f'resource_metadata="https://{SENTINEL}.example/prm"'
 )
 
@@ -403,15 +593,21 @@ def _exception_text(error: BaseException) -> str:
 
 def _log_text(caplog: pytest.LogCaptureFixture) -> str:
     # httpcore2's DEBUG wire trace prints raw response (and request) headers
-    # by design; it is a third-party transport log outside Dendrux's control.
-    # Every other logger, Dendrux and the MCP SDK included, is checked.
-    records = [r for r in caplog.records if not r.name.startswith("httpcore2")]
+    # by design; it is a third-party transport log outside Dendrux's control,
+    # so only its INFO-and-above records are checked. Every other logger,
+    # Dendrux and the MCP SDK included, is checked at every level.
+    records = [
+        r for r in caplog.records if not r.name.startswith("httpcore2") or r.levelno >= logging.INFO
+    ]
     assert any(r.name.startswith("dendrux") for r in records)
     return "\n".join(r.getMessage() for r in records)
 
 
 def _assert_no_sentinel(error: BaseException, events: list[Any], log_text: str) -> None:
     assert SENTINEL not in _exception_text(error)
+    challenge = getattr(error, "challenge", None)
+    assert SENTINEL not in repr(challenge)
+    assert SENTINEL not in str(challenge)
     for event in events:
         assert SENTINEL not in repr(event)
     assert SENTINEL not in log_text
@@ -452,8 +648,14 @@ async def test_rejection_text_never_escapes_at_connect_discovery_and_call(
         assert isinstance(error, MCPAuthenticationError)
         assert error.status_code == status
         assert error.request_rejected
-        assert error.challenge is not None
-        assert error.challenge.error_description == f"{SENTINEL}-description"
+        # The token-shaped values pass validation and are kept as data, but
+        # the free-text fields are gone and nothing renders them.
+        assert error.challenge == MCPAuthChallenge(
+            scheme="Bearer",
+            error=SENTINEL,
+            scope=("read", SENTINEL),
+            resource_metadata_url=f"https://{SENTINEL}.example/prm",
+        )
         _assert_no_sentinel(error, [], _log_text(caplog))
 
 
@@ -512,4 +714,4 @@ async def test_rejection_text_never_escapes_through_the_runtime(
     for error in (connect_error.value, call_error.value):
         _assert_no_sentinel(error, recorder.events, _log_text(caplog))
     assert call_error.value.challenge is not None
-    assert call_error.value.challenge.error == "insufficient_scope"
+    assert call_error.value.challenge.error == SENTINEL
