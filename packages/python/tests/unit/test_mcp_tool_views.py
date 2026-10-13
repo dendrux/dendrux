@@ -43,7 +43,7 @@ from dendrux.mcp._server import build_mcp_tool_defs
 from dendrux.runtime.runner import _emit_init_events
 from dendrux.skills import Skill
 from dendrux.tool import tool
-from dendrux.types import GovernanceEventType, LLMResponse, ToolCall
+from dendrux.types import GovernanceEventType, LLMResponse, RunStatus, ToolCall
 
 LONG_70 = "t" * 70
 LONG_60 = "u" * 60
@@ -691,6 +691,99 @@ class TestTelemetry:
             assert await lookups.fn["write"]() == "write:ok"
             assert _FakeAdapter.calls == ["read", "write"]
             await agent.close()
+
+
+# ---------------------------------------------------------------------------
+# Rename and governance: policy keys on server names, rules on exposed names
+# ---------------------------------------------------------------------------
+
+
+def _calling(name: str) -> MockLLM:
+    return MockLLM(
+        [
+            LLMResponse(tool_calls=[ToolCall(name=name, params={})]),
+            LLMResponse(text="done"),
+        ]
+    )
+
+
+class TestRenameAndGovernance:
+    async def test_tool_outside_allowed_tools_renamed_onto_an_allowed_name_stays_out(
+        self,
+    ) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            view = _connection(runtime).tools(
+                prefix=False, allowed_tools=["read"], rename={"write": "read"}
+            )
+            agent, defs = await _discover(view)
+            assert sorted(defs) == ["read"]
+            assert defs["read"].meta["mcp_tool_name"] == "read"
+            assert agent._mcp_skipped_tools == []
+            await agent.close()
+
+    async def test_allowed_tools_names_server_tools_not_exposed_names(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            view = _connection(runtime).tools(
+                prefix=False, allowed_tools=["fetch"], rename={"write": "fetch"}
+            )
+            agent, defs = await _discover(view)
+            assert defs == {}
+            assert agent._mcp_skipped_tools == [_skipped("unknown_tool", "fetch")]
+            await agent.close()
+
+    async def test_deny_on_the_exposed_name_prevents_the_call(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(
+                provider=_calling("fetch"),
+                prompt="test",
+                tool_sources=[_connection(runtime).tools(prefix=False, rename={"read": "fetch"})],
+                deny=["fetch"],
+            )
+            notifier = _Recorder()
+            try:
+                result = await agent.run("hi", notifier=notifier)
+            finally:
+                await agent.close()
+
+        assert result.answer == "done"
+        assert _FakeAdapter.calls == []
+        denied = [d for kind, d in notifier.events if kind == GovernanceEventType.POLICY_DENIED]
+        assert [d["tool_name"] for d in denied] == ["fetch"]
+
+    async def test_require_approval_on_the_exposed_name_pauses_the_run(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(
+                provider=_calling("fetch"),
+                prompt="test",
+                tool_sources=[_connection(runtime).tools(prefix=False, rename={"read": "fetch"})],
+                require_approval=["fetch"],
+            )
+            try:
+                result = await agent.run("hi")
+            finally:
+                await agent.close()
+
+        assert result.status == RunStatus.WAITING_APPROVAL
+        assert _FakeAdapter.calls == []
+
+    async def test_force_serial_keys_on_the_server_name_after_a_rename(self) -> None:
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            view = _connection(runtime).tools(
+                prefix=False, rename={"read": "fetch"}, force_serial_tools=["read"]
+            )
+            agent = Agent(provider=_calling("fetch"), prompt="test", tool_sources=[view])
+            try:
+                await agent.get_tool_lookups()
+                defs = {td.name: td for td in agent.get_all_tool_defs()}
+                assert defs["fetch"].parallel is False
+                # Control: the other read-only tool still runs in parallel.
+                assert defs["write"].parallel is True
+                result = await agent.run("hi")
+            finally:
+                await agent.close()
+
+        assert result.answer == "done"
+        assert _FakeAdapter.calls == ["read"]
 
 
 # ---------------------------------------------------------------------------
