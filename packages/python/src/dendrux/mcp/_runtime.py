@@ -447,6 +447,11 @@ class MCPConnection:
         does not list, is skipped and reported in
         ``RunResult.meta["mcp_skipped_tools"]``; ``strict=True`` raises
         ``ValueError`` at discovery instead.
+
+        A ``rename`` value equal to another tool's sanitized name makes
+        whichever of the two comes later in server order the
+        ``duplicate_name`` skip, which may be the renamed tool itself. Pick a
+        value no other tool sanitizes to.
         """
         resolved_namespace = self.source.name if namespace is None else namespace
         _validate_namespace(resolved_namespace)
