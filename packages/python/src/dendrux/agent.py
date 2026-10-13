@@ -1757,6 +1757,9 @@ class Agent:
             skipped: list[dict[str, Any]] = []
             skipped_tools: list[dict[str, Any]] = []
 
+            # Deferred: dendrux.mcp needs the optional mcp extra.
+            from dendrux.mcp._errors import MCPToolNameCollisionError
+
             # Hoist local tool info — computed once, not per-tool
             local_defs = {get_tool_def(fn).name: get_tool_def(fn) for fn in self.tools}
 
@@ -1781,21 +1784,21 @@ class Agent:
                     for td in tool_defs:
                         # Collision check against reserved name
                         if td.name == "use_skill" and (self._skills_dir or self._explicit_skills):
-                            raise ValueError(
+                            raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' from source "
                                 f"'{td.meta.get('source_name')}' collides with "
                                 f"the reserved 'use_skill' meta-tool."
                             )
                         # Collision check against local tools
                         if td.name in local_defs:
-                            raise ValueError(
+                            raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' from source "
                                 f"'{td.meta.get('source_name')}' collides with "
                                 f"a local tool of the same name."
                             )
                         # Collision check against other MCP tools
                         if td.name in executors:
-                            raise ValueError(
+                            raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' collides with a tool from "
                                 f"another MCP source."
                             )

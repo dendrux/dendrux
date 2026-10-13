@@ -15,7 +15,8 @@
   `RunResult.meta["mcp_skipped_tools"]` (present whenever
   `mcp_skipped_sources` is) and in one `mcp.tools_skipped` governance event.
   `strict=True` restores raising `ValueError`. Collisions with another source,
-  a local tool, or `use_skill` still raise.
+  a local tool, or `use_skill` still raise, now as `MCPToolNameCollisionError`
+  (a `ValueError` subclass, code `tool_name_collision`).
 - MCP: stable `code` on every `mcp_skipped_sources` entry and on the
   `mcp.error` payload (`authorization_required` adds `reason`), derived from
   the exception class by the new `error_code_for(exc)`.

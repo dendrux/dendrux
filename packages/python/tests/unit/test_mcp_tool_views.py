@@ -34,6 +34,7 @@ from dendrux.mcp import (
     MCPStaleConnectionError,
     MCPToolCallError,
     MCPToolCallStarted,
+    MCPToolNameCollisionError,
     MCPToolPolicy,
     error_code_for,
 )
@@ -612,6 +613,7 @@ _IDENTITY = (None, "c")
         (MCPStaleConnectionError(_IDENTITY, "stale"), "connection_state"),
         (MCPConnectionEvictingError(_IDENTITY, "evicting"), "connection_state"),
         (MCPConnectionStateError(_IDENTITY, "other"), "connection_state"),
+        (MCPToolNameCollisionError("clash"), "tool_name_collision"),
         (ValueError("names"), "invalid_tool_names"),
         (MCPToolCallError("failed"), "unknown"),
         (ConnectionError("refused"), "unknown"),
@@ -728,3 +730,36 @@ class TestCollisionsStillRaise:
             lookups = await agent.get_tool_lookups()
             assert {"read", "gl_read"} <= set(lookups.fn)
             await agent.close()
+
+    @pytest.mark.parametrize("clash", ["other_source", "local_tool", "use_skill"])
+    async def test_collisions_report_a_distinct_code(self, clash: str) -> None:
+        _FakeAdapter.catalogs["gitlab"] = [_tool("read")]
+        if clash == "use_skill":
+            _FakeAdapter.catalogs["github"] = [_tool("use_skill")]
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            sources = [_connection(runtime).tools(prefix=False)]
+            if clash == "other_source":
+                sources.append(_connection(runtime, "gitlab").tools(prefix=False))
+            agent = Agent(
+                provider=MockLLM([LLMResponse(text="done")]),
+                prompt="test",
+                tools=[read] if clash == "local_tool" else [],
+                skills=(
+                    [Skill(name="helper", description="d", body="b", path=Path("."))]
+                    if clash == "use_skill"
+                    else None
+                ),
+                tool_sources=sources,
+            )
+            notifier = _Recorder()
+            try:
+                with pytest.raises(MCPToolNameCollisionError) as caught:
+                    await agent.run("hi", notifier=notifier)
+            finally:
+                await agent.close()
+
+        assert isinstance(caught.value, ValueError)
+        assert error_code_for(caught.value) == "tool_name_collision"
+        (payload,) = [d for kind, d in notifier.events if kind == GovernanceEventType.MCP_ERROR]
+        assert payload["code"] == "tool_name_collision"
+        assert payload["error_type"] == "MCPToolNameCollisionError"

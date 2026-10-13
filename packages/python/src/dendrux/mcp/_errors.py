@@ -401,6 +401,16 @@ class MCPResultTooLargeError(MCPError):
     """An MCP result exceeded the configured output boundary."""
 
 
+class MCPToolNameCollisionError(ValueError):
+    """An MCP tool's exposed name clashes with another tool on the Agent.
+
+    Raised at discovery when the name equals a local tool, a tool from
+    another MCP source, or the reserved ``use_skill``. Rename one side with
+    ``connection.tools(rename=...)``. A ``ValueError`` subclass, so existing
+    handlers keep catching it.
+    """
+
+
 def error_code_for(exc: BaseException) -> str:
     """Return the stable machine code for an MCP discovery failure.
 
@@ -408,8 +418,8 @@ def error_code_for(exc: BaseException) -> str:
     the exception class alone, most specific first, and is one of
     ``authorization_required``, ``authentication_failed``, ``credential_error``,
     ``destination_denied``, ``circuit_open``, ``capacity``,
-    ``connection_failed``, ``connection_state``, ``invalid_tool_names`` or
-    ``unknown``.
+    ``connection_failed``, ``connection_state``, ``tool_name_collision``,
+    ``invalid_tool_names`` or ``unknown``.
     """
     if isinstance(exc, MCPAuthorizationRequired):
         return "authorization_required"
@@ -427,8 +437,9 @@ def error_code_for(exc: BaseException) -> str:
         return "connection_failed"
     if isinstance(exc, MCPConnectionStateError):
         return "connection_state"
-    # Strict view naming and the Agent's tool-name collision checks raise
-    # plain ValueError; MCP failures never do.
+    if isinstance(exc, MCPToolNameCollisionError):
+        return "tool_name_collision"
+    # Strict view naming raises plain ValueError; MCP failures never do.
     if isinstance(exc, ValueError):
         return "invalid_tool_names"
     return "unknown"
