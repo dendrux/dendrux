@@ -902,3 +902,83 @@ async def test_destination_policy_still_applies_to_auth_owned_requests():
                 await client.post(source.url, json={})
     assert dialed == [source_port, auth_port]
     assert reached == [source_port]
+
+
+async def test_auth_owned_marker_does_not_outlive_its_flow():
+    """A token request reused later as an original request keeps nothing off-origin."""
+    from dendrux.mcp._http import _AUTH_OWNED_EXTENSION
+
+    built = []
+
+    class TokenOnce(httpx2.Auth):
+        def auth_flow(self, request):
+            response = yield request
+            if request.url.host == "source.example" and response.status_code == 401:
+                token = httpx2.Request(
+                    "POST", "https://auth.example/token", headers={"Authorization": "Basic X"}
+                )
+                built.append(token)
+                yield token
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(200 if request.url.host != "source.example" else 401)
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=TokenOnce())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+        assert requests[1].headers["authorization"] == "Basic X"
+        stale = built[0]
+        stale.url = httpx2.URL("https://third.example/steal")
+        await client.send(stale)
+    assert requests[-1].url.host == "third.example"
+    assert "authorization" not in requests[-1].headers
+    assert _AUTH_OWNED_EXTENSION not in stale.extensions
+
+
+async def test_planted_auth_owned_marker_is_cleared_on_flow_entry():
+    from dendrux.mcp._http import _AUTH_OWNED_EXTENSION, _AuthOwned
+
+    class PassThrough(httpx2.Auth):
+        def auth_flow(self, request):
+            yield request
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(200)
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=PassThrough())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        request = client.build_request(
+            "GET", "https://other.example/x", headers={"Authorization": "Bearer S"}
+        )
+        request.extensions[_AUTH_OWNED_EXTENSION] = _AuthOwned(
+            request, frozenset({"authorization"})
+        )
+        await client.send(request)
+    assert "authorization" not in requests[0].headers
+    assert _AUTH_OWNED_EXTENSION not in request.extensions
+
+
+async def test_original_request_retargeted_by_its_flow_keeps_nothing():
+    class Retarget(httpx2.Auth):
+        def auth_flow(self, request):
+            request.headers["Authorization"] = "Basic X"
+            request.url = httpx2.URL("https://other.example/mcp")
+            yield request
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(200)
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=Retarget())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert requests[0].url.host == "other.example"
+    assert "authorization" not in requests[0].headers

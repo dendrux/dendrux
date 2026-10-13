@@ -236,6 +236,10 @@ class _ScopedAuth(httpx2.Auth):
     Only those headers survive the cross-origin scoping; anything copied
     from the original request is still stripped. The original request, and
     anything a redirect builds, is never tagged.
+
+    The marker lives only while its request is being sent by this flow: any
+    marker already on the original request is removed on entry, every yield
+    sets or removes it, and it is removed again once the request returns.
     """
 
     def __init__(self, auth: httpx2.Auth, sensitive: set[str], origin: _Origin) -> None:
@@ -247,6 +251,7 @@ class _ScopedAuth(httpx2.Auth):
         self,
         request: httpx2.Request,
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
+        request.extensions.pop(_AUTH_OWNED_EXTENSION, None)
         initial = dict(request.headers)
         before = initial
         flow = self._auth.async_auth_flow(request)
@@ -260,10 +265,15 @@ class _ScopedAuth(httpx2.Auth):
                         if initial.get(name) != value
                     )
                     outgoing.extensions[_AUTH_OWNED_EXTENSION] = _AuthOwned(outgoing, introduced)
+                else:
+                    outgoing.extensions.pop(_AUTH_OWNED_EXTENSION, None)
                 self._sensitive.update(
                     name for name, value in outgoing.headers.items() if before.get(name) != value
                 )
-                response = yield outgoing
+                try:
+                    response = yield outgoing
+                finally:
+                    outgoing.extensions.pop(_AUTH_OWNED_EXTENSION, None)
                 before = dict(outgoing.headers)
                 try:
                     outgoing = await flow.asend(response)
