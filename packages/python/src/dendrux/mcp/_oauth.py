@@ -688,13 +688,17 @@ def _model(build: Callable[[], _T]) -> _T | None:
         return None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class _Token:
     access_token: str
     token_type: str
     expires_in: int | None
     refresh_token: str | None
     scope: str | None
+
+    def __repr__(self) -> str:
+        refresh = None if self.refresh_token is None else "<set>"
+        return f"_Token(expires_in={self.expires_in!r}, refresh_token={refresh})"
 
 
 def _parse_token(body: bytes) -> _Token | None:

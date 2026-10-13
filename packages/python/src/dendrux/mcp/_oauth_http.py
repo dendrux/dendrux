@@ -139,13 +139,16 @@ def origin_of(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class OAuthResponse:
     """A fully read, already closed OAuth HTTP response."""
 
     status: int
     headers: httpx2.Headers
     body: bytes
+
+    def __repr__(self) -> str:
+        return f"OAuthResponse(status={self.status}, body=<{len(self.body)} bytes>)"
 
 
 class OAuthTransportError(Exception):
