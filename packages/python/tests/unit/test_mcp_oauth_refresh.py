@@ -770,3 +770,21 @@ async def test_expired_token_with_unsent_refresh_still_raises() -> None:
             await credentials.get_auth()
         assert credentials.events.outcomes() == ["unsent"]
         await oauth.aclose()
+
+
+async def test_malformed_expires_in_on_refresh_takes_the_uncertain_path() -> None:
+    async with OAuthHarness() as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        src = await sign_in(harness, oauth)
+        harness.config.token_status_override = 200
+        harness.config.token_body_override = b'{"access_token": "x", "expires_in": "\u00b2"}'
+        shift(oauth, LATER)
+        credentials = provider(oauth, src)
+        with pytest.raises(MCPOAuthRefreshError) as caught:
+            await credentials.get_auth()
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
+        retired = await row(store)
+        assert retired.status == "retired" and retired.refresh_claim is None
+        assert credentials.events.outcomes() == ["uncertain"]
+        await oauth.aclose()

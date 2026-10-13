@@ -1068,3 +1068,37 @@ async def test_store_failures_are_translated_and_detached() -> None:
     assert "hunter2" not in str(caught.value)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     await oauth.aclose()
+
+
+@pytest.mark.parametrize(
+    "expires_in", ['"\u00b2"', '"\u0661\u0662"', '"12345678901234"', '"1e3"', "1.5", "true"]
+)
+async def test_malformed_expires_in_is_an_exchange_failure(expires_in: str) -> None:
+    async with OAuthHarness() as harness:
+        oauth = make_oauth()
+        callback = await sign_in(oauth, harness)
+        harness.config.token_status_override = 200
+        harness.config.token_body_override = (
+            '{"access_token": "x", "expires_in": ' + expires_in + "}"
+        ).encode()
+        with pytest.raises(MCPOAuthFlowError) as caught:
+            await complete(oauth, callback)
+        assert caught.value.reason == "token_exchange_failed"
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
+        await oauth.aclose()
+
+
+def test_token_parser_never_raises() -> None:
+    from dendrux.mcp._oauth import _parse_token
+
+    for body in (
+        b'{"access_token": "x", "expires_in": "\u00b2"}',
+        b'{"access_token": "x", "expires_in": 1e400}',
+        b'{"access_token": "x", "scope": 7}',
+        b'{"access_token": "x", "token_type": null}',
+        b"[1, 2]",
+        b"\xff\xfe",
+        b"",
+    ):
+        assert _parse_token(body) is None
+    assert _parse_token(b'{"access_token": "x", "expires_in": "60"}').expires_in == 60  # type: ignore[union-attr]

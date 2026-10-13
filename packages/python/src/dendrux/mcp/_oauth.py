@@ -92,6 +92,7 @@ _REJECTED_ERRORS = frozenset(
 _SCOPE_TOKEN = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]{1,128}")
 _ACCESS_TOKEN = re.compile(r"[\x21-\x7e]{1,8192}")
 _REFRESH_TOKEN = re.compile(r"[\x20-\x7e]{1,8192}")
+_EXPIRES_IN = re.compile(r"[0-9]{1,11}")
 _MAX_EXPIRES_IN = 10 * 365 * 24 * 3600
 _CLAIM_POLL = 0.1
 _PUBLISH_ATTEMPTS = 5
@@ -697,7 +698,14 @@ class _Token:
 
 
 def _parse_token(body: bytes) -> _Token | None:
-    """Parse a token response strictly; None when it is unusable."""
+    """Parse a token response strictly; None when it is unusable. Never raises."""
+    try:
+        return _parse_token_fields(body)
+    except Exception:
+        return None
+
+
+def _parse_token_fields(body: bytes) -> _Token | None:
     data = _json_object(body)
     if data is None:
         return None
@@ -713,7 +721,7 @@ def _parse_token(body: bytes) -> _Token | None:
         expires_in = None
     elif isinstance(expires_raw, int) and not isinstance(expires_raw, bool):
         expires_in = expires_raw
-    elif isinstance(expires_raw, str) and expires_raw.isdigit() and len(expires_raw) < 12:
+    elif isinstance(expires_raw, str) and _EXPIRES_IN.fullmatch(expires_raw):
         expires_in = int(expires_raw)
     else:
         return None
