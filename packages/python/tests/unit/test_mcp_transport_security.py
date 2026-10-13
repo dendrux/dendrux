@@ -1009,3 +1009,102 @@ async def test_value_set_in_place_on_the_original_is_never_introduced_on_a_copy(
     assert requests[0].headers["authorization"] == "Bearer S"
     assert "authorization" not in requests[1].headers
     assert requests[2].headers["authorization"] == "Basic X"
+
+
+class MetadataThenCredentialAuth(httpx2.Auth):
+    """Off-origin GET differing only structurally, then a credentialed request."""
+
+    def __init__(self, metadata_url):
+        self.metadata_url = metadata_url
+
+    def auth_flow(self, request):
+        response = yield request
+        if response.status_code != 401:
+            return
+        yield httpx2.Request("POST", self.metadata_url, json={"discover": True})
+        request.headers["Authorization"] = "Bearer flow"
+        request.headers["X-Api-Key"] = "flow-key"
+        yield request
+
+
+async def test_structural_headers_never_enter_the_sensitive_set():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "auth.example":
+            return httpx2.Response(200)
+        if request.headers.get("authorization") == "Bearer flow":
+            return httpx2.Response(200)
+        return httpx2.Response(401)
+
+    source = MCPSource.http(
+        "test",
+        "https://source.example/mcp",
+        auth=MetadataThenCredentialAuth("https://auth.example/meta"),
+    )
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, content=b"{}")
+        sensitive = client.auth._sensitive
+    assert requests[1].url.host == "auth.example"
+    assert requests[1].headers["host"] == "auth.example"
+    for structural in ("host", "content-length", "content-type"):
+        assert structural not in sensitive
+    assert {"authorization", "x-api-key"} <= sensitive
+
+
+async def test_later_cross_origin_redirect_keeps_host_after_an_auth_flow():
+    """A polluted sensitive set used to strip Host and break the HTTP/1.1 request."""
+    from tests.unit.test_mcp_streamable_http_auth import _serve
+
+    target_hits = []
+
+    async def target(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        target_hits.append(dict(scope["headers"]))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def metadata(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    async with _serve(target) as target_url, _serve(metadata) as metadata_url:
+        state = {"calls": 0}
+
+        async def source_app(scope, receive, send):
+            if scope["type"] != "http":
+                return
+            state["calls"] += 1
+            authorization = dict(scope["headers"]).get(b"authorization")
+            if scope["path"] == "/again":
+                status, headers = 307, [(b"location", target_url.encode())]
+            elif authorization != b"Bearer flow":
+                status, headers = 401, []
+            else:
+                status, headers = 200, []
+            await send({"type": "http.response.start", "status": status, "headers": headers})
+            await send({"type": "http.response.body", "body": b""})
+
+        async with _serve(source_app) as source_url:
+            source = MCPSource.http(
+                "test",
+                source_url,
+                headers={"X-Static": "static-secret"},
+                auth=MetadataThenCredentialAuth(metadata_url),
+            )
+            async with create_http_client(source) as client:
+                first = await client.post(source.url, content=b"{}")
+                assert first.status_code == 200
+                again = source_url.replace("/mcp", "/again")
+                response = await client.get(again)
+    assert response.status_code == 200
+    assert len(target_hits) == 1
+    hop = target_hits[0]
+    assert hop[b"host"] == httpx2.URL(target_url).netloc
+    assert b"authorization" not in hop
+    assert b"x-api-key" not in hop
+    assert b"x-static" not in hop

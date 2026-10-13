@@ -202,6 +202,40 @@ def _origin(url: httpx2.URL) -> _Origin:
 
 _AUTH_OWNED_EXTENSION = "dendrux_auth_owned"
 
+# Structural and hop-by-hop headers an auth flow's request naturally differs
+# on. They never carry credentials, and stripping them (Host above all)
+# breaks later cross-origin requests on the same client.
+_NEVER_SENSITIVE = frozenset(
+    {
+        "host",
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "transfer-encoding",
+        "connection",
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "user-agent",
+        "date",
+        "expect",
+        "te",
+        "trailer",
+        "upgrade",
+        "via",
+        "cache-control",
+        "pragma",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "range",
+        "content-range",
+        "mcp-protocol-version",
+        "mcp-session-id",
+    }
+)
+
 
 class _AuthOwned:
     """Provenance of one request an auth flow built for another origin."""
@@ -237,6 +271,11 @@ class _ScopedAuth(httpx2.Auth):
     those headers survive the cross-origin scoping; anything copied from the
     original request is still stripped. The original request, and anything
     a redirect builds, is never tagged.
+
+    Header names the flow adds or changes join the client-wide sensitive set,
+    except the structural and hop-by-hop names in ``_NEVER_SENSITIVE`` (Host,
+    content and transfer framing, Accept*, User-Agent, caching, conditional
+    and range headers, MCP protocol headers), which never carry credentials.
 
     The marker lives only while its request is being sent by this flow: any
     marker already on the original request is removed on entry, every yield
@@ -278,7 +317,9 @@ class _ScopedAuth(httpx2.Auth):
                 else:
                     outgoing.extensions.pop(_AUTH_OWNED_EXTENSION, None)
                 self._sensitive.update(
-                    name for name, value in outgoing.headers.items() if before.get(name) != value
+                    name
+                    for name, value in outgoing.headers.items()
+                    if before.get(name) != value and name not in _NEVER_SENSITIVE
                 )
                 try:
                     response = yield outgoing
