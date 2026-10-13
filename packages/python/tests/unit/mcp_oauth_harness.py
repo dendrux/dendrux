@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
+from pydantic import AnyHttpUrl
 
 Handler = Callable[["RawRequest", asyncio.StreamWriter], Awaitable[None]]
 
@@ -388,6 +389,13 @@ class OAuthHarness:
     as_metadata_status: int | None = None
     prm_status: int | None = None
     challenge_override: str | None = None
+    prm_path: str = "/.well-known/oauth-protected-resource/mcp"
+    as_metadata_path: str = "/.well-known/oauth-authorization-server"
+    registration_override: dict[str, Any] | None = None
+    registration_drop: tuple[str, ...] = ()
+    token_latency: float = 0.0
+    token_entered: asyncio.Event | None = None
+    revocation_latency: float = 0.0
     preregistered: dict[str, Any] = field(default_factory=dict)
     rs_tool_calls: int = 0
     rs_auth_headers: list[list[str]] = field(default_factory=list)
@@ -438,7 +446,7 @@ class OAuthHarness:
         provider = self.provider
         routes = create_auth_routes(
             provider=provider,
-            issuer_url=self.as_url,  # type: ignore[arg-type]  # pydantic coerces the str
+            issuer_url=AnyHttpUrl(self.as_url),
             client_registration_options=ClientRegistrationOptions(
                 enabled=True, valid_scopes=["mcp", "admin"], default_scopes=["mcp"]
             ),
@@ -458,7 +466,7 @@ class OAuthHarness:
                 if harness.as_metadata_status is not None:
                     await _send_json(send, harness.as_metadata_status, {"error": "nope"})
                     return True
-                if path != "/.well-known/oauth-authorization-server":
+                if path != harness.as_metadata_path:
                     await _send_json(send, 404, {"error": "not_found"})
                     return True
                 base = f"{harness.as_url}"
@@ -491,6 +499,10 @@ class OAuthHarness:
                 return True
             if path == "/token":
                 provider.counters["token"] += 1
+                if harness.token_entered is not None:
+                    harness.token_entered.set()
+                if harness.token_latency:
+                    await asyncio.sleep(harness.token_latency)
                 provider.token_request_headers.append(headers)
                 form = {k: v[0] for k, v in parse_qs(body.decode()).items()}
                 if form.get("grant_type") == "refresh_token":
@@ -530,10 +542,32 @@ class OAuthHarness:
                     return True
                 return False
             if path == "/register":
-                provider.registration_requests.append(json.loads(body or b"{}"))
-                return False
+                request_body = json.loads(body or b"{}")
+                provider.registration_requests.append(request_body)
+                if harness.registration_override is None and not harness.registration_drop:
+                    return False
+                from mcp.shared.auth import OAuthClientInformationFull
+
+                provider.counters["register"] += 1
+                response = {
+                    **request_body,
+                    "client_id": "client-" + secrets.token_hex(4),
+                    **(harness.registration_override or {}),
+                }
+                for name in harness.registration_drop:
+                    response.pop(name, None)
+                stored = {k: v for k, v in response.items() if v is not None}
+                stored.setdefault("token_endpoint_auth_method", "client_secret_basic")
+                info = OAuthClientInformationFull.model_validate(
+                    {**stored, "redirect_uris": request_body.get("redirect_uris")}
+                )
+                provider.clients[info.client_id] = info
+                await _send_json(send, 201, {k: v for k, v in response.items() if v is not None})
+                return True
             if path == "/revoke":
                 provider.counters["revoke"] += 1
+                if harness.revocation_latency:
+                    await asyncio.sleep(harness.revocation_latency)
                 form = {k: v[0] for k, v in parse_qs(body.decode()).items()}
                 provider.revocation_requests.append(
                     {**form, **{"_auth": headers.get("authorization", "")}}
@@ -598,12 +632,12 @@ class OAuthHarness:
             auths = [v.decode() for k, v in raw_headers if k.decode().lower() == "authorization"]
             if path == "/mcp":
                 harness.rs_auth_headers.append(auths)
-            if path.startswith("/.well-known/oauth-protected-resource"):
+            if path.startswith("/.well-known/oauth-protected-resource") or path == harness.prm_path:
                 provider.counters["prm"] += 1
                 if harness.prm_status is not None:
                     await _send_json(send, harness.prm_status, {"error": "x"})
                     return True
-                if path != "/.well-known/oauth-protected-resource/mcp":
+                if path != harness.prm_path:
                     await _send_json(send, 404, {"error": "not_found"})
                     return True
                 prm: dict[str, Any] = {
@@ -689,7 +723,6 @@ class OAuthHarness:
     async def __aexit__(self, *exc: object) -> None:
         for server, _, _ in self._servers:
             server.should_exit = True
-            server.force_exit = True
         for _, task, sock in self._servers:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(task, timeout=5.0)
