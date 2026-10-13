@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import AsyncExitStack, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -13,12 +14,18 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import httpx2
 from mcp import Client, StdioServerParameters
+from mcp.client.auth.utils import (
+    extract_field_from_www_auth,
+    extract_resource_metadata_from_www_auth,
+    extract_scope_from_www_auth,
+)
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKMCPError
 from mcp.types import CONNECTION_CLOSED
 
 from dendrux.mcp._errors import (
+    MCPAuthChallenge,
     MCPAuthenticationError,
     MCPConnectionError,
     MCPDestinationDeniedError,
@@ -77,16 +84,70 @@ def _iter_error_tree(exc: BaseException) -> Iterator[BaseException]:
             stack.append(node.__context__)
 
 
-def _authentication_status(exc: BaseException) -> int | None:
-    """Find a credential-rejection HTTP status anywhere in an error tree."""
+def _authentication_status(exc: BaseException) -> tuple[int, Any] | None:
+    """Find a credential-rejection HTTP status anywhere in an error tree.
+
+    Returns the status and, when the tree carries it, the rejecting response.
+    """
     for node in _iter_error_tree(exc):
         response = getattr(node, "response", None)
         status = getattr(response, "status_code", None)
         if status is None:
+            response = None
             status = getattr(node, "status_code", None)
         if status in _AUTH_REJECTION_STATUSES:
-            return int(status)
+            return int(status), response
     return None
+
+
+# RFC 9110 token: the auth-scheme that opens a challenge.
+_AUTH_SCHEME = re.compile(r"\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)(?:\s|$)")
+
+
+def _challenge_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip('"')
+    return value or None
+
+
+def parse_auth_challenge(response: Any) -> MCPAuthChallenge | None:
+    """Parse a 401/403 response's ``WWW-Authenticate`` header.
+
+    Returns None when the response carries no such header. A header that
+    cannot be parsed yields a challenge with every field empty: the parse is
+    diagnostic and must never turn a rejection into a different failure.
+    """
+    try:
+        header = response.headers.get("www-authenticate")
+    except Exception:
+        return None
+    if not isinstance(header, str) or not header:
+        return None
+    try:
+        scheme_match = _AUTH_SCHEME.match(header)
+        scope = _challenge_value(extract_scope_from_www_auth(response))
+        return MCPAuthChallenge(
+            scheme=scheme_match.group(1) if scheme_match else None,
+            error=_challenge_value(extract_field_from_www_auth(response, "error")),
+            error_description=_challenge_value(
+                extract_field_from_www_auth(response, "error_description")
+            ),
+            scope=tuple(scope.split()) if scope else (),
+            resource_metadata_url=_challenge_value(
+                extract_resource_metadata_from_www_auth(response)
+            ),
+        )
+    except Exception:
+        return MCPAuthChallenge()
+
+
+def _response_destination(response: Any) -> MCPOrigin | None:
+    """Origin a response was served for, or None when it is unknown."""
+    request = None
+    with suppress(RuntimeError):
+        request = getattr(response, "request", None)
+    return _diagnostic_origin(getattr(request, "url", None))
 
 
 def is_connection_loss(exc: BaseException) -> bool:
@@ -133,6 +194,16 @@ class _ToolHTTPAttempt:
     tool: str
     status: int | None = None
     destination: MCPOrigin | None = None
+    challenge: MCPAuthChallenge | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Rejection:
+    """The latest 401/403 response seen outside a tool call."""
+
+    status: int
+    destination: MCPOrigin | None
+    challenge: MCPAuthChallenge | None
 
 
 _tool_http_attempt: ContextVar[_ToolHTTPAttempt | None] = ContextVar(
@@ -154,6 +225,7 @@ class MCPClientAdapter:
         self.info: MCPConnectionInfo | None = None
         self._last_redirect_target: MCPOrigin | None = None
         self._last_status: int | None = None
+        self._last_rejection: _Rejection | None = None
         self._destination_denied = False
         self._last_destination = _diagnostic_origin(source.url) if source.url else None
 
@@ -211,6 +283,12 @@ class MCPClientAdapter:
         still classify that failure as a credential rejection.
         """
         self._last_status = getattr(response, "status_code", None)
+        if self._last_status in _AUTH_REJECTION_STATUSES:
+            self._last_rejection = _Rejection(
+                self._last_status,
+                _response_destination(response),
+                parse_auth_challenge(response),
+            )
         if 300 <= (self._last_status or 0) < 400:
             location = response.headers.get("location")
             if location:
@@ -234,11 +312,17 @@ class MCPClientAdapter:
             return
         attempt.destination = _diagnostic_origin(request.url)
         attempt.status = response.status_code
+        attempt.challenge = (
+            parse_auth_challenge(response)
+            if response.status_code in _AUTH_REJECTION_STATUSES
+            else None
+        )
 
     async def _open(self) -> BaseException | None:
         """Open the transport, returning a detached safe failure if needed."""
 
         self._last_status = None
+        self._last_rejection = None
         self._destination_denied = False
         self._last_redirect_target = None
         stack = AsyncExitStack()
@@ -287,6 +371,7 @@ class MCPClientAdapter:
         failure_redirect_target = self._last_redirect_target
         failure_destination = self._last_destination
         failure_status = self._last_status
+        failure_rejection = self._last_rejection
         failure_denied = self._destination_denied
         cleanup_failure: BaseException | None = None
         try:
@@ -315,12 +400,14 @@ class MCPClientAdapter:
         self._last_redirect_target = failure_redirect_target
         self._last_destination = failure_destination
         self._last_status = failure_status
+        self._last_rejection = failure_rejection
         self._destination_denied = failure_denied
         return self._safe_error("connect to", failure)
 
     async def list_tools(self) -> list[Any]:
         client = self._require_client()
         self._last_status = None
+        self._last_rejection = None
         try:
             tools: list[Any] = []
             cursor: str | None = None
@@ -362,9 +449,24 @@ class MCPClientAdapter:
             detail if detail is not None else "[detail suppressed: opaque auth]",
             failure_class,
         )
-        status = _authentication_status(exc)
-        if status is None and self._last_status in _AUTH_REJECTION_STATUSES:
+        status: int | None = None
+        rejection: _Rejection | None = None
+        found = _authentication_status(exc)
+        if found is not None:
+            status, response = found
+            if response is not None:
+                rejection = _Rejection(
+                    status, _response_destination(response), parse_auth_challenge(response)
+                )
+        elif self._last_status in _AUTH_REJECTION_STATUSES:
             status = self._last_status
+        if (
+            rejection is None
+            and self._last_rejection is not None
+            and self._last_rejection.status == status
+        ):
+            rejection = self._last_rejection
+        origin = _diagnostic_origin(self.source.url) if self.source.url else None
         error: MCPConnectionError
         if self._destination_denied or any(
             isinstance(node, MCPDestinationDeniedError) for node in _iter_error_tree(exc)
@@ -379,13 +481,16 @@ class MCPClientAdapter:
                 f"the server rejected its credentials (HTTP {status})."
             )
             auth_error.status_code = status
+            if rejection is not None:
+                auth_error.challenge = rejection.challenge
+                auth_error.request_rejected = origin is not None and rejection.destination == origin
             error = auth_error
         else:
             error = MCPConnectionError(
                 f"Failed to {action} MCP source '{self.source.name}' ({failure_class})."
             )
         error.transport_detail = detail
-        error.origin = _diagnostic_origin(self.source.url) if self.source.url else None
+        error.origin = origin
         error.destination = self._last_destination
         for node in _iter_error_tree(exc):
             request = None
@@ -419,6 +524,7 @@ class MCPClientAdapter:
                 f"(HTTP {attempt.status})."
             )
             error.status_code = attempt.status
+            error.challenge = attempt.challenge
             error.request_rejected = attempt.destination == _diagnostic_origin(self.source.url)
             error.origin = _diagnostic_origin(self.source.url)
             error.destination = attempt.destination

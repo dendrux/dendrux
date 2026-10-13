@@ -62,16 +62,37 @@ class MCPCredentialError(MCPConnectionError):
     """
 
 
+@dataclass(frozen=True, slots=True)
+class MCPAuthChallenge:
+    """Parsed ``WWW-Authenticate`` challenge from a 401/403 response.
+
+    Server-authored data, kept out of exception messages. ``scope`` is the
+    challenged scope split on whitespace (RFC 6750); ``resource_metadata_url``
+    is the RFC 9728 protected-resource metadata hint. A header that cannot be
+    parsed yields a challenge with every field empty, never an exception.
+    """
+
+    scheme: str | None = None
+    error: str | None = None
+    error_description: str | None = None
+    scope: tuple[str, ...] = ()
+    resource_metadata_url: str | None = None
+
+
 class MCPAuthenticationError(MCPConnectionError):
     """The MCP server rejected the source's credentials (HTTP 401/403).
 
     Typed separately from transport failure so applications can refresh or
     rotate credentials and evict, instead of retrying blindly. Raised from
-    connect and discovery; ``status_code`` carries the rejecting status.
+    connect, discovery, and tool calls; ``status_code`` carries the rejecting
+    status. ``request_rejected`` is True only when the rejecting response
+    came from the source's own origin. ``challenge`` is the parsed
+    ``WWW-Authenticate`` header of that response, or None when it sent none.
     """
 
     status_code: int | None = None
     request_rejected: bool = False
+    challenge: MCPAuthChallenge | None = None
 
 
 class MCPBindingConflictError(MCPError):

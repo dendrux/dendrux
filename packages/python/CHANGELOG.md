@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- MCP: `MCPAuthenticationError.challenge` carries the parsed `WWW-Authenticate`
+  header of the rejecting 401/403 (`MCPAuthChallenge`: `scheme`, `error`,
+  `error_description`, `scope`, `resource_metadata_url`) at connect,
+  discovery, and tool-call time. Nothing from the header enters the message.
+- MCP: with `reauthenticate_on_401=True` and a refreshing credential provider,
+  a 401 from the source origin during connect or `tools/list` now calls
+  `on_auth_rejected()` once and retries the connection once, instead of
+  failing. Connect-time rejections also set `request_rejected`.
+- MCP: a request an `auth=` flow builds itself for another origin (for example
+  an OAuth token request with `Authorization: Basic`) keeps the headers its
+  flow set. Redirects, including redirects of such a request, are still
+  stripped.
+
 ## 0.2.0a20 - 2026-10-12
 
 - Tools: a tool call whose arguments are not valid JSON (or are JSON but not

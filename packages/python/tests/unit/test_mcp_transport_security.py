@@ -108,7 +108,126 @@ async def test_auth_generated_custom_header_is_scoped():
         await client.get(source.url)
     assert requests[0].headers["x-generated-key"] == "secret"
     assert len(requests) == 3
-    assert all("x-generated-key" not in r.headers for r in requests[1:])
+    # The redirect hop is built by the HTTP client, not the auth flow.
+    assert "x-generated-key" not in requests[1].headers
+    # A new request the auth flow itself sends is auth-owned and keeps its headers.
+    assert requests[2].headers["x-generated-key"] == "refreshed"
+
+
+class TokenRequestAuth(httpx2.Auth):
+    """Auth whose flow makes its own off-origin token request, like an OAuth client."""
+
+    def __init__(self, token_url="https://auth.example/token"):
+        self.token_url = token_url
+
+    def auth_flow(self, request):
+        response = yield request
+        if response.status_code != 401:
+            return
+        token_request = httpx2.Request(
+            "POST",
+            self.token_url,
+            headers={"Authorization": "Basic Y2xpZW50OnNlY3JldA=="},
+            data={"grant_type": "client_credentials"},
+        )
+        token_response = yield token_request
+        if token_response.status_code == 200:
+            request.headers["Authorization"] = "Bearer fresh"
+            yield request
+
+
+async def test_auth_owned_off_origin_request_keeps_its_headers():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "auth.example":
+            return httpx2.Response(200, json={"access_token": "fresh"})
+        if request.headers.get("authorization") == "Bearer fresh":
+            return httpx2.Response(200)
+        return httpx2.Response(401)
+
+    source = MCPSource.http(
+        "test",
+        "https://source.example/mcp",
+        headers={"X-Custom-Key": "static"},
+        auth=TokenRequestAuth(),
+    )
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        response = await client.post(source.url, json={"hello": "world"})
+    assert response.status_code == 200
+    assert [r.url.host for r in requests] == ["source.example", "auth.example", "source.example"]
+    assert requests[1].headers["authorization"] == "Basic Y2xpZW50OnNlY3JldA=="
+    # Static source headers are never added to a request the auth flow built.
+    assert "x-custom-key" not in requests[1].headers
+    assert requests[2].headers["authorization"] == "Bearer fresh"
+
+
+async def test_redirect_of_an_auth_owned_request_still_strips_headers():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "auth.example":
+            return httpx2.Response(307, headers={"location": "https://third.example/token"})
+        if request.url.host == "third.example":
+            return httpx2.Response(400)
+        return httpx2.Response(401)
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=TokenRequestAuth())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert [r.url.host for r in requests] == ["source.example", "auth.example", "third.example"]
+    assert "authorization" in requests[1].headers
+    assert "authorization" not in requests[2].headers
+
+
+async def test_redirect_of_the_mcp_request_to_another_origin_still_strips_auth():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "source.example":
+            return httpx2.Response(307, headers={"location": "https://other.example/mcp"})
+        return httpx2.Response(200)
+
+    class BearerAuth(httpx2.Auth):
+        def auth_flow(self, request):
+            request.headers["Authorization"] = "Bearer secret"
+            yield request
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=BearerAuth())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert [r.url.host for r in requests] == ["source.example", "other.example"]
+    assert requests[0].headers["authorization"] == "Bearer secret"
+    assert "authorization" not in requests[1].headers
+
+
+async def test_original_request_reyielded_by_auth_is_never_auth_owned():
+    """Re-sending the original request after a redirect keeps the redirect's scoping."""
+    requests = []
+
+    class RetryAuth(httpx2.Auth):
+        def auth_flow(self, request):
+            request.headers["Authorization"] = "Bearer one"
+            response = yield request
+            if response.status_code == 401:
+                request.headers["Authorization"] = "Bearer two"
+                yield request
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "source.example":
+            return httpx2.Response(307, headers={"location": "https://other.example/mcp"})
+        return httpx2.Response(401)
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=RetryAuth())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert [r.url.host for r in requests] == ["source.example", "other.example"] * 2
+    assert all("authorization" not in r.headers for r in requests[1::2])
+    assert requests[2].headers["authorization"] == "Bearer two"
 
 
 async def allow_public(destination):
@@ -461,3 +580,119 @@ async def test_real_cross_origin_redirect_never_receives_custom_credentials():
                 assert (await client.post(source.url, json={})).status_code == 200
     assert len(received) == 1
     assert b"x-custom-key" not in received[0]
+
+
+async def test_same_then_cross_origin_redirect_after_auth_owned_request_strips_auth():
+    """An earlier auth-owned request must not let a later redirect keep credentials."""
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if request.url.host == "auth.example":
+            return httpx2.Response(200, json={"access_token": "fresh"})
+        if request.url.host == "other.example":
+            return httpx2.Response(200)
+        if request.headers.get("authorization") != "Bearer fresh":
+            return httpx2.Response(401)
+        if request.url.path == "/mcp":
+            return httpx2.Response(307, headers={"location": "/next"})
+        return httpx2.Response(307, headers={"location": "https://other.example/mcp"})
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=TokenRequestAuth())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert [(r.url.host, r.url.path) for r in requests] == [
+        ("source.example", "/mcp"),
+        ("auth.example", "/token"),
+        ("source.example", "/mcp"),
+        ("source.example", "/next"),
+        ("other.example", "/mcp"),
+    ]
+    assert requests[1].headers["authorization"].startswith("Basic ")
+    assert requests[3].headers["authorization"] == "Bearer fresh"
+    assert "authorization" not in requests[4].headers
+
+
+async def test_real_sdk_same_then_cross_origin_redirect_never_carries_auth():
+    """The SDK follows the same-origin hop itself; the cross-origin hop is never credentialed."""
+    from dendrux.mcp import MCPConnectionError
+    from dendrux.mcp._client import MCPClientAdapter
+    from tests.unit.test_mcp_streamable_http_auth import _serve
+
+    seen = {"auth": [], "source": [], "target": []}
+
+    def recorder(name, status, headers=()):
+        async def app(scope, receive, send):
+            if scope["type"] != "http":
+                return
+            seen[name].append((scope["path"], dict(scope["headers"]).get(b"authorization")))
+            await send({"type": "http.response.start", "status": status, "headers": list(headers)})
+            await send({"type": "http.response.body", "body": b'{"access_token": "fresh"}'})
+
+        return app
+
+    async with (
+        _serve(recorder("auth", 200)) as auth_url,
+        _serve(recorder("target", 200)) as target_url,
+    ):
+
+        async def source_app(scope, receive, send):
+            if scope["type"] != "http":
+                return
+            authorization = dict(scope["headers"]).get(b"authorization")
+            seen["source"].append((scope["path"], authorization))
+            if authorization != b"Bearer fresh":
+                status, headers = 401, []
+            elif scope["path"] == "/mcp":
+                status, headers = 307, [(b"location", b"/next")]
+            else:
+                status, headers = 307, [(b"location", target_url.encode())]
+            await send({"type": "http.response.start", "status": status, "headers": headers})
+            await send({"type": "http.response.body", "body": b""})
+
+        async with _serve(source_app) as source_url:
+            adapter = MCPClientAdapter(
+                MCPSource.http("demo", source_url, auth=TokenRequestAuth(auth_url))
+            )
+            with pytest.raises(MCPConnectionError):
+                await adapter.connect()
+            await adapter.close()
+
+    assert seen["auth"] and all(value.startswith(b"Basic ") for _, value in seen["auth"])
+    assert ("/next", b"Bearer fresh") in seen["source"]
+    # The SDK does not follow the cross-origin hop at all.
+    assert seen["target"] == []
+
+
+async def test_destination_policy_still_applies_to_auth_owned_requests():
+    from tests.unit.test_mcp_streamable_http_auth import _serve
+
+    reached = []
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        reached.append(scope["server"][1])
+        await send({"type": "http.response.start", "status": 401, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async with _serve(app) as source_url, _serve(app) as auth_url:
+        source_port = httpx2.URL(source_url).port
+        auth_port = httpx2.URL(auth_url).port
+        dialed = []
+
+        async def policy(destination):
+            dialed.append(destination.port)
+            return destination.port == source_port
+
+        source = MCPSource.http(
+            "test",
+            source_url,
+            auth=TokenRequestAuth(auth_url),
+            destination_policy=policy,
+        )
+        async with create_http_client(source) as client:
+            with pytest.raises(MCPDestinationDeniedError):
+                await client.post(source.url, json={})
+    assert dialed == [source_port, auth_port]
+    assert reached == [source_port]

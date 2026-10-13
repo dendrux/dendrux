@@ -1954,12 +1954,32 @@ class MCPRuntime:
             )
         )
         try:
-            source = entry.source
-            if credentials is not None:
-                source = await _resolve_source_credentials(source, credentials)
-            adapter = MCPClientAdapter(source)
-            await adapter.connect()
-            raw_tools = entry.raw_tools if reuse_catalog else await adapter.list_tools()
+            recovered = False
+            while True:
+                source = entry.source
+                if credentials is not None:
+                    source = await _resolve_source_credentials(source, credentials)
+                adapter = MCPClientAdapter(source)
+                try:
+                    await adapter.connect()
+                    raw_tools = entry.raw_tools if reuse_catalog else await adapter.list_tools()
+                    break
+                except MCPAuthenticationError as auth_error:
+                    if (
+                        recovered
+                        or not entry.source.reauthenticate_on_401
+                        or not isinstance(credentials, MCPRefreshingCredentialProvider)
+                        or auth_error.status_code != 401
+                        or not auth_error.request_rejected
+                    ):
+                        raise
+                # The rejected token may already be cached by the provider:
+                # notify it once, then resolve again and reconnect. Waiters
+                # share this task, so the recovery is single-flight.
+                recovered = True
+                rejected_adapter, adapter = adapter, None
+                await self._close_rejected_adapter(entry, rejected_adapter)
+                await self._notify_connect_rejection(entry, credentials)
         except BaseException as exc:
             circuit_opened: MCPCircuitOpened | None = None
             failure_cause: str | None = None
@@ -2061,6 +2081,43 @@ class MCPRuntime:
                 "MCP source '%s' discovered zero tools. This may indicate a configuration problem.",
                 entry.source.name,
             )
+
+    async def _close_rejected_adapter(
+        self,
+        entry: _ConnectionEntry,
+        adapter: MCPClientAdapter,
+    ) -> None:
+        """Close a transport whose credentials were rejected before recovery."""
+        try:
+            await adapter.close()
+        except Exception as exc:
+            logger.warning(
+                "MCP source '%s' cleanup failed after a credential rejection: %s (%s)",
+                entry.source.name,
+                safe_source_exception_detail(adapter.source, exc),
+                type(exc).__name__,
+            )
+
+    async def _notify_connect_rejection(
+        self,
+        entry: _ConnectionEntry,
+        credentials: MCPRefreshingCredentialProvider,
+    ) -> None:
+        """Tell the provider its credentials were rejected while connecting.
+
+        Same contract as the call path: bounded by ``connect_timeout``, and a
+        failure marks the entry ``refresh_failed`` and surfaces as a
+        value-free credential error with the provider's exception detached.
+        """
+        failed = False
+        try:
+            async with asyncio.timeout(entry.source.connect_timeout):
+                await credentials.on_auth_rejected()
+        except Exception:
+            failed = True
+        if failed:
+            entry.refresh_failed = True
+            raise MCPCredentialError("MCP credential rejection callback failed.")
 
     def _release(
         self,

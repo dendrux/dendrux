@@ -192,15 +192,37 @@ class _PolicyTransport(httpx2.AsyncBaseTransport):
             await self._pool.aclose()
 
 
-def _origin(url: httpx2.URL) -> tuple[str, str, int | None]:
+_Origin = tuple[str, str, int | None]
+
+
+def _origin(url: httpx2.URL) -> _Origin:
     port = url.port if url.port is not None else {"http": 80, "https": 443}.get(url.scheme)
     return url.scheme, url.host, port
 
 
+_AUTH_OWNED_EXTENSION = "dendrux_auth_owned"
+
+
+def _is_auth_owned(request: httpx2.Request) -> bool:
+    # Redirect requests copy their parent's extensions, so the tag names the
+    # exact request object it was set on; a copy never matches.
+    return request.extensions.get(_AUTH_OWNED_EXTENSION) is request
+
+
 class _ScopedAuth(httpx2.Auth):
-    def __init__(self, auth: httpx2.Auth, sensitive: set[str]) -> None:
+    """Track auth-generated headers and tag the auth flow's own requests.
+
+    A request the wrapped flow builds itself (for example an OAuth token
+    request to an authorization server on another origin) is not the MCP
+    request, so its headers belong to it: it is tagged auth-owned and keeps
+    them. The original request, and anything a redirect builds, is never
+    tagged, so cross-origin hops still lose credentials.
+    """
+
+    def __init__(self, auth: httpx2.Auth, sensitive: set[str], origin: _Origin) -> None:
         self._auth = auth
         self._sensitive = sensitive
+        self._origin = origin
 
     async def async_auth_flow(
         self,
@@ -211,6 +233,8 @@ class _ScopedAuth(httpx2.Auth):
         try:
             outgoing = await anext(flow)
             while True:
+                if outgoing is not request and _origin(outgoing.url) != self._origin:
+                    outgoing.extensions[_AUTH_OWNED_EXTENSION] = outgoing
                 self._sensitive.update(
                     name for name, value in outgoing.headers.items() if before.get(name) != value
                 )
@@ -245,7 +269,7 @@ def create_http_client(
             if on_denied is not None:
                 on_denied()
             raise MCPDestinationDeniedError("MCP request has an unsupported destination URL.")
-        if _origin(request.url) != origin:
+        if _origin(request.url) != origin and not _is_auth_owned(request):
             for name in sensitive:
                 request.headers.pop(name, None)
 
@@ -267,5 +291,5 @@ def create_http_client(
         },
     )
     if client.auth is not None:
-        client.auth = _ScopedAuth(client.auth, sensitive)
+        client.auth = _ScopedAuth(client.auth, sensitive, origin)
     return client
