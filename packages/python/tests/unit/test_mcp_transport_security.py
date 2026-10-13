@@ -163,6 +163,212 @@ async def test_auth_owned_off_origin_request_keeps_its_headers():
     assert requests[2].headers["authorization"] == "Bearer fresh"
 
 
+class CopyingAuth(httpx2.Auth):
+    """Auth flow that re-targets a copy of the original request to another origin."""
+
+    def auth_flow(self, request):
+        response = yield request
+        if response.status_code != 401:
+            return
+        copied = httpx2.Request(
+            "POST", "https://auth.example/token", headers=request.headers, content=b"x"
+        )
+        copied.headers["Authorization"] = "Basic Y2xpZW50OnNlY3JldA=="
+        yield copied
+
+
+async def test_auth_owned_request_keeps_only_headers_its_flow_introduced():
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(200 if request.url.host == "auth.example" else 401)
+
+    source = MCPSource.http(
+        "test",
+        "https://source.example/mcp",
+        headers={"X-Api-Key": "static-key", "Cookie": "session=static"},
+        auth=CopyingAuth(),
+    )
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert [r.url.host for r in requests] == ["source.example", "auth.example"]
+    assert requests[0].headers["x-api-key"] == "static-key"
+    token_request = requests[1]
+    assert token_request.headers["authorization"] == "Basic Y2xpZW50OnNlY3JldA=="
+    assert "x-api-key" not in token_request.headers
+    assert "cookie" not in token_request.headers
+
+
+async def test_auth_owned_copy_of_an_unchanged_credential_is_stripped():
+    """A credential present before the flow ran is not the flow's to forward."""
+    requests = []
+
+    class ForwardingAuth(httpx2.Auth):
+        def auth_flow(self, request):
+            response = yield request
+            if response.status_code == 401:
+                yield httpx2.Request("GET", "https://auth.example/probe", headers=request.headers)
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(200 if request.url.host == "auth.example" else 401)
+
+    source = MCPSource.http(
+        "test",
+        "https://source.example/mcp",
+        headers={"Authorization": "Bearer static-token"},
+        auth=ForwardingAuth(),
+    )
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert requests[0].headers["authorization"] == "Bearer static-token"
+    assert "authorization" not in requests[1].headers
+
+
+async def test_sdk_oauth_client_provider_token_request_keeps_basic_auth_end_to_end():
+    """The unmanaged ``MCPSource(auth=OAuthClientProvider)`` path with a cross-origin AS."""
+    import base64
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.server.mcpserver import MCPServer as SDKServer
+    from mcp.shared.auth import (
+        AuthorizationCodeResult,
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+    )
+
+    from dendrux.mcp._client import MCPClientAdapter
+    from tests.unit.test_mcp_streamable_http_auth import _serve
+
+    bases = {}
+    token_requests = []
+    expected_basic = "Basic " + base64.b64encode(b"client:s3cret").decode()
+
+    async def respond(send, status, payload=None, headers=()):
+        body = b"" if payload is None else json.dumps(payload).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"application/json"), *headers],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def auth_server(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        base = bases["as"]
+        if scope["path"] == "/.well-known/oauth-authorization-server":
+            await respond(
+                send,
+                200,
+                {
+                    "issuer": base,
+                    "authorization_endpoint": f"{base}/authorize",
+                    "token_endpoint": f"{base}/token",
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                },
+            )
+        elif scope["path"] == "/token":
+            authorization = dict(scope["headers"]).get(b"authorization", b"").decode()
+            token_requests.append(authorization)
+            if authorization != expected_basic:
+                await respond(send, 401, {"error": "invalid_client"})
+            else:
+                await respond(
+                    send,
+                    200,
+                    {"access_token": "at-1", "token_type": "Bearer", "expires_in": 3600},
+                )
+        else:
+            await respond(send, 404)
+
+    mcp_server = SDKServer(name="oauth-rs")
+
+    @mcp_server.tool()
+    def echo(text: str) -> str:
+        return text
+
+    inner = mcp_server.streamable_http_app()
+
+    async def resource_server(scope, receive, send):
+        if scope["type"] != "http":
+            await inner(scope, receive, send)
+            return
+        base = bases["rs"]
+        if scope["path"].startswith("/.well-known/oauth-protected-resource"):
+            await respond(
+                send, 200, {"resource": f"{base}/mcp", "authorization_servers": [bases["as"]]}
+            )
+            return
+        if dict(scope["headers"]).get(b"authorization") != b"Bearer at-1":
+            challenge = (
+                f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp"'
+            )
+            await respond(send, 401, headers=[(b"www-authenticate", challenge.encode())])
+            return
+        await inner(scope, receive, send)
+
+    class Storage:
+        def __init__(self):
+            self.tokens = None
+            self.client = OAuthClientInformationFull(
+                client_id="client",
+                client_secret="s3cret",
+                token_endpoint_auth_method="client_secret_basic",
+                redirect_uris=["http://localhost/callback"],
+            )
+
+        async def get_tokens(self):
+            return self.tokens
+
+        async def set_tokens(self, tokens):
+            self.tokens = tokens
+
+        async def get_client_info(self):
+            return self.client
+
+        async def set_client_info(self, client):
+            self.client = client
+
+    authorization_urls = []
+
+    async def redirect_handler(url):
+        authorization_urls.append(url)
+
+    async def callback_handler():
+        state = parse_qs(urlsplit(authorization_urls[-1]).query)["state"][0]
+        return AuthorizationCodeResult(code="code-1", state=state)
+
+    async with _serve(auth_server) as as_url, _serve(resource_server) as rs_url:
+        bases["as"] = as_url.removesuffix("/mcp")
+        bases["rs"] = rs_url.removesuffix("/mcp")
+        provider = OAuthClientProvider(
+            server_url=rs_url,
+            client_metadata=OAuthClientMetadata(
+                redirect_uris=["http://localhost/callback"],
+                token_endpoint_auth_method="client_secret_basic",
+            ),
+            storage=Storage(),
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+        )
+        adapter = MCPClientAdapter(MCPSource.http("demo", rs_url, auth=provider))
+        await adapter.connect()
+        try:
+            tools = await adapter.list_tools()
+        finally:
+            await adapter.close()
+    assert [tool.name for tool in tools] == ["echo"]
+    assert token_requests == [expected_basic]
+
+
 async def test_redirect_of_an_auth_owned_request_still_strips_headers():
     requests = []
 

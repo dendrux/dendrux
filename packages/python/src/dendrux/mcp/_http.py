@@ -203,20 +203,39 @@ def _origin(url: httpx2.URL) -> _Origin:
 _AUTH_OWNED_EXTENSION = "dendrux_auth_owned"
 
 
-def _is_auth_owned(request: httpx2.Request) -> bool:
-    # Redirect requests copy their parent's extensions, so the tag names the
-    # exact request object it was set on; a copy never matches.
-    return request.extensions.get(_AUTH_OWNED_EXTENSION) is request
+class _AuthOwned:
+    """Provenance of one request an auth flow built for another origin."""
+
+    __slots__ = ("headers", "request")
+
+    def __init__(self, request: httpx2.Request, headers: frozenset[str]) -> None:
+        self.request = request
+        self.headers = headers
+
+
+def _auth_owned_headers(request: httpx2.Request) -> frozenset[str]:
+    """Header names an auth flow introduced on exactly this request.
+
+    Redirect requests copy their parent's extensions, so the marker names
+    the exact request object it was set on; a copy never matches and keeps
+    nothing.
+    """
+    marker = request.extensions.get(_AUTH_OWNED_EXTENSION)
+    if isinstance(marker, _AuthOwned) and marker.request is request:
+        return marker.headers
+    return frozenset()
 
 
 class _ScopedAuth(httpx2.Auth):
     """Track auth-generated headers and tag the auth flow's own requests.
 
-    A request the wrapped flow builds itself (for example an OAuth token
-    request to an authorization server on another origin) is not the MCP
-    request, so its headers belong to it: it is tagged auth-owned and keeps
-    them. The original request, and anything a redirect builds, is never
-    tagged, so cross-origin hops still lose credentials.
+    A request the wrapped flow builds itself for another origin (for
+    example an OAuth token request to an authorization server) is tagged
+    auth-owned together with the header names the flow introduced on it:
+    absent from, or different to, the original request before the flow ran.
+    Only those headers survive the cross-origin scoping; anything copied
+    from the original request is still stripped. The original request, and
+    anything a redirect builds, is never tagged.
     """
 
     def __init__(self, auth: httpx2.Auth, sensitive: set[str], origin: _Origin) -> None:
@@ -228,13 +247,19 @@ class _ScopedAuth(httpx2.Auth):
         self,
         request: httpx2.Request,
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
-        before = dict(request.headers)
+        initial = dict(request.headers)
+        before = initial
         flow = self._auth.async_auth_flow(request)
         try:
             outgoing = await anext(flow)
             while True:
                 if outgoing is not request and _origin(outgoing.url) != self._origin:
-                    outgoing.extensions[_AUTH_OWNED_EXTENSION] = outgoing
+                    introduced = frozenset(
+                        name
+                        for name, value in outgoing.headers.items()
+                        if initial.get(name) != value
+                    )
+                    outgoing.extensions[_AUTH_OWNED_EXTENSION] = _AuthOwned(outgoing, introduced)
                 self._sensitive.update(
                     name for name, value in outgoing.headers.items() if before.get(name) != value
                 )
@@ -269,8 +294,9 @@ def create_http_client(
             if on_denied is not None:
                 on_denied()
             raise MCPDestinationDeniedError("MCP request has an unsupported destination URL.")
-        if _origin(request.url) != origin and not _is_auth_owned(request):
-            for name in sensitive:
+        if _origin(request.url) != origin:
+            keep = _auth_owned_headers(request)
+            for name in sensitive - keep:
                 request.headers.pop(name, None)
 
     if transport is None and source.destination_policy is not None:
