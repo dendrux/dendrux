@@ -2096,15 +2096,39 @@ class MCPRuntime:
         entry: _ConnectionEntry,
         adapter: MCPClientAdapter,
     ) -> None:
-        """Close a transport whose credentials were rejected before recovery."""
+        """Close a transport whose credentials were rejected before recovery.
+
+        Bounded by ``close_timeout`` like every other teardown. A close that
+        does not finish is handed to the background and fails the opening
+        with a value-free error instead of blocking every waiter; a close
+        that raises is logged and recovery continues.
+        """
+
+        async def close() -> None:
+            try:
+                await adapter.close()
+            except Exception as exc:
+                logger.warning(
+                    "MCP source '%s' cleanup failed after a credential rejection: %s (%s)",
+                    entry.source.name,
+                    safe_source_exception_detail(adapter.source, exc),
+                    type(exc).__name__,
+                )
+
+        task = asyncio.create_task(close())
         try:
-            await adapter.close()
-        except Exception as exc:
-            logger.warning(
-                "MCP source '%s' cleanup failed after a credential rejection: %s (%s)",
-                entry.source.name,
-                safe_source_exception_detail(adapter.source, exc),
-                type(exc).__name__,
+            pending = await self._settle_teardown_tasks(
+                {task: entry},
+                timeout=self.close_timeout,
+                warning="MCP source '%s' rejected-credential close exceeded its grace.",
+            )
+        except asyncio.CancelledError:
+            if not task.done():
+                self._track_abandoned_task(task)
+            raise
+        if pending:
+            raise MCPConnectionError(
+                "MCP credential recovery could not close the rejected transport."
             )
 
     async def _notify_connect_rejection(

@@ -1150,6 +1150,80 @@ async def test_eviction_during_connect_recovery_never_publishes(adapters, monkey
         assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
 
 
+async def test_hanging_rejected_adapter_close_fails_the_opening(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    release = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer one":
+            await release.wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = Provider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=0.05)
+    try:
+        connection = _bind(runtime, provider)
+        waiters = [asyncio.create_task(connection.discover()) for _ in range(3)]
+        results = await asyncio.wait_for(
+            asyncio.gather(*waiters, return_exceptions=True), timeout=2
+        )
+        for result in results:
+            assert isinstance(result, MCPConnectionError)
+            assert not isinstance(result, MCPAuthenticationError)
+            assert "Bearer" not in str(result)
+        # Recovery stops before notifying the provider or reconnecting.
+        assert provider.rejections == 0
+        assert provider.gets == 1
+        assert len(adapters.instances) == 1
+        assert _opening_events(recorder) == (1, ["MCPConnectionFailed"])
+        failed = [e for e in recorder.events if type(e).__name__ == "MCPConnectionFailed"]
+        assert failed[0].cause == "MCPConnectionError"
+        assert runtime._registrations[connection.identity].circuit.consecutive_failures == 1
+        assert connection.identity not in runtime._entries
+    finally:
+        release.set()
+        await runtime.close()
+
+
+async def test_cancel_while_closing_rejected_adapter_hands_close_to_background(
+    adapters, monkeypatch
+):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer one":
+            closing.set()
+            await release.wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = Provider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=30.0)
+    try:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        open_task = runtime._entries[connection.identity].task
+        open_task.cancel()
+        await asyncio.gather(open_task, return_exceptions=True)
+        assert open_task.cancelled()
+        # The still-running close is tracked, not leaked.
+        assert len(runtime._abandoned_tasks) == 1
+        assert provider.rejections == 0
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+        await asyncio.gather(discover, return_exceptions=True)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await runtime.close()
+    assert not runtime._abandoned_tasks
+
+
 class CountingProvider:
     """Each rejection moves to the next token; every token is rejected."""
 
