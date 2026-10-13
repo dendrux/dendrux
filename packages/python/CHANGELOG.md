@@ -2,17 +2,19 @@
 
 ## Unreleased
 
-- MCP: `MCPAuthenticationError.challenge` carries the parsed `WWW-Authenticate`
-  header of the rejecting 401/403 (`MCPAuthChallenge`: `scheme`, `error`,
-  `error_description`, `scope`, `resource_metadata_url`) at connect,
-  discovery, and tool-call time. Nothing from the header enters the message.
+- MCP: `MCPAuthenticationError.challenge` carries the validated `Bearer`
+  challenge of the rejecting 401/403 (`MCPAuthChallenge`: `scheme`, `error`,
+  `scope`, `resource_metadata_url`) at connect, discovery, and tool-call time.
+  Fields failing their RFC grammar are dropped, free text is never stored, and
+  nothing from the header enters messages or `repr()`.
 - MCP: with `reauthenticate_on_401=True` and a refreshing credential provider,
   a 401 from the source origin during connect or `tools/list` now calls
   `on_auth_rejected()` once and retries the connection once, instead of
-  failing. Connect-time rejections also set `request_rejected`.
+  failing. A rejected operation notifies the provider at most once.
+  Connect-time rejections also set `request_rejected`.
 - MCP: a request an `auth=` flow builds itself for another origin (for example
-  an OAuth token request with `Authorization: Basic`) keeps the headers its
-  flow set. Redirects, including redirects of such a request, are still
+  an OAuth token request with `Authorization: Basic`) keeps only the headers
+  its flow introduced. Copied source headers, cookies, and redirects are still
   stripped.
 
 ## 0.2.0a20 - 2026-10-12
