@@ -62,3 +62,6 @@ examples/**/output/
 node_modules/
 packages/python/src/dendrite/dashboard/static/*
 !packages/python/src/dendrite/dashboard/static/.gitkeep
+
+# Private notes (never commit)
+meeting-prep.md

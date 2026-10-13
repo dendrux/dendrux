@@ -778,7 +778,7 @@ async def test_malformed_expires_in_on_refresh_takes_the_uncertain_path() -> Non
         oauth = make_oauth(store)
         src = await sign_in(harness, oauth)
         harness.config.token_status_override = 200
-        harness.config.token_body_override = b'{"access_token": "x", "expires_in": "\u00b2"}'
+        harness.config.token_body_override = '{"access_token": "x", "expires_in": "²"}'.encode()
         shift(oauth, LATER)
         credentials = provider(oauth, src)
         with pytest.raises(MCPOAuthRefreshError) as caught:
