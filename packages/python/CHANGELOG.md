@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a22 - 2026-10-14
 
 - MCP: `connection.tools()` gains `prefix`, `rename`, and `strict` (also on
   `MCPToolPolicy`). `prefix=False` exposes bare tool names; `rename` maps a
@@ -26,6 +26,9 @@
 - MCP fix: a failed call through `MCPServer` or `MCPHost` now names the tool by
   its exposed, sanitized name (`srv__get_echo`), not the raw server name
   (`srv__get.echo`).
+- MCP fix: internal OAuth token, token-response and rejection carriers now
+  have redacting `repr`s, so a stray log line or traceback never prints a
+  secret.
 
 ## 0.2.0a21 - 2026-10-13
 
