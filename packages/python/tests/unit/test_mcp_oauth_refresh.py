@@ -788,3 +788,36 @@ async def test_malformed_expires_in_on_refresh_takes_the_uncertain_path() -> Non
         assert retired.status == "retired" and retired.refresh_claim is None
         assert credentials.events.outcomes() == ["uncertain"]
         await oauth.aclose()
+
+
+class CancelOnClaimCommit(MCPOAuthMemoryStore):
+    """Commits the claim, then cancels the owning operation before it resumes."""
+
+    oauth: MCPOAuth | None = None
+
+    async def save(self, key, record, *, expected):  # type: ignore[no-untyped-def]
+        saved = await super().save(key, record, expected=expected)
+        if saved and record.refresh_claim is not None and self.oauth is not None:
+            for operation in self.oauth._operations:
+                operation.cancel()
+            self.oauth = None
+        return saved
+
+
+async def test_cancellation_after_a_committed_claim_releases_the_claim() -> None:
+    async with OAuthHarness() as harness:
+        store = CancelOnClaimCommit()
+        oauth = make_oauth(store)
+        src = await sign_in(harness, oauth)
+        shift(oauth, LATER)
+        store.oauth = oauth
+        credentials = provider(oauth, src)
+        with pytest.raises(asyncio.CancelledError):
+            await credentials.get_auth()
+        current = await row(store)
+        assert current.status == "active"
+        assert current.refresh_claim is None
+        assert current.credential.refresh_token is not None  # type: ignore[union-attr]
+        assert harness.counters["refresh"] == 0
+        assert credentials.events.outcomes() == []
+        await oauth.aclose()

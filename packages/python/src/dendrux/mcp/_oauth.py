@@ -910,9 +910,13 @@ class MCPOAuth:
             try:
                 return await asyncio.shield(task), cancelled
             except asyncio.CancelledError:
-                if task.done():
+                if task.cancelled():
                     raise
                 cancelled = True
+                if task.done():
+                    # The write finished as cancellation arrived: its result
+                    # is committed state the caller must still act on.
+                    return task.result(), cancelled
 
     async def aclose(self) -> None:
         """Stop new operations, settle running ones, and close the transport.
