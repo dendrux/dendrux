@@ -263,8 +263,10 @@ text, timeouts, and uncertain outcomes do not trigger replay. Recovery
 revalidates the catalog before retrying. The existing destination and credential
 origin policies apply to the replacement transport.
 
-`on_auth_rejected()` has a `connect_timeout` budget. Callback exceptions become
-value-free `MCPCredentialError`s. A failed rejection callback is shared for that
+`on_auth_rejected()` has a `connect_timeout` budget. A callback that raises
+`MCPCredentialError` or `MCPAuthorizationRequired` propagates unchanged; any
+other exception becomes a value-free `MCPCredentialError` with the original
+detached. A failed rejection callback is shared for that
 credential generation; explicitly rotate credentials or rebind to try again.
 One logical call emits one start and one terminal event, even if it recovers;
 those events retain the first attempt's connection instance ID. Physical
@@ -284,9 +286,10 @@ same value-free `MCPCredentialError` as on the call path. Each rejected
 operation notifies the provider at most once: the reconnect that follows a
 tool-call rejection does not run a second connect-time recovery.
 
-Dendrux does not implement OAuth exchanges, persist refresh tokens, or coordinate
-rotation across workers. The provider owns those operations. Without the
-opt-in flag, a live 401 is typed but is not automatically recovered.
+With `credentials=`, the provider owns token exchange, storage, and
+coordination across workers; for OAuth servers, bind with `oauth=` instead (see
+[OAuth sign-in](#oauth-sign-in)). Without the opt-in flag, a live 401 on a
+`credentials=` binding is typed but is not automatically recovered.
 
 ### Safe connection diagnostics
 
@@ -337,6 +340,99 @@ except MCPAuthenticationError as error:
         request_more_scopes(challenge.scope)  # application-owned
 ```
 
+
+## OAuth sign-in
+
+For remote MCP servers protected by OAuth 2.1 (the MCP authorization spec),
+Dendrux owns the protocol and the token lifecycle: discovery (RFC 9728
+protected-resource metadata, RFC 8414 / OpenID authorization-server
+metadata), client resolution (pre-registered, client ID metadata documents,
+or RFC 7591 dynamic registration), PKCE S256, the RFC 8707 `resource`
+indicator, RFC 9207 `iss` checks, refresh with cross-process
+coordination, scope step-up, and RFC 7009 revocation. Your application owns
+durable storage (encrypted, through a small store protocol), user identity,
+and the browser redirect. The [MCP OAuth in a web app recipe](/docs/recipes/mcp-oauth-web)
+shows the routes, the store contract, and every documented limitation.
+
+```python
+from dendrux.mcp import MCPAuthKey, MCPOAuth, MCPOAuthClient, MCPRuntime, MCPSource
+
+oauth = MCPOAuth(
+    store=my_encrypted_store,                     # implements MCPOAuthStore
+    client=MCPOAuthClient.dynamic(
+        client_name="Acme Assistant",
+        redirect_uris=["https://app.example.com/oauth/callback"],
+    ),
+)
+source = MCPSource.http("linear", "https://mcp.linear.app/mcp")
+key = MCPAuthKey("linear", tenant_key=user.id)
+
+# GET /connect: send the user's browser to the authorization server.
+url = await oauth.begin_authorization(key, source, redirect_uri=CALLBACK_URL)
+
+# GET /oauth/callback, on any worker: key comes from the authenticated session.
+await oauth.complete_authorization(key=key, state=state, code=code, iss=iss, error=error)
+
+# Agent turns: bind the identity to the user's sign-in.
+connection = runtime.bind(
+    connection_key="linear", tenant_key=user.id, source=source, oauth=oauth
+)
+```
+
+`bind(oauth=)` is exclusive with `credentials=`, accepts HTTP sources only,
+and rejects a source whose headers contain `Authorization` in any case. The
+runtime keeps one credential provider per registration; an equivalent bind
+reuses it, and binding a different `MCPOAuth` while the connection is live
+raises `MCPBindingConflictError`. Exactly one `Authorization` header reaches
+the server.
+
+Every delivery re-reads the stored row and re-validates it in a fixed order:
+the user must be signed in, the credential must have been issued for exactly
+this source's canonical URL (query included) by the issuer its client belongs
+to, and the access token must not be expired. An expired access token is
+never delivered. Tokens are refreshed shortly before expiry and on a 401; a
+store refresh claim makes sure a refresh token is redeemed at most once across
+every worker, and an interrupted, uncertain, or abandoned refresh retires the
+refresh token instead of replaying it.
+
+Recovery is on for OAuth bindings whether or not `reauthenticate_on_401` is
+set. A 401 at connect, discovery, or a tool call refreshes once and retries
+once. A 403 with `error="insufficient_scope"` is also recoverable: if another
+worker already stepped up, the connection reconnects and retries; otherwise
+the call raises `MCPAuthorizationRequired` with `reason="insufficient_scope"`
+and the challenged `scopes`. Begin a new sign-in with the union of
+`(await oauth.status(key)).scope` and those scopes, then call
+`runtime.refresh_authorization(...)` so the next call reconnects with the new
+token and re-reads the catalog.
+
+`MCPAuthorizationRequired` (a subclass of `MCPConnectionError`) means the user
+must sign in again: `not_signed_in`, `expired`, `revoked`,
+`insufficient_scope`, or `resource_mismatch`. `MCPOAuthRefreshError` (a
+transient `MCPCredentialError`) means a refresh could not complete right now.
+Neither marks the connection's credentials failed nor counts toward the
+circuit breaker, and the next rejection may recover. Sign-in and sign-out
+failures raise `MCPOAuthFlowError` with a fixed `reason` code and the HTTP
+`status_code` when there was one. Messages and representations never carry
+tokens, codes, scopes, URLs, or server text.
+
+`runtime.revoke_authorization(connection_key=..., tenant_key=...)` fences new
+leases and calls immediately, writes a sign-out tombstone, revokes at the
+authorization server (the outcome is reported, never assumed), and drains and
+evicts the connection. Cancelling the caller never cancels the revoke, and
+`close()` waits for it.
+
+The runtime emits `MCPOAuthRequired(reason, scope_count)` once per shared
+failure, `MCPOAuthRefreshed(expires_in)`, `MCPOAuthRefreshFailed(outcome, cause)`
+with outcome `unsent`, `uncertain`, `rejected`, `contention`, or
+`expired_claim`, and `MCPOAuthRevoked(remote)`. Their representations show only
+the reason, outcome, and counts.
+
+OAuth requests never go through `httpx2.AsyncClient`: they are sent straight
+through a transport with no redirects, an overall deadline, a 1 MiB body cap,
+and the destination policy enforced at the socket, so no library logs a token
+endpoint's reason phrase. The MCP connection itself still uses the SDK's
+client, which logs request URLs, reason phrases, and session ids at INFO; see
+the recipe's logging section.
 
 ## Views and tool policy
 

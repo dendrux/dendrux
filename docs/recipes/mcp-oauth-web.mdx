@@ -1,0 +1,350 @@
+---
+title: MCP OAuth in a web app
+description: Let each user connect their own account on an OAuth-protected MCP server — sign-in routes, the store you implement, refresh across workers, step-up, sign-out, and the limits you should know.
+---
+
+# MCP OAuth in a web app
+
+Remote MCP servers such as Linear, Notion, or your own are often protected by
+OAuth 2.1. Each of your users signs in once, and their agent turns then call
+the server with that user's token. Dendrux owns the protocol and the token
+lifecycle. You own three things:
+
+- **The store**: one encrypted table and one short-lived flow table, behind the
+  four-method `MCPOAuthStore` protocol.
+- **Identity**: the `MCPAuthKey` for the signed-in user, always taken from your
+  authenticated session.
+- **The browser redirect**: two routes, `/connect` and `/oauth/callback`.
+
+A complete runnable walkthrough (local demo servers, a real Anthropic model,
+connect, refresh, step-up, sign-out) is in
+`packages/python/examples/35_mcp_oauth_web.py`.
+
+## Set up once per process
+
+```python
+from dendrux.mcp import MCPOAuth, MCPOAuthClient, MCPRuntime, MCPSource
+
+CALLBACK_URL = "https://app.example.com/oauth/callback"
+
+oauth = MCPOAuth(
+    store=PostgresOAuthStore(pool, encryptor),   # your MCPOAuthStore, below
+    client=MCPOAuthClient.dynamic(
+        client_name="Acme Assistant",
+        redirect_uris=[CALLBACK_URL],
+        # Optional: host a client ID metadata document and Dendrux uses it
+        # wherever the authorization server supports one.
+        cimd_url="https://app.example.com/oauth/client.json",
+    ),
+)
+runtime = MCPRuntime()
+linear = MCPSource.http("linear", "https://mcp.linear.app/mcp")
+```
+
+`MCPOAuthClient.dynamic(...)` registers per authorization server (RFC 7591)
+when no client ID metadata document can be used. For a client you registered
+out of band, use `MCPOAuthClient.preregistered(client_id, client_secret,
+issuer=...)`: its secret is only ever sent to the authorization server whose
+metadata `issuer` equals `issuer` exactly.
+
+`MCPOAuth` options: `oauth_timeout` (10 s, the overall deadline of each OAuth
+request), `refresh_skew` (60 s, refresh this long before expiry),
+`flow_ttl` (600 s, how long a sign-in may take), `claim_ttl` (300 s, must
+exceed `oauth_timeout` by more than 60 s), `destination_policy` (checked at the
+socket for every OAuth request), `allow_insecure_issuer` (permit http outside
+loopback, for development only), and `allow_legacy_discovery` (fall back to the
+2025-03-26 discovery when the server publishes no protected-resource
+metadata).
+
+Call `await oauth.aclose()` and `await runtime.close()` at shutdown.
+
+## The routes (FastAPI)
+
+```python
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import RedirectResponse
+
+from dendrux.mcp import MCPAuthKey, MCPAuthorizationRequired, MCPOAuthFlowError
+
+app = FastAPI()
+
+
+def auth_key(user=Depends(current_user)) -> MCPAuthKey:
+    # Always from YOUR authenticated session, never from the URL.
+    return MCPAuthKey("linear", tenant_key=user.id)
+
+
+@app.get("/connect")
+async def connect(key: MCPAuthKey = Depends(auth_key), scopes: str | None = None):
+    url = await oauth.begin_authorization(
+        key,
+        linear,
+        redirect_uri=CALLBACK_URL,
+        scopes=scopes.split(",") if scopes else None,
+    )
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/oauth/callback")
+async def callback(request: Request, key: MCPAuthKey = Depends(auth_key)):
+    params = request.query_params
+    try:
+        await oauth.complete_authorization(
+            key=key,
+            state=params.get("state", ""),
+            code=params.get("code"),
+            iss=params.get("iss"),
+            error=params.get("error"),
+        )
+    except MCPOAuthFlowError as error:
+        return {"connected": False, "reason": error.reason}
+    # After a step-up, retire the live transport so the next call uses the
+    # new token and re-reads the catalog.
+    runtime.bind(connection_key="linear", tenant_key=key.tenant_key, source=linear, oauth=oauth)
+    await runtime.refresh_authorization(connection_key="linear", tenant_key=key.tenant_key)
+    return {"connected": True}
+
+
+@app.post("/ask")
+async def ask(body: Question, key: MCPAuthKey = Depends(auth_key)):
+    connection = runtime.bind(
+        connection_key="linear", tenant_key=key.tenant_key, source=linear, oauth=oauth
+    )
+    try:
+        await connection.discover()
+    except MCPAuthorizationRequired as error:
+        return {"status": error.reason}          # show "Connect Linear"
+    async with Agent(provider=provider, prompt=PROMPT,
+                     tool_sources=[connection.tools()]) as agent:
+        result = await agent.run(body.text)
+    return {"status": "ok", "answer": result.answer}
+
+
+@app.post("/disconnect")
+async def disconnect(key: MCPAuthKey = Depends(auth_key)):
+    runtime.bind(connection_key="linear", tenant_key=key.tenant_key, source=linear, oauth=oauth)
+    revocation = await runtime.revoke_authorization(
+        connection_key="linear", tenant_key=key.tenant_key
+    )
+    return {"local": revocation.local, "remote": revocation.remote}
+```
+
+`begin_authorization` and `complete_authorization` may run on different
+workers: everything they share is in the store. The flow is consumed by the
+first callback that presents its `state`, before any other check, and it is
+bound to the key that began it: a callback completed under a different key
+fails with `key_mismatch` and makes no token request. This is **principal
+binding, not browser-session binding**. It stops one user from completing
+another user's sign-in; it does not bind the flow to one browser tab.
+
+### Step-up
+
+When a tool needs more scopes, the call raises `MCPAuthorizationRequired`
+with `reason="insufficient_scope"` and the challenged `scopes`. Inside an
+Agent run the tool error reaches the model and the runtime emits
+`MCPOAuthRequired(reason="insufficient_scope")`. Start a new sign-in with the
+union of what the user already granted and what the server asked for:
+
+```python
+status = await oauth.status(key)
+granted = (status.scope or "").split()
+url = await oauth.begin_authorization(
+    key, linear, redirect_uri=CALLBACK_URL,
+    scopes=[*granted, *[s for s in error.scopes if s not in granted]],
+)
+```
+
+After the callback, `runtime.refresh_authorization(...)` drains calls and
+closes the old transport; the next call reconnects with the new token. Other
+workers recover on their next 403: they see that the stored credential
+changed and reconnect instead of failing.
+
+### Status for your settings page
+
+`await oauth.status(key)` returns `MCPOAuthStatus.state`: `signed_out`,
+`active`, `expired` (the next use refreshes), `refreshing`, `retired` (no
+refresh token; the access token works until it expires), or `needs_sign_in`.
+`scope`, `expires_at`, `issuer`, and `resource` are attributes; they are
+server-chosen values, so treat them as untrusted when you render them.
+
+## The store you implement
+
+```python
+from dendrux.mcp import (
+    MCPAuthKey, MCPOAuthFlow, MCPOAuthRecord, MCPOAuthStore, MCPOAuthVersion,
+)
+
+
+class PostgresOAuthStore:  # implements MCPOAuthStore
+    async def load(self, key: MCPAuthKey) -> MCPOAuthRecord | None: ...
+    async def save(self, key: MCPAuthKey, record: MCPOAuthRecord, *,
+                   expected: MCPOAuthVersion | None) -> bool: ...
+    async def save_flow(self, flow: MCPOAuthFlow) -> None: ...
+    async def take_flow(self, state: str) -> MCPOAuthFlow | None: ...
+```
+
+The semantics are normative:
+
+- **One row per key, never deleted by Dendrux.** `key` is
+  `(tenant_key, connection_key)`; store the two fields separately, never as a
+  concatenated string. Sign-out writes a new row version with no credential (a
+  tombstone), so a missing row and a signed-out row are different states.
+- **`save(expected=None)`** inserts only when no row exists for the key, and
+  returns False otherwise.
+- **`save(expected=v)`** replaces the row only when the stored version equals
+  `v` in both `generation` and `revision`, and returns False otherwise.
+  Dendrux assigns every version; persist `record.version` as given.
+- **`save` returns True only after the write is durable.**
+- **Read-after-write**: a `load` from any process observes the latest
+  acknowledged `save` for that key. Read from the primary, never a replica.
+- **`take_flow(state)` is an atomic one-shot across processes** (for example
+  `DELETE ... WHERE state = $1 RETURNING ...`). You may garbage-collect flows
+  whose `expires_at` has passed.
+- Dendrux never holds a lock or transaction across a network call; each
+  method is one short statement.
+- **Encrypt at rest.** Rows contain access tokens, refresh tokens, and client
+  secrets; flows contain the PKCE verifier and `state`. Dendrux never writes
+  tokens to its own database or run store.
+
+A compare-and-swap on Postgres is one statement:
+
+```sql
+UPDATE mcp_oauth
+   SET generation = $new_generation, revision = $new_revision, payload = $encrypted
+ WHERE tenant_key IS NOT DISTINCT FROM $tenant AND connection_key = $connection
+   AND generation = $expected_generation AND revision = $expected_revision;
+-- True when exactly one row was updated. Inserts use
+-- INSERT ... ON CONFLICT DO NOTHING and check the row count.
+```
+
+**Keep tombstones.** Retain signed-out rows permanently. If you must delete
+one, first make sure no sign-in for that key can still complete: no
+`begin_authorization` within `flow_ttl` **and** no `complete_authorization`
+in flight (a completion past its expiry check may still be exchanging the
+code). Deleting a tombstone earlier lets a stale sign-in resurrect a
+credential the user revoked.
+
+Check your implementation with the conformance helper. The factory must
+return a **new client** bound to the **same backend namespace** on every
+call, because competing operations run on two clients at once:
+
+```python
+from dendrux.mcp import check_oauth_store
+
+await check_oauth_store(lambda: PostgresOAuthStore(new_pool(), encryptor))
+```
+
+It checks insert/insert, CAS/CAS, and take/take races, exact-version
+semantics, read-after-write across clients, key isolation, and expired flows,
+and raises `AssertionError` naming the first failure. It writes rows under
+random keys that are never deleted, so point it at a test database. It checks
+semantics; it cannot prove that your backend is atomic across processes.
+`MCPOAuthMemoryStore` is the in-process reference implementation, for tests
+and single-process demos only.
+
+## How refresh works across workers
+
+Before redeeming a refresh token, a worker takes a **refresh claim** on the
+row with a compare-and-swap. Other workers wait for the claim and then use
+the published credential. Outcomes:
+
+- **Success**: the new credential is published and the claim released.
+- **Unsent** (connection refused, connect or pool timeout, destination denied,
+  cancelled before sending): the claim is released and the refresh token is
+  kept. No HTTP status ever counts as unsent.
+- **Rejected** (a 400 or 401 whose JSON `error` is `invalid_grant`,
+  `invalid_client`, `invalid_request`, `invalid_scope`, `unauthorized_client`,
+  or `unsupported_grant_type`): the refresh token is retired and the call
+  raises `MCPAuthorizationRequired(reason="revoked")`.
+- **Uncertain** (any other response, including 429 and every 5xx, a 3xx, a
+  2xx other than 200, an unparsable body, a dropped connection, a timeout):
+  the refresh token is retired, because the authorization server may already
+  have redeemed it. The remaining access token is still used until it
+  expires; then the user signs in again.
+- **Expired claim** (a worker crashed or stalled mid-refresh): the next reader
+  retires the refresh token instead of replaying it.
+
+A refresh token is never redeemed twice, so refresh-token reuse detection
+(RFC 9700) never revokes your users' grants.
+
+## Errors
+
+| Error | Meaning | What to do |
+|---|---|---|
+| `MCPAuthorizationRequired` | The user must (re)connect: `not_signed_in`, `expired`, `revoked`, `insufficient_scope`, `resource_mismatch` | Show a connect or step-up button |
+| `MCPOAuthRefreshError` | A refresh could not complete now (contended, unsent, or uncertain) | Retry later; a `MCPCredentialError` subclass |
+| `MCPOAuthFlowError` | Sign-in or sign-out failed; `reason` is a fixed code, `status_code` the HTTP status when there was one | Show the reason; start again |
+| `MCPOAuthError` | Base class; also raised for a store failure (class name only) | Check your store |
+
+`MCPOAuthFlowError.reason` is one of `invalid_argument`, `unknown_state`,
+`expired_state`, `key_mismatch`, `access_denied`, `issuer_mismatch`,
+`invalid_callback`, `superseded` (a sign-out or another sign-in won while this
+one was pending), `contention`, `token_exchange_failed`, `discovery_failed`,
+`registration_failed`, `destination_denied`, `insecure_url`,
+`pkce_unsupported`, or `closed`.
+
+Neither `MCPAuthorizationRequired` nor `MCPOAuthRefreshError` counts toward
+the circuit breaker or marks the connection's credentials failed. Messages
+are fixed text plus the reason; scopes, URLs, tokens, and server text are
+never in a message or representation.
+
+## Events
+
+| Event | Fields |
+|---|---|
+| `MCPOAuthRequired` | `reason`, `scope_count` (once per shared failure) |
+| `MCPOAuthRefreshed` | `expires_in` |
+| `MCPOAuthRefreshFailed` | `outcome` (`unsent`, `uncertain`, `rejected`, `contention`, `expired_claim`), `cause` (a class name or HTTP status label) |
+| `MCPOAuthRevoked` | `remote` (`confirmed`, `failed`, `unsupported`, `skipped`) |
+
+All carry `tenant_key`, `connection_key`, and `source_name`; their
+representations show only the reason, outcome, and counts.
+
+## Logging in production
+
+OAuth requests never go through `httpx2.AsyncClient`, so no library logs a
+token endpoint URL or reason phrase. The MCP connection itself still uses the
+SDK's HTTP client: `httpx2` logs each request URL and the server-chosen reason
+phrase at INFO, and the `mcp` SDK logs the session id at INFO. A hostile
+resource server can echo a credential it already holds into those lines.
+Raise both loggers to WARNING:
+
+```python
+import logging
+
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("mcp").setLevel(logging.WARNING)
+```
+
+That suppresses only those INFO sites. The SDK still logs attacker-controlled
+text at WARNING and ERROR (for example `logger.exception` on JSON-RPC
+validation failures and content-type errors in its Streamable HTTP
+transport), so a hostile server can still echo a credential it already holds
+into those records. Treat MCP transport logs as sensitive. `httpcore2` logs raw
+headers at DEBUG; keep it above DEBUG.
+
+## Documented limitations
+
+- **Your store holds the secrets.** Encrypt it; Dendrux never writes tokens to
+  its own database.
+- **Sign-out does not push-invalidate other workers.** Another worker's live
+  transport keeps its bearer token until the server rejects it or the worker
+  reconnects; then it raises `revoked`.
+- **An interrupted, uncertain, or abandoned refresh retires the refresh
+  token.** The user signs in again when the access token expires. A stalled
+  claimant blocks refresh for up to `claim_ttl`.
+- **A late remote revocation can invalidate a newer sign-in.** Revocation may
+  be grant-wide (RFC 7009); if it lands after the user signed in again, the
+  new credential is rejected, its refresh is rejected, and the user signs in
+  once more.
+- **Same-origin redirects of MCP requests keep credentials** (the existing
+  transport policy).
+- **`check_oauth_store` cannot prove multi-process atomicity** of a backend.
+- **Principal binding, not browser-session binding.**
+- **`httpcore2` DEBUG wire logs** are third-party and out of scope.
+- **Deleting a tombstone** before `flow_ttl` has elapsed since the last
+  `begin_authorization` for that key reopens a race in which a stale sign-in
+  completes after sign-out.
+- **Same access-token string after refresh.** If an authorization server
+  re-issues the identical access token, a delayed rejection from an older
+  transport can cause one extra refresh; the refresh claim keeps it safe.
