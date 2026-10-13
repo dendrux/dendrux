@@ -982,3 +982,30 @@ async def test_original_request_retargeted_by_its_flow_keeps_nothing():
         await client.post(source.url, json={})
     assert requests[0].url.host == "other.example"
     assert "authorization" not in requests[0].headers
+
+
+async def test_value_set_in_place_on_the_original_is_never_introduced_on_a_copy():
+    class InPlaceThenCopy(httpx2.Auth):
+        def auth_flow(self, request):
+            request.headers["Authorization"] = "Bearer S"
+            response = yield request
+            if response.status_code != 401:
+                return
+            yield httpx2.Request("GET", "https://auth.example/copy", headers=request.headers)
+            yield httpx2.Request(
+                "POST", "https://auth.example/token", headers={"Authorization": "Basic X"}
+            )
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(200 if request.url.host == "auth.example" else 401)
+
+    source = MCPSource.http("test", "https://source.example/mcp", auth=InPlaceThenCopy())
+    async with create_http_client(source, transport=httpx2.MockTransport(handle)) as client:
+        await client.post(source.url, json={})
+    assert [r.url.path for r in requests] == ["/mcp", "/copy", "/token"]
+    assert requests[0].headers["authorization"] == "Bearer S"
+    assert "authorization" not in requests[1].headers
+    assert requests[2].headers["authorization"] == "Basic X"

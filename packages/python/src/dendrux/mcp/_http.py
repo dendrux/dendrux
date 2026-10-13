@@ -232,10 +232,11 @@ class _ScopedAuth(httpx2.Auth):
     A request the wrapped flow builds itself for another origin (for
     example an OAuth token request to an authorization server) is tagged
     auth-owned together with the header names the flow introduced on it:
-    absent from, or different to, the original request before the flow ran.
-    Only those headers survive the cross-origin scoping; anything copied
-    from the original request is still stripped. The original request, and
-    anything a redirect builds, is never tagged.
+    absent from, or different to, the original request before the flow ran,
+    and not a value the flow set on the original request in place. Only
+    those headers survive the cross-origin scoping; anything copied from the
+    original request is still stripped. The original request, and anything
+    a redirect builds, is never tagged.
 
     The marker lives only while its request is being sent by this flow: any
     marker already on the original request is removed on entry, every yield
@@ -254,15 +255,24 @@ class _ScopedAuth(httpx2.Auth):
         request.extensions.pop(_AUTH_OWNED_EXTENSION, None)
         initial = dict(request.headers)
         before = initial
+        # (name, value) pairs the flow set on the original request in place.
+        # Such a value is the source's credential, never the flow's own for
+        # another origin, even when copied onto a new request.
+        set_on_original: set[tuple[str, str]] = set()
         flow = self._auth.async_auth_flow(request)
         try:
             outgoing = await anext(flow)
             while True:
+                set_on_original.update(
+                    (name, value)
+                    for name, value in request.headers.items()
+                    if initial.get(name) != value
+                )
                 if outgoing is not request and _origin(outgoing.url) != self._origin:
                     introduced = frozenset(
                         name
                         for name, value in outgoing.headers.items()
-                        if initial.get(name) != value
+                        if initial.get(name) != value and (name, value) not in set_on_original
                     )
                     outgoing.extensions[_AUTH_OWNED_EXTENSION] = _AuthOwned(outgoing, introduced)
                 else:

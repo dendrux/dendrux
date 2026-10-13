@@ -79,8 +79,8 @@ hop and authentication retry. The one exception is a new request that an opaque
 request with `Authorization: Basic` to an authorization server. That request
 keeps only the headers its auth flow introduced (absent from, or changed from,
 the original request before the flow ran); configured source headers, cookies,
-and any credential copied unchanged from the original request are still
-stripped. A redirect of such a request, and any redirect of the MCP request
+any credential copied unchanged from the original request, and any value the
+flow set on the original request itself are still stripped. A redirect of such a request, and any redirect of the MCP request
 itself, is stripped as usual, and the destination policy still applies to its
 socket. Same-origin redirects retain credentials; even an
 HTTP-to-HTTPS upgrade is a different origin. Redirect URLs containing userinfo
