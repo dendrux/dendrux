@@ -1756,9 +1756,21 @@ class _OAuthCredentialProvider:
             and now >= credential.expires_at - oauth.refresh_skew
             and now - credential.published_at > oauth.refresh_skew
         )
-        row: MCPOAuthRecord | None = (
-            await self._refresh(start) if verdict == _NEEDS_REFRESH or proactive else start
-        )
+        row: MCPOAuthRecord | None = start
+        if verdict == _NEEDS_REFRESH:
+            row = await self._refresh(start)
+        elif proactive:
+            failure: MCPOAuthRefreshError | None = None
+            try:
+                row = await self._refresh(start)
+            except MCPOAuthRefreshError as exc:
+                failure = exc
+            if failure is not None:
+                # A transient refresh failure must not take down a user whose
+                # access token is still valid: deliver it if it still is.
+                row = await oauth._load(self.key)
+                if _verdict(row, self._resource, oauth._now(), started_active=True) != _DELIVER:
+                    raise failure
         verdict = _verdict(row, self._resource, oauth._now(), started_active=True)
         if verdict == _NEEDS_REFRESH:
             verdict = "expired"

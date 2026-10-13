@@ -705,3 +705,68 @@ async def test_closed_oauth_rejects_provider_operations() -> None:
         oauth.credentials(KEY, MCPSource.stdio("d", ["x"]))
     with pytest.raises(ValueError):
         oauth.credentials(KEY, MCPSource.http("d", "https://rs.example/a/../b"))
+
+
+# -- proactive refresh failures -------------------------------------------------------
+
+PROACTIVE = 3600 - 30  # inside the 60 s skew window, token still valid
+
+
+async def _with_dead_token_endpoint(store: MCPOAuthMemoryStore) -> None:
+    current = await row(store)
+    assert current.credential is not None
+    dead = replace(
+        current,
+        version=replace(current.version, revision=current.version.revision + 1),
+        credential=replace(
+            current.credential, token_endpoint=f"http://127.0.0.1:{free_port()}/token"
+        ),
+    )
+    assert await store.save(KEY, dead, expected=current.version)
+
+
+async def test_proactive_unsent_refresh_delivers_the_still_valid_token() -> None:
+    async with OAuthHarness() as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        src = await sign_in(harness, oauth)
+        await _with_dead_token_endpoint(store)
+        before = await row(store)
+        shift(oauth, PROACTIVE)
+        credentials = provider(oauth, src)
+        header = await credentials.get_auth()
+        assert header["Authorization"] == before.credential.authorization  # type: ignore[union-attr]
+        assert credentials.events.outcomes() == ["unsent"]
+        assert harness.counters["refresh"] == 0
+        assert (await row(store)).status == "active"
+        await oauth.aclose()
+
+
+async def test_proactive_uncertain_refresh_delivers_the_token_and_retires() -> None:
+    async with OAuthHarness() as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        src = await sign_in(harness, oauth)
+        before = await row(store)
+        harness.config.token_status_override = 503
+        shift(oauth, PROACTIVE)
+        credentials = provider(oauth, src)
+        header = await credentials.get_auth()
+        assert header["Authorization"] == before.credential.authorization  # type: ignore[union-attr]
+        assert credentials.events.outcomes() == ["uncertain"]
+        assert (await row(store)).status == "retired"
+        await oauth.aclose()
+
+
+async def test_expired_token_with_unsent_refresh_still_raises() -> None:
+    async with OAuthHarness() as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        src = await sign_in(harness, oauth)
+        await _with_dead_token_endpoint(store)
+        shift(oauth, LATER)
+        credentials = provider(oauth, src)
+        with pytest.raises(MCPOAuthRefreshError):
+            await credentials.get_auth()
+        assert credentials.events.outcomes() == ["unsent"]
+        await oauth.aclose()
