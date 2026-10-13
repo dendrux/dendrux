@@ -116,13 +116,16 @@ _NOT_CREDENTIAL_FAILURES: tuple[type[Exception], ...] = (
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class _Rejection:
     """One observed 401/403 and the exact Authorization value it rejected."""
 
     status: int | None
     challenge: MCPAuthChallenge | None
     authorization: str | None
+
+    def __repr__(self) -> str:
+        return f"_Rejection(status={self.status!r})"
 
 
 def _auth_key(identity: tuple[str | None, str]) -> MCPAuthKey:

@@ -521,3 +521,21 @@ def test_status_and_record_reprs_hide_identifiers_from_servers() -> None:
     )
     assert HOSTILE not in repr(status)
     assert replace(status, state="active").state == "active"
+
+
+def test_internal_carriers_have_redacting_reprs() -> None:
+    from dendrux.mcp._oauth import _Token
+    from dendrux.mcp._oauth_http import OAuthResponse
+    from dendrux.mcp._runtime import _Rejection
+
+    token = _Token(SENTINEL, "Bearer", 60, SENTINEL, SENTINEL)
+    response = OAuthResponse(200, httpx2.Headers({"x-echo": SENTINEL}), SENTINEL.encode())
+    rejection = _Rejection(401, None, f"Bearer {SENTINEL}")
+    for value in (token, response, rejection):
+        assert SENTINEL not in repr(value)
+        assert SENTINEL not in str(value)
+    assert repr(response) == "OAuthResponse(status=200, body=<9 bytes>)".replace(
+        "9", str(len(SENTINEL))
+    )
+    assert repr(rejection) == "_Rejection(status=401)"
+    assert repr(token) == "_Token(expires_in=60, refresh_token=<set>)"
