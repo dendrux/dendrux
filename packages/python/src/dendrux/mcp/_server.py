@@ -85,7 +85,8 @@ MCPSkipReason = Literal["name_unsafe", "duplicate_name", "unknown_tool"]
 class MCPSkippedTool:
     """One server tool a view left out instead of failing its whole source.
 
-    ``reason`` is ``name_unsafe`` (the exposed name is not provider-safe),
+    ``reason`` is ``name_unsafe`` (the exposed name is not provider-safe, or
+    its base name is empty),
     ``duplicate_name`` (an earlier tool in server order already produced the
     exposed name) or ``unknown_tool`` (the view's ``allowed_tools``,
     ``force_serial_tools`` or ``rename`` names a tool the server does not
@@ -166,8 +167,18 @@ def build_mcp_tool_defs(
     seen_names: set[str] = set()
     for tool in tools:
         canonical = exposed_tool_name(tool.name, namespace=namespace, prefix=prefix, rename=rename)
-        if not _PROVIDER_SAFE_RE.fullmatch(canonical):
+        # An empty base is never a real name, even though "ns__" alone would
+        # pass the provider-safe pattern.
+        empty_base = not exposed_tool_name(
+            tool.name, namespace=namespace, prefix=False, rename=rename
+        )
+        if empty_base or not _PROVIDER_SAFE_RE.fullmatch(canonical):
             if strict:
+                if empty_base:
+                    raise ValueError(
+                        f"MCP source '{source.name}' has a tool with an empty name, "
+                        "which cannot be exposed."
+                    )
                 _validate_canonical_name(canonical, source.name, tool.name)
             skip(tool.name, "name_unsafe")
             continue

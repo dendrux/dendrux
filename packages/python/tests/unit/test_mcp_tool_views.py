@@ -379,6 +379,24 @@ class TestPerToolSkipping:
             assert type(caught.value) is ValueError
             await agent.close()
 
+    @pytest.mark.parametrize("prefix", [True, False])
+    async def test_empty_base_name_is_unsafe_in_both_modes(self, prefix: bool) -> None:
+        _FakeAdapter.catalogs["github"] = [_tool(""), _tool("read")]
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent, defs = await _discover(_connection(runtime).tools(prefix=prefix))
+            assert sorted(defs) == (["github__read"] if prefix else ["read"])
+            assert agent._mcp_skipped_tools == [_skipped("name_unsafe", "")]
+            await agent.close()
+
+    async def test_empty_base_name_raises_in_strict_prefixed_mode(self) -> None:
+        _FakeAdapter.catalogs["github"] = [_tool("")]
+        async with MCPRuntime(shutdown_timeout=0.05) as runtime:
+            agent = Agent(prompt="test", tool_sources=[_connection(runtime).tools(strict=True)])
+            with pytest.raises(ValueError) as caught:
+                await agent.get_tool_lookups()
+            assert type(caught.value) is ValueError
+            await agent.close()
+
     def test_build_returns_defs_and_typed_skips(self) -> None:
         source = SimpleNamespace(name="srv", transport="stdio", call_timeout=30.0)
         tools = [_tool("ok"), _tool(LONG_70)]

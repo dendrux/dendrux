@@ -481,7 +481,7 @@ view = connection.tools(prefix=False, rename={"search_code": "gh_search"})
 
 Rename values must match `[a-zA-Z0-9_-]` and be at most 64 characters, including the `namespace__` prefix when `prefix=True`, and must be unique; a bad value raises `ValueError` when the view is created. Rules (`deny`, `require_approval`) and telemetry use the exposed name; the server is always called by its own name, which stays in `ToolDef.meta["mcp_tool_name"]` next to `meta["exposed_name"]`.
 
-**`strict=True`** restores raising at discovery. By default one bad tool no longer drops its whole source: a tool whose exposed name is not provider-safe (`name_unsafe`), a tool whose exposed name an earlier tool in server order already took (`duplicate_name`), and a name in `allowed_tools`, `force_serial_tools`, or `rename` that the server does not list (`unknown_tool`) are skipped and reported in `RunResult.meta["mcp_skipped_tools"]` (see [Failure modes at discovery](#failure-modes-at-discovery)). With `strict=True` the first of these raises `ValueError` instead:
+**`strict=True`** restores raising at discovery. By default one bad tool no longer drops its whole source: a tool whose exposed name is not provider-safe or whose base name is empty (`name_unsafe`), a tool whose exposed name an earlier tool in server order already took (`duplicate_name`), and a name in `allowed_tools`, `force_serial_tools`, or `rename` that the server does not list (`unknown_tool`) are skipped and reported in `RunResult.meta["mcp_skipped_tools"]` (see [Failure modes at discovery](#failure-modes-at-discovery)). With `strict=True` the first of these raises `ValueError` instead:
 
 ```python
 view = connection.tools(allowed_tools=["read_file", "create_issue"], strict=True)

@@ -14,6 +14,8 @@
   Skips are reported as `MCPSkippedTool` entries in
   `RunResult.meta["mcp_skipped_tools"]` (present whenever
   `mcp_skipped_sources` is) and in one `mcp.tools_skipped` governance event.
+  A tool with an empty name is `name_unsafe` in both modes (it no longer loads
+  as `namespace__`; `MCPServer` and `MCPHost` now reject it).
   `strict=True` restores raising `ValueError`. Collisions with another source,
   a local tool, or `use_skill` still raise, now as `MCPToolNameCollisionError`
   (a `ValueError` subclass, code `tool_name_collision`).
