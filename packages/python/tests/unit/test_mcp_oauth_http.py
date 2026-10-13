@@ -310,3 +310,62 @@ async def test_oauth_requests_never_use_async_client(monkeypatch: pytest.MonkeyP
         response = await client.send("GET", server.url + "/x")
         await client.aclose()
     assert response.status == 200
+
+
+def _oversized() -> bytes:
+    return raw_response(200, b"x" * (MAX_BODY_BYTES + 10))
+
+
+async def test_a_stalled_response_close_never_holds_send_past_its_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dendrux.mcp._http import _ResponseStream
+
+    async def never_closes(self: _ResponseStream) -> None:
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(_ResponseStream, "aclose", never_closes)
+    async with RawHTTPServer(_handler(_oversized())) as server:
+        client = OAuthHTTP(policy=None, timeout=0.3)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(OAuthTransportError):
+            await client.send("GET", server.url + "/x")
+        assert loop.time() - started < 1.5
+        assert len(client._closing) == 1
+        started = loop.time()
+        await client.aclose()
+        assert loop.time() - started < 1.0
+        for task in list(client._closing):
+            task.cancel()
+
+
+async def test_cancellation_during_close_returns_and_the_close_still_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dendrux.mcp._http import _ResponseStream
+
+    original = _ResponseStream.aclose
+    closing = asyncio.Event()
+    closed: list[bool] = []
+
+    async def slow_close(self: _ResponseStream) -> None:
+        closing.set()
+        await asyncio.sleep(0.3)
+        await original(self)
+        closed.append(True)
+
+    monkeypatch.setattr(_ResponseStream, "aclose", slow_close)
+    async with RawHTTPServer(_handler(_oversized())) as server:
+        client = OAuthHTTP(policy=None, timeout=5.0)
+        task = asyncio.create_task(client.send("GET", server.url + "/x"))
+        await closing.wait()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert loop.time() - started < 0.2
+        assert not closed
+        await client.aclose()
+        assert closed == [True]

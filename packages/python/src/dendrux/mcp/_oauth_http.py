@@ -183,6 +183,7 @@ class OAuthHTTP:
         self._timeout = timeout
         self._transport = _PolicyTransport(policy)
         self._checked_hosts: set[tuple[str, int]] = set()
+        self._closing: set[asyncio.Task[None]] = set()
         self._closed = False
 
     async def _precheck(self, url: httpx2.URL) -> None:
@@ -284,10 +285,7 @@ class OAuthHTTP:
             failure = exc
         finally:
             if response is not None:
-                try:
-                    await response.aclose()
-                except Exception:
-                    logger.debug("OAuth response close failed")
+                await self._close_response(response)
         if failure is None:
             return OAuthResponse(status, response_headers, bytes(body))
         # Classified on the exception the transport actually raised, then
@@ -302,9 +300,32 @@ class OAuthHTTP:
         failure = None
         raise OAuthTransportError(outcome, cause, denied=denied)
 
+    async def _close_response(self, response: httpx2.Response) -> None:
+        """Close a response within ``timeout``; a slow close finishes in the background.
+
+        The close runs as its own task, so neither a stalled server nor the
+        caller's cancellation can abandon it or hold ``send()`` past its bound.
+        """
+
+        async def close() -> None:
+            try:
+                await response.aclose()
+            except Exception:
+                logger.debug("OAuth response close failed")
+
+        task = asyncio.get_running_loop().create_task(close())
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+        await asyncio.wait({task}, timeout=self._timeout)
+
     async def aclose(self) -> None:
-        """Close the transport; later sends fail as unsent."""
+        """Close the transport; later sends fail as unsent.
+
+        Response closes still running get one more ``timeout`` to finish.
+        """
         self._closed = True
+        if self._closing:
+            await asyncio.wait(set(self._closing), timeout=self._timeout)
         try:
             await self._transport.aclose()
         except Exception:
