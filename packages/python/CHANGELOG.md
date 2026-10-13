@@ -11,7 +11,8 @@
 - MCP: behaviour change for runtime views. A tool with an unsafe or duplicate
   exposed name, or an `allowed_tools` / `force_serial_tools` / `rename` entry
   the server does not list, is now skipped instead of failing the whole source.
-  Skips are reported as `MCPSkippedTool` entries in
+  Skips are reported as `MCPSkippedTool` entries (reason typed as
+  `MCPSkipReason`) in
   `RunResult.meta["mcp_skipped_tools"]` (present whenever
   `mcp_skipped_sources` is) and in one `mcp.tools_skipped` governance event.
   A tool with an empty name is `name_unsafe` in both modes (it no longer loads

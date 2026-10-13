@@ -126,7 +126,7 @@ from dendrux.mcp._runtime import (  # noqa: E402
     MCPToolPolicy,
     MCPToolView,
 )
-from dendrux.mcp._server import MCPServer, MCPSkippedTool  # noqa: E402
+from dendrux.mcp._server import MCPServer, MCPSkippedTool, MCPSkipReason  # noqa: E402
 from dendrux.mcp._source import MCPFailureMode, MCPSource  # noqa: E402
 
 __all__ = [
@@ -203,6 +203,7 @@ __all__ = [
     "MCPRuntimeSnapshot",
     "MCPRuntimeState",
     "MCPServer",
+    "MCPSkipReason",
     "MCPSkippedTool",
     "MCPSource",
     "MCPStaleConnectionError",

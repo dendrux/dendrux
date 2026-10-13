@@ -105,6 +105,7 @@ EXPECTED_ALL = (
     "MCPRuntimeSnapshot",
     "MCPRuntimeState",
     "MCPServer",
+    "MCPSkipReason",
     "MCPSkippedTool",
     "MCPSource",
     "MCPStaleConnectionError",
