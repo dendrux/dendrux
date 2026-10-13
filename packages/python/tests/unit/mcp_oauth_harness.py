@@ -396,6 +396,8 @@ class OAuthHarness:
     token_latency: float = 0.0
     token_entered: asyncio.Event | None = None
     revocation_latency: float = 0.0
+    forbid_list_tools: bool = False
+    reject_all_tokens: bool = False
     preregistered: dict[str, Any] = field(default_factory=dict)
     rs_tool_calls: int = 0
     rs_auth_headers: list[list[str]] = field(default_factory=list)
@@ -668,6 +670,31 @@ class OAuthHarness:
                     message = json.loads(body)
                 except ValueError:
                     return False
+                if harness.reject_all_tokens:
+                    await _send_json(
+                        send,
+                        401,
+                        {"error": "invalid_token"},
+                        [(b"www-authenticate", b'Bearer error="invalid_token"')],
+                    )
+                    return True
+                if (
+                    isinstance(message, dict)
+                    and message.get("method") == "tools/list"
+                    and harness.forbid_list_tools
+                ):
+                    await _send_json(
+                        send,
+                        403,
+                        {"error": "insufficient_scope"},
+                        [
+                            (
+                                b"www-authenticate",
+                                b'Bearer error="insufficient_scope", scope="admin"',
+                            )
+                        ],
+                    )
+                    return True
                 if (
                     isinstance(message, dict)
                     and message.get("method") == "tools/call"

@@ -35,6 +35,7 @@ except ModuleNotFoundError as err:
     raise  # Real import error from within the mcp package
 
 from dendrux.mcp._credentials import (  # noqa: E402
+    MCPAuthKey,
     MCPCredentialProvider,
     MCPRefreshingCredentialProvider,
 )
@@ -43,6 +44,7 @@ from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo  # noqa: E402
 from dendrux.mcp._errors import (  # noqa: E402
     MCPAuthChallenge,
     MCPAuthenticationError,
+    MCPAuthorizationRequired,
     MCPBindingConflictError,
     MCPCallCapacityError,
     MCPCapacityError,
@@ -55,6 +57,9 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPCredentialError,
     MCPDestinationDeniedError,
     MCPError,
+    MCPOAuthError,
+    MCPOAuthFlowError,
+    MCPOAuthRefreshError,
     MCPOrigin,
     MCPOutcomeUnknownError,
     MCPResultTooLargeError,
@@ -63,6 +68,21 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPToolCallError,
 )
 from dendrux.mcp._host import MCPHost  # noqa: E402
+from dendrux.mcp._oauth import (  # noqa: E402
+    MCPOAuth,
+    MCPOAuthClaim,
+    MCPOAuthClient,
+    MCPOAuthClientRecord,
+    MCPOAuthCredential,
+    MCPOAuthFlow,
+    MCPOAuthMemoryStore,
+    MCPOAuthRecord,
+    MCPOAuthRevocation,
+    MCPOAuthStatus,
+    MCPOAuthStore,
+    MCPOAuthVersion,
+    check_oauth_store,
+)
 from dendrux.mcp._observability import (  # noqa: E402
     MCPCallCapacityRejected,
     MCPCircuitClosed,
@@ -79,6 +99,10 @@ from dendrux.mcp._observability import (  # noqa: E402
     MCPConnectionStatus,
     MCPEvictionCompleted,
     MCPEvictionStarted,
+    MCPOAuthRefreshed,
+    MCPOAuthRefreshFailed,
+    MCPOAuthRequired,
+    MCPOAuthRevoked,
     MCPOpenCircuitSnapshot,
     MCPPhysicalConnectionEvent,
     MCPRuntimeEvent,
@@ -105,7 +129,9 @@ from dendrux.mcp._source import MCPFailureMode, MCPSource  # noqa: E402
 
 __all__ = [
     "MCPAuthChallenge",
+    "MCPAuthKey",
     "MCPAuthenticationError",
+    "MCPAuthorizationRequired",
     "MCPBindingConflictError",
     "MCPCallCapacityError",
     "MCPCallCapacityRejected",
@@ -141,6 +167,25 @@ __all__ = [
     "MCPEvictionStarted",
     "MCPFailureMode",
     "MCPHost",
+    "MCPOAuth",
+    "MCPOAuthClaim",
+    "MCPOAuthClient",
+    "MCPOAuthClientRecord",
+    "MCPOAuthCredential",
+    "MCPOAuthError",
+    "MCPOAuthFlow",
+    "MCPOAuthFlowError",
+    "MCPOAuthMemoryStore",
+    "MCPOAuthRecord",
+    "MCPOAuthRefreshError",
+    "MCPOAuthRefreshFailed",
+    "MCPOAuthRefreshed",
+    "MCPOAuthRequired",
+    "MCPOAuthRevocation",
+    "MCPOAuthRevoked",
+    "MCPOAuthStatus",
+    "MCPOAuthStore",
+    "MCPOAuthVersion",
     "MCPOpenCircuitSnapshot",
     "MCPOrigin",
     "MCPOutcomeUnknownError",
@@ -167,4 +212,5 @@ __all__ = [
     "MCPToolInfo",
     "MCPToolPolicy",
     "MCPToolView",
+    "check_oauth_store",
 ]
