@@ -258,7 +258,8 @@ From `dendrux.types.GovernanceEventType`. All thirteen values are deliverable th
 | `skill.denied` | Skill filtered by `deny_skills=` | `{"skill_name": str, "reason": "denied_by_policy"}` |
 | `skill.invoked` | LLM called `use_skill(name=...)` | `{"skill_name": str}` |
 | `mcp.connected` | MCP source discovery completed | `{"source_name": str, "tool_count": int, "tool_names": list[str]}` |
-| `mcp.error` | MCP discovery failed | `{"error": str}` (truncated to 500 chars) |
+| `mcp.error` | MCP discovery failed | `{"error": str, "error_type": str, "code": str}` (error truncated to 500 chars; `reason` added for OAuth verdicts) |
+| `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 
 Each `budget.threshold` fraction fires at most once per run. `budget.exceeded` fires at most once per run. Pause/resume persists the fired set, so resumed runs do not re-fire.
 

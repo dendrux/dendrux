@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- MCP: `connection.tools()` gains `prefix`, `rename`, and `strict` (also on
+  `MCPToolPolicy`). `prefix=False` exposes bare tool names; `rename` maps a
+  server tool name to the exposed base name; both are validated when the view
+  is created. `ToolDef.meta["exposed_name"]` is the Agent-visible name; calls
+  and the stale-tool check still use `meta["mcp_tool_name"]`, and call
+  telemetry reports the exposed name. `MCPServer` and `MCPHost` are unchanged.
+- MCP: behaviour change for runtime views. A tool with an unsafe or duplicate
+  exposed name, or an `allowed_tools` / `force_serial_tools` / `rename` entry
+  the server does not list, is now skipped instead of failing the whole source.
+  Skips are reported as `MCPSkippedTool` entries in
+  `RunResult.meta["mcp_skipped_tools"]` (present whenever
+  `mcp_skipped_sources` is) and in one `mcp.tools_skipped` governance event.
+  `strict=True` restores raising `ValueError`. Collisions with another source,
+  a local tool, or `use_skill` still raise.
+- MCP: stable `code` on every `mcp_skipped_sources` entry and on the
+  `mcp.error` payload (`authorization_required` adds `reason`), derived from
+  the exception class by the new `error_code_for(exc)`.
+
 ## 0.2.0a21 - 2026-10-13
 
 - MCP: OAuth 2.1 sign-in for remote MCP servers. `MCPOAuth` runs discovery
