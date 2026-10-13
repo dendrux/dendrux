@@ -902,3 +902,53 @@ async def test_store_failure_in_phase_one_keeps_the_fence_and_a_retry_completes(
             assert revocation.local == "signed_out"
             assert (TENANT, CONNECTION) not in runtime._registrations
         await oauth.aclose()
+
+
+async def test_callback_timeout_on_an_oauth_binding_is_transient() -> None:
+    async with OAuthHarness(config=ASConfig(refresh_latency=1.0)) as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        await sign_in(harness, oauth)
+        recorder = Recorder()
+        async with MCPRuntime(observer=recorder, circuit_failure_threshold=1) as runtime:
+            connection = bind(runtime, harness, oauth, connect_timeout=0.4)
+            view, echo = await executor_for(connection)
+            before = await store.load(KEY)
+            harness.provider.expire_access_tokens()  # type: ignore[union-attr]
+            with pytest.raises(MCPOAuthRefreshError):
+                await echo(text="slow")
+            entry = runtime._entries[(TENANT, CONNECTION)]
+            assert not entry.refresh_failed
+            assert not recorder.of(MCPCircuitOpened)
+            for _ in range(100):
+                current = await store.load(KEY)
+                if current.credential.publication_id != before.credential.publication_id:  # type: ignore[union-attr]
+                    break
+                await asyncio.sleep(0.05)
+            assert current.status == "active"  # type: ignore[union-attr]
+            assert await echo(text="recovered") == {"result": "recovered"}
+            assert harness.counters["refresh"] == 1
+            await view.close()
+        await oauth.aclose()
+
+
+async def test_get_auth_timeout_on_an_oauth_binding_is_transient() -> None:
+    async with OAuthHarness(config=ASConfig(refresh_latency=1.0)) as harness:
+        store = MCPOAuthMemoryStore()
+        oauth = make_oauth(store)
+        await sign_in(harness, oauth)
+        shift(oauth, LATER)
+        recorder = Recorder()
+        async with MCPRuntime(observer=recorder, circuit_failure_threshold=1) as runtime:
+            connection = bind(runtime, harness, oauth, connect_timeout=0.4)
+            with pytest.raises(MCPOAuthRefreshError) as caught:
+                await connection.discover()
+            assert caught.value.__cause__ is None and caught.value.__context__ is None
+            assert not recorder.of(MCPCircuitOpened)
+            for _ in range(100):
+                if harness.counters["refresh"] and (await store.load(KEY)).refresh_claim is None:  # type: ignore[union-attr]
+                    break
+                await asyncio.sleep(0.05)
+            assert (await connection.discover()).tools
+            assert harness.counters["refresh"] == 1
+        await oauth.aclose()

@@ -250,6 +250,12 @@ async def _resolve_source_credentials(
         raise
     except Exception as exc:
         failure = exc
+    if oauth and isinstance(failure, TimeoutError):
+        # The OAuth operation is owned elsewhere and keeps running behind its
+        # shield; it may still publish, so this outcome is transient.
+        raise MCPOAuthRefreshError(
+            f"MCP source '{source.name}' OAuth credentials were not ready in time."
+        )
     # Raised after the handler has exited so the original exception is
     # detached, not merely suppressed: its text is application-authored and
     # may embed the very secret being refreshed, and this error's rendering
@@ -2367,6 +2373,8 @@ class MCPRuntime:
         never do.
         """
         failed = False
+        timed_out = False
+        oauth = isinstance(credentials, _OAuthCredentialProvider)
         try:
             async with asyncio.timeout(entry.source.connect_timeout):
                 if isinstance(credentials, _OAuthCredentialProvider) and rejection is not None:
@@ -2379,8 +2387,13 @@ class MCPRuntime:
             if not isinstance(exc, _NOT_CREDENTIAL_FAILURES):
                 entry.refresh_failed = True
             raise
-        except Exception:
+        except Exception as exc:
             failed = True
+            timed_out = isinstance(exc, TimeoutError)
+        if failed and oauth and timed_out:
+            # The OAuth refresh keeps running behind its own shield and may
+            # still publish: transient, so the next rejection can recover.
+            raise MCPOAuthRefreshError("MCP OAuth credential recovery did not finish in time.")
         if failed:
             entry.refresh_failed = True
             raise MCPCredentialError("MCP credential rejection callback failed.")
