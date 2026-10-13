@@ -2095,15 +2095,9 @@ class MCPRuntime:
             )
             self._emit(circuit_closed)
         if not still_current:
-            try:
-                await adapter.close()
-            except Exception as exc:
-                logger.warning(
-                    "MCP source '%s' cleanup failed after late establishment: %s (%s)",
-                    entry.source.name,
-                    safe_source_exception_detail(adapter.source, exc),
-                    type(exc).__name__,
-                )
+            # Bounded: a close that resists is handed to the background, and
+            # the attempt still terminates as aborted below.
+            await self._bounded_adapter_close(entry, adapter, after="late establishment")
             # Established, but only after losing its slot: never served and
             # never published, so the attempt terminates as aborted.
             self._emit_opening_terminal(
@@ -2132,10 +2126,28 @@ class MCPRuntime:
     ) -> None:
         """Close a transport whose credentials were rejected before recovery.
 
-        Bounded by ``close_timeout`` like every other teardown. A close that
-        does not finish is handed to the background and fails the opening
-        with a value-free error instead of blocking every waiter; a close
-        that raises is logged and recovery continues.
+        A close that does not finish within ``close_timeout`` fails the
+        opening with a value-free error instead of blocking every waiter; a
+        close that raises is logged and recovery continues.
+        """
+        if not await self._bounded_adapter_close(entry, adapter, after="a credential rejection"):
+            raise MCPConnectionError(
+                "MCP credential recovery could not close the rejected transport."
+            )
+
+    async def _bounded_adapter_close(
+        self,
+        entry: _ConnectionEntry,
+        adapter: MCPClientAdapter,
+        *,
+        after: str,
+    ) -> bool:
+        """Close an unpublished transport within ``close_timeout``.
+
+        Returns whether the close finished. A close that raises is logged
+        value-free and counts as finished. One that is still running at the
+        deadline, or when this caller is cancelled, is tracked in the
+        background instead of awaited, so no opening waits on it unbounded.
         """
 
         async def close() -> None:
@@ -2143,8 +2155,9 @@ class MCPRuntime:
                 await adapter.close()
             except Exception as exc:
                 logger.warning(
-                    "MCP source '%s' cleanup failed after a credential rejection: %s (%s)",
+                    "MCP source '%s' cleanup failed after %s: %s (%s)",
                     entry.source.name,
+                    after,
                     safe_source_exception_detail(adapter.source, exc),
                     type(exc).__name__,
                 )
@@ -2154,16 +2167,13 @@ class MCPRuntime:
             pending = await self._settle_teardown_tasks(
                 {task: entry},
                 timeout=self.close_timeout,
-                warning="MCP source '%s' rejected-credential close exceeded its grace.",
+                warning=f"MCP source '%s' close after {after} exceeded its grace.",
             )
         except asyncio.CancelledError:
             if not task.done():
                 self._track_abandoned_task(task)
             raise
-        if pending:
-            raise MCPConnectionError(
-                "MCP credential recovery could not close the rejected transport."
-            )
+        return not pending
 
     async def _notify_connect_rejection(
         self,

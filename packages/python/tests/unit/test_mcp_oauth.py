@@ -1224,6 +1224,46 @@ async def test_cancel_while_closing_rejected_adapter_hands_close_to_background(
     assert not runtime._abandoned_tasks
 
 
+async def test_hanging_unpublished_adapter_close_is_bounded(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer two":
+            closing.set()
+            await release.wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = BlockingProvider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=0.05, shutdown_timeout=0.5)
+    try:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        open_task = runtime._entries[connection.identity].task
+        evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
+        await asyncio.sleep(0)
+        provider.release.set()
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        # The open task finishes within close_timeout although close never returns.
+        results = await asyncio.wait_for(
+            asyncio.gather(open_task, return_exceptions=True), timeout=1
+        )
+        assert isinstance(results[0], MCPConnectionError)
+        assert "released before establishment" in str(results[0])
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+        assert len(runtime._abandoned_tasks) == 1
+        await asyncio.wait_for(asyncio.gather(evict, discover, return_exceptions=True), timeout=2)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await runtime.close()
+    assert not runtime._abandoned_tasks
+
+
 async def test_cancel_during_unpublished_adapter_close_emits_one_terminal(adapters, monkeypatch):
     monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
     closing = asyncio.Event()
