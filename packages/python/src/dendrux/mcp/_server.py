@@ -10,7 +10,12 @@ from typing import Any, cast
 
 from dendrux.mcp._client import MCPClientAdapter, is_connection_loss
 from dendrux.mcp._destination import MCPDestinationPolicy  # noqa: TC001
-from dendrux.mcp._errors import MCPAuthenticationError, MCPDestinationDeniedError, MCPToolCallError
+from dendrux.mcp._errors import (
+    MCPAuthenticationError,
+    MCPAuthorizationRequired,
+    MCPDestinationDeniedError,
+    MCPToolCallError,
+)
 from dendrux.mcp._result import normalize_mcp_result
 from dendrux.mcp._source import (
     MCPFailureMode,
@@ -169,7 +174,10 @@ def create_mcp_executor(
         # it to correct itself. So it is redacted rather than suppressed — and
         # raised outside the handler, because both the message and __context__
         # would otherwise reach the run store and the model's context window.
-        if isinstance(failure, (MCPAuthenticationError, MCPDestinationDeniedError)):
+        if isinstance(
+            failure,
+            (MCPAuthenticationError, MCPAuthorizationRequired, MCPDestinationDeniedError),
+        ):
             raise failure from None
         detail = (
             type(failure).__name__

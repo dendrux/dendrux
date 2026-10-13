@@ -33,7 +33,9 @@ if TYPE_CHECKING:
 
 EXPECTED_ALL = (
     "MCPAuthChallenge",
+    "MCPAuthKey",
     "MCPAuthenticationError",
+    "MCPAuthorizationRequired",
     "MCPBindingConflictError",
     "MCPCallCapacityError",
     "MCPCallCapacityRejected",
@@ -69,6 +71,25 @@ EXPECTED_ALL = (
     "MCPEvictionStarted",
     "MCPFailureMode",
     "MCPHost",
+    "MCPOAuth",
+    "MCPOAuthClaim",
+    "MCPOAuthClient",
+    "MCPOAuthClientRecord",
+    "MCPOAuthCredential",
+    "MCPOAuthError",
+    "MCPOAuthFlow",
+    "MCPOAuthFlowError",
+    "MCPOAuthMemoryStore",
+    "MCPOAuthRecord",
+    "MCPOAuthRefreshError",
+    "MCPOAuthRefreshFailed",
+    "MCPOAuthRefreshed",
+    "MCPOAuthRequired",
+    "MCPOAuthRevocation",
+    "MCPOAuthRevoked",
+    "MCPOAuthStatus",
+    "MCPOAuthStore",
+    "MCPOAuthVersion",
     "MCPOpenCircuitSnapshot",
     "MCPOrigin",
     "MCPOutcomeUnknownError",
@@ -95,6 +116,7 @@ EXPECTED_ALL = (
     "MCPToolInfo",
     "MCPToolPolicy",
     "MCPToolView",
+    "check_oauth_store",
 )
 
 

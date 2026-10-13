@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+# Public error attributes are resolved at runtime by documentation tooling.
+from dendrux.mcp._credentials import MCPAuthKey  # noqa: TC001
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class MCPOrigin:
@@ -114,6 +117,97 @@ class MCPAuthenticationError(MCPConnectionError):
     status_code: int | None = None
     request_rejected: bool = False
     challenge: MCPAuthChallenge | None = None
+
+
+MCPAuthorizationReason = Literal[
+    "not_signed_in", "expired", "revoked", "insufficient_scope", "resource_mismatch"
+]
+
+
+class MCPAuthorizationRequired(MCPConnectionError):  # noqa: N818 - name fixed by the public API
+    """The user must sign in (again) before this MCP connection can be used.
+
+    A verdict about the user's authorization, not about the server: it never
+    counts toward the circuit breaker. ``reason`` says why:
+
+    * ``not_signed_in`` — no credential, or the user signed out.
+    * ``expired`` — the access token expired and cannot be refreshed.
+    * ``revoked`` — the authorization server or resource server rejected the
+      grant, or it was revoked while in use.
+    * ``insufficient_scope`` — the server requires more scopes (step-up);
+      ``scopes`` names the challenged scopes to add to the next sign-in.
+    * ``resource_mismatch`` — the stored credential was issued for a different
+      resource or issuer than the bound source; it is never delivered.
+
+    ``scopes`` and ``resource_metadata_url`` are server-chosen values from a
+    validated challenge. They are attributes only and never appear in the
+    message or representation.
+    """
+
+    def __init__(
+        self,
+        key: MCPAuthKey,
+        reason: MCPAuthorizationReason,
+        *,
+        scopes: tuple[str, ...] = (),
+        resource_metadata_url: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        self.key = key
+        self.reason: MCPAuthorizationReason = reason
+        self.scopes = tuple(scopes)
+        self.resource_metadata_url = resource_metadata_url
+        self.status_code = status_code
+        super().__init__(f"MCP authorization required ({reason}).")
+
+
+class MCPOAuthError(MCPError):
+    """Base class for MCP OAuth failures. Messages never carry values."""
+
+
+MCPOAuthFlowReason = Literal[
+    "invalid_argument",
+    "unknown_state",
+    "expired_state",
+    "key_mismatch",
+    "access_denied",
+    "issuer_mismatch",
+    "invalid_callback",
+    "superseded",
+    "contention",
+    "token_exchange_failed",
+    "discovery_failed",
+    "registration_failed",
+    "destination_denied",
+    "insecure_url",
+    "pkce_unsupported",
+    "closed",
+]
+
+
+class MCPOAuthFlowError(MCPOAuthError):
+    """A sign-in, sign-out, or OAuth lifecycle operation failed.
+
+    ``reason`` is a fixed code; ``status_code`` is the HTTP status of the
+    failing authorization-server response when there was one. Server text
+    (``error_description``, reason phrases, bodies) is never kept.
+    """
+
+    def __init__(self, reason: MCPOAuthFlowReason, *, status_code: int | None = None) -> None:
+        self.reason: MCPOAuthFlowReason = reason
+        self.status_code = status_code
+        super().__init__(f"MCP OAuth operation failed ({reason}).")
+
+
+class MCPOAuthRefreshError(MCPOAuthError, MCPCredentialError):
+    """A token refresh could not complete right now.
+
+    Transient and value-free: the refresh was contended, never sent, or its
+    outcome was uncertain (in which case the refresh token was retired and the
+    remaining access token is still used until it expires). It never marks
+    the connection's credentials as failed and never counts toward the
+    circuit breaker; the next rejection may recover.
+    """
 
 
 class MCPBindingConflictError(MCPError):

@@ -151,14 +151,20 @@ class _ResponseStream(httpx2.AsyncByteStream):
 
 
 class _PolicyTransport(httpx2.AsyncBaseTransport):
+    """Pool-backed transport; with a policy, every new socket is checked first.
+
+    Without a policy it is the same pool, SSL context, and error mapping over
+    the default network backend, and never consults proxy environment.
+    """
+
     def __init__(
         self,
-        policy: MCPDestinationPolicy,
+        policy: MCPDestinationPolicy | None,
         on_denied: Callable[[], None] | None = None,
     ) -> None:
         self._pool = httpcore2.AsyncConnectionPool(
             ssl_context=httpx2.create_ssl_context(trust_env=False),
-            network_backend=_PolicyBackend(policy, on_denied),
+            network_backend=None if policy is None else _PolicyBackend(policy, on_denied),
             max_connections=100,
             max_keepalive_connections=20,
             keepalive_expiry=5.0,

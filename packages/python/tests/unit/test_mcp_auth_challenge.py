@@ -784,3 +784,118 @@ async def test_rejection_text_never_escapes_through_the_runtime(
         _assert_no_sentinel(error, recorder.events, _log_text(caplog))
     assert call_error.value.challenge is not None
     assert call_error.value.challenge.error == SENTINEL
+
+
+# --------------------------------------------------------------------------
+# OAuth bindings: which rejections recover, and how terminal ones translate
+# --------------------------------------------------------------------------
+
+
+def _rejection(status: int, header: str | None, *, request_rejected: bool = True):  # type: ignore[no-untyped-def]
+    error = MCPAuthenticationError("rejected")
+    error.status_code = status
+    error.request_rejected = request_rejected
+    error.challenge = challenge_from_headers([header]) if header is not None else None
+    return error
+
+
+@pytest.mark.parametrize(
+    ("status", "header", "oauth", "reauth", "expected"),
+    [
+        (401, None, True, False, True),
+        (401, None, False, True, True),
+        (401, None, False, False, False),
+        (403, 'Bearer error="insufficient_scope", scope="admin"', True, False, True),
+        (403, 'Bearer error="insufficient_scope", scope="admin"', False, True, False),
+        (403, 'Bearer error="invalid_token"', True, False, False),
+        (403, None, True, False, False),
+    ],
+)
+def test_recoverable_rejections(
+    status: int, header: str | None, oauth: bool, reauth: bool, expected: bool
+) -> None:
+    from dendrux.mcp._runtime import _recoverable_rejection
+
+    error = _rejection(status, header)
+    assert _recoverable_rejection(error, oauth=oauth, reauthenticate_on_401=reauth) is expected
+    error.request_rejected = False
+    assert not _recoverable_rejection(error, oauth=oauth, reauthenticate_on_401=reauth)
+
+
+def test_terminal_rejections_translate_with_challenge_attributes() -> None:
+    from dendrux.mcp._runtime import _oauth_rejection_error
+
+    identity = ("tenant", "conn")
+    scoped = _oauth_rejection_error(
+        identity,
+        _rejection(
+            403,
+            'Bearer error="insufficient_scope", scope="admin write", '
+            'resource_metadata="https://mcp.example.com/prm"',
+        ),
+    )
+    assert scoped is not None
+    assert (scoped.reason, scoped.scopes, scoped.status_code) == (
+        "insufficient_scope",
+        ("admin", "write"),
+        403,
+    )
+    assert scoped.resource_metadata_url == "https://mcp.example.com/prm"
+    assert scoped.key.connection_key == "conn" and scoped.key.tenant_key == "tenant"
+    revoked = _oauth_rejection_error(identity, _rejection(401, 'Bearer scope="mcp"'))
+    assert revoked is not None and (revoked.reason, revoked.scopes) == ("revoked", ("mcp",))
+    assert _oauth_rejection_error(identity, _rejection(403, None)) is None
+    assert _oauth_rejection_error(identity, _rejection(401, None, request_rejected=False)) is None
+
+
+class _FakeAdapter:
+    instances: list[_FakeAdapter] = []
+    statuses: list[int] = []
+
+    def __init__(self, source: MCPSource) -> None:
+        self.source = source
+        self.info = None
+        self.instances.append(self)
+
+    async def connect(self) -> None:
+        if self.statuses:
+            raise _rejection(self.statuses.pop(0), None)
+
+    async def list_tools(self) -> list[Any]:
+        from mcp.types import Tool
+
+        return [Tool(name="echo", input_schema={"type": "object"})]
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize("raised", ["credential", "authorization"])
+async def test_application_provider_errors_pass_through_unchanged(raised: str) -> None:
+    from dendrux.mcp import MCPAuthKey, MCPAuthorizationRequired, MCPCredentialError, MCPRuntime
+
+    sentinel = (
+        MCPCredentialError("application credential failure")
+        if raised == "credential"
+        else MCPAuthorizationRequired(MCPAuthKey("c"), "expired")
+    )
+
+    class Provider:
+        async def get_auth(self) -> dict[str, str]:
+            return {"Authorization": "Bearer one"}
+
+        async def on_auth_rejected(self) -> None:
+            raise sentinel
+
+    _FakeAdapter.instances = []
+    _FakeAdapter.statuses = [401]
+    with patch("dendrux.mcp._runtime.MCPClientAdapter", _FakeAdapter):
+        async with MCPRuntime() as runtime:
+            connection = runtime.bind(
+                connection_key="c",
+                source=MCPSource.http("demo", SOURCE_URL, reauthenticate_on_401=True),
+                credentials=Provider(),
+            )
+            with pytest.raises(type(sentinel)) as caught:
+                await connection.discover()
+            assert caught.value is sentinel

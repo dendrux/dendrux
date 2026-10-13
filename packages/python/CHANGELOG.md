@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- MCP: OAuth 2.1 sign-in for remote MCP servers. `MCPOAuth` runs discovery
+  (RFC 9728, RFC 8414 / OpenID), client resolution (pre-registered, client ID
+  metadata documents, RFC 7591 registration), PKCE S256 with the RFC 8707
+  `resource` indicator and RFC 9207 `iss` checks, refresh, scope step-up, and
+  RFC 7009 revocation. `begin_authorization()` and `complete_authorization()`
+  may run on different workers; the flow is bound to the application's
+  `MCPAuthKey`. Applications implement the four-method `MCPOAuthStore`
+  (check it with `check_oauth_store`); `MCPOAuthMemoryStore` is the in-process
+  reference. Tokens are delivered only to the exact canonical resource they
+  were issued for, and an expired access token is never delivered.
+- MCP: refresh is serialized across processes by a store refresh claim and
+  exact-version compare-and-swap. A refresh token is redeemed at most once:
+  interrupted, uncertain, rejected, or abandoned refreshes retire it instead of
+  replaying it, and only pre-send transport failures keep it.
+- MCP: `MCPRuntime.bind(oauth=)` / `rebind(oauth=)` bind an identity to a
+  user's sign-in (exclusive with `credentials=`; exactly one `Authorization`
+  header on the wire). 401s and 403 `insufficient_scope` rejections recover
+  once with the exact rejected token; `refresh_authorization()` retires the
+  transport after a step-up; `revoke_authorization()` fences, signs out, and
+  evicts, and `close()` waits for it.
+- MCP: new errors `MCPAuthorizationRequired` (`not_signed_in`, `expired`,
+  `revoked`, `insufficient_scope`, `resource_mismatch`), `MCPOAuthError`,
+  `MCPOAuthFlowError`, and `MCPOAuthRefreshError`; new events
+  `MCPOAuthRequired`, `MCPOAuthRefreshed`, `MCPOAuthRefreshFailed`, and
+  `MCPOAuthRevoked`. Sign-in verdicts and transient refresh errors never count
+  toward the circuit breaker or mark credentials failed.
+- MCP: a credential provider's `MCPCredentialError` or
+  `MCPAuthorizationRequired` from `get_auth()` or `on_auth_rejected()` now
+  propagates unchanged; other exceptions are still wrapped value-free.
+- MCP: `MCPAuthKey`, `MCPCredentialProvider`, and
+  `MCPRefreshingCredentialProvider` live in `dendrux.mcp._credentials`
+  (still importable from `dendrux.mcp`). `rotate_credentials()` refuses OAuth
+  bindings.
 - MCP: `MCPAuthenticationError.challenge` carries the validated `Bearer`
   challenge of the rejecting 401/403 (`MCPAuthChallenge`: `scheme`, `error`,
   `scope`, `resource_metadata_url`) at connect, discovery, and tool-call time.

@@ -78,6 +78,13 @@ configure hosts the MCP server. See the
 To test a real hosted server, run the
 [read-only GitHub example](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/32_mcp_github_remote.py).
 
+For OAuth-protected MCP servers, bind with `oauth=MCPOAuth(...)` instead of
+`credentials=`: Dendrux runs discovery, registration, PKCE sign-in, refresh
+coordinated across workers, scope step-up, and revocation, while your
+application keeps the encrypted token store, user identity, and the redirect.
+See the [MCP OAuth web-app recipe](https://www.dendrux.dev/docs/recipes/mcp-oauth-web)
+and the [end-to-end example](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/35_mcp_oauth_web.py).
+
 ## Providers
 
 | Provider | Import | Use case |

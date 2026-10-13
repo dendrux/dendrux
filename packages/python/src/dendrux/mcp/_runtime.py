@@ -15,12 +15,19 @@ from collections import deque
 from collections.abc import Callable, Collection, Mapping  # noqa: TC003
 from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._credentials import (
+    MCPAuthKey,
+    MCPCredentialProvider,
+    MCPRefreshingCredentialProvider,
+)
 from dendrux.mcp._discovery import MCPDiscovery, build_discovery
 from dendrux.mcp._errors import (
+    MCPAuthChallenge,
     MCPAuthenticationError,
+    MCPAuthorizationRequired,
     MCPBindingConflictError,
     MCPCallCapacityError,
     MCPCircuitOpenError,
@@ -29,11 +36,14 @@ from dendrux.mcp._errors import (
     MCPConnectionEvictingError,
     MCPConnectionLostError,
     MCPCredentialError,
+    MCPOAuthRefreshError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
     MCPStaleConnectionError,
     MCPToolCallError,
 )
+from dendrux.mcp._oauth import MCPOAuth, MCPOAuthRevocation, _OAuthCredentialProvider
+from dendrux.mcp._oauth_http import URLRejectedError, canonical_url
 from dendrux.mcp._observability import (
     MCPCallCapacityRejected,
     MCPCircuitClosed,
@@ -49,6 +59,8 @@ from dendrux.mcp._observability import (
     MCPConnectionStatus,
     MCPEvictionCompleted,
     MCPEvictionStarted,
+    MCPOAuthRequired,
+    MCPOAuthRevoked,
     MCPOpenCircuitSnapshot,
     MCPRuntimeEvent,
     MCPRuntimeObserver,
@@ -90,40 +102,92 @@ MCPEvictionMode = Literal["drain", "force"]
 _CallInterruption = Literal["forced", "connection_lost"]
 
 
-@runtime_checkable
-class MCPCredentialProvider(Protocol):
-    """Application callback that returns ephemeral MCP authentication.
-
-    Invoked lazily, once per physical connection attempt — never per Agent,
-    per lease, or per tool call — and bounded by its own ``connect_timeout``
-    budget, separate from the transport handshake's identical budget (a
-    connect behind a slow provider can take up to twice ``connect_timeout``).
-    The provider must return a non-empty mapping: request headers for HTTP
-    sources, environment variables for stdio sources. Only mappings are
-    accepted because their exact values double as redaction needles. Managed
-    connections reject opaque static auth objects for the same reason; use
-    static headers or this provider boundary instead. The resolved value
-    exists only to establish that one transport: it is never persisted,
-    logged, or rendered into errors or representations.
-    """
-
-    async def get_auth(self) -> Mapping[str, str]:
-        """Return authentication suitable for the configured MCP transport."""
-        ...
+# Raised by credential resolution and rejection callbacks and passed through
+# unchanged; anything else is detached and wrapped as MCPCredentialError.
+_CREDENTIAL_PASS_THROUGH: tuple[type[Exception], ...] = (
+    MCPAuthorizationRequired,
+    MCPCredentialError,
+)
+# Verdicts about the user, or transient refresh outcomes: they never mark the
+# entry's credentials failed and never count toward the circuit breaker.
+_NOT_CREDENTIAL_FAILURES: tuple[type[Exception], ...] = (
+    MCPAuthorizationRequired,
+    MCPOAuthRefreshError,
+)
 
 
-@runtime_checkable
-class MCPRefreshingCredentialProvider(MCPCredentialProvider, Protocol):
-    """Credential provider supporting explicit rejection of a cached token.
+@dataclass(frozen=True, slots=True)
+class _Rejection:
+    """One observed 401/403 and the exact Authorization value it rejected."""
 
-    The runtime calls this once for concurrent rejected calls, then calls
-    ``get_auth()`` while reconnecting. The application owns refresh-token
-    exchange, durable storage, and synchronization across worker processes.
-    """
+    status: int | None
+    challenge: MCPAuthChallenge | None
+    authorization: str | None
 
-    async def on_auth_rejected(self) -> None:
-        """Invalidate or refresh rejected credentials before the next get_auth."""
-        ...
+
+def _auth_key(identity: tuple[str | None, str]) -> MCPAuthKey:
+    return MCPAuthKey(identity[1], tenant_key=identity[0])
+
+
+def _is_insufficient_scope(error: MCPAuthenticationError) -> bool:
+    challenge = error.challenge
+    return (
+        error.status_code == 403
+        and challenge is not None
+        and challenge.error == "insufficient_scope"
+    )
+
+
+def _recoverable_rejection(
+    error: MCPAuthenticationError,
+    *,
+    oauth: bool,
+    reauthenticate_on_401: bool,
+) -> bool:
+    """Whether a rejection may trigger one credential recovery and retry."""
+    if not error.request_rejected:
+        return False
+    if error.status_code == 401:
+        return oauth or reauthenticate_on_401
+    return oauth and _is_insufficient_scope(error)
+
+
+def _oauth_rejection_error(
+    identity: tuple[str | None, str],
+    error: MCPAuthenticationError,
+) -> MCPAuthorizationRequired | None:
+    """Translate a terminal rejection on an OAuth binding, or None to keep it."""
+    if not error.request_rejected:
+        return None
+    challenge = error.challenge
+    reason: Literal["insufficient_scope", "revoked"]
+    if _is_insufficient_scope(error):
+        reason = "insufficient_scope"
+    elif error.status_code == 401:
+        reason = "revoked"
+    else:
+        return None
+    return MCPAuthorizationRequired(
+        _auth_key(identity),
+        reason,
+        scopes=challenge.scope if challenge is not None else (),
+        resource_metadata_url=challenge.resource_metadata_url if challenge is not None else None,
+        status_code=error.status_code,
+    )
+
+
+def _apply_oauth_credentials(source: MCPSource, resolved: Any) -> MCPSource:
+    """Replace any Authorization header (any case) with exactly one value."""
+    value = resolved.get("Authorization") if isinstance(resolved, Mapping) else None
+    if not isinstance(value, str) or not value or len(resolved) != 1:
+        raise MCPCredentialError(
+            f"MCP source '{source.name}' OAuth credentials did not resolve to one header."
+        )
+    headers = {
+        name: item for name, item in source.headers.items() if name.lower() != "authorization"
+    }
+    headers["Authorization"] = value
+    return replace(source, headers=headers)
 
 
 def _apply_source_credentials(source: MCPSource, resolved: Any) -> MCPSource:
@@ -163,6 +227,8 @@ def _apply_source_credentials(source: MCPSource, resolved: Any) -> MCPSource:
 async def _resolve_source_credentials(
     source: MCPSource,
     credentials: MCPCredentialProvider,
+    *,
+    oauth: bool = False,
 ) -> MCPSource:
     """Resolve and apply ephemeral credentials for one connection attempt.
 
@@ -175,13 +241,21 @@ async def _resolve_source_credentials(
     try:
         async with asyncio.timeout(source.connect_timeout):
             resolved = await credentials.get_auth()
+        if oauth:
+            return _apply_oauth_credentials(source, resolved)
         return _apply_source_credentials(source, resolved)
     except asyncio.CancelledError:
         raise
-    except MCPCredentialError:
+    except _CREDENTIAL_PASS_THROUGH:
         raise
     except Exception as exc:
         failure = exc
+    if oauth and isinstance(failure, TimeoutError):
+        # The OAuth operation is owned elsewhere and keeps running behind its
+        # shield; it may still publish, so this outcome is transient.
+        raise MCPOAuthRefreshError(
+            f"MCP source '{source.name}' OAuth credentials were not ready in time."
+        )
     # Raised after the handler has exited so the original exception is
     # detached, not merely suppressed: its text is application-authored and
     # may embed the very secret being refreshed, and this error's rendering
@@ -575,25 +649,43 @@ class _ViewToolSource(MCPServer):
                     adapter = entry.adapter
                     assert adapter is not None
                     epoch = entry.credential_epoch
+                    authorization = entry.resolved_authorization
+                    oauth = connection.runtime._is_oauth_binding(connection.identity)
                     executor = create_mcp_executor(
                         adapter,
                         namespace=self.name,
                         mcp_tool_name=mcp_tool_name,
                         max_result_bytes=self.source.max_result_bytes,
                     )
+                    rejection: MCPAuthenticationError | None = None
                     try:
                         result = await executor(**params)
                         break
                     except MCPAuthenticationError as auth_error:
-                        if (
-                            attempt
-                            or not self.source.reauthenticate_on_401
-                            or auth_error.status_code != 401
-                            or not auth_error.request_rejected
-                        ):
-                            raise
+                        rejection = auth_error
+                    if attempt or not _recoverable_rejection(
+                        rejection,
+                        oauth=oauth,
+                        reauthenticate_on_401=self.source.reauthenticate_on_401,
+                    ):
+                        translated = (
+                            _oauth_rejection_error(connection.identity, rejection)
+                            if oauth
+                            else None
+                        )
+                        if translated is None:
+                            raise rejection
+                        connection.runtime._emit_oauth_required(
+                            connection.identity, source_name, translated
+                        )
+                        raise translated
                     connection.runtime._end_call(connection.identity, permit)
-                    await connection.runtime._reauthenticate(connection.identity, entry, epoch)
+                    await connection.runtime._reauthenticate(
+                        connection.identity,
+                        entry,
+                        epoch,
+                        _Rejection(rejection.status_code, rejection.challenge, authorization),
+                    )
                     permit = await connection.runtime._begin_call(
                         connection.identity,
                         entry,
@@ -732,6 +824,8 @@ class _ConnectionEntry:
     """
 
     __slots__ = (
+        "resolved_authorization",
+        "rotation_rejection",
         "rotation_task",
         "reconnect_pending",
         "rejection_reconnect",
@@ -762,6 +856,11 @@ class _ConnectionEntry:
 
     def __init__(self, source: MCPSource) -> None:
         self.source = source
+        # The exact Authorization value of the published transport (OAuth
+        # bindings only). Correlates a rejection with the token that was
+        # sent; never logged.
+        self.resolved_authorization: str | None = None
+        self.rotation_rejection: _Rejection | None = None
         self.rotation_task: asyncio.Task[None] | None = None
         self.reconnect_pending = False
         # The pending reconnect follows a rejection rotation that already
@@ -914,6 +1013,9 @@ class _Registration:
     credentials: MCPCredentialProvider | None
     credential_identity: str | None
     circuit: _CircuitState = field(default_factory=_CircuitState)
+    oauth: MCPOAuth | None = None
+    # Set by revoke_authorization: new leases and calls fail as revoked.
+    revoking: bool = False
 
 
 def _same_connection_config(registered: MCPSource, candidate: MCPSource) -> bool:
@@ -1084,6 +1186,10 @@ class MCPRuntime:
         # reclaimed permits whose transport operations are still running.
         self._connection_seq = 0
         self._detached_calls = 0
+        # revoke_authorization invocations, and the shared drain-and-evict
+        # per captured (identity, generation); close() awaits both.
+        self._revoke_tasks: set[asyncio.Task[Any]] = set()
+        self._revoke_evictions: dict[tuple[tuple[str | None, str], int], asyncio.Task[None]] = {}
         self._lock = Lock()
 
     @property
@@ -1127,6 +1233,46 @@ class MCPRuntime:
                 type(event).__name__,
                 type(exc).__name__,
             )
+
+    def _emit_unless_closed(self, event: MCPRuntimeEvent) -> None:
+        """Emit an event unless the runtime has already shut down."""
+        with self._lock:
+            closed = self._state is MCPRuntimeState.CLOSED
+        if not closed:
+            self._emit(event)
+
+    def _emit_oauth_required(
+        self,
+        identity: tuple[str | None, str],
+        source_name: str,
+        error: MCPAuthorizationRequired,
+    ) -> None:
+        """Emit one value-free event for one shared sign-in verdict."""
+        self._emit_unless_closed(
+            MCPOAuthRequired(
+                tenant_key=identity[0],
+                connection_key=identity[1],
+                source_name=source_name,
+                reason=error.reason,
+                scope_count=len(error.scopes),
+            )
+        )
+
+    def _is_oauth_binding(self, identity: tuple[str | None, str]) -> bool:
+        with self._lock:
+            registration = self._registrations.get(identity)
+            return registration is not None and registration.oauth is not None
+
+    def _oauth_provider(
+        self,
+        oauth: MCPOAuth,
+        identity: tuple[str | None, str],
+        source: MCPSource,
+    ) -> _OAuthCredentialProvider:
+        provider = oauth.credentials(_auth_key(identity), source)
+        assert isinstance(provider, _OAuthCredentialProvider)
+        provider._emit = self._emit_unless_closed
+        return provider
 
     def _emit_opening_terminal(
         self,
@@ -1835,6 +1981,8 @@ class MCPRuntime:
                             f"MCP connection handle {identity!r} was superseded by a rebind "
                             "with a different configuration. Bind again and use the new handle.",
                         )
+                    if registration.revoking:
+                        raise MCPAuthorizationRequired(_auth_key(identity), "revoked")
                     entry = self._entries.get(identity)
                     retire_task = entry.retire_task if entry is not None else None
                     if retire_task is None:
@@ -1995,43 +2143,60 @@ class MCPRuntime:
         """Body of :meth:`_open_connection`, after its opening event."""
         adapter: MCPClientAdapter | None = None
         tenant_key, connection_key = identity
+        oauth = isinstance(credentials, _OAuthCredentialProvider)
+        authorization: str | None = None
         try:
             recovered = False
             while True:
                 source = entry.source
                 if credentials is not None:
-                    source = await _resolve_source_credentials(source, credentials)
+                    source = await _resolve_source_credentials(source, credentials, oauth=oauth)
+                authorization = source.headers.get("Authorization") if oauth else None
                 adapter = MCPClientAdapter(source)
+                rejection: MCPAuthenticationError | None = None
                 try:
                     await adapter.connect()
                     raw_tools = entry.raw_tools if reuse_catalog else await adapter.list_tools()
                     break
                 except MCPAuthenticationError as auth_error:
-                    if (
-                        recovered
-                        or not auth_recovery
-                        or not entry.source.reauthenticate_on_401
-                        or not isinstance(credentials, MCPRefreshingCredentialProvider)
-                        or auth_error.status_code != 401
-                        or not auth_error.request_rejected
-                    ):
-                        raise
+                    rejection = auth_error
+                if (
+                    recovered
+                    or not auth_recovery
+                    or not isinstance(credentials, MCPRefreshingCredentialProvider)
+                    or not _recoverable_rejection(
+                        rejection,
+                        oauth=oauth,
+                        reauthenticate_on_401=entry.source.reauthenticate_on_401,
+                    )
+                ):
+                    translated = _oauth_rejection_error(identity, rejection) if oauth else None
+                    raise translated if translated is not None else rejection
                 # The rejected token may already be cached by the provider:
                 # notify it once, then resolve again and reconnect. Waiters
                 # share this task, so the recovery is single-flight.
                 recovered = True
                 rejected_adapter, adapter = adapter, None
                 await self._close_rejected_adapter(entry, rejected_adapter)
-                await self._notify_connect_rejection(entry, credentials)
+                await self._notify_connect_rejection(
+                    entry,
+                    credentials,
+                    _Rejection(rejection.status_code, rejection.challenge, authorization),
+                )
         except BaseException as exc:
             circuit_opened: MCPCircuitOpened | None = None
             failure_cause: str | None = None
             with self._lock:
                 # A cancelled attempt is a verdict about this runtime's
                 # teardown, not about the server: only real failures count.
+                # A sign-in verdict or a transient refresh outcome is about
+                # the user's authorization, never about the server.
                 if isinstance(exc, Exception) and not isinstance(exc, asyncio.CancelledError):
                     failure_cause = type(exc).__name__
-                    circuit_opened = self._record_circuit_failure(identity, entry, failure_cause)
+                    if not isinstance(exc, _NOT_CREDENTIAL_FAILURES):
+                        circuit_opened = self._record_circuit_failure(
+                            identity, entry, failure_cause
+                        )
                 if self._entries.get(identity) is entry and not entry.fenced:
                     # Discard so the identity can be retried with a fresh entry,
                     # freeing its slot and any idle timer a departed waiter armed.
@@ -2061,6 +2226,8 @@ class MCPRuntime:
                     ),
                 )
             self._emit(circuit_opened)
+            if isinstance(exc, MCPAuthorizationRequired):
+                self._emit_oauth_required(identity, entry.source.name, exc)
             if adapter is not None:
                 try:
                     await adapter.close()
@@ -2080,6 +2247,7 @@ class MCPRuntime:
             still_current = self._entries.get(identity) is entry and not entry.fenced
             if still_current:
                 entry.adapter = adapter
+                entry.resolved_authorization = authorization
                 entry.raw_tools = list(raw_tools)
                 entry.info = adapter.info
         if still_current:
@@ -2179,19 +2347,53 @@ class MCPRuntime:
         self,
         entry: _ConnectionEntry,
         credentials: MCPRefreshingCredentialProvider,
+        rejection: _Rejection,
     ) -> None:
         """Tell the provider its credentials were rejected while connecting.
 
-        Same contract as the call path: bounded by ``connect_timeout``, and a
-        failure marks the entry ``refresh_failed`` and surfaces as a
-        value-free credential error with the provider's exception detached.
+        Same contract as the call path: bounded by ``connect_timeout``;
+        sign-in verdicts and typed credential errors pass through unchanged,
+        and any other failure surfaces as a value-free credential error with
+        the provider's exception detached.
+        """
+        await self._call_rejection_callback(entry, credentials, rejection)
+
+    @staticmethod
+    async def _call_rejection_callback(
+        entry: _ConnectionEntry,
+        credentials: MCPRefreshingCredentialProvider,
+        rejection: _Rejection | None,
+    ) -> None:
+        """Notify the provider of one rejected operation.
+
+        The OAuth credential receives the status, challenge, and exact
+        Authorization value that was rejected; other providers receive
+        ``on_auth_rejected()``. Plain credential failures mark the entry
+        ``refresh_failed``; sign-in verdicts and transient refresh errors
+        never do.
         """
         failed = False
+        timed_out = False
+        oauth = isinstance(credentials, _OAuthCredentialProvider)
         try:
             async with asyncio.timeout(entry.source.connect_timeout):
-                await credentials.on_auth_rejected()
-        except Exception:
+                if isinstance(credentials, _OAuthCredentialProvider) and rejection is not None:
+                    await credentials.handle_rejection(
+                        rejection.status or 401, rejection.challenge, rejection.authorization
+                    )
+                else:
+                    await credentials.on_auth_rejected()
+        except _CREDENTIAL_PASS_THROUGH as exc:
+            if not isinstance(exc, _NOT_CREDENTIAL_FAILURES):
+                entry.refresh_failed = True
+            raise
+        except Exception as exc:
             failed = True
+            timed_out = isinstance(exc, TimeoutError)
+        if failed and oauth and timed_out:
+            # The OAuth refresh keeps running behind its own shield and may
+            # still publish: transient, so the next rejection can recover.
+            raise MCPOAuthRefreshError("MCP OAuth credential recovery did not finish in time.")
         if failed:
             entry.refresh_failed = True
             raise MCPCredentialError("MCP credential rejection callback failed.")
@@ -2297,6 +2499,8 @@ class MCPRuntime:
                 f"MCP connection handle {identity!r} is no longer registered; it was "
                 "evicted or never bound. Bind again and use the new handle.",
             )
+        if registration.revoking:
+            raise MCPAuthorizationRequired(_auth_key(identity), "revoked")
         if entry.broken:
             raise MCPConnectionLostError(
                 identity,
@@ -2573,6 +2777,7 @@ class MCPRuntime:
         tenant_key: str | None = None,
         credentials: MCPCredentialProvider | None = None,
         credential_identity: str | None = None,
+        oauth: MCPOAuth | None = None,
     ) -> MCPConnection:
         """Register a connection identity and return its lazy handle.
 
@@ -2596,6 +2801,15 @@ class MCPRuntime:
         Binding a live identity with any of them changed raises
         :class:`MCPBindingConflictError`; use :meth:`rebind` to replace the
         live connection in one step.
+
+        ``oauth`` binds the identity to a user's :class:`MCPOAuth` sign-in
+        (exclusive with ``credentials``; HTTP sources only, with no
+        ``Authorization`` header in ``source.headers``). The key is
+        ``MCPAuthKey(connection_key, tenant_key)``. Rejected tokens are
+        refreshed and retried once regardless of ``reauthenticate_on_401``,
+        and a sign-in verdict raises :class:`MCPAuthorizationRequired`.
+        Binding a different ``MCPOAuth`` instance while the connection is
+        live conflicts; an equivalent bind keeps the existing credential.
         """
         with self._lock:
             if self._state is not MCPRuntimeState.OPEN:
@@ -2606,6 +2820,7 @@ class MCPRuntime:
                 tenant_key=tenant_key,
                 credentials=credentials,
                 credential_identity=credential_identity,
+                oauth=oauth,
             )
 
             identity = tenant_key, connection_key
@@ -2623,8 +2838,13 @@ class MCPRuntime:
                 registration = _Registration(
                     source=source,
                     generation=self._generation_seq,
-                    credentials=credentials,
+                    credentials=(
+                        self._oauth_provider(oauth, identity, source)
+                        if oauth is not None
+                        else credentials
+                    ),
                     credential_identity=credential_identity,
+                    oauth=oauth,
                 )
                 self._registrations[identity] = registration
             else:
@@ -2640,10 +2860,14 @@ class MCPRuntime:
                 current_entry = self._entries.get(identity)
                 if current_entry is not None and current_entry.rotation_task is not None:
                     raise MCPBindingConflictError(identity, mismatch="configuration")
+                if oauth is not None or registration.oauth is not None:
+                    credentials_changed = registration.oauth is not oauth
+                else:
+                    credentials_changed = (registration.credentials is None) != (
+                        credentials is None
+                    ) or registration.credential_identity != (credential_identity)
                 config_changed = (
-                    not _same_connection_config(registration.source, source)
-                    or (registration.credentials is None) != (credentials is None)
-                    or registration.credential_identity != credential_identity
+                    not _same_connection_config(registration.source, source) or credentials_changed
                 )
                 if config_changed and identity in self._entries:
                     raise MCPBindingConflictError(identity, mismatch="configuration")
@@ -2656,11 +2880,22 @@ class MCPRuntime:
                 # Equivalent binds preserve handles. Changed configuration
                 # gets a new generation, so an old handle can never revive.
                 registration.source = source
-                registration.credentials = credentials
+                if oauth is not None:
+                    # One provider per registration, kept across equivalent
+                    # binds; a different MCPOAuth gets a new one.
+                    if registration.oauth is not oauth or not isinstance(
+                        registration.credentials, _OAuthCredentialProvider
+                    ):
+                        registration.credentials = self._oauth_provider(oauth, identity, source)
+                else:
+                    registration.credentials = credentials
+                registration.oauth = oauth
                 registration.credential_identity = credential_identity
                 if config_changed:
                     self._generation_seq += 1
                     registration.generation = self._generation_seq
+                    # A revoke fences only the generation it captured.
+                    registration.revoking = False
                     # Rotated credentials or a changed endpoint deserve an
                     # immediate attempt; the identical per-request rebind
                     # above keeps its circuit, so a reconnect storm cannot
@@ -2685,6 +2920,7 @@ class MCPRuntime:
         tenant_key: str | None,
         credentials: MCPCredentialProvider | None,
         credential_identity: str | None,
+        oauth: MCPOAuth | None = None,
     ) -> None:
         _validate_identity_key(tenant_key, "tenant", optional=True)
         _validate_identity_key(connection_key, "connection", optional=False)
@@ -2695,7 +2931,25 @@ class MCPRuntime:
                 "MCPRuntime source auth cannot be opaque because its secret values "
                 "cannot be redacted. Use static headers or a credentials provider."
             )
-        if source.reauthenticate_on_401 and not isinstance(
+        if oauth is not None:
+            if not isinstance(oauth, MCPOAuth):
+                raise ValueError("MCPRuntime oauth must be an MCPOAuth instance.")
+            if credentials is not None or credential_identity is not None:
+                raise ValueError("MCPRuntime oauth is exclusive with credentials.")
+            if source.url is None:
+                raise ValueError("MCPRuntime oauth requires an HTTP source.")
+            if source.auth is not None:
+                raise ValueError("MCPRuntime oauth cannot be combined with source auth.")
+            if any(name.lower() == "authorization" for name in source.headers):
+                raise ValueError("MCPRuntime oauth sources must not set an Authorization header.")
+            try:
+                canonical_url(source.url)
+            except URLRejectedError:
+                raise ValueError(
+                    "MCPRuntime oauth requires a source URL without fragments, "
+                    "dot segments, or control characters."
+                ) from None
+        elif source.reauthenticate_on_401 and not isinstance(
             credentials, MCPRefreshingCredentialProvider
         ):
             raise ValueError("reauthenticate_on_401 requires MCPRefreshingCredentialProvider.")
@@ -2731,23 +2985,97 @@ class MCPRuntime:
         """
         if not isinstance(credentials, MCPCredentialProvider):
             raise ValueError("rotate_credentials requires an MCPCredentialProvider.")
-        identity = tenant_key, connection_key
+        if not isinstance(preserve_catalog, bool):
+            raise ValueError("preserve_catalog must be a bool.")
+        registration = await self._rotate(
+            (tenant_key, connection_key),
+            credentials=credentials,
+            credential_identity=credential_identity,
+            preserve_catalog=preserve_catalog,
+            timeout=timeout,
+        )
+        return MCPConnection(
+            runtime=self,
+            tenant_key=tenant_key,
+            connection_key=connection_key,
+            source=registration.source,
+            credentials=credentials,
+            credential_identity=credential_identity,
+            generation=registration.generation,
+        )
+
+    async def refresh_authorization(
+        self,
+        *,
+        connection_key: str,
+        tenant_key: str | None = None,
+        timeout: float | None = None,
+    ) -> MCPConnection:
+        """Drain calls and close the transport of an OAuth binding.
+
+        Use after a step-up sign-in (or any new credential for this key): the
+        provider is kept, and the next lease or ``discover()`` reconnects with
+        the stored credential and re-reads the catalog. Returns after the old
+        transport is closed. Existing handles and views remain valid.
+        """
+        registration = await self._rotate(
+            (tenant_key, connection_key),
+            credentials=None,
+            credential_identity=None,
+            preserve_catalog=False,
+            timeout=timeout,
+        )
+        return MCPConnection(
+            runtime=self,
+            tenant_key=tenant_key,
+            connection_key=connection_key,
+            source=registration.source,
+            generation=registration.generation,
+        )
+
+    async def _rotate(
+        self,
+        identity: tuple[str | None, str],
+        *,
+        credentials: MCPCredentialProvider | None,
+        credential_identity: str | None,
+        preserve_catalog: bool,
+        timeout: float | None,
+    ) -> _Registration:
+        """Shared drain-close-replace for ``rotate_credentials`` and OAuth refresh.
+
+        ``credentials=None`` rotates an OAuth binding onto its own provider;
+        otherwise the binding must not be an OAuth binding.
+        """
+        tenant_key, connection_key = identity
         budget = (
             self.connection_wait_timeout if timeout is None else _positive_float(timeout, "timeout")
         )
-        if not isinstance(preserve_catalog, bool):
-            raise ValueError("preserve_catalog must be a bool.")
         while True:
             with self._lock:
                 self._bind_loop()
                 registration = self._rotation_registration(identity)
-                self._validate_binding(
-                    connection_key=connection_key,
-                    tenant_key=tenant_key,
-                    source=registration.source,
-                    credentials=credentials,
-                    credential_identity=credential_identity,
-                )
+                if credentials is None:
+                    if registration.oauth is None:
+                        raise MCPStaleConnectionError(
+                            identity, "MCP connection is not an OAuth binding."
+                        )
+                    replacement = registration.credentials
+                    assert replacement is not None
+                else:
+                    if registration.oauth is not None:
+                        raise ValueError(
+                            "rotate_credentials cannot replace an OAuth binding's credentials; "
+                            "use refresh_authorization() or rebind()."
+                        )
+                    self._validate_binding(
+                        connection_key=connection_key,
+                        tenant_key=tenant_key,
+                        source=registration.source,
+                        credentials=credentials,
+                        credential_identity=credential_identity,
+                    )
+                    replacement = credentials
                 if registration.source.url is None:
                     raise ValueError("Credential rotation requires an HTTP source.")
                 entry = self._entries.get(identity)
@@ -2761,14 +3089,14 @@ class MCPRuntime:
                         wait = entry.task
                 if wait is None:
                     if entry is None:
-                        self._replace_credentials(registration, credentials, credential_identity)
+                        self._replace_credentials(registration, replacement, credential_identity)
                         task = None
                     else:
                         task = self._start_rotation(
                             identity,
                             entry,
                             registration,
-                            credentials,
+                            replacement,
                             credential_identity,
                             preserve_catalog=preserve_catalog,
                             timeout=budget,
@@ -2778,15 +3106,7 @@ class MCPRuntime:
             await asyncio.shield(wait)
         if task is not None:
             await asyncio.shield(task)
-        return MCPConnection(
-            runtime=self,
-            tenant_key=tenant_key,
-            connection_key=connection_key,
-            source=registration.source,
-            credentials=credentials,
-            credential_identity=credential_identity,
-            generation=registration.generation,
-        )
+        return registration
 
     def _rotation_registration(self, identity: tuple[str | None, str]) -> _Registration:
         if self._state is not MCPRuntimeState.OPEN:
@@ -2819,8 +3139,10 @@ class MCPRuntime:
         preserve_catalog: bool,
         timeout: float,
         rejected: bool,
+        rejection: _Rejection | None = None,
     ) -> asyncio.Task[None]:
         self._cancel_idle(entry)
+        entry.rotation_rejection = rejection
         previous_task = entry.task
         task = asyncio.create_task(
             self._rotate_entry(
@@ -2867,14 +3189,7 @@ class MCPRuntime:
                     )
             if rejected:
                 assert isinstance(credentials, MCPRefreshingCredentialProvider)
-                failed = False
-                try:
-                    async with asyncio.timeout(entry.source.connect_timeout):
-                        await credentials.on_auth_rejected()
-                except Exception:
-                    failed = True
-                if failed:
-                    raise MCPCredentialError("MCP credential rejection callback failed.")
+                await self._call_rejection_callback(entry, credentials, entry.rotation_rejection)
             adapter = entry.adapter
             if adapter is not None:
                 close_task = asyncio.create_task(
@@ -2905,13 +3220,16 @@ class MCPRuntime:
                 entry.reconnect_pending = True
                 entry.rejection_reconnect = rejected
                 entry.preserve_catalog = preserve_catalog
-        except Exception:
-            if rejected:
+        except Exception as exc:
+            if rejected and not isinstance(exc, _NOT_CREDENTIAL_FAILURES):
                 entry.refresh_failed = True
+            if isinstance(exc, MCPAuthorizationRequired):
+                self._emit_oauth_required(identity, entry.source.name, exc)
             raise
         finally:
             with self._lock:
                 entry.rotation_task = None
+                entry.rotation_rejection = None
                 if not entry.reconnect_pending:
                     entry.task = previous_task
                 self._wake_call_waiters_for_entry(entry)
@@ -2966,6 +3284,7 @@ class MCPRuntime:
         identity: tuple[str | None, str],
         entry: _ConnectionEntry,
         epoch: int,
+        rejection: _Rejection | None = None,
     ) -> None:
         with self._lock:
             registration = self._rotation_registration(identity)
@@ -2995,6 +3314,7 @@ class MCPRuntime:
                     preserve_catalog=False,
                     timeout=self.connection_wait_timeout,
                     rejected=True,
+                    rejection=rejection,
                 )
         await asyncio.shield(task)
 
@@ -3008,6 +3328,7 @@ class MCPRuntime:
         credential_identity: str | None = None,
         mode: MCPEvictionMode = "drain",
         timeout: float | None = None,
+        oauth: MCPOAuth | None = None,
     ) -> MCPConnection:
         """Replace a connection identity's configuration, live or not.
 
@@ -3035,6 +3356,7 @@ class MCPRuntime:
                 tenant_key=tenant_key,
                 credentials=credentials,
                 credential_identity=credential_identity,
+                oauth=oauth,
             )
         await self.evict(
             connection_key=connection_key,
@@ -3048,6 +3370,7 @@ class MCPRuntime:
             tenant_key=tenant_key,
             credentials=credentials,
             credential_identity=credential_identity,
+            oauth=oauth,
         )
 
     async def evict(
@@ -3112,42 +3435,10 @@ class MCPRuntime:
                         entry.force_evicted = True
                 else:
                     escalate = False
-                    entry = self._entries.get(identity)
-                    if entry is None:
-                        # Nothing live: drop the registration so the key can be
-                        # rebound with a different endpoint or credentials. A
-                        # caller already queued for this identity must re-check
-                        # immediately instead of sleeping until its timeout.
-                        self._registrations.pop(identity, None)
-                        admission = self._admissions.get(identity)
-                        if admission is not None:
-                            admission.event.set()
+                    started = self._start_eviction_locked(identity, mode, resolved_timeout)
+                    if started is None:
                         return
-                    entry.fenced = True
-                    if mode == "force":
-                        entry.force_evicted = True
-                    # Eviction outranks idle retirement: it also forgets the
-                    # registration, so the handle becomes permanently stale.
-                    self._cancel_idle(entry)
-                    # Calls queued for a slot on this connection will never get
-                    # to run; reject them now rather than after their budget.
-                    self._wake_call_waiters_for_entry(entry)
-                    registration = self._registrations.get(identity)
-                    task = asyncio.get_running_loop().create_task(
-                        self._evict_impl(
-                            identity,
-                            entry,
-                            generation=registration.generation if registration else None,
-                            timeout=resolved_timeout,
-                        )
-                    )
-                    self._evictions[identity] = task
-                    started_event = MCPEvictionStarted(
-                        tenant_key=tenant_key,
-                        connection_key=connection_key,
-                        source_name=entry.source.name,
-                        mode=mode,
-                    )
+                    task, started_event = started
         self._emit(started_event)
         if escalate:
             # Wake the in-flight drain so it stops waiting for live work.
@@ -3157,6 +3448,167 @@ class MCPRuntime:
             return
         assert task is not None
         # Shielded so one cancelled caller cannot abort a shared eviction.
+        await asyncio.shield(task)
+
+    def _start_eviction_locked(
+        self,
+        identity: tuple[str | None, str],
+        mode: MCPEvictionMode,
+        timeout: float,
+    ) -> tuple[asyncio.Task[None], MCPEvictionStarted] | None:
+        """Fence and start evicting an identity; None when nothing is live.
+
+        With no live entry the registration is dropped at once. Caller must
+        hold the runtime lock, with the runtime open and no eviction running.
+        """
+        entry = self._entries.get(identity)
+        if entry is None:
+            # Nothing live: drop the registration so the key can be
+            # rebound with a different endpoint or credentials. A
+            # caller already queued for this identity must re-check
+            # immediately instead of sleeping until its timeout.
+            self._registrations.pop(identity, None)
+            admission = self._admissions.get(identity)
+            if admission is not None:
+                admission.event.set()
+            return None
+        entry.fenced = True
+        if mode == "force":
+            entry.force_evicted = True
+        # Eviction outranks idle retirement: it also forgets the
+        # registration, so the handle becomes permanently stale.
+        self._cancel_idle(entry)
+        # Calls queued for a slot on this connection will never get
+        # to run; reject them now rather than after their budget.
+        self._wake_call_waiters_for_entry(entry)
+        registration = self._registrations.get(identity)
+        task = asyncio.get_running_loop().create_task(
+            self._evict_impl(
+                identity,
+                entry,
+                generation=registration.generation if registration else None,
+                timeout=timeout,
+            )
+        )
+        self._evictions[identity] = task
+        return task, MCPEvictionStarted(
+            tenant_key=identity[0],
+            connection_key=identity[1],
+            source_name=entry.source.name,
+            mode=mode,
+        )
+
+    async def revoke_authorization(
+        self,
+        *,
+        connection_key: str,
+        tenant_key: str | None = None,
+        timeout: float | None = None,
+    ) -> MCPOAuthRevocation:
+        """Sign the user out of an OAuth binding and retire its connection.
+
+        Synchronously fences the registration (new leases and calls raise
+        :class:`MCPAuthorizationRequired` ``revoked``), then runs one owned
+        task that writes this call's own tombstone and revokes at the
+        authorization server, then drains and evicts the captured
+        registration (shared with concurrent revokes of the same binding;
+        ``timeout`` bounds the drain). Cancelling the caller never cancels
+        that task; :meth:`close` awaits it. A store failure leaves the fence
+        in place and propagates; call again to retry.
+        """
+        identity = tenant_key, connection_key
+        _validate_identity_key(tenant_key, "tenant", optional=True)
+        _validate_identity_key(connection_key, "connection", optional=False)
+        drain_timeout = (
+            self.shutdown_timeout if timeout is None else _positive_float(timeout, "timeout")
+        )
+        with self._lock:
+            self._bind_loop()
+            registration = self._rotation_registration(identity)
+            oauth = registration.oauth
+            if oauth is None:
+                raise MCPStaleConnectionError(identity, "MCP connection is not an OAuth binding.")
+            registration.revoking = True
+            task = asyncio.get_running_loop().create_task(
+                self._revoke_invocation(
+                    identity,
+                    oauth,
+                    generation=registration.generation,
+                    source_name=registration.source.name,
+                    timeout=drain_timeout,
+                )
+            )
+            self._revoke_tasks.add(task)
+            task.add_done_callback(self._revoke_task_done)
+        return await asyncio.shield(task)
+
+    def _revoke_task_done(self, task: asyncio.Task[Any]) -> None:
+        with self._lock:
+            self._revoke_tasks.discard(task)
+        self._consume_task_exception(task)
+
+    async def _revoke_invocation(
+        self,
+        identity: tuple[str | None, str],
+        oauth: MCPOAuth,
+        *,
+        generation: int,
+        source_name: str,
+        timeout: float,
+    ) -> MCPOAuthRevocation:
+        revocation = await oauth.revoke(_auth_key(identity))
+        self._emit_unless_closed(
+            MCPOAuthRevoked(
+                tenant_key=identity[0],
+                connection_key=identity[1],
+                source_name=source_name,
+                remote=revocation.remote,
+            )
+        )
+        pair = identity, generation
+        with self._lock:
+            evicting = self._revoke_evictions.get(pair)
+            if evicting is None:
+                evicting = asyncio.get_running_loop().create_task(
+                    self._evict_registration(identity, generation, timeout)
+                )
+                self._revoke_evictions[pair] = evicting
+
+                def forget(done: asyncio.Task[None], pair: Any = pair) -> None:
+                    with self._lock:
+                        if self._revoke_evictions.get(pair) is done:
+                            del self._revoke_evictions[pair]
+                    self._consume_task_exception(done)
+
+                evicting.add_done_callback(forget)
+        await asyncio.shield(evicting)
+        return revocation
+
+    async def _evict_registration(
+        self,
+        identity: tuple[str | None, str],
+        generation: int,
+        timeout: float,
+    ) -> None:
+        """Internal drain-and-evict of exactly one captured registration.
+
+        Never calls the public :meth:`evict` and does nothing once shutdown
+        has begun, so :meth:`close` may await it without a cycle.
+        """
+        started_event: MCPEvictionStarted | None = None
+        with self._lock:
+            if self._state is not MCPRuntimeState.OPEN:
+                return
+            registration = self._registrations.get(identity)
+            if registration is None or registration.generation != generation:
+                return
+            task = self._evictions.get(identity)
+            if task is None:
+                started = self._start_eviction_locked(identity, "drain", timeout)
+                if started is None:
+                    return
+                task, started_event = started
+        self._emit(started_event)
         await asyncio.shield(task)
 
     async def _evict_impl(
@@ -3355,6 +3807,14 @@ class MCPRuntime:
                         "detail suppressed",
                         type(exception).__name__,
                     )
+        with self._lock:
+            revoke_tasks = [*self._revoke_tasks, *self._revoke_evictions.values()]
+        if revoke_tasks:
+            # Revoke invocations finish their own tombstone and remote POST;
+            # their evictions no-op now that shutdown owns teardown.
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in revoke_tasks), return_exceptions=True
+            )
         with self._lock:
             self._entries.clear()
             self._registrations.clear()
