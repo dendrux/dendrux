@@ -192,29 +192,139 @@ class _PolicyTransport(httpx2.AsyncBaseTransport):
             await self._pool.aclose()
 
 
-def _origin(url: httpx2.URL) -> tuple[str, str, int | None]:
+_Origin = tuple[str, str, int | None]
+
+
+def _origin(url: httpx2.URL) -> _Origin:
     port = url.port if url.port is not None else {"http": 80, "https": 443}.get(url.scheme)
     return url.scheme, url.host, port
 
 
+_AUTH_OWNED_EXTENSION = "dendrux_auth_owned"
+
+# Structural and hop-by-hop headers an auth flow's request naturally differs
+# on. They never carry credentials, and stripping them (Host above all)
+# breaks later cross-origin requests on the same client.
+_NEVER_SENSITIVE = frozenset(
+    {
+        "host",
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "transfer-encoding",
+        "connection",
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "user-agent",
+        "date",
+        "expect",
+        "te",
+        "trailer",
+        "upgrade",
+        "via",
+        "cache-control",
+        "pragma",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "range",
+        "content-range",
+        "mcp-protocol-version",
+        "mcp-session-id",
+    }
+)
+
+
+class _AuthOwned:
+    """Provenance of one request an auth flow built for another origin."""
+
+    __slots__ = ("headers", "request")
+
+    def __init__(self, request: httpx2.Request, headers: frozenset[str]) -> None:
+        self.request = request
+        self.headers = headers
+
+
+def _auth_owned_headers(request: httpx2.Request) -> frozenset[str]:
+    """Header names an auth flow introduced on exactly this request.
+
+    Redirect requests copy their parent's extensions, so the marker names
+    the exact request object it was set on; a copy never matches and keeps
+    nothing.
+    """
+    marker = request.extensions.get(_AUTH_OWNED_EXTENSION)
+    if isinstance(marker, _AuthOwned) and marker.request is request:
+        return marker.headers
+    return frozenset()
+
+
 class _ScopedAuth(httpx2.Auth):
-    def __init__(self, auth: httpx2.Auth, sensitive: set[str]) -> None:
+    """Track auth-generated headers and tag the auth flow's own requests.
+
+    A request the wrapped flow builds itself for another origin (for
+    example an OAuth token request to an authorization server) is tagged
+    auth-owned together with the header names the flow introduced on it:
+    absent from, or different to, the original request before the flow ran,
+    and not a value the flow set on the original request in place. Only
+    those headers survive the cross-origin scoping; anything copied from the
+    original request is still stripped. The original request, and anything
+    a redirect builds, is never tagged.
+
+    Header names the flow adds or changes join the client-wide sensitive set,
+    except the structural and hop-by-hop names in ``_NEVER_SENSITIVE`` (Host,
+    content and transfer framing, Accept*, User-Agent, caching, conditional
+    and range headers, MCP protocol headers), which never carry credentials.
+
+    The marker lives only while its request is being sent by this flow: any
+    marker already on the original request is removed on entry, every yield
+    sets or removes it, and it is removed again once the request returns.
+    """
+
+    def __init__(self, auth: httpx2.Auth, sensitive: set[str], origin: _Origin) -> None:
         self._auth = auth
         self._sensitive = sensitive
+        self._origin = origin
 
     async def async_auth_flow(
         self,
         request: httpx2.Request,
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
-        before = dict(request.headers)
+        request.extensions.pop(_AUTH_OWNED_EXTENSION, None)
+        initial = dict(request.headers)
+        before = initial
+        # (name, value) pairs the flow set on the original request in place.
+        # Such a value is the source's credential, never the flow's own for
+        # another origin, even when copied onto a new request.
+        set_on_original: set[tuple[str, str]] = set()
         flow = self._auth.async_auth_flow(request)
         try:
             outgoing = await anext(flow)
             while True:
-                self._sensitive.update(
-                    name for name, value in outgoing.headers.items() if before.get(name) != value
+                set_on_original.update(
+                    (name, value)
+                    for name, value in request.headers.items()
+                    if initial.get(name) != value
                 )
-                response = yield outgoing
+                if outgoing is not request and _origin(outgoing.url) != self._origin:
+                    introduced = frozenset(
+                        name
+                        for name, value in outgoing.headers.items()
+                        if initial.get(name) != value and (name, value) not in set_on_original
+                    )
+                    outgoing.extensions[_AUTH_OWNED_EXTENSION] = _AuthOwned(outgoing, introduced)
+                else:
+                    outgoing.extensions.pop(_AUTH_OWNED_EXTENSION, None)
+                self._sensitive.update(
+                    name
+                    for name, value in outgoing.headers.items()
+                    if before.get(name) != value and name not in _NEVER_SENSITIVE
+                )
+                try:
+                    response = yield outgoing
+                finally:
+                    outgoing.extensions.pop(_AUTH_OWNED_EXTENSION, None)
                 before = dict(outgoing.headers)
                 try:
                     outgoing = await flow.asend(response)
@@ -246,7 +356,8 @@ def create_http_client(
                 on_denied()
             raise MCPDestinationDeniedError("MCP request has an unsupported destination URL.")
         if _origin(request.url) != origin:
-            for name in sensitive:
+            keep = _auth_owned_headers(request)
+            for name in sensitive - keep:
                 request.headers.pop(name, None)
 
     if transport is None and source.destination_policy is not None:
@@ -267,5 +378,5 @@ def create_http_client(
         },
     )
     if client.auth is not None:
-        client.auth = _ScopedAuth(client.auth, sensitive)
+        client.auth = _ScopedAuth(client.auth, sensitive, origin)
     return client

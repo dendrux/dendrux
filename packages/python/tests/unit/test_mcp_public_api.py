@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import pytest
 
 EXPECTED_ALL = (
+    "MCPAuthChallenge",
     "MCPAuthenticationError",
     "MCPBindingConflictError",
     "MCPCallCapacityError",

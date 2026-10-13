@@ -37,6 +37,7 @@ except ModuleNotFoundError as err:
 from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy  # noqa: E402
 from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo  # noqa: E402
 from dendrux.mcp._errors import (  # noqa: E402
+    MCPAuthChallenge,
     MCPAuthenticationError,
     MCPBindingConflictError,
     MCPCallCapacityError,
@@ -101,6 +102,7 @@ from dendrux.mcp._server import MCPServer  # noqa: E402
 from dendrux.mcp._source import MCPFailureMode, MCPSource  # noqa: E402
 
 __all__ = [
+    "MCPAuthChallenge",
     "MCPAuthenticationError",
     "MCPBindingConflictError",
     "MCPCallCapacityError",

@@ -62,16 +62,58 @@ class MCPCredentialError(MCPConnectionError):
     """
 
 
+_KNOWN_CHALLENGE_ERRORS = frozenset({"invalid_request", "invalid_token", "insufficient_scope"})
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class MCPAuthChallenge:
+    """Validated ``Bearer`` challenge from a 401/403 ``WWW-Authenticate``.
+
+    Safe by construction: free text (``error_description``, ``realm``) is
+    never stored, and every kept field matches a narrow grammar. ``error`` is
+    an RFC 6750 error code; ``scope`` holds RFC 6749 scope tokens (at most
+    32); ``resource_metadata_url`` is the RFC 9728 protected-resource
+    metadata hint, an absolute http(s) URL without userinfo or fragment.
+    A field that fails validation is empty, never an exception.
+
+    The values are still server-chosen, so the default representation shows
+    only the well-known scheme and error codes, a scope count, and whether a
+    metadata URL is present.
+    """
+
+    scheme: str | None = None
+    error: str | None = None
+    scope: tuple[str, ...] = ()
+    resource_metadata_url: str | None = None
+
+    def __repr__(self) -> str:
+        scheme = self.scheme
+        if scheme is not None and scheme.lower() != "bearer":
+            scheme = "<other>"
+        error = self.error
+        if error is not None and error not in _KNOWN_CHALLENGE_ERRORS:
+            error = "<other>"
+        metadata = None if self.resource_metadata_url is None else "<set>"
+        return (
+            f"MCPAuthChallenge(scheme={scheme!r}, error={error!r}, "
+            f"scope=<{len(self.scope)} items>, resource_metadata_url={metadata!r})"
+        )
+
+
 class MCPAuthenticationError(MCPConnectionError):
     """The MCP server rejected the source's credentials (HTTP 401/403).
 
     Typed separately from transport failure so applications can refresh or
     rotate credentials and evict, instead of retrying blindly. Raised from
-    connect and discovery; ``status_code`` carries the rejecting status.
+    connect, discovery, and tool calls; ``status_code`` carries the rejecting
+    status. ``request_rejected`` is True only when the rejecting response
+    came from the source's own origin. ``challenge`` is the parsed
+    ``WWW-Authenticate`` header of that response, or None when it sent none.
     """
 
     status_code: int | None = None
     request_rejected: bool = False
+    challenge: MCPAuthChallenge | None = None
 
 
 class MCPBindingConflictError(MCPError):

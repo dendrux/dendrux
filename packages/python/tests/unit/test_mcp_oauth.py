@@ -867,3 +867,496 @@ async def test_sdk_same_origin_redirect_respects_source_setting(follow):
             await adapter.connect()
         await adapter.close()
     assert bool(reached) is follow
+
+
+# ---------------------------------------------------------------------------
+# Connect-time and discovery-time 401 recovery
+# ---------------------------------------------------------------------------
+
+
+class Recorder:
+    def __init__(self):
+        self.events = []
+
+    def on_event(self, event):
+        self.events.append(event)
+
+    def names(self):
+        return [type(event).__name__ for event in self.events]
+
+
+def _opening_events(recorder):
+    terminals = {"MCPConnectionOpened", "MCPConnectionFailed", "MCPConnectionAborted"}
+    names = recorder.names()
+    return names.count("MCPConnectionOpening"), [n for n in names if n in terminals]
+
+
+def _reject_stale(phase, failure=None):
+    """Adapter method that rejects the stale token."""
+
+    async def connect(self):
+        if self.source.headers["Authorization"] == "Bearer one":
+            raise failure or rejected()
+
+    async def list_tools(self):
+        self.lists += 1
+        if self.source.headers["Authorization"] == "Bearer one":
+            raise failure or rejected()
+        return list(self.tools)
+
+    return connect if phase == "connect" else list_tools
+
+
+def _bind(runtime, provider, *, reauthenticate=True, connect_timeout=None):
+    kwargs = {} if connect_timeout is None else {"connect_timeout": connect_timeout}
+    return runtime.bind(
+        connection_key="demo",
+        credentials=provider,
+        source=MCPSource.http(
+            "demo", "https://example.com", reauthenticate_on_401=reauthenticate, **kwargs
+        ),
+    )
+
+
+@pytest.mark.parametrize("phase", ["connect", "discovery"])
+async def test_connect_time_401_recovers_once(adapters, monkeypatch, phase):
+    method = "connect" if phase == "connect" else "list_tools"
+    monkeypatch.setattr(adapters, method, _reject_stale(phase))
+    recorder = Recorder()
+    provider = Provider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        discovery = await connection.discover()
+        assert [tool.name for tool in discovery.tools] == ["echo"]
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert len(adapters.instances) == 2
+        assert adapters.instances[0].closed
+        assert not adapters.instances[1].closed
+        assert runtime._entries[connection.identity].adapter is adapters.instances[1]
+        assert _opening_events(recorder) == (1, ["MCPConnectionOpened"])
+
+
+async def test_connect_time_recovery_is_single_flight(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    recorder = Recorder()
+    provider = Provider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        await asyncio.gather(*(connection.discover() for _ in range(5)))
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert len(adapters.instances) == 2
+        assert _opening_events(recorder) == (1, ["MCPConnectionOpened"])
+
+
+class PlainProvider:
+    def __init__(self):
+        self.gets = 0
+
+    async def get_auth(self):
+        self.gets += 1
+        return {"Authorization": "Bearer one"}
+
+
+@pytest.mark.parametrize("case", ["plain_provider", "opt_out", "forbidden", "cross_origin"])
+async def test_connect_time_rejection_without_recovery(adapters, monkeypatch, case):
+    failure = {"forbidden": rejected(403), "cross_origin": rejected(correlated=False)}.get(case)
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect", failure))
+    recorder = Recorder()
+    provider = PlainProvider() if case == "plain_provider" else Provider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider, reauthenticate=case in ("forbidden", "cross_origin"))
+        with pytest.raises(MCPAuthenticationError):
+            await connection.discover()
+        assert getattr(provider, "rejections", 0) == 0
+        assert provider.gets == 1
+        assert len(adapters.instances) == 1
+        assert adapters.instances[0].closed
+        assert _opening_events(recorder) == (1, ["MCPConnectionFailed"])
+
+
+async def test_second_connect_time_401_is_not_retried_again(adapters, monkeypatch):
+    async def always_rejected(self):
+        raise rejected()
+
+    monkeypatch.setattr(adapters, "connect", always_rejected)
+    recorder = Recorder()
+    provider = Provider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        with pytest.raises(MCPAuthenticationError):
+            await connection.discover()
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert len(adapters.instances) == 2
+        assert all(adapter.closed for adapter in adapters.instances)
+        assert _opening_events(recorder) == (1, ["MCPConnectionFailed"])
+        assert runtime._registrations[connection.identity].circuit.consecutive_failures == 1
+
+
+@pytest.mark.parametrize("failure", ["raises", "times_out"])
+async def test_connect_time_callback_failure_is_safe(adapters, monkeypatch, failure):
+    from dendrux.mcp import MCPCredentialError
+
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    recorder = Recorder()
+    provider = Provider()
+    seen_entries = []
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider, connect_timeout=0.05)
+
+        async def on_auth_rejected():
+            seen_entries.append(runtime._entries[connection.identity])
+            if failure == "raises":
+                raise RuntimeError("secret-refresh-token")
+            await asyncio.Event().wait()
+
+        provider.on_auth_rejected = on_auth_rejected
+        with pytest.raises(MCPCredentialError) as caught:
+            await connection.discover()
+        assert "secret-refresh-token" not in str(caught.value)
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert len(seen_entries) == 1
+        assert seen_entries[0].refresh_failed
+        assert provider.gets == 1
+        assert len(adapters.instances) == 1
+        assert adapters.instances[0].closed
+        assert _opening_events(recorder) == (1, ["MCPConnectionFailed"])
+        failed = [e for e in recorder.events if type(e).__name__ == "MCPConnectionFailed"]
+        assert failed[0].cause == "MCPCredentialError"
+
+
+async def test_real_sdk_connect_time_401_recovers_with_refreshing_provider():
+    app, state = live_app()
+    state["token"] = "two"
+    provider = Provider("one")
+    recorder = Recorder()
+    async with _serve(app) as url, MCPRuntime(observer=recorder) as runtime:
+        connection = runtime.bind(
+            connection_key="demo",
+            credentials=provider,
+            source=MCPSource.http("demo", url, reauthenticate_on_401=True),
+        )
+        discovery = await connection.discover()
+        assert [tool.name for tool in discovery.tools] == ["echo"]
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert state["rejects"] >= 1
+        assert _opening_events(recorder) == (1, ["MCPConnectionOpened"])
+
+
+async def test_rejected_adapter_close_failure_does_not_stop_recovery(adapters, monkeypatch, caplog):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer one":
+            raise RuntimeError("close failed for Bearer one")
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = Provider()
+    caplog.set_level("DEBUG", logger="dendrux")
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        await connection.discover()
+        assert provider.rejections == 1
+        assert len(adapters.instances) == 2
+        assert runtime._entries[connection.identity].adapter is adapters.instances[1]
+        assert _opening_events(recorder) == (1, ["MCPConnectionOpened"])
+    assert "cleanup failed after a credential rejection" in caplog.text
+    # The provider-resolved token is a redaction needle in cleanup diagnostics.
+    assert "Bearer one" not in caplog.text
+
+
+class BlockingProvider(Provider):
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def on_auth_rejected(self):
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        await super().on_auth_rejected()
+
+
+async def test_runtime_close_during_connect_recovery_aborts_cleanly(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    recorder = Recorder()
+    provider = BlockingProvider()
+    runtime = MCPRuntime(observer=recorder, shutdown_timeout=1.0)
+    connection = _bind(runtime, provider)
+    discover = asyncio.create_task(connection.discover())
+    await asyncio.wait_for(provider.entered.wait(), timeout=2)
+    await runtime.close()
+    # Shutdown cancels the shared connect task; its waiter sees that cancellation.
+    with pytest.raises(asyncio.CancelledError):
+        await discover
+    assert provider.cancelled
+    assert provider.gets == 1
+    assert len(adapters.instances) == 1
+    assert adapters.instances[0].closed
+    assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+
+
+async def test_cancelled_waiter_does_not_cancel_shared_connect_recovery(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    recorder = Recorder()
+    provider = BlockingProvider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        first = asyncio.create_task(connection.discover())
+        second = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not provider.cancelled
+        provider.release.set()
+        discovery = await asyncio.wait_for(second, timeout=2)
+        assert [tool.name for tool in discovery.tools] == ["echo"]
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert _opening_events(recorder) == (1, ["MCPConnectionOpened"])
+
+
+async def test_eviction_during_connect_recovery_never_publishes(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    recorder = Recorder()
+    provider = BlockingProvider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
+        await asyncio.sleep(0)
+        provider.release.set()
+        await asyncio.wait_for(evict, timeout=2)
+        # The retried transport is established for a fenced entry, so it is
+        # closed unpublished, exactly like any connect that loses its slot.
+        with pytest.raises(MCPConnectionError, match="released before establishment"):
+            await discover
+        assert connection.identity not in runtime._entries
+        assert provider.rejections == 1
+        assert all(adapter.closed for adapter in adapters.instances)
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+
+
+async def test_hanging_rejected_adapter_close_fails_the_opening(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    release = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer one":
+            await release.wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = Provider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=0.05)
+    try:
+        connection = _bind(runtime, provider)
+        waiters = [asyncio.create_task(connection.discover()) for _ in range(3)]
+        results = await asyncio.wait_for(
+            asyncio.gather(*waiters, return_exceptions=True), timeout=2
+        )
+        for result in results:
+            assert isinstance(result, MCPConnectionError)
+            assert not isinstance(result, MCPAuthenticationError)
+            assert "Bearer" not in str(result)
+        # Recovery stops before notifying the provider or reconnecting.
+        assert provider.rejections == 0
+        assert provider.gets == 1
+        assert len(adapters.instances) == 1
+        assert _opening_events(recorder) == (1, ["MCPConnectionFailed"])
+        failed = [e for e in recorder.events if type(e).__name__ == "MCPConnectionFailed"]
+        assert failed[0].cause == "MCPConnectionError"
+        assert runtime._registrations[connection.identity].circuit.consecutive_failures == 1
+        assert connection.identity not in runtime._entries
+    finally:
+        release.set()
+        await runtime.close()
+
+
+async def test_cancel_while_closing_rejected_adapter_hands_close_to_background(
+    adapters, monkeypatch
+):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer one":
+            closing.set()
+            await release.wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = Provider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=30.0)
+    try:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        open_task = runtime._entries[connection.identity].task
+        open_task.cancel()
+        await asyncio.gather(open_task, return_exceptions=True)
+        assert open_task.cancelled()
+        # The still-running close is tracked, not leaked.
+        assert len(runtime._abandoned_tasks) == 1
+        assert provider.rejections == 0
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+        await asyncio.gather(discover, return_exceptions=True)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await runtime.close()
+    assert not runtime._abandoned_tasks
+
+
+async def test_hanging_unpublished_adapter_close_is_bounded(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer two":
+            closing.set()
+            await release.wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = BlockingProvider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=0.05, shutdown_timeout=0.5)
+    try:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        open_task = runtime._entries[connection.identity].task
+        evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
+        await asyncio.sleep(0)
+        provider.release.set()
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        # The open task finishes within close_timeout although close never returns.
+        results = await asyncio.wait_for(
+            asyncio.gather(open_task, return_exceptions=True), timeout=1
+        )
+        assert isinstance(results[0], MCPConnectionError)
+        assert "released before establishment" in str(results[0])
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+        assert len(runtime._abandoned_tasks) == 1
+        await asyncio.wait_for(asyncio.gather(evict, discover, return_exceptions=True), timeout=2)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await runtime.close()
+    assert not runtime._abandoned_tasks
+
+
+async def test_cancel_during_unpublished_adapter_close_emits_one_terminal(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    closing = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer two":
+            closing.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = BlockingProvider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=0.05, shutdown_timeout=0.5)
+    try:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        open_task = runtime._entries[connection.identity].task
+        evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
+        await asyncio.sleep(0)
+        provider.release.set()
+        # The retry succeeds for the fenced entry and is closed unpublished.
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        open_task.cancel()
+        await asyncio.gather(open_task, return_exceptions=True)
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+        await asyncio.wait_for(asyncio.gather(evict, discover, return_exceptions=True), timeout=2)
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+    finally:
+        await runtime.close()
+
+
+class CountingProvider:
+    """Each rejection moves to the next token; every token is rejected."""
+
+    def __init__(self):
+        self.generation = 1
+        self.gets = 0
+        self.rejections = 0
+
+    async def get_auth(self):
+        self.gets += 1
+        return {"Authorization": f"Bearer gen-{self.generation}"}
+
+    async def on_auth_rejected(self):
+        self.rejections += 1
+        self.generation += 1
+
+
+async def test_call_rejection_then_reconnect_rejection_notifies_provider_once(
+    adapters, monkeypatch
+):
+    """One rejected operation spends one on_auth_rejected(), call path included."""
+
+    async def connect(self):
+        if self.source.headers["Authorization"] != "Bearer gen-1":
+            raise rejected()
+
+    monkeypatch.setattr(adapters, "connect", connect)
+    monkeypatch.setattr(adapters, "call_tool", AsyncMock(side_effect=rejected()))
+    recorder = Recorder()
+    provider = CountingProvider()
+    async with MCPRuntime(observer=recorder) as runtime:
+        connection = _bind(runtime, provider)
+        view = _ViewToolSource(connection.tools())
+        await view._discover()
+        executor = view._create_executor("echo")
+        with pytest.raises(MCPAuthenticationError):
+            await executor()
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        assert len(adapters.instances) == 2
+        assert recorder.names().count("MCPConnectionOpening") == 2
+        assert recorder.names().count("MCPConnectionFailed") == 1
+        await view.close()
+
+
+async def test_explicit_rotation_reconnect_keeps_connect_time_recovery(adapters, monkeypatch):
+    """Only a rejection rotation spends the budget; a manual rotation does not."""
+    provider = CountingProvider()
+    async with MCPRuntime() as runtime:
+        connection = _bind(runtime, Provider())
+        view = _ViewToolSource(connection.tools())
+        await view._discover()
+        await runtime.rotate_credentials(connection_key="demo", credentials=provider)
+
+        async def connect(self):
+            if self.source.headers["Authorization"] == "Bearer gen-1":
+                raise rejected()
+
+        monkeypatch.setattr(adapters, "connect", connect)
+        await view._create_executor("echo")()
+        assert provider.rejections == 1
+        assert provider.gets == 2
+        await view.close()

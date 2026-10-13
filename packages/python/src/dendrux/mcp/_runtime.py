@@ -734,6 +734,7 @@ class _ConnectionEntry:
     __slots__ = (
         "rotation_task",
         "reconnect_pending",
+        "rejection_reconnect",
         "preserve_catalog",
         "credential_epoch",
         "refresh_failed",
@@ -763,6 +764,9 @@ class _ConnectionEntry:
         self.source = source
         self.rotation_task: asyncio.Task[None] | None = None
         self.reconnect_pending = False
+        # The pending reconnect follows a rejection rotation that already
+        # spent this operation's one on_auth_rejected() call.
+        self.rejection_reconnect = False
         self.preserve_catalog = False
         self.credential_epoch = 0
         self.refresh_failed = False
@@ -1936,14 +1940,17 @@ class MCPRuntime:
         *,
         credentials: MCPCredentialProvider | None,
         reuse_catalog: bool = False,
+        auth_recovery: bool = True,
     ) -> None:
         """Connect and discover once for an entry; owns cleanup on failure.
 
         Runs as the entry's single shared task, which is what makes credential
         resolution single-flight: however many Agents race for this identity,
         the provider is consulted exactly once per physical connection.
+        ``auth_recovery=False`` disables the connect-time 401 recovery when the
+        rejected operation that scheduled this open already notified the
+        provider, so ``on_auth_rejected()`` runs at most once per rejection.
         """
-        adapter: MCPClientAdapter | None = None
         tenant_key, connection_key = identity
         self._emit(
             MCPConnectionOpening(
@@ -1954,12 +1961,68 @@ class MCPRuntime:
             )
         )
         try:
-            source = entry.source
-            if credentials is not None:
-                source = await _resolve_source_credentials(source, credentials)
-            adapter = MCPClientAdapter(source)
-            await adapter.connect()
-            raw_tools = entry.raw_tools if reuse_catalog else await adapter.list_tools()
+            await self._establish_connection(
+                identity,
+                entry,
+                credentials=credentials,
+                reuse_catalog=reuse_catalog,
+                auth_recovery=auth_recovery,
+            )
+        finally:
+            # Every exit gets exactly one terminal event. The specific one
+            # (opened, failed, aborted) is normally emitted already and wins;
+            # this covers cancellation during late cleanup, which escapes the
+            # failure handling below.
+            self._emit_opening_terminal(
+                entry,
+                MCPConnectionAborted(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                ),
+            )
+
+    async def _establish_connection(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        credentials: MCPCredentialProvider | None,
+        reuse_catalog: bool,
+        auth_recovery: bool,
+    ) -> None:
+        """Body of :meth:`_open_connection`, after its opening event."""
+        adapter: MCPClientAdapter | None = None
+        tenant_key, connection_key = identity
+        try:
+            recovered = False
+            while True:
+                source = entry.source
+                if credentials is not None:
+                    source = await _resolve_source_credentials(source, credentials)
+                adapter = MCPClientAdapter(source)
+                try:
+                    await adapter.connect()
+                    raw_tools = entry.raw_tools if reuse_catalog else await adapter.list_tools()
+                    break
+                except MCPAuthenticationError as auth_error:
+                    if (
+                        recovered
+                        or not auth_recovery
+                        or not entry.source.reauthenticate_on_401
+                        or not isinstance(credentials, MCPRefreshingCredentialProvider)
+                        or auth_error.status_code != 401
+                        or not auth_error.request_rejected
+                    ):
+                        raise
+                # The rejected token may already be cached by the provider:
+                # notify it once, then resolve again and reconnect. Waiters
+                # share this task, so the recovery is single-flight.
+                recovered = True
+                rejected_adapter, adapter = adapter, None
+                await self._close_rejected_adapter(entry, rejected_adapter)
+                await self._notify_connect_rejection(entry, credentials)
         except BaseException as exc:
             circuit_opened: MCPCircuitOpened | None = None
             failure_cause: str | None = None
@@ -2032,15 +2095,9 @@ class MCPRuntime:
             )
             self._emit(circuit_closed)
         if not still_current:
-            try:
-                await adapter.close()
-            except Exception as exc:
-                logger.warning(
-                    "MCP source '%s' cleanup failed after late establishment: %s (%s)",
-                    entry.source.name,
-                    safe_source_exception_detail(adapter.source, exc),
-                    type(exc).__name__,
-                )
+            # Bounded: a close that resists is handed to the background, and
+            # the attempt still terminates as aborted below.
+            await self._bounded_adapter_close(entry, adapter, after="late establishment")
             # Established, but only after losing its slot: never served and
             # never published, so the attempt terminates as aborted.
             self._emit_opening_terminal(
@@ -2061,6 +2118,83 @@ class MCPRuntime:
                 "MCP source '%s' discovered zero tools. This may indicate a configuration problem.",
                 entry.source.name,
             )
+
+    async def _close_rejected_adapter(
+        self,
+        entry: _ConnectionEntry,
+        adapter: MCPClientAdapter,
+    ) -> None:
+        """Close a transport whose credentials were rejected before recovery.
+
+        A close that does not finish within ``close_timeout`` fails the
+        opening with a value-free error instead of blocking every waiter; a
+        close that raises is logged and recovery continues.
+        """
+        if not await self._bounded_adapter_close(entry, adapter, after="a credential rejection"):
+            raise MCPConnectionError(
+                "MCP credential recovery could not close the rejected transport."
+            )
+
+    async def _bounded_adapter_close(
+        self,
+        entry: _ConnectionEntry,
+        adapter: MCPClientAdapter,
+        *,
+        after: str,
+    ) -> bool:
+        """Close an unpublished transport within ``close_timeout``.
+
+        Returns whether the close finished. A close that raises is logged
+        value-free and counts as finished. One that is still running at the
+        deadline, or when this caller is cancelled, is tracked in the
+        background instead of awaited, so no opening waits on it unbounded.
+        """
+
+        async def close() -> None:
+            try:
+                await adapter.close()
+            except Exception as exc:
+                logger.warning(
+                    "MCP source '%s' cleanup failed after %s: %s (%s)",
+                    entry.source.name,
+                    after,
+                    safe_source_exception_detail(adapter.source, exc),
+                    type(exc).__name__,
+                )
+
+        task = asyncio.create_task(close())
+        try:
+            pending = await self._settle_teardown_tasks(
+                {task: entry},
+                timeout=self.close_timeout,
+                warning=f"MCP source '%s' close after {after} exceeded its grace.",
+            )
+        except asyncio.CancelledError:
+            if not task.done():
+                self._track_abandoned_task(task)
+            raise
+        return not pending
+
+    async def _notify_connect_rejection(
+        self,
+        entry: _ConnectionEntry,
+        credentials: MCPRefreshingCredentialProvider,
+    ) -> None:
+        """Tell the provider its credentials were rejected while connecting.
+
+        Same contract as the call path: bounded by ``connect_timeout``, and a
+        failure marks the entry ``refresh_failed`` and surfaces as a
+        value-free credential error with the provider's exception detached.
+        """
+        failed = False
+        try:
+            async with asyncio.timeout(entry.source.connect_timeout):
+                await credentials.on_auth_rejected()
+        except Exception:
+            failed = True
+        if failed:
+            entry.refresh_failed = True
+            raise MCPCredentialError("MCP credential rejection callback failed.")
 
     def _release(
         self,
@@ -2769,6 +2903,7 @@ class MCPRuntime:
                 entry.credential_epoch += 1
                 entry.refresh_failed = False
                 entry.reconnect_pending = True
+                entry.rejection_reconnect = rejected
                 entry.preserve_catalog = preserve_catalog
         except Exception:
             if rejected:
@@ -2805,12 +2940,15 @@ class MCPRuntime:
                     entry.opening_terminal_emitted = False
                     self._connection_seq += 1
                     entry.instance_id = self._connection_seq
+                    auth_recovery = not entry.rejection_reconnect
+                    entry.rejection_reconnect = False
                     task = asyncio.create_task(
                         self._open_connection(
                             identity,
                             entry,
                             credentials=registration.credentials,
                             reuse_catalog=entry.preserve_catalog,
+                            auth_recovery=auth_recovery,
                         )
                     )
                     entry.task = task

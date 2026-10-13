@@ -74,7 +74,15 @@ All configured headers, including custom API-key headers and headers supplied by
 credential providers, are scoped to the source's original scheme, hostname, and
 effective port. Authentication-generated headers, Authorization, and Cookie are
 also stripped before requests to another origin. This applies on every redirect
-hop and authentication retry. Same-origin redirects retain credentials; even an
+hop and authentication retry. The one exception is a new request that an opaque
+`auth=` object's flow builds itself for another origin, such as an OAuth token
+request with `Authorization: Basic` to an authorization server. That request
+keeps only the headers its auth flow introduced (absent from, or changed from,
+the original request before the flow ran); configured source headers, cookies,
+any credential copied unchanged from the original request, and any value the
+flow set on the original request itself are still stripped. A redirect of such a request, and any redirect of the MCP request
+itself, is stripped as usual, and the destination policy still applies to its
+socket. Same-origin redirects retain credentials; even an
 HTTP-to-HTTPS upgrade is a different origin. Redirect URLs containing userinfo
 are rejected. MCP 2.2 or newer follows only method-preserving redirects within
 the endpoint origin (also allowing the SDK's default-port HTTP-to-HTTPS upgrade).
@@ -262,6 +270,20 @@ One logical call emits one start and one terminal event, even if it recovers;
 those events retain the first attempt's connection instance ID. Physical
 rotation emits a connection-close event with `reason="credentials_rotated"`.
 
+Recovery also covers connect and discovery. When the `initialize` handshake or
+`tools/list` of a new connection is rejected with a 401 from the source origin,
+the runtime closes that transport, invokes `on_auth_rejected()` once, resolves
+credentials again through `get_auth()`, and retries the connect and discovery
+once. A provider whose cached access token has expired therefore recovers on
+the first `connection.discover()` or Agent turn instead of failing it. Waiters
+for the same connection share the one recovery, and the attempt still emits
+exactly one `MCPConnectionOpening` and one terminal event. A second 401 raises
+`MCPAuthenticationError`; a 403, a 401 from another origin, or a provider
+without `on_auth_rejected()` is not recovered. A failing callback raises the
+same value-free `MCPCredentialError` as on the call path. Each rejected
+operation notifies the provider at most once: the reconnect that follows a
+tool-call rejection does not run a second connect-time recovery.
+
 Dendrux does not implement OAuth exchanges, persist refresh tokens, or coordinate
 rotation across workers. The provider owns those operations. Without the
 opt-in flag, a live 401 is typed but is not automatically recovered.
@@ -284,6 +306,36 @@ credential-redaction behavior. `MCPAuthenticationError.status_code` identifies
 specific tool POST at the original source origin rather than an unrelated
 response. A cross-origin redirect challenge is typed but never refreshes the
 original source's credentials.
+
+`MCPAuthenticationError.challenge` is the parsed `WWW-Authenticate` header of
+the rejecting 401/403 response, at connect, discovery, and tool-call time, or
+`None` when the server sent none. Only the `Bearer` challenge is read, across
+every `WWW-Authenticate` header; other challenges are ignored. It is an
+`MCPAuthChallenge` with `scheme`, `error` (an RFC 6750 error code), `scope` (up
+to 32 RFC 6749 scope tokens), and `resource_metadata_url` (the RFC 9728
+protected-resource metadata hint: an absolute http(s) URL without userinfo or
+fragment, at most 2048 characters). Each field is validated against that
+grammar and left empty when it does not match; free text such as
+`error_description` and `realm` is never stored. A 403 with
+`error="insufficient_scope"` names the scopes the server wants, for a scope
+step-up. The values are still server-chosen, so they are never copied into the
+exception message, and `repr()` of a challenge shows only the well-known scheme
+and error codes, a scope count, and whether a metadata URL is present. A header
+that cannot be parsed yields a challenge with empty fields rather than an
+error. One limitation: the third-party `httpcore2` transport logger prints raw
+request and response headers, including `WWW-Authenticate` and
+`Authorization`, at DEBUG level, so keep that logger above DEBUG in production.
+
+```python
+from dendrux.mcp import MCPAuthenticationError
+
+try:
+    await connection.discover()
+except MCPAuthenticationError as error:
+    challenge = error.challenge
+    if error.status_code == 403 and challenge and challenge.error == "insufficient_scope":
+        request_more_scopes(challenge.scope)  # application-owned
+```
 
 
 ## Views and tool policy
