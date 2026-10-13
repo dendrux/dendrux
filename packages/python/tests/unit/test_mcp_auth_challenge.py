@@ -123,6 +123,51 @@ def test_first_occurrence_of_a_parameter_wins() -> None:
 
 
 @pytest.mark.parametrize(
+    "header",
+    [
+        "Bearer error=invalid_token\U0001f4a5",
+        'Bearer error="invalid_token"garbage',
+        "Bearer error=invalid_token/extra",
+        'Bearer error="invalid_token"=',
+    ],
+)
+def test_error_with_a_malformed_suffix_is_discarded(header: str) -> None:
+    assert _parse(header).error is None
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("Bearer scope=read/write", ()),
+        ('Bearer scope="read"write', ()),
+        ("Bearer scope=read\U0001f4a5, error=invalid_token", ()),
+    ],
+)
+def test_scope_with_a_malformed_suffix_is_discarded(header: str, expected: tuple[str, ...]) -> None:
+    challenge = _parse(header)
+    assert challenge.scope == expected
+
+
+def test_malformed_parameter_does_not_swallow_the_next_one() -> None:
+    challenge = _parse("Bearer scope=read/write, error=invalid_token")
+    assert challenge.scope == ()
+    assert challenge.error == "invalid_token"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Bearer error=invalid_token",
+        "Bearer error=invalid_token ",
+        "Bearer error=invalid_token\t, scope=a",
+        'Bearer error="invalid_token" , scope=a',
+    ],
+)
+def test_parameter_followed_by_end_space_or_comma_is_kept(header: str) -> None:
+    assert _parse(header).error == "invalid_token"
+
+
+@pytest.mark.parametrize(
     "error",
     [
         "invalid_token\r\nX-Injected: 1",

@@ -72,7 +72,9 @@ def _parse_challenges(value: str) -> list[_Challenge]:
     """Split one header value into ``(scheme, params)`` challenges.
 
     Parameter names are lower-cased; the first occurrence of a name wins.
-    token68 credentials and anything unparseable are skipped.
+    A value must be followed by the end of input, whitespace, or a comma;
+    otherwise the whole parameter is discarded. token68 credentials and
+    anything unparseable are skipped.
     """
     challenges: list[_Challenge] = []
     current: _Challenge | None = None
@@ -97,7 +99,9 @@ def _parse_challenges(value: str) -> list[_Challenge]:
                 token = _TOKEN.match(value, after)
                 if token is not None:
                     param, after = token.group(), token.end()
-            if param is None:
+            # A value must end the element: a valid prefix of a malformed
+            # value (``read/write``, ``"x"garbage``) is discarded entirely.
+            if param is None or (after < end and value[after] not in " \t,"):
                 index = _skip_element(value, after)
                 continue
             if current is not None:
