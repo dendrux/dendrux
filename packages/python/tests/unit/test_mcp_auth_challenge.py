@@ -321,14 +321,38 @@ def test_stdio_source_status_is_never_request_rejected() -> None:
     assert error.challenge == MCPAuthChallenge(scheme="Bearer")
 
 
-def test_status_attribute_without_response_falls_back_to_observed_rejection() -> None:
-    class StatusError(RuntimeError):
-        status_code = 401
+class _StatusError(RuntimeError):
+    """An error carrying a 401 status but no response object."""
 
+    status_code = 401
+
+
+@pytest.mark.parametrize(
+    ("observed_url", "rejected_here"),
+    [(SOURCE_URL, True), ("https://elsewhere.example/mcp", False)],
+)
+async def test_status_attribute_without_response_falls_back_to_observed_rejection(
+    observed_url: str, rejected_here: bool
+) -> None:
     adapter = MCPClientAdapter(MCPSource.http("demo", SOURCE_URL))
-    adapter._last_rejection = None
-    error = adapter._safe_error("connect to", StatusError("rejected"))
+    await adapter._observe_response(
+        _response(401, 'Bearer error="invalid_token", scope="read"', url=observed_url)
+    )
+    error = adapter._safe_error("connect to", _StatusError("rejected"))
     assert isinstance(error, MCPAuthenticationError)
+    assert error.status_code == 401
+    assert error.challenge == MCPAuthChallenge(
+        scheme="Bearer", error="invalid_token", scope=("read",)
+    )
+    assert error.request_rejected is rejected_here
+
+
+async def test_observed_rejection_with_another_status_is_not_borrowed() -> None:
+    adapter = MCPClientAdapter(MCPSource.http("demo", SOURCE_URL))
+    await adapter._observe_response(_response(403, 'Bearer error="insufficient_scope"'))
+    error = adapter._safe_error("connect to", _StatusError("rejected"))
+    assert isinstance(error, MCPAuthenticationError)
+    assert error.status_code == 401
     assert error.challenge is None
     assert not error.request_rejected
 
