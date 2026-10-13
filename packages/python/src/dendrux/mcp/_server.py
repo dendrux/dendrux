@@ -242,10 +242,10 @@ def create_mcp_executor(
     """Create an async Dendrux executor bound to one live MCP adapter.
 
     ``exposed_name`` is the Agent-visible name used in error text; it defaults
-    to ``<namespace>__<mcp_tool_name>``. The server is always called with
+    to the prefixed, sanitized name. The server is always called with
     ``mcp_tool_name``.
     """
-    display_name = exposed_name or f"{namespace}__{mcp_tool_name}"
+    display_name = exposed_name or exposed_tool_name(mcp_tool_name, namespace=namespace)
 
     async def executor(**params: Any) -> Any:
         # With an opaque auth object even server-authored error text could

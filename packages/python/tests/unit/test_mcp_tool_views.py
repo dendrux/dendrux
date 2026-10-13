@@ -26,9 +26,11 @@ from dendrux.mcp import (
     MCPConnectionStateError,
     MCPCredentialError,
     MCPDestinationDeniedError,
+    MCPHost,
     MCPOAuthRefreshError,
     MCPRuntime,
     MCPRuntimeEvent,
+    MCPServer,
     MCPSkippedTool,
     MCPSource,
     MCPStaleConnectionError,
@@ -111,7 +113,7 @@ def _connection(
         source=MCPSource.http(
             name,
             f"https://{name}.example.com/mcp",
-            failure_mode=failure_mode,  # type: ignore[arg-type]
+            failure_mode=failure_mode,  # type: ignore[arg-type]  # str, not the Literal
         ),
     )
 
@@ -207,7 +209,7 @@ class TestPolicyValidation:
         source["write"] = "put"
         assert dict(policy.rename) == {"read": "fetch"}
         with pytest.raises(TypeError):
-            policy.rename["x"] = "y"  # type: ignore[index]
+            policy.rename["x"] = "y"  # type: ignore[index]  # proves read-only
 
     def test_equal_policies_compare_and_hash_equal(self) -> None:
         first = MCPToolPolicy(rename={"read": "fetch"}, prefix=False)
@@ -231,9 +233,9 @@ class TestPolicyValidation:
 
     def test_non_string_rename_entries_raise(self) -> None:
         with pytest.raises(ValueError, match="rename"):
-            MCPToolPolicy(rename={"read": 3})  # type: ignore[dict-item]
+            MCPToolPolicy(rename={"read": 3})  # type: ignore[dict-item]  # invalid on purpose
         with pytest.raises(ValueError, match="rename"):
-            MCPToolPolicy(rename=["read"])  # type: ignore[arg-type]
+            MCPToolPolicy(rename=["read"])  # type: ignore[arg-type]  # invalid on purpose
 
     def test_duplicate_rename_values_raise(self) -> None:
         with pytest.raises(ValueError, match="rename"):
@@ -242,7 +244,7 @@ class TestPolicyValidation:
     @pytest.mark.parametrize("field", ["prefix", "strict"])
     def test_flags_must_be_bool(self, field: str) -> None:
         with pytest.raises(ValueError, match=field):
-            MCPToolPolicy(**{field: "yes"})  # type: ignore[arg-type]
+            MCPToolPolicy(**{field: "yes"})  # type: ignore[arg-type]  # invalid on purpose
 
     def test_over_long_prefixed_rename_raises_at_view_construction(self) -> None:
         connection = _connection(MCPRuntime())
@@ -401,7 +403,7 @@ class TestPerToolSkipping:
         source = SimpleNamespace(name="srv", transport="stdio", call_timeout=30.0)
         tools = [_tool("ok"), _tool(LONG_70)]
         defs, skipped = build_mcp_tool_defs(
-            source=source,  # type: ignore[arg-type]
+            source=source,  # type: ignore[arg-type]  # minimal stand-in
             namespace="srv",
             tools=tools,
             connection_info=None,
@@ -415,7 +417,7 @@ class TestPerToolSkipping:
     def test_skipped_tool_is_immutable(self) -> None:
         entry = MCPSkippedTool(source_name="s", namespace="n", tool="t", reason="duplicate_name")
         with pytest.raises(AttributeError):
-            entry.tool = "x"  # type: ignore[misc]
+            entry.tool = "x"  # type: ignore[misc]  # proves frozen
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +682,7 @@ class TestTelemetry:
             assert await lookups.fn["fetch"]() == "read:ok"
             assert _FakeAdapter.calls == ["read"]
 
-            entry = agent._tool_sources[0]._entry  # type: ignore[attr-defined]
+            entry = agent._tool_sources[0]._entry  # type: ignore[attr-defined]  # view internals
             changed = _tool("read").model_copy(update={"description": "changed"})
             entry.raw_tools = [changed, _tool("write")]
             with pytest.raises(MCPStaleConnectionError):
@@ -882,3 +884,54 @@ class TestCollisionsStillRaise:
         (payload,) = [d for kind, d in notifier.events if kind == GovernanceEventType.MCP_ERROR]
         assert payload["code"] == "tool_name_collision"
         assert payload["error_type"] == "MCPToolNameCollisionError"
+
+
+# ---------------------------------------------------------------------------
+# Legacy facades name failures by the exposed (sanitized) name
+# ---------------------------------------------------------------------------
+
+
+class _FailingLegacyAdapter(_FakeAdapter):
+    _stack: Any = None
+    _client: Any = None
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        type(self).calls.append(name)
+        raise RuntimeError("boom")
+
+
+class TestLegacyErrorNames:
+    @pytest.mark.parametrize("hosted", [True, False])
+    async def test_failed_call_reports_the_exposed_name(self, hosted: bool) -> None:
+        _FakeAdapter.catalogs["srv"] = [_tool("get.echo")]
+        server = MCPServer.from_source(MCPSource.http("srv", "https://srv.example.com/mcp"))
+        host = MCPHost([server]) if hosted else None
+        agent = Agent(prompt="test", tool_sources=[host if host is not None else server])
+        with patch("dendrux.mcp._server.MCPClientAdapter", _FailingLegacyAdapter):
+            try:
+                lookups = await agent.get_tool_lookups()
+                with pytest.raises(MCPToolCallError) as caught:
+                    await lookups.fn["srv__get_echo"]()
+            finally:
+                await agent.close()
+                if host is not None:
+                    await host.close()
+
+        assert _FakeAdapter.calls == ["get.echo"]
+        assert "'srv__get_echo'" in str(caught.value)
+        assert "get.echo" not in str(caught.value)
+
+    async def test_executor_fallback_name_is_sanitized(self) -> None:
+        from dendrux.mcp._server import create_mcp_executor
+
+        adapter = _FailingLegacyAdapter(MCPSource.http("srv", "https://srv.example.com/mcp"))
+        executor = create_mcp_executor(
+            adapter,  # type: ignore[arg-type]  # fake adapter
+            namespace="srv",
+            mcp_tool_name="get.echo",
+            max_result_bytes=1000,
+        )
+        with pytest.raises(MCPToolCallError) as caught:
+            await executor()
+        assert "'srv__get_echo'" in str(caught.value)
+        assert _FakeAdapter.calls == ["get.echo"]

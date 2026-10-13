@@ -39,8 +39,7 @@ class _HostedMCPServer(MCPServer):
     def _create_executor(
         self, mcp_tool_name: str, exposed_name: str | None = None
     ) -> Callable[..., Any]:
-        # Hosted sources have no view options; they keep their legacy naming.
-        return self._host._create_executor(self.name, mcp_tool_name)
+        return self._host._create_executor(self.name, mcp_tool_name, exposed_name)
 
     async def close(self) -> None:
         """Release this agent view; the application-owned host stays open."""
@@ -102,10 +101,12 @@ class MCPHost:
                 self._catalogs[source_name] = cached
             return list(cached)
 
-    def _create_executor(self, source_name: str, mcp_tool_name: str) -> Callable[..., Any]:
+    def _create_executor(
+        self, source_name: str, mcp_tool_name: str, exposed_name: str | None = None
+    ) -> Callable[..., Any]:
         if source_name not in self._catalogs:
             raise RuntimeError(f"MCP source '{source_name}' has not been discovered.")
-        return self._servers[source_name]._create_executor(mcp_tool_name)
+        return self._servers[source_name]._create_executor(mcp_tool_name, exposed_name)
 
     async def refresh(self) -> None:
         """Close connections and clear catalogs for the next agent run."""

@@ -23,6 +23,9 @@
 - MCP: stable `code` on every `mcp_skipped_sources` entry and on the
   `mcp.error` payload (`authorization_required` adds `reason`), derived from
   the exception class by the new `error_code_for(exc)`.
+- MCP fix: a failed call through `MCPServer` or `MCPHost` now names the tool by
+  its exposed, sanitized name (`srv__get_echo`), not the raw server name
+  (`srv__get.echo`).
 
 ## 0.2.0a21 - 2026-10-13
 
