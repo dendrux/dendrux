@@ -675,13 +675,21 @@ class TestTelemetry:
             view = _connection(runtime).tools(prefix=False, rename={"read": "fetch"})
             agent = Agent(prompt="test", tool_sources=[view])
             lookups = await agent.get_tool_lookups()
+            # The unchanged catalog matches: the renamed tool resolves its own
+            # definition by server name and reaches the server.
+            assert await lookups.fn["fetch"]() == "read:ok"
+            assert _FakeAdapter.calls == ["read"]
+
             entry = agent._tool_sources[0]._entry  # type: ignore[attr-defined]
             changed = _tool("read").model_copy(update={"description": "changed"})
             entry.raw_tools = [changed, _tool("write")]
             with pytest.raises(MCPStaleConnectionError):
                 await lookups.fn["fetch"]()
+            assert _FakeAdapter.calls == ["read"]
+
             # A different tool keyed on its own server name is unaffected.
             assert await lookups.fn["write"]() == "write:ok"
+            assert _FakeAdapter.calls == ["read", "write"]
             await agent.close()
 
 
