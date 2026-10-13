@@ -1224,6 +1224,39 @@ async def test_cancel_while_closing_rejected_adapter_hands_close_to_background(
     assert not runtime._abandoned_tasks
 
 
+async def test_cancel_during_unpublished_adapter_close_emits_one_terminal(adapters, monkeypatch):
+    monkeypatch.setattr(adapters, "connect", _reject_stale("connect"))
+    closing = asyncio.Event()
+
+    async def close(self):
+        self.closed = True
+        if self.source.headers["Authorization"] == "Bearer two":
+            closing.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(adapters, "close", close)
+    recorder = Recorder()
+    provider = BlockingProvider()
+    runtime = MCPRuntime(observer=recorder, close_timeout=0.05, shutdown_timeout=0.5)
+    try:
+        connection = _bind(runtime, provider)
+        discover = asyncio.create_task(connection.discover())
+        await asyncio.wait_for(provider.entered.wait(), timeout=2)
+        open_task = runtime._entries[connection.identity].task
+        evict = asyncio.create_task(runtime.evict(connection_key="demo", timeout=1.0))
+        await asyncio.sleep(0)
+        provider.release.set()
+        # The retry succeeds for the fenced entry and is closed unpublished.
+        await asyncio.wait_for(closing.wait(), timeout=2)
+        open_task.cancel()
+        await asyncio.gather(open_task, return_exceptions=True)
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+        await asyncio.wait_for(asyncio.gather(evict, discover, return_exceptions=True), timeout=2)
+        assert _opening_events(recorder) == (1, ["MCPConnectionAborted"])
+    finally:
+        await runtime.close()
+
+
 class CountingProvider:
     """Each rejection moves to the next token; every token is rejected."""
 

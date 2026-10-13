@@ -1951,7 +1951,6 @@ class MCPRuntime:
         rejected operation that scheduled this open already notified the
         provider, so ``on_auth_rejected()`` runs at most once per rejection.
         """
-        adapter: MCPClientAdapter | None = None
         tenant_key, connection_key = identity
         self._emit(
             MCPConnectionOpening(
@@ -1961,6 +1960,41 @@ class MCPRuntime:
                 instance_id=entry.instance_id,
             )
         )
+        try:
+            await self._establish_connection(
+                identity,
+                entry,
+                credentials=credentials,
+                reuse_catalog=reuse_catalog,
+                auth_recovery=auth_recovery,
+            )
+        finally:
+            # Every exit gets exactly one terminal event. The specific one
+            # (opened, failed, aborted) is normally emitted already and wins;
+            # this covers cancellation during late cleanup, which escapes the
+            # failure handling below.
+            self._emit_opening_terminal(
+                entry,
+                MCPConnectionAborted(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=entry.source.name,
+                    instance_id=entry.instance_id,
+                ),
+            )
+
+    async def _establish_connection(
+        self,
+        identity: tuple[str | None, str],
+        entry: _ConnectionEntry,
+        *,
+        credentials: MCPCredentialProvider | None,
+        reuse_catalog: bool,
+        auth_recovery: bool,
+    ) -> None:
+        """Body of :meth:`_open_connection`, after its opening event."""
+        adapter: MCPClientAdapter | None = None
+        tenant_key, connection_key = identity
         try:
             recovered = False
             while True:
