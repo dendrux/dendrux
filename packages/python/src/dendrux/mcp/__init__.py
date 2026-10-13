@@ -34,6 +34,10 @@ except ModuleNotFoundError as err:
         ) from None
     raise  # Real import error from within the mcp package
 
+from dendrux.mcp._credentials import (  # noqa: E402
+    MCPCredentialProvider,
+    MCPRefreshingCredentialProvider,
+)
 from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy  # noqa: E402
 from dendrux.mcp._discovery import MCPDiscovery, MCPToolInfo  # noqa: E402
 from dendrux.mcp._errors import (  # noqa: E402
@@ -91,9 +95,7 @@ from dendrux.mcp._observability import (  # noqa: E402
 )
 from dendrux.mcp._runtime import (  # noqa: E402
     MCPConnection,
-    MCPCredentialProvider,
     MCPEvictionMode,
-    MCPRefreshingCredentialProvider,
     MCPRuntime,
     MCPToolPolicy,
     MCPToolView,

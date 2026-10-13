@@ -15,9 +15,13 @@ from collections import deque
 from collections.abc import Callable, Collection, Mapping  # noqa: TC003
 from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._credentials import (
+    MCPCredentialProvider,
+    MCPRefreshingCredentialProvider,
+)
 from dendrux.mcp._discovery import MCPDiscovery, build_discovery
 from dendrux.mcp._errors import (
     MCPAuthenticationError,
@@ -88,42 +92,6 @@ _FORCED_CANCEL_GRACE = 0.25
 
 MCPEvictionMode = Literal["drain", "force"]
 _CallInterruption = Literal["forced", "connection_lost"]
-
-
-@runtime_checkable
-class MCPCredentialProvider(Protocol):
-    """Application callback that returns ephemeral MCP authentication.
-
-    Invoked lazily, once per physical connection attempt — never per Agent,
-    per lease, or per tool call — and bounded by its own ``connect_timeout``
-    budget, separate from the transport handshake's identical budget (a
-    connect behind a slow provider can take up to twice ``connect_timeout``).
-    The provider must return a non-empty mapping: request headers for HTTP
-    sources, environment variables for stdio sources. Only mappings are
-    accepted because their exact values double as redaction needles. Managed
-    connections reject opaque static auth objects for the same reason; use
-    static headers or this provider boundary instead. The resolved value
-    exists only to establish that one transport: it is never persisted,
-    logged, or rendered into errors or representations.
-    """
-
-    async def get_auth(self) -> Mapping[str, str]:
-        """Return authentication suitable for the configured MCP transport."""
-        ...
-
-
-@runtime_checkable
-class MCPRefreshingCredentialProvider(MCPCredentialProvider, Protocol):
-    """Credential provider supporting explicit rejection of a cached token.
-
-    The runtime calls this once for concurrent rejected calls, then calls
-    ``get_auth()`` while reconnecting. The application owns refresh-token
-    exchange, durable storage, and synchronization across worker processes.
-    """
-
-    async def on_auth_rejected(self) -> None:
-        """Invalidate or refresh rejected credentials before the next get_auth."""
-        ...
 
 
 def _apply_source_credentials(source: MCPSource, resolved: Any) -> MCPSource:

@@ -324,6 +324,67 @@ class MCPRuntimeShutdownCompleted(MCPRuntimeEvent):
     forced: bool
 
 
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class MCPOAuthRequired(MCPConnectionEvent):
+    """An OAuth binding needs the user to sign in (again).
+
+    Emitted once per shared failure, however many callers observe it.
+    ``scope_count`` counts challenged step-up scopes; the scopes themselves
+    are server-chosen and stay on the raised error.
+    """
+
+    reason: Literal[
+        "not_signed_in", "expired", "revoked", "insufficient_scope", "resource_mismatch"
+    ]
+    scope_count: int
+
+    def __repr__(self) -> str:
+        return f"MCPOAuthRequired(reason={self.reason!r}, scope_count={self.scope_count})"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class MCPOAuthRefreshed(MCPConnectionEvent):
+    """An access token was refreshed and published to the store."""
+
+    expires_in: float | None
+
+    def __repr__(self) -> str:
+        return f"MCPOAuthRefreshed(expires_in={self.expires_in!r})"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class MCPOAuthRefreshFailed(MCPConnectionEvent):
+    """A token refresh failed.
+
+    ``outcome`` is ``unsent`` (never reached the token endpoint; the refresh
+    token is intact), ``uncertain`` or ``rejected`` (the refresh token was
+    retired), ``contention`` (another worker held the refresh claim), or
+    ``expired_claim`` (a stalled or crashed worker's claim expired and its
+    refresh token was retired without being replayed). ``cause`` is a
+    value-free class name or HTTP status label.
+    """
+
+    outcome: Literal["unsent", "uncertain", "rejected", "contention", "expired_claim"]
+    cause: str
+
+    def __repr__(self) -> str:
+        return f"MCPOAuthRefreshFailed(outcome={self.outcome!r})"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True, repr=False)
+class MCPOAuthRevoked(MCPConnectionEvent):
+    """A user signed out through the runtime.
+
+    ``remote`` is the authorization server's revocation outcome:
+    ``confirmed``, ``failed``, ``unsupported``, or ``skipped``.
+    """
+
+    remote: str
+
+    def __repr__(self) -> str:
+        return f"MCPOAuthRevoked(remote={self.remote!r})"
+
+
 @runtime_checkable
 class MCPRuntimeObserver(Protocol):
     """Application callback receiving managed-runtime lifecycle events.
