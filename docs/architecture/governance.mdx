@@ -51,7 +51,7 @@ MCP_TOOLS_SKIPPED       = 'mcp.tools_skipped'
 PROVIDER_RETRY          = 'provider.retry'
 ```
 
-`guardrail.detected` and `guardrail.blocked` carry the matched entity type and snippet in their payload, so a single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
+`guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction and an error string; that error includes the blocked finding's entity type and a bounded snippet. A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
 
 Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
 

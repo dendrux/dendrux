@@ -452,7 +452,7 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`11_structured_output.py`](packages/python/examples/11_structured_output.py) | Typed Pydantic models from LLM |
 | [`12_structured_output_stream.py`](packages/python/examples/12_structured_output_stream.py) | Structured output in streaming mode |
 | [`13_mcp_filesystem.py`](packages/python/examples/13_mcp_filesystem.py) | Agent with an MCP tool source |
-| [`14_skills/`](packages/python/examples/14_skills/) | Skills with files and a script executor: model-driven and explicit activation, approvals |
+| [`14_skills/`](packages/python/examples/14_skills/) | Skills with files and a script executor: model-driven and explicit activation, deny policy |
 | [`15_cache_efficiency.py`](packages/python/examples/15_cache_efficiency.py) | Anthropic prompt-cache hit measurement |
 | [`16_cache_efficiency_openai.py`](packages/python/examples/16_cache_efficiency_openai.py) | OpenAI prompt-cache hit measurement |
 | [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |

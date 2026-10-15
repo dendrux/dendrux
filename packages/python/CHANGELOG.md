@@ -11,7 +11,8 @@
     under `scripts/` is a script), `allowed_tools`, `revision` (a non-secret
     audit label) and `digest` (`sha256:...`, content only). Invalid input
     raises `SkillValidationError` (a `ValueError`). `path` is now optional and
-    keyword-only, and the body is kept exactly as written instead of stripped.
+    keyword-only; after frontmatter parsing removes exactly one leading newline,
+    the remaining body is kept without further stripping.
   - New built-in tools `read_skill_resource` and `run_skill_script` join
     `use_skill`. All three are reserved names, can be named in `deny=` and
     `require_approval=` (even on an agent with no other tools), and skip

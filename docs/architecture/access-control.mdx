@@ -140,7 +140,7 @@ If you misspell a tool name in `deny`, the agent refuses to construct. This prev
 Skills and MCP connections enter the governance pipeline at different points, but they follow the same principle: fail at the boundary with a typed event, keep the run moving when it can.
 
 - `deny_skills=[...]` is the skill analogue of `deny`. A skill listed there is removed from the run before the model sees anything: it is not in the catalogue, and `use_skill`, `read_skill_resource` and `run_skill_script` cannot reach it. The names are listed in the `denied` field of the `skill.catalog_resolved` event at run start. To gate what an allowed skill may do, name the skill tools in `deny` or `require_approval`. See [Skills](/docs/architecture/skills).
-- MCP connections happen in `_emit_init_events` during agent setup. A connection that fails auth or discovery emits `mcp.error`, with the error payload in `data`. The run continues without the server's tools. See [MCP](/docs/architecture/mcp).
+- MCP connections happen in `_emit_init_events` during agent setup. An auth or discovery failure emits `mcp.error`. A `best_effort` source is skipped and the run continues without its tools; a strict source failure terminates the run. See [MCP](/docs/architecture/mcp).
 
 All three layers share `run_events` as the audit surface. Querying `WHERE event_type IN ('policy.denied', 'skill.catalog_resolved', 'skill.activation_failed', 'mcp.error')` on a run returns the full access-control story in one query, in order.
 
