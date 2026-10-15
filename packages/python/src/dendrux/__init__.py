@@ -20,6 +20,11 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
     SchemaNotInitializedError,
+    SkillContinuityError,
+    SkillDigestMismatch,
+    SkillMismatchError,
+    SkillMissingError,
+    SkillValidationError,
 )
 from dendrux.loops.single import SingleCall
 from dendrux.pricing import ModelPricing, PriceTable
@@ -61,6 +66,11 @@ __all__ = [
     "RunNotPausedError",
     "SchemaNotInitializedError",
     "SingleCall",
+    "SkillContinuityError",
+    "SkillDigestMismatch",
+    "SkillMismatchError",
+    "SkillMissingError",
+    "SkillValidationError",
     "StructuredOutputValidationError",
     "ToolResultContext",
     "ToolResultTransform",
