@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0a23 - 2026-10-15
 
 - Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context leaked between yields.
 - Skills v2. A skill can now carry files and scripts, be built from code, and be
