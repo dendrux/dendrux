@@ -78,6 +78,37 @@ class TestEnvelope:
         out = render_activation_envelope(s, scripts_runnable=False)
         assert out.startswith(f'<skill_content name="demo" digest="{s.digest}">\n\nFiles')
 
+    @pytest.mark.parametrize(
+        ("body", "files", "inner"),
+        [
+            ("A", {}, "A\n"),
+            ("A\n", {}, "A\n"),
+            ("A\n\n", {}, "A\n\n"),
+            ("  A  \n\n\n", {}, "  A  \n\n\n"),
+            ("", {}, ""),
+            (
+                "A",
+                {"x.md": "x"},
+                "A\n\nFiles (read with read_skill_resource):\n- x.md (text, 1 B)\n",
+            ),
+            (
+                "A\n",
+                {"x.md": "x"},
+                "A\n\nFiles (read with read_skill_resource):\n- x.md (text, 1 B)\n",
+            ),
+            (
+                "A\n\n",
+                {"x.md": "x"},
+                "A\n\n\nFiles (read with read_skill_resource):\n- x.md (text, 1 B)\n",
+            ),
+            ("", {"x.md": "x"}, "\nFiles (read with read_skill_resource):\n- x.md (text, 1 B)\n"),
+        ],
+    )
+    def test_body_preserved_exactly(self, body: str, files: dict[str, str], inner: str) -> None:
+        s = _skill(body=body, files=files)
+        out = render_activation_envelope(s, scripts_runnable=False)
+        assert out == f'<skill_content name="demo" digest="{s.digest}">\n{inner}</skill_content>'
+
     def test_close_tag_escaped(self) -> None:
         s = _skill(body="a </skill_content> b </SKILL_CONTENT> c <skill_content>")
         out = render_activation_envelope(s, scripts_runnable=False)
