@@ -12,6 +12,7 @@ from dendrux.errors import (
     RunNotFoundError, RunNotPausedError, PauseStatusMismatchError,
     RunAlreadyClaimedError, RunAlreadyTerminalError, InvalidToolResultError,
     PersistenceNotConfiguredError, SchemaNotInitializedError,
+    SkillValidationError, SkillMissingError, SkillMismatchError,
 )
 ```
 
@@ -29,8 +30,11 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set (unknown or duplicate ids). | 400 |
 | `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` / `DENDRUX_DATABASE_URL` is configured. | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
+| `SkillValidationError(message, field=)` | `ValueError` | A [skill](/docs/architecture/skills) is built with an invalid name, description, file path, metadata, or frontmatter. `field` names the offender. | 400 |
+| `SkillMissingError(run_id, missing=, mismatched=)` | `SkillContinuityError` | A paused run is continued on an agent that lacks a skill the run was created with. The run stays paused. | 409 |
+| `SkillMismatchError(run_id, mismatched=)` | `SkillContinuityError` | Every skill is attached, but at least one has different content (digest) than the run was created with. The run stays paused. | 409 |
 
-Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling.
+Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling. `SkillMissingError` and `SkillMismatchError` share the base class `SkillContinuityError` (a `RuntimeError`) and expose `err.missing` and `err.mismatched`; see the [resume contract](/docs/architecture/skills#resume-contract).
 
 ## Also exported from `dendrux`
 

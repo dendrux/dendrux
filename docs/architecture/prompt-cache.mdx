@@ -46,7 +46,7 @@ def _apply_cache_control(self, system_prompt, api_messages):
 
 Two breakpoints per call:
 
-1. **System block.** The whole system prompt (including any loaded skill catalogue) is marked. This is the big, stable part that barely changes across calls.
+1. **System block.** The whole system prompt (including the skill catalogue, or the inlined skill bodies on SingleCall) is marked. The skill tools are part of the tool definitions, which also belong to the cached prefix, so changing which skills are attached or which tools are offered invalidates it. This is the big, stable part that barely changes across calls.
 2. **Last message's last content block.** Dendrux marks the conversation-so-far up through whatever the model just saw. That marker "warms the next iteration's cache": the current call pays to write it, and the next call reads it.
 
 Default TTL is Anthropic's default (5 minutes). Configure a longer one via the provider constructor if your agents pause for approval longer than that.

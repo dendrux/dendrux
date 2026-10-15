@@ -17,7 +17,7 @@ This page is the map. Each concern has its own page for the details.
 | --- | --- | --- |
 | [Guardrails](/docs/architecture/guardrails) | Scan every message before and after the LLM. Built-in detectors for [PII](/docs/architecture/pii-redaction), secrets, and [prompt injection](/docs/recipes/prompt-injection-patterns), plus custom regex patterns. Redact, block, or warn. | `dendrux.guardrails` |
 | [Approval](/docs/architecture/approval) | Pause the run before a gated tool executes. A human decides approve or deny. | `require_approval=[...]` |
-| [Access control](/docs/architecture/access-control) | Policy gate on tool calls, skill invocations, and MCP connections. Denies at the boundary before state changes. | `policy=...`, `skills=...` |
+| [Access control](/docs/architecture/access-control) | Policy gate on tool calls, skill invocations, and MCP connections. Denies at the boundary before state changes. | `deny=[...]`, `deny_skills=[...]` |
 | Budget | Track per-run spend and token usage. Raise threshold events at configurable ratios, abort at the hard cap. | `budget=Budget(...)` |
 
 Guardrails, approval, and access control are independent. You can use any one, any two, any three, or all four on the same run. The runtime applies them in a fixed order (incoming guardrail → access check → approval → tool execute → outgoing guardrail), but each layer does not know or care about the others. Their only coupling is the shared event log.
@@ -26,7 +26,7 @@ Guardrails, approval, and access control are independent. You can use any one, a
 
 Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
 
-All 15 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+All 20 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
 
 ```text
 POLICY_DENIED           = 'policy.denied'
@@ -37,16 +37,21 @@ BUDGET_EXCEEDED         = 'budget.exceeded'
 GUARDRAIL_DETECTED      = 'guardrail.detected'
 GUARDRAIL_REDACTED      = 'guardrail.redacted'
 GUARDRAIL_BLOCKED       = 'guardrail.blocked'
-SKILL_REGISTERED        = 'skill.registered'
-SKILL_DENIED            = 'skill.denied'
-SKILL_INVOKED           = 'skill.invoked'
+GUARDRAIL_UNMAPPED_PLACEHOLDER = 'guardrail.unmapped_placeholder'
+SKILL_CATALOG_RESOLVED  = 'skill.catalog_resolved'
+SKILL_ACTIVATED         = 'skill.activated'
+SKILL_ACTIVATION_FAILED = 'skill.activation_failed'
+SKILL_RESOURCE_READ     = 'skill.resource_read'
+SKILL_SCRIPT_REQUESTED  = 'skill.script_requested'
+SKILL_SCRIPT_COMPLETED  = 'skill.script_completed'
+SKILL_SCRIPT_FAILED     = 'skill.script_failed'
 MCP_CONNECTED           = 'mcp.connected'
 MCP_ERROR               = 'mcp.error'
 MCP_TOOLS_SKIPPED       = 'mcp.tools_skipped'
 PROVIDER_RETRY          = 'provider.retry'
 ```
 
-`guardrail.detected` and `guardrail.blocked` carry the matched entity type and snippet in their payload, so a single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
+`guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction and an error string; that error includes the blocked finding's entity type and a bounded snippet. A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
 
 Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
 
@@ -165,7 +170,7 @@ Dendrux does not do that, for three reasons.
 
 1. **Ordering is important and cross-cutting.** "Did the guardrail detect the PII before or after the approval was decided?" is a question that matters. The answer requires a single ordered log, not four tables that need to be merged on timestamps. `sequence_index` is that log.
 2. **Readers want one stream.** A dashboard that wants to render "what happened on this run" reads one table. An SSE client that wants to stream live events reads one endpoint. A developer who wants to debug a suspicious decision greps one log. Four tables means four queries, four joins, four schemas to learn.
-3. **The set of concerns will grow.** MCP events and skill events were added after the original PII + approval cut. Every addition would otherwise require a new table, a new migration, a new query pattern. A typed event on a shared table needs neither. Adding a new governance concern means adding a new `event_type` constant and calling `recorder.on_governance_event(...)`; everything downstream works.
+3. **The set of concerns will grow.** MCP events and skill events (seven of them, covering activation, file reads and script runs) were added after the original PII + approval cut. Every addition would otherwise require a new table, a new migration, a new query pattern. A typed event on a shared table needs neither. Adding a new governance concern means adding a new `event_type` constant and calling `recorder.on_governance_event(...)`; everything downstream works.
 
 The cost is a JSON `data` column on `run_events` that is typed per `event_type`, not per column. For a log that readers mostly want in order, that is the right tradeoff. Queries that need a specific event type (`WHERE event_type = 'guardrail.blocked'`) still return the relevant rows in the right order, and the JSON column gives each event type the flexibility to carry whatever payload makes sense without forcing a schema migration.
 

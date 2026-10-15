@@ -47,6 +47,7 @@ Agent(
     skills_dir: str | Path | None = None,
     skills: list[Skill] | None = None,
     deny_skills: list[str] | None = None,
+    skill_executor: SkillExecutor | None = None,
     tool_result_transform: ToolResultTransform | None = None,
 )
 ```
@@ -70,7 +71,8 @@ Agent(
 | `budget` | A `Budget(max_tokens=..., warn_at=...)`. See [Budget](/docs/architecture/budget). |
 | `pricing` | A `PriceTable` of USD-per-million-token rates used to fill `cost_usd` for providers that report tokens only. See [Cost and pricing](/docs/architecture/pricing). |
 | `guardrails` | List of guardrails scanned each turn. See [Guardrails](/docs/architecture/guardrails). |
-| `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. See [Skills](/docs/architecture/skills). |
+| `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. `skills_dir` is read lazily at the first run. See [Skills](/docs/architecture/skills). |
+| `skill_executor` | A `SkillExecutor` subclass instance that runs skill scripts. Without it, `run_skill_script` is not offered to the model. See [Running scripts](/docs/architecture/skills#running-scripts). |
 | `tool_result_transform` | Callable that rewrites a server tool's result before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
 
 Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, and tools with `SingleCall` all raise `ValueError`.
@@ -111,6 +113,7 @@ async def run(
     user_input: str,
     *,
     history: list[ChatMessage] | None = None,
+    activate_skills: Sequence[str] | None = None,
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     notifier: LoopNotifier | None = None,
@@ -119,7 +122,7 @@ async def run(
 ) -> RunResult
 ```
 
-Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence.
+Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence. `activate_skills` names skills to deliver in the run's first message instead of waiting for the model to call `use_skill`; unknown or denied names raise `ValueError` before any run is created ([Skills](/docs/architecture/skills#explicit-activate_skills)).
 
 On success, `RunResult.answer` contains only the final answer turn after tool
 use, not all assistant text produced during the run. `RunResult.commentary` is
@@ -143,6 +146,7 @@ def stream(
     user_input: str,
     *,
     history: list[ChatMessage] | None = None,
+    activate_skills: Sequence[str] | None = None,
     tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     notifier: LoopNotifier | None = None,
@@ -150,7 +154,7 @@ def stream(
 ) -> RunStream
 ```
 
-Same inputs as `run`, but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration; with an idempotency key it is provisional until first iteration resolves the key. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. To interrupt from another coroutine, call `cancel_run(stream.run_id)`; the stream ends with `RUN_CANCELLED` carrying the partial answer. Closing the stream early also cancels the run and persists its current partial answer. Guardrails are not supported on the streaming path.
+Same inputs as `run` (including `activate_skills`, validated before the stream is returned), but returns a `RunStream` immediately (no `await`). `stream.run_id` is available before iteration; with an idempotency key it is provisional until first iteration resolves the key. Iterate it for `RunEvent`s, or `.text()` for text deltas. Prefer `async with agent.stream(...) as s:` for deterministic cleanup. To interrupt from another coroutine, call `cancel_run(stream.run_id)`; the stream ends with `RUN_CANCELLED` carrying the partial answer. Closing the stream early also cancels the run and persists its current partial answer. Guardrails are not supported on the streaming path.
 
 The final `RunResult.answer` contains the final answer turn only. On cancellation,
 the partial answer contains only the current text buffer, which resets at every
@@ -238,6 +242,8 @@ async def resume(run_id: str, *, tool_results=None, user_input=None, notifier=No
 | `submit_approval` | `waiting_approval` | the shared resume errors below. |
 | `resume` | generic resume entry point | same. |
 
+If the run was created with skills, these methods first compare them with the skills on this agent and raise `SkillMissingError` or `SkillMismatchError` (leaving the run paused) when they differ; `resume_stream` ends with a `RUN_ERROR` instead of raising. See [Resume contract](/docs/architecture/skills#resume-contract).
+
 Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `PersistenceNotConfiguredError`. See [Errors](/docs/reference/errors).
 
 ## `resume_stream`
@@ -262,7 +268,7 @@ Request cancellation. Works for paused runs (atomic CAS to `cancelled`), running
 async def retry(run_id: str, *, tenant_id=None, metadata=None, notifier=None, **kwargs) -> RunResult
 ```
 
-Start a fresh run that reuses an existing terminal run's input and approximate prior context. Requires persistence.
+Start a fresh run that reuses an existing terminal run's input and approximate prior context. Requires persistence. The source run must belong to `tenant_id`, otherwise `ReplayRunError` is raised. Skills the source run activated explicitly stay activated; if one is no longer attached, `retry` raises `ValueError` before creating a run.
 
 ## `close`
 

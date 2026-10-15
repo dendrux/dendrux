@@ -1,7 +1,15 @@
-"""Skills + MCP Agent — composable capabilities with governance.
+"""Skills + MCP Agent — instructions, files, scripts and governance.
 
-Demonstrates skills (instruction packages) working alongside MCP tools
-and governance. The agent has two skills but one is denied by policy.
+Demonstrates skills working alongside MCP tools:
+
+  * ``summarize-file`` has a reference file (read with ``read_skill_resource``)
+    and a script (run with ``run_skill_script`` through the local executor).
+  * ``organize-notes`` is denied by policy.
+  * Task 1 lets the model activate the skill; task 3 activates it up front
+    with ``activate_skills=``.
+
+The local executor runs scripts on THIS machine. That is fine for the
+skills bundled here; use a container or hosted sandbox for anything else.
 
 Prerequisites:
     - Node.js + npx installed
@@ -24,6 +32,7 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
+from local_executor import LocalSubprocessExecutor
 from rich.console import Console
 from rich.panel import Panel
 
@@ -31,6 +40,8 @@ from dendrux import Agent
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.mcp import MCPSource
 from dendrux.notifiers.console import ConsoleNotifier
+from dendrux.skills import Skill
+from dendrux.store import RunStore
 
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
@@ -68,8 +79,6 @@ async def main() -> None:
     db_path = Path.home() / ".dendrux" / "dendrux.db"
 
     # Show what skills are available
-    from dendrux.skills import Skill
-
     all_skills = Skill.scan_dir(SKILLS_DIR)
     console.print(
         Panel(
@@ -102,6 +111,7 @@ async def main() -> None:
         ],
         skills_dir=str(SKILLS_DIR),
         deny_skills=["organize-notes"],
+        skill_executor=LocalSubprocessExecutor(),
         deny=[
             "filesystem__move_file",
             "filesystem__edit_file",
@@ -109,9 +119,9 @@ async def main() -> None:
         database_url=f"sqlite+aiosqlite:///{db_path}",
         max_iterations=10,
     ) as agent:
-        # Task 1: Use the summarize-file skill
+        # Task 1: the model activates the skill, reads its style guide, runs its script
         console.print()
-        console.print("[bold]Task 1:[/bold] Summarize meeting notes (uses summarize-file skill)")
+        console.print("[bold]Task 1:[/bold] Summarize meeting notes (model activates the skill)")
         console.print()
 
         result = await agent.run(
@@ -141,13 +151,14 @@ async def main() -> None:
             f"{result2.usage.total_tokens} tokens[/dim]"
         )
 
-        # Task 3: Use filesystem tools directly (no skill needed)
+        # Task 3: activate the skill up front, so the model starts with its instructions
         console.print()
-        console.print("[bold]Task 3:[/bold] List files in working directory")
+        console.print("[bold]Task 3:[/bold] Summarize project ideas (skill activated explicitly)")
         console.print()
 
         result3 = await agent.run(
-            "List all files in the working directory.",
+            "Summarize the project-ideas.txt file.",
+            activate_skills=["summarize-file"],
             notifier=ConsoleNotifier(),
         )
         console.print(f"\n[bold green]Answer:[/bold green] {result3.answer}")
@@ -155,6 +166,13 @@ async def main() -> None:
             f"[dim]Run {result3.run_id} — {result3.iteration_count} iterations, "
             f"{result3.usage.total_tokens} tokens[/dim]"
         )
+
+    # The skill events: which skills were resolved, activated, read and run
+    store = RunStore.from_database_url(f"sqlite+aiosqlite:///{db_path}")
+    async with store:
+        for run_id in (result.run_id, result2.run_id, result3.run_id):
+            names = [e.event_type for e in await store.get_events(run_id)]
+            console.print(f"[dim]{run_id}: {[n for n in names if n.startswith('skill.')]}[/dim]")
 
     console.print()
     console.print("[bold]Inspect persisted data with:[/bold]")
