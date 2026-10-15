@@ -52,6 +52,8 @@ class TestSkillFromDir:
 
         assert skill.body.startswith("## Instructions")
         assert "Edge Cases" in skill.body
+        # Body is kept exactly: one leading newline removed, nothing else stripped.
+        assert skill.body.endswith("OCR is needed\n")
 
     def test_missing_skill_md_raises(self) -> None:
         from dendrux.skills import Skill
@@ -119,54 +121,31 @@ class TestSkillNameValidation:
     def test_valid_single_char(self) -> None:
         self._make_skill("a")
 
-    def test_uppercase_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
+    @pytest.mark.parametrize(
+        ("name", "match"),
+        [
+            ("PDF-Processing", "lowercase"),
+            ("-pdf", "hyphen"),
+            ("pdf-", "hyphen"),
+            ("pdf--tool", "consecutive"),
+            ("a" * 65, "64"),
+            ("", "empty"),
+            ("pdf.tool", "lowercase"),
+            ("pdf_tool", "lowercase"),
+        ],
+    )
+    def test_invalid_names_rejected(self, name: str, match: str) -> None:
+        from dendrux.errors import SkillValidationError
+        from dendrux.skills import Skill
 
-        with pytest.raises(ValueError, match="lowercase"):
-            _validate_skill_name("PDF-Processing", "PDF-Processing")
+        with pytest.raises(SkillValidationError, match=match) as info:
+            Skill(name=name, description="d")
+        assert info.value.field == "name"
 
-    def test_leading_hyphen_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
+    def test_max_length_name_accepted(self) -> None:
+        from dendrux.skills import Skill
 
-        with pytest.raises(ValueError, match="hyphen"):
-            _validate_skill_name("-pdf", "-pdf")
-
-    def test_trailing_hyphen_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
-
-        with pytest.raises(ValueError, match="hyphen"):
-            _validate_skill_name("pdf-", "pdf-")
-
-    def test_consecutive_hyphens_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
-
-        with pytest.raises(ValueError, match="consecutive"):
-            _validate_skill_name("pdf--tool", "pdf--tool")
-
-    def test_too_long_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
-
-        with pytest.raises(ValueError, match="64"):
-            _validate_skill_name("a" * 65, "a" * 65)
-
-    def test_empty_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
-
-        with pytest.raises(ValueError):
-            _validate_skill_name("", "")
-
-    def test_dots_rejected(self) -> None:
-        from dendrux.skills._loader import _validate_skill_name
-
-        with pytest.raises(ValueError, match="lowercase"):
-            _validate_skill_name("pdf.tool", "pdf.tool")
-
-    def test_underscores_rejected(self) -> None:
-        """Spec says lowercase + hyphens only — no underscores."""
-        from dendrux.skills._loader import _validate_skill_name
-
-        with pytest.raises(ValueError, match="lowercase"):
-            _validate_skill_name("pdf_tool", "pdf_tool")
+        assert Skill(name="a" * 64, description="d").name == "a" * 64
 
 
 # ---------------------------------------------------------------------------
