@@ -109,21 +109,18 @@ def parse_frontmatter(markdown: str) -> tuple[dict[str, Any], str]:
 
     kwargs: dict[str, Any] = {}
     for key in ("name", "description"):
-        value = data.get(key)
-        if value is None:
+        if key not in data:
             raise SkillValidationError(f"Missing required '{key}' field in frontmatter.", field=key)
-        kwargs[key] = _require_str(value, key)
+        kwargs[key] = _require_str(data[key], key)
     for key in ("license", "compatibility"):
-        value = data.get(key)
-        if value is not None:
-            kwargs[key] = _require_str(value, key)
-
-    tools = data.get("allowed-tools")
-    if tools is not None:
-        kwargs["allowed_tools"] = tuple(_require_str(tools, "allowed-tools").split())
-
-    metadata = data.get("metadata")
-    if metadata is not None:
+        if key in data:
+            kwargs[key] = _require_str(data[key], key)
+    if "allowed-tools" in data:
+        kwargs["allowed_tools"] = tuple(
+            _require_str(data["allowed-tools"], "allowed-tools").split()
+        )
+    if "metadata" in data:
+        metadata = data["metadata"]
         if not isinstance(metadata, Mapping):
             raise SkillValidationError(
                 f"'metadata' must be a YAML mapping, got {type(metadata).__name__}.",

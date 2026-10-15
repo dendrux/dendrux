@@ -12,7 +12,7 @@ _FORBIDDEN_CHARS = frozenset('<>"\\')
 def validate_file_path(path: str) -> None:
     """Raise :class:`SkillValidationError` unless ``path`` is a valid file key.
 
-    A valid key is a non-empty relative POSIX path of at most 512 chars,
+    A valid key is a non-empty, UTF-8 encodable relative POSIX path of at most 512 chars,
     with ``/`` separators, no ASCII control characters, none of ``<>"\\``,
     no ``.``/``..``/empty segments, and not the reserved ``SKILL.md``.
     Runtime tools must resolve paths by exact match against ``Skill.files``
@@ -43,6 +43,10 @@ def _path_problem(path: str) -> str | None:
         return "contains an empty, '.' or '..' segment"
     if path == "SKILL.md":
         return "'SKILL.md' is reserved for the skill body"
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return "not valid Unicode (cannot be encoded as UTF-8)"
     return None
 
 

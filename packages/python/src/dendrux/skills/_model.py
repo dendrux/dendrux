@@ -16,6 +16,7 @@ from typing import Any
 
 from dendrux.errors import SkillValidationError
 from dendrux.skills._digest import compute_digest
+from dendrux.skills._fs import SkillDir
 from dendrux.skills._markdown import parse_frontmatter, render_markdown
 from dendrux.skills._paths import validate_file_path
 
@@ -139,7 +140,9 @@ class Skill:
         """Load a skill directory: ``SKILL.md`` plus every regular file below it.
 
         The directory name must equal the skill name. Symlinks (the root,
-        ``SKILL.md`` or any traversed entry) are rejected; hidden files and
+        ``SKILL.md`` or any traversed entry) are rejected, including entries
+        swapped for a symlink mid-load where the OS supports ``dir_fd`` (see
+        ``dendrux.skills._fs`` for the fallback); hidden files and
         directories are skipped. Files that decode as strict UTF-8 without a
         NUL byte become ``str``, others ``bytes``.
 
@@ -147,21 +150,20 @@ class Skill:
             FileNotFoundError: If the directory or its SKILL.md is missing.
             SkillValidationError: If SKILL.md or any file fails validation.
         """
-        from dendrux.skills._fs import read_package_files, read_skill_md
-
         root = Path(path)
-        skill_md, text = read_skill_md(root)
-        with _prefixed(skill_md):
-            kwargs, body = parse_frontmatter(text)
-            name = kwargs["name"]
-            _validate_name(name)
-            if name != root.name:
-                raise SkillValidationError(
-                    f"Skill name '{name}' does not match directory name '{root.name}'. "
-                    "The name field must match the parent directory name.",
-                    field="name",
-                )
-        files = read_package_files(root)
+        with SkillDir(root) as skill_dir:
+            skill_md, text = skill_dir.read_skill_md()
+            with _prefixed(skill_md):
+                kwargs, body = parse_frontmatter(text)
+                name = kwargs["name"]
+                _validate_name(name)
+                if name != root.name:
+                    raise SkillValidationError(
+                        f"Skill name '{name}' does not match directory name '{root.name}'. "
+                        "The name field must match the parent directory name.",
+                        field="name",
+                    )
+            files = skill_dir.read_files()
         with _prefixed(root):
             return cls(body=body, files=files, revision=revision, path=root, **kwargs)
 

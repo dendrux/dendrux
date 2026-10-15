@@ -40,6 +40,46 @@ class TestTypes:
             req.run_id = "x"  # type: ignore[misc]
         assert "SKILL.md" not in repr(req)
 
+    def test_args_normalized_to_tuple_copy(self) -> None:
+        args = ["one"]
+        req = _request(args=args)
+        args.append("two")
+        assert req.args == ("one",)
+
+    def test_frozen_view_kept_without_copy(self) -> None:
+        view = MappingProxyType({"SKILL.md": b"x"})
+        assert _request(files=view).files is view
+
+    def test_plain_dict_files_copied_and_frozen(self) -> None:
+        files = {"SKILL.md": b"before"}
+        req = _request(files=files)
+        files["SKILL.md"] = b"after"
+        assert req.files["SKILL.md"] == b"before"
+        with pytest.raises(TypeError):
+            req.files["x"] = b"y"  # type: ignore[index]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"run_id": 1},
+            {"tool_call_id": None},
+            {"skill_name": b"x"},
+            {"revision": 3},
+            {"digest": None},
+            {"script_path": 1},
+            {"args": "one two"},
+            {"args": [1]},
+            {"args": None},
+            {"files": [("SKILL.md", b"x")]},
+            {"files": {"SKILL.md": "text"}},
+            {"files": MappingProxyType({"SKILL.md": bytearray(b"x")})},
+            {"files": {1: b"x"}},
+        ],
+    )
+    def test_request_types_checked(self, overrides: dict[str, object]) -> None:
+        with pytest.raises(TypeError):
+            _request(**overrides)
+
     def test_result_defaults(self) -> None:
         r = SkillExecutionResult()
         assert (r.stdout, r.stderr, r.exit_code) == ("", "", 0)

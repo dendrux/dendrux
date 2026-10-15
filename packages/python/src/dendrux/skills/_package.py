@@ -37,24 +37,23 @@ def escape_body(body: str) -> str:
 def render_activation_envelope(skill: Skill, *, scripts_runnable: bool) -> str:
     """Render the model-facing ``<skill_content>`` block for an activated skill.
 
-    Lists files as text (readable), binary (not readable) or script. Script
+    The body is kept exactly (only ``</skill_content`` is escaped); a newline
+    is added after it only when it does not already end with one. Lists files
+    as text (readable), binary (not readable) or script. Script
     lines and the run-scripts hint appear only when ``scripts_runnable``.
     The envelope is framing for the model, not an authorization boundary.
     """
-    lines = [f'<skill_content name="{skill.name}" digest="{skill.digest}">']
-    body = escape_body(skill.body).rstrip("\n")
-    if body:
-        lines.append(body)
+    text = f'<skill_content name="{skill.name}" digest="{skill.digest}">\n'
+    text += escape_body(skill.body)
+    if not text.endswith("\n"):
+        text += "\n"
     listing = _file_listing(skill, scripts_runnable=scripts_runnable)
     if listing:
         hint = "read with read_skill_resource"
         if scripts_runnable:
             hint += "; run scripts with run_skill_script"
-        lines.append("")
-        lines.append(f"Files ({hint}):")
-        lines.extend(listing)
-    lines.append("</skill_content>")
-    return "\n".join(lines)
+        text += f"\nFiles ({hint}):\n" + "".join(f"{line}\n" for line in listing)
+    return text + "</skill_content>"
 
 
 def _file_listing(skill: Skill, *, scripts_runnable: bool) -> list[str]:

@@ -5,11 +5,9 @@ from __future__ import annotations
 import inspect
 import math
 import numbers
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+from types import MappingProxyType
 
 
 @dataclass(frozen=True)
@@ -17,8 +15,10 @@ class SkillExecutionRequest:
     """One ``run_skill_script`` call handed to a :class:`SkillExecutor`.
 
     ``files`` is a read-only view of the whole package, including
-    ``SKILL.md``; text files are UTF-8 encoded. It is shared across calls,
-    so executors must not try to mutate it.
+    ``SKILL.md``; text files are UTF-8 encoded. A ``MappingProxyType`` is
+    kept as is (shared across calls, not copied); any other mapping is
+    copied and frozen. ``args`` is normalized to a tuple. Wrong field
+    types raise ``TypeError``.
     """
 
     run_id: str
@@ -29,6 +29,15 @@ class SkillExecutionRequest:
     script_path: str
     args: tuple[str, ...]
     files: Mapping[str, bytes] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        for name in ("run_id", "tool_call_id", "skill_name", "digest", "script_path"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"SkillExecutionRequest.{name} must be a str.")
+        if self.revision is not None and not isinstance(self.revision, str):
+            raise TypeError("SkillExecutionRequest.revision must be a str or None.")
+        object.__setattr__(self, "args", _freeze_args(self.args))
+        object.__setattr__(self, "files", _freeze_files(self.files))
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,26 @@ class SkillExecutionResult:
             raise TypeError("SkillExecutionResult stdout and stderr must be str.")
         if not isinstance(self.exit_code, int) or isinstance(self.exit_code, bool):
             raise TypeError("SkillExecutionResult exit_code must be an int.")
+
+
+def _freeze_args(args: object) -> tuple[str, ...]:
+    if isinstance(args, str | bytes) or not isinstance(args, Iterable):
+        raise TypeError("SkillExecutionRequest.args must be a sequence of str.")
+    frozen = tuple(args)
+    if not all(isinstance(a, str) for a in frozen):
+        raise TypeError("SkillExecutionRequest.args items must be str.")
+    return frozen
+
+
+def _freeze_files(files: object) -> Mapping[str, bytes]:
+    if not isinstance(files, Mapping):
+        raise TypeError("SkillExecutionRequest.files must be a Mapping[str, bytes].")
+    for key, value in files.items():
+        if not isinstance(key, str) or not isinstance(value, bytes):
+            raise TypeError("SkillExecutionRequest.files must map str paths to bytes.")
+    if isinstance(files, MappingProxyType):
+        return files
+    return MappingProxyType(dict(files))
 
 
 class SkillExecutor:
