@@ -12,10 +12,10 @@ Three knobs cover the common cases:
 | Parameter | Scope | Event emitted |
 | --- | --- | --- |
 | `deny=["tool_name"]` | Per-agent list of tools that cannot execute, even if the LLM calls them | `policy.denied` |
-| `deny_skills=["skill_name"]` | Per-agent list of [skills](/docs/architecture/skills) that cannot load | `skill.denied` |
+| `deny_skills=["skill_name"]` | Per-agent list of [skills](/docs/architecture/skills) removed from every run | Names listed in `skill.catalog_resolved` |
 | MCP server auth / errors | Network-layer failures reaching an [MCP](/docs/architecture/mcp) server | `mcp.error` |
 
-The rest of this page focuses on `deny`, which is the most commonly used. The other two share the same shape: decide at the gate, emit a typed event, keep going.
+The rest of this page focuses on `deny`, which is the most commonly used. The other two share the same shape: decide at the gate, emit a typed event, keep going. The three tools that skills add (`use_skill`, `read_skill_resource`, `run_skill_script`) are ordinary names for `deny`; see [Skills](/docs/architecture/skills#approvals-and-deny).
 
 ## A real deny in action
 
@@ -139,10 +139,10 @@ If you misspell a tool name in `deny`, the agent refuses to construct. This prev
 
 Skills and MCP connections enter the governance pipeline at different points, but they follow the same principle: fail at the boundary with a typed event, keep the run moving when it can.
 
-- `deny_skills=[...]` is the skill analogue of `deny`. A skill listed there will not be registered when the agent boots. The runner emits `skill.denied` on startup. See [Skills](/docs/architecture/skills).
+- `deny_skills=[...]` is the skill analogue of `deny`. A skill listed there is removed from the run before the model sees anything: it is not in the catalogue, and `use_skill`, `read_skill_resource` and `run_skill_script` cannot reach it. The names are listed in the `denied` field of the `skill.catalog_resolved` event at run start. To gate what an allowed skill may do, name the skill tools in `deny` or `require_approval`. See [Skills](/docs/architecture/skills).
 - MCP connections happen in `_emit_init_events` during agent setup. A connection that fails auth or discovery emits `mcp.error`, with the error payload in `data`. The run continues without the server's tools. See [MCP](/docs/architecture/mcp).
 
-All three layers share `run_events` as the audit surface. Querying `WHERE event_type IN ('policy.denied', 'skill.denied', 'mcp.error')` on a run returns the full access-control story in one query, in order.
+All three layers share `run_events` as the audit surface. Querying `WHERE event_type IN ('policy.denied', 'skill.catalog_resolved', 'skill.activation_failed', 'mcp.error')` on a run returns the full access-control story in one query, in order.
 
 ## Why a synthetic result instead of an exception
 
@@ -158,6 +158,6 @@ The synthetic tool result is the cheapest way to give the model enough informati
 ## Where this fits
 
 - Declared on `Agent(deny=[...], deny_skills=[...])`.
-- Enforced in `dendrux.loops.react.ReActLoop` (phase 0 of tool dispatch) and during skill registration.
-- Emits `policy.denied`, `skill.denied`, `mcp.error` events on `run_events`.
+- Enforced in `dendrux.loops.react.ReActLoop` (phase 0 of tool dispatch) and when the run's skill set is resolved.
+- Emits `policy.denied`, `skill.catalog_resolved`, `skill.activation_failed`, `mcp.error` events on `run_events`.
 - Sits alongside the other [governance](/docs/architecture/governance) layers: guardrails, approval, budget. Nothing about access control fights any of them.

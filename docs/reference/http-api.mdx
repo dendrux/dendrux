@@ -242,7 +242,7 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 
 ### Governance events
 
-From `dendrux.types.GovernanceEventType`. All thirteen values are deliverable through `on_governance_event` on notifiers and `/events/stream`.
+From `dendrux.types.GovernanceEventType`. The values below are deliverable through `on_governance_event` on notifiers and `/events/stream`.
 
 | `event_type` | Fires when | `data` payload |
 | --- | --- | --- |
@@ -254,9 +254,13 @@ From `dendrux.types.GovernanceEventType`. All thirteen values are deliverable th
 | `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
 | `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "outgoing", "error": str}` |
-| `skill.registered` | Skill loaded at run start | `{"skill_name": str, "description": str}` |
-| `skill.denied` | Skill filtered by `deny_skills=` | `{"skill_name": str, "reason": "denied_by_policy"}` |
-| `skill.invoked` | LLM called `use_skill(name=...)` | `{"skill_name": str}` |
+| `skill.catalog_resolved` | Run start, when skills are configured | `{"delivery": "progressive" \| "inlined", "skills": [{"name", "revision", "digest"}], "denied": list[str]}` |
+| `skill.activated` | A skill's body was delivered to the model | `{"name": str, "digest": str, "origin": "model" \| "explicit" \| "inlined"}` |
+| `skill.activation_failed` | `use_skill` named an unknown or denied skill | `{"name": str, "reason": "not_found" \| "denied"}` |
+| `skill.resource_read` | `read_skill_resource` returned a text file | `{"name": str, "path": str, "chars": int, "truncated": bool}` |
+| `skill.script_requested` | A `run_skill_script` call passed its checks, before any approval | `{"name": str, "path": str, "argc": int}` |
+| `skill.script_completed` | The skill executor returned | `{"name": str, "path": str, "exit_code": int, "duration_ms": int, "stdout_chars": int, "stderr_chars": int, "truncated": bool}` |
+| `skill.script_failed` | Script timed out, the executor raised, or no executor on resume | `{"name": str, "path": str, "error_type": str}` (`timeout`, an exception class name, or `executor_unavailable`) |
 | `mcp.connected` | MCP source discovery completed | `{"source_name": str, "tool_count": int, "tool_names": list[str]}` |
 | `mcp.error` | MCP discovery failed | `{"error": str, "error_type": str, "code": str}` (error truncated to 500 chars; `reason` added for OAuth verdicts) |
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
@@ -406,6 +410,8 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids). No partial claim. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
+| `SkillMissingError` | `SkillContinuityError` | 409 | The run was created with a skill this agent does not have. Run stays paused; attach the skill and retry. |
+| `SkillMismatchError` | `SkillContinuityError` | 409 | A skill the run was created with has different content now. Run stays paused; attach the original content and retry. |
 
 ## Read-side types
 

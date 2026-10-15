@@ -219,7 +219,7 @@ summarization, extraction, one-turn Q&A.
 
 Three constraints are enforced at construction or at run time:
 
-1. **Zero tools.** The `Agent` constructor raises `ValueError` if `tools` is non-empty and `loop=SingleCall()`. Same for `tool_sources` (MCP) and skills.
+1. **Zero tools.** The `Agent` constructor raises `ValueError` if `tools` is non-empty and `loop=SingleCall()`. Same for `tool_sources` (MCP). Skills are the exception: instruction-only skills are allowed and are written into the system prompt (see [Skills](/docs/architecture/skills#singlecall)), while a skill that carries files is rejected.
 2. **No resume.** If the runner ever passes resume-shaped parameters (`initial_history`, `initial_steps`, `iteration_offset`, `initial_usage`), `SingleCall.run()` raises `RuntimeError`. SingleCall has no waiting states to resume from.
 3. **No tool calls from the provider.** If the provider unexpectedly returns `tool_calls`, `SingleCall` raises `RuntimeError` rather than silently swallow them.
 

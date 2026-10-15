@@ -487,7 +487,7 @@ Rename values must match `[a-zA-Z0-9_-]` and be at most 64 characters, including
 view = connection.tools(allowed_tools=["read_file", "create_issue"], strict=True)
 ```
 
-Clashes between a view and anything else — another MCP source, a local tool, or the reserved `use_skill` — always raise `MCPToolNameCollisionError` (a `ValueError`) when the agent discovers its tools, whatever `strict` says: a cross-source clash nobody renamed fails loudly.
+Clashes between a view and anything else — another MCP source, a local tool, or a reserved skill tool name (`use_skill`, `read_skill_resource`, `run_skill_script`) — always raise `MCPToolNameCollisionError` (a `ValueError`) when the agent discovers its tools, whatever `strict` says: a cross-source clash nobody renamed fails loudly.
 
 ## Sizing
 
@@ -702,7 +702,7 @@ Branch on `code`, never on `error` text. It is derived from the exception class 
 | `MCPConnectionCapacityError`, `MCPCallCapacityError` | `capacity` |
 | `MCPConnectionLostError`, any other `MCPConnectionError` | `connection_failed` |
 | `MCPStaleConnectionError`, `MCPConnectionEvictingError`, any other `MCPConnectionStateError` | `connection_state` |
-| `MCPToolNameCollisionError` (an exposed name equals another source's tool, a local tool, or `use_skill`) | `tool_name_collision` |
+| `MCPToolNameCollisionError` (an exposed name equals another source's tool, a local tool, or a reserved skill tool name) | `tool_name_collision` |
 | `ValueError` from tool naming with `strict=True` | `invalid_tool_names` |
 | anything else | `unknown` |
 
