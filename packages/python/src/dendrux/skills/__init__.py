@@ -13,6 +13,7 @@ Usage:
     skills = Skill.scan_dir("./skills")
 """
 
+from dendrux.skills._executor import SkillExecutionRequest, SkillExecutionResult, SkillExecutor
 from dendrux.skills._model import Skill
 
-__all__ = ["Skill"]
+__all__ = ["Skill", "SkillExecutionRequest", "SkillExecutionResult", "SkillExecutor"]
