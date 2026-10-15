@@ -8,7 +8,9 @@ you do not control, run scripts in a container or a hosted sandbox instead.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -46,13 +48,15 @@ class LocalSubprocessExecutor(SkillExecutor):
                 env={"PATH": os.environ.get("PATH", "")},
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group, so we can kill descendants too
             )
             try:
                 stdout, stderr = await proc.communicate()
-            finally:
-                if proc.returncode is None:  # timed out or the task was cancelled
-                    proc.kill()
-                    await proc.wait()
+            except BaseException:  # timed out or the task was cancelled
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
+                raise
 
             return SkillExecutionResult(
                 stdout=stdout.decode(errors="replace"),

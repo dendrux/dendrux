@@ -115,7 +115,7 @@ skill = Skill.from_markdown(markdown_text, files={"references/policy.md": "..."}
 skill = Skill.from_dir("./skills/ticket-triage")
 ```
 
-`from_markdown` and `from_dir` are strict. Unknown frontmatter keys, non-string values for string fields, and malformed YAML all raise `SkillValidationError`. There is no lenient mode. `from_markdown` strips a UTF-8 byte-order mark and keeps the body exactly as written after the closing `---` line.
+`from_markdown` and `from_dir` are strict. Unknown frontmatter keys, non-string values for string fields, and malformed YAML all raise `SkillValidationError`. There is no lenient mode. `from_markdown` strips a UTF-8 byte-order mark and defines the body as the text after the closing `---` line with exactly one leading newline removed; nothing else is stripped.
 
 `from_dir` requires the directory name to equal the skill name. It skips hidden files and directories (names starting with `.`) and rejects symlinks anywhere: the root, `SKILL.md`, or any entry it walks. A file that decodes as strict UTF-8 without a NUL byte becomes text; anything else becomes binary.
 
@@ -126,7 +126,7 @@ skill = Skill.from_dir("./skills/ticket-triage")
 | Field | Required | Notes |
 | --- | --- | --- |
 | `name` | yes | 1 to 64 characters: lowercase letters, digits and single hyphens (`^[a-z0-9]+(-[a-z0-9]+)*$`) |
-| `description` | yes | 1 to 1,024 characters. This is all the model sees until it activates the skill, so say when to use it |
+| `description` | yes | 1 to 1,024 non-padding characters (leading and trailing whitespace is ignored for this length check, but the original string is stored). This is all the model sees until it activates the skill, so say when to use it |
 | `body` | no | Markdown instructions, stored exactly as given |
 | `license`, `compatibility` | no | Strings. `compatibility` is at most 500 characters. Use `None`, not an empty string |
 | `metadata` | no | Mapping of string to string |
@@ -145,9 +145,9 @@ skill = Skill.from_dir("./skills/ticket-triage")
 - A `bytes` value is a **binary file**. The model sees its name and size and can never read it.
 - Any path starting with `scripts/` is a **script**, whatever its content type. Scripts can be run through the executor and can never be read into context.
 
-Paths must be relative POSIX paths: `/` separators only, no leading `/`, no backslash, no `.` or `..` or empty segments, no control characters, none of `<`, `>` or `"`, at most 512 characters, and not `SKILL.md` (the body lives in `body`). A bad path raises `SkillValidationError`. At runtime the model's path argument is matched against these keys as plain strings; it is never joined onto a filesystem path, so a hostile path cannot escape the package.
+Paths must be relative POSIX paths: `/` separators only, no leading `/`, no backslash, no `.` or `..` or empty segments, no ASCII control characters (`U+0000` to `U+001F` or `U+007F`), none of `<`, `>` or `"`, at most 512 characters, and not `SKILL.md` (the body lives in `body`). A bad path raises `SkillValidationError`. At runtime the model's path argument is matched against these keys as plain strings; it is never joined onto a filesystem path, so a hostile path cannot escape the package.
 
-Dendrux holds the whole package in memory and copies it to your executor on script runs. There is no hard size cap, but a package over 5 MiB emits one `UserWarning` at construction. Keep large data outside the skill and have a script fetch it.
+Dendrux holds the package in memory. It builds one read-only bytes mapping per run and shares that mapping across executor calls; it is not copied per call. There is no hard size cap. If UTF-8 body bytes plus file bytes exceed 5 MiB (generated `SKILL.md` frontmatter is not counted), construction emits one `UserWarning`. Keep large data outside the skill and have a script fetch it.
 
 ### Digest
 
@@ -270,7 +270,9 @@ One executor serves every skill on the agent. Route on `request.skill_name` if d
 | Emits `skill.script_requested`, `skill.script_completed` and `skill.script_failed` with sizes and timing, never contents | Cleaning up temporary files and sandboxes |
 | Records the call, parameters and result like any tool call | Keeping secrets out of what scripts print |
 
-Failures never stop the run. A non-zero exit code, a timeout, or any exception from `execute` comes back to the model as an error tool result (`skill.script_failed` for the last two) and the model can react. A real task cancellation (`asyncio.CancelledError`) is different: it propagates unchanged.
+Failures never stop the run. A non-zero exit code, a timeout, an exception from `execute`, or a return value that is not a `SkillExecutionResult` comes back to the model as an error tool result and the model can react. The last three also emit `skill.script_failed`: `error_type` is `timeout` only when Dendrux's `timeout_seconds` expires (an `asyncio.TimeoutError` your own code raises is labelled by its exception type, like any other exception), and `invalid_result` when `execute` returns something else. A real task cancellation (`asyncio.CancelledError`) is different: it propagates unchanged.
+
+Files a script creates stay in the executor's environment. Dendrux returns only stdout, stderr and the exit code to the model and records nothing else. If the user or a later step needs an output file, the executor uploads it to your storage (and can print a reference), or keeps a per-run sandbox keyed by `request.run_id`; cleanup is yours. Resume does not restore files.
 
 ### Approvals and deny
 
@@ -353,7 +355,7 @@ Skills write seven governance events to `run_events`. Their payloads carry names
 | `skill.resource_read` | `read_skill_resource` succeeded | `name`, `path`, `chars`, `truncated` |
 | `skill.script_requested` | A script call passed the checks, before any approval | `name`, `path`, `argc` |
 | `skill.script_completed` | The executor returned, whatever the exit code | `name`, `path`, `exit_code`, `duration_ms`, `stdout_chars`, `stderr_chars`, `truncated` |
-| `skill.script_failed` | Timeout, an exception from `execute`, or no executor on resume | `name`, `path`, `error_type` (`timeout`, the exception class name, or `executor_unavailable`) |
+| `skill.script_failed` | Dendrux's timeout expired, `execute` raised, `execute` returned something other than a `SkillExecutionResult`, or an approved script resumed on an agent with no executor | `name`, `path`, `error_type` (`timeout`, the exception class name, `invalid_result`, or `executor_unavailable`) |
 
 > These replace the earlier `skill.registered`, `skill.denied` and `skill.invoked` events. If you filter on those names, switch to `skill.catalog_resolved` (which lists denied names), `skill.activated` and `skill.activation_failed`. A query on the `skill.` prefix keeps working.
 
@@ -388,7 +390,9 @@ Dendrux does not run skill scripts. These two executors show the shape; adapt th
 
 ```python
 import asyncio
+import contextlib
 import os
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -426,13 +430,15 @@ class LocalSubprocessExecutor(SkillExecutor):
                 env={"PATH": os.environ.get("PATH", "")},  # no inherited secrets
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group, so we can kill descendants too
             )
             try:
                 stdout, stderr = await proc.communicate()
-            finally:
-                if proc.returncode is None:  # timed out or the task was cancelled
-                    proc.kill()
-                    await proc.wait()
+            except BaseException:  # timed out or the task was cancelled
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
+                raise
 
             return SkillExecutionResult(
                 stdout=stdout.decode(errors="replace"),
@@ -441,7 +447,7 @@ class LocalSubprocessExecutor(SkillExecutor):
             )
 ```
 
-The `finally` block is what makes timeouts and task cancellation safe: when Dendrux's timeout fires, or the task is cancelled, `communicate()` is interrupted and the process is killed before the temporary directory is removed.
+On POSIX, `start_new_session=True` plus `killpg` terminates the subprocess group when timeout or task cancellation interrupts `communicate()`. A deliberately detached descendant can still escape; this remains a trusted-code-only executor.
 
 ### E2B sandbox (sketch)
 
