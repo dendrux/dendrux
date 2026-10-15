@@ -48,6 +48,8 @@ def test_valid_paths(path: str) -> None:
         "newline\nchar",
         "del\x7fchar",
         "esc\x1bchar",
+        "lone\ud800surrogate.txt",
+        "dir\udcff/file.txt",
     ],
 )
 def test_invalid_paths(path: str) -> None:

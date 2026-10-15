@@ -258,9 +258,32 @@ class TestFromMarkdown:
         with pytest.raises(SkillValidationError):
             Skill.from_markdown(b"---\n")  # type: ignore[arg-type]
 
-    def test_optional_null_values_treated_as_absent(self) -> None:
-        s = Skill.from_markdown("---\nname: a\ndescription: d\nlicense:\nmetadata:\n---\n")
-        assert s.license is None and s.metadata == {}
+    @pytest.mark.parametrize(
+        ("line", "field"),
+        [
+            ("name: null", "name"),
+            ("description: ~", "description"),
+            ("license: null", "license"),
+            ("license:", "license"),
+            ("compatibility: null", "compatibility"),
+            ("allowed-tools: null", "allowed_tools"),
+            ("metadata: null", "metadata"),
+            ("metadata:", "metadata"),
+        ],
+    )
+    def test_explicit_null_values_rejected(self, line: str, field: str) -> None:
+        base = {"name": "name: a", "description": "description: d"}
+        key = line.split(":")[0]
+        base[key] = line
+        text = "---\n" + "\n".join(base.values()) + "\n---\n"
+        with pytest.raises(SkillValidationError) as info:
+            Skill.from_markdown(text)
+        assert info.value.field == field
+
+    def test_surrogate_file_key_rejected(self) -> None:
+        with pytest.raises(SkillValidationError) as info:
+            _skill(files={"bad\ud800.txt": "x"})
+        assert info.value.field == "files"
 
     def test_indented_dashes_do_not_close(self) -> None:
         text = "---\nname: a\ndescription: |\n  one\n  ---\n  two\n---\nBody"
