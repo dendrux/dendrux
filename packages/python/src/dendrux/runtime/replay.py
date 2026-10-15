@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop
     from dendrux.runtime.state import RunRecord, StateStore, TraceRecord
+    from dendrux.skills._session import SkillSession
     from dendrux.types import ToolDef
 
 logger = logging.getLogger(__name__)
@@ -549,6 +550,8 @@ def user_trace_message(
     seeded_history: list[Message],
     stable_band: str,
     context: list[ContextBlock] | None = None,
+    *,
+    session: SkillSession | None = None,
 ) -> Message:
     """The current user message as recorded to react_traces.
 
@@ -558,11 +561,8 @@ def user_trace_message(
     """
     from dataclasses import asdict
 
-    from dendrux.skills._session import current as current_session
-
     current = seeded_history[-1]
     meta: dict[str, Any] = {}
-    session = current_session()
     if session and session.explicit:
         meta["dendrux.skills.context"] = [
             asdict(b) for b in context or [] if b.placement == "dynamic" or len(seeded_history) == 1

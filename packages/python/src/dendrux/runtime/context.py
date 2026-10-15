@@ -24,6 +24,14 @@ from __future__ import annotations
 import logging
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, Awaitable
+
+    from dendrux.skills._session import SkillSession
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +108,7 @@ def get_delegation_context() -> DelegationContext | None:
     return _current_delegation.get()
 
 
-def set_delegation_context(ctx: DelegationContext) -> Token[DelegationContext | None]:
+def set_delegation_context(ctx: DelegationContext | None) -> Token[DelegationContext | None]:
     """Set the delegation context for the current async task.
 
     Returns a token for resetting in finally blocks.
@@ -193,3 +201,52 @@ def resolve_parent_link(
 
     # Case 1: same store, both persisted — link
     return parent_ctx.run_id, delegation_level
+
+
+class StreamContext:
+    """Bind run state only while a stream advances or closes, never across a yield.
+
+    The inner generator may discover its session/delegation on the first step.
+    Setters update that step's context and retain the values for subsequent steps;
+    the wrapper owns all reset tokens, including when closed from another task.
+    """
+
+    def __init__(self, session: SkillSession | None = None):
+        self.session = session
+        self.delegation: DelegationContext | None = None
+        self.started = False
+
+    def set_session(self, session: SkillSession) -> None:
+        from dendrux.skills._session import set_session
+
+        self.session = session
+        set_session(session)
+
+    def set_delegation(self, delegation: DelegationContext) -> None:
+        self.delegation = delegation
+        set_delegation_context(delegation)
+
+    async def _step(self, operation: Awaitable[T]) -> T:
+        from dendrux.skills._session import reset_session, set_session
+
+        if not self.started:
+            self.delegation = get_delegation_context()
+            self.started = True
+        skill_token = set_session(self.session)
+        delegation_token = set_delegation_context(self.delegation)
+        try:
+            return await operation
+        finally:
+            reset_delegation_context(delegation_token)
+            reset_session(skill_token)
+
+    async def wrap(self, generator: AsyncGenerator[T, None]) -> AsyncGenerator[T, None]:
+        try:
+            while True:
+                try:
+                    event = await self._step(anext(generator))
+                except StopAsyncIteration:
+                    return
+                yield event
+        finally:
+            await self._step(generator.aclose())

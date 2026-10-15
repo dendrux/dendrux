@@ -45,6 +45,7 @@ from dendrux.loops._helpers import (
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime.context import (
     DelegationContext,
+    StreamContext,
     get_delegation_context,
     get_store_identity,
     reset_delegation_context,
@@ -66,6 +67,7 @@ from dendrux.runtime.replay import (
     validate_replay_args,
 )
 from dendrux.skills._session import META_KEY, SkillSession, continuation, current
+from dendrux.skills._session import current as current_skill_session
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
@@ -774,7 +776,9 @@ async def run(
         # is constructed) so seeded prior turns stay out of react_traces.
         # With runs=, the replayed prefix is folded in after expansion.
         if replay_req is None:
-            seeded_history = fold_context(normalized_history, context, user_input)
+            seeded_history = fold_context(
+                normalized_history, context, user_input, session=skill_session
+            )
         else:
             validate_context(context)
             seeded_history = None
@@ -960,7 +964,11 @@ async def run(
                 # — they live in the dev's chat DB).
                 if seeded_history is not None:
                     user_msg = user_trace_message(
-                        user_input, seeded_history, render_band(context, "stable"), context
+                        user_input,
+                        seeded_history,
+                        render_band(context, "stable"),
+                        context,
+                        session=skill_session,
                     )
                     await record_message(recorder, run_id, user_msg, 0)
                     await notify_message(extra_notifier, run_id, user_msg, 0)
@@ -1100,7 +1108,12 @@ async def _apply_replay(
         plan = expand_replay(
             replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
         )
-        seeded_history = fold_context([*plan.messages, *normalized_history], context, user_input)
+        seeded_history = fold_context(
+            [*plan.messages, *normalized_history],
+            context,
+            user_input,
+            session=current_skill_session(agent),
+        )
     await record_run_prefix(
         state_store,
         run_id,
@@ -1349,7 +1362,7 @@ async def retry(
             retry_context = [
                 ContextBlock(**b) for b in (raw_user.meta or {}).get("dendrux.skills.context", [])
             ]
-            initial_history[first_user] = replace(
+            retry_user = initial_history[first_user] = replace(
                 initial_history[first_user],
                 content=wire_user_input(user_input, skill_session.envelopes(), retry_context),
             )
@@ -1486,9 +1499,12 @@ async def retry(
             )
 
             if explicit:
-                retry_user = next(m for m in initial_history if m.role == Role.USER)
                 trace_user = user_trace_message(
-                    user_input, [retry_user], render_band(retry_context, "stable"), retry_context
+                    user_input,
+                    [retry_user],
+                    render_band(retry_context, "stable"),
+                    retry_context,
+                    session=skill_session,
                 )
                 await record_message(recorder, run_id, trace_user, 0)
                 await notify_message(extra_notifier, run_id, trace_user, 0)
@@ -1677,7 +1693,9 @@ def run_stream(
     skill_session = SkillSession.prepare(agent, loop=resolved_loop, explicit=activate_skills)
     with skill_session.bind():
         if replay_req is None:
-            initial_seeded = fold_context(normalized_history, context, user_input)
+            initial_seeded = fold_context(
+                normalized_history, context, user_input, session=skill_session
+            )
         else:
             validate_context(context)
             initial_seeded = None
@@ -1691,6 +1709,8 @@ def run_stream(
 
     mcp_meta: dict[str, Any] = {}
 
+    stream_context = StreamContext(skill_session)
+
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         """Inner generator — lazy async setup, then loop stream with lifecycle.
 
@@ -1698,327 +1718,323 @@ def run_stream(
         (state_store_resolver, create_run, notifier init) are also caught
         and yielded as RUN_ERROR — honoring the "no exception to consumer" contract.
         """
-        with skill_session.bind():
-            # store is captured in the closure for the error handler.
-            # Starts as the pre-provided value (often None for the lazy path).
-            nonlocal run_id
-            store = state_store
-            recorder: LoopRecorder | None = None
-            seeded_history = initial_seeded
-            replay_plan: ReplayPlan | None = None
-            sequencer = _shared["sequencer"]
-            ctx_token = None
+        # store is captured in the closure for the error handler.
+        # Starts as the pre-provided value (often None for the lazy path).
+        nonlocal run_id
+        store = state_store
+        recorder: LoopRecorder | None = None
+        seeded_history = initial_seeded
+        replay_plan: ReplayPlan | None = None
+        sequencer = _shared["sequencer"]
 
-            try:
-                # 1. Resolve state store lazily (may create DB engine)
-                if store is None and state_store_resolver is not None:
-                    store = await state_store_resolver()
-                _shared["state_store"] = store
+        try:
+            # 1. Resolve state store lazily (may create DB engine)
+            if store is None and state_store_resolver is not None:
+                store = await state_store_resolver()
+            _shared["state_store"] = store
 
-                # --- Delegation context ---
-                parent_ctx = get_delegation_context()
-                parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
-                eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
+            # --- Delegation context ---
+            parent_ctx = get_delegation_context()
+            parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
+            eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
 
-                # Resolve system prompt BEFORE create_run() so skill loading
-                # failures don't leave a DB row stuck in running.
-                _system_prompt = agent.get_system_prompt(loop=resolved_loop)
+            # Resolve system prompt BEFORE create_run() so skill loading
+            # failures don't leave a DB row stuck in running.
+            _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-                if idempotency_key is not None and store is None:
-                    raise ValueError(
-                        "idempotency_key requires persistence (database_url, state_store, "
-                        "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
-                    )
-
-                replay_runs: list[Any] = []
-                if replay_req is not None:
-                    # Rejected before any row exists: no lifecycle hooks fire.
-                    _shared["existing_run"] = True
-                    if store is None:
-                        raise ValueError(
-                            "runs= requires persistence (database_url, state_store, or "
-                            "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
-                        )
-                    replay_runs = await load_replay_runs(store, replay_req, tenant_id=tenant_id)
-                    _shared["existing_run"] = False
-
-                if store is not None:
-                    run_meta = dict(metadata) if metadata else {}
-                    run_meta["dendrux.loop"] = type(resolved_loop).__name__
-                    if skill_session.configured:
-                        run_meta[META_KEY] = skill_session.manifest()
-                    if eff_max_depth is not None:
-                        run_meta["dendrux.max_delegation_depth"] = eff_max_depth
-                    if output_type is not None:
-                        run_meta["dendrux.output_type"] = (
-                            f"{output_type.__module__}.{output_type.__qualname__}"
-                        )
-                    fingerprint = None
-                    if idempotency_key is not None:
-                        fingerprint = compute_idempotency_fingerprint(
-                            agent.name,
-                            user_input,
-                            output_type_name=(
-                                f"{output_type.__module__}.{output_type.__qualname__}"
-                                if output_type is not None
-                                else None
-                            ),
-                            history=normalized_history or None,
-                            context=context or None,
-                            replay=replay_req.fingerprint() if replay_req else None,
-                            skills=skill_session.fingerprint(),
-                        )
-                    try:
-                        create_result = await store.create_run(
-                            run_id,
-                            agent.name,
-                            input_data={"input": user_input},
-                            model=provider.model,
-                            strategy=type(resolved_strategy).__name__,
-                            parent_run_id=parent_run_id,
-                            delegation_level=delegation_level,
-                            tenant_id=tenant_id,
-                            meta=run_meta,
-                            idempotency_key=idempotency_key,
-                            idempotency_fingerprint=fingerprint,
-                        )
-                    except IdempotencyConflictError:
-                        # No row was created and no lifecycle opened; the error
-                        # handler must not fire failure hooks for a run that
-                        # never started (mirrors run(), which re-raises bare).
-                        _shared["existing_run"] = True
-                        raise
-                    _shared["existing_run"] = create_result.outcome != "created"
-                    run_id = create_result.run_id
-                    stream.run_id = run_id
-                    if create_result.outcome == "existing_terminal":
-                        cached = await _build_cached_result(store, run_id, output_type)
-                        event_type = {
-                            RunStatus.ERROR: RunEventType.RUN_ERROR,
-                            RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
-                        }.get(cached.status, RunEventType.RUN_COMPLETED)
-                        yield RunEvent(
-                            type=event_type,
-                            run_id=run_id,
-                            run_result=cached,
-                            error=cached.error if event_type == RunEventType.RUN_ERROR else None,
-                            phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
-                        )
-                        return
-                    if create_result.outcome == "existing_active":
-                        raise RunAlreadyActiveError(run_id, create_result.status)
-
-                    from dendrux.runtime.persistence import PersistenceRecorder
-                    from dendrux.tool import get_tool_def
-
-                    target_lookup = {}
-                    for fn in agent.tools:
-                        td = get_tool_def(fn)
-                        target_lookup[td.name] = td.target
-                    recorder = PersistenceRecorder(
-                        store,
-                        run_id,
-                        model=provider.model,
-                        provider_name=type(provider).__name__,
-                        target_lookup=target_lookup,
-                        event_sequencer=sequencer,
-                    )
-
-                # 2. Set delegation context for the generator lifetime
-                this_ctx = DelegationContext(
-                    run_id=run_id,
-                    delegation_level=delegation_level,
-                    persisted=store is not None,
-                    store_identity=get_store_identity(store),
-                    max_delegation_depth=eff_max_depth,
+            if idempotency_key is not None and store is None:
+                raise ValueError(
+                    "idempotency_key requires persistence (database_url, state_store, "
+                    "or DENDRUX_DATABASE_URL). Idempotency cannot work without durable state."
                 )
-                ctx_token = set_delegation_context(this_ctx)
 
-                # 3. Emit lifecycle start
-                await _emit_event(
+            replay_runs: list[Any] = []
+            if replay_req is not None:
+                # Rejected before any row exists: no lifecycle hooks fire.
+                _shared["existing_run"] = True
+                if store is None:
+                    raise ValueError(
+                        "runs= requires persistence (database_url, state_store, or "
+                        "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+                    )
+                replay_runs = await load_replay_runs(store, replay_req, tenant_id=tenant_id)
+                _shared["existing_run"] = False
+
+            if store is not None:
+                run_meta = dict(metadata) if metadata else {}
+                run_meta["dendrux.loop"] = type(resolved_loop).__name__
+                if skill_session.configured:
+                    run_meta[META_KEY] = skill_session.manifest()
+                if eff_max_depth is not None:
+                    run_meta["dendrux.max_delegation_depth"] = eff_max_depth
+                if output_type is not None:
+                    run_meta["dendrux.output_type"] = (
+                        f"{output_type.__module__}.{output_type.__qualname__}"
+                    )
+                fingerprint = None
+                if idempotency_key is not None:
+                    fingerprint = compute_idempotency_fingerprint(
+                        agent.name,
+                        user_input,
+                        output_type_name=(
+                            f"{output_type.__module__}.{output_type.__qualname__}"
+                            if output_type is not None
+                            else None
+                        ),
+                        history=normalized_history or None,
+                        context=context or None,
+                        replay=replay_req.fingerprint() if replay_req else None,
+                        skills=skill_session.fingerprint(),
+                    )
+                try:
+                    create_result = await store.create_run(
+                        run_id,
+                        agent.name,
+                        input_data={"input": user_input},
+                        model=provider.model,
+                        strategy=type(resolved_strategy).__name__,
+                        parent_run_id=parent_run_id,
+                        delegation_level=delegation_level,
+                        tenant_id=tenant_id,
+                        meta=run_meta,
+                        idempotency_key=idempotency_key,
+                        idempotency_fingerprint=fingerprint,
+                    )
+                except IdempotencyConflictError:
+                    # No row was created and no lifecycle opened; the error
+                    # handler must not fire failure hooks for a run that
+                    # never started (mirrors run(), which re-raises bare).
+                    _shared["existing_run"] = True
+                    raise
+                _shared["existing_run"] = create_result.outcome != "created"
+                run_id = create_result.run_id
+                stream.run_id = run_id
+                if create_result.outcome == "existing_terminal":
+                    cached = await _build_cached_result(store, run_id, output_type)
+                    event_type = {
+                        RunStatus.ERROR: RunEventType.RUN_ERROR,
+                        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+                    }.get(cached.status, RunEventType.RUN_COMPLETED)
+                    yield RunEvent(
+                        type=event_type,
+                        run_id=run_id,
+                        run_result=cached,
+                        error=cached.error if event_type == RunEventType.RUN_ERROR else None,
+                        phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
+                    )
+                    return
+                if create_result.outcome == "existing_active":
+                    raise RunAlreadyActiveError(run_id, create_result.status)
+
+                from dendrux.runtime.persistence import PersistenceRecorder
+                from dendrux.tool import get_tool_def
+
+                target_lookup = {}
+                for fn in agent.tools:
+                    td = get_tool_def(fn)
+                    target_lookup[td.name] = td.target
+                recorder = PersistenceRecorder(
                     store,
                     run_id,
-                    "run.started",
-                    sequencer,
-                    {"agent_name": agent.name, "system_prompt": _system_prompt},
+                    model=provider.model,
+                    provider_name=type(provider).__name__,
+                    target_lookup=target_lookup,
+                    event_sequencer=sequencer,
                 )
-                await record_run_started(
-                    recorder, run_id, agent_name=agent.name, agent_model=provider.model
-                )
-                await notify_run_started(
-                    extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
-                )
-                # Lifecycle pair is now open. Stash recorder/notifier so the
-                # cleanup callback can close it with a CANCELLED finish if the
-                # consumer abandons the stream before a terminal event.
-                _shared["recorder"] = recorder
-                _shared["notifier"] = extra_notifier
 
-                yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
+            # 2. Set delegation context for the generator lifetime
+            this_ctx = DelegationContext(
+                run_id=run_id,
+                delegation_level=delegation_level,
+                persisted=store is not None,
+                store_identity=get_store_identity(store),
+                max_delegation_depth=eff_max_depth,
+            )
+            stream_context.set_delegation(this_ctx)
 
-                # Emit init governance events (skills + MCP)
+            # 3. Emit lifecycle start
+            await _emit_event(
+                store,
+                run_id,
+                "run.started",
+                sequencer,
+                {"agent_name": agent.name, "system_prompt": _system_prompt},
+            )
+            await record_run_started(
+                recorder, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+            await notify_run_started(
+                extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+            # Lifecycle pair is now open. Stash recorder/notifier so the
+            # cleanup callback can close it with a CANCELLED finish if the
+            # consumer abandons the stream before a terminal event.
+            _shared["recorder"] = recorder
+            _shared["notifier"] = extra_notifier
+
+            yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
+
+            # Emit init governance events (skills + MCP)
+            try:
+                await _emit_init_events(
+                    agent,
+                    recorder,
+                    extra_notifier,
+                    run_id,
+                    resolved_loop=resolved_loop,
+                    mcp_meta=mcp_meta,
+                )
+            except _MCPDiscoveryError as mcp_exc:
                 try:
-                    await _emit_init_events(
-                        agent,
+                    await _emit_init_governance_event(
                         recorder,
                         extra_notifier,
                         run_id,
-                        resolved_loop=resolved_loop,
-                        mcp_meta=mcp_meta,
+                        GovernanceEventType.MCP_ERROR,
+                        _mcp_error_payload(mcp_exc),
                     )
-                except _MCPDiscoveryError as mcp_exc:
-                    try:
-                        await _emit_init_governance_event(
-                            recorder,
-                            extra_notifier,
-                            run_id,
-                            GovernanceEventType.MCP_ERROR,
-                            _mcp_error_payload(mcp_exc),
-                        )
-                    except Exception:
-                        logger.warning("Failed to emit mcp.error event", exc_info=True)
-                    raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+                except Exception:
+                    logger.warning("Failed to emit mcp.error event", exc_info=True)
+                raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
-                replay_plan, seeded_history = await _apply_replay(
-                    agent,
-                    provider,
-                    resolved_loop,
-                    provider_kwargs,
-                    state_store=store,
-                    run_id=run_id,
-                    replay_req=replay_req,
-                    replay_runs=replay_runs,
-                    normalized_history=normalized_history,
-                    context=context,
-                    user_input=user_input,
-                    seeded_history=seeded_history,
+            replay_plan, seeded_history = await _apply_replay(
+                agent,
+                provider,
+                resolved_loop,
+                provider_kwargs,
+                state_store=store,
+                run_id=run_id,
+                replay_req=replay_req,
+                replay_runs=replay_runs,
+                normalized_history=normalized_history,
+                context=context,
+                user_input=user_input,
+                seeded_history=seeded_history,
+            )
+
+            # When chat history was provided, the loop receives a complete
+            # message list as initial_history and skips its own user-message
+            # recording. Record the new user_input here so it still lands in
+            # react_traces (seeded prior turns are NOT recorded).
+            if seeded_history is not None:
+                user_msg = user_trace_message(
+                    user_input,
+                    seeded_history,
+                    render_band(context, "stable"),
+                    context,
+                    session=skill_session,
                 )
+                await record_message(recorder, run_id, user_msg, 0)
+                await notify_message(extra_notifier, run_id, user_msg, 0)
 
-                # When chat history was provided, the loop receives a complete
-                # message list as initial_history and skips its own user-message
-                # recording. Record the new user_input here so it still lands in
-                # react_traces (seeded prior turns are NOT recorded).
-                if seeded_history is not None:
-                    user_msg = user_trace_message(
-                        user_input, seeded_history, render_band(context, "stable"), context
+            # 3. Stream the loop. The interrupt signal lets cancel_run reach
+            # an in-flight provider stream owned by this process; the closing
+            # wrapper guarantees the loop generator is finalized in this task
+            # when the consumer abandons the stream.
+            interrupt = agent._task_manager.register_interrupt(run_id)
+            loop_stream = resolved_loop.run_stream(
+                agent=agent,
+                provider=provider,
+                strategy=resolved_strategy,
+                user_input=user_input,
+                run_id=run_id,
+                recorder=recorder,
+                notifier=extra_notifier,
+                initial_history=seeded_history,
+                provider_kwargs=provider_kwargs or None,
+                output_type=output_type,
+                state_store=store,
+                interrupt=interrupt,
+            )
+            async with _closing_loop_stream(loop_stream, run_id):
+                async for event in loop_stream:
+                    _terminal_types = (
+                        RunEventType.RUN_COMPLETED,
+                        RunEventType.RUN_PAUSED,
+                        RunEventType.RUN_CANCELLED,
                     )
-                    await record_message(recorder, run_id, user_msg, 0)
-                    await notify_message(extra_notifier, run_id, user_msg, 0)
-
-                # 3. Stream the loop. The interrupt signal lets cancel_run reach
-                # an in-flight provider stream owned by this process; the closing
-                # wrapper guarantees the loop generator is finalized in this task
-                # when the consumer abandons the stream.
-                interrupt = agent._task_manager.register_interrupt(run_id)
-                loop_stream = resolved_loop.run_stream(
-                    agent=agent,
-                    provider=provider,
-                    strategy=resolved_strategy,
-                    user_input=user_input,
-                    run_id=run_id,
-                    recorder=recorder,
-                    notifier=extra_notifier,
-                    initial_history=seeded_history,
-                    provider_kwargs=provider_kwargs or None,
-                    output_type=output_type,
-                    state_store=store,
-                    interrupt=interrupt,
-                )
-                async with _closing_loop_stream(loop_stream, run_id):
-                    async for event in loop_stream:
-                        _terminal_types = (
-                            RunEventType.RUN_COMPLETED,
-                            RunEventType.RUN_PAUSED,
-                            RunEventType.RUN_CANCELLED,
-                        )
-                        terminal_result = (
-                            event.run_result if event.type in _terminal_types else None
-                        )
-                        if terminal_result is not None:
-                            if replay_plan is not None:
-                                terminal_result.replay = replay_plan.summary
-                            _attach_mcp_meta(terminal_result, mcp_meta)
-                            if store is not None:
-                                persisted = await _persist_loop_outcome(
-                                    state_store=store,
-                                    run_id=run_id,
-                                    result=terminal_result,
-                                    sequencer=sequencer,
+                    terminal_result = event.run_result if event.type in _terminal_types else None
+                    if terminal_result is not None:
+                        if replay_plan is not None:
+                            terminal_result.replay = replay_plan.summary
+                        _attach_mcp_meta(terminal_result, mcp_meta)
+                        if store is not None:
+                            persisted = await _persist_loop_outcome(
+                                state_store=store,
+                                run_id=run_id,
+                                result=terminal_result,
+                                sequencer=sequencer,
+                            )
+                            # Pre-pause checkpoint can flip a PAUSED iteration to
+                            # CANCELLED. Re-derive the event type from the persisted
+                            # status so the consumer sees the correct terminal event.
+                            if persisted.status == RunStatus.CANCELLED:
+                                event = RunEvent(
+                                    type=RunEventType.RUN_CANCELLED, run_result=persisted
                                 )
-                                # Pre-pause checkpoint can flip a PAUSED iteration to
-                                # CANCELLED. Re-derive the event type from the persisted
-                                # status so the consumer sees the correct terminal event.
-                                if persisted.status == RunStatus.CANCELLED:
-                                    event = RunEvent(
-                                        type=RunEventType.RUN_CANCELLED, run_result=persisted
-                                    )
-                                else:
-                                    event = RunEvent(
-                                        type=event.type, run_result=persisted, phase=event.phase
-                                    )
-                                await record_run_finished(recorder, run_id, persisted)
-                                await notify_run_finished(extra_notifier, run_id, persisted)
                             else:
-                                # No persistence: skip _persist_loop_outcome but still
-                                # close the lifecycle pair so notifier-side spans
-                                # (OTel root span) don't leak.
-                                await record_run_finished(recorder, run_id, terminal_result)
-                                await notify_run_finished(extra_notifier, run_id, terminal_result)
-                            yield event
+                                event = RunEvent(
+                                    type=event.type, run_result=persisted, phase=event.phase
+                                )
+                            await record_run_finished(recorder, run_id, persisted)
+                            await notify_run_finished(extra_notifier, run_id, persisted)
                         else:
-                            # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
-                            _track_partial_text(_shared, event)
-                            yield event
+                            # No persistence: skip _persist_loop_outcome but still
+                            # close the lifecycle pair so notifier-side spans
+                            # (OTel root span) don't leak.
+                            await record_run_finished(recorder, run_id, terminal_result)
+                            await notify_run_finished(extra_notifier, run_id, terminal_result)
+                        yield event
+                    else:
+                        # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
+                        _track_partial_text(_shared, event)
+                        yield event
 
-            except Exception as exc:
-                # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
-                # Covers both setup failures and loop execution errors.
-                if store is not None and not _shared.get("existing_run"):
-                    error_won = False
-                    try:
-                        error_won = await store.finalize_run(
-                            run_id,
-                            status=RunStatus.ERROR.value,
-                            error=str(exc),
-                            total_usage=None,
-                            expected_current_status="running",
-                        )
-                    except Exception:
-                        logger.error(
-                            "Failed to persist ERROR status for run %s", run_id, exc_info=True
-                        )
-                    if error_won:
-                        await _emit_event_safe(
-                            store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-                        )
-                if not _shared.get("existing_run"):
-                    try:
-                        await record_run_failed(recorder, run_id, exc)
-                        await notify_run_failed(extra_notifier, run_id, exc)
-                    except Exception:
-                        logger.warning(
-                            "Lifecycle hooks failed during stream error handler for run %s",
-                            run_id,
-                            exc_info=True,
-                        )
-
-                yield RunEvent(
-                    type=RunEventType.RUN_ERROR,
-                    run_result=RunResult(
-                        run_id=run_id,
-                        status=RunStatus.ERROR,
+        except Exception as exc:
+            # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
+            # Covers both setup failures and loop execution errors.
+            if store is not None and not _shared.get("existing_run"):
+                error_won = False
+                try:
+                    error_won = await store.finalize_run(
+                        run_id,
+                        status=RunStatus.ERROR.value,
                         error=str(exc),
-                        meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
-                    ),
-                    run_id=run_id,
-                    error=str(exc),
-                )
+                        total_usage=None,
+                        expected_current_status="running",
+                    )
+                except Exception:
+                    logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+                if error_won:
+                    await _emit_event_safe(
+                        store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                    )
+            if not _shared.get("existing_run"):
+                try:
+                    await record_run_failed(recorder, run_id, exc)
+                    await notify_run_failed(extra_notifier, run_id, exc)
+                except Exception:
+                    logger.warning(
+                        "Lifecycle hooks failed during stream error handler for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
 
-            finally:
-                if not _shared.get("existing_run"):
-                    agent._task_manager.release_interrupt(run_id)
-                if ctx_token is not None:
-                    reset_delegation_context(ctx_token)
+            yield RunEvent(
+                type=RunEventType.RUN_ERROR,
+                run_result=RunResult(
+                    run_id=run_id,
+                    status=RunStatus.ERROR,
+                    error=str(exc),
+                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
+                ),
+                run_id=run_id,
+                error=str(exc),
+            )
+
+        finally:
+            if not _shared.get("existing_run"):
+                agent._task_manager.release_interrupt(run_id)
 
     async def _cleanup() -> RunResult | None:
         """CAS-guarded cancellation + local lifecycle close.
@@ -2092,7 +2108,7 @@ def run_stream(
             return cancelled_result
         return None
 
-    stream = _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    stream = _RunStream(run_id=run_id, generator=stream_context.wrap(_generate()), cleanup=_cleanup)
     return stream
 
 
@@ -2393,36 +2409,71 @@ async def _execute_approved_tools(
     runtime loop override stays consistent across resume.
     Caller is responsible for governance events and loop re-entry.
     """
-    from dendrux.loops.react import _process_tool_calls
-    from dendrux.types import AgentStep, Role
+    from dendrux.loops._helpers import notify_message as _ntfy_msg
+    from dendrux.loops._helpers import notify_tool as _ntfy_tool
+    from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
+    from dendrux.loops._helpers import record_tool_started as _rec_tool_started
+    from dendrux.loops.react import _execute_tool, _process_tool_calls
+    from dendrux.skills._session import SkillTool
+    from dendrux.tools._validate import check_tool_call
+    from dendrux.types import AgentStep, Message, Role
 
-    target_history = history if history is not None else list(pause_state.history)
+    target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
+    results: list[tuple[ToolCall, ToolResult]] = []
     counts: dict[str, int] = {}
     for message in pause_state.history:
         if message.role == Role.TOOL and message.name:
             counts[message.name] = counts.get(message.name, 0) + 1
-    if not pause_state.pending_tool_calls:
-        return []
-    outcome = await _process_tool_calls(
-        step=AgentStep(
-            reasoning=None,
-            action=pause_state.pending_tool_calls[0],
-            meta={"all_tool_calls": pause_state.pending_tool_calls},
-        ),
-        call_counts=counts,
-        lookups=lookups,
-        strategy=NativeToolCalling(),
-        recorder=recorder,
-        notifier=notifier,
-        run_id=run_id,
-        iteration=pause_state.iteration,
-        history=target_history,
-        warnings=[],
-        deny=agent._deny,
-        tool_result_transform=agent.tool_result_transform,
-    )
-    return outcome.all_results
+    session = current(agent)
+    # An absent executor is a specified error only for a pinned approved script.
+    # Inject an execution closure here without advertising the unavailable tool.
+    if session is not None and session.configured and session.executor is None:
+        for tc in pause_state.pending_tool_calls:
+            if tc.name == "run_skill_script" and tc.name not in lookups.fn:
+                lookups.fn[tc.name] = SkillTool(session, tc.name)
+
+    for tc in pause_state.pending_tool_calls:
+        if isinstance(lookups.fn.get(tc.name), SkillTool):
+            outcome = await _process_tool_calls(
+                step=AgentStep(reasoning=None, action=tc),
+                call_counts=counts,
+                lookups=lookups,
+                strategy=NativeToolCalling(),
+                recorder=recorder,
+                notifier=notifier,
+                run_id=run_id,
+                iteration=pause_state.iteration,
+                history=target_history,
+                warnings=[],
+                deny=agent._deny,
+                tool_result_transform=agent.tool_result_transform,
+                approved_skills=True,
+            )
+            results.extend(outcome.all_results)
+            continue
+        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
+        if invalid_result is None:
+            await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
+            await _ntfy_tool_started(notifier, run_id, tc, pause_state.iteration)
+            tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
+        else:
+            tr = invalid_result
+        await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
+        await _ntfy_tool(notifier, run_id, tc, tr, pause_state.iteration)
+        result_msg = Message(
+            role=Role.TOOL,
+            content=tr.payload,
+            name=tr.name,
+            call_id=tr.call_id,
+            meta={"is_error": True} if not tr.success else {},
+        )
+        target_history.append(result_msg)
+        await recorder.on_message_appended(run_id, result_msg, pause_state.iteration)
+        await _ntfy_msg(notifier, run_id, result_msg, pause_state.iteration)
+        results.append((tc, tr))
+
+    return results
 
 
 async def _resume_core(
@@ -2450,7 +2501,24 @@ async def _resume_core(
     """
     skill_session = current(agent)
     if skill_session is None or skill_session.run_id != run_id:
-        skill_session = await continuation(agent, state_store, run_id, loop=loop)
+        try:
+            skill_session = await continuation(agent, state_store, run_id, loop=loop)
+        except Exception as exc:
+            # Internal claimed-entry callers normally inherit the verified session.
+            # If they do not, a failed verification must finalize the owned claim.
+            if _skip_claim:
+                won = await state_store.finalize_run(
+                    run_id,
+                    status=RunStatus.ERROR.value,
+                    error=str(exc),
+                    expected_current_status="running",
+                )
+                if won:
+                    seq = EventSequencer(initial=await state_store.get_next_event_sequence(run_id))
+                    await _emit_event(
+                        state_store, run_id, "run.error", seq, {"error": str(exc)[:500]}
+                    )
+            raise
     with skill_session.bind():
         # 1. Load pause state
         raw_pause = await state_store.get_pause_state(run_id)
@@ -2661,12 +2729,16 @@ async def _resume_core(
             return result
 
         except asyncio.CancelledError:
-            cleanup = asyncio.create_task(
-                _persist_task_cancellation(
-                    state_store, run_id, ctx.sequencer if ctx else EventSequencer()
-                ),
-                name=f"cancel-resume:{run_id}",
-            )
+
+            async def persist_cancellation() -> RunResult:
+                sequencer = (
+                    ctx.sequencer
+                    if ctx
+                    else EventSequencer(initial=await state_store.get_next_event_sequence(run_id))
+                )
+                return await _persist_task_cancellation(state_store, run_id, sequencer)
+
+            cleanup = asyncio.create_task(persist_cancellation(), name=f"cancel-resume:{run_id}")
             while not cleanup.done():
                 try:
                     await asyncio.shield(cleanup)
@@ -2674,7 +2746,10 @@ async def _resume_core(
                     continue
             cancelled_result = cleanup.result()
             if ctx is not None:
-                await record_run_finished(ctx.recorder, run_id, cancelled_result)
+                try:
+                    await record_run_finished(ctx.recorder, run_id, cancelled_result)
+                except Exception:
+                    logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
                 await notify_run_finished(ctx.notifier, run_id, cancelled_result)
             raise
 
@@ -2746,11 +2821,11 @@ def resume_stream(
 
     mcp_meta: dict[str, Any] = {}
 
+    stream_context = StreamContext()
+
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
-        ctx_token = None
 
-        skill_binding = None
         try:
             # 1. Resolve state store
             if store is None and state_store_resolver is not None:
@@ -2764,8 +2839,7 @@ def resume_stream(
                 )
 
             skill_session = await continuation(agent, store, run_id)
-            skill_binding = skill_session.bind()
-            skill_binding.__enter__()
+            stream_context.set_session(skill_session)
 
             # 2. Load pause state
             raw_pause = await store.get_pause_state(run_id)
@@ -2872,7 +2946,7 @@ def resume_stream(
                 store_identity=get_store_identity(store),
                 max_delegation_depth=resume_max_depth,
             )
-            ctx_token = set_delegation_context(resume_ctx)
+            stream_context.set_delegation(resume_ctx)
 
             # 7. Emit RUN_RESUMED as first event (contract guarantee)
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
@@ -3054,11 +3128,7 @@ def resume_stream(
             )
 
         finally:
-            if skill_binding is not None:
-                skill_binding.__exit__(None, None, None)
             agent._task_manager.release_interrupt(run_id)
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
 
     async def _cleanup() -> RunResult | None:
         """CAS-guarded cancellation + local lifecycle close.
@@ -3123,7 +3193,7 @@ def resume_stream(
             return cancelled_result
         return None
 
-    return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    return _RunStream(run_id=run_id, generator=stream_context.wrap(_generate()), cleanup=_cleanup)
 
 
 async def resume_claimed(

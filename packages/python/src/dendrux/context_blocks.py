@@ -34,7 +34,10 @@ audit but never interprets them. The app owns its taxonomy.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from dendrux.skills._session import SkillSession
 
 from dendrux.types import Message, Role
 
@@ -99,6 +102,8 @@ def fold_context(
     history_messages: list[Message],
     context: list[ContextBlock] | None,
     user_input: str,
+    *,
+    session: SkillSession | None = None,
 ) -> list[Message] | None:
     """Fold context blocks into user-message content per the locked format.
 
@@ -110,9 +115,6 @@ def fold_context(
     Returns ``None`` only when there is no history AND no context — the
     single-turn path where the loop builds the ``user_input`` message itself.
     """
-    from dendrux.skills._session import current as current_session
-
-    session = current_session()
     activations = session.envelopes() if session else []
     validate_context(context)
     stable = render_band(context, "stable")

@@ -295,7 +295,11 @@ class ConsoleNotifier(BaseNotifier):
             )
         elif str(event_type).startswith("skill."):
             label = str(event_type).removeprefix("skill.").replace("_", " ")
-            name = data.get("name", ", ".join(s["name"] for s in data.get("skills", [])))
+            from rich.markup import escape
+
+            name = escape(
+                str(data.get("name", ", ".join(s["name"] for s in data.get("skills", []))))
+            )
             _console.print(
                 f"  [bright_cyan]  skill[/bright_cyan]  [bold]{name}[/bold] [dim]{label}[/dim]"
             )

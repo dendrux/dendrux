@@ -6,11 +6,11 @@ import asyncio
 import json
 import time
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import SkillDigestMismatch
-from dendrux.skills import Skill, SkillExecutionRequest
+from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult
 from dendrux.skills._internal import (
     continuity_error,
     is_script,
@@ -37,6 +37,15 @@ def current(agent: Agent | None = None) -> SkillSession | None:
     return session if session is not None and (agent is None or session.agent is agent) else None
 
 
+def set_session(session: SkillSession | None) -> Token[SkillSession | None]:
+    """Set a session for a runtime-owned execution scope."""
+    return _current.set(session)
+
+
+def reset_session(token: Token[SkillSession | None]) -> None:
+    _current.reset(token)
+
+
 class SkillSession:
     def __init__(
         self, agent: Agent, *, skills: list[Skill], delivery: str, explicit: Sequence[str]
@@ -52,6 +61,7 @@ class SkillSession:
         self.denied = frozenset(agent._deny_skills)
         self.configured = bool(agent._skills_dir or agent._explicit_skills)
         self.run_id = ""
+        self.requested: set[str] = set()
         self.sink: Callable[[str, dict[str, Any], str | None], Awaitable[None]] | None = None
 
     @classmethod
@@ -203,7 +213,12 @@ class SkillSession:
         return definitions
 
     async def preflight(
-        self, tc: ToolCall, *, requested: bool = False, anticipated: set[str] | None = None
+        self,
+        tc: ToolCall,
+        *,
+        requested: bool = False,
+        anticipated: set[str] | None = None,
+        approved: bool = False,
     ) -> ToolResult | None:
         params = tc.params
         name = params.get("name" if tc.name == "use_skill" else "skill")
@@ -212,7 +227,7 @@ class SkillSession:
                 await self.emit(
                     "skill.activation_failed",
                     {
-                        "name": name,
+                        "name": str(name)[:256],
                         "reason": "denied"
                         if isinstance(name, str) and name in self.denied
                         else "not_found",
@@ -250,13 +265,15 @@ class SkillSession:
                     tc, "args must contain at most 64 strings of at most 4096 characters."
                 )
             if self.executor is None:
-                await self.emit(
-                    "skill.script_failed",
-                    {"name": name, "path": path, "error_type": "executor_unavailable"},
-                    tc.id,
-                )
+                if approved:
+                    await self.emit(
+                        "skill.script_failed",
+                        {"name": name, "path": path, "error_type": "executor_unavailable"},
+                        tc.id,
+                    )
                 return self.failure(tc, "Skill executor unavailable.")
-            if requested:
+            if requested and tc.id not in self.requested:
+                self.requested.add(tc.id)
                 await self.emit(
                     "skill.script_requested", {"name": name, "path": path, "argc": len(args)}, tc.id
                 )
@@ -321,16 +338,29 @@ class SkillSession:
             files=self.packages[name],
         )
         start = time.monotonic()
+        deadline = asyncio.timeout(self.executor.timeout_seconds)
         try:
-            result = await asyncio.wait_for(
-                self.executor.execute(request), self.executor.timeout_seconds
-            )
+            async with deadline:
+                result = await self.executor.execute(request)
         except Exception as exc:
-            error_type = "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__
+            error_type = "timeout" if deadline.expired() else type(exc).__name__
             await self.emit(
                 "skill.script_failed", {"name": name, "path": path, "error_type": error_type}, tc.id
             )
             return self.failure(tc, f"{error_type}: {exc}")
+        if (
+            not isinstance(result, SkillExecutionResult)
+            or not isinstance(result.stdout, str)
+            or not isinstance(result.stderr, str)
+            or not isinstance(result.exit_code, int)
+            or isinstance(result.exit_code, bool)
+        ):
+            await self.emit(
+                "skill.script_failed",
+                {"name": name, "path": path, "error_type": "invalid_result"},
+                tc.id,
+            )
+            return self.failure(tc, "invalid_result: executor must return SkillExecutionResult.")
         truncated = len(result.stdout) > 20000 or len(result.stderr) > 20000
         duration = int((time.monotonic() - start) * 1000)
         await self.emit(
@@ -363,6 +393,33 @@ class SkillSession:
         )
 
 
+def _validate_manifest(manifest: Any, run_id: str) -> None:
+    """Reject corrupt durable state before claiming, without echoing its contents."""
+    valid = (
+        isinstance(manifest, dict)
+        and type(manifest.get("version")) is int
+        and manifest["version"] == 1
+        and manifest.get("delivery") in ("progressive", "inlined")
+        and isinstance(manifest.get("skills"), list)
+        and isinstance(manifest.get("explicit"), list)
+    )
+    if valid:
+        entries = manifest["skills"]
+        valid = all(
+            isinstance(e, dict)
+            and isinstance(e.get("name"), str)
+            and isinstance(e.get("digest"), str)
+            for e in entries
+        )
+        if valid:
+            names = [e["name"] for e in entries]
+            valid = len(names) == len(set(names)) and all(
+                isinstance(n, str) and n in names for n in manifest["explicit"]
+            )
+    if not valid:
+        raise ValueError(f"Invalid skill manifest for run '{run_id}'.")
+
+
 async def continuation(
     agent: Agent, store: StateStore, run_id: str, *, loop: Loop | None = None
 ) -> SkillSession:
@@ -370,7 +427,8 @@ async def continuation(
     session = SkillSession.prepare(agent, loop=loop)
     record = await store.get_run(run_id)
     manifest = (record.meta or {}).get(META_KEY) if record else None
-    if manifest:
+    if manifest is not None:
+        _validate_manifest(manifest, run_id)
         missing = []
         mismatched = []
         for entry in manifest["skills"]:

@@ -414,6 +414,7 @@ async def _process_tool_calls(
     require_approval: frozenset[str] | None = None,
     guardrail_engine: GuardrailEngine | None = None,
     tool_result_transform: ToolResultTransform | None = None,
+    approved_skills: bool = False,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -423,14 +424,9 @@ async def _process_tool_calls(
 
     Side effects: mutates call_counts, appends to history, records then notifies.
     """
-    from dendrux.skills._session import NAMES, SkillTool
-    from dendrux.skills._session import current as current_session
+    from dendrux.skills._session import SkillTool
 
-    session = current_session()
-    if session is None:
-        session = next(
-            (fn.session for fn in lookups.fn.values() if isinstance(fn, SkillTool)), None
-        )
+    session = next((fn.session for fn in lookups.fn.values() if isinstance(fn, SkillTool)), None)
     if session is not None:
         session.run_id = run_id
 
@@ -454,7 +450,11 @@ async def _process_tool_calls(
     parsed_calls: list[ToolCall] = []
     for tc in all_calls:
         json_result = check_tool_json(tc)
-        if json_result is None and session is not None and tc.name in NAMES:
+        if (
+            json_result is None
+            and session is not None
+            and isinstance(lookups.fn.get(tc.name), SkillTool)
+        ):
             json_result = check_tool_call(tc, lookups.defs.get(tc.name))
             if json_result is not None and tc.name == "use_skill":
                 await session.preflight(tc)
@@ -528,13 +528,18 @@ async def _process_tool_calls(
         anticipated: set[str] = set()
         for tc in non_denied:
             failure = (
-                await session.preflight(tc, requested=True, anticipated=anticipated)
-                if tc.name in NAMES
+                await session.preflight(
+                    tc,
+                    requested=not approved_skills,
+                    anticipated=anticipated,
+                    approved=approved_skills,
+                )
+                if isinstance(lookups.fn.get(tc.name), SkillTool)
                 else None
             )
             if failure is None:
                 ready.append(tc)
-                if tc.name == "use_skill":
+                if tc.name == "use_skill" and isinstance(lookups.fn.get(tc.name), SkillTool):
                     anticipated.add(tc.params["name"])
                 continue
             result_msg = strategy.format_tool_result(failure)
