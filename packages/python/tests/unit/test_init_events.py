@@ -2,7 +2,7 @@
 
 Covers:
 - GovernanceEventType enum additions (4 new members)
-- Runner helper _emit_init_events() emitting skill.registered, skill.denied,
+- Runner helper _emit_init_events() emitting skill.catalog_resolved, skill.activation_failed,
   mcp.connected after run.started inside the try block
 - MCP discovery failure → mcp.error + run error cleanup
 - Console notifier rendering of all 4 new event types
@@ -98,14 +98,14 @@ class RecordingNotifier(BaseNotifier):
 class TestGovernanceEventTypeEnum:
     """New event type members exist and compare correctly."""
 
-    def test_skill_registered_member(self) -> None:
-        assert GovernanceEventType.SKILL_REGISTERED == "skill.registered"
+    def test_skill_catalog_resolved_member(self) -> None:
+        assert GovernanceEventType.SKILL_CATALOG_RESOLVED == "skill.catalog_resolved"
 
-    def test_skill_denied_member(self) -> None:
-        assert GovernanceEventType.SKILL_DENIED == "skill.denied"
+    def test_skill_activation_failed_member(self) -> None:
+        assert GovernanceEventType.SKILL_ACTIVATION_FAILED == "skill.activation_failed"
 
-    def test_skill_invoked_member(self) -> None:
-        assert GovernanceEventType.SKILL_INVOKED == "skill.invoked"
+    def test_skill_activated_member(self) -> None:
+        assert GovernanceEventType.SKILL_ACTIVATED == "skill.activated"
 
     def test_mcp_connected_member(self) -> None:
         assert GovernanceEventType.MCP_CONNECTED == "mcp.connected"
@@ -117,8 +117,8 @@ class TestGovernanceEventTypeEnum:
         assert GovernanceEventType.PROVIDER_RETRY == "provider.retry"
 
     def test_total_member_count(self) -> None:
-        """8 original + 6 init + 1 transport + 1 unmapped-placeholder = 16 total."""
-        assert len(GovernanceEventType) == 16
+        """The seven v2 skill events replace the original three."""
+        assert len(GovernanceEventType) == 20
 
     def test_guardrail_unmapped_placeholder_member(self) -> None:
         assert (
@@ -135,7 +135,7 @@ class TestEmitInitEvents:
     """Runner helper emits skill and MCP governance events."""
 
     async def test_emits_skill_loaded_events(self) -> None:
-        """Each loaded skill produces a skill.registered event at iteration=0."""
+        """Each loaded skill produces a skill.catalog_resolved event at iteration=0."""
         from pathlib import Path
 
         from dendrux.runtime.runner import _emit_init_events
@@ -154,15 +154,17 @@ class TestEmitInitEvents:
         loaded = [
             (et, it, d)
             for et, it, d, _ in recorder.governance_events
-            if et == GovernanceEventType.SKILL_REGISTERED
+            if et == GovernanceEventType.SKILL_CATALOG_RESOLVED
         ]
         assert len(loaded) == 1
         assert loaded[0][1] == 0  # iteration=0
-        assert loaded[0][2]["skill_name"] == "pdf-processing"
-        assert "description" in loaded[0][2]
+        assert loaded[0][2]["skills"] == [
+            {"name": skill.name, "revision": skill.revision, "digest": skill.digest}
+        ]
+        assert loaded[0][2]["delivery"] == "progressive"
 
     async def test_emits_skill_denied_events(self) -> None:
-        """Each denied skill produces a skill.denied event."""
+        """Each denied skill produces a skill.activation_failed event."""
         from pathlib import Path
 
         from dendrux.runtime.runner import _emit_init_events
@@ -186,12 +188,11 @@ class TestEmitInitEvents:
         denied = [
             (et, it, d)
             for et, it, d, _ in recorder.governance_events
-            if et == GovernanceEventType.SKILL_DENIED
+            if et == GovernanceEventType.SKILL_CATALOG_RESOLVED
         ]
         assert len(denied) == 1
         assert denied[0][1] == 0
-        assert denied[0][2]["skill_name"] == "pdf-processing"
-        assert denied[0][2]["reason"] == "denied_by_policy"
+        assert denied[0][2]["denied"] == ["pdf-processing"]
 
     async def test_notifier_receives_skill_events(self) -> None:
         """Notifier also receives the same skill events."""
@@ -211,7 +212,7 @@ class TestEmitInitEvents:
         await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
         assert len(notifier.governance_events) == 1
-        assert notifier.governance_events[0][0] == GovernanceEventType.SKILL_REGISTERED
+        assert notifier.governance_events[0][0] == GovernanceEventType.SKILL_CATALOG_RESOLVED
 
     async def test_no_skills_no_events(self) -> None:
         """Agent without skills emits no skill events."""
@@ -413,7 +414,7 @@ class TestEmitInitEvents:
         agent._ensure_skills_loaded()
         agent._tool_sources = [AsyncMock()]  # has MCP sources
 
-        # Make the recorder throw during skill.registered emission
+        # Make the recorder throw during skill.catalog_resolved emission
         bad_recorder = RecordingRecorder()
         bad_recorder.on_governance_event = AsyncMock(  # type: ignore[method-assign]
             side_effect=RuntimeError("DB write failed")
@@ -485,28 +486,28 @@ class TestSingleCallToolSourcesGuard:
 class TestConsoleNotifierInitEvents:
     """Console notifier renders the 5 new event types."""
 
-    async def test_skill_registered_rendering(self, capsys) -> None:
+    async def test_skill_catalog_resolved_rendering(self, capsys) -> None:
         from dendrux.notifiers.console import ConsoleNotifier
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
             "r1",
-            GovernanceEventType.SKILL_REGISTERED,
+            GovernanceEventType.SKILL_CATALOG_RESOLVED,
             0,
-            {"skill_name": "pdf-processing", "description": "Extract text from PDFs"},
+            {"name": "pdf-processing", "description": "Extract text from PDFs"},
         )
         captured = capsys.readouterr()
         assert "pdf-processing" in captured.out
 
-    async def test_skill_denied_rendering(self, capsys) -> None:
+    async def test_skill_activation_failed_rendering(self, capsys) -> None:
         from dendrux.notifiers.console import ConsoleNotifier
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
             "r1",
-            GovernanceEventType.SKILL_DENIED,
+            GovernanceEventType.SKILL_ACTIVATION_FAILED,
             0,
-            {"skill_name": "organize-notes", "reason": "denied_by_policy"},
+            {"name": "organize-notes", "reason": "denied_by_policy"},
         )
         captured = capsys.readouterr()
         assert "organize-notes" in captured.out
@@ -529,19 +530,19 @@ class TestConsoleNotifierInitEvents:
         assert "filesystem" in captured.out
         assert "3" in captured.out
 
-    async def test_skill_invoked_rendering(self, capsys) -> None:
+    async def test_skill_activated_rendering(self, capsys) -> None:
         from dendrux.notifiers.console import ConsoleNotifier
 
         notifier = ConsoleNotifier()
         await notifier.on_governance_event(
             "r1",
-            GovernanceEventType.SKILL_INVOKED,
+            GovernanceEventType.SKILL_ACTIVATED,
             1,
-            {"skill_name": "pdf-processing"},
+            {"name": "pdf-processing"},
         )
         captured = capsys.readouterr()
         assert "pdf-processing" in captured.out
-        assert "invoked" in captured.out
+        assert "activated" in captured.out
 
     async def test_mcp_error_rendering(self, capsys) -> None:
         from dendrux.notifiers.console import ConsoleNotifier
@@ -565,17 +566,17 @@ class TestConsoleNotifierInitEvents:
 class TestNormalizerInitEvents:
     """GOVERNANCE_EVENT_META has entries for 5 new event types."""
 
-    def test_skill_registered_in_meta(self) -> None:
+    def test_skill_catalog_resolved_in_meta(self) -> None:
         from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
 
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_REGISTERED]
+        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_CATALOG_RESOLVED]
         assert severity == "info"
         assert "skill" in title.lower() or "loaded" in title.lower()
 
-    def test_skill_denied_in_meta(self) -> None:
+    def test_skill_activation_failed_in_meta(self) -> None:
         from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
 
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_DENIED]
+        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_ACTIVATION_FAILED]
         assert severity == "warning"
         assert "skill" in title.lower() or "denied" in title.lower()
 
@@ -593,10 +594,10 @@ class TestNormalizerInitEvents:
         assert severity == "error"
         assert "mcp" in title.lower() or "error" in title.lower()
 
-    def test_skill_invoked_in_meta(self) -> None:
+    def test_skill_activated_in_meta(self) -> None:
         from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
 
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_INVOKED]
+        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_ACTIVATED]
         assert severity == "info"
         assert "skill" in title.lower() or "invoked" in title.lower()
 
@@ -604,14 +605,14 @@ class TestNormalizerInitEvents:
         """The frozenset used for node dispatch includes new types."""
         from dendrux.dashboard.normalizer import _GOVERNANCE_EVENT_TYPES
 
-        assert GovernanceEventType.SKILL_REGISTERED in _GOVERNANCE_EVENT_TYPES
-        assert GovernanceEventType.SKILL_DENIED in _GOVERNANCE_EVENT_TYPES
-        assert GovernanceEventType.SKILL_INVOKED in _GOVERNANCE_EVENT_TYPES
+        assert GovernanceEventType.SKILL_CATALOG_RESOLVED in _GOVERNANCE_EVENT_TYPES
+        assert GovernanceEventType.SKILL_ACTIVATION_FAILED in _GOVERNANCE_EVENT_TYPES
+        assert GovernanceEventType.SKILL_ACTIVATED in _GOVERNANCE_EVENT_TYPES
         assert GovernanceEventType.MCP_CONNECTED in _GOVERNANCE_EVENT_TYPES
         assert GovernanceEventType.MCP_ERROR in _GOVERNANCE_EVENT_TYPES
 
     async def test_normalizer_creates_governance_node_for_skill_loaded(self) -> None:
-        """Normalizer converts skill.registered DB event into GovernanceEventNode."""
+        """Normalizer converts skill.catalog_resolved DB event into GovernanceEventNode."""
         from dendrux.dashboard.normalizer import (
             GovernanceEventNode,
             normalize_timeline,
@@ -681,11 +682,11 @@ class TestNormalizerInitEvents:
                 ),
                 _Event(
                     id="e1",
-                    event_type="skill.registered",
+                    event_type="skill.catalog_resolved",
                     sequence_index=1,
                     iteration_index=0,
                     data={
-                        "skill_name": "pdf-processing",
+                        "name": "pdf-processing",
                         "description": "Extract text from PDFs",
                     },
                 ),
@@ -704,21 +705,21 @@ class TestNormalizerInitEvents:
         assert len(result.nodes) == 3
         gov_node = result.nodes[1]
         assert isinstance(gov_node, GovernanceEventNode)
-        assert gov_node.event_type == "skill.registered"
+        assert gov_node.event_type == "skill.catalog_resolved"
         assert gov_node.severity == "info"
-        assert gov_node.data["skill_name"] == "pdf-processing"
+        assert gov_node.data["name"] == "pdf-processing"
 
 
 # ------------------------------------------------------------------
-# skill.invoked emission in ReAct loop
+# skill.activated emission in ReAct loop
 # ------------------------------------------------------------------
 
 
-class TestSkillInvokedEmission:
-    """skill.invoked is emitted when LLM calls use_skill during the loop."""
+class TestSkillActivatedEmission:
+    """skill.activated is emitted when LLM calls use_skill during the loop."""
 
-    async def test_use_skill_emits_skill_invoked(self) -> None:
-        """Successful use_skill tool call emits skill.invoked governance event."""
+    async def test_use_skill_emits_skill_activated(self) -> None:
+        """Successful use_skill tool call emits skill.activated governance event."""
         from pathlib import Path
 
         from dendrux.llm.mock import MockLLM
@@ -752,14 +753,14 @@ class TestSkillInvokedEmission:
         invoked = [
             (et, it, d)
             for et, it, d, _ in notifier.governance_events
-            if et == GovernanceEventType.SKILL_INVOKED
+            if et == GovernanceEventType.SKILL_ACTIVATED
         ]
         assert len(invoked) == 1
-        assert invoked[0][2]["skill_name"] == "pdf-processing"
+        assert invoked[0][2]["name"] == "pdf-processing"
         assert invoked[0][1] == 1  # iteration 1 (first loop iteration)
 
-    async def test_use_skill_unknown_still_emits_invoked(self) -> None:
-        """use_skill with unknown name still emits skill.invoked (LLM invoked the mechanism)."""
+    async def test_use_skill_unknown_emits_activation_failed(self) -> None:
+        """Unknown names are failed activations, never successful deliveries."""
         from pathlib import Path
 
         from dendrux.llm.mock import MockLLM
@@ -793,7 +794,7 @@ class TestSkillInvokedEmission:
         invoked = [
             (et, d)
             for et, _, d, _ in notifier.governance_events
-            if et == GovernanceEventType.SKILL_INVOKED
+            if et == GovernanceEventType.SKILL_ACTIVATION_FAILED
         ]
         assert len(invoked) == 1
-        assert invoked[0][1]["skill_name"] == "nonexistent"
+        assert invoked[0][1]["name"] == "nonexistent"

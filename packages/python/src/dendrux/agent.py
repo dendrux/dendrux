@@ -31,10 +31,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux._sentinel import _UnsetType
+from dendrux.skills._internal import is_script, validate_executor
+from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -50,7 +52,7 @@ if TYPE_CHECKING:
     from dendrux.mcp._source import MCPSource
     from dendrux.pricing import PriceTable
     from dendrux.runtime.state import StateStore
-    from dendrux.skills._loader import Skill
+    from dendrux.skills import Skill, SkillExecutor
     from dendrux.tools import ToolLookups
     from dendrux.types import (
         Budget,
@@ -242,6 +244,7 @@ class Agent:
         skills_dir: str | Path | None = ...,
         skills: list[Skill] | None = ...,
         deny_skills: list[str] | None = ...,
+        skill_executor: SkillExecutor | None = ...,
         tool_result_transform: ToolResultTransform | None = ...,
     ) -> None: ...
 
@@ -269,6 +272,7 @@ class Agent:
         skills_dir: str | Path | None = ...,
         skills: list[Skill] | None = ...,
         deny_skills: list[str] | None = ...,
+        skill_executor: SkillExecutor | None = ...,
         tool_result_transform: ToolResultTransform | None = ...,
     ) -> None: ...
 
@@ -295,6 +299,7 @@ class Agent:
         skills_dir: str | Path | None = None,
         skills: list[Skill] | None = None,
         deny_skills: list[str] | None = None,
+        skill_executor: SkillExecutor | None = None,
         tool_result_transform: ToolResultTransform | None = None,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
@@ -444,7 +449,7 @@ class Agent:
 
         self._explicit_skills: list[Skill] | None = None
         if skills is not None:
-            from dendrux.skills._loader import Skill as _Skill
+            from dendrux.skills import Skill as _Skill
 
             for i, s in enumerate(skills):
                 if not isinstance(s, _Skill):
@@ -458,6 +463,10 @@ class Agent:
         self._loaded_skills: list[Skill] | None = None
         self._denied_skill_names: list[str] | None = None
         self._inline_skill_warning_emitted: bool = False
+        validate_executor(skill_executor)
+        self._skill_executor = skill_executor
+        self._script_warning_names: set[str] = set()
+        self._validate_skill_contents(self._explicit_skills or [])
 
         self._validate()
 
@@ -621,11 +630,11 @@ class Agent:
         has_skills = bool(self._skills_dir or self._explicit_skills)
         if has_skills:
             for fn in self.tools:
-                if getattr(fn, "__name__", None) == "use_skill":
+                if getattr(fn, "__name__", None) in NAMES:
                     raise ValueError(
-                        f"Agent '{self.name}' has a tool named 'use_skill' but also "
-                        f"has skills configured. 'use_skill' is reserved as the "
-                        f"skill activation tool when skills are present."
+                        f"Agent '{self.name}' has a tool named '{fn.__name__}' but also "
+                        f"has skills configured. '{fn.__name__}' is reserved "
+                        "for skill runtime tools when skills are present."
                     )
 
         if self.max_iterations < 1:
@@ -645,10 +654,13 @@ class Agent:
         if self.tools and (self._deny or self._require_approval):
             known_tools = frozenset(str(getattr(fn, "__name__", fn)) for fn in self.tools)
 
+        if has_skills:
+            known_tools |= NAMES
+
         # --- deny= validation ---
         if self._deny:
             # deny requires tools or tool_sources
-            if not self.tools and not has_mcp:
+            if not self.tools and not has_mcp and not has_skills:
                 raise ValueError(f"Agent '{self.name}' has deny={sorted(self._deny)} but no tools.")
 
             # deny + SingleCall is not supported
@@ -672,7 +684,7 @@ class Agent:
         # --- require_approval= validation ---
         if self._require_approval:
             # require_approval requires tools or tool_sources
-            if not self.tools and not has_mcp:
+            if not self.tools and not has_mcp and not has_skills:
                 raise ValueError(
                     f"Agent '{self.name}' has require_approval="
                     f"{sorted(self._require_approval)} but no tools."
@@ -733,6 +745,8 @@ class Agent:
         from dendrux.types import ToolTarget as _ToolTarget
 
         all_names = frozenset(all_tool_defs.keys())
+        if self._skills_dir or self._explicit_skills:
+            all_names |= NAMES
 
         if self._deny:
             unknown = self._deny - all_names
@@ -849,6 +863,7 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        activate_skills: Sequence[str] | None = ...,
         runs: list[str] | None = ...,
         replay_last: int | Literal["all"] = ...,
         replay_reasoning: bool = ...,
@@ -868,6 +883,7 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        activate_skills: Sequence[str] | None = ...,
         runs: list[str] | None = ...,
         replay_last: int | Literal["all"] = ...,
         replay_reasoning: bool = ...,
@@ -885,6 +901,7 @@ class Agent:
         *,
         history: list[ChatMessage] | None = None,
         context: list[ContextBlock] | None = None,
+        activate_skills: Sequence[str] | None = None,
         runs: list[str] | None = None,
         replay_last: int | Literal["all"] = 0,
         replay_reasoning: bool = True,
@@ -1028,6 +1045,7 @@ class Agent:
             user_input=user_input,
             history=history,
             context=context,
+            activate_skills=activate_skills,
             runs=runs,
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
@@ -1216,26 +1234,28 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        await validate_tool_results(store, run_id, results)
-        await claim_or_raise(
-            store,
-            run_id,
-            expected_status=RunStatus.WAITING_CLIENT_TOOL,
-            submitted_data={"submitted_tool_results": serialize_tool_results(results)},
-        )
-
-        task = self._task_manager.spawn(
-            run_id,
-            resume_claimed(
+        skill_session = await continuation(self, store, run_id)
+        with skill_session.bind():
+            await validate_tool_results(store, run_id, results)
+            await claim_or_raise(
+                store,
                 run_id,
-                state_store=store,
-                agent=self,
-                provider=provider,
-                extra_notifier=notifier,
-                pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
-            ),
-        )
-        return await task
+                expected_status=RunStatus.WAITING_CLIENT_TOOL,
+                submitted_data={"submitted_tool_results": serialize_tool_results(results)},
+            )
+
+            task = self._task_manager.spawn(
+                run_id,
+                resume_claimed(
+                    run_id,
+                    state_store=store,
+                    agent=self,
+                    provider=provider,
+                    extra_notifier=notifier,
+                    pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
+                ),
+            )
+            return await task
 
     async def submit_input(
         self,
@@ -1269,25 +1289,27 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        await claim_or_raise(
-            store,
-            run_id,
-            expected_status=RunStatus.WAITING_HUMAN_INPUT,
-            submitted_data={"submitted_user_input": text},
-        )
-
-        task = self._task_manager.spawn(
-            run_id,
-            resume_claimed(
+        skill_session = await continuation(self, store, run_id)
+        with skill_session.bind():
+            await claim_or_raise(
+                store,
                 run_id,
-                state_store=store,
-                agent=self,
-                provider=provider,
-                extra_notifier=notifier,
-                pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
-            ),
-        )
-        return await task
+                expected_status=RunStatus.WAITING_HUMAN_INPUT,
+                submitted_data={"submitted_user_input": text},
+            )
+
+            task = self._task_manager.spawn(
+                run_id,
+                resume_claimed(
+                    run_id,
+                    state_store=store,
+                    agent=self,
+                    provider=provider,
+                    extra_notifier=notifier,
+                    pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
+                ),
+            )
+            return await task
 
     async def submit_approval(
         self,
@@ -1339,50 +1361,52 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        if approved:
+        skill_session = await continuation(self, store, run_id)
+        with skill_session.bind():
+            if approved:
+                await claim_or_raise(
+                    store,
+                    run_id,
+                    expected_status=RunStatus.WAITING_APPROVAL,
+                )
+                task = self._task_manager.spawn(
+                    run_id,
+                    resume_approval_approved_claim(
+                        run_id,
+                        state_store=store,
+                        agent=self,
+                        provider=provider,
+                        extra_notifier=notifier,
+                    ),
+                )
+                return await task
+
+            # Rejection path — fabricate one failed result per pending tool call,
+            # then submit-and-claim so the runner's resume_claimed sees them as
+            # ordinary tool results.
+            raw_pause = await store.get_pause_state(run_id)
+            if raw_pause is None:
+                await raise_for_non_paused_status(store, run_id)
+            pause_state = PauseState.from_dict(raw_pause)
+            synthetic = build_rejection_results(pause_state, rejection_reason)
             await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_APPROVAL,
+                submitted_data={"submitted_tool_results": serialize_tool_results(synthetic)},
             )
             task = self._task_manager.spawn(
                 run_id,
-                resume_approval_approved_claim(
+                resume_claimed(
                     run_id,
                     state_store=store,
                     agent=self,
                     provider=provider,
                     extra_notifier=notifier,
+                    pre_claim_status=RunStatus.WAITING_APPROVAL.value,
                 ),
             )
             return await task
-
-        # Rejection path — fabricate one failed result per pending tool call,
-        # then submit-and-claim so the runner's resume_claimed sees them as
-        # ordinary tool results.
-        raw_pause = await store.get_pause_state(run_id)
-        if raw_pause is None:
-            await raise_for_non_paused_status(store, run_id)
-        pause_state = PauseState.from_dict(raw_pause)
-        synthetic = build_rejection_results(pause_state, rejection_reason)
-        await claim_or_raise(
-            store,
-            run_id,
-            expected_status=RunStatus.WAITING_APPROVAL,
-            submitted_data={"submitted_tool_results": serialize_tool_results(synthetic)},
-        )
-        task = self._task_manager.spawn(
-            run_id,
-            resume_claimed(
-                run_id,
-                state_store=store,
-                agent=self,
-                provider=provider,
-                extra_notifier=notifier,
-                pre_claim_status=RunStatus.WAITING_APPROVAL.value,
-            ),
-        )
-        return await task
 
     async def cancel_run(self, run_id: str) -> RunResult:
         """Request cancellation for ``run_id``.
@@ -1499,6 +1523,7 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        activate_skills: Sequence[str] | None = ...,
         runs: list[str] | None = ...,
         replay_last: int | Literal["all"] = ...,
         replay_reasoning: bool = ...,
@@ -1517,6 +1542,7 @@ class Agent:
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
+        activate_skills: Sequence[str] | None = ...,
         runs: list[str] | None = ...,
         replay_last: int | Literal["all"] = ...,
         replay_reasoning: bool = ...,
@@ -1533,6 +1559,7 @@ class Agent:
         *,
         history: list[ChatMessage] | None = None,
         context: list[ContextBlock] | None = None,
+        activate_skills: Sequence[str] | None = None,
         runs: list[str] | None = None,
         replay_last: int | Literal["all"] = 0,
         replay_reasoning: bool = True,
@@ -1653,6 +1680,7 @@ class Agent:
             user_input=user_input,
             history=history,
             context=context,
+            activate_skills=activate_skills,
             runs=runs,
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
@@ -1783,11 +1811,11 @@ class Agent:
                         skipped_tools.extend(asdict(entry) for entry in source_skips)
                     for td in tool_defs:
                         # Collision check against reserved name
-                        if td.name == "use_skill" and (self._skills_dir or self._explicit_skills):
+                        if td.name in NAMES and (self._skills_dir or self._explicit_skills):
                             raise MCPToolNameCollisionError(
                                 f"MCP tool '{td.name}' from source "
                                 f"'{td.meta.get('source_name')}' collides with "
-                                f"the reserved 'use_skill' meta-tool."
+                                f"the reserved '{td.name}' meta-tool."
                             )
                         # Collision check against local tools
                         if td.name in local_defs:
@@ -1845,7 +1873,6 @@ class Agent:
         (``agent.run(loop=...)``) is honored. Defaults to the agent's
         configured loop when omitted.
         """
-        from dendrux.loops.single import SingleCall
 
         await self._ensure_discovered()
         self._ensure_skills_loaded()
@@ -1860,13 +1887,11 @@ class Agent:
             mcp_tool_defs=self._discovered_tool_defs,
         )
 
-        # Inject use_skill meta-tool only when skills load AND the
-        # effective loop supports tool calls. SingleCall delivers skills
-        # inline (see get_system_prompt), so use_skill has nothing to do
-        # there.
-        if self._loaded_skills and not isinstance(effective_loop, SingleCall):
-            td = self._get_use_skill_tool_def()
-            lookups.fn[td.name] = self._execute_use_skill
+        from dendrux.skills._session import SkillTool
+
+        session = current(self) or SkillSession.prepare(self, loop=effective_loop)
+        for td in session.tool_defs():
+            lookups.fn[td.name] = SkillTool(session, td.name)
             lookups.target[td.name] = _ToolTarget.SERVER
             lookups.timeout[td.name] = td.timeout_seconds
             lookups.explicit_timeout[td.name] = td.has_explicit_timeout
@@ -1885,15 +1910,15 @@ class Agent:
         ``loop`` overrides the agent's configured loop for delivery-mode
         selection — see :meth:`get_tool_lookups`.
         """
-        from dendrux.loops.single import SingleCall
 
         self._ensure_skills_loaded()
         effective_loop = self._effective_loop(loop)
         local = [get_tool_def(fn) for fn in self.tools]
         discovered = self._discovered_tool_defs or []
         all_defs = local + discovered
-        if self._loaded_skills and not isinstance(effective_loop, SingleCall):
-            all_defs.append(self._get_use_skill_tool_def())
+        all_defs.extend(
+            (current(self) or SkillSession.prepare(self, loop=effective_loop)).tool_defs()
+        )
         return sorted(all_defs, key=lambda td: td.name)
 
     def _effective_loop(self, loop: Loop | None) -> Loop | None:
@@ -1909,6 +1934,20 @@ class Agent:
     # Skills
     # ------------------------------------------------------------------
 
+    def _validate_skill_contents(self, skills: list[Skill], loop: Loop | None = None) -> None:
+        from dendrux.loops.single import SingleCall
+
+        if isinstance(self._effective_loop(loop), SingleCall) and any(s.files for s in skills):
+            raise ValueError("SingleCall cannot use skills with files.")
+        unavailable = {s.name for s in skills if any(is_script(p) for p in s.files)}
+        if self._skill_executor is None and unavailable - self._script_warning_names:
+            warnings.warn(
+                f"Skills with scripts have no skill_executor: {', '.join(sorted(unavailable))}",
+                UserWarning,
+                stacklevel=3,
+            )
+            self._script_warning_names.update(unavailable)
+
     def _ensure_skills_loaded(self) -> None:
         """Lazy skill loading — scans skills_dir and merges explicit skills.
 
@@ -1918,7 +1957,7 @@ class Agent:
         if self._loaded_skills is not None:
             return  # already loaded
 
-        from dendrux.skills._loader import Skill as _Skill
+        from dendrux.skills import Skill as _Skill
 
         all_skills: list[Skill] = []
 
@@ -1976,16 +2015,17 @@ class Agent:
         Used by loops, runner events, and LLM semantic evidence.
         Single source of truth for the complete system prompt.
         """
-        from dendrux.loops.single import SingleCall
 
         self._ensure_skills_loaded()
-        if not self._loaded_skills:
+        session = current(self) or SkillSession.prepare(self, loop=loop)
+        if not session.available or (
+            session.delivery == "progressive" and "use_skill" in session.deny
+        ):
             return self.prompt
 
-        sorted_skills = sorted(self._loaded_skills, key=lambda s: s.name)
-        effective_loop = self._effective_loop(loop)
+        sorted_skills = sorted(session.available.values(), key=lambda s: s.name)
 
-        if isinstance(effective_loop, SingleCall):
+        if session.delivery == "inlined":
             # Inlined skill mode: render bodies verbatim into the prompt.
             parts = [self.prompt, "\n\n## Skills"]
             for skill in sorted_skills:
@@ -2029,45 +2069,6 @@ class Agent:
             stacklevel=3,
         )
         self._inline_skill_warning_emitted = True
-
-    async def _execute_use_skill(self, name: str) -> str:
-        """Execute the use_skill meta-tool — returns skill body.
-
-        Called by the loop when the LLM calls use_skill(name=...).
-        Returns the full Markdown instructions for the skill.
-        """
-        if not self._loaded_skills:
-            return f"Skill '{name}' not found. No skills are available."
-
-        for skill in self._loaded_skills:
-            if skill.name == name:
-                return skill.body
-
-        available = ", ".join(s.name for s in self._loaded_skills)
-        return f"Skill '{name}' not found. Available skills: {available}"
-
-    def _get_use_skill_tool_def(self) -> ToolDef:
-        """Create the ToolDef for the auto-injected use_skill tool."""
-        from dendrux.types import ToolDef as _ToolDef
-
-        return _ToolDef(
-            name="use_skill",
-            description=(
-                "Activate a skill to get detailed instructions for a task. "
-                "Call this with the skill name before performing a skill-related task."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "The name of the skill to activate.",
-                    }
-                },
-                "required": ["name"],
-            },
-            meta={"dendrux.internal": True},
-        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2161,13 +2162,11 @@ class Agent:
         Output is sorted by ToolDef.name for cache-stable prefixes across
         runs. self.tools storage preserves caller order.
         """
-        from dendrux.loops.single import SingleCall
 
         self._ensure_skills_loaded()
         effective_loop = self._effective_loop(loop)
         defs = [get_tool_def(fn) for fn in self.tools]
-        if self._loaded_skills and not isinstance(effective_loop, SingleCall):
-            defs.append(self._get_use_skill_tool_def())
+        defs.extend((current(self) or SkillSession.prepare(self, loop=effective_loop)).tool_defs())
         return sorted(defs, key=lambda td: td.name)
 
     def __repr__(self) -> str:
