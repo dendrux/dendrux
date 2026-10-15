@@ -107,3 +107,13 @@ class TestValidateExecutor:
 
         with pytest.raises(ValueError):
             validate_executor(Slow())
+
+
+def test_top_level_exports() -> None:
+    import dendrux
+    import dendrux.skills
+
+    for name in ("Skill", "SkillExecutor", "SkillExecutionRequest", "SkillExecutionResult"):
+        assert getattr(dendrux, name) is getattr(dendrux.skills, name)
+        assert name in dendrux.__all__
+        assert name in dendrux.skills.__all__
