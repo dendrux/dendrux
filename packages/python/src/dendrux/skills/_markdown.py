@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
@@ -24,7 +24,8 @@ def _construct_strict_mapping(loader: _StrictLoader, node: yaml.MappingNode) -> 
     loader.flatten_mapping(node)
     seen: set[Hashable] = set()
     for key_node, _ in node.value:
-        key = loader.construct_object(key_node, deep=True)  # type: ignore[no-untyped-call]
+        # Stub versions differ on whether construct_object is typed; cast keeps both happy.
+        key = cast("Any", loader).construct_object(key_node, deep=True)
         if isinstance(key, Hashable):
             if key in seen:
                 raise yaml.constructor.ConstructorError(
