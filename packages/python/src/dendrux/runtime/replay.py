@@ -544,15 +544,29 @@ def build_seed(plan: ReplayPlan | None, history: list[Message]) -> dict[str, Any
     return seed
 
 
-def user_trace_message(user_input: str, seeded_history: list[Message], stable_band: str) -> Message:
+def user_trace_message(
+    user_input: str,
+    seeded_history: list[Message],
+    stable_band: str,
+    context: list[ContextBlock] | None = None,
+) -> Message:
     """The current user message as recorded to react_traces.
 
     Content stays the raw ``user_input``; when folded context changed what
     went on the wire, the wire form is kept in meta so a later replay can
     send it byte-for-byte.
     """
+    from dataclasses import asdict
+
+    from dendrux.skills._session import current as current_session
+
     current = seeded_history[-1]
     meta: dict[str, Any] = {}
+    session = current_session()
+    if session and session.explicit:
+        meta["dendrux.skills.context"] = [
+            asdict(b) for b in context or [] if b.placement == "dynamic" or len(seeded_history) == 1
+        ]
     if current.content != user_input:
         meta[WIRE_CONTENT_KEY] = current.content
     if len(seeded_history) == 1 and current.placement == "stable" and stable_band:
