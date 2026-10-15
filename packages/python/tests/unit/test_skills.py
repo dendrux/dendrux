@@ -132,6 +132,10 @@ class TestSkillNameValidation:
             ("", "empty"),
             ("pdf.tool", "lowercase"),
             ("pdf_tool", "lowercase"),
+            ("abc\n", "lowercase"),
+            ("abc\r\n", "lowercase"),
+            ("\nabc", "lowercase"),
+            ("abc-\n", "hyphen"),
         ],
     )
     def test_invalid_names_rejected(self, name: str, match: str) -> None:
