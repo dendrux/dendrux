@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context leaked between yields.
 - Skills v2. A skill can now carry files and scripts, be built from code, and be
   activated per run. Dendrux still never executes skill code itself.
   - `Skill` is validated and immutable, and is exported from `dendrux`. Build it

@@ -2507,17 +2507,25 @@ async def _resume_core(
             # Internal claimed-entry callers normally inherit the verified session.
             # If they do not, a failed verification must finalize the owned claim.
             if _skip_claim:
-                won = await state_store.finalize_run(
-                    run_id,
-                    status=RunStatus.ERROR.value,
-                    error=str(exc),
-                    expected_current_status="running",
-                )
-                if won:
-                    seq = EventSequencer(initial=await state_store.get_next_event_sequence(run_id))
-                    await _emit_event(
-                        state_store, run_id, "run.error", seq, {"error": str(exc)[:500]}
+                try:
+                    won = await state_store.finalize_run(
+                        run_id,
+                        status=RunStatus.ERROR.value,
+                        error=str(exc),
+                        expected_current_status="running",
                     )
+                    if won:
+                        seq = EventSequencer(
+                            initial=await state_store.get_next_event_sequence(run_id)
+                        )
+                        await _emit_event(
+                            state_store, run_id, "run.error", seq, {"error": str(exc)[:500]}
+                        )
+                except Exception:
+                    logger.error(
+                        "Failed to persist claimed resume error for run %s", run_id, exc_info=True
+                    )
+                await notify_run_failed(extra_notifier, run_id, exc)
             raise
     with skill_session.bind():
         # 1. Load pause state
@@ -2731,11 +2739,20 @@ async def _resume_core(
         except asyncio.CancelledError:
 
             async def persist_cancellation() -> RunResult:
-                sequencer = (
-                    ctx.sequencer
-                    if ctx
-                    else EventSequencer(initial=await state_store.get_next_event_sequence(run_id))
-                )
+                sequencer = ctx.sequencer if ctx else EventSequencer()
+                if ctx is None:
+                    try:
+                        sequencer = EventSequencer(
+                            initial=await state_store.get_next_event_sequence(run_id)
+                        )
+                    except Exception:
+                        # Event numbering must not prevent the status transition
+                        # or replace the cancellation that triggered cleanup.
+                        logger.warning(
+                            "Failed to read cancellation event sequence for run %s",
+                            run_id,
+                            exc_info=True,
+                        )
                 return await _persist_task_cancellation(state_store, run_id, sequencer)
 
             cleanup = asyncio.create_task(persist_cancellation(), name=f"cancel-resume:{run_id}")
