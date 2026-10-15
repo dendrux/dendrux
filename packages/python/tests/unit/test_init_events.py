@@ -494,7 +494,11 @@ class TestConsoleNotifierInitEvents:
             "r1",
             GovernanceEventType.SKILL_CATALOG_RESOLVED,
             0,
-            {"name": "pdf-processing", "description": "Extract text from PDFs"},
+            {
+                "delivery": "progressive",
+                "skills": [{"name": "pdf-processing", "revision": None, "digest": "sha256:test"}],
+                "denied": [],
+            },
         )
         captured = capsys.readouterr()
         assert "pdf-processing" in captured.out

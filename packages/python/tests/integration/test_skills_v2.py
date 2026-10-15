@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
@@ -54,14 +53,19 @@ async def invoke(a, streaming=False, **kwargs):
 @pytest.mark.parametrize("contextual", [False, True])
 async def test_explicit_wire_and_raw_trace(store, streaming, contextual):
     a = agent(store, [LLMResponse(text="done")])
-    kwargs = {"activate_skills": ["demo", "demo"]}
+    kwargs = {
+        "activate_skills": ["demo", "demo"],
+        "context": [
+            ContextBlock(content="STABLE", placement="stable"),
+            ContextBlock(content="DYNAMIC"),
+        ],
+    }
     if contextual:
         kwargs.update(
             history=[
                 ChatMessage(role=Role.USER, content="old"),
                 ChatMessage(role=Role.ASSISTANT, content="answer"),
             ],
-            context=[ContextBlock(content="context")],
         )
     result = await invoke(a, streaming, **kwargs)
     assert result.status == RunStatus.SUCCESS
@@ -70,7 +74,14 @@ async def test_explicit_wire_and_raw_trace(store, streaming, contextual):
     traces = await store.get_traces(result.run_id)
     user = next(t for t in traces if t.role == "user")
     assert user.content == "raw input"
-    assert "<skill_content" in json.dumps(user.meta)
+    wire = user.meta["wire_content"]
+    assert wire.count('<skill_content name="demo"') == 1
+    assert wire.index("<skill_content") < wire.index("DYNAMIC") < wire.index("raw input")
+    if contextual:
+        assert "STABLE" in a._provider.call_history[0]["messages"][1].content
+        assert "STABLE" not in wire
+    else:
+        assert wire.index("<skill_content") < wire.index("STABLE") < wire.index("DYNAMIC")
     assert "activate_skills" not in a._provider.call_history[0].get("kwargs", {})
 
 
@@ -125,6 +136,10 @@ async def test_preflight_before_approval(store, activated, path):
     )
     result = await a.run("input", activate_skills=["demo"] if activated else [])
     assert result.status == RunStatus.SUCCESS
+    events = await store.get_run_events(result.run_id)
+    assert not any(e.event_type in ("approval.requested", "skill.script_requested") for e in events)
+    results = await store.get_tool_calls(result.run_id)
+    assert len(results) == 1 and not results[0].success
 
 
 @tool(target="client")
