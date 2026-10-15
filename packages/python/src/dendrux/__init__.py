@@ -31,6 +31,7 @@ from dendrux.pricing import ModelPricing, PriceTable
 from dendrux.runtime.context import DelegationDepthExceededError
 from dendrux.runtime.runner import run
 from dendrux.runtime.sweep import sweep
+from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult, SkillExecutor
 from dendrux.tool import tool
 from dendrux.types import (
     Budget,
@@ -66,8 +67,12 @@ __all__ = [
     "RunNotPausedError",
     "SchemaNotInitializedError",
     "SingleCall",
+    "Skill",
     "SkillContinuityError",
     "SkillDigestMismatch",
+    "SkillExecutionRequest",
+    "SkillExecutionResult",
+    "SkillExecutor",
     "SkillMismatchError",
     "SkillMissingError",
     "SkillValidationError",
