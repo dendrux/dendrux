@@ -20,7 +20,7 @@ from dendrux.skills._fs import SkillDir
 from dendrux.skills._markdown import parse_frontmatter, render_markdown
 from dendrux.skills._paths import validate_file_path
 
-_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_NAME_RE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 MAX_NAME_LEN = 64
 MAX_DESCRIPTION_LEN = 1024
 MAX_COMPATIBILITY_LEN = 500
@@ -244,7 +244,7 @@ def _validate_name(name: object) -> str:
             f"Skill name '{value}' exceeds {MAX_NAME_LEN} characters (got {len(value)}).",
             field="name",
         )
-    if _NAME_RE.match(value):
+    if _NAME_RE.fullmatch(value):
         return value
     if "--" in value and re.fullmatch(r"[a-z0-9-]+", value):
         reason = "contains consecutive hyphens"
