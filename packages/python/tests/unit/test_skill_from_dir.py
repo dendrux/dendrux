@@ -5,15 +5,30 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from dendrux.errors import SkillValidationError
-from dendrux.skills import Skill
+from dendrux.skills import Skill, _fs
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "skills" / "forecast"
 
 SKILL_MD = "---\nname: demo\ndescription: Demo skill.\n---\n\nBody\n"
+
+FD_SUPPORTED = _fs._FD_MODE
+
+
+@pytest.fixture(autouse=True, params=["fd", "path"])
+def traversal_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run every test with descriptor traversal and with the path-based fallback."""
+    if request.param == "fd" and not FD_SUPPORTED:
+        pytest.skip("platform lacks dir_fd support")
+    monkeypatch.setattr(_fs, "_FD_MODE", request.param == "fd")
+    return str(request.param)
 
 
 @pytest.fixture
@@ -230,3 +245,113 @@ def test_legacy_loader_import_path() -> None:
     from dendrux.skills._loader import Skill as LegacySkill
 
     assert LegacySkill is Skill
+
+
+class TestSwapRace:
+    """An entry checked during enumeration is replaced by a symlink before it is opened."""
+
+    @pytest.fixture
+    def outside(self, tmp_path: Path) -> Path:
+        out = tmp_path / "outside"
+        out.mkdir()
+        (out / "secret.txt").write_text("EXTERNAL SECRET")
+        return out
+
+    def _swap_before_open(
+        self, monkeypatch: pytest.MonkeyPatch, victim: str, replace: Callable[[Path], None]
+    ) -> None:
+        real_open_entry = _fs._open_entry
+
+        def racing_open_entry(dir_fd: int, name: str, *, directory: bool, display: Path) -> int:
+            if name == victim:
+                replace(display)
+            return real_open_entry(dir_fd, name, directory=directory, display=display)
+
+        monkeypatch.setattr(_fs, "_open_entry", racing_open_entry)
+
+    @needs_symlinks
+    def test_directory_swapped_for_symlink(
+        self,
+        traversal_mode: str,
+        skill_dir: Path,
+        outside: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if traversal_mode != "fd":
+            pytest.skip("path-based fallback cannot close this race (documented)")
+        nested = skill_dir / "nested"
+        nested.mkdir()
+        (nested / "secret.txt").write_text("inside")
+
+        def replace(display: Path) -> None:
+            nested.rename(skill_dir.parent / "moved-away")
+            nested.symlink_to(outside, target_is_directory=True)
+
+        self._swap_before_open(monkeypatch, "nested", replace)
+        with pytest.raises(SkillValidationError, match="symlink"):
+            Skill.from_dir(skill_dir)
+
+    @needs_symlinks
+    def test_file_swapped_for_symlink(
+        self,
+        traversal_mode: str,
+        skill_dir: Path,
+        outside: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if traversal_mode != "fd":
+            pytest.skip("path-based fallback has its own O_NOFOLLOW test")
+        (skill_dir / "notes.txt").write_text("inside")
+
+        def replace(display: Path) -> None:
+            (skill_dir / "notes.txt").unlink()
+            (skill_dir / "notes.txt").symlink_to(outside / "secret.txt")
+
+        self._swap_before_open(monkeypatch, "notes.txt", replace)
+        with pytest.raises(SkillValidationError, match="symlink"):
+            Skill.from_dir(skill_dir)
+
+    def test_directory_swapped_for_file(
+        self, traversal_mode: str, skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if traversal_mode != "fd":
+            pytest.skip("descriptor traversal only")
+        nested = skill_dir / "nested"
+        nested.mkdir()
+
+        def replace(display: Path) -> None:
+            nested.rmdir()
+            nested.write_text("now a file")
+
+        self._swap_before_open(monkeypatch, "nested", replace)
+        with pytest.raises(SkillValidationError, match="changed"):
+            Skill.from_dir(skill_dir)
+
+    def test_file_swapped_for_directory(
+        self, traversal_mode: str, skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if traversal_mode != "fd":
+            pytest.skip("descriptor traversal only")
+        (skill_dir / "notes.txt").write_text("inside")
+
+        def replace(display: Path) -> None:
+            (skill_dir / "notes.txt").unlink()
+            (skill_dir / "notes.txt").mkdir()
+
+        self._swap_before_open(monkeypatch, "notes.txt", replace)
+        with pytest.raises(SkillValidationError, match="regular"):
+            Skill.from_dir(skill_dir)
+
+
+def test_no_descriptor_leak(skill_dir: Path) -> None:
+    (skill_dir / "a" / "b").mkdir(parents=True)
+    (skill_dir / "a" / "b" / "f.txt").write_text("x")
+    (skill_dir / "a" / "bad\x01.txt").write_text("x")
+    fd_dir = Path("/dev/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("cannot count open descriptors")
+    before = len(os.listdir(fd_dir))
+    for _ in range(20):
+        with pytest.raises(SkillValidationError):
+            Skill.from_dir(skill_dir)
+    assert len(os.listdir(fd_dir)) == before
