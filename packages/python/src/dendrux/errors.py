@@ -17,13 +17,21 @@ Suggested HTTP mappings:
     ReplayRunError              -> 400 (404 when reason == "not_found")
     PersistenceNotConfiguredError -> 500
     SchemaNotInitializedError   -> 500
+    SkillMissingError           -> 409
+    SkillMismatchError          -> 409
+
+``SkillValidationError`` is raised while building a :class:`~dendrux.skills.Skill`
+(a configuration error, not a request error).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from dendrux.types import RunStatus
 
 
@@ -166,6 +174,76 @@ class ReplayRunError(ValueError):
         super().__init__(f"Cannot replay run '{run_id}': {detail}")
 
 
+class SkillValidationError(ValueError):
+    """Raised when a skill's content or metadata is invalid.
+
+    ``field`` names the offending field (``"name"``, ``"files"``,
+    ``"frontmatter"``, ...) when one applies.
+    """
+
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        self.field = field
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class SkillDigestMismatch:
+    """One skill whose content changed between run creation and continuation."""
+
+    name: str
+    expected_digest: str
+    actual_digest: str
+
+
+class SkillContinuityError(RuntimeError):
+    """Raised when a paused run's skills are not what the run was created with.
+
+    Base class of :class:`SkillMissingError` and :class:`SkillMismatchError`.
+    The run is left in its paused status. ``missing`` and ``mismatched``
+    are sorted by skill name.
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        missing: Iterable[str] = (),
+        mismatched: Iterable[SkillDigestMismatch] = (),
+    ) -> None:
+        self.run_id = run_id
+        self.missing: tuple[str, ...] = tuple(sorted(missing))
+        self.mismatched: tuple[SkillDigestMismatch, ...] = tuple(
+            sorted(mismatched, key=lambda m: m.name)
+        )
+        parts: list[str] = []
+        if self.missing:
+            parts.append("missing skills: " + ", ".join(self.missing))
+        if self.mismatched:
+            parts.append(
+                "changed skills: "
+                + ", ".join(
+                    f"{m.name} (expected {m.expected_digest}, got {m.actual_digest})"
+                    for m in self.mismatched
+                )
+            )
+        detail = "; ".join(parts) if parts else "skills do not match"
+        super().__init__(
+            f"Run '{run_id}' cannot continue: {detail}. "
+            "Attach the same skill content the run was created with."
+        )
+
+
+class SkillMissingError(SkillContinuityError):
+    """Raised when a skill the run was created with is not attached to the agent.
+
+    Any digest mismatches found in the same check are reported in ``mismatched``.
+    """
+
+
+class SkillMismatchError(SkillContinuityError):
+    """Raised when every skill is attached but some have different content."""
+
+
 __all__ = [
     "InvalidToolResultError",
     "PauseStatusMismatchError",
@@ -176,4 +254,9 @@ __all__ = [
     "RunNotFoundError",
     "RunNotPausedError",
     "SchemaNotInitializedError",
+    "SkillContinuityError",
+    "SkillDigestMismatch",
+    "SkillMismatchError",
+    "SkillMissingError",
+    "SkillValidationError",
 ]

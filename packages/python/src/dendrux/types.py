@@ -440,9 +440,13 @@ class GovernanceEventType(StrEnum):
     GUARDRAIL_UNMAPPED_PLACEHOLDER = "guardrail.unmapped_placeholder"
 
     # Init events: Skills + MCP
-    SKILL_REGISTERED = "skill.registered"
-    SKILL_DENIED = "skill.denied"
-    SKILL_INVOKED = "skill.invoked"
+    SKILL_CATALOG_RESOLVED = "skill.catalog_resolved"
+    SKILL_ACTIVATED = "skill.activated"
+    SKILL_ACTIVATION_FAILED = "skill.activation_failed"
+    SKILL_RESOURCE_READ = "skill.resource_read"
+    SKILL_SCRIPT_REQUESTED = "skill.script_requested"
+    SKILL_SCRIPT_COMPLETED = "skill.script_completed"
+    SKILL_SCRIPT_FAILED = "skill.script_failed"
     MCP_CONNECTED = "mcp.connected"
     MCP_ERROR = "mcp.error"
     MCP_TOOLS_SKIPPED = "mcp.tools_skipped"
@@ -1077,6 +1081,7 @@ def compute_idempotency_fingerprint(
     history: list[Message] | None = None,
     context: list[Any] | None = None,
     replay: dict[str, Any] | None = None,
+    skills: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic SHA-256 fingerprint for idempotency conflict detection.
 
@@ -1112,5 +1117,7 @@ def compute_idempotency_fingerprint(
         ]
     if replay:
         data["replay"] = replay
+    if skills is not None:
+        data["skills"] = skills
     payload = json.dumps(data, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

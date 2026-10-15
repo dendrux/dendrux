@@ -1,209 +1,502 @@
 ---
 title: Skills
-description: Loading Markdown skill definitions into an agent, the progressive-disclosure `use_skill` pattern that keeps token cost down, and the governance events it emits.
+description: Instruction packages for agents. Start with Markdown instructions, add files the model can read, add scripts your own executor runs. Covers activation, the executor contract, governance, resume safety, and the seven skill events.
 ---
 
 # Skills
 
-A skill is a Markdown file that teaches an agent how to do one specific thing. A single `SKILL.md` file sits in a directory, carries YAML frontmatter with a `name` and a `description`, and a Markdown body of instructions. Agents load skills declaratively at construction time. Delivery to the LLM depends on the loop: ReAct exposes a catalogue and lets the LLM pull bodies via the built-in `use_skill` tool (progressive disclosure); SingleCall inlines bodies into the system prompt (see [Inlined skill mode](#inlined-skill-mode-singlecall) below).
+A skill is a named package of instructions an agent can pick up when a task calls for it. The smallest skill is a name, a one-line description, and a Markdown body. A bigger one carries reference files, binary assets, and scripts.
 
-The open standard this follows is [agentskills.io](https://agentskills.io/). Dendrux's integration is a faithful implementation of the spec: one `SKILL.md` per skill, per directory, with standard frontmatter keys.
+The format follows the [Agent Skills](https://agentskills.io/) convention: a `SKILL.md` with YAML frontmatter, plus optional supporting files. Dendrux adds what a production system needs on top: skills that live in memory or a database as easily as on disk, per-run activation, a governed way to run scripts, and a guarantee that a paused run resumes with the same skill content it started with.
 
-## A skill on disk
+## Three steps
 
-```text
-_skills/
-  json-formatter/
-    SKILL.md
-```
+You can stop at any step. Each one adds capability and responsibility.
 
-`SKILL.md`:
-
-```markdown
----
-name: json-formatter
-description: Format raw JSON strings into pretty indented output with 2-space indent.
----
-
-# JSON Formatter
-
-When asked to format JSON, parse the input with json.loads and re-emit
-with json.dumps(obj, indent=2, sort_keys=True). Always include a trailing
-newline. If the input is not valid JSON, reply with the exact error message.
-```
-
-The frontmatter has two required keys: `name` (must match the directory name, lowercase, hyphen-allowed) and `description` (under 1024 characters). The body is plain Markdown and can be as long as you like; it is the full instructions the model will read when it decides to invoke the skill.
-
-## Attaching skills to an agent
-
-Two loading strategies, compose freely:
+### 1. Instructions only
 
 ```python
-from dendrux import Agent
+from dendrux import Agent, Skill
 from dendrux.llm.anthropic import AnthropicProvider
+
+triage = Skill(
+    name="ticket-triage",
+    description="Classify a support ticket and pick a priority. Use for any inbound ticket.",
+    body="# Ticket triage\n\n1. Read the ticket.\n2. Pick one of: billing, bug, how-to.\n3. Pick P1-P3.\n",
+)
 
 agent = Agent(
     provider=AnthropicProvider(model="claude-haiku-4-5"),
-    prompt="You are a helpful assistant.",
-    skills_dir="./_skills",                    # scan a directory
-    deny_skills=["dangerous-tool"],            # skip some of what you find
-    database_url="sqlite+aiosqlite:///demo.db",
+    prompt="You are a support assistant.",
+    skills=[triage],
 )
 ```
 
-`skills_dir=` walks a directory and loads every subdirectory that contains a `SKILL.md`. `skills=[Skill, ...]` takes pre-built `Skill` objects if you want to load them from a non-filesystem source. You can use both; duplicate names across the two sources raise `ValueError` at construction time.
+The system prompt lists the skill's name and description. When the model decides the skill applies, it calls the built-in `use_skill` tool and receives the body. Nothing else to configure.
 
-`deny_skills=` is the deny-list equivalent for skills: names that get filtered out even if they would otherwise have loaded. See [Access control](/docs/architecture/access-control) for how this relates to the tool-level deny list.
-
-## Progressive disclosure: the catalogue, then the body
-
-A skill body can be hundreds of tokens. If an agent has ten skills, pre-pending all of them to every system prompt would blow the context window and charge for tokens the model may never use. Dendrux avoids that by only exposing the skill catalogue (name + description) in the system prompt. The full body is fetched via a `use_skill` tool when the LLM decides to invoke one.
-
-The system prompt for an agent with one skill loaded, pulled verbatim from a real run:
-
-```text
-You are a helpful assistant.
-
-
-## Available Skills
-
-You have access to the following skills. To use a skill, call the `use_skill` tool with the skill name. The skill's detailed instructions will be returned to you.
-
-- **json-formatter**: Format raw JSON strings into pretty indented output with 2-space indent.
-```
-
-The `use_skill` tool is auto-injected by the agent. You do not declare it. It takes a `name` argument, and its implementation returns the full body of the matching skill as a string. From the agent code:
+### 2. Add files
 
 ```python
-async def _execute_use_skill(self, name: str) -> str:
-    """Execute the use_skill meta-tool — returns skill body.
-
-    Called by the loop when the LLM calls use_skill(name=...).
-    Returns the full Markdown instructions for the skill.
-    """
-    ...
-    for skill in self._loaded_skills:
-        if skill.name == name:
-            return skill.body
-    ...
+triage = Skill(
+    name="ticket-triage",
+    description="Classify a support ticket and pick a priority.",
+    body="# Ticket triage\n\nSee references/policy.md for priority rules.\n",
+    files={
+        "references/policy.md": "P1: outage or data loss. P2: broken feature. P3: question.\n",
+        "assets/escalation-chart.png": open("chart.png", "rb").read(),
+    },
+)
 ```
 
-This is the progressive-disclosure pattern: only pay for the skills the model actually uses, on the turns it uses them.
+Text files become readable through `read_skill_resource`. Binary files are listed for the model but never put in its context. Nothing to execute yet, so no executor is needed.
 
-## The full run lifecycle
+### 3. Add an executor for scripts
 
-A complete example: write a `SKILL.md`, load it with `skills_dir=`, run a prompt that triggers it, and read the skill events back:
+Files under `scripts/` can be run, but only by code you provide. Dendrux never executes a skill script itself.
+
+```python
+agent = Agent(
+    provider=AnthropicProvider(model="claude-haiku-4-5"),
+    prompt="You are a support assistant.",
+    skills=[triage_with_scripts],
+    skill_executor=MyExecutor(),   # you write this; recipes below
+)
+```
+
+Without a `skill_executor`, `run_skill_script` is not offered to the model at all, and a one-time `UserWarning` names the skills whose scripts cannot run.
+
+## What the model sees
+
+Skills reveal themselves in layers, so a skill costs tokens only as the model goes deeper into it.
+
+| Level | What | How it reaches the model | Tool |
+| --- | --- | --- | --- |
+| Catalogue | Name and description of every available skill | System prompt | none |
+| Body | The skill's Markdown instructions, plus a list of its files | Tool result | `use_skill` |
+| Text files | Any non-script file stored as text | Tool result, cut at 50,000 characters | `read_skill_resource` |
+| Scripts | Files under `scripts/` | Never read. Run through your executor; the model gets exit code, stdout and stderr (each cut at 20,000 characters) | `run_skill_script` |
+| Binary files | Files stored as bytes | Listed by name and size, never in context | none |
+
+The three tools are added by Dendrux when skills are attached. You do not declare them, and the names `use_skill`, `read_skill_resource` and `run_skill_script` are reserved (see [Attaching skills](#attaching-skills-to-an-agent)). Each tool is offered only when it could do something: `read_skill_resource` needs at least one readable text file somewhere in the available skills, and `run_skill_script` needs both a script and an executor.
+
+When `use_skill` returns a body, it wraps it in a `skill_content` envelope that also lists the files:
+
+```text
+<skill_content name="ticket-triage" digest="sha256:09059d...">
+# Ticket triage
+
+See references/policy.md for priority rules.
+
+Files (read with read_skill_resource; run scripts with run_skill_script):
+- references/policy.md (text, 62 B)
+- assets/escalation-chart.png (binary, 48 KB, not readable)
+- scripts/priority.py (script)
+</skill_content>
+```
+
+The script lines and the "run scripts" hint only appear when the agent has an executor. The digest identifies the exact content the model was given (see [Resume contract](#resume-contract)).
+
+## Building a skill
+
+A `Skill` is an immutable, validated value. Every construction path checks the same rules and raises `SkillValidationError` (a `ValueError`) naming the field that failed.
+
+### Three ways to make one
+
+```python
+from dendrux import Skill
+
+# 1. Directly, from Python values (database rows, generated content, tests)
+skill = Skill(name="ticket-triage", description="...", body="...")
+
+# 2. From SKILL.md text you already hold, with optional files
+skill = Skill.from_markdown(markdown_text, files={"references/policy.md": "..."})
+
+# 3. From a directory: SKILL.md plus every regular file below it
+skill = Skill.from_dir("./skills/ticket-triage")
+```
+
+`from_markdown` and `from_dir` are strict. Unknown frontmatter keys, non-string values for string fields, and malformed YAML all raise `SkillValidationError`. There is no lenient mode. `from_markdown` strips a UTF-8 byte-order mark and defines the body as the text after the closing `---` line with exactly one leading newline removed; nothing else is stripped.
+
+`from_dir` requires the directory name to equal the skill name. It skips hidden files and directories (names starting with `.`) and rejects symlinks anywhere: the root, `SKILL.md`, or any entry it walks. A file that decodes as strict UTF-8 without a NUL byte becomes text; anything else becomes binary.
+
+`skill.to_markdown()` writes canonical `SKILL.md` text, so a skill built in code can be saved and re-read.
+
+### Fields
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `name` | yes | 1 to 64 characters: lowercase letters, digits and single hyphens (`^[a-z0-9]+(-[a-z0-9]+)*$`) |
+| `description` | yes | 1 to 1,024 non-padding characters (leading and trailing whitespace is ignored for this length check, but the original string is stored). This is all the model sees until it activates the skill, so say when to use it |
+| `body` | no | Markdown instructions, stored exactly as given |
+| `license`, `compatibility` | no | Strings. `compatibility` is at most 500 characters. Use `None`, not an empty string |
+| `metadata` | no | Mapping of string to string |
+| `allowed_tools` | no | Frontmatter `allowed-tools` as a tuple of names. Stored for your use, not enforced by Dendrux |
+| `files` | no | Mapping of path to text or bytes. See below |
+| `revision` | no | Your label for this version of the skill, at most 256 characters, no control characters |
+| `path` | no | Where it was loaded from. Provenance only |
+
+> `revision` is public audit metadata, not a secret. It is copied into run metadata and into event payloads. Never put credentials, customer data, or internal-only identifiers in it.
+
+### Files
+
+`files` maps a relative path to its content:
+
+- A `str` value is a **text file**. The model can read it.
+- A `bytes` value is a **binary file**. The model sees its name and size and can never read it.
+- Any path starting with `scripts/` is a **script**, whatever its content type. Scripts can be run through the executor and can never be read into context.
+
+Paths must be relative POSIX paths: `/` separators only, no leading `/`, no backslash, no `.` or `..` or empty segments, no ASCII control characters (`U+0000` to `U+001F` or `U+007F`), none of `<`, `>` or `"`, at most 512 characters, and not `SKILL.md` (the body lives in `body`). A bad path raises `SkillValidationError`. At runtime the model's path argument is matched against these keys as plain strings; it is never joined onto a filesystem path, so a hostile path cannot escape the package.
+
+Dendrux holds the package in memory. It builds one read-only bytes mapping per run and shares that mapping across executor calls; it is not copied per call. There is no hard size cap. If UTF-8 body bytes plus file bytes exceed 5 MiB (generated `SKILL.md` frontmatter is not counted), construction emits one `UserWarning`. Keep large data outside the skill and have a script fetch it.
+
+### Digest
+
+Every skill has a content digest, `skill.digest`, formatted `sha256:<hex>`. It covers the name, description, body, license, compatibility, allowed tools, metadata, and every file with its text-or-binary kind. It does not cover `revision` or `path`. Two skills built different ways but with identical content have the same digest, and the digest is stable across processes.
+
+## Attaching skills to an agent
+
+```python
+agent = Agent(
+    provider=...,
+    prompt="You are a helpful assistant.",
+    skills=[triage],                 # Skill values you built
+    skills_dir="./skills",           # and/or a directory of skill folders
+    deny_skills=["experimental"],    # filter out names from either source
+    skill_executor=MyExecutor(),     # only needed for scripts
+)
+```
+
+- `skills=[...]` takes `Skill` objects from any source.
+- `skills_dir=` scans a directory and loads each subfolder that contains a `SKILL.md`. It is read lazily, the first time a run needs the skills, not when the `Agent` is constructed. Duplicate names across `skills=` and `skills_dir=` raise `ValueError`, an invalid skill raises `SkillValidationError`, and a missing directory raises `FileNotFoundError`, all at that point. Call `agent.refresh()` to rescan.
+- `deny_skills=[...]` removes the named skills from the run. They are still read from disk and validated first, then filtered out. Denied names are listed in the `skill.catalog_resolved` event.
+- `skill_executor=` takes one `SkillExecutor` for the whole agent (see [Running scripts](#running-scripts)).
+
+The names `use_skill`, `read_skill_resource` and `run_skill_script` are reserved whenever skills are configured. A local `@tool` with one of those names raises `ValueError` at construction. An MCP tool that exposes one of them raises `MCPToolNameCollisionError` at discovery.
+
+Skill state is per run, never per agent. One `Agent` can serve many concurrent runs, and activating a skill in one run never makes its files or scripts available in another.
+
+## Activation
+
+A skill's body and files are available to the model only after the skill is **activated** in that run. There are two ways.
+
+### Model-driven
+
+In a ReAct loop the model calls `use_skill` with a skill name. Dendrux checks the name against the available set (the tool's `name` argument is an enum of those names), activates the skill, and returns the envelope. Calling `use_skill` on an already-active skill returns a short "already active" message and emits no second event. An unknown or denied name returns an error result and emits `skill.activation_failed`.
+
+`read_skill_resource` and `run_skill_script` refuse a skill that is not active in the run. The `use_skill` and `read_skill_resource` calls can arrive in the same model response: `use_skill` runs first (it never runs in parallel with other calls), so the read in the same response succeeds.
+
+### Explicit: `activate_skills`
+
+If your application already knows which skill applies, activate it before the first model call and save a round trip:
+
+```python
+result = await agent.run(
+    "Triage this ticket: the export button does nothing.",
+    activate_skills=["ticket-triage"],
+)
+
+async with agent.stream(
+    "Triage this ticket: the export button does nothing.",
+    activate_skills=["ticket-triage"],
+) as stream:
+    async for event in stream:
+        ...
+```
+
+`activate_skills` is accepted on `Agent.run` and `Agent.stream`. It is not accepted on resume or submit methods; a resumed run keeps whatever it had activated.
+
+Unknown or denied names raise `ValueError` immediately, before any run row exists. On `stream`, the error is raised when you call `stream(...)`, not delivered later as a `RUN_ERROR` event. Duplicates are collapsed and order is kept.
+
+The bodies travel in the run's first user message, ahead of any context blocks and your input, in the order you listed them:
+
+```text
+<skill_content name="first" digest="sha256:...">...</skill_content>
+
+<skill_content name="second" digest="sha256:...">...</skill_content>
+
+[context blocks, if any]
+
+[your user input]
+```
+
+The trace keeps your raw input as the message content and records the exact wire text in its metadata. Each explicit name produces a `skill.activated` event with `origin: "explicit"`. The explicit list is saved in the run's skill manifest and is part of the idempotency fingerprint: the same idempotency key with a different `activate_skills`, a different skill digest, or a different available set is a different request.
+
+`agent.retry(run_id)` keeps the source run's explicit activations. It rebuilds the first user message from the raw trace, so blocks are never duplicated, and raises `ValueError` before creating a row if an inherited skill is no longer attached. Retry also checks that the source run belongs to the calling tenant.
+
+> The activation envelope is model-facing framing, not a security boundary. The text inside it is instruction content the model reads like any other. Dendrux enforces what a skill can reach in code (which names are active, which paths exist, whether a script may run), never through the envelope. Attach only skill content you trust, and never build a skill body from untrusted input.
+
+## Running scripts
+
+A script is any file under `scripts/`. When the model calls `run_skill_script`, Dendrux validates the call and hands it to your executor. The executor decides how, where and with what isolation the script runs.
+
+### The contract
+
+```python
+from dendrux import SkillExecutionRequest, SkillExecutionResult, SkillExecutor
+
+
+class MyExecutor(SkillExecutor):
+    timeout_seconds = 120.0   # optional, default 300
+
+    async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
+        ...
+        return SkillExecutionResult(stdout="...", stderr="", exit_code=0)
+```
+
+Subclass `SkillExecutor` and implement one `async def execute`. Passing anything else, or a synchronous `execute`, raises `TypeError` when the `Agent` is built. `timeout_seconds` must be a finite number greater than zero or construction raises `ValueError`. Dendrux ships no executor subclasses; running code is a decision for your deployment.
+
+One executor serves every skill on the agent. Route on `request.skill_name` if different skills need different environments.
+
+`SkillExecutionRequest` is immutable and carries:
+
+| Field | Meaning |
+| --- | --- |
+| `run_id`, `tool_call_id` | Identify the run and the model's call, for logging and idempotency |
+| `skill_name`, `revision`, `digest` | Which skill, your label for it, and its content digest |
+| `script_path` | The script to run, for example `scripts/priority.py` (already validated) |
+| `args` | Tuple of argument strings from the model: at most 64, each at most 4,096 characters |
+| `files` | Read-only mapping of path to bytes for the whole package, including `SKILL.md`. Text files are UTF-8 encoded. Built once per run and shared, not copied per call |
+
+`SkillExecutionResult` has `stdout`, `stderr` (both strings, default empty) and `exit_code` (an integer, default 0).
+
+### What Dendrux does and what you own
+
+| Dendrux | You |
+| --- | --- |
+| Checks the skill is active, the path exists and is under `scripts/`, and `args` has the right shape, before anything runs | Choosing where code runs: a container, a microVM, a remote sandbox, a subprocess |
+| Applies `deny` and `require_approval` to `run_skill_script` | Isolation: filesystem, network, credentials, CPU and memory limits |
+| Wraps your `execute` in `timeout_seconds` | Killing the process or sandbox when `execute` is cancelled |
+| Returns exit code, stdout and stderr to the model (each stream cut at 20,000 characters) and marks a non-zero exit as a tool error | Deciding which interpreters and file types you support |
+| Emits `skill.script_requested`, `skill.script_completed` and `skill.script_failed` with sizes and timing, never contents | Cleaning up temporary files and sandboxes |
+| Records the call, parameters and result like any tool call | Keeping secrets out of what scripts print |
+
+Failures never stop the run. A non-zero exit code, a timeout, an exception from `execute`, or a return value that is not a `SkillExecutionResult` comes back to the model as an error tool result and the model can react. The last three also emit `skill.script_failed`: `error_type` is `timeout` only when Dendrux's `timeout_seconds` expires (an `asyncio.TimeoutError` your own code raises is labelled by its exception type, like any other exception), and `invalid_result` when `execute` returns something else. A real task cancellation (`asyncio.CancelledError`) is different: it propagates unchanged.
+
+Files a script creates stay in the executor's environment. Dendrux returns only stdout, stderr and the exit code to the model and records nothing else. If the user or a later step needs an output file, the executor uploads it to your storage (and can print a reference), or keeps a per-run sandbox keyed by `request.run_id`; cleanup is yours. Resume does not restore files.
+
+### Approvals and deny
+
+The three skill tools can be named in `deny` and `require_approval` like any other tool, even on an agent with no other tools:
+
+```python
+agent = Agent(
+    provider=...,
+    prompt="...",
+    skills=[triage_with_scripts],
+    skill_executor=MyExecutor(),
+    require_approval=["run_skill_script"],   # pause for a human before any script runs
+    deny=["read_skill_resource"],            # or forbid a tool entirely
+)
+```
+
+Script runs need no approval by default. For skills you did not write yourself, require it.
+
+Dendrux checks the call before it asks for approval. A script call for a skill that is not active, or with a bad path, comes back as an error and does not pause the run; you are only asked to approve calls that could actually run. `skill.script_requested` is emitted after those checks and before the pause. When an approved call resumes, the checks run again against the current `deny` list, then the script runs.
+
+`deny=["use_skill"]` turns off model-driven activation. The catalogue is dropped from the system prompt and `use_skill` is not offered. `read_skill_resource` and `run_skill_script` are still offered, but only for skills you activated with `activate_skills`, and their `skill` argument lists only those names.
+
+### Cancellation
+
+`agent.cancel_run(run_id)` is cooperative: it sets a flag the loop checks between iterations. It does not interrupt a script that is already running, exactly as with every other tool. The script finishes (or times out), and the run is cancelled at the next checkpoint.
+
+Cancelling the asyncio task that is driving the run, or the task spawned for a `submit_*` call, delivers a real `CancelledError` into `execute`. Write your executor so that it cleans up when that happens (kill the process, delete the sandbox). Dendrux does not catch it.
+
+## Resume contract
+
+A run that pauses (for client tools, human input or approval) may resume hours later in a different process with a freshly built `Agent`. Dendrux makes sure it resumes with the same skills.
+
+When a run is created, Dendrux stores a manifest in the run's metadata under `dendrux.skills`: the delivery mode, each available skill's name, revision and digest, and the explicit activation list. No schema migration is involved. Before any continuation claims the run, it checks the manifest against the skills on the agent that is resuming:
+
+- A skill in the manifest that the agent does not have raises `SkillMissingError`.
+- A skill that is attached but whose digest changed raises `SkillMismatchError`.
+- Extra skills on the new agent are ignored. The run keeps using exactly the manifest set.
+- Runs created before this feature have no manifest and are not checked.
+
+Both errors extend `SkillContinuityError` and carry `run_id`, `missing` (sorted names) and `mismatched` (a tuple of `SkillDigestMismatch` with `name`, `expected_digest` and `actual_digest`). They live in `dendrux.errors`. The check covers `resume`, `resume_stream`, `submit_tool_results`, `submit_input` and `submit_approval`, approve or reject. A failed check does not claim the run: it stays in its paused status, so you can attach the right content and try again. `resume_stream` reports the failure as a terminal `RUN_ERROR` event with `error_type` set to `"SkillMissingError"` or `"SkillMismatchError"`, because that method never raises.
+
+```python
+from dendrux.errors import SkillMismatchError, SkillMissingError
+
+try:
+    result = await agent.submit_approval(run_id, approved=True)
+except SkillMissingError as exc:
+    print("attach these skills:", exc.missing)
+except SkillMismatchError as exc:
+    for m in exc.mismatched:
+        print(m.name, "expected", m.expected_digest, "got", m.actual_digest)
+```
+
+What this means for you: **keep old versions of skills retrievable for as long as runs that used them can still be paused.** If your skills come from a database, store the content (or at least a way to rebuild it) per `revision`, and when a paused run needs resuming, load the version recorded in its manifest. Use `revision` as the lookup key; it is the label you chose, and the manifest records it next to the digest. There is no escape hatch that resumes with changed content.
+
+The set of skills a run has already activated is rebuilt on resume from the explicit list plus the successful `use_skill` calls in the run's history. Activations survive the pause.
+
+## SingleCall
+
+A SingleCall agent makes exactly one model call, so it cannot go through a catalogue and a tool round trip. Skills are delivered inline instead:
+
+| Case | Behavior |
+| --- | --- |
+| Instruction-only skills | Every body is written into the system prompt, sorted by name. No tools are offered |
+| A skill with any files | `ValueError`. Raised at construction for `skills=`, at run preparation for `skills_dir=`, and when you pass `loop=SingleCall()` to a run |
+| `activate_skills` | Names are validated, but the prompt does not change; all skills are already inline |
+| Events | One `skill.activated` per skill at run start: `origin: "explicit"` if named in `activate_skills`, otherwise `origin: "inlined"` |
+
+Inlining happens when the system prompt is built for a run, not when the agent is constructed. A one-time `UserWarning` reports the rendered prompt size so you notice when bodies grow. Use a ReAct loop when you have many skills and want to pay only for the ones used.
+
+## Events
+
+Skills write seven governance events to `run_events`. Their payloads carry names, paths, counts and timings, never skill bodies, script arguments, file content, stdout or stderr.
+
+| Event | Fires | Payload |
+| --- | --- | --- |
+| `skill.catalog_resolved` | Once at run start, when skills are configured | `delivery` (`progressive` or `inlined`), `skills` (name, revision, digest for each), `denied` (names) |
+| `skill.activated` | A skill's body was delivered | `name`, `digest`, `origin` (`model`, `explicit` or `inlined`) |
+| `skill.activation_failed` | `use_skill` named an unknown or denied skill | `name`, `reason` (`not_found` or `denied`) |
+| `skill.resource_read` | `read_skill_resource` succeeded | `name`, `path`, `chars`, `truncated` |
+| `skill.script_requested` | A script call passed the checks, before any approval | `name`, `path`, `argc` |
+| `skill.script_completed` | The executor returned, whatever the exit code | `name`, `path`, `exit_code`, `duration_ms`, `stdout_chars`, `stderr_chars`, `truncated` |
+| `skill.script_failed` | Dendrux's timeout expired, `execute` raised, `execute` returned something other than a `SkillExecutionResult`, or an approved script resumed on an agent with no executor | `name`, `path`, `error_type` (`timeout`, the exception class name, `invalid_result`, or `executor_unavailable`) |
+
+> These replace the earlier `skill.registered`, `skill.denied` and `skill.invoked` events. If you filter on those names, switch to `skill.catalog_resolved` (which lists denied names), `skill.activated` and `skill.activation_failed`. A query on the `skill.` prefix keeps working.
+
+A run that activates a skill, reads a file and runs a script looks like this in `run_events`:
+
+```text
+seq=0   run.started
+seq=1   skill.catalog_resolved  delivery=progressive, skills=[ticket-triage ...], denied=[]
+seq=2   llm.completed           (model calls use_skill)
+seq=3   skill.activated         name=ticket-triage, origin=model
+seq=4   tool.completed          tool_name=use_skill
+seq=5   llm.completed           (model calls read_skill_resource)
+seq=6   skill.resource_read     path=references/policy.md, chars=62, truncated=false
+seq=7   tool.completed
+seq=8   llm.completed           (model calls run_skill_script)
+seq=9   skill.script_requested  path=scripts/priority.py, argc=1
+seq=10  skill.script_completed  exit_code=0, duration_ms=17, stdout_chars=16
+seq=11  tool.completed
+seq=12  llm.completed
+seq=13  run.completed
+```
+
+The tool calls themselves, including their parameters and the results the model saw, are in `tool_calls` and the message traces like any other tool. The skill tools skip `tool_result_transform`: your transform never sees skill bodies or script output.
+
+## Recipes
+
+Dendrux does not run skill scripts. These two executors show the shape; adapt them to your environment.
+
+### Local subprocess
+
+> This executor runs code on your machine, with your user's permissions, files and network access. Use it only for skills you wrote or have reviewed. For anything else, use a sandbox.
 
 ```python
 import asyncio
+import contextlib
+import os
+import signal
+import sys
+import tempfile
 from pathlib import Path
 
-from dendrux import Agent
-from dendrux.llm.anthropic import AnthropicProvider
-from dendrux.store import RunStore
+from dendrux import SkillExecutionRequest, SkillExecutionResult, SkillExecutor
 
-# 1. A skill on disk: _skills/json-formatter/SKILL.md
-skill_dir = Path("_skills/json-formatter")
-skill_dir.mkdir(parents=True, exist_ok=True)
-(skill_dir / "SKILL.md").write_text(
-    "---\n"
-    "name: json-formatter\n"
-    "description: Format raw JSON strings into pretty indented output with 2-space indent.\n"
-    "---\n\n"
-    "# JSON Formatter\n\n"
-    "When asked to format JSON, parse it and re-emit with 2-space indent.\n"
-)
+INTERPRETERS = {".py": sys.executable, ".sh": "/bin/sh"}
 
 
-async def main() -> None:
-    url = "sqlite+aiosqlite:///skills.db"
+class LocalSubprocessExecutor(SkillExecutor):
+    """Runs skill scripts as subprocesses on this machine. Trusted skills only."""
 
-    async with Agent(
-        name="Helper",
-        provider=AnthropicProvider(model="claude-haiku-4-5"),
-        prompt="You are a helpful assistant.",
-        skills_dir="_skills",
-        database_url=url,
-    ) as agent:
-        result = await agent.run('Please format this JSON for me: {"b": 2, "a": 1}')
+    timeout_seconds = 60.0
 
-    store = RunStore.from_database_url(url)
-    async with store:
-        print([e.event_type for e in await store.get_events(result.run_id)])
-        # ['run.started', 'skill.registered', 'llm.completed', 'tool.completed',
-        #  'skill.invoked', 'llm.completed', 'run.completed']
+    async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
+        with tempfile.TemporaryDirectory(prefix="skill-") as tmp:
+            root = Path(tmp)
+            for path, content in request.files.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
 
+            script = root / request.script_path
+            interpreter = INTERPRETERS.get(script.suffix)
+            if interpreter is None:
+                return SkillExecutionResult(
+                    stderr=f"Unsupported script type: {script.suffix}", exit_code=126
+                )
 
-asyncio.run(main())
+            proc = await asyncio.create_subprocess_exec(
+                interpreter,
+                str(script),
+                *request.args,
+                cwd=root,
+                env={"PATH": os.environ.get("PATH", "")},  # no inherited secrets
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group, so we can kill descendants too
+            )
+            try:
+                stdout, stderr = await proc.communicate()
+            except BaseException:  # timed out or the task was cancelled
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
+                raise
+
+            return SkillExecutionResult(
+                stdout=stdout.decode(errors="replace"),
+                stderr=stderr.decode(errors="replace"),
+                exit_code=proc.returncode or 0,
+            )
 ```
 
-The captured timeline below adds a second, denied skill (`deny_skills=["dangerous-tool"]`) to also show `skill.denied`:
+On POSIX, `start_new_session=True` plus `killpg` terminates the subprocess group when timeout or task cancellation interrupts `communicate()`. A deliberately detached descendant can still escape; this remains a trusted-code-only executor.
 
-```text
-run_events:
-  [lifecycle] seq=0  run.started
-  [SKILL]     seq=1  skill.registered  data={"skill_name": "json-formatter", "description": "..."}
-  [SKILL]     seq=2  skill.denied      data={"skill_name": "dangerous-tool", "reason": "denied_by_policy"}
-  [lifecycle] seq=3  llm.completed     (model decides to call use_skill)
-  [lifecycle] seq=4  tool.completed    data={"tool_name": "use_skill", "success": true}
-  [SKILL]     seq=5  skill.invoked     data={"skill_name": "json-formatter"}
-  [lifecycle] seq=6  llm.completed     (model formats the JSON using the fetched instructions)
-  [lifecycle] seq=7  run.completed
+### E2B sandbox (sketch)
 
-tool_calls:
-  use_skill  params={"name": "json-formatter"}  result="# JSON Formatter\n\nWhen asked to format JSON..."
+A hosted sandbox keeps untrusted code off your machine. This sketch uses the E2B Python SDK (`pip install e2b`); check its documentation for the current method names and options, which may differ from what is shown.
+
+```python
+import shlex
+
+from e2b import AsyncSandbox
+
+from dendrux import SkillExecutionRequest, SkillExecutionResult, SkillExecutor
+
+
+class E2BExecutor(SkillExecutor):
+    """Runs each script in a fresh sandbox. Sketch: adapt to your E2B setup."""
+
+    timeout_seconds = 120.0
+
+    async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
+        sandbox = await AsyncSandbox.create(timeout=int(self.timeout_seconds) + 30)
+        try:
+            root = f"/home/user/{request.skill_name}"
+            for path, content in request.files.items():
+                await sandbox.files.write(f"{root}/{path}", content)
+
+            command = "python " + " ".join(
+                shlex.quote(part) for part in (request.script_path, *request.args)
+            )
+            try:
+                done = await sandbox.commands.run(command, cwd=root, timeout=self.timeout_seconds)
+            except Exception as exc:  # the SDK raises on a non-zero exit code
+                if not hasattr(exc, "exit_code"):
+                    raise
+                return SkillExecutionResult(
+                    stdout=exc.stdout, stderr=exc.stderr, exit_code=exc.exit_code
+                )
+            return SkillExecutionResult(
+                stdout=done.stdout, stderr=done.stderr, exit_code=done.exit_code
+            )
+        finally:
+            await sandbox.kill()  # runs on timeout and on task cancellation too
 ```
 
-Three moments worth calling out:
-
-1. **`skill.registered` fires at boot, before the LLM runs.** Every loaded skill gets one event. A reader scanning a run's events sees the full set of skills the agent started with, not just the ones the model ended up invoking.
-2. **`skill.denied` fires for filtered names.** The denied skill's body is never loaded into memory, never available to `use_skill`, and never counted in the catalogue. But the attempted denial is recorded, which is the right audit shape for a negative decision.
-3. **`skill.invoked` is separate from `tool.completed`.** The same iteration produces both: `tool.completed` is the generic tool-execution event (applies to `use_skill` like any other tool), and `skill.invoked` is the governance-layer event that names which skill was pulled. This separation lets a dashboard filter skill activity (`WHERE event_type = 'skill.invoked'`) without joining through tool-call rows.
-
-## Why a tool, not a prompt injection
-
-A different design would inject the full skill body into the system prompt whenever the LLM's recent messages mention keywords from the skill description. Progressive disclosure would be emergent from keyword triggering.
-
-That design is fragile for two reasons:
-
-1. **Keyword triggering is a guess.** Which messages count? How recent is recent? What keywords? Every answer is either too loose (bodies get injected unnecessarily) or too tight (the model never gets the instructions it needs).
-2. **Invocation is not auditable.** If skills get silently injected, the audit log cannot say "the model invoked this skill." All the runtime knows is "text appeared in the prompt; hopefully the model saw it."
-
-Routing skill invocation through an explicit tool makes the decision first-class. The model makes the call; the runtime records `skill.invoked`; the body comes back as a tool result the same way any other tool result does. Every part of the runtime that already handles tool calls (notifiers, recorder, governance) handles skills without special-casing.
-
-## Inlined skill mode (SingleCall)
-
-Progressive disclosure requires at least two LLM turns: one to call `use_skill`, one to act on the body it returns. SingleCall is allowed exactly one LLM call. The two cannot coexist.
-
-So when an agent is configured with both `loop=SingleCall()` and skills, Dendrux switches delivery: every skill body is rendered into the system prompt at construction time, sorted alphabetically. The `use_skill` tool is not injected — there's nothing for it to do, and SingleCall is by contract a zero-tool loop. The same `deny_skills` filter applies.
-
-The architectural rule:
-
-> In SingleCall, skills are static prompt context.  
-> In ReAct, skills are dynamically discoverable capabilities.
-
-A `UserWarning` fires once at the first prompt build, naming the rendered character count, so devs notice when inlined bodies start to bloat the prompt:
-
-```text
-UserWarning: Agent 'chat-participant': SingleCall + 2 skill(s) → inlined skill mode.
-Skill bodies are rendered into the system prompt at every turn (no progressive
-disclosure with one LLM call). Rendered system prompt is 1843 characters.
-Switch to ReActLoop for tool-mediated disclosure.
-```
-
-When to pick which:
-
-- **Multi-skill chatbot, dev pre-selects which skills attach per participant** — SingleCall + inlined. No round-trip cost, predictable single-call latency, the dev's skill choice acts as the disclosure decision.
-- **Agent with many skills the LLM should pick from** — ReActLoop + tool-mediated. Pay the second-call cost only when a skill is actually used.
-
-`SingleCall + tools` remains rejected. Tool execution is inherently multi-turn (LLM emits a call, loop runs it, LLM sees the result) and has no inline alternative the way skill content does.
-
-> **Bundled resources are not yet supported.** A skill today is a Markdown body only — sibling files in the skill directory are not read. When a future sprint adds bundled-script execution, those skills will require a tool layer and will not be inlinable on SingleCall.
+Points worth copying even if you use a different sandbox: create or reuse an environment per run (`request.run_id`), upload `request.files` as bytes, quote every argument, translate a non-zero exit into a result instead of letting it raise, and always tear the environment down in `finally`.
 
 ## Where this fits
 
-- Declared on `Agent(skills_dir=..., skills=[...], deny_skills=[...])`.
-- Loaded by `dendrux.skills._loader.Skill.scan_dir` and explicit `Skill` objects.
-- Exposed via `get_system_prompt()` — catalogue (ReAct) or full bodies (SingleCall, inlined).
-- ReAct: invoked via the auto-injected `use_skill` tool, dispatched through the normal tool pipeline.
-- Emits `skill.registered`, `skill.denied`, and `skill.invoked` events on `run_events` (the third only fires in ReAct, where the model invokes a skill mid-loop).
+- Public types: `Skill`, `SkillExecutor`, `SkillExecutionRequest`, `SkillExecutionResult` from `dendrux` (also `dendrux.skills`). Errors `SkillValidationError`, `SkillMissingError`, `SkillMismatchError`, `SkillContinuityError` and `SkillDigestMismatch` from `dendrux.errors`.
+- Declared on `Agent(skills=..., skills_dir=..., deny_skills=..., skill_executor=...)`. Per-run activation on `agent.run(..., activate_skills=[...])` and `agent.stream(...)`.
+- Governed by the same `deny` and `require_approval` as other tools, under the names `use_skill`, `read_skill_resource` and `run_skill_script`. See [Access control](/docs/architecture/access-control) and [Approval](/docs/architecture/approval).
+- Resume safety builds on [Pause and resume](/docs/architecture/pause-resume).
+- Skills and the tools they add change the system prompt and tool definitions, which are part of the [prompt cache](/docs/architecture/prompt-cache) prefix and the [run replay](/docs/recipes/run-replay) prefix check.

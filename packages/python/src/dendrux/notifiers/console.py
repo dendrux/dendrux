@@ -293,23 +293,15 @@ class ConsoleNotifier(BaseNotifier):
             _console.print(
                 f"  [bright_red]  guard[/bright_red]  [bold]blocked[/bold] [dim]{error}[/dim]"
             )
-        elif event_type == _GovType.SKILL_REGISTERED:
-            skill_name = data.get("skill_name", "")
-            _console.print(
-                f"  [bright_green]  skill[/bright_green]  "
-                f"[bold]{skill_name}[/bold] [dim]registered[/dim]"
+        elif str(event_type).startswith("skill."):
+            label = str(event_type).removeprefix("skill.").replace("_", " ")
+            from rich.markup import escape
+
+            name = escape(
+                str(data.get("name", ", ".join(s["name"] for s in data.get("skills", []))))
             )
-        elif event_type == _GovType.SKILL_DENIED:
-            skill_name = data.get("skill_name", "")
             _console.print(
-                f"  [bright_yellow]  skill[/bright_yellow]  "
-                f"[bold]{skill_name}[/bold] [dim]denied[/dim]"
-            )
-        elif event_type == _GovType.SKILL_INVOKED:
-            skill_name = data.get("skill_name", "")
-            _console.print(
-                f"  [bright_cyan]  skill[/bright_cyan]  "
-                f"[bold]{skill_name}[/bold] [dim]invoked[/dim]"
+                f"  [bright_cyan]  skill[/bright_cyan]  [bold]{name}[/bold] [dim]{label}[/dim]"
             )
         elif event_type == _GovType.MCP_CONNECTED:
             source = data.get("source_name", "")

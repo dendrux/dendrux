@@ -60,7 +60,6 @@ from dendrux.types import (
     Budget,
     Clarification,
     Finish,
-    GovernanceEventType,
     LLMResponse,
     Message,
     PauseState,
@@ -360,7 +359,9 @@ async def _init_loop_state(
     if initial_history is not None:
         history = list(initial_history)
     else:
-        user_msg = Message(role=Role.USER, content=user_input)
+        from dendrux.context_blocks import wire_user_input
+
+        user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
         history = [user_msg]
         await _record_message(recorder, run_id, user_msg, 0)
         await _notify_message(notifier, run_id, user_msg, 0)
@@ -413,6 +414,7 @@ async def _process_tool_calls(
     require_approval: frozenset[str] | None = None,
     guardrail_engine: GuardrailEngine | None = None,
     tool_result_transform: ToolResultTransform | None = None,
+    approved_skills: bool = False,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -422,6 +424,21 @@ async def _process_tool_calls(
 
     Side effects: mutates call_counts, appends to history, records then notifies.
     """
+    from dendrux.skills._session import SkillTool
+
+    session = next((fn.session for fn in lookups.fn.values() if isinstance(fn, SkillTool)), None)
+    if session is not None:
+        session.run_id = run_id
+
+        async def skill_sink(event: str, data: dict[str, Any], call_id: str | None) -> None:
+            await _record_governance(
+                recorder, run_id, event, iteration, data, correlation_id=call_id
+            )
+            await _notify_governance(
+                notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
+            )
+
+        session.sink = skill_sink
     all_calls: list[ToolCall] = step.meta.get("all_tool_calls", [step.action])
     all_results: list[tuple[ToolCall, ToolResult]] = []
     deny_set = deny or frozenset()
@@ -433,6 +450,14 @@ async def _process_tool_calls(
     parsed_calls: list[ToolCall] = []
     for tc in all_calls:
         json_result = check_tool_json(tc)
+        if (
+            json_result is None
+            and session is not None
+            and isinstance(lookups.fn.get(tc.name), SkillTool)
+        ):
+            json_result = check_tool_call(tc, lookups.defs.get(tc.name))
+            if json_result is not None and tc.name == "use_skill":
+                await session.preflight(tc)
         if json_result is None:
             parsed_calls.append(tc)
             continue
@@ -495,6 +520,36 @@ async def _process_tool_calls(
                         id=tc.id,
                         provider_tool_call_id=tc.provider_tool_call_id,
                     )
+
+    # Preflight before approval. Earlier valid activation barriers in this batch
+    # may satisfy reads; execution rechecks against actual successful activations.
+    if session is not None:
+        ready: list[ToolCall] = []
+        anticipated: set[str] = set()
+        for tc in non_denied:
+            failure = (
+                await session.preflight(
+                    tc,
+                    requested=not approved_skills,
+                    anticipated=anticipated,
+                    approved=approved_skills,
+                )
+                if isinstance(lookups.fn.get(tc.name), SkillTool)
+                else None
+            )
+            if failure is None:
+                ready.append(tc)
+                if tc.name == "use_skill" and isinstance(lookups.fn.get(tc.name), SkillTool):
+                    anticipated.add(tc.params["name"])
+                continue
+            result_msg = strategy.format_tool_result(failure)
+            history.append(result_msg)
+            await _record_tool(recorder, run_id, tc, failure, iteration)
+            await _notify_tool(notifier, run_id, tc, failure, iteration, warnings)
+            await _record_message(recorder, run_id, result_msg, iteration)
+            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
+            all_results.append((tc, failure))
+        non_denied = ready
 
     # --- Phase 1: Approval check (governance) ---
     approval_set = require_approval or frozenset()
@@ -621,25 +676,6 @@ async def _process_tool_calls(
         await _record_message(recorder, run_id, result_msg, iteration)
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
         all_results.append((tc, tool_result))
-
-        # Emit skill.invoked governance event when LLM activates a skill
-        if tc.name == "use_skill" and tool_result.success:
-            skill_name = (tc.params or {}).get("name", "")
-            await _record_governance(
-                recorder,
-                run_id,
-                GovernanceEventType.SKILL_INVOKED,
-                iteration,
-                {"skill_name": skill_name},
-            )
-            await _notify_governance(
-                notifier,
-                run_id,
-                GovernanceEventType.SKILL_INVOKED,
-                iteration,
-                {"skill_name": skill_name},
-                warnings=warnings,
-            )
 
     return _ToolCallOutcome(all_results=all_results, pending_calls=pending_calls)
 
@@ -1641,6 +1677,8 @@ async def _execute_tool(
     store, notifiers and the model all see the transformed result.
     A transform that raises fails the call.
     """
+    from dendrux.skills._session import SkillTool
+
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
         return ToolResult(
@@ -1650,6 +1688,9 @@ async def _execute_tool(
             success=False,
             error=f"Unknown tool: {tool_call.name}",
         )
+
+    if isinstance(fn, SkillTool):
+        return await fn.session.execute(tool_call)
 
     timeout_s = lookups.timeout.get(tool_call.name, DEFAULT_TOOL_TIMEOUT)
     is_explicit = lookups.explicit_timeout.get(tool_call.name, False)

@@ -25,7 +25,13 @@ from typing import TYPE_CHECKING, Any, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import normalize_chat_history
-from dendrux.context_blocks import ContextBlock, fold_context, render_band, validate_context
+from dendrux.context_blocks import (
+    ContextBlock,
+    fold_context,
+    render_band,
+    validate_context,
+    wire_user_input,
+)
 from dendrux.loops._helpers import (
     notify_message,
     notify_run_failed,
@@ -39,6 +45,7 @@ from dendrux.loops._helpers import (
 from dendrux.loops.react import ReActLoop
 from dendrux.runtime.context import (
     DelegationContext,
+    StreamContext,
     get_delegation_context,
     get_store_identity,
     reset_delegation_context,
@@ -59,6 +66,8 @@ from dendrux.runtime.replay import (
     user_trace_message,
     validate_replay_args,
 )
+from dendrux.skills._session import META_KEY, SkillSession, continuation, current
+from dendrux.skills._session import current as current_skill_session
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
@@ -76,7 +85,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 
     from dendrux.agent import Agent
     from dendrux.chat import ChatMessage
@@ -196,8 +205,7 @@ async def _emit_init_events(
     ``resolved_loop`` is forwarded to ``agent.get_tool_lookups()`` so
     MCP discovery + use_skill injection respect a runtime loop override.
 
-    Skills: reads agent._loaded_skills / agent._denied_skill_names
-    (populated by get_system_prompt()).
+    Skills: reads the bound run session, established before prompt resolution.
 
     MCP: if agent._tool_sources is non-empty, forces discovery via
     get_tool_lookups(), then groups discovered tools by their
@@ -205,25 +213,14 @@ async def _emit_init_events(
     Discovery failures are wrapped in _MCPDiscoveryError so callers
     can distinguish them from skill emission failures.
     """
-    # Skill events
-    if agent._loaded_skills:
-        for skill in agent._loaded_skills:
-            await _emit_init_governance_event(
-                recorder,
-                notifier,
-                run_id,
-                GovernanceEventType.SKILL_REGISTERED,
-                {"skill_name": skill.name, "description": skill.description},
-            )
-    if agent._denied_skill_names:
-        for name in agent._denied_skill_names:
-            await _emit_init_governance_event(
-                recorder,
-                notifier,
-                run_id,
-                GovernanceEventType.SKILL_DENIED,
-                {"skill_name": name, "reason": "denied_by_policy"},
-            )
+    session = current(agent) or SkillSession.prepare(agent, loop=resolved_loop)
+    session.run_id = run_id
+
+    async def skill_sink(event: str, data: dict[str, Any], call_id: str | None) -> None:
+        await _emit_init_governance_event(recorder, notifier, run_id, event, data)
+
+    session.sink = skill_sink
+    await session.start()
 
     if not agent._tool_sources and mcp_meta is not None:
         mcp_meta["mcp_skipped_sources"] = []
@@ -644,6 +641,7 @@ async def run(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    activate_skills: Sequence[str] | None = ...,
     runs: list[str] | None = ...,
     replay_last: ReplayLast = ...,
     replay_reasoning: bool = ...,
@@ -668,6 +666,7 @@ async def run(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    activate_skills: Sequence[str] | None = ...,
     runs: list[str] | None = ...,
     replay_last: ReplayLast = ...,
     replay_reasoning: bool = ...,
@@ -690,6 +689,7 @@ async def run(
     user_input: str,
     history: list[ChatMessage] | None = None,
     context: list[ContextBlock] | None = None,
+    activate_skills: Sequence[str] | None = None,
     runs: list[str] | None = None,
     replay_last: ReplayLast = 0,
     replay_reasoning: bool = True,
@@ -749,320 +749,335 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
-    # Validate + resolve depth early — before any side effects.
-    # _resolve_max_delegation_depth is a pure policy helper; side effect
-    # is limited to dedup warning state on parent_ctx.warned_mismatches.
-    parent_ctx = get_delegation_context()
-    effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
-
-    resolved_strategy = strategy or NativeToolCalling()
-    resolved_loop = loop or agent.loop or ReActLoop()
-    _validate_loop_skill_compat(agent, resolved_loop)
-
-    # Validate + normalize chat history before any side effects.
-    # Raises ValueError on bad input so no DB row is created.
-    normalized_history = normalize_chat_history(history)
-    replay_req = validate_replay_args(
-        runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
+    skill_session = SkillSession.prepare(
+        agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
     )
-    # When chat history is provided, the loop expects initial_history to
-    # be the COMPLETE message list (loops use initial_history as-is and
-    # do not separately append user_input — same contract as resume).
-    # The runner will record the new user_input itself (after the recorder
-    # is constructed) so seeded prior turns stay out of react_traces.
-    # With runs=, the replayed prefix is folded in after expansion.
-    if replay_req is None:
-        seeded_history = fold_context(normalized_history, context, user_input)
-    else:
-        validate_context(context)
-        seeded_history = None
-        if state_store is None:
-            raise ValueError(
-                "runs= requires persistence (database_url, state_store, or "
-                "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+    with skill_session.bind():
+        # Validate + resolve depth early — before any side effects.
+        # _resolve_max_delegation_depth is a pure policy helper; side effect
+        # is limited to dedup warning state on parent_ctx.warned_mismatches.
+        parent_ctx = get_delegation_context()
+        effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
+
+        resolved_strategy = strategy or NativeToolCalling()
+        resolved_loop = loop or agent.loop or ReActLoop()
+        _validate_loop_skill_compat(agent, resolved_loop)
+
+        # Validate + normalize chat history before any side effects.
+        # Raises ValueError on bad input so no DB row is created.
+        normalized_history = normalize_chat_history(history)
+        replay_req = validate_replay_args(
+            runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
+        )
+        # When chat history is provided, the loop expects initial_history to
+        # be the COMPLETE message list (loops use initial_history as-is and
+        # do not separately append user_input — same contract as resume).
+        # The runner will record the new user_input itself (after the recorder
+        # is constructed) so seeded prior turns stay out of react_traces.
+        # With runs=, the replayed prefix is folded in after expansion.
+        if replay_req is None:
+            seeded_history = fold_context(
+                normalized_history, context, user_input, session=skill_session
             )
-    replay_runs = (
-        await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
-        if replay_req is not None and state_store is not None
-        else []
-    )
-    replay_plan: ReplayPlan | None = None
-
-    provider_kwargs = dict(kwargs) if kwargs else {}
-
-    run_id = generate_ulid()
-    recorder: LoopRecorder | None = None
-    sequencer = EventSequencer()
-
-    # --- Delegation context ---
-    parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
-
-    # Resolve system prompt BEFORE create_run() so skill loading
-    # failures don't leave a DB row stuck in running.
-    _system_prompt = agent.get_system_prompt(loop=resolved_loop)
-
-    ctx_token = None
-    mcp_meta: dict[str, Any] = {}
-    lifecycle_started = False
-    recorder_closed = False
-    notifier_closed = False
-    result: RunResult | None = None
-
-    try:
-        try:
-            if state_store is not None:
-                # Create the run record before the loop starts
-                # Merge loop type + depth limit into developer metadata
-                run_meta = dict(metadata) if metadata else {}
-                run_meta["dendrux.loop"] = type(resolved_loop).__name__
-                if effective_max_depth is not None:
-                    run_meta["dendrux.max_delegation_depth"] = effective_max_depth
-                if output_type is not None:
-                    run_meta["dendrux.output_type"] = (
-                        f"{output_type.__module__}.{output_type.__qualname__}"
-                    )
-
-                # Compute idempotency fingerprint if key is provided
-                idem_fingerprint: str | None = None
-                if idempotency_key is not None:
-                    output_type_name = (
-                        f"{output_type.__module__}.{output_type.__qualname__}"
-                        if output_type is not None
-                        else None
-                    )
-                    idem_fingerprint = compute_idempotency_fingerprint(
-                        agent.name,
-                        user_input,
-                        output_type_name=output_type_name,
-                        history=normalized_history or None,
-                        context=context or None,
-                        replay=replay_req.fingerprint() if replay_req else None,
-                    )
-
-                create_result = await state_store.create_run(
-                    run_id,
-                    agent.name,
-                    input_data={"input": user_input},
-                    model=provider.model,
-                    strategy=type(resolved_strategy).__name__,
-                    parent_run_id=parent_run_id,
-                    delegation_level=delegation_level,
-                    tenant_id=tenant_id,
-                    meta=run_meta,
-                    idempotency_key=idempotency_key,
-                    idempotency_fingerprint=idem_fingerprint,
+        else:
+            validate_context(context)
+            seeded_history = None
+            if state_store is None:
+                raise ValueError(
+                    "runs= requires persistence (database_url, state_store, or "
+                    "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
                 )
+        replay_runs = (
+            await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
+            if replay_req is not None and state_store is not None
+            else []
+        )
+        replay_plan: ReplayPlan | None = None
 
-                # Handle idempotency outcomes
-                if create_result.outcome == "existing_terminal":
-                    return await _build_cached_result(
-                        state_store, create_result.run_id, output_type
+        provider_kwargs = dict(kwargs) if kwargs else {}
+
+        run_id = generate_ulid()
+        recorder: LoopRecorder | None = None
+        sequencer = EventSequencer()
+
+        # --- Delegation context ---
+        parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
+
+        # Resolve system prompt BEFORE create_run() so skill loading
+        # failures don't leave a DB row stuck in running.
+        _system_prompt = agent.get_system_prompt(loop=resolved_loop)
+
+        ctx_token = None
+        mcp_meta: dict[str, Any] = {}
+        lifecycle_started = False
+        recorder_closed = False
+        notifier_closed = False
+        result: RunResult | None = None
+
+        try:
+            try:
+                if state_store is not None:
+                    # Create the run record before the loop starts
+                    # Merge loop type + depth limit into developer metadata
+                    run_meta = dict(metadata) if metadata else {}
+                    run_meta["dendrux.loop"] = type(resolved_loop).__name__
+                    if skill_session.configured:
+                        run_meta[META_KEY] = skill_session.manifest()
+                    if effective_max_depth is not None:
+                        run_meta["dendrux.max_delegation_depth"] = effective_max_depth
+                    if output_type is not None:
+                        run_meta["dendrux.output_type"] = (
+                            f"{output_type.__module__}.{output_type.__qualname__}"
+                        )
+
+                    # Compute idempotency fingerprint if key is provided
+                    idem_fingerprint: str | None = None
+                    if idempotency_key is not None:
+                        output_type_name = (
+                            f"{output_type.__module__}.{output_type.__qualname__}"
+                            if output_type is not None
+                            else None
+                        )
+                        idem_fingerprint = compute_idempotency_fingerprint(
+                            agent.name,
+                            user_input,
+                            output_type_name=output_type_name,
+                            history=normalized_history or None,
+                            context=context or None,
+                            replay=replay_req.fingerprint() if replay_req else None,
+                            skills=skill_session.fingerprint(),
+                        )
+
+                    create_result = await state_store.create_run(
+                        run_id,
+                        agent.name,
+                        input_data={"input": user_input},
+                        model=provider.model,
+                        strategy=type(resolved_strategy).__name__,
+                        parent_run_id=parent_run_id,
+                        delegation_level=delegation_level,
+                        tenant_id=tenant_id,
+                        meta=run_meta,
+                        idempotency_key=idempotency_key,
+                        idempotency_fingerprint=idem_fingerprint,
                     )
-                if create_result.outcome == "existing_active":
-                    raise RunAlreadyActiveError(create_result.run_id, create_result.status)
 
-                # "created" — use the run_id from the result (same as generated)
-                run_id = create_result.run_id
+                    # Handle idempotency outcomes
+                    if create_result.outcome == "existing_terminal":
+                        return await _build_cached_result(
+                            state_store, create_result.run_id, output_type
+                        )
+                    if create_result.outcome == "existing_active":
+                        raise RunAlreadyActiveError(create_result.run_id, create_result.status)
 
-                # Create persistence recorder with shared sequencer
-                from dendrux.runtime.persistence import PersistenceRecorder
-                from dendrux.tool import get_tool_def
+                    # "created" — use the run_id from the result (same as generated)
+                    run_id = create_result.run_id
 
-                target_lookup = {}
-                for fn in agent.tools:
-                    td = get_tool_def(fn)
-                    target_lookup[td.name] = td.target
-                recorder = PersistenceRecorder(
+                    # Create persistence recorder with shared sequencer
+                    from dendrux.runtime.persistence import PersistenceRecorder
+                    from dendrux.tool import get_tool_def
+
+                    target_lookup = {}
+                    for fn in agent.tools:
+                        td = get_tool_def(fn)
+                        target_lookup[td.name] = td.target
+                    recorder = PersistenceRecorder(
+                        state_store,
+                        run_id,
+                        model=provider.model,
+                        provider_name=type(provider).__name__,
+                        target_lookup=target_lookup,
+                        event_sequencer=sequencer,
+                    )
+
+                await _emit_event(
                     state_store,
                     run_id,
-                    model=provider.model,
-                    provider_name=type(provider).__name__,
-                    target_lookup=target_lookup,
-                    event_sequencer=sequencer,
+                    "run.started",
+                    sequencer,
+                    {"agent_name": agent.name, "system_prompt": _system_prompt},
+                )
+                lifecycle_started = True
+                await record_run_started(
+                    recorder, run_id, agent_name=agent.name, agent_model=provider.model
+                )
+                await notify_run_started(
+                    extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
                 )
 
-            await _emit_event(
-                state_store,
-                run_id,
-                "run.started",
-                sequencer,
-                {"agent_name": agent.name, "system_prompt": _system_prompt},
-            )
-            lifecycle_started = True
-            await record_run_started(
-                recorder, run_id, agent_name=agent.name, agent_model=provider.model
-            )
-            await notify_run_started(
-                extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
-            )
-
-            # Set delegation context for the duration of this run so nested
-            # agent.run() calls inside tools inherit the parent link.
-            this_ctx = DelegationContext(
-                run_id=run_id,
-                delegation_level=delegation_level,
-                persisted=state_store is not None,
-                store_identity=get_store_identity(state_store),
-                max_delegation_depth=effective_max_depth,
-            )
-            ctx_token = set_delegation_context(this_ctx)
-
-            # Emit init governance events (skills + MCP) inside the try block
-            # so discovery failures flow through the error cleanup path.
-            # _MCPDiscoveryError is caught here, mcp.error emitted, then the
-            # original cause is re-raised for the outer except Exception.
-            try:
-                await _emit_init_events(
-                    agent,
-                    recorder,
-                    extra_notifier,
-                    run_id,
-                    resolved_loop=resolved_loop,
-                    mcp_meta=mcp_meta,
+                # Set delegation context for the duration of this run so nested
+                # agent.run() calls inside tools inherit the parent link.
+                this_ctx = DelegationContext(
+                    run_id=run_id,
+                    delegation_level=delegation_level,
+                    persisted=state_store is not None,
+                    store_identity=get_store_identity(state_store),
+                    max_delegation_depth=effective_max_depth,
                 )
-            except _MCPDiscoveryError as mcp_exc:
+                ctx_token = set_delegation_context(this_ctx)
+
+                # Emit init governance events (skills + MCP) inside the try block
+                # so discovery failures flow through the error cleanup path.
+                # _MCPDiscoveryError is caught here, mcp.error emitted, then the
+                # original cause is re-raised for the outer except Exception.
                 try:
-                    await _emit_init_governance_event(
+                    await _emit_init_events(
+                        agent,
                         recorder,
                         extra_notifier,
                         run_id,
-                        GovernanceEventType.MCP_ERROR,
-                        _mcp_error_payload(mcp_exc),
+                        resolved_loop=resolved_loop,
+                        mcp_meta=mcp_meta,
                     )
-                except Exception:
-                    logger.warning("Failed to emit mcp.error event", exc_info=True)
-                raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+                except _MCPDiscoveryError as mcp_exc:
+                    try:
+                        await _emit_init_governance_event(
+                            recorder,
+                            extra_notifier,
+                            run_id,
+                            GovernanceEventType.MCP_ERROR,
+                            _mcp_error_payload(mcp_exc),
+                        )
+                    except Exception:
+                        logger.warning("Failed to emit mcp.error event", exc_info=True)
+                    raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
-            replay_plan, seeded_history = await _apply_replay(
-                agent,
-                provider,
-                resolved_loop,
-                provider_kwargs,
-                state_store=state_store,
-                run_id=run_id,
-                replay_req=replay_req,
-                replay_runs=replay_runs,
-                normalized_history=normalized_history,
-                context=context,
-                user_input=user_input,
-                seeded_history=seeded_history,
-            )
-
-            # When chat history was provided, the loop receives a complete
-            # message list as initial_history and skips its own user-message
-            # recording. The runner records the new user_input itself so it
-            # still lands in react_traces (seeded prior turns are NOT recorded
-            # — they live in the dev's chat DB).
-            if seeded_history is not None:
-                user_msg = user_trace_message(
-                    user_input, seeded_history, render_band(context, "stable")
-                )
-                await record_message(recorder, run_id, user_msg, 0)
-                await notify_message(extra_notifier, run_id, user_msg, 0)
-
-            result = await resolved_loop.run(
-                agent=agent,
-                provider=provider,
-                strategy=resolved_strategy,
-                user_input=user_input,
-                run_id=run_id,
-                recorder=recorder,
-                notifier=extra_notifier,
-                initial_history=seeded_history,
-                provider_kwargs=provider_kwargs or None,
-                output_type=output_type,
-                state_store=state_store,
-            )
-
-            if replay_plan is not None:
-                result.replay = replay_plan.summary
-            _attach_mcp_meta(result, mcp_meta)
-            if state_store is not None:
-                result = await _persist_loop_outcome(
+                replay_plan, seeded_history = await _apply_replay(
+                    agent,
+                    provider,
+                    resolved_loop,
+                    provider_kwargs,
                     state_store=state_store,
                     run_id=run_id,
-                    result=result,
-                    sequencer=sequencer,
+                    replay_req=replay_req,
+                    replay_runs=replay_runs,
+                    normalized_history=normalized_history,
+                    context=context,
+                    user_input=user_input,
+                    seeded_history=seeded_history,
                 )
 
-            recorder_closed = True
-            await record_run_finished(recorder, run_id, result)
-            notifier_closed = True
-            await notify_run_finished(extra_notifier, run_id, result)
+                # When chat history was provided, the loop receives a complete
+                # message list as initial_history and skips its own user-message
+                # recording. The runner records the new user_input itself so it
+                # still lands in react_traces (seeded prior turns are NOT recorded
+                # — they live in the dev's chat DB).
+                if seeded_history is not None:
+                    user_msg = user_trace_message(
+                        user_input,
+                        seeded_history,
+                        render_band(context, "stable"),
+                        context,
+                        session=skill_session,
+                    )
+                    await record_message(recorder, run_id, user_msg, 0)
+                    await notify_message(extra_notifier, run_id, user_msg, 0)
 
-            return result
+                result = await resolved_loop.run(
+                    agent=agent,
+                    provider=provider,
+                    strategy=resolved_strategy,
+                    user_input=user_input,
+                    run_id=run_id,
+                    recorder=recorder,
+                    notifier=extra_notifier,
+                    initial_history=seeded_history,
+                    provider_kwargs=provider_kwargs or None,
+                    output_type=output_type,
+                    state_store=state_store,
+                )
 
-        except Exception as exc:
-            if not lifecycle_started and isinstance(
-                exc, (RunAlreadyActiveError, IdempotencyConflictError)
-            ):
+                if replay_plan is not None:
+                    result.replay = replay_plan.summary
+                _attach_mcp_meta(result, mcp_meta)
+                if state_store is not None:
+                    result = await _persist_loop_outcome(
+                        state_store=state_store,
+                        run_id=run_id,
+                        result=result,
+                        sequencer=sequencer,
+                    )
+
+                recorder_closed = True
+                await record_run_finished(recorder, run_id, result)
+                notifier_closed = True
+                await notify_run_finished(extra_notifier, run_id, result)
+
+                return result
+
+            except Exception as exc:
+                if not lifecycle_started and isinstance(
+                    exc, (RunAlreadyActiveError, IdempotencyConflictError)
+                ):
+                    raise
+                _attach_run_error_meta(exc, run_id, mcp_meta)
+                # Persist ERROR status before re-raising.
+                # Conditional: only if still running (prevents cancel race).
+                if state_store is not None:
+                    error_won = False
+                    try:
+                        error_won = await state_store.finalize_run(
+                            run_id,
+                            status=RunStatus.ERROR.value,
+                            error=str(exc),
+                            total_usage=None,
+                            expected_current_status="running",
+                        )
+                    except Exception:
+                        logger.error(
+                            "Failed to persist ERROR status for run %s", run_id, exc_info=True
+                        )
+                    # Only the CAS winner emits the error event
+                    if error_won:
+                        await _emit_event(
+                            state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                        )
+                if lifecycle_started:
+                    if not recorder_closed:
+                        recorder_closed = True
+                        await record_run_failed(recorder, run_id, exc)
+                    if not notifier_closed:
+                        notifier_closed = True
+                        await notify_run_failed(extra_notifier, run_id, exc)
                 raise
-            _attach_run_error_meta(exc, run_id, mcp_meta)
-            # Persist ERROR status before re-raising.
-            # Conditional: only if still running (prevents cancel race).
-            if state_store is not None:
-                error_won = False
+
+        except asyncio.CancelledError:
+            # Retain and drain the write task: shielding alone would let run()
+            # return while cleanup is still pending after another cancellation.
+            cleanup_task = asyncio.create_task(
+                _persist_task_cancellation(state_store, run_id, sequencer),
+                name=f"cancel-run:{run_id}",
+            )
+            while not cleanup_task.done():
                 try:
-                    error_won = await state_store.finalize_run(
-                        run_id,
-                        status=RunStatus.ERROR.value,
-                        error=str(exc),
-                        total_usage=None,
-                        expected_current_status="running",
-                    )
-                except Exception:
-                    logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
-                # Only the CAS winner emits the error event
-                if error_won:
-                    await _emit_event(
-                        state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-                    )
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            cancelled_result = cleanup_task.result()
+            if result is not None and (
+                state_store is None
+                or (result.status == cancelled_result.status and result.meta.get("_finalize_won"))
+            ):
+                cancelled_result = result
+            _attach_mcp_meta(cancelled_result, mcp_meta)
+
+            # Keep callbacks in the run task so notifier ContextVar tokens remain
+            # valid. Mark each sink before awaiting it to prevent duplicate hooks.
             if lifecycle_started:
                 if not recorder_closed:
                     recorder_closed = True
-                    await record_run_failed(recorder, run_id, exc)
+                    try:
+                        await record_run_finished(recorder, run_id, cancelled_result)
+                    except Exception:
+                        logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
                 if not notifier_closed:
                     notifier_closed = True
-                    await notify_run_failed(extra_notifier, run_id, exc)
+                    await notify_run_finished(extra_notifier, run_id, cancelled_result)
             raise
 
-    except asyncio.CancelledError:
-        # Retain and drain the write task: shielding alone would let run()
-        # return while cleanup is still pending after another cancellation.
-        cleanup_task = asyncio.create_task(
-            _persist_task_cancellation(state_store, run_id, sequencer),
-            name=f"cancel-run:{run_id}",
-        )
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                continue
-        cancelled_result = cleanup_task.result()
-        if result is not None and (
-            state_store is None
-            or (result.status == cancelled_result.status and result.meta.get("_finalize_won"))
-        ):
-            cancelled_result = result
-        _attach_mcp_meta(cancelled_result, mcp_meta)
-
-        # Keep callbacks in the run task so notifier ContextVar tokens remain
-        # valid. Mark each sink before awaiting it to prevent duplicate hooks.
-        if lifecycle_started:
-            if not recorder_closed:
-                recorder_closed = True
-                try:
-                    await record_run_finished(recorder, run_id, cancelled_result)
-                except Exception:
-                    logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
-            if not notifier_closed:
-                notifier_closed = True
-                await notify_run_finished(extra_notifier, run_id, cancelled_result)
-        raise
-
-    finally:
-        if ctx_token is not None:
-            reset_delegation_context(ctx_token)
+        finally:
+            if ctx_token is not None:
+                reset_delegation_context(ctx_token)
 
 
 async def _apply_replay(
@@ -1093,7 +1108,12 @@ async def _apply_replay(
         plan = expand_replay(
             replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
         )
-        seeded_history = fold_context([*plan.messages, *normalized_history], context, user_input)
+        seeded_history = fold_context(
+            [*plan.messages, *normalized_history],
+            context,
+            user_input,
+            session=current_skill_session(agent),
+        )
     await record_run_prefix(
         state_store,
         run_id,
@@ -1283,215 +1303,265 @@ async def retry(
     if source_run is None:
         raise ValueError(f"Run '{original_run_id}' not found.")
 
-    terminal_statuses = {"success", "error", "cancelled", "max_iterations"}
-    if source_run.status not in terminal_statuses:
-        raise ValueError(
-            f"Run '{original_run_id}' is in status '{source_run.status}' — "
-            f"only terminal runs (error, cancelled, max_iterations, success) can be retried."
+    if source_run.tenant_id != tenant_id:
+        from dendrux.errors import ReplayRunError
+
+        raise ReplayRunError(
+            original_run_id, "tenant_mismatch", "it belongs to a different tenant than this call"
         )
-
-    # 2. Validate source run was not SingleCall (no iterative history to seed)
-    source_loop = (source_run.meta or {}).get("dendrux.loop", "")
-    if source_loop == "SingleCall":
-        raise ValueError(
-            "SingleCall runs cannot be retried with context — "
-            "they have no iterative history to seed. Call agent.run() instead."
-        )
-
-    resolved_loop = loop or agent.loop or ReActLoop()
-    _validate_loop_skill_compat(agent, resolved_loop)
-
-    # 3. Read traces and reconstruct approximate history. Reasoning replay
-    #    blocks only seed a retry on the model that made them.
-    traces = await state_store.get_traces(original_run_id)
-    retry_model = (kwargs or {}).get("model") or provider.model
-    initial_history = rebuild_messages(traces, reasoning_for=retry_model)
-
-    if not initial_history:
-        raise ValueError(
-            f"Run '{original_run_id}' has no persisted traces. Cannot retry without prior context."
-        )
-
-    # 4. Extract the original user input from the first USER trace
-    user_input = next(
-        (t.content for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"),
-        "Continue from previous attempt.",
+    explicit = (source_run.meta or {}).get(META_KEY, {}).get("explicit", [])
+    skill_session = SkillSession.prepare(
+        agent, loop=loop or agent.loop or ReActLoop(), explicit=explicit
     )
-
-    # 4a. A source run that used runs= re-expands the same runs, same knobs.
-    replay_req: ReplayRequest | None = None
-    replay_runs: list[Any] = []
-    source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
-    if isinstance(source_replay, dict) and source_replay.get("runs"):
-        replay_req = validate_replay_args(
-            list(source_replay["runs"]),
-            source_replay.get("replay_last", 0),
-            bool(source_replay.get("replay_reasoning", True)),
-            loop=resolved_loop,
-            context=None,
-        )
-        if replay_req is not None:
-            replay_runs = await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
-
-    # 5. Create the retry run
-    resolved_strategy = strategy or NativeToolCalling()
-    provider_kwargs = dict(kwargs) if kwargs else {}
-
-    run_id = generate_ulid()
-    sequencer = EventSequencer()
-
-    parent_ctx = get_delegation_context()
-    parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
-    effective_max_depth = _resolve_max_delegation_depth(_UNSET_DEPTH, parent_ctx)
-
-    _system_prompt = agent.get_system_prompt(loop=resolved_loop)
-
-    run_meta = dict(metadata) if metadata else {}
-    run_meta["dendrux.loop"] = type(resolved_loop).__name__
-    run_meta["dendrux.retry_of"] = original_run_id
-
-    create_result = await state_store.create_run(
-        run_id,
-        agent.name,
-        input_data={"input": user_input},
-        model=provider.model,
-        strategy=type(resolved_strategy).__name__,
-        parent_run_id=parent_run_id,
-        delegation_level=delegation_level,
-        tenant_id=tenant_id,
-        meta=run_meta,
-        retry_of_run_id=original_run_id,
-    )
-    run_id = create_result.run_id
-
-    # Create persistence recorder
-    from dendrux.runtime.persistence import PersistenceRecorder
-    from dendrux.tool import get_tool_def
-
-    target_lookup = {}
-    for fn in agent.tools:
-        td = get_tool_def(fn)
-        target_lookup[td.name] = td.target
-    recorder = PersistenceRecorder(
-        state_store,
-        run_id,
-        model=provider.model,
-        provider_name=type(provider).__name__,
-        target_lookup=target_lookup,
-        event_sequencer=sequencer,
-    )
-
-    await _emit_event(
-        state_store,
-        run_id,
-        "run.started",
-        sequencer,
-        {"agent_name": agent.name, "system_prompt": _system_prompt, "retry_of": original_run_id},
-    )
-    await record_run_started(recorder, run_id, agent_name=agent.name, agent_model=provider.model)
-    await notify_run_started(
-        extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
-    )
-
-    this_ctx = DelegationContext(
-        run_id=run_id,
-        delegation_level=delegation_level,
-        persisted=True,
-        store_identity=get_store_identity(state_store),
-        max_delegation_depth=effective_max_depth,
-    )
-    ctx_token = set_delegation_context(this_ctx)
-    mcp_meta: dict[str, Any] = {}
-
-    try:
-        try:
-            await _emit_init_events(
-                agent,
-                recorder,
-                extra_notifier,
-                run_id,
-                resolved_loop=resolved_loop,
-                mcp_meta=mcp_meta,
+    with skill_session.bind():
+        terminal_statuses = {"success", "error", "cancelled", "max_iterations"}
+        if source_run.status not in terminal_statuses:
+            raise ValueError(
+                f"Run '{original_run_id}' is in status '{source_run.status}' — "
+                f"only terminal runs (error, cancelled, max_iterations, success) can be retried."
             )
-        except _MCPDiscoveryError as mcp_exc:
+
+        # 2. Validate source run was not SingleCall (no iterative history to seed)
+        source_loop = (source_run.meta or {}).get("dendrux.loop", "")
+        if source_loop == "SingleCall":
+            raise ValueError(
+                "SingleCall runs cannot be retried with context — "
+                "they have no iterative history to seed. Call agent.run() instead."
+            )
+
+        resolved_loop = loop or agent.loop or ReActLoop()
+        _validate_loop_skill_compat(agent, resolved_loop)
+
+        # 3. Read traces and reconstruct approximate history. Reasoning replay
+        #    blocks only seed a retry on the model that made them.
+        traces = await state_store.get_traces(original_run_id)
+        retry_model = (kwargs or {}).get("model") or provider.model
+        initial_history = rebuild_messages(traces, reasoning_for=retry_model)
+
+        if not initial_history:
+            raise ValueError(
+                f"Run '{original_run_id}' has no persisted traces. "
+                "Cannot retry without prior context."
+            )
+
+        # 4. Extract the original user input from the first USER trace
+        user_input = next(
+            (t.content for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"),
+            "Continue from previous attempt.",
+        )
+
+        if explicit:
+            from dataclasses import replace
+
+            from dendrux.types import Role
+
+            first_user = next(i for i, m in enumerate(initial_history) if m.role == Role.USER)
+            raw_user = next(
+                t for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"
+            )
+            retry_context = [
+                ContextBlock(**b) for b in (raw_user.meta or {}).get("dendrux.skills.context", [])
+            ]
+            retry_user = initial_history[first_user] = replace(
+                initial_history[first_user],
+                content=wire_user_input(user_input, skill_session.envelopes(), retry_context),
+            )
+
+        # 4a. A source run that used runs= re-expands the same runs, same knobs.
+        replay_req: ReplayRequest | None = None
+        replay_runs: list[Any] = []
+        source_replay = (source_run.meta or {}).get(REPLAY_META_KEY)
+        if isinstance(source_replay, dict) and source_replay.get("runs"):
+            replay_req = validate_replay_args(
+                list(source_replay["runs"]),
+                source_replay.get("replay_last", 0),
+                bool(source_replay.get("replay_reasoning", True)),
+                loop=resolved_loop,
+                context=None,
+            )
+            if replay_req is not None:
+                replay_runs = await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
+
+        # 5. Create the retry run
+        resolved_strategy = strategy or NativeToolCalling()
+        provider_kwargs = dict(kwargs) if kwargs else {}
+
+        run_id = generate_ulid()
+        sequencer = EventSequencer()
+
+        parent_ctx = get_delegation_context()
+        parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
+        effective_max_depth = _resolve_max_delegation_depth(_UNSET_DEPTH, parent_ctx)
+
+        _system_prompt = agent.get_system_prompt(loop=resolved_loop)
+
+        run_meta = dict(metadata) if metadata else {}
+        run_meta["dendrux.loop"] = type(resolved_loop).__name__
+        if skill_session.configured:
+            run_meta[META_KEY] = skill_session.manifest()
+        run_meta["dendrux.retry_of"] = original_run_id
+
+        create_result = await state_store.create_run(
+            run_id,
+            agent.name,
+            input_data={"input": user_input},
+            model=provider.model,
+            strategy=type(resolved_strategy).__name__,
+            parent_run_id=parent_run_id,
+            delegation_level=delegation_level,
+            tenant_id=tenant_id,
+            meta=run_meta,
+            retry_of_run_id=original_run_id,
+        )
+        run_id = create_result.run_id
+
+        # Create persistence recorder
+        from dendrux.runtime.persistence import PersistenceRecorder
+        from dendrux.tool import get_tool_def
+
+        target_lookup = {}
+        for fn in agent.tools:
+            td = get_tool_def(fn)
+            target_lookup[td.name] = td.target
+        recorder = PersistenceRecorder(
+            state_store,
+            run_id,
+            model=provider.model,
+            provider_name=type(provider).__name__,
+            target_lookup=target_lookup,
+            event_sequencer=sequencer,
+        )
+
+        await _emit_event(
+            state_store,
+            run_id,
+            "run.started",
+            sequencer,
+            {
+                "agent_name": agent.name,
+                "system_prompt": _system_prompt,
+                "retry_of": original_run_id,
+            },
+        )
+        await record_run_started(
+            recorder, run_id, agent_name=agent.name, agent_model=provider.model
+        )
+        await notify_run_started(
+            extra_notifier, run_id, agent_name=agent.name, agent_model=provider.model
+        )
+
+        this_ctx = DelegationContext(
+            run_id=run_id,
+            delegation_level=delegation_level,
+            persisted=True,
+            store_identity=get_store_identity(state_store),
+            max_delegation_depth=effective_max_depth,
+        )
+        ctx_token = set_delegation_context(this_ctx)
+        mcp_meta: dict[str, Any] = {}
+
+        try:
             try:
-                await _emit_init_governance_event(
+                await _emit_init_events(
+                    agent,
                     recorder,
                     extra_notifier,
                     run_id,
-                    GovernanceEventType.MCP_ERROR,
-                    _mcp_error_payload(mcp_exc),
+                    resolved_loop=resolved_loop,
+                    mcp_meta=mcp_meta,
+                )
+            except _MCPDiscoveryError as mcp_exc:
+                try:
+                    await _emit_init_governance_event(
+                        recorder,
+                        extra_notifier,
+                        run_id,
+                        GovernanceEventType.MCP_ERROR,
+                        _mcp_error_payload(mcp_exc),
+                    )
+                except Exception:
+                    logger.warning("Failed to emit mcp.error event", exc_info=True)
+                raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+
+            current = current_prefix(agent, provider, resolved_loop, provider_kwargs)
+            replay_plan: ReplayPlan | None = None
+            if replay_req is not None:
+                replay_plan = expand_replay(
+                    replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
+                )
+                initial_history = [*replay_plan.messages, *initial_history]
+            await record_run_prefix(
+                state_store,
+                run_id,
+                current=current,
+                seed={"retry_of": original_run_id},
+                plan=replay_plan,
+            )
+
+            if explicit:
+                trace_user = user_trace_message(
+                    user_input,
+                    [retry_user],
+                    render_band(retry_context, "stable"),
+                    retry_context,
+                    session=skill_session,
+                )
+                await record_message(recorder, run_id, trace_user, 0)
+                await notify_message(extra_notifier, run_id, trace_user, 0)
+
+            result = await resolved_loop.run(
+                agent=agent,
+                provider=provider,
+                strategy=resolved_strategy,
+                user_input=user_input,
+                run_id=run_id,
+                recorder=recorder,
+                notifier=extra_notifier,
+                initial_history=initial_history,
+                provider_kwargs=provider_kwargs or None,
+                state_store=state_store,
+            )
+
+            if replay_plan is not None:
+                result.replay = replay_plan.summary
+            _attach_mcp_meta(result, mcp_meta)
+            result = await _persist_loop_outcome(
+                state_store=state_store,
+                run_id=run_id,
+                result=result,
+                sequencer=sequencer,
+            )
+
+            await record_run_finished(recorder, run_id, result)
+            await notify_run_finished(extra_notifier, run_id, result)
+
+            return result
+
+        except Exception as exc:
+            _attach_run_error_meta(exc, run_id, mcp_meta)
+            error_won = False
+            try:
+                error_won = await state_store.finalize_run(
+                    run_id,
+                    status=RunStatus.ERROR.value,
+                    error=str(exc),
+                    total_usage=None,
+                    expected_current_status="running",
                 )
             except Exception:
-                logger.warning("Failed to emit mcp.error event", exc_info=True)
-            raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
+                logger.error(
+                    "Failed to persist ERROR status for retry run %s", run_id, exc_info=True
+                )
+            if error_won:
+                await _emit_event(
+                    state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                )
+            await record_run_failed(recorder, run_id, exc)
+            await notify_run_failed(extra_notifier, run_id, exc)
+            raise
 
-        current = current_prefix(agent, provider, resolved_loop, provider_kwargs)
-        replay_plan: ReplayPlan | None = None
-        if replay_req is not None:
-            replay_plan = expand_replay(
-                replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
-            )
-            initial_history = [*replay_plan.messages, *initial_history]
-        await record_run_prefix(
-            state_store,
-            run_id,
-            current=current,
-            seed={"retry_of": original_run_id},
-            plan=replay_plan,
-        )
-
-        result = await resolved_loop.run(
-            agent=agent,
-            provider=provider,
-            strategy=resolved_strategy,
-            user_input=user_input,
-            run_id=run_id,
-            recorder=recorder,
-            notifier=extra_notifier,
-            initial_history=initial_history,
-            provider_kwargs=provider_kwargs or None,
-            state_store=state_store,
-        )
-
-        if replay_plan is not None:
-            result.replay = replay_plan.summary
-        _attach_mcp_meta(result, mcp_meta)
-        result = await _persist_loop_outcome(
-            state_store=state_store,
-            run_id=run_id,
-            result=result,
-            sequencer=sequencer,
-        )
-
-        await record_run_finished(recorder, run_id, result)
-        await notify_run_finished(extra_notifier, run_id, result)
-
-        return result
-
-    except Exception as exc:
-        _attach_run_error_meta(exc, run_id, mcp_meta)
-        error_won = False
-        try:
-            error_won = await state_store.finalize_run(
-                run_id,
-                status=RunStatus.ERROR.value,
-                error=str(exc),
-                total_usage=None,
-                expected_current_status="running",
-            )
-        except Exception:
-            logger.error("Failed to persist ERROR status for retry run %s", run_id, exc_info=True)
-        if error_won:
-            await _emit_event(
-                state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-            )
-        await record_run_failed(recorder, run_id, exc)
-        await notify_run_failed(extra_notifier, run_id, exc)
-        raise
-
-    finally:
-        reset_delegation_context(ctx_token)
+        finally:
+            reset_delegation_context(ctx_token)
 
 
 @overload
@@ -1502,6 +1572,7 @@ def run_stream(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    activate_skills: Sequence[str] | None = ...,
     runs: list[str] | None = ...,
     replay_last: ReplayLast = ...,
     replay_reasoning: bool = ...,
@@ -1527,6 +1598,7 @@ def run_stream(
     user_input: str,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
+    activate_skills: Sequence[str] | None = ...,
     runs: list[str] | None = ...,
     replay_last: ReplayLast = ...,
     replay_reasoning: bool = ...,
@@ -1550,6 +1622,7 @@ def run_stream(
     user_input: str,
     history: list[ChatMessage] | None = None,
     context: list[ContextBlock] | None = None,
+    activate_skills: Sequence[str] | None = None,
     runs: list[str] | None = None,
     replay_last: ReplayLast = 0,
     replay_reasoning: bool = True,
@@ -1617,11 +1690,15 @@ def run_stream(
     # The new user_input is recorded by the runner itself inside _generate()
     # so seeded prior turns stay out of react_traces. With runs=, the replayed
     # prefix is folded in after expansion.
-    if replay_req is None:
-        initial_seeded = fold_context(normalized_history, context, user_input)
-    else:
-        validate_context(context)
-        initial_seeded = None
+    skill_session = SkillSession.prepare(agent, loop=resolved_loop, explicit=activate_skills)
+    with skill_session.bind():
+        if replay_req is None:
+            initial_seeded = fold_context(
+                normalized_history, context, user_input, session=skill_session
+            )
+        else:
+            validate_context(context)
+            initial_seeded = None
     provider_kwargs = dict(kwargs) if kwargs else {}
 
     run_id = generate_ulid()
@@ -1631,6 +1708,8 @@ def run_stream(
     _shared: dict[str, Any] = {"state_store": state_store, "sequencer": EventSequencer()}
 
     mcp_meta: dict[str, Any] = {}
+
+    stream_context = StreamContext(skill_session)
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         """Inner generator — lazy async setup, then loop stream with lifecycle.
@@ -1647,7 +1726,6 @@ def run_stream(
         seeded_history = initial_seeded
         replay_plan: ReplayPlan | None = None
         sequencer = _shared["sequencer"]
-        ctx_token = None
 
         try:
             # 1. Resolve state store lazily (may create DB engine)
@@ -1685,6 +1763,8 @@ def run_stream(
             if store is not None:
                 run_meta = dict(metadata) if metadata else {}
                 run_meta["dendrux.loop"] = type(resolved_loop).__name__
+                if skill_session.configured:
+                    run_meta[META_KEY] = skill_session.manifest()
                 if eff_max_depth is not None:
                     run_meta["dendrux.max_delegation_depth"] = eff_max_depth
                 if output_type is not None:
@@ -1704,6 +1784,7 @@ def run_stream(
                         history=normalized_history or None,
                         context=context or None,
                         replay=replay_req.fingerprint() if replay_req else None,
+                        skills=skill_session.fingerprint(),
                     )
                 try:
                     create_result = await store.create_run(
@@ -1769,7 +1850,7 @@ def run_stream(
                 store_identity=get_store_identity(store),
                 max_delegation_depth=eff_max_depth,
             )
-            ctx_token = set_delegation_context(this_ctx)
+            stream_context.set_delegation(this_ctx)
 
             # 3. Emit lifecycle start
             await _emit_event(
@@ -1837,7 +1918,11 @@ def run_stream(
             # react_traces (seeded prior turns are NOT recorded).
             if seeded_history is not None:
                 user_msg = user_trace_message(
-                    user_input, seeded_history, render_band(context, "stable")
+                    user_input,
+                    seeded_history,
+                    render_band(context, "stable"),
+                    context,
+                    session=skill_session,
                 )
                 await record_message(recorder, run_id, user_msg, 0)
                 await notify_message(extra_notifier, run_id, user_msg, 0)
@@ -1950,8 +2035,6 @@ def run_stream(
         finally:
             if not _shared.get("existing_run"):
                 agent._task_manager.release_interrupt(run_id)
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
 
     async def _cleanup() -> RunResult | None:
         """CAS-guarded cancellation + local lifecycle close.
@@ -2025,7 +2108,7 @@ def run_stream(
             return cancelled_result
         return None
 
-    stream = _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    stream = _RunStream(run_id=run_id, generator=stream_context.wrap(_generate()), cleanup=_cleanup)
     return stream
 
 
@@ -2330,15 +2413,45 @@ async def _execute_approved_tools(
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
     from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
     from dendrux.loops._helpers import record_tool_started as _rec_tool_started
-    from dendrux.loops.react import _execute_tool
+    from dendrux.loops.react import _execute_tool, _process_tool_calls
+    from dendrux.skills._session import SkillTool
     from dendrux.tools._validate import check_tool_call
-    from dendrux.types import Message, Role
+    from dendrux.types import AgentStep, Message, Role
 
     target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
     results: list[tuple[ToolCall, ToolResult]] = []
+    counts: dict[str, int] = {}
+    for message in pause_state.history:
+        if message.role == Role.TOOL and message.name:
+            counts[message.name] = counts.get(message.name, 0) + 1
+    session = current(agent)
+    # An absent executor is a specified error only for a pinned approved script.
+    # Inject an execution closure here without advertising the unavailable tool.
+    if session is not None and session.configured and session.executor is None:
+        for tc in pause_state.pending_tool_calls:
+            if tc.name == "run_skill_script" and tc.name not in lookups.fn:
+                lookups.fn[tc.name] = SkillTool(session, tc.name)
 
     for tc in pause_state.pending_tool_calls:
+        if isinstance(lookups.fn.get(tc.name), SkillTool):
+            outcome = await _process_tool_calls(
+                step=AgentStep(reasoning=None, action=tc),
+                call_counts=counts,
+                lookups=lookups,
+                strategy=NativeToolCalling(),
+                recorder=recorder,
+                notifier=notifier,
+                run_id=run_id,
+                iteration=pause_state.iteration,
+                history=target_history,
+                warnings=[],
+                deny=agent._deny,
+                tool_result_transform=agent.tool_result_transform,
+                approved_skills=True,
+            )
+            results.extend(outcome.all_results)
+            continue
         invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
         if invalid_result is None:
             await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
@@ -2386,252 +2499,315 @@ async def _resume_core(
         _skip_claim: Internal flag — skip the atomic claim step when the caller
             has already claimed via submit_and_claim(). Used by resume_claimed().
     """
-    # 1. Load pause state
-    raw_pause = await state_store.get_pause_state(run_id)
-    if raw_pause is None:
-        raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
-    pause_state = PauseState.from_dict(raw_pause)
-
-    # 1a. Load pii_mapping for guardrail continuity across pause/resume
-    _saved_pii_mapping = await state_store.get_pii_mapping(run_id)
-
-    # 1b. Verify agent identity — fail closed on mismatch (H-003)
-    if pause_state.agent_name and pause_state.agent_name != agent.name:
-        raise ValueError(
-            f"Agent name mismatch: run '{run_id}' was paused by "
-            f"'{pause_state.agent_name}', but resume called with "
-            f"'{agent.name}'. This can cause state corruption."
-        )
-
-    # 2. Validate tool results BEFORE claiming (prevents stuck RUNNING on bad input)
-    if tool_results is not None:
-        pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
-        provided_ids = {tr.call_id for tr in tool_results}
-        if provided_ids != pending_ids:
-            raise ValueError(
-                f"Tool result call_ids {provided_ids} do not match "
-                f"pending tool call_ids {pending_ids}."
-            )
-
-    # 3. Atomic claim — transition WAITING → RUNNING
-    if not _skip_claim:
-        claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
-        # Fallback: tool_results might be for approval-reject (WAITING_APPROVAL)
-        if (
-            not claimed
-            and tool_results is not None
-            and expected_status != RunStatus.WAITING_APPROVAL.value
-        ):
-            alt = RunStatus.WAITING_APPROVAL.value
-            claimed = await state_store.claim_paused_run(run_id, expected_status=alt)
-            if claimed:
-                expected_status = alt
-        if not claimed:
-            await _raise_resume_claim_failure(state_store, run_id, expected_status)
-
-    # 4-10. Everything that runs after on_run_started fires must live
-    #       inside the try block so on_run_failed can balance the lifecycle
-    #       pair on any failure (including injected-history replay errors).
-    ctx: _ResumeContext | None = None
-    ctx_token = None
-    mcp_meta: dict[str, Any] = {}
-
-    try:
-        # 4-8. Prepare history, notifier, sequencer (shared with resume_stream).
-        #      Does NOT fire any lifecycle hooks — that's the caller's job.
-        ctx = await _prepare_resume(
-            run_id,
-            pause_state,
-            state_store=state_store,
-            agent=agent,
-            provider=provider,
-            strategy=strategy,
-            loop=loop,
-            expected_status=expected_status,
-            tool_results=tool_results,
-            user_input=user_input,
-            extra_notifier=extra_notifier,
-        )
-
-        # 8a. Fire run-level lifecycle hooks. AFTER this point, any failure
-        #     must pair with on_run_failed in the except handler.
-        await record_run_started(
-            ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
-        )
-        await notify_run_started(
-            ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
-        )
-
-        await agent.get_tool_lookups(loop=ctx.resolved_loop)
-        mcp_meta.update(_snapshot_mcp_meta(agent))
-
-        # 8b. tool/user-input history. Inside the try so
-        #     a recorder failure here fires on_run_failed.
-        await _replay_resume_injected_history(
-            ctx, run_id, tool_results=tool_results, user_input=user_input
-        )
-
-        # 9. Set delegation context — resumed run is the active parent for any
-        #    nested agent.run() calls spawned during this resume cycle.
-        #    Read max_delegation_depth from persisted metadata so the depth
-        #    guard survives pause/resume cycles.
-        run_record = await state_store.get_run(run_id)
-        resume_delegation_level = run_record.delegation_level if run_record else 0
-        resume_max_depth: int | None = None
-        if run_record and run_record.meta:
-            raw = run_record.meta.get("dendrux.max_delegation_depth")
-            if isinstance(raw, int):
-                resume_max_depth = raw
-        resume_ctx = DelegationContext(
-            run_id=run_id,
-            delegation_level=resume_delegation_level,
-            persisted=True,
-            store_identity=get_store_identity(state_store),
-            max_delegation_depth=resume_max_depth,
-        )
-        ctx_token = set_delegation_context(resume_ctx)
-
-        # 10. Re-enter loop (batch)
-        # Approval-approve: execute pending tools before loop re-entry.
-        # Runs inside try/except so failures properly finalize as ERROR.
-        _is_approval_approve = (
-            tool_results is None
-            and user_input is None
-            and expected_status == RunStatus.WAITING_APPROVAL.value
-        )
-        if _is_approval_approve:
-            from dendrux.loops._helpers import (
-                notify_governance as _ntfy_gov,
-            )
-            from dendrux.loops._helpers import (
-                record_governance as _rec_gov,
-            )
-
-            await _execute_approved_tools(
-                agent,
-                pause_state,
-                ctx.recorder,
-                ctx.notifier,
-                run_id,
-                history=ctx.history,
-                resolved_loop=ctx.resolved_loop,
-            )
-
-            _decided_data: dict[str, Any] = {
-                "decision": "approved",
-                "run_id": run_id,
-            }
-            await _rec_gov(
-                ctx.recorder,
-                run_id,
-                "approval.decided",
-                pause_state.iteration,
-                _decided_data,
-            )
-            await _ntfy_gov(
-                ctx.notifier,
-                run_id,
-                "approval.decided",
-                pause_state.iteration,
-                _decided_data,
-            )
-
-        # Approval-reject: tool results already in history from _prepare_resume.
-        # Emit governance event only.
-        if tool_results is not None and expected_status == RunStatus.WAITING_APPROVAL.value:
-            from dendrux.loops._helpers import (
-                notify_governance as _ntfy_gov_r,
-            )
-            from dendrux.loops._helpers import (
-                record_governance as _rec_gov_r,
-            )
-
-            _rejected_data: dict[str, Any] = {
-                "decision": "rejected",
-                "run_id": run_id,
-            }
-            await _rec_gov_r(
-                ctx.recorder,
-                run_id,
-                "approval.decided",
-                pause_state.iteration,
-                _rejected_data,
-            )
-            await _ntfy_gov_r(
-                ctx.notifier,
-                run_id,
-                "approval.decided",
-                pause_state.iteration,
-                _rejected_data,
-            )
-
-        result = await ctx.resolved_loop.run(
-            agent=agent,
-            provider=provider,
-            strategy=ctx.resolved_strategy,
-            user_input="",
-            run_id=run_id,
-            recorder=ctx.recorder,
-            notifier=ctx.notifier,
-            initial_history=ctx.history,
-            initial_steps=ctx.pause_state.steps,
-            iteration_offset=ctx.pause_state.iteration,
-            initial_usage=ctx.pause_state.usage,
-            initial_pii_mapping=_saved_pii_mapping,
-            state_store=state_store,
-        )
-
-        _attach_mcp_meta(result, mcp_meta)
-        result = await _persist_loop_outcome(
-            state_store=state_store,
-            run_id=run_id,
-            result=result,
-            sequencer=ctx.sequencer,
-        )
-
-        await record_run_finished(ctx.recorder, run_id, result)
-        await notify_run_finished(ctx.notifier, run_id, result)
-
-        return result
-
-    except Exception as exc:
-        _attach_run_error_meta(exc, run_id, mcp_meta)
-        error_won = False
+    skill_session = current(agent)
+    if skill_session is None or skill_session.run_id != run_id:
         try:
-            error_won = await state_store.finalize_run(
-                run_id,
-                status=RunStatus.ERROR.value,
-                error=str(exc),
-                total_usage=None,
-                expected_current_status="running",
-            )
-        except Exception:
-            logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
-        if error_won:
-            # Use ctx.sequencer if available; otherwise fall back to a fresh
-            # sequencer so the run.error event still emits with sane numbering.
-            err_sequencer = ctx.sequencer if ctx is not None else EventSequencer()
-            await _emit_event(
-                state_store, run_id, "run.error", err_sequencer, {"error": str(exc)[:500]}
-            )
-        # Fire on_run_failed only if _prepare_resume returned (ctx exists).
-        # If _prepare_resume itself raised, on_run_started never fired, so
-        # the lifecycle pair is balanced (both unfired).
-        if ctx is not None:
-            try:
-                await record_run_failed(ctx.recorder, run_id, exc)
-                await notify_run_failed(ctx.notifier, run_id, exc)
-            except Exception:
-                logger.warning(
-                    "Lifecycle hooks failed during resume error handler for run %s",
-                    run_id,
-                    exc_info=True,
-                )
-        raise
+            skill_session = await continuation(agent, state_store, run_id, loop=loop)
+        except Exception as exc:
+            # Internal claimed-entry callers normally inherit the verified session.
+            # If they do not, a failed verification must finalize the owned claim.
+            if _skip_claim:
+                try:
+                    won = await state_store.finalize_run(
+                        run_id,
+                        status=RunStatus.ERROR.value,
+                        error=str(exc),
+                        expected_current_status="running",
+                    )
+                    if won:
+                        seq = EventSequencer(
+                            initial=await state_store.get_next_event_sequence(run_id)
+                        )
+                        await _emit_event(
+                            state_store, run_id, "run.error", seq, {"error": str(exc)[:500]}
+                        )
+                except Exception:
+                    logger.error(
+                        "Failed to persist claimed resume error for run %s", run_id, exc_info=True
+                    )
+                await notify_run_failed(extra_notifier, run_id, exc)
+            raise
+    with skill_session.bind():
+        # 1. Load pause state
+        raw_pause = await state_store.get_pause_state(run_id)
+        if raw_pause is None:
+            raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
+        pause_state = PauseState.from_dict(raw_pause)
 
-    finally:
-        if ctx_token is not None:
-            reset_delegation_context(ctx_token)
+        # 1a. Load pii_mapping for guardrail continuity across pause/resume
+        _saved_pii_mapping = await state_store.get_pii_mapping(run_id)
+
+        # 1b. Verify agent identity — fail closed on mismatch (H-003)
+        if pause_state.agent_name and pause_state.agent_name != agent.name:
+            raise ValueError(
+                f"Agent name mismatch: run '{run_id}' was paused by "
+                f"'{pause_state.agent_name}', but resume called with "
+                f"'{agent.name}'. This can cause state corruption."
+            )
+
+        # 2. Validate tool results BEFORE claiming (prevents stuck RUNNING on bad input)
+        if tool_results is not None:
+            pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
+            provided_ids = {tr.call_id for tr in tool_results}
+            if provided_ids != pending_ids:
+                raise ValueError(
+                    f"Tool result call_ids {provided_ids} do not match "
+                    f"pending tool call_ids {pending_ids}."
+                )
+
+        # 3. Atomic claim — transition WAITING → RUNNING
+        if not _skip_claim:
+            claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
+            # Fallback: tool_results might be for approval-reject (WAITING_APPROVAL)
+            if (
+                not claimed
+                and tool_results is not None
+                and expected_status != RunStatus.WAITING_APPROVAL.value
+            ):
+                alt = RunStatus.WAITING_APPROVAL.value
+                claimed = await state_store.claim_paused_run(run_id, expected_status=alt)
+                if claimed:
+                    expected_status = alt
+            if not claimed:
+                await _raise_resume_claim_failure(state_store, run_id, expected_status)
+
+        # 4-10. Everything that runs after on_run_started fires must live
+        #       inside the try block so on_run_failed can balance the lifecycle
+        #       pair on any failure (including injected-history replay errors).
+        ctx: _ResumeContext | None = None
+        ctx_token = None
+        mcp_meta: dict[str, Any] = {}
+
+        try:
+            # 4-8. Prepare history, notifier, sequencer (shared with resume_stream).
+            #      Does NOT fire any lifecycle hooks — that's the caller's job.
+            ctx = await _prepare_resume(
+                run_id,
+                pause_state,
+                state_store=state_store,
+                agent=agent,
+                provider=provider,
+                strategy=strategy,
+                loop=loop,
+                expected_status=expected_status,
+                tool_results=tool_results,
+                user_input=user_input,
+                extra_notifier=extra_notifier,
+            )
+
+            # 8a. Fire run-level lifecycle hooks. AFTER this point, any failure
+            #     must pair with on_run_failed in the except handler.
+            await record_run_started(
+                ctx.recorder, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+            await notify_run_started(
+                ctx.notifier, run_id, agent_name=agent.name, agent_model=provider.model
+            )
+
+            await agent.get_tool_lookups(loop=ctx.resolved_loop)
+            mcp_meta.update(_snapshot_mcp_meta(agent))
+
+            # 8b. tool/user-input history. Inside the try so
+            #     a recorder failure here fires on_run_failed.
+            await _replay_resume_injected_history(
+                ctx, run_id, tool_results=tool_results, user_input=user_input
+            )
+
+            # 9. Set delegation context — resumed run is the active parent for any
+            #    nested agent.run() calls spawned during this resume cycle.
+            #    Read max_delegation_depth from persisted metadata so the depth
+            #    guard survives pause/resume cycles.
+            run_record = await state_store.get_run(run_id)
+            resume_delegation_level = run_record.delegation_level if run_record else 0
+            resume_max_depth: int | None = None
+            if run_record and run_record.meta:
+                raw = run_record.meta.get("dendrux.max_delegation_depth")
+                if isinstance(raw, int):
+                    resume_max_depth = raw
+            resume_ctx = DelegationContext(
+                run_id=run_id,
+                delegation_level=resume_delegation_level,
+                persisted=True,
+                store_identity=get_store_identity(state_store),
+                max_delegation_depth=resume_max_depth,
+            )
+            ctx_token = set_delegation_context(resume_ctx)
+
+            # 10. Re-enter loop (batch)
+            # Approval-approve: execute pending tools before loop re-entry.
+            # Runs inside try/except so failures properly finalize as ERROR.
+            _is_approval_approve = (
+                tool_results is None
+                and user_input is None
+                and expected_status == RunStatus.WAITING_APPROVAL.value
+            )
+            if _is_approval_approve:
+                from dendrux.loops._helpers import (
+                    notify_governance as _ntfy_gov,
+                )
+                from dendrux.loops._helpers import (
+                    record_governance as _rec_gov,
+                )
+
+                await _execute_approved_tools(
+                    agent,
+                    pause_state,
+                    ctx.recorder,
+                    ctx.notifier,
+                    run_id,
+                    history=ctx.history,
+                    resolved_loop=ctx.resolved_loop,
+                )
+
+                _decided_data: dict[str, Any] = {
+                    "decision": "approved",
+                    "run_id": run_id,
+                }
+                await _rec_gov(
+                    ctx.recorder,
+                    run_id,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _decided_data,
+                )
+                await _ntfy_gov(
+                    ctx.notifier,
+                    run_id,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _decided_data,
+                )
+
+            # Approval-reject: tool results already in history from _prepare_resume.
+            # Emit governance event only.
+            if tool_results is not None and expected_status == RunStatus.WAITING_APPROVAL.value:
+                from dendrux.loops._helpers import (
+                    notify_governance as _ntfy_gov_r,
+                )
+                from dendrux.loops._helpers import (
+                    record_governance as _rec_gov_r,
+                )
+
+                _rejected_data: dict[str, Any] = {
+                    "decision": "rejected",
+                    "run_id": run_id,
+                }
+                await _rec_gov_r(
+                    ctx.recorder,
+                    run_id,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _rejected_data,
+                )
+                await _ntfy_gov_r(
+                    ctx.notifier,
+                    run_id,
+                    "approval.decided",
+                    pause_state.iteration,
+                    _rejected_data,
+                )
+
+            result = await ctx.resolved_loop.run(
+                agent=agent,
+                provider=provider,
+                strategy=ctx.resolved_strategy,
+                user_input="",
+                run_id=run_id,
+                recorder=ctx.recorder,
+                notifier=ctx.notifier,
+                initial_history=ctx.history,
+                initial_steps=ctx.pause_state.steps,
+                iteration_offset=ctx.pause_state.iteration,
+                initial_usage=ctx.pause_state.usage,
+                initial_pii_mapping=_saved_pii_mapping,
+                state_store=state_store,
+            )
+
+            _attach_mcp_meta(result, mcp_meta)
+            result = await _persist_loop_outcome(
+                state_store=state_store,
+                run_id=run_id,
+                result=result,
+                sequencer=ctx.sequencer,
+            )
+
+            await record_run_finished(ctx.recorder, run_id, result)
+            await notify_run_finished(ctx.notifier, run_id, result)
+
+            return result
+
+        except asyncio.CancelledError:
+
+            async def persist_cancellation() -> RunResult:
+                sequencer = ctx.sequencer if ctx else EventSequencer()
+                if ctx is None:
+                    try:
+                        sequencer = EventSequencer(
+                            initial=await state_store.get_next_event_sequence(run_id)
+                        )
+                    except Exception:
+                        # Event numbering must not prevent the status transition
+                        # or replace the cancellation that triggered cleanup.
+                        logger.warning(
+                            "Failed to read cancellation event sequence for run %s",
+                            run_id,
+                            exc_info=True,
+                        )
+                return await _persist_task_cancellation(state_store, run_id, sequencer)
+
+            cleanup = asyncio.create_task(persist_cancellation(), name=f"cancel-resume:{run_id}")
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cancelled_result = cleanup.result()
+            if ctx is not None:
+                try:
+                    await record_run_finished(ctx.recorder, run_id, cancelled_result)
+                except Exception:
+                    logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
+                await notify_run_finished(ctx.notifier, run_id, cancelled_result)
+            raise
+
+        except Exception as exc:
+            _attach_run_error_meta(exc, run_id, mcp_meta)
+            error_won = False
+            try:
+                error_won = await state_store.finalize_run(
+                    run_id,
+                    status=RunStatus.ERROR.value,
+                    error=str(exc),
+                    total_usage=None,
+                    expected_current_status="running",
+                )
+            except Exception:
+                logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+            if error_won:
+                # Use ctx.sequencer if available; otherwise fall back to a fresh
+                # sequencer so the run.error event still emits with sane numbering.
+                err_sequencer = ctx.sequencer if ctx is not None else EventSequencer()
+                await _emit_event(
+                    state_store, run_id, "run.error", err_sequencer, {"error": str(exc)[:500]}
+                )
+            # Fire on_run_failed only if _prepare_resume returned (ctx exists).
+            # If _prepare_resume itself raised, on_run_started never fired, so
+            # the lifecycle pair is balanced (both unfired).
+            if ctx is not None:
+                try:
+                    await record_run_failed(ctx.recorder, run_id, exc)
+                    await notify_run_failed(ctx.notifier, run_id, exc)
+                except Exception:
+                    logger.warning(
+                        "Lifecycle hooks failed during resume error handler for run %s",
+                        run_id,
+                        exc_info=True,
+                    )
+            raise
+
+        finally:
+            if ctx_token is not None:
+                reset_delegation_context(ctx_token)
 
 
 def resume_stream(
@@ -2662,9 +2838,10 @@ def resume_stream(
 
     mcp_meta: dict[str, Any] = {}
 
+    stream_context = StreamContext()
+
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
-        ctx_token = None
 
         try:
             # 1. Resolve state store
@@ -2677,6 +2854,9 @@ def resume_stream(
                     "resume_stream() requires persistence. "
                     "Pass database_url or state_store to the agent."
                 )
+
+            skill_session = await continuation(agent, store, run_id)
+            stream_context.set_session(skill_session)
 
             # 2. Load pause state
             raw_pause = await store.get_pause_state(run_id)
@@ -2783,7 +2963,7 @@ def resume_stream(
                 store_identity=get_store_identity(store),
                 max_delegation_depth=resume_max_depth,
             )
-            ctx_token = set_delegation_context(resume_ctx)
+            stream_context.set_delegation(resume_ctx)
 
             # 7. Emit RUN_RESUMED as first event (contract guarantee)
             yield RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
@@ -2959,15 +3139,13 @@ def resume_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
-                    meta=deepcopy(mcp_meta),
+                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
                 ),
                 error=str(exc),
             )
 
         finally:
             agent._task_manager.release_interrupt(run_id)
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
 
     async def _cleanup() -> RunResult | None:
         """CAS-guarded cancellation + local lifecycle close.
@@ -3032,7 +3210,7 @@ def resume_stream(
             return cancelled_result
         return None
 
-    return _RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
+    return _RunStream(run_id=run_id, generator=stream_context.wrap(_generate()), cleanup=_cleanup)
 
 
 async def resume_claimed(

@@ -34,7 +34,10 @@ audit but never interprets them. The app owns its taxonomy.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from dendrux.skills._session import SkillSession
 
 from dendrux.types import Message, Role
 
@@ -99,6 +102,8 @@ def fold_context(
     history_messages: list[Message],
     context: list[ContextBlock] | None,
     user_input: str,
+    *,
+    session: SkillSession | None = None,
 ) -> list[Message] | None:
     """Fold context blocks into user-message content per the locked format.
 
@@ -110,6 +115,7 @@ def fold_context(
     Returns ``None`` only when there is no history AND no context — the
     single-turn path where the loop builds the ``user_input`` message itself.
     """
+    activations = session.envelopes() if session else []
     validate_context(context)
     stable = render_band(context, "stable")
     dynamic = render_band(context, "dynamic")
@@ -124,16 +130,19 @@ def fold_context(
             )
         else:
             first_folded = first
-        current = Message(role=Role.USER, content=_fold_current(dynamic, user_input))
+        current = Message(
+            role=Role.USER,
+            content=wire_user_input(user_input, activations, context, include_stable=False),
+        )
         return [first_folded, *history_messages[1:], current]
 
-    if not stable and not dynamic:
+    if not stable and not dynamic and not activations:
         return None
 
     # Single-turn (no history): render the first-message stable wrapper around
     # the current-message content so that, once this turn becomes history[0]
     # next run, its stable head is byte-identical → cross-run cache hit.
-    content = _fold_first(stable, _fold_current(dynamic, user_input))
+    content = wire_user_input(user_input, activations, context)
     return [
         Message(
             role=Role.USER,
@@ -153,3 +162,17 @@ def _fold_current(dynamic: str, user_input: str) -> str:
     if not dynamic:
         return user_input
     return f"{DYNAMIC_HEADER}\n{dynamic}\n\n{INPUT_HEADER}\n{user_input}"
+
+
+def wire_user_input(
+    raw_input: str,
+    activations: list[str],
+    context_blocks: list[ContextBlock] | None,
+    *,
+    include_stable: bool = True,
+) -> str:
+    """Canonical first-input framing; activation envelopes always precede context."""
+    content = _fold_current(render_band(context_blocks, "dynamic"), raw_input)
+    if include_stable:
+        content = _fold_first(render_band(context_blocks, "stable"), content)
+    return "\n\n".join([*activations, content])

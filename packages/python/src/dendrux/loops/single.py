@@ -135,7 +135,9 @@ class SingleCall(Loop):
             # supposed to land in react_traces. Use as-is, do not re-record.
             history: list[Message] = list(initial_history)
         else:
-            user_msg = Message(role=Role.USER, content=user_input)
+            from dendrux.context_blocks import wire_user_input
+
+            user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
             history = [user_msg]
             await record_message(recorder, resolved_run_id, user_msg, 0)
             await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)
@@ -530,7 +532,9 @@ class SingleCall(Loop):
             # supposed to land in react_traces. Use as-is, do not re-record.
             history: list[Message] = list(initial_history)
         else:
-            user_msg = Message(role=Role.USER, content=user_input)
+            from dendrux.context_blocks import wire_user_input
+
+            user_msg = Message(role=Role.USER, content=wire_user_input(user_input, [], None))
             history = [user_msg]
             await record_message(recorder, resolved_run_id, user_msg, 0)
             await notify_message(notifier, resolved_run_id, user_msg, 0, notifier_warnings)

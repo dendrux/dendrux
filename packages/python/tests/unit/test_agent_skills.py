@@ -343,9 +343,12 @@ class TestUseSkillTool:
         )
         agent._ensure_skills_loaded()
 
-        result = await agent._execute_use_skill(name="pdf-processing")
-        assert "Instructions" in result
-        assert "read_file" in result
+        lookups = await agent.get_tool_lookups()
+        result = await lookups.fn["use_skill"](name="pdf-processing")
+        assert result.success
+        assert "<skill_content" in result.payload
+        assert "Instructions" in result.payload
+        assert "read_file" in result.payload
 
     @pytest.mark.asyncio
     async def test_use_skill_unknown_name_returns_error(self) -> None:
@@ -359,8 +362,10 @@ class TestUseSkillTool:
         )
         agent._ensure_skills_loaded()
 
-        result = await agent._execute_use_skill(name="nonexistent")
-        assert "not found" in result.lower() or "unknown" in result.lower()
+        lookups = await agent.get_tool_lookups()
+        result = await lookups.fn["use_skill"](name="nonexistent")
+        assert not result.success
+        assert "not found" in result.error
 
     @pytest.mark.asyncio
     async def test_use_skill_denied_name_returns_error(self) -> None:
@@ -375,8 +380,14 @@ class TestUseSkillTool:
         )
         agent._ensure_skills_loaded()
 
-        result = await agent._execute_use_skill(name="pdf-processing")
-        assert "not found" in result.lower() or "not available" in result.lower()
+        from dendrux.skills._session import SkillSession
+        from dendrux.types import ToolCall
+
+        result = await SkillSession.prepare(agent).execute(
+            ToolCall(name="use_skill", params={"name": "pdf-processing"})
+        )
+        assert not result.success
+        assert "denied" in result.error
 
 
 # ---------------------------------------------------------------------------

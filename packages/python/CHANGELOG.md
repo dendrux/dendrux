@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+- Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context leaked between yields.
+- Skills v2. A skill can now carry files and scripts, be built from code, and be
+  activated per run. Dendrux still never executes skill code itself.
+  - `Skill` is validated and immutable, and is exported from `dendrux`. Build it
+    directly, with `Skill.from_markdown(text, files=, revision=)` or
+    `Skill.from_dir(path, revision=)`; `skill.to_markdown()` writes canonical
+    `SKILL.md`. New fields: `files` (text as `str`, binary as `bytes`, anything
+    under `scripts/` is a script), `allowed_tools`, `revision` (a non-secret
+    audit label) and `digest` (`sha256:...`, content only). Invalid input
+    raises `SkillValidationError` (a `ValueError`). `path` is now optional and
+    keyword-only; after frontmatter parsing removes exactly one leading newline,
+    the remaining body is kept without further stripping.
+  - New built-in tools `read_skill_resource` and `run_skill_script` join
+    `use_skill`. All three are reserved names, can be named in `deny=` and
+    `require_approval=` (even on an agent with no other tools), and skip
+    `tool_result_transform`. `deny=["use_skill"]` turns off model-driven
+    activation.
+  - `Agent(skill_executor=...)` takes a `SkillExecutor` subclass
+    (`execute(request) -> SkillExecutionResult`, `timeout_seconds`) that you
+    write. Without one, `run_skill_script` is not offered and a one-time
+    warning names the skills whose scripts cannot run. `SkillExecutor`,
+    `SkillExecutionRequest` and `SkillExecutionResult` are exported from
+    `dendrux`.
+  - `agent.run(..., activate_skills=[...])` and `agent.stream(...)` deliver
+    chosen skill bodies in the first message. Unknown or denied names raise
+    `ValueError` before a run is created. Activations are part of the
+    idempotency fingerprint, and `agent.retry` keeps them.
+  - Resume safety: every run records a manifest (name, revision, digest) in
+    `agent_runs.meta["dendrux.skills"]`. `resume`, `resume_stream`,
+    `submit_tool_results`, `submit_input` and `submit_approval` check it before
+    claiming the run and raise `SkillMissingError` or `SkillMismatchError`
+    (`dendrux.errors`, base `SkillContinuityError`), leaving the run paused.
+    `resume_stream` ends with a `RUN_ERROR` instead. No migration.
+  - **Breaking (alpha):** the governance events `skill.registered`,
+    `skill.denied` and `skill.invoked` are replaced by seven events:
+    `skill.catalog_resolved` (also lists denied names), `skill.activated`,
+    `skill.activation_failed`, `skill.resource_read`, `skill.script_requested`,
+    `skill.script_completed` and `skill.script_failed`. Payloads carry names,
+    paths, counts and timings, never bodies, arguments or output. Update any
+    code that filters on the old names.
+  - Behaviour changes: a `use_skill` miss is now an error result (it used to be
+    a successful call that still emitted `skill.invoked`); on SingleCall a skill
+    with files raises `ValueError`; `agent.retry` now rejects a source run from
+    another tenant with `ReplayRunError`; `skills_dir` problems surface at the
+    first run, not at construction.
+  - Docs: rewritten Skills page with local subprocess and E2B executor recipes,
+    and the example in `examples/14_skills/` now shows files, a script executor,
+    explicit activation and the skill events.
+
 ## 0.2.0a22 - 2026-10-14
 
 - MCP: `connection.tools()` gains `prefix`, `rename`, and `strict` (also on

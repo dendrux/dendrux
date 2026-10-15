@@ -233,16 +233,16 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | --- | --- | --- |
 | `run.started` | First event on any run | `{"agent_name": str, "system_prompt": str}` |
 | `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval", "pending_tool_calls": [{"id", "name", "target", "params"}]}` |
-| `run.resumed` | Submit method claims a paused run | `{"submitted_results": [...]}` or `{"user_input": str}` |
-| `run.completed` | Terminal success or max_iterations | empty `{}` |
+| `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}` |
+| `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str}` |
 | `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, or streamed run interrupted / closed | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when a model stream was abandoned mid-generation; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream |
 | `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars) |
-| `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "cost_usd", "model", "has_tool_calls"}` |
-| `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`, `correlation_id` = tool call id |
+| `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens", "cost_usd", "cost_source", "usage_reported", "model", "has_tool_calls", "phase"}` |
+| `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`; malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
 
 ### Governance events
 
-From `dendrux.types.GovernanceEventType`. All thirteen values are deliverable through `on_governance_event` on notifiers and `/events/stream`.
+From `dendrux.types.GovernanceEventType`. The values below are deliverable through `on_governance_event` on notifiers and `/events/stream`.
 
 | `event_type` | Fires when | `data` payload |
 | --- | --- | --- |
@@ -254,12 +254,18 @@ From `dendrux.types.GovernanceEventType`. All thirteen values are deliverable th
 | `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
 | `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "outgoing", "error": str}` |
-| `skill.registered` | Skill loaded at run start | `{"skill_name": str, "description": str}` |
-| `skill.denied` | Skill filtered by `deny_skills=` | `{"skill_name": str, "reason": "denied_by_policy"}` |
-| `skill.invoked` | LLM called `use_skill(name=...)` | `{"skill_name": str}` |
-| `mcp.connected` | MCP source discovery completed | `{"source_name": str, "tool_count": int, "tool_names": list[str]}` |
-| `mcp.error` | MCP discovery failed | `{"error": str, "error_type": str, "code": str}` (error truncated to 500 chars; `reason` added for OAuth verdicts) |
+| `guardrail.unmapped_placeholder` | Final output contains placeholders that cannot be deanonymized | `{"placeholders": list[str]}` |
+| `skill.catalog_resolved` | Run start, when skills are configured | `{"delivery": "progressive" \| "inlined", "skills": [{"name", "revision", "digest"}], "denied": list[str]}` |
+| `skill.activated` | A skill's body was delivered to the model | `{"name": str, "digest": str, "origin": "model" \| "explicit" \| "inlined"}` |
+| `skill.activation_failed` | `use_skill` named an unknown or denied skill | `{"name": str, "reason": "not_found" \| "denied"}` |
+| `skill.resource_read` | `read_skill_resource` returned a text file | `{"name": str, "path": str, "chars": int, "truncated": bool}` |
+| `skill.script_requested` | A `run_skill_script` call passed its checks, before any approval | `{"name": str, "path": str, "argc": int}` |
+| `skill.script_completed` | The skill executor returned | `{"name": str, "path": str, "exit_code": int, "duration_ms": int, "stdout_chars": int, "stderr_chars": int, "truncated": bool}` |
+| `skill.script_failed` | Dendrux's timeout expired, the executor raised, it returned something other than a `SkillExecutionResult`, or an approved script resumed on an agent with no executor | `{"name": str, "path": str, "error_type": str}` (`timeout`, an exception class name, `invalid_result`, or `executor_unavailable`) |
+| `mcp.connected` | MCP source discovery completed | `{"source_name": str, "namespace": str, "tool_count": int, "tool_names": list[str]}` |
+| `mcp.error` | MCP discovery failed | Strict failure: `{"error": str, "error_type": str \| null, "code": str}`. Best-effort source failure also includes `"source_name"`, `"namespace"`, and `"failure_mode"`. OAuth failures may add `"reason"`; `error` is truncated to 500 characters |
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
+| `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
 
 Each `budget.threshold` fraction fires at most once per run. `budget.exceeded` fires at most once per run. Pause/resume persists the fired set, so resumed runs do not re-fire.
 
@@ -406,6 +412,8 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids). No partial claim. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
+| `SkillMissingError` | `SkillContinuityError` | 409 | The run was created with a skill this agent does not have. Run stays paused; attach the skill and retry. |
+| `SkillMismatchError` | `SkillContinuityError` | 409 | A skill the run was created with has different content now. Run stays paused; attach the original content and retry. |
 
 ## Read-side types
 
