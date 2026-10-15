@@ -273,6 +273,26 @@ async def research(query: str) -> str:
 
 The state store links parent and child runs. The dashboard shows the full delegation tree. Depth guards prevent runaway recursion.
 
+### 📚 Skills
+
+Package instructions, reference files, and scripts as a skill. The model sees a catalogue, pulls a body only when it needs it, and reads files or runs scripts on demand.
+
+```python
+from dendrux import Agent, Skill, SkillExecutionResult, SkillExecutor
+
+triage = Skill(
+    name="ticket-triage",
+    description="Classify a support ticket and pick a priority.",
+    body="Read references/policy.md, then classify the ticket.",
+    files={"references/policy.md": "P1: outage. P2: broken feature. P3: question."},
+)
+
+agent = Agent(provider=provider, prompt="You are a support agent.", skills=[triage])
+result = await agent.run("The export button does nothing.", activate_skills=["ticket-triage"])
+```
+
+Skills build from code, `SKILL.md` text, or a directory. Scripts under `scripts/` run only through a `SkillExecutor` you write (a subprocess, a container, a hosted sandbox); the model's tool calls obey `deny` and `require_approval` like any other tool. A run records the digest of every skill it started with and refuses to resume against changed content. See [Skills](docs/architecture/skills.mdx).
+
 ### ⏸️ Pause for the Real World
 
 **Client-side tools**: define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
@@ -432,7 +452,7 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`11_structured_output.py`](packages/python/examples/11_structured_output.py) | Typed Pydantic models from LLM |
 | [`12_structured_output_stream.py`](packages/python/examples/12_structured_output_stream.py) | Structured output in streaming mode |
 | [`13_mcp_filesystem.py`](packages/python/examples/13_mcp_filesystem.py) | Agent with an MCP tool source |
-| [`14_skills/`](packages/python/examples/14_skills/) | Filesystem-loaded skill packs |
+| [`14_skills/`](packages/python/examples/14_skills/) | Skills with files and a script executor: model-driven and explicit activation, approvals |
 | [`15_cache_efficiency.py`](packages/python/examples/15_cache_efficiency.py) | Anthropic prompt-cache hit measurement |
 | [`16_cache_efficiency_openai.py`](packages/python/examples/16_cache_efficiency_openai.py) | OpenAI prompt-cache hit measurement |
 | [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |
