@@ -103,6 +103,14 @@ class Image:
         _check_detail(detail)
         return cls(source="url", url=url, detail=detail)
 
+    def __post_init__(self) -> None:
+        payload = {"bytes": self.data, "path": self.path, "base64": self.text, "url": self.url}
+        if self.source not in payload:
+            raise ValueError(f"Image.source must be one of {tuple(payload)}, got {self.source!r}")
+        if payload[self.source] is None or sum(v is not None for v in payload.values()) != 1:
+            raise ValueError("build an Image with Image.from_bytes/from_path/from_base64/from_url")
+        _check_detail(self.detail)
+
     def __repr__(self) -> str:
         fields = [f"source={self.source!r}"]
         if self.source == "bytes":

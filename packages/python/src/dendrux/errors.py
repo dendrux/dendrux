@@ -32,6 +32,7 @@ Suggested HTTP mappings:
     BlobNotFoundError           -> 404
     BlobIntegrityError          -> 500
     ImagePersistenceUnsupportedError -> 500
+    BlobContentionError         -> 503 (transient; safe to retry)
 
 Image errors never carry image bytes, base64, data URLs, file paths or URL
 paths/queries/credentials, and are raised with no ``__cause__`` and no
@@ -587,7 +588,20 @@ class ImagePersistenceUnsupportedError(RuntimeError):
         super().__init__(f"Images are not supported here{store}: {hint}.")
 
 
+class BlobContentionError(RuntimeError):
+    """Storing an image lost too many races with concurrent purge, GC or ingest.
+
+    Transient: retrying the same call is safe.
+    """
+
+    def __init__(self, image_id: str | None = None) -> None:
+        self.image_id = image_id
+        what = f"image {image_id!r}" if image_id else "an image"
+        super().__init__(f"Could not store {what} due to concurrent changes; retry the call.")
+
+
 __all__ = [
+    "BlobContentionError",
     "BlobIntegrityError",
     "BlobNotFoundError",
     "ContextLengthExceededError",

@@ -52,6 +52,10 @@ class BlobCatalog(Protocol):
 
     async def promote(self, scope: str, sha256: str, generation: str) -> bool: ...
 
+    async def adopt_pending(
+        self, scope: str, sha256: str, old_generation: str, new_generation: str
+    ) -> bool: ...
+
     async def revive(
         self,
         scope: str,

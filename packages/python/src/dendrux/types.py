@@ -78,6 +78,13 @@ class ToolCall:
     parse_error: str | None = None
 
 
+# Sentinel for Message.meta's default (keeps dataclass default_factory semantics).
+_META_UNSET: Any = object()
+_ROLE_TOOL = Role.TOOL
+_ROLE_SYSTEM = Role.SYSTEM
+_ROLE_ASSISTANT = Role.ASSISTANT
+
+
 # ------------------------------------------------------------------
 # Image content parts (0.4.0)
 # ------------------------------------------------------------------
@@ -257,7 +264,7 @@ def _text_projection(parts: tuple[ContentPart, ...]) -> str:
     return projection
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Message:
     """A single message in the conversation.
 
@@ -306,37 +313,74 @@ class Message:
     reasoning_blocks: list[Any] | None = None
     parts: tuple[ContentPart, ...] | None = None
 
+    def __init__(
+        self,
+        role: Role,
+        content: str,
+        name: str | None = None,
+        tool_calls: list[ToolCall] | None = None,
+        call_id: str | None = None,
+        meta: dict[str, Any] = _META_UNSET,
+        kind: str = "chat",
+        placement: str = "dynamic",
+        source: str | None = None,
+        reasoning: str | None = None,
+        reasoning_blocks: list[Any] | None = None,
+        parts: tuple[ContentPart, ...] | None = None,
+    ) -> None:
+        # Hand-written (dataclass init=False) so the 13-field frozen message is
+        # built with one dict update instead of one object.__setattr__ per field.
+        self.__dict__.update(
+            role=role,
+            content=content,
+            name=name,
+            tool_calls=tool_calls,
+            call_id=call_id,
+            meta={} if meta is _META_UNSET else meta,
+            kind=kind,
+            placement=placement,
+            source=source,
+            reasoning=reasoning,
+            reasoning_blocks=reasoning_blocks,
+            parts=parts,
+        )
+        self.__post_init__()
+
     def __post_init__(self) -> None:
         if self.parts is not None:
             self._validate_parts()
-        if self.placement not in ("stable", "dynamic"):
-            raise ValueError(f"placement must be 'stable' or 'dynamic', got {self.placement!r}")
+        # Hot path: locals and module-level role constants keep text-only
+        # construction as cheap as v0.3.0 despite the extra field.
+        placement = self.placement
+        if placement != "dynamic" and placement != "stable":
+            raise ValueError(f"placement must be 'stable' or 'dynamic', got {placement!r}")
+        role = self.role
         # Derive kind from role when left at the generic default. A TOOL message
         # is always a tool_result; a SYSTEM message is always system context.
         if self.kind == "chat":
-            if self.role == Role.TOOL:
+            if role == _ROLE_TOOL:
                 object.__setattr__(self, "kind", "tool_result")
-            elif self.role == Role.SYSTEM:
+            elif role == _ROLE_SYSTEM:
                 object.__setattr__(self, "kind", "system")
-        if self.role == Role.TOOL:
+        if role == _ROLE_TOOL:
             if not self.name:
                 raise ValueError("TOOL messages require name")
             if not self.call_id:
                 raise ValueError("TOOL messages require call_id")
             if self.tool_calls is not None:
                 raise ValueError("TOOL messages cannot have tool_calls")
-        elif self.role == Role.ASSISTANT:
+        elif role == _ROLE_ASSISTANT:
             if self.call_id is not None:
                 raise ValueError("ASSISTANT messages cannot have call_id")
             if self.name is not None:
                 raise ValueError("ASSISTANT messages cannot have name")
         else:
             if self.tool_calls is not None:
-                raise ValueError(f"{self.role.value.upper()} messages cannot have tool_calls")
+                raise ValueError(f"{role.value.upper()} messages cannot have tool_calls")
             if self.call_id is not None:
-                raise ValueError(f"{self.role.value.upper()} messages cannot have call_id")
+                raise ValueError(f"{role.value.upper()} messages cannot have call_id")
             if self.name is not None:
-                raise ValueError(f"{self.role.value.upper()} messages cannot have name")
+                raise ValueError(f"{role.value.upper()} messages cannot have name")
 
     def _validate_parts(self) -> None:
         parts = self.parts
@@ -482,24 +526,32 @@ class ToolResult:
     # Images attached to the result. Client tools pass Image / ImageRef /
     # ImagePart; after ingest these are canonical ImageParts.
     images: tuple[Image | ImageRef | ImagePart, ...] = ()
+    # Per-image ingest notes (lenient MCP results): rendered as text after the payload.
+    notes: tuple[str, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         if type(self.images) is not tuple:
             object.__setattr__(self, "images", tuple(self.images))
+        if type(self.notes) is not tuple:
+            object.__setattr__(self, "notes", tuple(self.notes))
 
 
 def tool_result_message(result: ToolResult) -> Message:
     """Build the TOOL message for a tool result.
 
-    Without images this is exactly the v0.3.0 shape (``content=payload``).
-    With images: ``Message.with_parts(TOOL, (TextPart(payload), *image_parts))``.
+    Without images or notes this is exactly the v0.3.0 shape (``content=payload``).
+    With images: ``Message.with_parts(TOOL, (TextPart(payload), *TextPart(note), *image_parts))``.
+    Notes without images: text-only, ``content = payload + "\n\n" + "\n".join(notes)``.
     ``result.images`` must already be ingested (``ImagePart`` or ``ImageRef``).
     """
     meta: dict[str, Any] = {"is_error": True} if not result.success else {}
     if not result.images:
+        content = result.payload
+        if result.notes:
+            content = result.payload + "\n\n" + "\n".join(result.notes)
         return Message(
             role=Role.TOOL,
-            content=result.payload,
+            content=content,
             name=result.name,
             call_id=result.call_id,
             meta=meta,
@@ -507,6 +559,7 @@ def tool_result_message(result: ToolResult) -> Message:
     parts: list[ContentPart] = []
     if result.payload:
         parts.append(TextPart(result.payload))
+    parts.extend(TextPart(note) for note in result.notes)
     for img in result.images:
         if isinstance(img, ImagePart):
             parts.append(img)
@@ -1024,7 +1077,9 @@ class ImageViewState:
     ``sent_through``: slots below it count as history (sent or seeded).
     ``dropped_through``: eligible slots below it render the drop placeholder.
     ``rejected`` only grows; ``described`` and ``guardrail_verdicts`` are
-    first-wins; ``warned`` lists warning keys already emitted.
+    first-wins; ``placeholders`` maps a slot to the placeholder reason it took
+    the first time (sticky; only ever changes to ``"purged"``); ``warned``
+    lists warning keys already emitted.
     """
 
     epoch: int = 0
@@ -1033,6 +1088,7 @@ class ImageViewState:
     rejected: list[ImageKey] = field(default_factory=list)
     described: dict[ImageKey, str] = field(default_factory=dict)
     guardrail_verdicts: dict[GuardrailVerdictKey, GuardrailVerdict] = field(default_factory=dict)
+    placeholders: dict[int, str] = field(default_factory=dict)
     warned: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1060,6 +1116,10 @@ class ImageViewState:
                     "entities": list(v.entities),
                 }
                 for k, v in verdicts
+            ],
+            "placeholders": [
+                {"slot": slot, "reason": reason}
+                for slot, reason in sorted(self.placeholders.items())
             ],
             "warned": sorted(set(self.warned)),
         }
@@ -1091,6 +1151,9 @@ class ImageViewState:
                 vkey,
                 GuardrailVerdict(action=item["action"], entities=tuple(item.get("entities") or ())),
             )
+        placeholders: dict[int, str] = {}
+        for item in d.get("placeholders") or []:
+            placeholders.setdefault(int(item["slot"]), str(item["reason"]))
         return cls(
             epoch=int(d.get("epoch") or 0),
             dropped_through=int(d.get("dropped_through") or 0),
@@ -1098,6 +1161,7 @@ class ImageViewState:
             rejected=rejected,
             described=described,
             guardrail_verdicts=verdicts,
+            placeholders=placeholders,
             warned=list(dict.fromkeys(str(w) for w in d.get("warned") or [])),
         )
 

@@ -7,7 +7,14 @@ Public names: :class:`Image`, :class:`ToolOutput`, :class:`ImagePolicy`,
 """
 
 from dendrux.media._catalog import BlobCatalog, BlobEdge, BlobResolver
-from dendrux.media._ids import IMAGE_ID_RE, PLACEHOLDERS, image_id, placeholder
+from dendrux.media._ids import (
+    IMAGE_ID_RE,
+    PLACEHOLDER_PRECEDENCE,
+    PLACEHOLDERS,
+    image_id,
+    placeholder,
+    placeholder_rank,
+)
 from dendrux.media._image import Detail, Image, ImageInput, ImageSource, ToolOutput, UserContent
 from dendrux.media._ingest import ingest
 from dendrux.media._policy import (
@@ -48,6 +55,7 @@ from dendrux.types import ImagePart, ImageRef, TextPart
 __all__ = [
     "IMAGE_ID_RE",
     "PLACEHOLDERS",
+    "PLACEHOLDER_PRECEDENCE",
     "SUPPORTED_MEDIA_TYPES",
     "BlobAccessor",
     "BlobCatalog",
@@ -91,6 +99,7 @@ __all__ = [
     "ingest",
     "inspect_image",
     "placeholder",
+    "placeholder_rank",
     "sniff_media_type",
     "tenant_scope_for",
     "verify_blob_bytes",

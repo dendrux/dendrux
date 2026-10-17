@@ -43,6 +43,7 @@ class ImageViewDelta:
     dropped_through: int | None = None
     described: Mapping[ImageKey, str] = field(default_factory=dict)
     guardrail_verdicts: Mapping[GuardrailVerdictKey, GuardrailVerdict] = field(default_factory=dict)
+    placeholders: Mapping[int, str] = field(default_factory=dict)
     warned: tuple[str, ...] = ()
 
 

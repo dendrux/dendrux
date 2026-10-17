@@ -121,6 +121,8 @@ class BlobInfo:
     purged_at: datetime | None = None
     purge_reason: str | None = None
     ingest_transform: str | None = None
+    # When the row last changed state (pending-staleness check in ingest).
+    state_changed_at: datetime | None = None
 
     def to_ref(self) -> ImageRef:
         """The canonical :class:`~dendrux.types.ImageRef` for this row."""
@@ -154,6 +156,7 @@ class GcResult:
     deleted_orphan_edges: int = 0
     completed_purges: int = 0
     retried_deletes: int = 0
+    skipped_referenced: int = 0
     bytes_freed: int = 0
 
 
