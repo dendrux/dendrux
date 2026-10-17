@@ -93,6 +93,19 @@ def _to_aware_utc(dt: _dt.datetime | None) -> _dt.datetime | None:
     return dt.astimezone(_dt.UTC)
 
 
+def _usage_totals(total_usage: UsageStats) -> dict[str, Any]:
+    """``agent_runs.total_*`` columns for a run-level usage total."""
+    return {
+        "total_input_tokens": total_usage.input_tokens,
+        "total_output_tokens": total_usage.output_tokens,
+        "total_cost_usd": total_usage.cost_usd,
+        # Cache/reasoning rollup: None treated as 0 in aggregation
+        "total_cache_read_tokens": total_usage.cache_read_input_tokens or 0,
+        "total_cache_creation_tokens": total_usage.cache_creation_input_tokens or 0,
+        "total_reasoning_tokens": total_usage.reasoning_tokens or 0,
+    }
+
+
 def _require_aware_utc(name: str, value: _dt.datetime | None) -> None:
     """Reject naive datetimes at the public-API boundary.
 
@@ -493,6 +506,7 @@ class StateStore(Protocol):
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
     ) -> bool:
         """Atomic CAS over a set of allowed current statuses.
 
@@ -549,6 +563,7 @@ class StateStore(Protocol):
         pause_data: dict[str, Any],
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> bool:
         """Persist a pause with one CAS: only a RUNNING row without a pending cancel.
 
@@ -568,8 +583,12 @@ class StateStore(Protocol):
         event_data: dict[str, Any] | None = None,
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> int | None:
         """``try_pause_run`` and the ``run.paused`` event in one transaction.
+
+        ``total_usage`` writes the run's running totals (``total_*``) so a
+        paused run does not read as zero spend.
 
         Returns the event's sequence index, or None when the CAS lost.
         """
@@ -588,6 +607,7 @@ class StateStore(Protocol):
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
     ) -> int | None:
         """``finalize_run_if_status_in`` and its event in one transaction.
 
@@ -651,6 +671,7 @@ class StateStore(Protocol):
         pause_data: dict[str, Any],
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> None: ...
 
     async def get_pause_state(self, run_id: str) -> dict[str, Any] | None: ...
@@ -1208,15 +1229,7 @@ class SQLAlchemyStateStore:
                 if error is not None:
                     values["error"] = error
                 if total_usage is not None:
-                    values["total_input_tokens"] = total_usage.input_tokens
-                    values["total_output_tokens"] = total_usage.output_tokens
-                    values["total_cost_usd"] = total_usage.cost_usd
-                    # Cache rollup: None treated as 0 in aggregation
-                    values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
-                    values["total_cache_creation_tokens"] = (
-                        total_usage.cache_creation_input_tokens or 0
-                    )
-                    values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
+                    values.update(_usage_totals(total_usage))
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
 
@@ -1258,6 +1271,7 @@ class SQLAlchemyStateStore:
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
     ) -> bool:
         """Atomic CAS finalize over multiple acceptable current statuses.
 
@@ -1279,6 +1293,7 @@ class SQLAlchemyStateStore:
                     iteration_count=iteration_count,
                     total_usage=total_usage,
                     pii_mapping=pii_mapping,
+                    failure_reason=failure_reason,
                 )
                 await session.commit()
                 return won
@@ -1298,6 +1313,7 @@ class SQLAlchemyStateStore:
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
     ) -> int | None:
         """:meth:`finalize_run_if_status_in` plus its lifecycle event, in one transaction.
 
@@ -1319,6 +1335,7 @@ class SQLAlchemyStateStore:
                     iteration_count=iteration_count,
                     total_usage=total_usage,
                     pii_mapping=pii_mapping,
+                    failure_reason=failure_reason,
                 )
                 if not won:
                     await session.rollback()
@@ -1341,6 +1358,7 @@ class SQLAlchemyStateStore:
         iteration_count: int | None,
         total_usage: UsageStats | None,
         pii_mapping: dict[str, str] | None,
+        failure_reason: str | None = None,
     ) -> bool:
         from sqlalchemy import update
 
@@ -1362,14 +1380,11 @@ class SQLAlchemyStateStore:
         if error is not None:
             values["error"] = error
         if total_usage is not None:
-            values["total_input_tokens"] = total_usage.input_tokens
-            values["total_output_tokens"] = total_usage.output_tokens
-            values["total_cost_usd"] = total_usage.cost_usd
-            values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
-            values["total_cache_creation_tokens"] = total_usage.cache_creation_input_tokens or 0
-            values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
+            values.update(_usage_totals(total_usage))
         if pii_mapping is not None:
             values["pii_mapping"] = pii_mapping
+        if failure_reason is not None:
+            values["failure_reason"] = failure_reason
 
         result: Any = await session.execute(
             update(AgentRun)
@@ -1510,6 +1525,7 @@ class SQLAlchemyStateStore:
         pause_data: dict[str, Any],
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> bool:
         """CAS pause: RUNNING and no pending cancel, else False (caller honors winner)."""
         from sqlalchemy import update
@@ -1527,6 +1543,8 @@ class SQLAlchemyStateStore:
                     values["iteration_count"] = iteration_count
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
+                if total_usage is not None:
+                    values.update(_usage_totals(total_usage))
                 result = await session.execute(
                     update(AgentRun)
                     .where(
@@ -1550,6 +1568,7 @@ class SQLAlchemyStateStore:
         event_data: dict[str, Any] | None = None,
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> int | None:
         """:meth:`try_pause_run` plus the ``run.paused`` event, in one transaction.
 
@@ -1573,6 +1592,8 @@ class SQLAlchemyStateStore:
                     values["iteration_count"] = iteration_count
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
+                if total_usage is not None:
+                    values.update(_usage_totals(total_usage))
                 result = await session.execute(
                     update(AgentRun)
                     .where(
@@ -1741,8 +1762,12 @@ class SQLAlchemyStateStore:
         pause_data: dict[str, Any],
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> None:
-        """Persist pause state and set WAITING status."""
+        """Persist pause state and set the paused status.
+
+        ``total_usage`` writes the run's running totals (``total_*``).
+        """
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
@@ -1758,6 +1783,8 @@ class SQLAlchemyStateStore:
                     values["iteration_count"] = iteration_count
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
+                if total_usage is not None:
+                    values.update(_usage_totals(total_usage))
                 stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
                 await session.execute(stmt)
                 await session.commit()

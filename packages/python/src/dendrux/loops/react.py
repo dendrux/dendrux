@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
+from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
@@ -58,7 +59,6 @@ from dendrux.tools._validate import check_tool_call, check_tool_json
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     AgentStep,
-    Budget,
     Clarification,
     Finish,
     GovernanceEventType,
@@ -110,9 +110,6 @@ _notify_llm_failed = notify_llm_failed
 _notify_tool = notify_tool
 _notify_tool_started = notify_tool_started
 _notify_governance = notify_governance
-
-# Sentinel value in fired_thresholds to track that budget.exceeded has fired.
-_BUDGET_EXCEEDED_SENTINEL = -1.0
 
 
 class _ToolCallOutcome(NamedTuple):
@@ -178,79 +175,6 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
         ) + step_usage.cache_creation_input_tokens
     if step_usage.reasoning_tokens is not None:
         total.reasoning_tokens = (total.reasoning_tokens or 0) + step_usage.reasoning_tokens
-
-
-async def _check_budget(
-    budget: Budget | None,
-    total_usage: UsageStats,
-    fired_thresholds: list[float],
-    recorder: LoopRecorder | None,
-    notifier: LoopNotifier | None,
-    run_id: str,
-    iteration: int,
-    warnings: list[str],
-) -> None:
-    """Check budget thresholds and exceeded after usage accumulation.
-
-    Advisory only — fires governance events but does not pause or stop.
-    Each threshold and exceeded fires exactly once per run.
-    """
-    if budget is None:
-        return
-
-    used = total_usage.total_tokens
-    max_t = budget.max_tokens
-    fraction = used / max_t
-
-    # Threshold events — fire once per fraction when first crossed
-    for threshold in budget.warn_at:
-        if fraction >= threshold and threshold not in fired_thresholds:
-            fired_thresholds.append(threshold)
-            event_data = {
-                "fraction": threshold,
-                "used": used,
-                "max": max_t,
-                "reason": "threshold_crossed",
-            }
-            await _record_governance(
-                recorder,
-                run_id,
-                "budget.threshold",
-                iteration,
-                event_data,
-            )
-            await _notify_governance(
-                notifier,
-                run_id,
-                "budget.threshold",
-                iteration,
-                event_data,
-                warnings=warnings,
-            )
-
-    # Exceeded event — fire once when usage first reaches max
-    if used >= max_t and _BUDGET_EXCEEDED_SENTINEL not in fired_thresholds:
-        fired_thresholds.append(_BUDGET_EXCEEDED_SENTINEL)
-        event_data = {
-            "used": used,
-            "max": max_t,
-            "reason": "budget_exceeded",
-        }
-        await _record_governance(
-            recorder,
-            run_id,
-            "budget.exceeded",
-            iteration,
-            event_data,
-        )
-        await _notify_governance(
-            notifier,
-            run_id,
-            "budget.exceeded",
-            iteration,
-            event_data,
-            warnings=warnings,
-        )
 
 
 async def _append_assistant(
@@ -322,6 +246,7 @@ def _build_pause(
     iteration: int,
     usage: UsageStats,
     approval_gates: dict[str, dict[str, str | None]] | None = None,
+    budget: BudgetTracker | None = None,
 ) -> PauseState:
     """Build PauseState for client tool, approval or clarification pause."""
     pending_targets = (
@@ -340,6 +265,7 @@ def _build_pause(
         trace_order_offset=len(history),
         usage=_snapshot_usage(usage),
         approval_gates=approval_gates,
+        **(budget.pause_fields() if budget is not None else {}),
     )
 
 
@@ -362,7 +288,7 @@ async def _read_control(state_store: StateStore, run_id: str) -> Any:
     return _LegacyControl(cancel_requested=bool(await state_store.is_cancel_requested(run_id)))
 
 
-def _requested_pause_result(
+def _checkpoint_pause_result(
     *,
     agent_name: str,
     run_id: str,
@@ -371,12 +297,17 @@ def _requested_pause_result(
     iteration: int,
     usage: UsageStats,
     meta: dict[str, Any],
+    budget: BudgetTracker | None = None,
+    breaches: list[BudgetBreach] | None = None,
 ) -> RunResult:
-    """PAUSED result for a requested pause observed at the top of ``iteration``.
+    """PAUSED result for a pause observed at the top of ``iteration``.
 
     Nothing of ``iteration`` has run, so the pause records ``iteration - 1``
-    and resume continues at ``iteration`` with the full history.
+    and resume continues at ``iteration`` with the full history. With
+    ``breaches`` it is a budget pause (``pause_reason="budget"``), else a
+    requested one.
     """
+    exceeded = breach_payload(breaches) if breaches else None
     pause = PauseState(
         agent_name=agent_name,
         pending_tool_calls=[],
@@ -385,8 +316,11 @@ def _requested_pause_result(
         iteration=iteration - 1,
         trace_order_offset=len(history),
         usage=_snapshot_usage(usage),
-        pause_reason="requested",
+        pause_reason="budget" if exceeded else "requested",
+        budget_exceeded=exceeded,
+        **(budget.pause_fields() if budget is not None else {}),
     )
+    extra = {"budget_exceeded": exceeded} if exceeded else {}
     return RunResult(
         run_id=run_id,
         status=RunStatus.PAUSED,
@@ -394,7 +328,69 @@ def _requested_pause_result(
         commentary=_commentary(steps),
         iteration_count=iteration - 1,
         usage=usage,
-        meta={"pause_state": pause, **meta},
+        meta={"pause_state": pause, **meta, **extra},
+    )
+
+
+def _budget_cancel_result(
+    *,
+    run_id: str,
+    steps: list[AgentStep],
+    iteration: int,
+    usage: UsageStats,
+    meta: dict[str, Any],
+    breaches: list[BudgetBreach],
+) -> RunResult:
+    """CANCELLED result for a budget cancel at the top of ``iteration``.
+
+    ``meta["budget_exceeded"]`` tells the runner to persist
+    ``failure_reason="budget_exceeded"`` and a distinct event reason.
+    """
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.CANCELLED,
+        steps=steps,
+        commentary=_commentary(steps),
+        iteration_count=iteration - 1,
+        usage=usage,
+        meta={**meta, "budget_exceeded": breach_payload(breaches)},
+    )
+
+
+async def _budget_stop(
+    budget: BudgetTracker,
+    *,
+    agent_name: str,
+    run_id: str,
+    history: list[Message],
+    steps: list[AgentStep],
+    iteration: int,
+    usage: UsageStats,
+    meta: dict[str, Any],
+) -> RunResult | None:
+    """Checkpoint budget enforcement: a PAUSED/CANCELLED result, or None to go on."""
+    action, breaches = await budget.checkpoint(iteration)
+    if not breaches:
+        return None
+    if action == "cancel":
+        return _budget_cancel_result(
+            run_id=run_id,
+            steps=steps,
+            iteration=iteration,
+            usage=usage,
+            meta=meta,
+            breaches=breaches,
+        )
+    return _checkpoint_pause_result(
+        agent_name=agent_name,
+        run_id=run_id,
+        history=history,
+        steps=steps,
+        iteration=iteration,
+        usage=usage,
+        meta=meta,
+        budget=budget,
+        breaches=breaches,
     )
 
 
@@ -1053,8 +1049,13 @@ class ReActLoop(Loop):
         output_type: type[BaseModel] | None = None,
         initial_pii_mapping: dict[str, str] | None = None,
         state_store: StateStore | None = None,
+        budget_carry: BudgetCarry | None = None,
     ) -> RunResult:
-        """Execute the ReAct loop, optionally resuming from a pause."""
+        """Execute the ReAct loop, optionally resuming from a pause.
+
+        ``budget_carry`` restores budget bookkeeping (fired keys) from the
+        pause being resumed.
+        """
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
         cache_key_prefix = build_cache_key_prefix(agent)
@@ -1071,7 +1072,17 @@ class ReActLoop(Loop):
         )
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
-        budget_fired: list[float] = []
+        budget = BudgetTracker(
+            agent.budget,
+            run_id=resolved_run_id,
+            usage=total_usage,
+            recorder=recorder,
+            notifier=notifier,
+            warnings=notifier_warnings,
+            state_store=state_store,
+            carry=budget_carry,
+            fresh=iteration_offset == 0,
+        )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
         g_engine = (
@@ -1084,41 +1095,59 @@ class ReActLoop(Loop):
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
             # Cooperative checkpoint before starting the next iteration:
-            # cancel wins over pause; then inbox notes are delivered. The
-            # current iteration's LLM/tools are not preempted — flags are seen
-            # here or at the runner's pre-pause checkpoint.
-            if state_store is not None:
-                control = await _read_control(state_store, resolved_run_id)
-                if control.cancel_requested:
-                    return RunResult(
-                        run_id=resolved_run_id,
-                        status=RunStatus.CANCELLED,
-                        steps=steps,
-                        commentary=_commentary(steps),
-                        iteration_count=iteration - 1,
-                        usage=total_usage,
-                        meta=guardrail_meta(g_engine, notifier_warnings),
-                    )
-                if control.pause_requested:
-                    return _requested_pause_result(
-                        agent_name=agent.name,
-                        run_id=resolved_run_id,
-                        history=history,
-                        steps=steps,
-                        iteration=iteration,
-                        usage=total_usage,
-                        meta=guardrail_meta(g_engine, notifier_warnings),
-                    )
-                if control.has_pending_notes:
-                    await _deliver_inbox(
-                        state_store,
-                        recorder,
-                        notifier,
-                        resolved_run_id,
-                        iteration,
-                        history,
-                        notifier_warnings,
-                    )
+            # cancel > requested pause > budget pause/cancel; then inbox notes
+            # are delivered. The current iteration's LLM/tools are not
+            # preempted — flags are seen here or at the runner's pre-pause
+            # checkpoint.
+            control = (
+                await _read_control(state_store, resolved_run_id)
+                if state_store is not None
+                else None
+            )
+            if control is not None and control.cancel_requested:
+                return RunResult(
+                    run_id=resolved_run_id,
+                    status=RunStatus.CANCELLED,
+                    steps=steps,
+                    commentary=_commentary(steps),
+                    iteration_count=iteration - 1,
+                    usage=total_usage,
+                    meta=guardrail_meta(g_engine, notifier_warnings),
+                )
+            if control is not None and control.pause_requested:
+                return _checkpoint_pause_result(
+                    agent_name=agent.name,
+                    run_id=resolved_run_id,
+                    history=history,
+                    steps=steps,
+                    iteration=iteration,
+                    usage=total_usage,
+                    meta=guardrail_meta(g_engine, notifier_warnings),
+                    budget=budget,
+                )
+            budget_result = await _budget_stop(
+                budget,
+                agent_name=agent.name,
+                run_id=resolved_run_id,
+                history=history,
+                steps=steps,
+                iteration=iteration,
+                usage=total_usage,
+                meta=guardrail_meta(g_engine, notifier_warnings),
+            )
+            if budget_result is not None:
+                return budget_result
+            if control is not None and control.has_pending_notes:
+                assert state_store is not None
+                await _deliver_inbox(
+                    state_store,
+                    recorder,
+                    notifier,
+                    resolved_run_id,
+                    iteration,
+                    history,
+                    notifier_warnings,
+                )
 
             messages, tools = strategy.build_messages(
                 system_prompt=agent.get_system_prompt(loop=self),
@@ -1337,16 +1366,8 @@ class ReActLoop(Loop):
                         guardrail_findings=_all_guardrail_findings or None,
                     )
                     _accumulate_usage(total_usage, response.usage)
-                    await _check_budget(
-                        agent.budget,
-                        total_usage,
-                        budget_fired,
-                        recorder,
-                        notifier,
-                        resolved_run_id,
-                        iteration,
-                        notifier_warnings,
-                    )
+                    budget.add_response(response.usage)
+                    await budget.evaluate(iteration)
                     await _record_governance(
                         recorder,
                         resolved_run_id,
@@ -1397,16 +1418,8 @@ class ReActLoop(Loop):
                 guardrail_findings=_all_guardrail_findings or None,
             )
             _accumulate_usage(total_usage, response.usage)
-            await _check_budget(
-                agent.budget,
-                total_usage,
-                budget_fired,
-                recorder,
-                notifier,
-                resolved_run_id,
-                iteration,
-                notifier_warnings,
-            )
+            budget.add_response(response.usage)
+            await budget.evaluate(iteration)
 
             step = strategy.parse_response(response)
             if response.reasoning is not None:
@@ -1454,6 +1467,7 @@ class ReActLoop(Loop):
                     steps=steps,
                     iteration=iteration,
                     usage=total_usage,
+                    budget=budget,
                 )
                 meta: dict[str, Any] = {
                     "pause_state": pause,
@@ -1514,6 +1528,7 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         usage=total_usage,
                         approval_gates=outcome.approval_gates,
+                        budget=budget,
                     )
                     meta = {"pause_state": pause, **guardrail_meta(g_engine, notifier_warnings)}
                     return RunResult(
@@ -1554,6 +1569,7 @@ class ReActLoop(Loop):
         output_type: type[BaseModel] | None = None,
         state_store: StateStore | None = None,
         interrupt: asyncio.Event | None = None,
+        budget_carry: BudgetCarry | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 
@@ -1578,7 +1594,17 @@ class ReActLoop(Loop):
         )
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
-        budget_fired: list[float] = []
+        budget = BudgetTracker(
+            agent.budget,
+            run_id=resolved_run_id,
+            usage=total_usage,
+            recorder=recorder,
+            notifier=notifier,
+            warnings=notifier_warnings,
+            state_store=state_store,
+            carry=budget_carry,
+            fresh=iteration_offset == 0,
+        )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
 
@@ -1615,7 +1641,7 @@ class ReActLoop(Loop):
             if control is not None and control.pause_requested:
                 yield RunEvent(
                     type=RunEventType.RUN_PAUSED,
-                    run_result=_requested_pause_result(
+                    run_result=_checkpoint_pause_result(
                         agent_name=agent.name,
                         run_id=resolved_run_id,
                         history=history,
@@ -1623,7 +1649,28 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         usage=total_usage,
                         meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                        budget=budget,
                     ),
+                )
+                return
+            budget_result = await _budget_stop(
+                budget,
+                agent_name=agent.name,
+                run_id=resolved_run_id,
+                history=history,
+                steps=steps,
+                iteration=iteration,
+                usage=total_usage,
+                meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+            )
+            if budget_result is not None:
+                yield RunEvent(
+                    type=(
+                        RunEventType.RUN_CANCELLED
+                        if budget_result.status == RunStatus.CANCELLED
+                        else RunEventType.RUN_PAUSED
+                    ),
+                    run_result=budget_result,
                 )
                 return
             if control is not None and control.has_pending_notes:
@@ -1796,16 +1843,8 @@ class ReActLoop(Loop):
                 duration_ms=llm_duration_ms,
             )
             _accumulate_usage(total_usage, llm_response.usage)
-            await _check_budget(
-                agent.budget,
-                total_usage,
-                budget_fired,
-                recorder,
-                notifier,
-                resolved_run_id,
-                iteration,
-                notifier_warnings,
-            )
+            budget.add_response(llm_response.usage)
+            await budget.evaluate(iteration)
 
             step = strategy.parse_response(llm_response)
             if llm_response.reasoning is not None:
@@ -1861,6 +1900,7 @@ class ReActLoop(Loop):
                     steps=steps,
                     iteration=iteration,
                     usage=total_usage,
+                    budget=budget,
                 )
                 meta = {"pause_state": pause}
                 if notifier_warnings:
@@ -1932,6 +1972,7 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         usage=total_usage,
                         approval_gates=outcome.approval_gates,
+                        budget=budget,
                     )
                     meta = {"pause_state": pause}
                     if notifier_warnings:

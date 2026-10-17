@@ -1,4 +1,4 @@
-"""Tests for Wave 3 — budget (governance v1, advisory)."""
+"""Budget: advisory events (Wave 3) and 0.3.0 dollar limit, hard actions, fired keys."""
 
 from __future__ import annotations
 
@@ -6,12 +6,22 @@ import pytest
 
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
+from dendrux.loops._budget import BudgetCarry, BudgetTracker
 from dendrux.loops.base import BaseRecorder
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
+from dendrux.runtime.runner import _accepts_kwarg, _budget_carry_kwargs
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.tool import tool
-from dendrux.types import Budget, LLMResponse, RunEventType, RunStatus, ToolCall, UsageStats
+from dendrux.types import (
+    Budget,
+    LLMResponse,
+    PauseState,
+    RunEventType,
+    RunStatus,
+    ToolCall,
+    UsageStats,
+)
 
 # ------------------------------------------------------------------
 # Test tools
@@ -415,3 +425,397 @@ class TestBudgetStreaming:
         completed = [e for e in events if e.type == RunEventType.RUN_COMPLETED]
         assert len(completed) == 1
         assert completed[0].run_result.status == RunStatus.SUCCESS
+
+
+# ------------------------------------------------------------------
+# 0.3.0: dollar limit, hard actions, persisted fired keys
+# ------------------------------------------------------------------
+
+
+class _GovSpy(BaseRecorder):
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    async def on_message_appended(self, run_id, message, iteration):
+        pass
+
+    async def on_llm_call_completed(self, run_id, response, iteration, **kw):
+        pass
+
+    async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
+        pass
+
+    async def on_governance_event(self, run_id, event_type, iteration, data, correlation_id=None):
+        self.events.append((event_type, data))
+
+    def of(self, event_type: str) -> list[dict]:
+        return [d for t, d in self.events if t == event_type]
+
+
+def _priced(text: str | None, tokens: int, cost: float | None, tool_calls=None) -> LLMResponse:
+    return LLMResponse(
+        text=text,
+        tool_calls=tool_calls,
+        usage=UsageStats(
+            input_tokens=tokens // 2,
+            output_tokens=tokens - tokens // 2,
+            total_tokens=tokens,
+            cost_usd=cost,
+        ),
+    )
+
+
+def _search_call(pid: str = "t1") -> list[ToolCall]:
+    return [ToolCall(name="search", params={"query": "q"}, provider_tool_call_id=pid)]
+
+
+class TestBudgetV2Construction:
+    def test_positional_max_tokens_still_works(self):
+        b = Budget(10_000)
+        assert (b.max_tokens, b.max_cost_usd, b.on_exceed, b.include_children) == (
+            10_000,
+            None,
+            "warn",
+            True,
+        )
+
+    def test_cost_only(self):
+        assert Budget(max_cost_usd=1.5).max_tokens is None
+
+    def test_needs_a_limit(self):
+        with pytest.raises(ValueError, match="max_tokens and/or max_cost_usd"):
+            Budget()
+
+    @pytest.mark.parametrize("cost", [0, -1.0, float("inf"), float("nan"), True])
+    def test_bad_cost(self, cost):
+        with pytest.raises(ValueError, match="max_cost_usd must be > 0"):
+            Budget(max_cost_usd=cost)
+
+    @pytest.mark.parametrize("tokens", [True, 1.5])
+    def test_bad_token_type(self, tokens):
+        with pytest.raises(ValueError, match="max_tokens must be > 0"):
+            Budget(max_tokens=tokens)
+
+    def test_bad_action(self):
+        with pytest.raises(ValueError, match="on_exceed"):
+            Budget(max_tokens=10, on_exceed="stop")  # type: ignore[arg-type]
+
+    def test_bad_include_children(self):
+        with pytest.raises(ValueError, match="include_children"):
+            Budget(max_tokens=10, include_children=1)  # type: ignore[arg-type]
+
+
+class TestPauseStateBudgetFields:
+    def _pause(self, **kw) -> PauseState:
+        return PauseState(
+            agent_name="A",
+            pending_tool_calls=[],
+            history=[],
+            steps=[],
+            iteration=1,
+            trace_order_offset=0,
+            usage=UsageStats(),
+            **kw,
+        )
+
+    def test_round_trip(self):
+        pause = self._pause(
+            pause_reason="budget",
+            budget_fired=[("tokens", 0.5), ("cost_usd", 1.0)],
+            budget_unpriced_reported=True,
+            budget_exceeded=[{"metric": "cost_usd", "used": 2.0, "max": 1.0}],
+        )
+        back = PauseState.from_dict(pause.to_dict())
+        assert back.budget_fired == [("tokens", 0.5), ("cost_usd", 1.0)]
+        assert back.budget_unpriced_reported is True
+        assert back.budget_exceeded == [{"metric": "cost_usd", "used": 2.0, "max": 1.0}]
+        assert BudgetCarry.from_pause(back).fired == (("tokens", 0.5), ("cost_usd", 1.0))
+
+    def test_defaults_add_no_keys(self):
+        d = self._pause().to_dict()
+        assert not {"budget_fired", "budget_unpriced_reported", "budget_exceeded"} & set(d)
+        back = PauseState.from_dict(d)
+        assert back.budget_fired is None and back.budget_unpriced_reported is False
+
+
+class TestBudgetActionsInLoop:
+    async def test_pause_waits_for_next_checkpoint(self):
+        llm = MockLLM([_priced("s", 600, 0.0, _search_call()), _priced("never", 1, 0.0)])
+        agent = _make_agent(budget=Budget(max_tokens=500, on_exceed="pause"))
+        result = await ReActLoop().run(
+            agent=agent, provider=llm, strategy=NativeToolCalling(), user_input="go"
+        )
+        assert result.status == RunStatus.PAUSED
+        assert len(llm.call_history) == 1
+        pause = result.meta["pause_state"]
+        assert pause.pause_reason == "budget"
+        assert pause.iteration == 1
+        assert pause.history[-1].role.value == "tool"  # tool result appended first
+        assert pause.budget_exceeded == [{"metric": "tokens", "used": 600, "max": 500}]
+
+    async def test_cancel(self):
+        llm = MockLLM([_priced("s", 600, 0.0, _search_call()), _priced("never", 1, 0.0)])
+        spy = _GovSpy()
+        agent = _make_agent(budget=Budget(max_tokens=500, on_exceed="cancel"))
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            recorder=spy,
+        )
+        assert result.status == RunStatus.CANCELLED
+        assert result.meta["budget_exceeded"][0]["metric"] == "tokens"
+        assert spy.of("budget.exceeded")[0]["action"] == "cancel"
+
+    async def test_stream_pause_and_cancel(self):
+        for action, terminal in (
+            ("pause", RunEventType.RUN_PAUSED),
+            ("cancel", RunEventType.RUN_CANCELLED),
+        ):
+            llm = MockLLM([_priced("s", 600, 0.0, _search_call()), _priced("never", 1, 0.0)])
+            agent = _make_agent(budget=Budget(max_tokens=500, on_exceed=action))
+            events = [
+                e
+                async for e in ReActLoop().run_stream(
+                    agent=agent, provider=llm, strategy=NativeToolCalling(), user_input="go"
+                )
+            ]
+            assert events[-1].type == terminal
+            assert len(llm.call_history) == 1
+
+    async def test_cost_limit_in_memory_with_unpriced_call(self):
+        llm = MockLLM(
+            [
+                _priced("a", 10, None, _search_call("t1")),
+                _priced("b", 10, 0.06, _search_call("t2")),
+                _priced("never", 1, 0.0),
+            ]
+        )
+        spy = _GovSpy()
+        agent = _make_agent(budget=Budget(max_cost_usd=0.05, on_exceed="pause"))
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            recorder=spy,
+        )
+        assert result.status == RunStatus.PAUSED
+        assert result.meta["budget_exceeded"] == [{"metric": "cost_usd", "used": 0.06, "max": 0.05}]
+        assert spy.of("budget.unpriced") == [
+            {
+                "metric": "cost_usd",
+                "used": 0.0,
+                "max": 0.05,
+                "unpriced_calls": 1,
+                "known_cost_usd": 0.0,
+            }
+        ]
+        assert result.meta["pause_state"].budget_unpriced_reported is True
+
+    async def test_events_carry_metric(self):
+        llm = MockLLM([_priced("Done.", 900, 0.9)])
+        spy = _GovSpy()
+        agent = _make_agent(tools=[], budget=Budget(max_tokens=1000, max_cost_usd=1.0))
+        await ReActLoop().run(
+            agent=agent, provider=llm, strategy=NativeToolCalling(), user_input="go", recorder=spy
+        )
+        keys = sorted((d["metric"], d["fraction"]) for d in spy.of("budget.threshold"))
+        assert keys == [(m, f) for m in ("cost_usd", "tokens") for f in (0.5, 0.75, 0.9)]
+        assert all({"metric", "used", "max"} <= set(d) for d in spy.of("budget.threshold"))
+
+    async def test_carry_prevents_refire(self):
+        llm = MockLLM([_priced("Done.", 600, 0.0)])
+        spy = _GovSpy()
+        agent = _make_agent(tools=[], budget=Budget(max_tokens=1000))
+        await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            recorder=spy,
+            budget_carry=BudgetCarry(fired=(("tokens", 0.5),)),
+        )
+        assert spy.of("budget.threshold") == []
+
+    async def test_single_call_stream_degrades(self):
+        llm = MockLLM([_priced("Classified.", 900, 0.0)])
+        spy = _GovSpy()
+        agent = Agent(
+            prompt="Classify.",
+            loop=SingleCall(),
+            budget=Budget(max_tokens=500, on_exceed="cancel"),
+        )
+        events = [
+            e
+            async for e in SingleCall().run_stream(
+                agent=agent,
+                provider=llm,
+                strategy=NativeToolCalling(),
+                user_input="x",
+                recorder=spy,
+            )
+        ]
+        assert events[-1].type == RunEventType.RUN_COMPLETED
+        assert spy.of("budget.exceeded")[0]["action"] == "warn"
+
+
+class TestBudgetTrackerSources:
+    async def test_store_without_rollups_uses_own_usage(self, caplog):
+        class OldStore:
+            pass
+
+        usage = UsageStats(total_tokens=700, cost_usd=0.2)
+        tracker = BudgetTracker(
+            Budget(max_tokens=500, max_cost_usd=1.0, on_exceed="pause"),
+            run_id="r",
+            usage=usage,
+            recorder=BaseRecorder(),
+            notifier=None,
+            warnings=[],
+            state_store=OldStore(),  # type: ignore[arg-type]
+        )
+        assert "include_children ignored" in caplog.text
+        action, breaches = await tracker.checkpoint(2)
+        assert action == "pause"
+        assert [b.metric for b in breaches] == ["tokens"]
+
+    async def test_failed_live_read_falls_back(self):
+        class BrokenStore:
+            async def subtree_usage(self, run_id):
+                raise RuntimeError("db down")
+
+        tracker = BudgetTracker(
+            Budget(max_tokens=500, on_exceed="pause"),
+            run_id="r",
+            usage=UsageStats(total_tokens=700),
+            recorder=BaseRecorder(),
+            notifier=None,
+            warnings=[],
+            state_store=BrokenStore(),  # type: ignore[arg-type]
+        )
+        _, breaches = await tracker.checkpoint(2)
+        assert [b.metric for b in breaches] == ["tokens"]
+
+    async def test_restored_unknown_cost_counts_as_unpriced(self):
+        tracker = BudgetTracker(
+            Budget(max_cost_usd=1.0),
+            run_id="r",
+            usage=UsageStats(total_tokens=10, cost_usd=None, cost_unknown=True),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+        )
+        spy_events = await tracker.evaluate(1)
+        assert spy_events == []
+        assert tracker.unpriced_reported is True
+
+    async def test_no_budget_is_inert(self):
+        tracker = BudgetTracker(
+            None, run_id="r", usage=UsageStats(), recorder=None, notifier=None, warnings=[]
+        )
+        assert await tracker.checkpoint(1) == ("warn", [])
+        assert await tracker.evaluate(1) == []
+        assert tracker.action == "warn"
+
+
+class TestRunnerBudgetHelpers:
+    def test_carry_only_for_loops_that_accept_it(self):
+        pause = PauseState(
+            agent_name="A",
+            pending_tool_calls=[],
+            history=[],
+            steps=[],
+            iteration=1,
+            trace_order_offset=0,
+            usage=UsageStats(),
+            budget_fired=[("tokens", 0.5)],
+        )
+        assert _budget_carry_kwargs(ReActLoop().run, pause) == {
+            "budget_carry": BudgetCarry(fired=(("tokens", 0.5),))
+        }
+
+        async def legacy_run(*, agent, provider, strategy, user_input, **kwargs):
+            return None
+
+        async def old_run(*, agent, provider, strategy, user_input, state_store=None):
+            return None
+
+        assert _budget_carry_kwargs(legacy_run, pause) == {}
+        assert _budget_carry_kwargs(old_run, pause) == {}
+
+    def test_accepts_kwarg(self):
+        def explicit(*, total_usage=None):
+            return None
+
+        def var_kw(**kwargs):
+            return None
+
+        def neither(*, other=None):
+            return None
+
+        assert _accepts_kwarg(explicit, "total_usage")
+        assert _accepts_kwarg(var_kw, "total_usage")
+        assert not _accepts_kwarg(neither, "total_usage")
+        assert not _accepts_kwarg(object(), "total_usage")
+
+
+class TestBudgetCarryFixRound:
+    def _pause(self, **kw) -> PauseState:
+        return PauseState(
+            agent_name="A",
+            pending_tool_calls=[],
+            history=[],
+            steps=[],
+            iteration=1,
+            trace_order_offset=0,
+            usage=UsageStats(),
+            **kw,
+        )
+
+    def test_accounting_round_trip_and_gate_only_for_budget_pauses(self):
+        exceeded = [{"metric": "cost_usd", "used": 0.2, "max": 0.1}]
+        pause = PauseState.from_dict(
+            self._pause(
+                pause_reason="budget",
+                budget_exceeded=exceeded,
+                budget_known_cost_usd=0.04,
+                budget_unpriced_calls=2,
+            ).to_dict()
+        )
+        carry = BudgetCarry.from_pause(pause)
+        assert (carry.known_cost_usd, carry.unpriced_calls, carry.gate) == (0.04, 2, ("cost_usd",))
+        requested = self._pause(pause_reason="requested", budget_exceeded=exceeded)
+        assert BudgetCarry.from_pause(requested).gate == ()
+
+    async def test_carried_subtotal_seeds_fallback_accounting(self):
+        tracker = BudgetTracker(
+            Budget(max_cost_usd=0.05, on_exceed="pause"),
+            run_id="r",
+            usage=UsageStats(total_tokens=20, cost_usd=None, cost_unknown=True),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+            carry=BudgetCarry(known_cost_usd=0.04, unpriced_calls=1),
+        )
+        tracker.add_response(UsageStats(total_tokens=10, cost_usd=0.02))
+        breaches = await tracker.evaluate(3)
+        assert [(b.metric, b.used) for b in breaches] == [("cost_usd", 0.06)]
+        assert tracker.pause_fields()["budget_known_cost_usd"] == 0.06
+        assert tracker.pause_fields()["budget_unpriced_calls"] == 1
+
+    @pytest.mark.parametrize(
+        "budget", [None, Budget(max_tokens=10, on_exceed="pause")], ids=["none", "no-cost-limit"]
+    )
+    async def test_gate_passes_without_a_limit_on_the_metric(self, budget):
+        tracker = BudgetTracker(
+            budget,
+            run_id="r",
+            usage=UsageStats(total_tokens=5, cost_usd=1.0),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+            carry=BudgetCarry(gate=("cost_usd",)),
+        )
+        assert (await tracker.checkpoint(2))[1] == []
