@@ -29,7 +29,7 @@ from dendrux.errors import (
 )
 from dendrux.loops.single import SingleCall
 from dendrux.pricing import ModelPricing, PriceTable
-from dendrux.runtime.context import DelegationDepthExceededError
+from dendrux.runtime.context import DelegationDepthExceededError, aheartbeat, heartbeat
 from dendrux.runtime.runner import run
 from dendrux.runtime.sweep import sweep
 from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult, SkillExecutor
@@ -41,6 +41,7 @@ from dendrux.types import (
     CreateRunResult,
     GovernanceEventType,
     IdempotencyConflictError,
+    PauseOutcome,
     ReplaySummary,
     RunAlreadyActiveError,
     StructuredOutputValidationError,
@@ -63,6 +64,7 @@ __all__ = [
     "IdempotencyConflictError",
     "InvalidToolResultError",
     "ModelPricing",
+    "PauseOutcome",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
     "PriceTable",
@@ -89,6 +91,8 @@ __all__ = [
     "ToolDecision",
     "ToolResultContext",
     "ToolResultTransform",
+    "aheartbeat",
+    "heartbeat",
     "run",
     "sweep",
     "tool",

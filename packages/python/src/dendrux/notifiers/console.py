@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 # The pause states are still terminal-from-runner-perspective, but the
 # final SUCCESS/ERROR/CANCELLED flavors get the rich print_summary panel
 # instead so we don't double-paint when callers also call print_summary.
-_PAUSE_STATUSES = {"waiting_client_tool", "waiting_human_input", "waiting_approval"}
+_PAUSE_STATUSES = {"waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"}
 
 _console = Console()
 

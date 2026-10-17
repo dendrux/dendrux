@@ -491,6 +491,8 @@ class RunStatus(StrEnum):
     WAITING_CLIENT_TOOL = "waiting_client_tool"
     WAITING_HUMAN_INPUT = "waiting_human_input"
     WAITING_APPROVAL = "waiting_approval"
+    # Durable cooperative pause requested via ``Agent.request_pause``.
+    PAUSED = "paused"
     SUCCESS = "success"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -548,6 +550,9 @@ class GovernanceEventType(StrEnum):
     # Provider transport: vendor-SDK retry observability
     PROVIDER_RETRY = "provider.retry"
 
+    # Run control: inbox note delivered to the model (payload: note_id only)
+    INBOX_DELIVERED = "inbox.delivered"
+
 
 @dataclass
 class RunResult:
@@ -565,8 +570,11 @@ class RunResult:
     a stream early persists that buffer as the run's answer. It can be None
     even if earlier turns produced text. Cancelling the coroutine awaiting run()
     re-raises CancelledError rather than returning a RunResult; it does not
-    capture in-flight model text. Paused runs may carry a clarification
-    question in ``answer``.
+    capture in-flight model text. ``Agent.cancel_run`` from the same process
+    instead makes run() return CANCELLED with ``meta["interrupted"]=True`` and
+    ``meta["partial_output"]=False``. Paused runs may carry a clarification
+    question in ``answer``. ``meta["undelivered_notes"]`` lists inbox note ids
+    a finished run never delivered (only present when there are any).
     """
 
     run_id: str
@@ -580,6 +588,35 @@ class RunResult:
     meta: dict[str, Any] = field(default_factory=dict)
     commentary: list[str] = field(default_factory=list)
     replay: ReplaySummary | None = None
+
+
+PauseRequestOutcome: TypeAlias = Literal[
+    "requested", "already_waiting", "already_paused", "terminal"
+]
+
+
+@dataclass(frozen=True)
+class PauseOutcome:
+    """Result of :meth:`Agent.request_pause`.
+
+    ``status_before`` / ``status_after`` are the root run's status when the
+    request started and after it was recorded. ``affected`` lists every run
+    the request touched as ``(run_id, outcome)``, deepest descendants first
+    and the root last:
+
+    - ``"requested"``: the run was RUNNING; it pauses at its next checkpoint.
+    - ``"already_waiting"``: WAITING_*; already durable, nothing latched.
+    - ``"already_paused"``: already PAUSED.
+    - ``"terminal"``: already finished; nothing to pause.
+
+    Returning is not confirmation that a run paused: ``run.paused`` in the
+    event log (status ``paused``) confirms it.
+    """
+
+    run_id: str
+    status_before: RunStatus
+    status_after: RunStatus
+    affected: list[tuple[str, PauseRequestOutcome]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -644,6 +681,14 @@ class PauseState:
     # Approval-gated call ids at pause time: {call_id: {"source", "reason"}}.
     # None on non-approval pauses and on pauses persisted before 0.3.0.
     approval_gates: dict[str, dict[str, str | None]] | None = None
+    # Why a PAUSED run paused ("requested"); None for WAITING_* pauses.
+    pause_reason: str | None = None
+    # Free-text reason given to ``Agent.request_pause(reason=...)``.
+    pause_message: str | None = None
+    # Decisions already made for pending calls of a pause that interrupted an
+    # approval batch: {call_id: {"approved": bool, "reason": str | None}}.
+    # Resume executes them without asking for approval again.
+    pending_decisions: dict[str, dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -665,6 +710,12 @@ class PauseState:
         }
         if self.approval_gates is not None:
             d["approval_gates"] = self.approval_gates
+        if self.pause_reason is not None:
+            d["pause_reason"] = self.pause_reason
+        if self.pause_message is not None:
+            d["pause_message"] = self.pause_message
+        if self.pending_decisions is not None:
+            d["pending_decisions"] = self.pending_decisions
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -688,6 +739,9 @@ class PauseState:
             trace_order_offset=data["trace_order_offset"],
             usage=_usage_from_dict(data["usage"]),
             approval_gates=data.get("approval_gates"),
+            pause_reason=data.get("pause_reason"),
+            pause_message=data.get("pause_message"),
+            pending_decisions=data.get("pending_decisions"),
         )
 
 

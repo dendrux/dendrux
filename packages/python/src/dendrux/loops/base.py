@@ -630,6 +630,7 @@ class Loop(ABC):
             _RunStatus.WAITING_CLIENT_TOOL,
             _RunStatus.WAITING_HUMAN_INPUT,
             _RunStatus.WAITING_APPROVAL,
+            _RunStatus.PAUSED,
         ):
             yield _RunEvent(type=_RunEventType.RUN_PAUSED, run_result=result)
         elif result.status == _RunStatus.CANCELLED:

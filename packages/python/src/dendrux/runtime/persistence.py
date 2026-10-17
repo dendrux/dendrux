@@ -282,6 +282,13 @@ class PersistenceRecorder(BaseRecorder):
         except Exception:
             logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
 
+    async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
+        """Touch ``last_progress_at`` at dispatch so a long tool starts fresh. BEST-EFFORT."""
+        try:
+            await self._store.touch_progress(self._run_id)
+        except Exception:
+            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+
     async def on_tool_completed(
         self,
         run_id: str,

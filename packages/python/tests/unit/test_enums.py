@@ -18,6 +18,7 @@ class TestAgentRunStatus:
             "waiting_client_tool",
             "waiting_human_input",
             "waiting_approval",
+            "paused",
         }
 
     def test_is_str_enum(self) -> None:

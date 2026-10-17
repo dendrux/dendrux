@@ -64,6 +64,7 @@ _PAUSE_STATUSES = frozenset(
         RunStatus.WAITING_CLIENT_TOOL,
         RunStatus.WAITING_HUMAN_INPUT,
         RunStatus.WAITING_APPROVAL,
+        RunStatus.PAUSED,
     }
 )
 

@@ -52,12 +52,14 @@ async def sweep(
             with ``database_url``.
         stale_running: Threshold for stale RUNNING detection. Runs with
             no forward progress beyond this duration are swept. If None,
-            no stale-running sweep is performed.
+            no stale-running sweep is performed. It must exceed the longest
+            gap between progress updates (LLM calls, tool starts/ends,
+            ``heartbeat()``), otherwise event sequence indexes of a run that
+            is still executing may collide with the sweep's event.
         abandoned_waiting: Threshold for abandoned WAITING detection.
-            WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, and
-            WAITING_APPROVAL runs with no state change beyond this
-            duration are swept. If None, no abandoned-waiting sweep
-            is performed.
+            WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, WAITING_APPROVAL and
+            PAUSED runs with no state change beyond this duration are
+            swept. If None, no abandoned-waiting sweep is performed.
 
     Returns:
         SweepResult with lists of swept runs by category.
