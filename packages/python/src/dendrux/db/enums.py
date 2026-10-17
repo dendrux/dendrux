@@ -24,3 +24,4 @@ class AgentRunStatus(StrEnum):
     WAITING_CLIENT_TOOL = "waiting_client_tool"
     WAITING_HUMAN_INPUT = "waiting_human_input"
     WAITING_APPROVAL = "waiting_approval"
+    PAUSED = "paused"

@@ -21,6 +21,30 @@ class CancellationStubsMixin:
     async def is_cancel_requested(self, run_id: str) -> bool:  # noqa: ARG002
         return False
 
+    async def get_run_control(self, run_id: str) -> Any:
+        from dendrux.runtime.state import RunControl
+
+        return RunControl(cancel_requested=await self.is_cancel_requested(run_id))
+
+    async def request_pause(self, run_id: str, **kwargs: Any) -> bool:  # noqa: ARG002
+        return False
+
+    async def try_pause_run(self, run_id: str, **kwargs: Any) -> bool:
+        """Default fakes treat this as an unconditional `pause_run`."""
+        pause_run = getattr(self, "pause_run", None)
+        if pause_run is not None:
+            await pause_run(run_id, **kwargs)
+        return True
+
+    async def add_note(self, run_id: str, **kwargs: Any) -> bool:  # noqa: ARG002
+        return False
+
+    async def get_notes(self, run_id: str, **kwargs: Any) -> list[Any]:  # noqa: ARG002
+        return []
+
+    async def mark_notes_delivered(self, run_id: str, note_ids: list[str], **kwargs: Any) -> int:  # noqa: ARG002
+        return 0
+
     async def request_cancel(self, run_id: str) -> bool:  # noqa: ARG002
         return True
 

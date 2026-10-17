@@ -7,6 +7,7 @@ Tables:
     token_usage      — Per-LLM-call token counts and cost (legacy, kept for backcompat).
     llm_interactions — Per-LLM-call record with semantic + provider payloads (Sprint 3.5).
     run_events       — Append-only state transition log for observability.
+    run_inbox        — Notes submitted to a run, delivered at its next iteration.
 
 Each sub-agent spawn gets its own agent_run linked via parent_run_id.
 No instance_id or delegation columns on react_traces — isolation is
@@ -124,6 +125,11 @@ class AgentRun(Base):
     cancel_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )
+    # Cooperative pause flag — set by request_pause on a RUNNING run, cleared
+    # when the runner persists any pause, on every claim, and on finalize.
+    pause_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
@@ -144,6 +150,9 @@ class AgentRun(Base):
         back_populates="agent_run", cascade="all, delete-orphan"
     )
     run_events: Mapped[list[RunEvent]] = relationship(
+        back_populates="agent_run", cascade="all, delete-orphan"
+    )
+    inbox_notes: Mapped[list[RunInbox]] = relationship(
         back_populates="agent_run", cascade="all, delete-orphan"
     )
     child_runs: Mapped[list[AgentRun]] = relationship(
@@ -358,4 +367,36 @@ class RunEvent(Base):
     __table_args__ = (
         Index("ix_run_events_agent_run_id_seq", "agent_run_id", "sequence_index"),
         Index("ix_run_events_event_type", "event_type"),
+    )
+
+
+class RunInbox(Base):
+    """A note submitted to a run via ``Agent.submit_note``.
+
+    The runner that owns the run delivers undelivered notes, ordered by
+    ``(created_at, id)``, at the top of its next iteration as a USER message.
+    Delivery is at-least-once: the message is recorded before the row is
+    marked delivered. ``metadata`` is app data — never rendered into model
+    content.
+    """
+
+    __tablename__ = "run_inbox"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        String(26), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    text: Mapped[str] = mapped_column(Text)
+    # ``metadata`` is reserved on declarative models; the SQL column keeps the name.
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    delivered_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    delivered_iteration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    agent_run: Mapped[AgentRun] = relationship(back_populates="inbox_notes")
+
+    __table_args__ = (
+        Index("ix_run_inbox_run_pending", "run_id", "delivered_at", "created_at", "id"),
     )

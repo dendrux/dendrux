@@ -160,6 +160,26 @@ class RunDetail:
     total_reasoning_tokens: int = 0
     cancel_requested: bool = False
     replay: ReplaySummary | None = None
+    pause_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RunNote:
+    """A note submitted to a run with ``Agent.submit_note``.
+
+    ``delivered_at`` / ``delivered_iteration`` are None until the runner
+    delivered it to the model. A note still undelivered on a finished run
+    was never seen by the model. ``metadata`` is the app data stored with
+    the note (never shown to the model).
+    """
+
+    note_id: str
+    run_id: str
+    text: str
+    metadata: Any
+    created_at: datetime | None
+    delivered_at: datetime | None
+    delivered_iteration: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +556,27 @@ class RunStore:
         mapping = await self._state.get_pii_mapping(run_id)
         return mapping or {}
 
+    async def get_notes(self, run_id: str, *, undelivered_only: bool = False) -> list[RunNote]:
+        """Inbox notes of a run in delivery order (``created_at``, then id).
+
+        Unscoped by id like the other per-run reads; an app serving several
+        tenants checks the run's tenant first. Empty list for a run with
+        no notes or that does not exist.
+        """
+        rows = await self._state.get_notes(run_id, undelivered_only=undelivered_only)
+        return [
+            RunNote(
+                note_id=r.id,
+                run_id=r.run_id,
+                text=r.text,
+                metadata=r.metadata,
+                created_at=r.created_at,
+                delivered_at=r.delivered_at,
+                delivered_iteration=r.delivered_iteration,
+            )
+            for r in rows
+        ]
+
     async def get_pauses(self, run_id: str) -> list[PausePair]:
         """Derive pause/resume cycles from ``run_events``.
 
@@ -623,6 +664,7 @@ def _run_to_detail(record: Any) -> RunDetail:
         total_reasoning_tokens=record.total_reasoning_tokens,
         cancel_requested=bool(getattr(record, "cancel_requested", False)),
         replay=_replay_of(record),
+        pause_requested=bool(getattr(record, "pause_requested", False)),
     )
 
 
@@ -728,6 +770,7 @@ __all__ = [
     "LLMCall",
     "PausePair",
     "RunDetail",
+    "RunNote",
     "RunNotFoundError",
     "RunStore",
     "RunSubtree",
