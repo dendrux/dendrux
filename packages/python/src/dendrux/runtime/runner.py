@@ -21,7 +21,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import normalize_chat_history
@@ -70,6 +70,7 @@ from dendrux.skills._session import META_KEY, SkillSession, continuation, curren
 from dendrux.skills._session import current as current_skill_session
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
+    ApprovalDecision,
     GovernanceEventType,
     IdempotencyConflictError,
     Message,
@@ -2390,6 +2391,102 @@ async def _replay_resume_injected_history(
         await _notify_msg(extra_notifier, run_id, msg, pause_state.iteration)
 
 
+class _ApprovalResume(NamedTuple):
+    """Outcome of executing an approval batch on resume."""
+
+    # (ToolCall, ToolResult) pairs appended to history, in pending order.
+    results: list[tuple[ToolCall, ToolResult]]
+    # Client-target calls held in the batch; they never run on the server.
+    client_pending: list[ToolCall]
+    # ``approval.decided`` payload (scalar decision + per-call outcomes).
+    decided: dict[str, Any]
+    # Set when a resume barrier stopped execution before a side effect.
+    barrier: RunStatus | None
+
+
+async def _resume_pause_barrier(state_store: StateStore, run_id: str) -> RunStatus | None:
+    """Pause half of the resume barrier — seam for durable pause (Track E).
+
+    Returns ``RunStatus.PAUSED`` when a pause was requested. No-op until
+    durable pause exists.
+    """
+    return None
+
+
+async def _resume_barrier(state_store: StateStore | None, run_id: str) -> RunStatus | None:
+    """Cancel-then-pause check before an approved side effect (E-P0-3).
+
+    Runs after an approval claim, before each approved/held server call.
+    Cancellation wins over pause.
+    """
+    if state_store is None:
+        return None
+    if await state_store.is_cancel_requested(run_id):
+        return RunStatus.CANCELLED
+    return await _resume_pause_barrier(state_store, run_id)
+
+
+def _approval_outcomes(
+    pause_state: PauseState,
+    target_lookup: dict[str, Any],
+    decisions: dict[str, ApprovalDecision] | None,
+) -> list[tuple[ToolCall, str, str | None]]:
+    """Classify each pending call: (call, outcome, denial reason) in pending order.
+
+    ``decisions=None`` is the legacy batch approve: every gate approved.
+    """
+    from dendrux.runtime.submit import DEFAULT_DENIAL_REASON, approval_gates_of, is_client_call
+
+    gates = approval_gates_of(pause_state, target_lookup)
+    out: list[tuple[ToolCall, str, str | None]] = []
+    for tc in pause_state.pending_tool_calls:
+        if is_client_call(pause_state, tc, target_lookup):
+            out.append((tc, "client_pending", None))
+        elif tc.id not in gates:
+            out.append((tc, "not_gated_executed", None))
+        else:
+            decision = decisions.get(tc.id) if decisions is not None else None
+            if decision is None or decision.approved:
+                out.append((tc, "approved", None))
+            else:
+                out.append((tc, "denied", decision.reason or DEFAULT_DENIAL_REASON))
+    return out
+
+
+def _decided_payload(
+    run_id: str,
+    outcomes: list[tuple[ToolCall, str, str | None]],
+    *,
+    scalar: str | None = None,
+) -> dict[str, Any]:
+    """``approval.decided`` payload: scalar decision + every pending call's outcome."""
+    if scalar is None:
+        gated = [o for _, o, _ in outcomes if o in ("approved", "denied")]
+        if all(o == "approved" for o in gated):
+            scalar = "approved"
+        elif all(o == "denied" for o in gated):
+            scalar = "rejected"
+        else:
+            scalar = "mixed"
+    return {
+        "decision": scalar,
+        "run_id": run_id,
+        "decisions": [
+            {"call_id": tc.id, "tool_name": tc.name, "decision": outcome, "reason": reason}
+            for tc, outcome, reason in outcomes
+        ],
+    }
+
+
+def _rejection_decided_payload(
+    run_id: str, pause_state: PauseState, tool_results: list[ToolResult]
+) -> dict[str, Any]:
+    """Legacy batch rejection: every pending call received a synthetic denial."""
+    errors = {tr.call_id: tr.error for tr in tool_results}
+    outcomes = [(tc, "denied", errors.get(tc.id)) for tc in pause_state.pending_tool_calls]
+    return _decided_payload(run_id, outcomes, scalar="rejected")
+
+
 async def _execute_approved_tools(
     agent: Agent,
     pause_state: PauseState,
@@ -2399,16 +2496,33 @@ async def _execute_approved_tools(
     *,
     history: list[Message] | None = None,
     resolved_loop: Loop | None = None,
-) -> list[tuple[ToolCall, ToolResult]]:
-    """Execute pending tools after approval. Returns (ToolCall, ToolResult) pairs.
+    decisions: dict[str, ApprovalDecision] | None = None,
+    state_store: StateStore | None = None,
+) -> _ApprovalResume:
+    """Resolve an approval batch on resume, routing each call by target.
 
-    Shared by _resume_core (batch) and resume_stream (streaming).
-    Records tool completions and appends tool messages to ``history``
-    (the live ctx.history list, not pause_state.history which is a snapshot).
-    ``resolved_loop`` is forwarded to ``agent.get_tool_lookups()`` so a
-    runtime loop override stays consistent across resume.
-    Caller is responsible for governance events and loop re-entry.
+    Shared by _resume_core (batch) and resume_stream (streaming). Walks
+    ``pending_tool_calls`` in order:
+
+    - client-target calls are never executed; they are returned in
+      ``client_pending`` and the caller pauses the run for client results;
+    - denied gated calls get a failed result ``{"denied": reason}``;
+    - approved gated calls and held non-gated server calls execute through
+      the approved path (no ``before_tool`` re-run: the human decision wins
+      and held calls were already evaluated before the pause).
+
+    ``decisions=None`` is the legacy batch approve. Before every server
+    execution a resume barrier checks cancel (then pause); on a hit the
+    remaining calls are skipped and ``barrier`` is set.
+
+    Tool messages are appended to ``history`` (the live ctx.history list,
+    not pause_state.history which is a snapshot). ``resolved_loop`` is
+    forwarded to ``agent.get_tool_lookups()`` so a runtime loop override
+    stays consistent across resume. Caller emits ``approval.decided`` and
+    handles loop re-entry.
     """
+    import json
+
     from dendrux.loops._helpers import notify_message as _ntfy_msg
     from dendrux.loops._helpers import notify_tool as _ntfy_tool
     from dendrux.loops._helpers import notify_tool_started as _ntfy_tool_started
@@ -2416,11 +2530,14 @@ async def _execute_approved_tools(
     from dendrux.loops.react import _execute_tool, _process_tool_calls
     from dendrux.skills._session import SkillTool
     from dendrux.tools._validate import check_tool_call
-    from dendrux.types import AgentStep, Message, Role
+    from dendrux.types import AgentStep, Message, Role, ToolResult
 
     target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
+    outcomes = _approval_outcomes(pause_state, lookups.target, decisions)
+    decided = _decided_payload(run_id, outcomes, scalar="approved" if decisions is None else None)
     results: list[tuple[ToolCall, ToolResult]] = []
+    client_pending = [tc for tc, outcome, _ in outcomes if outcome == "client_pending"]
     counts: dict[str, int] = {}
     for message in pause_state.history:
         if message.role == Role.TOOL and message.name:
@@ -2433,34 +2550,11 @@ async def _execute_approved_tools(
             if tc.name == "run_skill_script" and tc.name not in lookups.fn:
                 lookups.fn[tc.name] = SkillTool(session, tc.name)
 
-    for tc in pause_state.pending_tool_calls:
-        if isinstance(lookups.fn.get(tc.name), SkillTool):
-            outcome = await _process_tool_calls(
-                step=AgentStep(reasoning=None, action=tc),
-                call_counts=counts,
-                lookups=lookups,
-                strategy=NativeToolCalling(),
-                recorder=recorder,
-                notifier=notifier,
-                run_id=run_id,
-                iteration=pause_state.iteration,
-                history=target_history,
-                warnings=[],
-                deny=agent._deny,
-                tool_result_transform=agent.tool_result_transform,
-                approved_skills=True,
-            )
-            results.extend(outcome.all_results)
-            continue
-        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
-        if invalid_result is None:
-            await _rec_tool_started(recorder, run_id, tc, pause_state.iteration)
-            await _ntfy_tool_started(notifier, run_id, tc, pause_state.iteration)
-            tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
-        else:
-            tr = invalid_result
-        await recorder.on_tool_completed(run_id, tc, tr, pause_state.iteration)
-        await _ntfy_tool(notifier, run_id, tc, tr, pause_state.iteration)
+    iteration = pause_state.iteration
+
+    async def _append(tc: ToolCall, tr: ToolResult) -> None:
+        await recorder.on_tool_completed(run_id, tc, tr, iteration)
+        await _ntfy_tool(notifier, run_id, tc, tr, iteration)
         result_msg = Message(
             role=Role.TOOL,
             content=tr.payload,
@@ -2469,11 +2563,127 @@ async def _execute_approved_tools(
             meta={"is_error": True} if not tr.success else {},
         )
         target_history.append(result_msg)
-        await recorder.on_message_appended(run_id, result_msg, pause_state.iteration)
-        await _ntfy_msg(notifier, run_id, result_msg, pause_state.iteration)
+        await recorder.on_message_appended(run_id, result_msg, iteration)
+        await _ntfy_msg(notifier, run_id, result_msg, iteration)
         results.append((tc, tr))
 
-    return results
+    for tc, outcome, reason in outcomes:
+        if outcome == "client_pending":
+            continue
+        if outcome == "denied":
+            assert reason is not None
+            denied = ToolResult(
+                name=tc.name,
+                call_id=tc.id,
+                payload=json.dumps({"denied": reason}),
+                success=False,
+                error=reason,
+            )
+            await _rec_tool_started(recorder, run_id, tc, iteration)
+            await _ntfy_tool_started(notifier, run_id, tc, iteration)
+            await _append(tc, denied)
+            continue
+
+        barrier = await _resume_barrier(state_store, run_id)
+        if barrier is not None:
+            return _ApprovalResume(results, client_pending, decided, barrier)
+
+        if isinstance(lookups.fn.get(tc.name), SkillTool):
+            outcome_s = await _process_tool_calls(
+                step=AgentStep(reasoning=None, action=tc),
+                call_counts=counts,
+                lookups=lookups,
+                strategy=NativeToolCalling(),
+                recorder=recorder,
+                notifier=notifier,
+                run_id=run_id,
+                iteration=iteration,
+                history=target_history,
+                warnings=[],
+                deny=agent._deny,
+                tool_result_transform=agent.tool_result_transform,
+                approved_skills=True,
+            )
+            results.extend(outcome_s.all_results)
+            continue
+        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
+        if invalid_result is None:
+            await _rec_tool_started(recorder, run_id, tc, iteration)
+            await _ntfy_tool_started(notifier, run_id, tc, iteration)
+            tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
+        else:
+            tr = invalid_result
+        await _append(tc, tr)
+
+    return _ApprovalResume(results, client_pending, decided, None)
+
+
+async def _validated_decisions(
+    agent: Agent,
+    ctx: _ResumeContext,
+    run_id: str,
+    pause_state: PauseState,
+    decisions: list[tuple[str, ApprovalDecision]] | None,
+) -> dict[str, ApprovalDecision] | None:
+    """Re-validate claimed decisions against the persisted gate snapshot."""
+    if decisions is None:
+        return None
+    from dendrux.runtime.submit import validate_approval_decisions
+
+    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
+    return validate_approval_decisions(run_id, pause_state, decisions, lookups.target)
+
+
+def _approval_stop_result(
+    run_id: str,
+    pause_state: PauseState,
+    history: list[Message],
+    approval: _ApprovalResume,
+) -> RunResult | None:
+    """Result for an approval resume that must not re-enter the loop.
+
+    Barrier hit → CANCELLED. Held client calls → a fresh WAITING_CLIENT_TOOL
+    pause over the updated history. Otherwise None (re-enter the loop).
+    """
+    from dendrux.loops.react import _commentary, _snapshot_usage
+    from dendrux.types import RunResult
+
+    if approval.barrier is not None:
+        # Track E seam: a PAUSED barrier must persist a PauseState holding the
+        # unexecuted remainder (with its resolved decisions) instead of this
+        # bare result; only CANCELLED is produced today.
+        return RunResult(
+            run_id=run_id,
+            status=approval.barrier,
+            steps=pause_state.steps,
+            commentary=_commentary(pause_state.steps),
+            iteration_count=pause_state.iteration,
+            usage=pause_state.usage,
+        )
+    if not approval.client_pending:
+        return None
+    client_pause = PauseState(
+        agent_name=pause_state.agent_name,
+        pending_tool_calls=list(approval.client_pending),
+        pending_targets={
+            tc.id: pause_state.pending_targets.get(tc.id) or "client"
+            for tc in approval.client_pending
+        },
+        history=list(history),
+        steps=list(pause_state.steps),
+        iteration=pause_state.iteration,
+        trace_order_offset=len(history),
+        usage=_snapshot_usage(pause_state.usage),
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.WAITING_CLIENT_TOOL,
+        steps=pause_state.steps,
+        commentary=_commentary(pause_state.steps),
+        iteration_count=pause_state.iteration,
+        usage=pause_state.usage,
+        meta={"pause_state": client_pause},
+    )
 
 
 async def _resume_core(
@@ -2489,16 +2699,26 @@ async def _resume_core(
     user_input: str | None = None,
     extra_notifier: LoopNotifier | None = None,
     _skip_claim: bool = False,
+    decisions: list[tuple[str, ApprovalDecision]] | None = None,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
     Args:
+        decisions: Per-call approval decisions (call_id, decision) for an
+            approval resume; validated against the pause's persisted
+            ``approval_gates`` snapshot. None = legacy batch approve.
         extra_notifier: Optional additional LoopNotifier. Composed with
             PersistenceRecorder — recorder handles persistence, notifier
             handles observation side-effects.
         _skip_claim: Internal flag — skip the atomic claim step when the caller
             has already claimed via submit_and_claim(). Used by resume_claimed().
     """
+    if decisions is not None and (
+        tool_results is not None
+        or user_input is not None
+        or expected_status != RunStatus.WAITING_APPROVAL.value
+    ):
+        raise ValueError("Approval decisions only resume a run awaiting approval.")
     skill_session = current(agent)
     if skill_session is None or skill_session.run_id != run_id:
         try:
@@ -2649,7 +2869,10 @@ async def _resume_core(
                     record_governance as _rec_gov,
                 )
 
-                await _execute_approved_tools(
+                decision_map = await _validated_decisions(
+                    agent, ctx, run_id, pause_state, decisions
+                )
+                approval = await _execute_approved_tools(
                     agent,
                     pause_state,
                     ctx.recorder,
@@ -2657,26 +2880,37 @@ async def _resume_core(
                     run_id,
                     history=ctx.history,
                     resolved_loop=ctx.resolved_loop,
+                    decisions=decision_map,
+                    state_store=state_store,
                 )
 
-                _decided_data: dict[str, Any] = {
-                    "decision": "approved",
-                    "run_id": run_id,
-                }
                 await _rec_gov(
                     ctx.recorder,
                     run_id,
                     "approval.decided",
                     pause_state.iteration,
-                    _decided_data,
+                    approval.decided,
                 )
                 await _ntfy_gov(
                     ctx.notifier,
                     run_id,
                     "approval.decided",
                     pause_state.iteration,
-                    _decided_data,
+                    approval.decided,
                 )
+
+                stop = _approval_stop_result(run_id, pause_state, ctx.history, approval)
+                if stop is not None:
+                    _attach_mcp_meta(stop, mcp_meta)
+                    stopped = await _persist_loop_outcome(
+                        state_store=state_store,
+                        run_id=run_id,
+                        result=stop,
+                        sequencer=ctx.sequencer,
+                    )
+                    await record_run_finished(ctx.recorder, run_id, stopped)
+                    await notify_run_finished(ctx.notifier, run_id, stopped)
+                    return stopped
 
             # Approval-reject: tool results already in history from _prepare_resume.
             # Emit governance event only.
@@ -2688,10 +2922,7 @@ async def _resume_core(
                     record_governance as _rec_gov_r,
                 )
 
-                _rejected_data: dict[str, Any] = {
-                    "decision": "rejected",
-                    "run_id": run_id,
-                }
+                _rejected_data = _rejection_decided_payload(run_id, pause_state, tool_results)
                 await _rec_gov_r(
                     ctx.recorder,
                     run_id,
@@ -2975,7 +3206,7 @@ def resume_stream(
                 and expected == RunStatus.WAITING_APPROVAL.value
             )
             if _is_approval_approve:
-                for tc, tr in await _execute_approved_tools(
+                approval = await _execute_approved_tools(
                     agent,
                     pause_state,
                     ctx.recorder,
@@ -2983,7 +3214,9 @@ def resume_stream(
                     run_id,
                     history=ctx.history,
                     resolved_loop=ctx.resolved_loop,
-                ):
+                    state_store=store,
+                )
+                for tc, tr in approval.results:
                     yield RunEvent(
                         type=RunEventType.TOOL_RESULT,
                         tool_call=tc,
@@ -2999,24 +3232,41 @@ def resume_stream(
                     record_governance as _rec_gov_s,
                 )
 
-                _decided_data_s: dict[str, Any] = {
-                    "decision": "approved",
-                    "run_id": run_id,
-                }
                 await _rec_gov_s(
                     ctx.recorder,
                     run_id,
                     "approval.decided",
                     pause_state.iteration,
-                    _decided_data_s,
+                    approval.decided,
                 )
                 await _ntfy_gov_s(
                     ctx.notifier,
                     run_id,
                     "approval.decided",
                     pause_state.iteration,
-                    _decided_data_s,
+                    approval.decided,
                 )
+
+                stop = _approval_stop_result(run_id, pause_state, ctx.history, approval)
+                if stop is not None:
+                    _attach_mcp_meta(stop, mcp_meta)
+                    stopped = await _persist_loop_outcome(
+                        state_store=store,
+                        run_id=run_id,
+                        result=stop,
+                        sequencer=ctx.sequencer,
+                    )
+                    await record_run_finished(ctx.recorder, run_id, stopped)
+                    await notify_run_finished(ctx.notifier, run_id, stopped)
+                    yield RunEvent(
+                        type=(
+                            RunEventType.RUN_CANCELLED
+                            if stopped.status == RunStatus.CANCELLED
+                            else RunEventType.RUN_PAUSED
+                        ),
+                        run_result=stopped,
+                    )
+                    return
 
             if tool_results is not None and expected == RunStatus.WAITING_APPROVAL.value:
                 from dendrux.loops._helpers import (
@@ -3026,10 +3276,7 @@ def resume_stream(
                     record_governance as _rec_gov_r,
                 )
 
-                _rejected_data_s: dict[str, Any] = {
-                    "decision": "rejected",
-                    "run_id": run_id,
-                }
+                _rejected_data_s = _rejection_decided_payload(run_id, pause_state, tool_results)
                 await _rec_gov_r(
                     ctx.recorder,
                     run_id,
@@ -3309,6 +3556,23 @@ async def resume_claimed(
             tool_results=tool_results,
             extra_notifier=extra_notifier,
             _skip_claim=True,
+        )
+
+    submitted_decisions = raw_pause.get("submitted_decisions")
+    if submitted_decisions is not None:
+        from dendrux.runtime.submit import deserialize_decisions
+
+        # Re-validated against the approval_gates snapshot inside _resume_core,
+        # where a mismatch finalizes the claimed run as ERROR.
+        return await _resume_core(
+            run_id,
+            state_store=state_store,
+            agent=agent,
+            provider=provider,
+            expected_status=RunStatus.WAITING_APPROVAL.value,
+            extra_notifier=extra_notifier,
+            _skip_claim=True,
+            decisions=deserialize_decisions(submitted_decisions),
         )
 
     if submitted_input is not None:

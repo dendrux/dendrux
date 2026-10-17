@@ -235,6 +235,8 @@ class ToolResult:
     success: bool = True
     error: str | None = None
     duration_ms: int = 0
+    # Runtime annotations persisted on the tool_calls row (e.g. ``substituted``).
+    meta: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -262,6 +264,93 @@ The return value ALWAYS replaces the result — return ``ctx.result`` to leave
 it unchanged (``None`` is a legitimate new result, not "unchanged"). Sync and
 async callables are both accepted. See ``Agent(tool_result_transform=...)``.
 """
+
+
+@dataclass(frozen=True)
+class ToolCallContext:
+    """What a ``before_tool`` policy hook sees for one tool call.
+
+    ``params`` and ``meta`` are deep copies taken for the hook: mutating
+    them never changes what executes. ``params`` are deanonymized (real
+    values, not guardrail placeholders). ``source`` is ``"local"`` for
+    ``@tool`` functions, ``"mcp"`` for MCP tools and ``"skill"`` for the
+    built-in skill tools. ``tenant_id`` is the run's tenant (``None`` when
+    unset or when the run is not persisted).
+    """
+
+    run_id: str
+    call_id: str
+    tool_name: str
+    params: dict[str, Any]
+    target: ToolTarget
+    source: Literal["local", "mcp", "skill"]
+    meta: dict[str, Any]
+    iteration: int
+    tenant_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolDecision:
+    """A ``before_tool`` hook's verdict for one tool call.
+
+    Build one with :meth:`allow`, :meth:`deny`, :meth:`require_approval`
+    or :meth:`substitute`. Returning ``None`` from the hook means allow.
+    """
+
+    kind: Literal["allow", "deny", "require_approval", "substitute"]
+    reason: str | None = None
+    result: Any = None
+
+    @classmethod
+    def allow(cls) -> ToolDecision:
+        """Run the tool normally."""
+        return cls(kind="allow")
+
+    @classmethod
+    def deny(cls, reason: str) -> ToolDecision:
+        """Do not run the tool; the model receives ``{"denied": reason}``."""
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("ToolDecision.deny() requires a non-empty reason string.")
+        return cls(kind="deny", reason=reason)
+
+    @classmethod
+    def require_approval(cls, reason: str | None = None) -> ToolDecision:
+        """Pause the batch for human approval (server-target tools only)."""
+        return cls(kind="require_approval", reason=reason)
+
+    @classmethod
+    def substitute(cls, result: Any) -> ToolDecision:
+        """Do not run the tool; ``result`` (JSON-serializable) is the tool output."""
+        return cls(kind="substitute", result=result)
+
+
+BeforeToolHook: TypeAlias = Callable[
+    [ToolCallContext], "ToolDecision | None | Awaitable[ToolDecision | None]"
+]
+"""Policy hook evaluated before every tool call. See ``Agent(before_tool=...)``."""
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """A human decision for one approval-gated tool call.
+
+    Used with ``Agent.submit_approval(run_id, decisions={call_id: ...})``.
+    """
+
+    approved: bool
+    reason: str | None = None
+
+    @classmethod
+    def approve(cls) -> ApprovalDecision:
+        """Run the call."""
+        return cls(approved=True)
+
+    @classmethod
+    def deny(cls, reason: str | None = None) -> ApprovalDecision:
+        """Skip the call; the model receives ``{"denied": reason}``."""
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("ApprovalDecision.deny() reason must be a string or None.")
+        return cls(approved=False, reason=reason)
 
 
 @dataclass
@@ -429,6 +518,11 @@ class GovernanceEventType(StrEnum):
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
 
+    # before_tool policy hook
+    POLICY_SUBSTITUTED = "policy.substituted"
+    POLICY_HOOK_ERROR = "policy.hook_error"
+    POLICY_HOOK_WARNING = "policy.hook_warning"
+
     # Wave 3: Budget
     BUDGET_THRESHOLD = "budget.threshold"
     BUDGET_EXCEEDED = "budget.exceeded"
@@ -547,6 +641,9 @@ class PauseState:
     trace_order_offset: int
     usage: UsageStats
     pending_targets: dict[str, str] = field(default_factory=dict)  # tool_call_id → target
+    # Approval-gated call ids at pause time: {call_id: {"source", "reason"}}.
+    # None on non-approval pauses and on pauses persisted before 0.3.0.
+    approval_gates: dict[str, dict[str, str | None]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -566,6 +663,8 @@ class PauseState:
             "trace_order_offset": self.trace_order_offset,
             "usage": _usage_to_dict(self.usage),
         }
+        if self.approval_gates is not None:
+            d["approval_gates"] = self.approval_gates
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -588,6 +687,7 @@ class PauseState:
             iteration=data["iteration"],
             trace_order_offset=data["trace_order_offset"],
             usage=_usage_from_dict(data["usage"]),
+            approval_gates=data.get("approval_gates"),
         )
 
 

@@ -36,7 +36,7 @@ from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     from dendrux.skills import Skill, SkillExecutor
     from dendrux.tools import ToolLookups
     from dendrux.types import (
+        ApprovalDecision,
+        BeforeToolHook,
         Budget,
         RunResult,
         RunStream,
@@ -246,6 +248,7 @@ class Agent:
         deny_skills: list[str] | None = ...,
         skill_executor: SkillExecutor | None = ...,
         tool_result_transform: ToolResultTransform | None = ...,
+        before_tool: BeforeToolHook | None = ...,
     ) -> None: ...
 
     @overload
@@ -274,6 +277,7 @@ class Agent:
         deny_skills: list[str] | None = ...,
         skill_executor: SkillExecutor | None = ...,
         tool_result_transform: ToolResultTransform | None = ...,
+        before_tool: BeforeToolHook | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -301,6 +305,7 @@ class Agent:
         deny_skills: list[str] | None = None,
         skill_executor: SkillExecutor | None = None,
         tool_result_transform: ToolResultTransform | None = None,
+        before_tool: BeforeToolHook | None = None,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -372,6 +377,12 @@ class Agent:
                 f"got {type(tool_result_transform).__name__}."
             )
         self._tool_result_transform: ToolResultTransform | None = tool_result_transform
+        if before_tool is not None and not callable(before_tool):
+            raise ValueError(
+                f"Agent '{self.name}' before_tool must be callable, "
+                f"got {type(before_tool).__name__}."
+            )
+        self._before_tool: BeforeToolHook | None = before_tool
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
 
@@ -539,6 +550,41 @@ class Agent:
         return self._tool_result_transform
 
     @property
+    def before_tool(self) -> BeforeToolHook | None:
+        """Policy hook evaluated before every tool call, or None.
+
+        Called with a :class:`~dendrux.types.ToolCallContext` (deep-copied
+        ``params``/``meta`` — mutation never affects execution) for local,
+        MCP and skill tools in ``run`` and ``stream``, after static
+        ``deny=`` and skill preflight and before approval. Return a
+        :class:`~dendrux.types.ToolDecision` or ``None`` (allow); sync or
+        async.
+
+        - ``deny(reason)``: not executed; the model gets ``{"denied": reason}``
+          and ``policy.denied`` fires with ``source="hook"``.
+        - ``require_approval(reason)``: joins the approval pause
+          (``approval.requested`` with ``source="hook"``). Server-target tools
+          only — on a client-target call it is treated as a deny with a
+          ``policy.hook_warning`` event.
+        - ``substitute(result)``: not executed; ``result`` (JSON-serialized
+          first) is the successful tool output, the tool_calls row carries
+          ``meta.substituted=true`` and ``policy.substituted`` fires.
+        - Static ``deny=`` applies first and cannot be undone. A tool in
+          ``require_approval=`` stays gated unless the hook denies it (allow,
+          substitute and require_approval leave the static gate in place).
+        - Fails closed: a hook that raises, returns anything other than a
+          ``ToolDecision``/``None``, or substitutes a non-JSON value denies
+          the call with ``"policy hook error"`` and emits
+          ``policy.hook_error`` (exception type only). Cancellation is never
+          swallowed.
+        - Not re-run on resume: approved calls (the human decision wins) and
+          held non-gated calls were evaluated before the pause. The hook is
+          not persisted — pass it to every Agent that runs or resumes.
+        - Sync hooks run inline on the event loop — keep them cheap.
+        """
+        return self._before_tool
+
+    @property
     def provider(self) -> LLMProvider | None:
         """The LLM provider, or None if not configured."""
         return self._provider
@@ -608,6 +654,12 @@ class Agent:
                 f"{len(self._tool_sources)} tool_source(s). SingleCall agents cannot "
                 f"have tool_sources for the same reason as tools — multi-turn execution "
                 f"is required. Skills (inline-delivered) are still supported."
+            )
+
+        if isinstance(self._loop, SingleCall) and self._before_tool is not None:
+            raise ValueError(
+                f"Agent '{self.name}' has before_tool but uses SingleCall loop. "
+                f"before_tool is not supported with SingleCall (no tool calls)."
             )
 
         # output_type requires SingleCall in v1
@@ -1315,33 +1367,49 @@ class Agent:
         self,
         run_id: str,
         *,
-        approved: bool,
+        approved: bool | None = None,
+        decisions: Mapping[str, ApprovalDecision] | None = None,
         rejection_reason: str | None = None,
         notifier: LoopNotifier | None = None,
     ) -> RunResult:
         """Submit an approval decision for a run awaiting human approval.
 
-        - ``approved=True``: claims and resumes; the approval-gated tool
-          executes server-side and its output is fed to the LLM.
-        - ``approved=False``: the pending batch is treated as all
-          rejected. Every pending tool call receives a synthetic failed
-          :class:`ToolResult` carrying ``rejection_reason`` (default:
-          ``"User declined to run this tool."``). The LLM decides what
-          to do next.
+        Pass exactly one of ``approved=`` (whole batch) or ``decisions=``
+        (per call).
 
-        Per-tool approve/reject within a batch is not supported — the
-        decision applies to the whole batch. Callers needing finer-grained
-        approval can pre-split batches upstream of the agent.
+        - ``approved=True``: claims and resumes. Approved and held server
+          calls execute server-side and their output is fed to the LLM.
+        - ``approved=False``: every pending call receives a synthetic failed
+          :class:`ToolResult` whose payload is ``rejection_reason`` as a JSON
+          string (default: ``"User declined to run this tool."``). The LLM
+          decides what to do next. ``rejection_reason`` is ignored when
+          ``approved=True``.
+        - ``decisions={call_id: ApprovalDecision.approve() | .deny(reason)}``:
+          keys must be exactly the approval-gated call ids (those that fired
+          ``approval.requested``); missing, unknown or duplicate ids raise
+          ``ValueError`` before anything is claimed. Validation uses the gate
+          snapshot persisted at pause time, so a different Agent instance
+          (with or without the ``before_tool`` hook) can decide. Denied calls
+          get a failed result ``{"denied": reason}``; held non-gated server
+          calls execute automatically.
+
+        In every form, client-target calls held in the batch never run on the
+        server: after the server calls resolve, the run pauses again as
+        ``WAITING_CLIENT_TOOL`` for those calls.
+
+        ``approval.decided`` carries a scalar ``decision``
+        (``approved|rejected|mixed``) and ``decisions``: one entry per pending
+        call with ``approved|denied|not_gated_executed|client_pending``.
 
         Args:
             run_id: A run in status ``WAITING_APPROVAL``.
-            approved: Approval decision.
-            rejection_reason: Optional message used as the error payload
-                on every synthetic rejection result. Ignored when
-                ``approved=True``.
+            approved: Whole-batch decision.
+            decisions: Per-call decisions keyed by tool call id.
+            rejection_reason: Reason used with ``approved=False``.
             notifier: Optional additional notifier composed during resume.
 
         Raises:
+            ValueError: invalid argument combination or decision ids.
             PersistenceNotConfiguredError, RunNotFoundError,
             RunNotPausedError, PauseStatusMismatchError,
             RunAlreadyClaimedError, RunAlreadyTerminalError.
@@ -1351,10 +1419,23 @@ class Agent:
         from dendrux.runtime.submit import (
             build_rejection_results,
             claim_or_raise,
+            normalize_decisions,
+            preflight_status,
             raise_for_non_paused_status,
+            serialize_decisions,
             serialize_tool_results,
+            validate_approval_decisions,
         )
         from dendrux.types import PauseState, RunStatus
+
+        if (approved is None) == (decisions is None):
+            raise ValueError("submit_approval() takes exactly one of approved= or decisions=.")
+        if decisions is not None and rejection_reason is not None:
+            raise ValueError(
+                "rejection_reason is only valid with approved=False; "
+                "give per-call reasons with ApprovalDecision.deny(reason)."
+            )
+        pairs = normalize_decisions(decisions) if decisions is not None else None
 
         provider = self._require_provider()
         store = await self._resolve_state_store()
@@ -1363,6 +1444,49 @@ class Agent:
 
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
+            if pairs is not None:
+                await preflight_status(store, run_id, RunStatus.WAITING_APPROVAL)
+                raw_pause = await store.get_pause_state(run_id)
+                if raw_pause is None:
+                    await raise_for_non_paused_status(store, run_id)
+                pause_state = PauseState.from_dict(raw_pause)
+                target_lookup = {
+                    get_tool_def(fn).name: get_tool_def(fn).target for fn in self.tools
+                }
+                decision_map = validate_approval_decisions(
+                    run_id, pause_state, pairs, target_lookup
+                )
+
+                def same_pause_generation(current: dict[str, Any]) -> None:
+                    # Re-validate against the exact pause being claimed: a
+                    # newer approval pause (ABA) must reject stale decisions
+                    # and stay WAITING_APPROVAL.
+                    validate_approval_decisions(
+                        run_id, PauseState.from_dict(current), pairs, target_lookup
+                    )
+
+                await claim_or_raise(
+                    store,
+                    run_id,
+                    expected_status=RunStatus.WAITING_APPROVAL,
+                    submitted_data={
+                        "submitted_decisions": serialize_decisions(pause_state, decision_map)
+                    },
+                    validate=same_pause_generation,
+                )
+                task = self._task_manager.spawn(
+                    run_id,
+                    resume_claimed(
+                        run_id,
+                        state_store=store,
+                        agent=self,
+                        provider=provider,
+                        extra_notifier=notifier,
+                        pre_claim_status=RunStatus.WAITING_APPROVAL.value,
+                    ),
+                )
+                return await task
+
             if approved:
                 await claim_or_raise(
                     store,

@@ -117,8 +117,8 @@ class TestGovernanceEventTypeEnum:
         assert GovernanceEventType.PROVIDER_RETRY == "provider.retry"
 
     def test_total_member_count(self) -> None:
-        """The seven v2 skill events replace the original three."""
-        assert len(GovernanceEventType) == 20
+        """The seven v2 skill events replace the original three; +3 before_tool events."""
+        assert len(GovernanceEventType) == 23
 
     def test_guardrail_unmapped_placeholder_member(self) -> None:
         assert (
