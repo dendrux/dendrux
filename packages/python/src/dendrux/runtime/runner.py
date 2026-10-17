@@ -730,6 +730,19 @@ async def _pause_with_event(
         pii_mapping=pii_mapping,
     )
     await _emit_event(state_store, run_id, "run.paused", sequencer, event_data)
+    # The read and the pause are separate here: a cancel committed in between
+    # left a paused row with cancel_requested set. Finish it now; the caller
+    # reloads and returns the persisted winner.
+    if await state_store.is_cancel_requested(run_id):
+        await _transition_with_event(
+            state_store,
+            run_id,
+            sequencer,
+            status=RunStatus.CANCELLED.value,
+            allowed_current_statuses=[status],
+            event_type="run.cancelled",
+            event_data={"reason": "cancel_requested"},
+        )
     return True
 
 

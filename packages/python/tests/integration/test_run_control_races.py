@@ -442,6 +442,39 @@ class TestPre03Store:
         assert [e.event_type for e in events][-1] == "run.cancelled"
         _assert_unique_sequences(events)
 
+    async def test_cancel_between_legacy_check_and_pause_is_honored(self, store) -> None:
+        """Legacy path reads the cancel flag, then pauses unconditionally: a
+        cancel landing in between must still end the run CANCELLED."""
+        legacy = Pre03Store(store)
+
+        @tool(target="client")
+        async def client_read() -> str:
+            return ""
+
+        agent = Agent(
+            provider=ScriptedLLM([tool_call("client_read", pid="t1")]),
+            prompt="P.",
+            tools=[client_read],
+            state_store=legacy,  # type: ignore[arg-type]
+        )
+        original = store.pause_run
+
+        async def cancel_then_pause(run_id: str, **kwargs: Any) -> None:
+            await store.request_cancel(run_id)
+            await original(run_id, **kwargs)
+
+        store.pause_run = cancel_then_pause  # type: ignore[method-assign]
+        result = await agent.run("read")
+
+        record = await store.get_run(result.run_id)
+        assert result.status == RunStatus.CANCELLED
+        assert record.status == "cancelled"
+        assert record.cancel_requested is False
+        events = await store.get_run_events(result.run_id)
+        types = [e.event_type for e in events]
+        assert types.index("run.paused") < types.index("run.cancelled")
+        _assert_unique_sequences(events)
+
     async def test_run_control_apis_name_the_missing_method(self, store) -> None:
         legacy = Pre03Store(store)
         agent = Agent(provider=ScriptedLLM([]), prompt="P.", state_store=legacy)  # type: ignore[arg-type]
