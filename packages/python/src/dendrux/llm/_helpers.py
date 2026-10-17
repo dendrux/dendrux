@@ -13,6 +13,9 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from dendrux.types import REASONING_MODEL_META_KEY, ToolCall
@@ -121,6 +124,139 @@ def connection_error(
     return ConnectionError(
         f"Connection to {api_name} {verb}. Model: {model}. Original error: {exc}"
     )
+
+
+# ------------------------------------------------------------------
+# Context-length and stream-rejection detection (OpenAI-compatible wire)
+# ------------------------------------------------------------------
+
+# Provider error codes (lower-cased) that mean "request exceeds the context window".
+CONTEXT_LENGTH_CODES: frozenset[str] = frozenset(
+    {"context_length_exceeded", "context_length_exceeded_error"}
+)
+
+# Statuses an endpoint uses for an oversized request. 403 covers Together's
+# documented-but-odd labelling; 413/422 cover gateways and FastAPI/TGI servers.
+# An in-stream error event has no status (None) and is judged on code/text alone.
+CONTEXT_LENGTH_STATUSES: frozenset[int] = frozenset({400, 403, 413, 422})
+
+# Streaming-unsupported is only ever a plain 400.
+STREAM_REJECTED_STATUSES: frozenset[int] = frozenset({400})
+
+# Server-templated phrases (OpenAI, vLLM, SGLang, Ollama, Groq, Together,
+# Fireworks, DeepInfra, TGI), matched case-insensitively. Loose by design but
+# every pattern is about the context window or input length, never about rate
+# limits (a Groq "request too large ... tokens per minute" 413 is deliberately
+# not matched). Never pin exact provider wording beyond these fragments.
+CONTEXT_LENGTH_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"maximum context length",
+        r"context[ _-]?(length|window|size)\b.{0,40}\b(exceed|too (long|large)|limit|only)",
+        r"\b(exceed\w*|longer than|over|above)\b.{0,40}\bcontext[ _-]?(length|window|size)",
+        r"\binput (length|token count|tokens?)\b.{0,60}\b(exceed\w*|too (long|large)|must be)",
+        r"\b(prompt|input|messages?)\s{1,3}(is|are) too (long|large)",
+        r"reduce the length of (the |your )?(messages?|prompt|input)",
+        r"`?inputs`? (tokens )?\+ `?max_(new_)?tokens`?",
+        r"`?inputs`? must have less than \d+ tokens",
+        r"\btoken length too long\b",
+        r"context overflow",
+    )
+)
+
+# The error's ``param`` naming the stream flag is itself a rejection signal.
+STREAM_REJECTED_PARAMS: frozenset[str] = frozenset({"stream"})
+
+STREAM_REJECTED_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bstream(ing)?\b.{0,60}\b(not (be )?(supported|allowed|available|enabled|implemented)"
+        r"|unsupported|isn'?t supported|disabled)",
+        r"\b(does ?n[o']t|do not|cannot|can'?t|not) (support|allow|stream)\w*\b.{0,40}\bstream",
+        r"\bunsupported (value|parameter)\b.{0,30}\bstream\b",
+    )
+)
+
+_ERROR_TEXT_LIMIT = 2000
+
+
+class GatewayErrorKind(Enum):
+    """Outcome of classifying an OpenAI-compatible endpoint error."""
+
+    CONTEXT_LENGTH = "context_length"
+    STREAMING_UNSUPPORTED = "streaming_unsupported"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class GatewayErrorClass:
+    """Classification of one endpoint error, with normalized status and provider code."""
+
+    kind: GatewayErrorKind
+    status_code: int | None
+    provider_code: str | None
+
+
+def _error_text(message: str, body: object) -> str:
+    """Searchable error text: the parsed body fields, else the SDK message.
+
+    The SDK message for a JSON error is a repr of the whole body, so it is only
+    used when no readable field could be extracted.
+    """
+    parts: list[str] = []
+    if isinstance(body, dict):
+        for key in ("message", "detail", "error"):
+            value = body.get(key)
+            if value is not None:
+                parts.append(value if isinstance(value, str) else str(value))
+    elif isinstance(body, str) and body.strip():
+        parts.append(body)
+    if not parts:
+        parts.append(message)
+    return "\n".join(parts)[:_ERROR_TEXT_LIMIT]
+
+
+def _body_field(body: object, key: str) -> str | None:
+    if isinstance(body, dict):
+        value = body.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def classify_gateway_error(
+    *,
+    status_code: int | None,
+    code: str | None,
+    param: str | None,
+    message: str,
+    body: object = None,
+) -> GatewayErrorClass:
+    """Classify an endpoint error. Pure; the single decision point for all call sites.
+
+    Precedence is fixed: context-length overflow first, streaming-unsupported
+    second, otherwise ``OTHER`` (the caller re-raises the original exception
+    untouched). Context length matches an accepted provider code or message
+    pattern on an accepted status (see the constants above); streaming
+    rejection requires a 400 whose ``param`` is ``stream`` or whose text says
+    streaming is unsupported.
+    """
+    provider_code = code or _body_field(body, "code")
+    text = _error_text(message, body)
+
+    status_ok = status_code is None or status_code in CONTEXT_LENGTH_STATUSES
+    if status_ok and (
+        (provider_code is not None and provider_code.lower() in CONTEXT_LENGTH_CODES)
+        or any(p.search(text) for p in CONTEXT_LENGTH_PATTERNS)
+    ):
+        return GatewayErrorClass(GatewayErrorKind.CONTEXT_LENGTH, status_code, provider_code)
+
+    if status_code in STREAM_REJECTED_STATUSES and (
+        param in STREAM_REJECTED_PARAMS or any(p.search(text) for p in STREAM_REJECTED_PATTERNS)
+    ):
+        return GatewayErrorClass(GatewayErrorKind.STREAMING_UNSUPPORTED, status_code, provider_code)
+
+    return GatewayErrorClass(GatewayErrorKind.OTHER, status_code, provider_code)
 
 
 # ------------------------------------------------------------------

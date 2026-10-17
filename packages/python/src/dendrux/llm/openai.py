@@ -21,9 +21,12 @@ from typing import TYPE_CHECKING, Any, Literal
 import httpx
 import openai
 
+from dendrux.errors import ContextLengthExceededError
 from dendrux.llm._helpers import (
+    GatewayErrorKind,
     build_call_index,
     build_tool_call,
+    classify_gateway_error,
     connection_error,
     resolve_tool_message_call,
     timeout_error,
@@ -456,6 +459,11 @@ class OpenAIProvider(LLMProvider):
         try:
             with call_attempt_tracking():
                 response = await self._client.chat.completions.create(**api_kwargs)
+        except openai.APIStatusError as exc:
+            translated = self._translate_error(exc, streaming=False)
+            if translated is not None:
+                raise translated from exc
+            raise
         except openai.APITimeoutError:
             raise timeout_error("OpenAIProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
@@ -484,7 +492,8 @@ class OpenAIProvider(LLMProvider):
 
         Text deltas are yielded immediately as they arrive.
         Tool call arguments are buffered by index and flushed as complete
-        TOOL_USE_END events when the terminal finish_reason arrives.
+        TOOL_USE_END events when the terminal finish_reason arrives, or at
+        end of stream if the backend never sent one.
 
         ``cache_key_prefix`` drives ``prompt_cache_key`` for OpenAI cache
         pool routing (a constructor ``cache_key_prefix`` takes precedence).
@@ -492,8 +501,10 @@ class OpenAIProvider(LLMProvider):
 
         At stream end, yields a DONE event carrying the full LLMResponse.
 
-        Raises NotImplementedError if the endpoint rejects streaming (common
-        with some OpenAI-compatible backends).
+        Raises NotImplementedError if the endpoint says streaming is not
+        supported (common with some OpenAI-compatible backends), and
+        ContextLengthExceededError if the request overflows the context window.
+        Other request errors propagate unchanged.
         """
         api_kwargs, captured_request = self._build_api_kwargs(
             messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
@@ -507,12 +518,11 @@ class OpenAIProvider(LLMProvider):
         attempt_token = begin_call_attempt_tracking()
         try:
             stream = await self._client.chat.completions.create(**api_kwargs)
-        except openai.BadRequestError as exc:
-            raise NotImplementedError(
-                f"Streaming request rejected by endpoint at {self._client.base_url}. "
-                f"If this endpoint does not support streaming, use agent.run() instead. "
-                f"Original error: {exc.message}"
-            ) from exc
+        except openai.APIStatusError as exc:
+            translated = self._translate_error(exc, streaming=True)
+            if translated is not None:
+                raise translated from exc
+            raise
         except openai.APITimeoutError:
             raise timeout_error("OpenAIProvider", self._timeout) from None
         except openai.APIConnectionError as exc:
@@ -536,7 +546,18 @@ class OpenAIProvider(LLMProvider):
         # (some OpenAI-compatible backends don't guarantee name-first).
         _tool_buffers: dict[int, _ToolCallBuffer] = {}
 
-        async for chunk in stream:
+        chunk_iter = stream.__aiter__()
+        while True:
+            try:
+                chunk = await chunk_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except openai.APIError as exc:
+                translated = self._translate_error(exc, streaming=True)
+                if translated is not None:
+                    raise translated from exc
+                raise
+
             # Usage arrives in the final chunk
             if chunk.usage:
                 usage = self._normalize_usage(chunk.usage)
@@ -599,44 +620,14 @@ class OpenAIProvider(LLMProvider):
             # --- Flush all buffered tool calls on terminal finish_reason ---
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
-                if _tool_buffers:
-                    for flush_idx in sorted(_tool_buffers):
-                        buf = _tool_buffers[flush_idx]
-                        raw_json = "".join(buf.json_parts)
+                for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+                    yield flush_event
 
-                        # Ensure START was emitted even if name arrived late
-                        if buf.name and not buf.start_emitted:
-                            buf.start_emitted = True
-                            yield StreamEvent(
-                                type=StreamEventType.TOOL_USE_START,
-                                tool_name=buf.name,
-                                tool_call_id=buf.tool_call_id,
-                            )
-
-                        if buf.name is None:
-                            logger.warning(
-                                "Tool call completed with no name — "
-                                "provider=%s model=%s call_id=%s",
-                                "openai",
-                                self._model,
-                                buf.tool_call_id,
-                            )
-
-                        tc = build_tool_call(
-                            buf.name or "unknown",
-                            raw_json,
-                            provider_tool_call_id=buf.tool_call_id,
-                            provider="openai",
-                            model=self._model,
-                        )
-                        tool_calls.append(tc)
-                        yield StreamEvent(
-                            type=StreamEventType.TOOL_USE_END,
-                            tool_call=tc,
-                            tool_name=tc.name,
-                            tool_call_id=buf.tool_call_id,
-                        )
-                    _tool_buffers.clear()
+        # Some compatible backends end the stream without ever sending a
+        # finish_reason; flush whatever is still buffered so calls are not lost.
+        # No-op when the finish_reason chunk already drained the buffers.
+        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+            yield flush_event
 
         # Assemble the final LLMResponse
         llm_response = LLMResponse(
@@ -660,6 +651,92 @@ class OpenAIProvider(LLMProvider):
         }
 
         yield StreamEvent(type=StreamEventType.DONE, raw=llm_response)
+
+    def _drain_tool_buffers(
+        self,
+        buffers: dict[int, _ToolCallBuffer],
+        tool_calls: list[ToolCall],
+    ) -> list[StreamEvent]:
+        """Turn buffered tool-call fragments into START/END events and clear them.
+
+        Appends each completed call to ``tool_calls``. Emptying ``buffers``
+        makes a second drain a no-op, so a call is never emitted twice.
+        """
+        events: list[StreamEvent] = []
+        for idx in sorted(buffers):
+            buf = buffers[idx]
+            raw_json = "".join(buf.json_parts)
+
+            # Ensure START was emitted even if name arrived late
+            if buf.name and not buf.start_emitted:
+                buf.start_emitted = True
+                events.append(
+                    StreamEvent(
+                        type=StreamEventType.TOOL_USE_START,
+                        tool_name=buf.name,
+                        tool_call_id=buf.tool_call_id,
+                    )
+                )
+
+            if buf.name is None:
+                logger.warning(
+                    "Tool call completed with no name — provider=%s model=%s call_id=%s",
+                    "openai",
+                    self._model,
+                    buf.tool_call_id,
+                )
+
+            tc = build_tool_call(
+                buf.name or "unknown",
+                raw_json,
+                provider_tool_call_id=buf.tool_call_id,
+                provider="openai",
+                model=self._model,
+            )
+            tool_calls.append(tc)
+            events.append(
+                StreamEvent(
+                    type=StreamEventType.TOOL_USE_END,
+                    tool_call=tc,
+                    tool_name=tc.name,
+                    tool_call_id=buf.tool_call_id,
+                )
+            )
+        buffers.clear()
+        return events
+
+    def _translate_error(
+        self, exc: openai.APIError, *, streaming: bool
+    ) -> ContextLengthExceededError | NotImplementedError | None:
+        """Translate an SDK error via the shared classifier, or None to re-raise it as-is.
+
+        Used around the batch call, stream creation and stream iteration.
+        Streaming-unsupported is only meaningful for a streaming call.
+        """
+        classified = classify_gateway_error(
+            status_code=getattr(exc, "status_code", None),
+            code=exc.code if isinstance(exc.code, str) else None,
+            param=exc.param if isinstance(exc.param, str) else None,
+            message=exc.message,
+            body=exc.body,
+        )
+        if classified.kind is GatewayErrorKind.CONTEXT_LENGTH:
+            where = f" for model '{self._model}'"
+            status = f" (HTTP {classified.status_code})" if classified.status_code else ""
+            return ContextLengthExceededError(
+                f"Request exceeds the model's context window{where}{status}. "
+                "Reduce the conversation history, tool results or max_tokens.",
+                status_code=classified.status_code,
+                provider_code=classified.provider_code,
+                model=self._model,
+            )
+        if streaming and classified.kind is GatewayErrorKind.STREAMING_UNSUPPORTED:
+            return NotImplementedError(
+                f"Streaming request rejected by endpoint at {self._client.base_url}. "
+                f"If this endpoint does not support streaming, use agent.run() instead. "
+                f"Original error: {exc.message}"
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Outbound conversions: Dendrux → OpenAI
