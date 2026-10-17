@@ -2135,7 +2135,9 @@ class Agent:
         load, claim, history build) runs lazily on first iteration.
 
         First event is RUN_RESUMED (not RUN_STARTED), carrying the
-        existing run_id for correlation.
+        existing run_id for correlation. With neither ``tool_results`` nor
+        ``user_input`` it approves a WAITING_APPROVAL batch or continues a
+        PAUSED run.
 
         Usage:
             async with agent.resume_stream(run_id, tool_results=results) as stream:

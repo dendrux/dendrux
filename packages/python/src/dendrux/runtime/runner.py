@@ -2226,7 +2226,7 @@ async def resume(
 
     Three shapes:
       - tool_results provided → client-tool results or approval rejection
-      - No args (tool_results=None) → approval approve
+      - No args (tool_results=None) → approval approve, or continue a PAUSED run
 
     Uses an atomic claim to prevent double-resume races.
 
