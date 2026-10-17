@@ -118,6 +118,17 @@
     "plain_text_body": {
       "status": 413,
       "text": "maximum context length exceeded"
+    },
+    "vllm_output_cap_param": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "'max_tokens' or 'max_completion_tokens' is too large: 4000. This model's maximum context length is 4096 tokens and your request has 3000 input tokens (4000 > 4096 - 3000).",
+          "type": "BadRequestError",
+          "param": "max_completion_tokens",
+          "code": 400
+        }
+      }
     }
   },
   "not_context": {
@@ -173,6 +184,34 @@
       "body": {
         "error": {
           "message": "Internal server error"
+        }
+      }
+    },
+    "review_rate_limit_413": {
+      "status": 413,
+      "body": {
+        "error": {
+          "message": "Input token count exceeds the token rate limit",
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "review_permission_403": {
+      "status": 403,
+      "body": {
+        "error": {
+          "message": "Access denied to the model with maximum context length 128000; contact your administrator",
+          "code": "permission_denied"
+        }
+      }
+    },
+    "review_output_cap_400": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "max_tokens is too large: 32768; the maximum context length supported for output is 16384",
+          "code": "invalid_value",
+          "param": "max_tokens"
         }
       }
     }

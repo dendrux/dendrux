@@ -121,6 +121,10 @@ async def _drain(provider: OpenAIProvider) -> list[Any]:
     return [event async for event in provider.complete_stream(MESSAGES)]
 
 
+async def _drain_messages(provider: OpenAIProvider) -> list[Any]:
+    return await _drain(provider)
+
+
 # ---------------------------------------------------------------------------
 # B4 — context-length detection
 # ---------------------------------------------------------------------------
@@ -222,6 +226,70 @@ class TestContextLengthStream:
         with pytest.raises(openai.APIError) as info:
             await _drain(provider)
         assert not isinstance(info.value, ContextLengthExceededError)
+
+
+class TestFalsePositiveVetoes:
+    """Codex review P1-1: explicit non-context signals beat the message patterns."""
+
+    @pytest.mark.parametrize(
+        "name", ["review_rate_limit_413", "review_permission_403", "review_output_cap_400"]
+    )
+    def test_probe_fixtures_are_other(self, name: str) -> None:
+        fx = _FIXTURES["not_context"][name]
+        err = fx["body"]["error"]
+        result = classify_gateway_error(
+            status_code=fx["status"],
+            code=err.get("code"),
+            param=err.get("param"),
+            message=err["message"],
+            body=err,
+        )
+        assert result.kind is GatewayErrorKind.OTHER
+
+    @pytest.mark.parametrize(
+        "name", ["review_rate_limit_413", "review_permission_403", "review_output_cap_400"]
+    )
+    async def test_probe_fixtures_propagate_unchanged(
+        self, provider: OpenAIProvider, name: str
+    ) -> None:
+        fx = _FIXTURES["not_context"][name]
+        for call in (provider.complete, lambda m: _drain_messages(provider)):
+            _wire(provider, _json(fx["status"], fx["body"]))
+            with pytest.raises(openai.APIStatusError) as info:
+                await call(MESSAGES)
+            assert not isinstance(info.value, ContextLengthExceededError)
+
+    def test_explicit_context_code_still_beats_veto_param(self) -> None:
+        result = classify_gateway_error(
+            status_code=400,
+            code="context_length_exceeded",
+            param="max_tokens",
+            message="x",
+        )
+        assert result.kind is GatewayErrorKind.CONTEXT_LENGTH
+
+    def test_output_cap_with_input_token_evidence_is_context_length(self) -> None:
+        fx = _FIXTURES["context_overflow"]["vllm_output_cap_param"]["body"]["error"]
+        result = classify_gateway_error(
+            status_code=400, code=None, param=fx["param"], message=fx["message"], body=fx
+        )
+        assert result.kind is GatewayErrorKind.CONTEXT_LENGTH
+
+    def test_403_accepts_only_together_formula(self) -> None:
+        together = _FIXTURES["context_overflow"]["together_403"]["body"]["error"]
+        assert (
+            classify_gateway_error(
+                status_code=403, code=None, param=None, message=together["message"], body=together
+            ).kind
+            is GatewayErrorKind.CONTEXT_LENGTH
+        )
+        generic = classify_gateway_error(
+            status_code=403,
+            code=None,
+            param=None,
+            message="This model's maximum context length is 4096 tokens",
+        )
+        assert generic.kind is GatewayErrorKind.OTHER
 
 
 class TestClassifier:
@@ -462,3 +530,76 @@ class TestOpenRouterInherits:
         )
         events = await _drain(openrouter)
         assert [e.type for e in events].count(StreamEventType.TOOL_USE_END) == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex review: P1-2 sanitized streaming message, P2-1 per-call model
+# ---------------------------------------------------------------------------
+class TestReviewFixRound:
+    async def test_stream_unsupported_message_has_no_provider_text(
+        self, provider: OpenAIProvider
+    ) -> None:
+        _wire(
+            provider,
+            _json(
+                400,
+                {
+                    "error": {
+                        "message": "Streaming is not supported for this deployment; "
+                        f"request excerpt: {PROMPT_SECRET}",
+                        "param": "stream",
+                    }
+                },
+            ),
+        )
+        with pytest.raises(NotImplementedError) as info:
+            await _drain(provider)
+        assert PROMPT_SECRET not in str(info.value)
+        assert isinstance(info.value.__cause__, openai.BadRequestError)
+        assert PROMPT_SECRET in str(info.value.__cause__)
+
+    async def test_batch_error_uses_per_call_model(self) -> None:
+        provider = OpenAIProvider(model="configured-model", api_key="k", max_retries=0)
+        status, body = CONTEXT_OVERFLOWS["openai"]
+        _wire(provider, _json(status, body))
+        with pytest.raises(ContextLengthExceededError) as info:
+            await provider.complete(MESSAGES, model="per-call-model")
+        assert info.value.model == "per-call-model"
+        assert "per-call-model" in str(info.value)
+        assert "configured-model" not in str(info.value)
+
+    async def test_stream_creation_error_uses_per_call_model(self) -> None:
+        provider = OpenAIProvider(model="configured-model", api_key="k", max_retries=0)
+        status, body = CONTEXT_OVERFLOWS["openai"]
+        _wire(provider, _json(status, body))
+        with pytest.raises(ContextLengthExceededError) as info:
+            async for _ in provider.complete_stream(MESSAGES, model="per-call-model"):
+                pass
+        assert info.value.model == "per-call-model"
+
+    async def test_stream_iteration_error_uses_per_call_model(self) -> None:
+        provider = OpenAIProvider(model="configured-model", api_key="k", max_retries=0)
+        _wire(
+            provider,
+            _sse_response(
+                _chunk({"content": "x"}),
+                {"error": {"message": "too big", "code": "context_length_exceeded"}},
+            ),
+        )
+        with pytest.raises(ContextLengthExceededError) as info:
+            async for _ in provider.complete_stream(MESSAGES, model="per-call-model"):
+                pass
+        assert info.value.model == "per-call-model"
+
+    async def test_openrouter_inherits_per_call_model(self, openrouter: OpenRouterProvider) -> None:
+        status, body = CONTEXT_OVERFLOWS["openai"]
+        _wire(openrouter, _json(status, body))
+        with pytest.raises(ContextLengthExceededError) as info:
+            await openrouter.complete(MESSAGES, model="other/model")
+        assert info.value.model == "other/model"
+
+    def test_top_level_export(self) -> None:
+        import dendrux
+
+        assert dendrux.ContextLengthExceededError is ContextLengthExceededError
+        assert "ContextLengthExceededError" in dendrux.__all__

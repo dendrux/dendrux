@@ -140,6 +140,49 @@ CONTEXT_LENGTH_CODES: frozenset[str] = frozenset(
 # An in-stream error event has no status (None) and is judged on code/text alone.
 CONTEXT_LENGTH_STATUSES: frozenset[int] = frozenset({400, 403, 413, 422})
 
+# Provider codes that name a different failure. They veto the message-pattern
+# path (an explicit context-length code still wins first), so a rate limit or
+# auth error whose text mentions tokens or a context window is never an overflow.
+NON_CONTEXT_CODES: frozenset[str] = frozenset(
+    {
+        "rate_limit_exceeded",
+        "rate_limit",
+        "rate_limited",
+        "too_many_requests",
+        "insufficient_quota",
+        "quota_exceeded",
+        "billing_hard_limit_reached",
+        "permission_denied",
+        "forbidden",
+        "unauthorized",
+        "authentication_error",
+        "invalid_api_key",
+        "access_denied",
+        "model_not_found",
+        "model_not_available",
+        "invalid_value",
+    }
+)
+
+# ``param`` values that name the output-token cap. An error about the cap is a
+# request-configuration error unless its text also counts input/prompt tokens
+# (vLLM: "... maximum context length is N tokens and your request has M input tokens").
+OUTPUT_CAP_PARAMS: frozenset[str] = frozenset(
+    {"max_tokens", "max_completion_tokens", "max_new_tokens", "max_output_tokens"}
+)
+OUTPUT_CAP_INPUT_EVIDENCE = re.compile(
+    r"\binput tokens?\b|\bin the (messages?|prompt)\b|\byour (messages?|prompt)\b|"
+    r"\bprompt tokens?\b",
+    re.IGNORECASE,
+)
+
+# On 403 the generic phrases are too weak (an auth error can describe a model's
+# context length). Only Together's documented formula is accepted there.
+FORBIDDEN_CONTEXT_PATTERN = re.compile(
+    r"input token count\s*\+\s*`?max_(new_)?tokens`?.{0,80}\bcontext[ _-]?length",
+    re.IGNORECASE,
+)
+
 # Streaming-unsupported is only ever a plain 400.
 STREAM_REJECTED_STATUSES: frozenset[int] = frozenset({400})
 
@@ -224,6 +267,22 @@ def _body_field(body: object, key: str) -> str | None:
     return None
 
 
+def _is_context_length(
+    status_code: int | None, code: str | None, param: str | None, text: str
+) -> bool:
+    if code in CONTEXT_LENGTH_CODES:
+        return True
+    if code in NON_CONTEXT_CODES:
+        return False
+    if status_code == 403:
+        return FORBIDDEN_CONTEXT_PATTERN.search(text) is not None
+    if not any(p.search(text) for p in CONTEXT_LENGTH_PATTERNS):
+        return False
+    if param in OUTPUT_CAP_PARAMS:
+        return OUTPUT_CAP_INPUT_EVIDENCE.search(text) is not None
+    return True
+
+
 def classify_gateway_error(
     *,
     status_code: int | None,
@@ -237,17 +296,18 @@ def classify_gateway_error(
     Precedence is fixed: context-length overflow first, streaming-unsupported
     second, otherwise ``OTHER`` (the caller re-raises the original exception
     untouched). Context length matches an accepted provider code or message
-    pattern on an accepted status (see the constants above); streaming
+    pattern on an accepted status (see the constants above), unless a
+    non-context provider code or an output-cap ``param`` vetoes the text path
+    (403 accepts only Together's formula); streaming
     rejection requires a 400 whose ``param`` is ``stream`` or whose text says
     streaming is unsupported.
     """
     provider_code = code or _body_field(body, "code")
     text = _error_text(message, body)
 
-    status_ok = status_code is None or status_code in CONTEXT_LENGTH_STATUSES
-    if status_ok and (
-        (provider_code is not None and provider_code.lower() in CONTEXT_LENGTH_CODES)
-        or any(p.search(text) for p in CONTEXT_LENGTH_PATTERNS)
+    lowered_code = provider_code.lower() if provider_code is not None else None
+    if (status_code is None or status_code in CONTEXT_LENGTH_STATUSES) and _is_context_length(
+        status_code, lowered_code, param, text
     ):
         return GatewayErrorClass(GatewayErrorKind.CONTEXT_LENGTH, status_code, provider_code)
 

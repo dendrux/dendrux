@@ -460,7 +460,7 @@ class OpenAIProvider(LLMProvider):
             with call_attempt_tracking():
                 response = await self._client.chat.completions.create(**api_kwargs)
         except openai.APIStatusError as exc:
-            translated = self._translate_error(exc, streaming=False)
+            translated = self._translate_error(exc, streaming=False, model=api_kwargs["model"])
             if translated is not None:
                 raise translated from exc
             raise
@@ -519,7 +519,7 @@ class OpenAIProvider(LLMProvider):
         try:
             stream = await self._client.chat.completions.create(**api_kwargs)
         except openai.APIStatusError as exc:
-            translated = self._translate_error(exc, streaming=True)
+            translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
             if translated is not None:
                 raise translated from exc
             raise
@@ -553,7 +553,7 @@ class OpenAIProvider(LLMProvider):
             except StopAsyncIteration:
                 break
             except openai.APIError as exc:
-                translated = self._translate_error(exc, streaming=True)
+                translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
                 if translated is not None:
                     raise translated from exc
                 raise
@@ -706,7 +706,7 @@ class OpenAIProvider(LLMProvider):
         return events
 
     def _translate_error(
-        self, exc: openai.APIError, *, streaming: bool
+        self, exc: openai.APIError, *, streaming: bool, model: str
     ) -> ContextLengthExceededError | NotImplementedError | None:
         """Translate an SDK error via the shared classifier, or None to re-raise it as-is.
 
@@ -721,20 +721,20 @@ class OpenAIProvider(LLMProvider):
             body=exc.body,
         )
         if classified.kind is GatewayErrorKind.CONTEXT_LENGTH:
-            where = f" for model '{self._model}'"
+            where = f" for model '{model}'"
             status = f" (HTTP {classified.status_code})" if classified.status_code else ""
             return ContextLengthExceededError(
                 f"Request exceeds the model's context window{where}{status}. "
                 "Reduce the conversation history, tool results or max_tokens.",
                 status_code=classified.status_code,
                 provider_code=classified.provider_code,
-                model=self._model,
+                model=model,
             )
         if streaming and classified.kind is GatewayErrorKind.STREAMING_UNSUPPORTED:
             return NotImplementedError(
                 f"Streaming request rejected by endpoint at {self._client.base_url}. "
                 f"If this endpoint does not support streaming, use agent.run() instead. "
-                f"Original error: {exc.message}"
+                f"(Provider detail is on __cause__.)"
             )
         return None
 
