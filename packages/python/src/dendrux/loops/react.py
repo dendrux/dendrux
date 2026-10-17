@@ -346,6 +346,22 @@ def _build_pause(
 INBOX_NOTE_PREFIX = "NOTE FROM USER:\n"
 
 
+class _LegacyControl(NamedTuple):
+    """Checkpoint flags of a pre-0.3 store: cancel only, no pause, no inbox."""
+
+    cancel_requested: bool
+    pause_requested: bool = False
+    has_pending_notes: bool = False
+
+
+async def _read_control(state_store: StateStore, run_id: str) -> Any:
+    """``get_run_control`` when the store has it, else ``is_cancel_requested``."""
+    getter = getattr(state_store, "get_run_control", None)
+    if getter is not None:
+        return await getter(run_id)
+    return _LegacyControl(cancel_requested=bool(await state_store.is_cancel_requested(run_id)))
+
+
 def _requested_pause_result(
     *,
     agent_name: str,
@@ -1072,7 +1088,7 @@ class ReActLoop(Loop):
             # current iteration's LLM/tools are not preempted — flags are seen
             # here or at the runner's pre-pause checkpoint.
             if state_store is not None:
-                control = await state_store.get_run_control(resolved_run_id)
+                control = await _read_control(state_store, resolved_run_id)
                 if control.cancel_requested:
                     return RunResult(
                         run_id=resolved_run_id,
@@ -1575,7 +1591,7 @@ class ReActLoop(Loop):
             # provider call is even started.
             interrupted_here = interrupt is not None and interrupt.is_set()
             control = (
-                await state_store.get_run_control(resolved_run_id)
+                await _read_control(state_store, resolved_run_id)
                 if state_store is not None and not interrupted_here
                 else None
             )

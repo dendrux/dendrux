@@ -344,6 +344,9 @@ class SweptRun:
     failure_reason: str
     last_progress_at: datetime | None
     swept_at: datetime
+    # Status the sweep wrote: "error", or "cancelled" for a stale RUNNING row
+    # whose cancellation had been requested.
+    status: str = "error"
 
 
 @dataclass(frozen=True)
@@ -556,6 +559,42 @@ class StateStore(Protocol):
         """
         ...
 
+    async def pause_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        event_data: dict[str, Any] | None = None,
+        iteration_count: int | None = None,
+        pii_mapping: dict[str, str] | None = None,
+    ) -> int | None:
+        """``try_pause_run`` and the ``run.paused`` event in one transaction.
+
+        Returns the event's sequence index, or None when the CAS lost.
+        """
+        ...
+
+    async def finalize_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        event_type: str,
+        event_data: dict[str, Any] | None = None,
+        answer: str | None = None,
+        error: str | None = None,
+        iteration_count: int | None = None,
+        total_usage: UsageStats | None = None,
+        pii_mapping: dict[str, str] | None = None,
+    ) -> int | None:
+        """``finalize_run_if_status_in`` and its event in one transaction.
+
+        Returns the event's sequence index, or None when the CAS lost.
+        """
+        ...
+
     async def add_note(
         self,
         run_id: str,
@@ -573,8 +612,18 @@ class StateStore(Protocol):
         """
         ...
 
-    async def get_notes(self, run_id: str, *, undelivered_only: bool = False) -> list[NoteRecord]:
-        """Inbox notes of a run ordered by ``(created_at, id)``."""
+    async def get_notes(
+        self,
+        run_id: str,
+        *,
+        undelivered_only: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[NoteRecord]:
+        """Inbox notes of a run ordered by ``(created_at, id)``.
+
+        A scoped ``tenant_id`` (incl. ``None``) returns nothing unless the run
+        belongs to exactly that tenant.
+        """
         ...
 
     async def mark_notes_delivered(
@@ -1217,52 +1266,117 @@ class SQLAlchemyStateStore:
         Mirrors :meth:`finalize_run`'s side-effects: clears ``pause_data``
         and ``cancel_requested``.
         """
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                won = await self._cas_finalize(
+                    session,
+                    run_id,
+                    status=status,
+                    allowed_current_statuses=allowed_current_statuses,
+                    answer=answer,
+                    error=error,
+                    iteration_count=iteration_count,
+                    total_usage=total_usage,
+                    pii_mapping=pii_mapping,
+                )
+                await session.commit()
+                return won
+
+        return await retry_transient_db(_attempt, label="finalize_run_if_status_in", run_id=run_id)
+
+    async def finalize_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        event_type: str,
+        event_data: dict[str, Any] | None = None,
+        answer: str | None = None,
+        error: str | None = None,
+        iteration_count: int | None = None,
+        total_usage: UsageStats | None = None,
+        pii_mapping: dict[str, str] | None = None,
+    ) -> int | None:
+        """:meth:`finalize_run_if_status_in` plus its lifecycle event, in one transaction.
+
+        The event's sequence index is allocated after the CAS took the row
+        lock, so nothing can observe the new status before the event is
+        durable and no two transition events share an index. Returns the
+        event's sequence index, or None when the CAS lost (nothing written).
+        """
+
+        async def _attempt() -> int | None:
+            async with self._session_factory() as session:
+                won = await self._cas_finalize(
+                    session,
+                    run_id,
+                    status=status,
+                    allowed_current_statuses=allowed_current_statuses,
+                    answer=answer,
+                    error=error,
+                    iteration_count=iteration_count,
+                    total_usage=total_usage,
+                    pii_mapping=pii_mapping,
+                )
+                if not won:
+                    await session.rollback()
+                    return None
+                seq = await _insert_event_locked(session, run_id, event_type, event_data)
+                await session.commit()
+                return seq
+
+        return await retry_transient_db(_attempt, label="finalize_with_event", run_id=run_id)
+
+    async def _cas_finalize(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        answer: str | None,
+        error: str | None,
+        iteration_count: int | None,
+        total_usage: UsageStats | None,
+        pii_mapping: dict[str, str] | None,
+    ) -> bool:
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
-        async def _attempt() -> bool:
-            async with self._session_factory() as session:
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
-                values: dict[str, Any] = {
-                    "status": status,
-                    "pause_data": None,
-                    "cancel_requested": False,
-                    "pause_requested": False,
-                }
-                if iteration_count is not None:
-                    values["iteration_count"] = iteration_count
-                if answer is not None or total_usage is not None:
-                    values["output_data"] = await _finalized_output_data(
-                        session, run_id, answer, total_usage
-                    )
-                if error is not None:
-                    values["error"] = error
-                if total_usage is not None:
-                    values["total_input_tokens"] = total_usage.input_tokens
-                    values["total_output_tokens"] = total_usage.output_tokens
-                    values["total_cost_usd"] = total_usage.cost_usd
-                    values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
-                    values["total_cache_creation_tokens"] = (
-                        total_usage.cache_creation_input_tokens or 0
-                    )
-                    values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
-                if pii_mapping is not None:
-                    values["pii_mapping"] = pii_mapping
+        # updated_at is filled by the model's onupdate hook (Python aware-UTC).
+        values: dict[str, Any] = {
+            "status": status,
+            "pause_data": None,
+            "cancel_requested": False,
+            "pause_requested": False,
+        }
+        if iteration_count is not None:
+            values["iteration_count"] = iteration_count
+        if answer is not None or total_usage is not None:
+            values["output_data"] = await _finalized_output_data(
+                session, run_id, answer, total_usage
+            )
+        if error is not None:
+            values["error"] = error
+        if total_usage is not None:
+            values["total_input_tokens"] = total_usage.input_tokens
+            values["total_output_tokens"] = total_usage.output_tokens
+            values["total_cost_usd"] = total_usage.cost_usd
+            values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
+            values["total_cache_creation_tokens"] = total_usage.cache_creation_input_tokens or 0
+            values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
+        if pii_mapping is not None:
+            values["pii_mapping"] = pii_mapping
 
-                stmt = (
-                    update(AgentRun)
-                    .where(
-                        AgentRun.id == run_id,
-                        AgentRun.status.in_(allowed_current_statuses),
-                    )
-                    .values(**values)
-                )
-                result = await session.execute(stmt)
-                await session.commit()
-                return bool(result.rowcount and result.rowcount > 0)
-
-        return await retry_transient_db(_attempt, label="finalize_run_if_status_in", run_id=run_id)
+        result: Any = await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.status.in_(allowed_current_statuses))
+            .values(**values)
+        )
+        return bool(result.rowcount and result.rowcount > 0)
 
     async def request_cancel(self, run_id: str) -> bool:
         """Set ``cancel_requested=True`` on a non-terminal run.
@@ -1427,6 +1541,62 @@ class SQLAlchemyStateStore:
 
         return await retry_transient_db(_attempt, label="try_pause_run", run_id=run_id)
 
+    async def pause_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        event_data: dict[str, Any] | None = None,
+        iteration_count: int | None = None,
+        pii_mapping: dict[str, str] | None = None,
+    ) -> int | None:
+        """:meth:`try_pause_run` plus the ``run.paused`` event, in one transaction.
+
+        A finalizer of paused runs (``cancel_run``, the sweeper) can only act
+        once this commits, so it always sees ``run.paused`` and allocates a
+        later sequence index. Returns the event's sequence index, or None
+        when the CAS lost (a pending cancel or a non-RUNNING row).
+        """
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> int | None:
+            async with self._session_factory() as session:
+                values: dict[str, Any] = {
+                    "status": status,
+                    "pause_data": pause_data,
+                    "pause_requested": False,
+                }
+                if iteration_count is not None:
+                    values["iteration_count"] = iteration_count
+                if pii_mapping is not None:
+                    values["pii_mapping"] = pii_mapping
+                result = await session.execute(
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_id,
+                        AgentRun.status == RunStatus.RUNNING.value,
+                        AgentRun.cancel_requested.is_(False),
+                    )
+                    .values(**values)
+                )
+                if not result.rowcount:
+                    await session.rollback()
+                    return None
+                seq = await _insert_event_locked(
+                    session,
+                    run_id,
+                    "run.paused",
+                    event_data,
+                    iteration_index=iteration_count or 0,
+                )
+                await session.commit()
+                return seq
+
+        return await retry_transient_db(_attempt, label="pause_with_event", run_id=run_id)
+
     async def add_note(
         self,
         run_id: str,
@@ -1476,13 +1646,24 @@ class SQLAlchemyStateStore:
 
         return await retry_transient_db(_attempt, label="add_note", run_id=run_id)
 
-    async def get_notes(self, run_id: str, *, undelivered_only: bool = False) -> list[NoteRecord]:
+    async def get_notes(
+        self,
+        run_id: str,
+        *,
+        undelivered_only: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[NoteRecord]:
         from sqlalchemy import select
 
-        from dendrux.db.models import RunInbox
+        from dendrux.db.models import AgentRun, RunInbox
 
         async with self._session_factory() as session:
             stmt = select(RunInbox).where(RunInbox.run_id == run_id)
+            if not isinstance(tenant_id, _Unscoped):
+                owner = _apply_tenant_scope(
+                    select(AgentRun.id).where(AgentRun.id == run_id), tenant_id
+                )
+                stmt = stmt.where(owner.exists())
             if undelivered_only:
                 stmt = stmt.where(RunInbox.delivered_at.is_(None))
             rows = (
@@ -1908,6 +2089,11 @@ class SQLAlchemyStateStore:
         Detection uses last_progress_at (or created_at if last_progress_at
         is NULL — run never got far enough to record progress).
 
+        A stale row whose cancellation was already requested is finalized
+        CANCELLED instead (never ERROR): the request is honored, the
+        ``failure_reason`` still records the stale classification, and the
+        event is ``run.cancelled`` with ``reason="cancel_requested"``.
+
         Classification is best-effort: absence of a run.started event
         does NOT strictly prove 'never started' because that event is
         emitted through a helper that swallows failures. Useful heuristic
@@ -1915,7 +2101,7 @@ class SQLAlchemyStateStore:
         """
         import datetime as _dt
 
-        from sqlalchemy import func, select, update
+        from sqlalchemy import case, func, select, update
 
         from dendrux.db.models import AgentRun, RunEvent
 
@@ -1948,31 +2134,20 @@ class SQLAlchemyStateStore:
             started_result = await session.execute(started_stmt)
             started_run_ids = {row[0] for row in started_result.all()}
 
-            # Get max sequence_index per run for event ordering
-            seq_stmt = (
-                select(
-                    RunEvent.agent_run_id,
-                    func.max(RunEvent.sequence_index).label("max_seq"),
-                )
-                .where(RunEvent.agent_run_id.in_(stale_ids))
-                .group_by(RunEvent.agent_run_id)
-            )
-            seq_result = await session.execute(seq_stmt)
-            max_seqs: dict[str, int] = {row[0]: row[1] for row in seq_result.all()}
-
             # Process each stale run
             for row in stale_rows:
                 classification = "stale_running" if row.id in started_run_ids else "never_started"
+                flagged = AgentRun.cancel_requested.is_(True)
 
-                # Mark as ERROR with failure_reason; updated_at is filled
-                # by the model's onupdate hook (Python-side aware-UTC).
+                # One CAS: a pending cancel finalizes CANCELLED, else ERROR.
+                # updated_at is filled by the model's onupdate hook.
                 update_stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == row.id, AgentRun.status == "running")
                     .values(
-                        status="error",
+                        status=case((flagged, "cancelled"), else_="error"),
                         failure_reason=classification,
-                        error=f"Run swept as {classification}",
+                        error=case((flagged, None), else_=f"Run swept as {classification}"),
                         cancel_requested=False,
                         pause_requested=False,
                     )
@@ -1983,17 +2158,18 @@ class SQLAlchemyStateStore:
                 if not (update_result.rowcount and update_result.rowcount > 0):
                     continue
 
-                # Emit run.interrupted event
-                next_seq = max_seqs.get(row.id, -1) + 1
-                event = RunEvent(
-                    id=generate_ulid(),
-                    agent_run_id=row.id,
-                    event_type="run.interrupted",
-                    sequence_index=next_seq,
-                    iteration_index=row.iteration_count or 0,
-                    data={"failure_reason": classification},
+                new_status = (
+                    await session.execute(select(AgentRun.status).where(AgentRun.id == row.id))
+                ).scalar_one()
+                if new_status == "cancelled":
+                    event_type = "run.cancelled"
+                    data = {"reason": "cancel_requested", "failure_reason": classification}
+                else:
+                    event_type = "run.interrupted"
+                    data = {"failure_reason": classification}
+                await _insert_event_locked(
+                    session, row.id, event_type, data, iteration_index=row.iteration_count or 0
                 )
-                session.add(event)
 
                 # Commit per-run so partial progress is durable.
                 # If run N+1 fails, runs 0..N are already committed.
@@ -2007,6 +2183,7 @@ class SQLAlchemyStateStore:
                         failure_reason=classification,
                         last_progress_at=_to_aware_utc(row.last_progress_at),
                         swept_at=_to_aware_utc(now),
+                        status=new_status,
                     )
                 )
 
@@ -2024,7 +2201,7 @@ class SQLAlchemyStateStore:
         from sqlalchemy import select, update
 
         from dendrux.db.enums import AgentRunStatus
-        from dendrux.db.models import AgentRun, RunEvent
+        from dendrux.db.models import AgentRun
 
         now = _dt.datetime.now(_dt.UTC)
         cutoff = now - older_than
@@ -2050,21 +2227,6 @@ class SQLAlchemyStateStore:
             if not abandoned_rows:
                 return swept
 
-            # Get max sequence_index per run for event ordering
-            from sqlalchemy import func as sa_func
-
-            run_ids = [r.id for r in abandoned_rows]
-            seq_stmt = (
-                select(
-                    RunEvent.agent_run_id,
-                    sa_func.max(RunEvent.sequence_index),
-                )
-                .where(RunEvent.agent_run_id.in_(run_ids))
-                .group_by(RunEvent.agent_run_id)
-            )
-            seq_result = await session.execute(seq_stmt)
-            max_seqs: dict[str, int] = {row[0]: row[1] for row in seq_result.all()}
-
             # Process each abandoned run
             for row in abandoned_rows:
                 previous_status = row.status
@@ -2086,18 +2248,10 @@ class SQLAlchemyStateStore:
                 if update_result.rowcount == 0:
                     continue  # Status changed between SELECT and UPDATE
 
-                # Emit run.abandoned event
-                next_seq = (max_seqs.get(row.id, -1)) + 1
-                max_seqs[row.id] = next_seq
-
-                event = RunEvent(
-                    id=generate_ulid(),
-                    agent_run_id=row.id,
-                    event_type="run.abandoned",
-                    sequence_index=next_seq,
-                    data={"failure_reason": "abandoned_waiting"},
+                # Emit run.abandoned with a sequence allocated under the row lock.
+                await _insert_event_locked(
+                    session, row.id, "run.abandoned", {"failure_reason": "abandoned_waiting"}
                 )
-                session.add(event)
 
                 # Per-run commit for isolation
                 await session.commit()
@@ -2570,6 +2724,68 @@ class SQLAlchemyStateStore:
         for key, value in metadata_filter.items():
             stmt = stmt.where(func.json_extract(AgentRun.meta, f"$.{key}") == value)
         return stmt
+
+
+async def read_run_control(store: Any, run_id: str) -> RunControl:
+    """Checkpoint read that also works on pre-0.3 custom stores.
+
+    A store without ``get_run_control`` gets the cancel flag from
+    ``is_cancel_requested``; it has no pause flag and no inbox.
+    """
+    getter = getattr(store, "get_run_control", None)
+    if getter is not None:
+        control: RunControl = await getter(run_id)
+        return control
+    return RunControl(cancel_requested=bool(await store.is_cancel_requested(run_id)))
+
+
+def require_store_method(store: Any, name: str) -> Any:
+    """Return ``store.<name>`` or raise a clear error for a pre-0.3 custom store."""
+    method = getattr(store, name, None)
+    if method is None:
+        raise NotImplementedError(
+            f"{type(store).__name__} does not implement StateStore.{name}(), which this "
+            "run-control API needs (added in Dendrux 0.3). Implement it on the custom "
+            "store or use SQLAlchemyStateStore."
+        )
+    return method
+
+
+async def _insert_event_locked(
+    session: AsyncSession,
+    run_id: str,
+    event_type: str,
+    data: dict[str, Any] | None,
+    *,
+    iteration_index: int = 0,
+) -> int:
+    """Append a run event with ``max(sequence_index) + 1``, inside the caller's transaction.
+
+    Called only after the caller's CAS UPDATE on the run row succeeded, so
+    the row lock serializes every transition writer allocating here.
+    """
+    from sqlalchemy import func, select
+
+    from dendrux.db.models import RunEvent
+
+    current = (
+        await session.execute(
+            select(func.max(RunEvent.sequence_index)).where(RunEvent.agent_run_id == run_id)
+        )
+    ).scalar_one_or_none()
+    seq = 0 if current is None else int(current) + 1
+    session.add(
+        RunEvent(
+            id=generate_ulid(),
+            agent_run_id=run_id,
+            event_type=event_type,
+            sequence_index=seq,
+            iteration_index=iteration_index,
+            data=data,
+        )
+    )
+    await session.flush()
+    return seq
 
 
 def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:

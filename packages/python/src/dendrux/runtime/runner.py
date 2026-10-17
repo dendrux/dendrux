@@ -320,6 +320,10 @@ class EventSequencer:
     def current(self) -> int:
         return self._seq
 
+    def advance_past(self, sequence_index: int) -> None:
+        """Skip past an index a store primitive allocated inside its own transaction."""
+        self._seq = max(self._seq, sequence_index + 1)
+
 
 async def _emit_event(
     state_store: StateStore | None,
@@ -402,8 +406,11 @@ async def _attach_undelivered_notes(
 
     Only set when there are any, so runs that never get notes are unchanged.
     """
+    get_notes = getattr(state_store, "get_notes", None)
+    if get_notes is None:  # pre-0.3 store: no inbox
+        return
     try:
-        notes = await state_store.get_notes(run_id, undelivered_only=True)
+        notes = await get_notes(run_id, undelivered_only=True)
     except Exception:
         logger.warning("Failed to read undelivered notes for run %s", run_id, exc_info=True)
         return
@@ -511,72 +518,60 @@ async def _persist_loop_outcome(
             replay=result.replay,
         )
 
-    if result.status == RunStatus.CANCELLED:
-        won = await state_store.finalize_run_if_status_in(
+    async def _persisted(status_if_missing: RunStatus) -> RunResult:
+        """The persisted winner after a lost CAS (never the loop's proposal)."""
+        record = await state_store.get_run(run_id)
+        status = RunStatus(record.status) if record is not None else status_if_missing
+        persisted = _wrap(status=status, won=False)
+        if record is not None:
+            persisted.answer = record.answer
+        if status not in _PAUSE_STATUSES:
+            persisted.meta.pop("pause_state", None)
+            await _attach_undelivered_notes(state_store, run_id, persisted)
+        return persisted
+
+    async def _finalize_cancelled(allowed: list[str], payload: dict[str, Any]) -> RunResult:
+        won = await _transition_with_event(
+            state_store,
             run_id,
+            sequencer,
             status=RunStatus.CANCELLED.value,
-            allowed_current_statuses=[s.value for s in _WAITING_STATUSES]
-            + [RunStatus.RUNNING.value],
+            allowed_current_statuses=allowed,
+            event_type="run.cancelled",
+            event_data=payload,
             answer=user_answer,
             iteration_count=result.iteration_count,
             total_usage=result.usage,
             pii_mapping=result.meta.get("pii_mapping"),
         )
-        if won:
-            payload: dict[str, Any] = {"reason": "cancel_requested"}
-            if result.meta.get("interrupted"):
-                payload["interrupted"] = True
-                payload["partial_output"] = bool(result.meta.get("partial_output"))
-            await _emit_event(state_store, run_id, "run.cancelled", sequencer, payload)
-        cancelled = _wrap(status=RunStatus.CANCELLED, won=won)
+        if not won:
+            return await _persisted(RunStatus.CANCELLED)
+        cancelled = _wrap(status=RunStatus.CANCELLED, won=True)
+        cancelled.meta.pop("pause_state", None)
         await _attach_undelivered_notes(state_store, run_id, cancelled)
         return cancelled
+
+    if result.status == RunStatus.CANCELLED:
+        payload: dict[str, Any] = {"reason": "cancel_requested"}
+        if result.meta.get("interrupted"):
+            payload["interrupted"] = True
+            payload["partial_output"] = bool(result.meta.get("partial_output"))
+        return await _finalize_cancelled(
+            [s.value for s in _WAITING_STATUSES] + [RunStatus.RUNNING.value], payload
+        )
 
     if result.status in _PAUSE_STATUSES:
         # Pre-pause checkpoint as one CAS: the pause persists only while the
         # row is RUNNING with no pending cancel. Cancellation wins over pause;
-        # any durable pause (incl. WAITING_*) satisfies a pause request.
+        # any durable pause (incl. WAITING_*) satisfies a pause request. The
+        # pause and its run.paused event commit together, so a finalizer of
+        # paused runs (cancel_run, sweep) always acts after the event.
         pause_state: PauseState = result.meta["pause_state"]
         if pause_state.pause_reason == "requested" and pause_state.pause_message is None:
             pause_state = replace(
                 pause_state, pause_message=await _pause_request_message(state_store, run_id)
             )
             result.meta["pause_state"] = pause_state
-        _run_pii = result.meta.get("pii_mapping")
-        paused = await state_store.try_pause_run(
-            run_id,
-            status=result.status.value,
-            pause_data=pause_state.to_dict(),
-            iteration_count=result.iteration_count,
-            pii_mapping=_run_pii,
-        )
-        if not paused:
-            # CAS lost: honor the winner. On a still-RUNNING row only a
-            # pending cancel makes the CAS miss, so finalize cancelled.
-            record = await state_store.get_run(run_id)
-            if record is not None and record.status != RunStatus.RUNNING.value:
-                return _wrap(status=RunStatus(record.status), won=False)
-            won = await state_store.finalize_run_if_status_in(
-                run_id,
-                status=RunStatus.CANCELLED.value,
-                allowed_current_statuses=[RunStatus.RUNNING.value],
-                iteration_count=result.iteration_count,
-                total_usage=result.usage,
-                pii_mapping=_run_pii,
-            )
-            if won:
-                await _emit_event(
-                    state_store,
-                    run_id,
-                    "run.cancelled",
-                    sequencer,
-                    {"reason": "cancel_requested"},
-                )
-            cancelled = _wrap(status=RunStatus.CANCELLED, won=won)
-            cancelled.meta.pop("pause_state", None)
-            await _attach_undelivered_notes(state_store, run_id, cancelled)
-            return cancelled
-
         paused_data: dict[str, Any] = {
             "status": result.status.value,
             "pending_tool_calls": [
@@ -593,10 +588,35 @@ async def _persist_loop_outcome(
             paused_data["reason"] = pause_state.pause_reason
         if pause_state.pause_message:
             paused_data["message"] = pause_state.pause_message[:500]
-        await _emit_event(state_store, run_id, "run.paused", sequencer, paused_data)
+        paused = await _pause_with_event(
+            state_store,
+            run_id,
+            sequencer,
+            status=result.status.value,
+            pause_data=pause_state.to_dict(),
+            event_data=paused_data,
+            iteration_count=result.iteration_count,
+            pii_mapping=result.meta.get("pii_mapping"),
+        )
+        if not paused:
+            # CAS lost: honor the winner. On a still-RUNNING row only a
+            # pending cancel makes the CAS miss, so finalize cancelled.
+            record = await state_store.get_run(run_id)
+            if record is not None and record.status != RunStatus.RUNNING.value:
+                return await _persisted(RunStatus(record.status))
+            return await _finalize_cancelled(
+                [RunStatus.RUNNING.value], {"reason": "cancel_requested"}
+            )
+        # Return the persisted state: a finalizer may already have acted on
+        # the durable pause (e.g. cancel_run right after it committed).
+        record = await state_store.get_run(run_id)
+        if record is not None and record.status != result.status.value:
+            return await _persisted(RunStatus(record.status))
         return _wrap(status=result.status, won=True)
 
-    # Terminal: success / max_iterations / error.
+    # Terminal: success / max_iterations / error. Cooperative cancellation:
+    # a cancel requested after the last checkpoint does not override a run
+    # that finished — its work and side effects happened.
     _run_pii = result.meta.get("pii_mapping")
     finalize_won = await state_store.finalize_run(
         run_id,
@@ -607,25 +627,110 @@ async def _persist_loop_outcome(
         expected_current_status="running",
         pii_mapping=_run_pii,
     )
-    if finalize_won:
-        if unmapped_placeholders:
-            await _emit_event(
-                state_store,
-                run_id,
-                "guardrail.unmapped_placeholder",
-                sequencer,
-                {"placeholders": unmapped_placeholders},
-            )
+    if not finalize_won:
+        return await _persisted(result.status)
+    if unmapped_placeholders:
         await _emit_event(
             state_store,
             run_id,
-            "run.completed",
+            "guardrail.unmapped_placeholder",
             sequencer,
-            {"status": result.status.value},
+            {"placeholders": unmapped_placeholders},
         )
-    finished = _wrap(status=result.status, won=finalize_won)
+    await _emit_event(
+        state_store,
+        run_id,
+        "run.completed",
+        sequencer,
+        {"status": result.status.value},
+    )
+    finished = _wrap(status=result.status, won=True)
     await _attach_undelivered_notes(state_store, run_id, finished)
     return finished
+
+
+async def _transition_with_event(
+    state_store: StateStore,
+    run_id: str,
+    sequencer: EventSequencer,
+    *,
+    status: str,
+    allowed_current_statuses: list[str],
+    event_type: str,
+    event_data: dict[str, Any],
+    **finalize_kwargs: Any,
+) -> bool:
+    """CAS-finalize and record the transition event atomically when the store can.
+
+    Pre-0.3 stores lack ``finalize_with_event``: fall back to the CAS
+    followed by a separate event write.
+    """
+    atomic = getattr(state_store, "finalize_with_event", None)
+    if atomic is not None:
+        seq = await atomic(
+            run_id,
+            status=status,
+            allowed_current_statuses=allowed_current_statuses,
+            event_type=event_type,
+            event_data=event_data,
+            **finalize_kwargs,
+        )
+        if seq is None:
+            return False
+        sequencer.advance_past(seq)
+        return True
+    won = await state_store.finalize_run_if_status_in(
+        run_id,
+        status=status,
+        allowed_current_statuses=allowed_current_statuses,
+        **finalize_kwargs,
+    )
+    if won:
+        await _emit_event(state_store, run_id, event_type, sequencer, event_data)
+    return bool(won)
+
+
+async def _pause_with_event(
+    state_store: StateStore,
+    run_id: str,
+    sequencer: EventSequencer,
+    *,
+    status: str,
+    pause_data: dict[str, Any],
+    event_data: dict[str, Any],
+    iteration_count: int | None,
+    pii_mapping: dict[str, str] | None,
+) -> bool:
+    """Persist a pause and its ``run.paused`` event; False when cancellation won.
+
+    Pre-0.3 stores lack ``pause_with_event``: fall back to the legacy
+    cancel read, unconditional ``pause_run`` and a separate event write.
+    """
+    atomic = getattr(state_store, "pause_with_event", None)
+    if atomic is not None:
+        seq = await atomic(
+            run_id,
+            status=status,
+            pause_data=pause_data,
+            event_data=event_data,
+            iteration_count=iteration_count,
+            pii_mapping=pii_mapping,
+        )
+        if seq is None:
+            return False
+        sequencer.advance_past(seq)
+        return True
+    if await state_store.is_cancel_requested(run_id):
+        return False
+    await state_store.pause_run(
+        run_id,
+        status=status,
+        pause_data=pause_data,
+        iteration_count=iteration_count,
+        pii_mapping=pii_mapping,
+    )
+    await _emit_event(state_store, run_id, "run.paused", sequencer, event_data)
+    return True
 
 
 _UNSET_DEPTH = _UnsetType()
@@ -2511,7 +2616,9 @@ async def _resume_pause_barrier(state_store: StateStore, run_id: str) -> RunStat
     Returns ``CANCELLED`` when cancellation was requested, else ``PAUSED``
     when a pause was requested, else None. Cancellation wins over pause.
     """
-    control = await state_store.get_run_control(run_id)
+    from dendrux.runtime.state import read_run_control
+
+    control = await read_run_control(state_store, run_id)
     if control.cancel_requested:
         return RunStatus.CANCELLED
     if control.pause_requested:

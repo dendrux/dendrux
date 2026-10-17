@@ -301,13 +301,13 @@ class TestRequestedPause:
         """A cancel that lands after the loop decided to pause, before the
         pause CAS: the CAS loses and the run ends CANCELLED, not PAUSED."""
         agent, _, _ = _pausing_agent(store)
-        original = store.try_pause_run
+        original = store.pause_with_event
 
-        async def cancel_first(run_id: str, **kwargs: Any) -> bool:
+        async def cancel_first(run_id: str, **kwargs: Any) -> Any:
             await store.request_cancel(run_id)
             return await original(run_id, **kwargs)
 
-        store.try_pause_run = cancel_first  # type: ignore[method-assign]
+        store.pause_with_event = cancel_first  # type: ignore[method-assign]
         result = await agent.run("go")
         assert result.status == RunStatus.CANCELLED
         events = await _event_types(store, result.run_id)

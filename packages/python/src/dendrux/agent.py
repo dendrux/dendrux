@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux._sentinel import _UnsetType
-from dendrux.runtime.state import UNSCOPED, TenantScope
+from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
@@ -1580,7 +1580,11 @@ class Agent:
           this flag at the top of the next iteration (and at the
           pre-pause checkpoint after the current iteration's loop body
           returns) and exits cleanly as ``CANCELLED``. Cancellation wins
-          over a pending pause request.
+          over a pending pause request. Cancellation is cooperative: a run
+          that finishes before observing the request (its last LLM call
+          returned a final answer) completes normally — its work and side
+          effects happened — and the request is cleared. A stale RUNNING
+          row swept with the request pending is finalized ``CANCELLED``.
         - **Batch** :meth:`run` **executing in this process on this Agent
           instance:** additionally cancels the task awaiting it, so an
           in-flight provider call or tool is interrupted. That ``run()``
@@ -1628,7 +1632,9 @@ class Agent:
 
         Returns:
             :class:`RunResult` reflecting the persisted state of ``run_id``
-            after the cancel attempt.
+            after the cancel attempt. When that state is terminal,
+            ``meta["undelivered_notes"]`` lists inbox notes the run never
+            delivered (only when there are any).
 
         Raises:
             PersistenceNotConfiguredError: Agent has no DB.
@@ -1649,7 +1655,8 @@ class Agent:
 
         outcomes: list[dict[str, str]] = []
         if cascade:
-            subtree = await store.get_subtree(run_id, tenant_id=tenant_id)
+            get_subtree = require_store_method(store, "get_subtree")
+            subtree = await get_subtree(run_id, tenant_id=tenant_id)
             if subtree is not None:
                 for rid in _cascade_order(subtree)[:-1]:
                     outcome = await self._cancel_one(store, rid)
@@ -1671,6 +1678,10 @@ class Agent:
             # meta.cancel_requested) rather than racing the loop's own finalize.
             self._task_manager.cancel(run_id)
             result = _record_to_run_result(record)
+        if result.status.value in _TERMINAL_STATUS_VALUES:
+            from dendrux.runtime.runner import _attach_undelivered_notes
+
+            await _attach_undelivered_notes(store, run_id, result)
         if cascade:
             result.meta["cascade"] = outcomes
         return result
@@ -1685,8 +1696,16 @@ class Agent:
         # flag at its next checkpoint and finalizes itself.
         if not await store.request_cancel(run_id):
             return "terminal"
-        cancel_won = await store.finalize_run_if_status_in(
+        # Paused-run cancel: we own the terminal event, written in the CAS's
+        # transaction (sequence allocated under the row lock) so it always
+        # sorts after the runner's run.paused. Running-run cancel: the runner
+        # emits run.cancelled at a checkpoint.
+        from dendrux.runtime.runner import EventSequencer, _transition_with_event
+
+        cancel_won = await _transition_with_event(
+            store,
             run_id,
+            EventSequencer(initial=await store.get_next_event_sequence(run_id)),
             status=RunStatus.CANCELLED.value,
             allowed_current_statuses=[
                 RunStatus.WAITING_CLIENT_TOOL.value,
@@ -1694,19 +1713,9 @@ class Agent:
                 RunStatus.WAITING_APPROVAL.value,
                 RunStatus.PAUSED.value,
             ],
+            event_type="run.cancelled",
+            event_data={"reason": "cancel_requested"},
         )
-        if cancel_won:
-            # Paused-run cancel: we own the terminal event. Running-run
-            # cancel: the runner emits run.cancelled at a checkpoint.
-            # Sequence the event AFTER existing run.started/run.paused so
-            # SSE clients reading by after_sequence_index don't miss it.
-            from dendrux.runtime.runner import EventSequencer, _emit_event
-
-            next_seq = await store.get_next_event_sequence(run_id)
-            sequencer = EventSequencer(initial=next_seq)
-            await _emit_event(
-                store, run_id, "run.cancelled", sequencer, {"reason": "cancel_requested"}
-            )
         if signal:
             self._task_manager.cancel(run_id)
         return "cancelled" if cancel_won else "cancel_requested"
@@ -1788,15 +1797,16 @@ class Agent:
         if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
 
+        store_request_pause = require_store_method(store, "request_pause")
         order = [run_id]
         if cascade:
-            subtree = await store.get_subtree(run_id, tenant_id=tenant_id)
+            subtree = await require_store_method(store, "get_subtree")(run_id, tenant_id=tenant_id)
             if subtree is not None:
                 order = _cascade_order(subtree)
 
         affected: list[tuple[str, Any]] = []
         for rid in order:
-            if await store.request_pause(rid, reason=reason):
+            if await store_request_pause(rid, reason=reason):
                 affected.append((rid, "requested"))
                 continue
             current = await store.get_run(rid)
@@ -1933,8 +1943,9 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        add_note = require_store_method(store, "add_note")
         note_id = generate_ulid()
-        if await store.add_note(
+        if await add_note(
             run_id, note_id=note_id, text=text, metadata=metadata, tenant_id=tenant_id
         ):
             return note_id
