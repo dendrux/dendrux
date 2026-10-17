@@ -30,6 +30,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
     from dendrux.db.models import AgentRun
 
 logger = logging.getLogger(__name__)
+
+_COST_DECIMALS = 6  # llm_interactions.cost_usd is Numeric(10, 6)
+_IN_CHUNK = 500  # keep IN (...) lists well under SQLite's variable limit
 
 
 @overload
@@ -222,6 +226,62 @@ class RunEventRecord:
 
 
 @dataclass(frozen=True)
+class UsageRollup:
+    """Token and cost totals summed live from ``llm_interactions``.
+
+    Root inclusive when produced by ``subtree_usage``. ``known_cost_usd`` is
+    the sum of non-null call costs. ``cost_usd`` equals it only when
+    ``unpriced_calls == 0``, else ``None``, so a partial sum never reads as
+    the whole spend. Cache/reasoning columns that
+    are NULL (provider did not report) count as zero.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    known_cost_usd: float = 0.0
+    unpriced_calls: int = 0
+    llm_calls: int = 0
+
+    @property
+    def cost_usd(self) -> float | None:
+        return None if self.unpriced_calls else self.known_cost_usd
+
+    @classmethod
+    def combine(cls, rollups: Iterable[UsageRollup]) -> UsageRollup:
+        items = list(rollups)
+        return cls(
+            input_tokens=sum(r.input_tokens for r in items),
+            output_tokens=sum(r.output_tokens for r in items),
+            cache_read_tokens=sum(r.cache_read_tokens for r in items),
+            cache_write_tokens=sum(r.cache_write_tokens for r in items),
+            reasoning_tokens=sum(r.reasoning_tokens for r in items),
+            known_cost_usd=round(sum(r.known_cost_usd for r in items), _COST_DECIMALS),
+            unpriced_calls=sum(r.unpriced_calls for r in items),
+            llm_calls=sum(r.llm_calls for r in items),
+        )
+
+
+@dataclass(frozen=True)
+class SubtreeNodeRecord:
+    """One run in a subtree with its depth below the root and its own live usage."""
+
+    run: RunRecord
+    depth: int
+    usage: UsageRollup
+
+
+@dataclass(frozen=True)
+class SubtreeRecord:
+    """A root run, its descendants (BFS order, root first) and rolled-up usage."""
+
+    nodes: list[SubtreeNodeRecord]
+    usage: UsageRollup
+
+
+@dataclass(frozen=True)
 class SweptRun:
     """A run that was swept by the stale-run maintenance API."""
 
@@ -350,6 +410,7 @@ class StateStore(Protocol):
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[LLMInteractionRecord]: ...
 
     async def finalize_run(
@@ -483,6 +544,7 @@ class StateStore(Protocol):
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[ToolCallReadRecord]: ...
 
     async def save_run_event(
@@ -503,6 +565,7 @@ class StateStore(Protocol):
         after_sequence_index: int | None = None,
         limit: int | None = None,
         event_types: list[str] | None = None,
+        before: datetime | None = None,
     ) -> list[RunEventRecord]: ...
 
     async def list_runs(
@@ -566,6 +629,26 @@ class StateStore(Protocol):
         Returns parent ref, direct children, ancestry chain, and subtree
         summary with rolled-up metrics. Returns None if the run doesn't exist.
         """
+        ...
+
+    async def get_subtree(
+        self, run_id: str, *, tenant_id: str | None = None
+    ) -> SubtreeRecord | None:
+        """Root run plus all descendants with per-node and rolled-up live usage.
+
+        Usage is summed from ``llm_interactions`` so running and paused runs
+        count. With ``tenant_id``, nodes of other tenants (and everything
+        below them) are excluded; a root of another tenant reads as missing.
+        Returns None if the run doesn't exist.
+        """
+        ...
+
+    async def subtree_usage(self, run_id: str) -> UsageRollup:
+        """Live usage rolled up over a run and all its descendants."""
+        ...
+
+    async def run_usage(self, run_id: str) -> UsageRollup:
+        """Live usage of one run only (no descendants)."""
         ...
 
 
@@ -870,8 +953,11 @@ class SQLAlchemyStateStore:
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[LLMInteractionRecord]:
         from sqlalchemy import select
+
+        _require_aware_utc("before", before)
 
         from dendrux.db.models import LLMInteraction
 
@@ -883,6 +969,8 @@ class SQLAlchemyStateStore:
             )
             if iteration_index is not None:
                 stmt = stmt.where(LLMInteraction.iteration_index == iteration_index)
+            if before is not None:
+                stmt = stmt.where(LLMInteraction.created_at < _to_aware_utc(before))
             if limit is not None:
                 stmt = stmt.limit(max(1, min(limit, 1000)))
             if offset:
@@ -1343,8 +1431,11 @@ class SQLAlchemyStateStore:
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[ToolCallReadRecord]:
         from sqlalchemy import select
+
+        _require_aware_utc("before", before)
 
         from dendrux.db.models import ToolCallRecord
 
@@ -1356,6 +1447,8 @@ class SQLAlchemyStateStore:
             )
             if iteration_index is not None:
                 stmt = stmt.where(ToolCallRecord.iteration_index == iteration_index)
+            if before is not None:
+                stmt = stmt.where(ToolCallRecord.created_at < _to_aware_utc(before))
             if limit is not None:
                 stmt = stmt.limit(max(1, min(limit, 1000)))
             if offset:
@@ -1412,10 +1505,13 @@ class SQLAlchemyStateStore:
         after_sequence_index: int | None = None,
         limit: int | None = None,
         event_types: list[str] | None = None,
+        before: datetime | None = None,
     ) -> list[RunEventRecord]:
         from sqlalchemy import false, select
 
         from dendrux.db.models import RunEvent
+
+        _require_aware_utc("before", before)
 
         async with self._session_factory() as session:
             stmt = (
@@ -1426,6 +1522,9 @@ class SQLAlchemyStateStore:
 
             if after_sequence_index is not None:
                 stmt = stmt.where(RunEvent.sequence_index > after_sequence_index)
+
+            if before is not None:
+                stmt = stmt.where(RunEvent.created_at < _to_aware_utc(before))
 
             if event_types is not None:
                 if not event_types:
@@ -1779,6 +1878,58 @@ class SQLAlchemyStateStore:
         ancestry.reverse()
         return ancestry, complete
 
+    async def _bfs_descendants(
+        self,
+        session: AsyncSession,
+        root_id: str,
+        *,
+        tenant_id: str | None = None,
+        light: bool = False,
+    ) -> list[tuple[AgentRun, int]]:
+        """Descendants of ``root_id`` as ``(row, depth)`` in BFS order, root excluded.
+
+        ``depth`` is 1 for direct children. Cycle-safe via a seen set. With
+        ``tenant_id`` set, other tenants' runs are skipped and so is
+        everything below them. ``light`` loads only id / parent / tenant so
+        usage-only callers don't pull large JSON columns.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm import load_only
+
+        from dendrux.db.models import AgentRun
+
+        seen: set[str] = {root_id}
+        current_level = [root_id]
+        found: list[tuple[AgentRun, int]] = []
+        depth = 0
+
+        while current_level:
+            depth += 1
+            rows: list[AgentRun] = []
+            for i in range(0, len(current_level), _IN_CHUNK):
+                stmt = select(AgentRun).where(
+                    AgentRun.parent_run_id.in_(current_level[i : i + _IN_CHUNK])
+                )
+                if light:
+                    stmt = stmt.options(
+                        load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id)
+                    )
+                if tenant_id is not None:
+                    stmt = stmt.where(AgentRun.tenant_id == tenant_id)
+                result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
+                rows.extend(result.scalars().all())
+
+            next_level: list[str] = []
+            for cr in rows:
+                if cr.id in seen:
+                    continue
+                seen.add(cr.id)
+                next_level.append(cr.id)
+                found.append((cr, depth))
+            current_level = next_level
+
+        return found
+
     async def _traverse_subtree_bfs(
         self,
         session: AsyncSession,
@@ -1788,76 +1939,41 @@ class SQLAlchemyStateStore:
 
         Summary includes the root run itself in token/cost/status counts.
         """
-        from sqlalchemy import select
+        descendants = await self._bfs_descendants(session, run_row.id)
 
-        from dendrux.db.models import AgentRun
-
-        run_id = run_row.id
-        seen: set[str] = {run_id}
-        current_level = [run_id]
-        children: list[RunBrief] = []
-        max_depth = 0
-        depth = 0
-
-        # Seed metrics with the root run
         sum_input = run_row.total_input_tokens or 0
         sum_output = run_row.total_output_tokens or 0
-        sum_cost = 0.0
-        has_cost = run_row.total_cost_usd is not None
+        root_cost = run_row.total_cost_usd
+        has_cost = root_cost is not None
+        sum_cost = float(root_cost) if root_cost is not None else 0.0
         unknown_cost_count = 0 if has_cost else 1
-        if run_row.total_cost_usd is not None:
-            sum_cost = float(run_row.total_cost_usd)
-        descendant_count = 0
-        status_counts: dict[str, int] = {}
-        root_status = _extract_status(run_row)
-        status_counts[root_status] = 1
-        is_first_level = True
+        status_counts: dict[str, int] = {_extract_status(run_row): 1}
+        children: list[RunBrief] = []
 
-        while current_level:
-            stmt = (
-                select(AgentRun)
-                .where(AgentRun.parent_run_id.in_(current_level))
-                .order_by(AgentRun.created_at)
-            )
-            result = await session.execute(stmt)
-            rows = result.scalars().all()
-
-            next_level: list[str] = []
-            for cr in rows:
-                if cr.id in seen:
-                    continue
-                seen.add(cr.id)
-                next_level.append(cr.id)
-                descendant_count += 1
-                sum_input += cr.total_input_tokens or 0
-                sum_output += cr.total_output_tokens or 0
-                if cr.total_cost_usd is not None:
-                    sum_cost += float(cr.total_cost_usd)
-                    has_cost = True
-                else:
-                    unknown_cost_count += 1
-                s = _extract_status(cr)
-                status_counts[s] = status_counts.get(s, 0) + 1
-                if is_first_level:
-                    children.append(
-                        RunBrief(
-                            run_id=cr.id,
-                            agent_name=cr.agent_name,
-                            status=s,
-                            delegation_level=cr.delegation_level,
-                        )
+        for cr, depth in descendants:
+            sum_input += cr.total_input_tokens or 0
+            sum_output += cr.total_output_tokens or 0
+            if cr.total_cost_usd is not None:
+                sum_cost += float(cr.total_cost_usd)
+                has_cost = True
+            else:
+                unknown_cost_count += 1
+            s = _extract_status(cr)
+            status_counts[s] = status_counts.get(s, 0) + 1
+            if depth == 1:
+                children.append(
+                    RunBrief(
+                        run_id=cr.id,
+                        agent_name=cr.agent_name,
+                        status=s,
+                        delegation_level=cr.delegation_level,
                     )
-
-            is_first_level = False
-            if next_level:
-                depth += 1
-                max_depth = depth
-            current_level = next_level
+                )
 
         summary = SubtreeSummary(
             direct_child_count=len(children),
-            descendant_count=descendant_count,
-            max_depth=max_depth,
+            descendant_count=len(descendants),
+            max_depth=max((d for _, d in descendants), default=0),
             subtree_input_tokens=sum_input,
             subtree_output_tokens=sum_output,
             subtree_cost_usd=sum_cost if has_cost else None,
@@ -1865,6 +1981,82 @@ class SQLAlchemyStateStore:
             status_counts=status_counts,
         )
         return children, summary
+
+    async def _usage_by_run(
+        self, session: AsyncSession, run_ids: list[str]
+    ) -> dict[str, UsageRollup]:
+        """Per-run live usage, one grouped query per chunk of ids.
+
+        Runs without any ``llm_interactions`` row are absent from the result.
+        """
+        from sqlalchemy import case, func, select
+
+        from dendrux.db.models import LLMInteraction as L
+
+        out: dict[str, UsageRollup] = {}
+        for i in range(0, len(run_ids), _IN_CHUNK):
+            stmt = (
+                select(
+                    L.agent_run_id,
+                    func.coalesce(func.sum(L.input_tokens), 0),
+                    func.coalesce(func.sum(L.output_tokens), 0),
+                    func.coalesce(func.sum(L.cache_read_input_tokens), 0),
+                    func.coalesce(func.sum(L.cache_creation_input_tokens), 0),
+                    func.coalesce(func.sum(L.reasoning_tokens), 0),
+                    func.coalesce(func.sum(L.cost_usd), 0),
+                    func.coalesce(func.sum(case((L.cost_usd.is_(None), 1), else_=0)), 0),
+                    func.count(),
+                )
+                .where(L.agent_run_id.in_(run_ids[i : i + _IN_CHUNK]))
+                .group_by(L.agent_run_id)
+            )
+            for row in (await session.execute(stmt)).all():
+                out[row[0]] = UsageRollup(
+                    input_tokens=int(row[1]),
+                    output_tokens=int(row[2]),
+                    cache_read_tokens=int(row[3]),
+                    cache_write_tokens=int(row[4]),
+                    reasoning_tokens=int(row[5]),
+                    known_cost_usd=round(float(row[6]), _COST_DECIMALS),
+                    unpriced_calls=int(row[7]),
+                    llm_calls=int(row[8]),
+                )
+        return out
+
+    async def get_subtree(
+        self, run_id: str, *, tenant_id: str | None = None
+    ) -> SubtreeRecord | None:
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            stmt = select(AgentRun).where(AgentRun.id == run_id)
+            if tenant_id is not None:
+                stmt = stmt.where(AgentRun.tenant_id == tenant_id)
+            root = (await session.execute(stmt)).scalar_one_or_none()
+            if root is None:
+                return None
+
+            rows = [(root, 0), *await self._bfs_descendants(session, root.id, tenant_id=tenant_id)]
+            usage = await self._usage_by_run(session, [r.id for r, _ in rows])
+            nodes = [
+                SubtreeNodeRecord(
+                    run=_run_to_record(r), depth=d, usage=usage.get(r.id, UsageRollup())
+                )
+                for r, d in rows
+            ]
+            return SubtreeRecord(nodes=nodes, usage=UsageRollup.combine(n.usage for n in nodes))
+
+    async def subtree_usage(self, run_id: str) -> UsageRollup:
+        async with self._session_factory() as session:
+            descendants = await self._bfs_descendants(session, run_id, light=True)
+            usage = await self._usage_by_run(session, [run_id, *(r.id for r, _ in descendants)])
+            return UsageRollup.combine(usage.values())
+
+    async def run_usage(self, run_id: str) -> UsageRollup:
+        async with self._session_factory() as session:
+            return (await self._usage_by_run(session, [run_id])).get(run_id, UsageRollup())
 
     _MAX_LIST_LIMIT = 1000
 

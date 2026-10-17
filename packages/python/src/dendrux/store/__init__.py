@@ -86,6 +86,55 @@ class RunSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class RunUsage:
+    """Token and cost totals summed live from ``llm_interactions``.
+
+    Live means running and paused runs are counted, unlike the finalized
+    ``total_*`` fields on :class:`RunSummary`. ``cost_usd`` is ``None`` when
+    any call was unpriced (``unpriced_calls > 0``); ``known_cost_usd`` is
+    the sum over the priced calls only. Cache and reasoning counts treat
+    providers that did not report them as zero.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    reasoning_tokens: int
+    cost_usd: float | None
+    known_cost_usd: float
+    unpriced_calls: int
+    llm_calls: int
+
+
+@dataclass(frozen=True, slots=True)
+class SubtreeNode:
+    """One run in a subtree: its summary, depth below the root, and own live usage."""
+
+    run: RunSummary
+    depth: int
+    usage: RunUsage
+
+
+@dataclass(frozen=True, slots=True)
+class RunSubtree:
+    """A run, all its descendants, and live usage rolled up across them.
+
+    ``nodes`` is in breadth-first order with the root first (``depth`` 0).
+    ``usage`` is the sum over every node, so it matches the sum of the
+    per-node ``usage`` values.
+    """
+
+    root_run_id: str
+    nodes: list[SubtreeNode]
+    usage: RunUsage
+
+    @property
+    def root(self) -> SubtreeNode:
+        return self.nodes[0]
+
+
+@dataclass(frozen=True, slots=True)
 class RunDetail:
     """A single run's full detail — summary fields plus answer and error."""
 
@@ -329,18 +378,57 @@ class RunStore:
         *,
         after_sequence_index: int | None = None,
         limit: int | None = None,
+        event_types: list[str] | None = None,
+        before: datetime | None = None,
     ) -> list[StoredEvent]:
         """Read events for a run in ``sequence_index`` order.
 
         ``after_sequence_index`` is an exclusive cursor. Pass the previous
-        batch's last ``sequence_index`` to continue.
+        batch's last ``sequence_index`` to continue. ``event_types`` keeps
+        only those types (an empty list matches nothing). ``before`` is an
+        exclusive, timezone-aware upper bound on ``created_at``.
         """
         rows = await self._state.get_run_events(
             run_id,
             after_sequence_index=after_sequence_index,
             limit=limit,
+            event_types=event_types,
+            before=before,
         )
         return [_event_to_stored(r) for r in rows]
+
+    async def get_subtree(self, run_id: str, *, tenant_id: str | None = None) -> RunSubtree:
+        """Return a run, all its descendants, and live rolled-up usage.
+
+        ``RunSubtree.usage`` is the authoritative usage: it is summed from
+        ``llm_interactions`` at read time (root inclusive), so running and
+        paused runs and not-yet-finalized children are counted. The
+        ``total_*`` fields on each node's :class:`RunSummary` are the
+        persisted snapshots on ``agent_runs`` and may lag or read 0 for
+        unfinished runs. The reads are best-effort and not one snapshot
+        transaction: a run that is still writing can make nodes and usage
+        differ by a call or a child.
+
+        Tenancy: with ``tenant_id`` the root must belong to that tenant
+        (otherwise it reads as missing) and every descendant must too; other
+        tenants' runs are excluded together with everything below them.
+        Omitted (``None``) means unscoped: all descendants are returned.
+
+        Raises :class:`RunNotFoundError` if the run does not exist.
+        """
+        record = await self._state.get_subtree(run_id, tenant_id=tenant_id)
+        if record is None:
+            raise RunNotFoundError(f"Run '{run_id}' does not exist.")
+        return RunSubtree(
+            root_run_id=run_id,
+            nodes=[
+                SubtreeNode(
+                    run=_run_to_summary(n.run), depth=n.depth, usage=_usage_to_public(n.usage)
+                )
+                for n in record.nodes
+            ],
+            usage=_usage_to_public(record.usage),
+        )
 
     async def stream_events(
         self,
@@ -385,14 +473,17 @@ class RunStore:
         iteration: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[LLMCall]:
         """Return LLM interactions for a run. ``limit``/``offset`` push
-        pagination into SQL."""
+        pagination into SQL. ``before`` is an exclusive, timezone-aware
+        upper bound on ``created_at``."""
         rows = await self._state.get_llm_interactions(
             run_id,
             iteration_index=iteration,
             limit=limit,
             offset=offset,
+            before=before,
         )
         return [_llm_to_public(r) for r in rows]
 
@@ -403,14 +494,17 @@ class RunStore:
         iteration: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[ToolInvocation]:
         """Return tool invocations for a run. ``limit``/``offset`` push
-        pagination into SQL."""
+        pagination into SQL. ``before`` is an exclusive, timezone-aware
+        upper bound on ``created_at``."""
         rows = await self._state.get_tool_calls(
             run_id,
             iteration_index=iteration,
             limit=limit,
             offset=offset,
+            before=before,
         )
         return [_tool_to_public(r) for r in rows]
 
@@ -480,6 +574,20 @@ def _run_to_summary(record: Any) -> RunSummary:
         delegation_level=record.delegation_level,
         total_reasoning_tokens=record.total_reasoning_tokens,
         replay=_replay_of(record),
+    )
+
+
+def _usage_to_public(rollup: Any) -> RunUsage:
+    return RunUsage(
+        input_tokens=rollup.input_tokens,
+        output_tokens=rollup.output_tokens,
+        cache_read_tokens=rollup.cache_read_tokens,
+        cache_write_tokens=rollup.cache_write_tokens,
+        reasoning_tokens=rollup.reasoning_tokens,
+        cost_usd=rollup.cost_usd,
+        known_cost_usd=rollup.known_cost_usd,
+        unpriced_calls=rollup.unpriced_calls,
+        llm_calls=rollup.llm_calls,
     )
 
 
@@ -621,8 +729,11 @@ __all__ = [
     "RunDetail",
     "RunNotFoundError",
     "RunStore",
+    "RunSubtree",
     "RunSummary",
+    "RunUsage",
     "StoredEvent",
+    "SubtreeNode",
     "ToolInvocation",
     "TraceEntry",
 ]
