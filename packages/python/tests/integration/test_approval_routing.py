@@ -581,3 +581,54 @@ class TestRejectionViaResumeStream:
                 expected_status=RunStatus.WAITING_CLIENT_TOOL.value,
                 decisions=[],
             )
+
+
+class TestStalePauseGeneration:
+    async def test_decisions_for_replaced_pause_fail_before_claim(self, store) -> None:
+        """ABA: the pause is replaced between validation and claim (review P1)."""
+        import copy
+
+        llm = MockLLM(
+            [
+                LLMResponse(tool_calls=[ToolCall(name="refund", params={"order_id": 1})]),
+                LLMResponse(text="done"),
+            ]
+        )
+        agent = _agent(llm, store)
+        paused = await agent.run("go")
+        old_pause = await store.get_pause_state(paused.run_id)
+        old_id = old_pause["pending_tool_calls"][0]["id"]
+        new_id = "new-pause-call"
+        new_pause = copy.deepcopy(old_pause)
+        new_pause["pending_tool_calls"][0]["id"] = new_id
+        new_pause["pending_targets"] = {new_id: "server"}
+        new_pause["approval_gates"] = {new_id: {"source": "static", "reason": "requires_approval"}}
+
+        original = store.submit_and_claim
+
+        async def replace_pause_then_claim(run_id, **kwargs):
+            await store.pause_run(
+                run_id, status=RunStatus.WAITING_APPROVAL.value, pause_data=new_pause
+            )
+            return await original(run_id, **kwargs)
+
+        store.submit_and_claim = replace_pause_then_claim
+        try:
+            with pytest.raises(ValueError, match="new-pause-call"):
+                await agent.submit_approval(
+                    paused.run_id, decisions={old_id: ApprovalDecision.approve()}
+                )
+        finally:
+            store.submit_and_claim = original
+
+        record = await store.get_run(paused.run_id)
+        assert record.status == RunStatus.WAITING_APPROVAL.value
+        assert await store.get_pause_state(paused.run_id) == new_pause
+        assert SERVER_SIDE_EFFECTS == []
+
+        # The newer pause is still healthy and accepts its own decisions.
+        result = await agent.submit_approval(
+            paused.run_id, decisions={new_id: ApprovalDecision.approve()}
+        )
+        assert result.status == RunStatus.SUCCESS
+        assert SERVER_SIDE_EFFECTS == ["refund:1"]

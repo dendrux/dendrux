@@ -1456,6 +1456,15 @@ class Agent:
                 decision_map = validate_approval_decisions(
                     run_id, pause_state, pairs, target_lookup
                 )
+
+                def same_pause_generation(current: dict[str, Any]) -> None:
+                    # Re-validate against the exact pause being claimed: a
+                    # newer approval pause (ABA) must reject stale decisions
+                    # and stay WAITING_APPROVAL.
+                    validate_approval_decisions(
+                        run_id, PauseState.from_dict(current), pairs, target_lookup
+                    )
+
                 await claim_or_raise(
                     store,
                     run_id,
@@ -1463,6 +1472,7 @@ class Agent:
                     submitted_data={
                         "submitted_decisions": serialize_decisions(pause_state, decision_map)
                     },
+                    validate=same_pause_generation,
                 )
                 task = self._task_manager.spawn(
                     run_id,

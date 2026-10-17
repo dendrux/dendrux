@@ -30,6 +30,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -443,6 +444,7 @@ class StateStore(Protocol):
         *,
         expected_status: str,
         submitted_data: dict[str, Any],
+        validate: Callable[[dict[str, Any]], None] | None = None,
     ) -> bool:
         """Atomically save submitted data to pause_data and claim the run.
 
@@ -460,6 +462,11 @@ class StateStore(Protocol):
             expected_status: Guard value (e.g. "waiting_client_tool").
             submitted_data: Keys to merge into pause_data
                 (e.g. ``{"submitted_tool_results": [...]}``)
+            validate: Optional check run on the pause_data being claimed,
+                inside the claiming transaction. If it raises, nothing is
+                written (the run stays in *expected_status*) and the
+                exception propagates. Binds a submission to the exact pause
+                generation it was validated against.
 
         Returns:
             True if saved + claimed, False if another caller already won.
@@ -1234,20 +1241,19 @@ class SQLAlchemyStateStore:
         *,
         expected_status: str,
         submitted_data: dict[str, Any],
+        validate: Callable[[dict[str, Any]], None] | None = None,
     ) -> bool:
         """Atomically save submitted data and claim the run.
 
-        Implementation:
-          1. Read pause_data + status in a session.
-          2. Merge submitted_data into pause_data (Python-side).
-          3. Conditional UPDATE: set merged blob + status='running'
-             WHERE status still equals *expected_status*.
-
-        The CAS on the status column is the concurrency boundary.
-        On SQLite, writes are serialized (single-writer lock) so the
-        second writer's UPDATE sees the first writer's committed status
-        change and matches 0 rows.  On Postgres, the UPDATE takes a
-        row-level lock achieving the same effect.
+        Implementation (one transaction):
+          1. Conditional UPDATE status -> 'running' WHERE status still equals
+             *expected_status*. Losing this CAS returns False. Winning it
+             takes the row's write lock (Postgres row lock / SQLite write
+             lock), so the pause_data read next cannot change underneath.
+          2. Read pause_data and run *validate* on it. A failure rolls the
+             whole transaction back (status stays *expected_status*) and
+             re-raises.
+          3. Merge submitted_data into pause_data and commit.
         """
         from sqlalchemy import select, update
 
@@ -1255,36 +1261,39 @@ class SQLAlchemyStateStore:
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
-                # 1. Read current pause_data
-                stmt = select(AgentRun.pause_data, AgentRun.status).where(AgentRun.id == run_id)
-                result = await session.execute(stmt)
-                row = result.one_or_none()
-                if row is None:
-                    return False
-
-                current_pause_data, current_status = row
-                if current_status != expected_status:
-                    return False
-                if current_pause_data is None:
-                    return False
-
-                # 2. Merge submitted_data into pause_data
-                merged = dict(current_pause_data)
-                merged.update(submitted_data)
-
-                # 3. Conditional UPDATE — CAS on status column. updated_at is
-                # filled by the model's onupdate hook (Python aware-UTC).
-                update_stmt = (
+                # 1. Claim first — the CAS on status is the concurrency
+                # boundary. updated_at is filled by the model's onupdate hook.
+                claim = await session.execute(
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                    .values(
-                        pause_data=merged,
-                        status="running",
-                    )
+                    .values(status="running")
                 )
-                update_result = await session.execute(update_stmt)
+                if not claim.rowcount:
+                    await session.rollback()
+                    return False
+
+                # 2. Read the pause being claimed, under the claim's lock.
+                current_pause_data = (
+                    await session.execute(select(AgentRun.pause_data).where(AgentRun.id == run_id))
+                ).scalar_one_or_none()
+                if current_pause_data is None:
+                    await session.rollback()
+                    return False
+                if validate is not None:
+                    try:
+                        validate(current_pause_data)
+                    except BaseException:
+                        await session.rollback()
+                        raise
+
+                # 3. Merge submitted_data into pause_data.
+                merged = dict(current_pause_data)
+                merged.update(submitted_data)
+                await session.execute(
+                    update(AgentRun).where(AgentRun.id == run_id).values(pause_data=merged)
+                )
                 await session.commit()
-                return bool(update_result.rowcount and update_result.rowcount > 0)
+                return True
 
         return await retry_transient_db(_attempt, label="submit_and_claim", run_id=run_id)
 

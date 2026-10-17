@@ -27,7 +27,7 @@ from dendrux.errors import (
 from dendrux.types import ApprovalDecision, PauseState, RunStatus, ToolCall, ToolResult, ToolTarget
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from dendrux.runtime.state import StateStore
 
@@ -138,6 +138,7 @@ async def claim_or_raise(
     *,
     expected_status: RunStatus,
     submitted_data: dict[str, Any] | None = None,
+    validate: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Perform a status preflight, then persist-first handoff + CAS claim.
 
@@ -149,7 +150,9 @@ async def claim_or_raise(
 
     If ``submitted_data`` is provided, merges it into ``pause_data`` and
     transitions from ``expected_status`` to RUNNING atomically. Otherwise
-    just claims (used for approval-approve).
+    just claims (used for approval-approve). ``validate`` (with
+    ``submitted_data``) runs on the pause_data being claimed inside the
+    claim transaction; if it raises, nothing is claimed and it propagates.
 
     Raises:
         RunNotFoundError: ``run_id`` does not exist.
@@ -164,10 +167,12 @@ async def claim_or_raise(
 
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
     if submitted_data is not None:
+        claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
         won = await store.submit_and_claim(
             run_id,
             expected_status=expected_status.value,
             submitted_data=submitted_data,
+            **claim_kwargs,
         )
     else:
         won = await store.claim_paused_run(run_id, expected_status=expected_status.value)
