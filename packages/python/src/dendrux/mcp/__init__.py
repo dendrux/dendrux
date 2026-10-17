@@ -67,6 +67,7 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPStaleConnectionError,
     MCPToolCallError,
     MCPToolNameCollisionError,
+    MCPToolNotFoundError,
     error_code_for,
 )
 from dendrux.mcp._host import MCPHost  # noqa: E402
@@ -215,6 +216,7 @@ __all__ = [
     "MCPToolCallStarted",
     "MCPToolInfo",
     "MCPToolNameCollisionError",
+    "MCPToolNotFoundError",
     "MCPToolPolicy",
     "MCPToolView",
     "check_oauth_store",

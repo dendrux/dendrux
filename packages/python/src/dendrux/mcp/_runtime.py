@@ -42,6 +42,7 @@ from dendrux.mcp._errors import (
     MCPRuntimeClosedError,
     MCPStaleConnectionError,
     MCPToolCallError,
+    MCPToolNotFoundError,
 )
 from dendrux.mcp._oauth import MCPOAuth, MCPOAuthRevocation, _OAuthCredentialProvider
 from dendrux.mcp._oauth_http import URLRejectedError, canonical_url
@@ -488,6 +489,67 @@ class MCPConnection:
         finally:
             runtime._release(self.identity, entry)
 
+    async def call_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """Call one server tool directly, outside any Agent run.
+
+        ``name`` is the server's own tool name, never a prefixed or renamed
+        Agent-facing one. The call takes exactly the path an Agent-run call
+        takes — lease and release, the runtime-wide in-flight cap,
+        stale-definition check, one recoverable 401 re-authentication,
+        telemetry, result normalization, credential redaction and the same
+        error mapping — and returns the payload an Agent tool would receive.
+
+        An unlisted ``name`` raises :class:`MCPToolNotFoundError` before
+        anything is sent. A result the server flags as an error raises
+        :class:`MCPToolCallError`. ``timeout`` (seconds) replaces the source's
+        ``call_timeout`` for this call only.
+
+        This is outside a run, so no Agent governance applies: approvals,
+        guardrails, hooks, budgets and the run store do not see the call. The
+        application owns authorization, retries and audit. Await it on the
+        event loop that runtime is bound to, like :meth:`discover`.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("MCP tool name must be a non-empty string.")
+        params = dict(arguments) if arguments is not None else {}
+        if not all(isinstance(key, str) for key in params):
+            raise ValueError("MCP tool argument names must be strings.")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("MCP call timeout must be a positive finite number of seconds.")
+        runtime = self.runtime
+        entry = await runtime._lease(self)
+        try:
+            original_tool = next((tool for tool in entry.raw_tools if tool.name == name), None)
+            if original_tool is None:
+                raise MCPToolNotFoundError(name)
+            return await runtime._execute_call(
+                self,
+                entry,
+                mcp_tool_name=name,
+                original_tool=original_tool,
+                qualified_name=name,
+                namespace=self.source.name,
+                owner=object(),
+                # The lease is held for the whole call and released below, so
+                # there is no view that could close underneath it.
+                check_lease=lambda: None,
+                params=params,
+                timeout=None if timeout is None else float(timeout),
+            )
+        finally:
+            runtime._release(self.identity, entry)
+
     def __repr__(self) -> str:
         return (
             "MCPConnection("
@@ -614,77 +676,6 @@ class _ViewToolSource(MCPServer):
         qualified_name = exposed_name or exposed_tool_name(
             mcp_tool_name, namespace=self.name, prefix=policy.prefix, rename=policy.rename
         )
-        tenant_key, connection_key = connection.identity
-        # Physical telemetry is pinned to the source that opened the entry.
-        # A live rebind may change only the presentation name used as the next
-        # view's default namespace; it must not rename an existing socket.
-        source_name = entry.source.name
-
-        def _started_event(instance_id: int) -> MCPToolCallStarted:
-            return MCPToolCallStarted(
-                tenant_key=tenant_key,
-                connection_key=connection_key,
-                source_name=source_name,
-                instance_id=instance_id,
-                tool=qualified_name,
-            )
-
-        def _completed_event(duration: float, instance_id: int) -> MCPToolCallCompleted:
-            return MCPToolCallCompleted(
-                tenant_key=tenant_key,
-                connection_key=connection_key,
-                source_name=source_name,
-                instance_id=instance_id,
-                tool=qualified_name,
-                duration=duration,
-            )
-
-        def _failed_event(duration: float, cause: str, instance_id: int) -> MCPToolCallFailed:
-            return MCPToolCallFailed(
-                tenant_key=tenant_key,
-                connection_key=connection_key,
-                source_name=source_name,
-                instance_id=instance_id,
-                tool=qualified_name,
-                duration=duration,
-                cause=cause,
-            )
-
-        def _unknown_event(
-            duration: float, reason: _CallInterruption, instance_id: int
-        ) -> MCPToolCallOutcomeUnknown:
-            return MCPToolCallOutcomeUnknown(
-                tenant_key=tenant_key,
-                connection_key=connection_key,
-                source_name=source_name,
-                instance_id=instance_id,
-                tool=qualified_name,
-                duration=duration,
-                reason=reason,
-            )
-
-        def _cancelled_event(duration: float, instance_id: int) -> MCPToolCallCancelled:
-            return MCPToolCallCancelled(
-                tenant_key=tenant_key,
-                connection_key=connection_key,
-                source_name=source_name,
-                instance_id=instance_id,
-                tool=qualified_name,
-                duration=duration,
-            )
-
-        def unknown_outcome(reason: _CallInterruption) -> MCPOutcomeUnknownError:
-            if reason == "connection_lost":
-                return MCPOutcomeUnknownError(
-                    f"MCP tool '{qualified_name}' was interrupted by a lost connection. "
-                    "The server may already have applied it, so it must not be retried "
-                    "automatically. The next acquisition opens a fresh connection."
-                )
-            return MCPOutcomeUnknownError(
-                f"MCP tool '{qualified_name}' was interrupted by a forced eviction. "
-                "The server may already have applied it, so it must not be retried "
-                "automatically."
-            )
 
         def check_lease() -> None:
             """Fail unless this view still holds this exact lease."""
@@ -695,191 +686,17 @@ class _ViewToolSource(MCPServer):
                 )
 
         async def guarded_executor(**params: Any) -> Any:
-            try:
-                permit = await connection.runtime._begin_call(
-                    connection.identity,
-                    entry,
-                    generation=connection.generation,
-                    tool=qualified_name,
-                    owner=self._call_owner,
-                    # Re-checked on every wake, so one message covers both a stale
-                    # executor and an Agent that closed while its call was queued.
-                    check_lease=check_lease,
-                )
-            except MCPCallCapacityError:
-                connection.runtime._emit(
-                    MCPCallCapacityRejected(
-                        tenant_key=tenant_key,
-                        connection_key=connection_key,
-                        source_name=source_name,
-                        tool=qualified_name,
-                        limit=connection.runtime.max_in_flight_calls,
-                    )
-                )
-                raise
-            loop = asyncio.get_running_loop()
-            instance_id = entry.instance_id
-            started_at = loop.time()
-            permit.started_at = started_at
-            connection.runtime._emit(_started_event(instance_id))
-            try:
-                for attempt in range(2):
-                    current_tool = next(
-                        (tool for tool in entry.raw_tools if tool.name == mcp_tool_name), None
-                    )
-                    if current_tool != original_tool:
-                        raise MCPStaleConnectionError(
-                            connection.identity,
-                            "MCP tool definition changed; discover a new view before calling.",
-                        )
-                    adapter = entry.adapter
-                    assert adapter is not None
-                    epoch = entry.credential_epoch
-                    authorization = entry.resolved_authorization
-                    oauth = connection.runtime._is_oauth_binding(connection.identity)
-                    executor = create_mcp_executor(
-                        adapter,
-                        namespace=self.name,
-                        mcp_tool_name=mcp_tool_name,
-                        max_result_bytes=self.source.max_result_bytes,
-                        exposed_name=qualified_name,
-                    )
-                    rejection: MCPAuthenticationError | None = None
-                    try:
-                        result = await executor(**params)
-                        break
-                    except MCPAuthenticationError as auth_error:
-                        rejection = auth_error
-                    if attempt or not _recoverable_rejection(
-                        rejection,
-                        oauth=oauth,
-                        reauthenticate_on_401=self.source.reauthenticate_on_401,
-                    ):
-                        translated = (
-                            _oauth_rejection_error(connection.identity, rejection)
-                            if oauth
-                            else None
-                        )
-                        if translated is None:
-                            raise rejection
-                        connection.runtime._emit_oauth_required(
-                            connection.identity, source_name, translated
-                        )
-                        raise translated
-                    connection.runtime._end_call(connection.identity, permit)
-                    await connection.runtime._reauthenticate(
-                        connection.identity,
-                        entry,
-                        epoch,
-                        _Rejection(rejection.status_code, rejection.challenge, authorization),
-                    )
-                    permit = await connection.runtime._begin_call(
-                        connection.identity,
-                        entry,
-                        generation=connection.generation,
-                        tool=qualified_name,
-                        owner=self._call_owner,
-                        check_lease=check_lease,
-                    )
-                    permit.started_at = started_at
-            except asyncio.CancelledError as exc:
-                interruption = permit.interruption
-                if interruption is None:
-                    # Purely application-issued cancellation: the runtime did
-                    # not interrupt this call, but the started operation still
-                    # needs its one terminal event.
-                    connection.runtime._emit_call_terminal(
-                        permit, _cancelled_event(loop.time() - started_at, instance_id)
-                    )
-                    raise
-                # Absorb only the cancellation issued by MCPRuntime. If the
-                # application also cancelled this Agent task, its independent
-                # request remains and cancellation must keep propagating.
-                remaining = permit.task.uncancel()
-                permit.interruption = None
-                connection.runtime._emit_call_terminal(
-                    permit, _unknown_event(loop.time() - started_at, interruption, instance_id)
-                )
-                if remaining:
-                    raise
-                raise unknown_outcome(interruption) from exc
-            except BaseException as exc:
-                interruption = permit.interruption
-                if interruption is not None or entry.force_evicted:
-                    connection.runtime._emit_call_terminal(
-                        permit,
-                        _unknown_event(
-                            loop.time() - started_at, interruption or "forced", instance_id
-                        ),
-                    )
-                    if interruption is not None:
-                        remaining = permit.task.uncancel()
-                        permit.interruption = None
-                        # A non-zero remainder is an application cancellation.
-                        # Raise it now instead of letting the unrelated tool
-                        # failure hide it until some later suspension point.
-                        if remaining:
-                            raise asyncio.CancelledError from exc
-                    raise unknown_outcome(interruption or "forced") from exc
-                if isinstance(exc, MCPToolCallError) and exc.connection_lost:
-                    # The transport died underneath this call. The request may
-                    # already have reached the server, so the outcome is
-                    # unknown and must not be retried automatically. Recovery
-                    # only fences the entry so future acquisitions reconnect.
-                    connection.runtime._connection_lost(
-                        connection.identity,
-                        entry,
-                        reporting_permit=permit,
-                    )
-                    connection.runtime._emit_call_terminal(
-                        permit,
-                        _unknown_event(loop.time() - started_at, "connection_lost", instance_id),
-                    )
-                    raise unknown_outcome("connection_lost") from exc
-                if isinstance(exc, Exception):
-                    # Any ordinary tool failure arrived over a functioning
-                    # MCP session. Process-level control flow is not a server
-                    # response and must not change health state.
-                    connection.runtime._record_healthy_tool_response(
-                        connection.identity,
-                        entry,
-                    )
-                    connection.runtime._emit_call_terminal(
-                        permit,
-                        _failed_event(loop.time() - started_at, type(exc).__name__, instance_id),
-                    )
-                else:
-                    # SystemExit or KeyboardInterrupt unwound the call: no
-                    # server verdict, but the start still gets its terminal.
-                    connection.runtime._emit_call_terminal(
-                        permit, _cancelled_event(loop.time() - started_at, instance_id)
-                    )
-                raise
-            else:
-                interruption = permit.interruption
-                if interruption is not None:
-                    remaining = permit.task.uncancel()
-                    permit.interruption = None
-                    if remaining:
-                        # The server answered — record that truth before the
-                        # application's own cancellation takes over.
-                        connection.runtime._emit_call_terminal(
-                            permit, _completed_event(loop.time() - started_at, instance_id)
-                        )
-                        raise asyncio.CancelledError
-                    # A normal return is a definitive server response. Forced
-                    # teardown prevents future work; it does not make this
-                    # already-completed call's outcome uncertain.
-                connection.runtime._record_healthy_tool_response(
-                    connection.identity,
-                    entry,
-                )
-                connection.runtime._emit_call_terminal(
-                    permit, _completed_event(loop.time() - started_at, instance_id)
-                )
-                return result
-            finally:
-                connection.runtime._end_call(connection.identity, permit)
+            return await connection.runtime._execute_call(
+                connection,
+                entry,
+                mcp_tool_name=mcp_tool_name,
+                original_tool=original_tool,
+                qualified_name=qualified_name,
+                namespace=self.name,
+                owner=self._call_owner,
+                check_lease=check_lease,
+                params=params,
+            )
 
         return guarded_executor
 
@@ -2661,6 +2478,282 @@ class MCPRuntime:
             if waiter is not None:
                 with self._lock:
                     self._dequeue_call(waiter)
+
+    async def _execute_call(
+        self,
+        connection: MCPConnection,
+        entry: _ConnectionEntry,
+        *,
+        mcp_tool_name: str,
+        original_tool: Any,
+        qualified_name: str,
+        namespace: str,
+        owner: object,
+        check_lease: Callable[[], None],
+        params: dict[str, Any],
+        timeout: float | None = None,
+    ) -> Any:
+        """Run one MCP tool call under the full managed-call contract.
+
+        The single path behind both Agent-run calls (``guarded_executor``)
+        and :meth:`MCPConnection.call_tool`: call-slot admission, stale
+        definition check against ``original_tool``, one recoverable credential
+        re-authentication, telemetry with exactly one terminal event, result
+        normalization and redaction, and outcome-unknown mapping. The caller
+        must hold a lease on ``entry`` for the whole call.
+        """
+        tenant_key, connection_key = connection.identity
+        # Physical telemetry is pinned to the source that opened the entry.
+        # A live rebind may change only the presentation name used as the next
+        # view's default namespace; it must not rename an existing socket.
+        source_name = entry.source.name
+
+        def _started_event(instance_id: int) -> MCPToolCallStarted:
+            return MCPToolCallStarted(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+            )
+
+        def _completed_event(duration: float, instance_id: int) -> MCPToolCallCompleted:
+            return MCPToolCallCompleted(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+            )
+
+        def _failed_event(duration: float, cause: str, instance_id: int) -> MCPToolCallFailed:
+            return MCPToolCallFailed(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+                cause=cause,
+            )
+
+        def _unknown_event(
+            duration: float, reason: _CallInterruption, instance_id: int
+        ) -> MCPToolCallOutcomeUnknown:
+            return MCPToolCallOutcomeUnknown(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+                reason=reason,
+            )
+
+        def _cancelled_event(duration: float, instance_id: int) -> MCPToolCallCancelled:
+            return MCPToolCallCancelled(
+                tenant_key=tenant_key,
+                connection_key=connection_key,
+                source_name=source_name,
+                instance_id=instance_id,
+                tool=qualified_name,
+                duration=duration,
+            )
+
+        def unknown_outcome(reason: _CallInterruption) -> MCPOutcomeUnknownError:
+            if reason == "connection_lost":
+                return MCPOutcomeUnknownError(
+                    f"MCP tool '{qualified_name}' was interrupted by a lost connection. "
+                    "The server may already have applied it, so it must not be retried "
+                    "automatically. The next acquisition opens a fresh connection."
+                )
+            return MCPOutcomeUnknownError(
+                f"MCP tool '{qualified_name}' was interrupted by a forced eviction. "
+                "The server may already have applied it, so it must not be retried "
+                "automatically."
+            )
+
+        try:
+            permit = await self._begin_call(
+                connection.identity,
+                entry,
+                generation=connection.generation,
+                tool=qualified_name,
+                owner=owner,
+                # Re-checked on every wake, so one message covers both a stale
+                # executor and an Agent that closed while its call was queued.
+                check_lease=check_lease,
+            )
+        except MCPCallCapacityError:
+            self._emit(
+                MCPCallCapacityRejected(
+                    tenant_key=tenant_key,
+                    connection_key=connection_key,
+                    source_name=source_name,
+                    tool=qualified_name,
+                    limit=self.max_in_flight_calls,
+                )
+            )
+            raise
+        loop = asyncio.get_running_loop()
+        instance_id = entry.instance_id
+        started_at = loop.time()
+        permit.started_at = started_at
+        self._emit(_started_event(instance_id))
+        try:
+            for attempt in range(2):
+                current_tool = next(
+                    (tool for tool in entry.raw_tools if tool.name == mcp_tool_name), None
+                )
+                if current_tool != original_tool:
+                    raise MCPStaleConnectionError(
+                        connection.identity,
+                        "MCP tool definition changed; discover a new view before calling.",
+                    )
+                adapter = entry.adapter
+                assert adapter is not None
+                epoch = entry.credential_epoch
+                authorization = entry.resolved_authorization
+                oauth = self._is_oauth_binding(connection.identity)
+                executor = create_mcp_executor(
+                    adapter,
+                    namespace=namespace,
+                    mcp_tool_name=mcp_tool_name,
+                    max_result_bytes=connection.source.max_result_bytes,
+                    exposed_name=qualified_name,
+                    call_timeout=timeout,
+                )
+                rejection: MCPAuthenticationError | None = None
+                try:
+                    result = await executor(**params)
+                    break
+                except MCPAuthenticationError as auth_error:
+                    rejection = auth_error
+                if attempt or not _recoverable_rejection(
+                    rejection,
+                    oauth=oauth,
+                    reauthenticate_on_401=connection.source.reauthenticate_on_401,
+                ):
+                    translated = (
+                        _oauth_rejection_error(connection.identity, rejection) if oauth else None
+                    )
+                    if translated is None:
+                        raise rejection
+                    self._emit_oauth_required(connection.identity, source_name, translated)
+                    raise translated
+                self._end_call(connection.identity, permit)
+                await self._reauthenticate(
+                    connection.identity,
+                    entry,
+                    epoch,
+                    _Rejection(rejection.status_code, rejection.challenge, authorization),
+                )
+                permit = await self._begin_call(
+                    connection.identity,
+                    entry,
+                    generation=connection.generation,
+                    tool=qualified_name,
+                    owner=owner,
+                    check_lease=check_lease,
+                )
+                permit.started_at = started_at
+        except asyncio.CancelledError as exc:
+            interruption = permit.interruption
+            if interruption is None:
+                # Purely application-issued cancellation: the runtime did
+                # not interrupt this call, but the started operation still
+                # needs its one terminal event.
+                self._emit_call_terminal(
+                    permit, _cancelled_event(loop.time() - started_at, instance_id)
+                )
+                raise
+            # Absorb only the cancellation issued by MCPRuntime. If the
+            # application also cancelled this Agent task, its independent
+            # request remains and cancellation must keep propagating.
+            remaining = permit.task.uncancel()
+            permit.interruption = None
+            self._emit_call_terminal(
+                permit, _unknown_event(loop.time() - started_at, interruption, instance_id)
+            )
+            if remaining:
+                raise
+            raise unknown_outcome(interruption) from exc
+        except BaseException as exc:
+            interruption = permit.interruption
+            if interruption is not None or entry.force_evicted:
+                self._emit_call_terminal(
+                    permit,
+                    _unknown_event(loop.time() - started_at, interruption or "forced", instance_id),
+                )
+                if interruption is not None:
+                    remaining = permit.task.uncancel()
+                    permit.interruption = None
+                    # A non-zero remainder is an application cancellation.
+                    # Raise it now instead of letting the unrelated tool
+                    # failure hide it until some later suspension point.
+                    if remaining:
+                        raise asyncio.CancelledError from exc
+                raise unknown_outcome(interruption or "forced") from exc
+            if isinstance(exc, MCPToolCallError) and exc.connection_lost:
+                # The transport died underneath this call. The request may
+                # already have reached the server, so the outcome is
+                # unknown and must not be retried automatically. Recovery
+                # only fences the entry so future acquisitions reconnect.
+                self._connection_lost(
+                    connection.identity,
+                    entry,
+                    reporting_permit=permit,
+                )
+                self._emit_call_terminal(
+                    permit,
+                    _unknown_event(loop.time() - started_at, "connection_lost", instance_id),
+                )
+                raise unknown_outcome("connection_lost") from exc
+            if isinstance(exc, Exception):
+                # Any ordinary tool failure arrived over a functioning
+                # MCP session. Process-level control flow is not a server
+                # response and must not change health state.
+                self._record_healthy_tool_response(
+                    connection.identity,
+                    entry,
+                )
+                self._emit_call_terminal(
+                    permit,
+                    _failed_event(loop.time() - started_at, type(exc).__name__, instance_id),
+                )
+            else:
+                # SystemExit or KeyboardInterrupt unwound the call: no
+                # server verdict, but the start still gets its terminal.
+                self._emit_call_terminal(
+                    permit, _cancelled_event(loop.time() - started_at, instance_id)
+                )
+            raise
+        else:
+            interruption = permit.interruption
+            if interruption is not None:
+                remaining = permit.task.uncancel()
+                permit.interruption = None
+                if remaining:
+                    # The server answered — record that truth before the
+                    # application's own cancellation takes over.
+                    self._emit_call_terminal(
+                        permit, _completed_event(loop.time() - started_at, instance_id)
+                    )
+                    raise asyncio.CancelledError
+                # A normal return is a definitive server response. Forced
+                # teardown prevents future work; it does not make this
+                # already-completed call's outcome uncertain.
+            self._record_healthy_tool_response(
+                connection.identity,
+                entry,
+            )
+            self._emit_call_terminal(
+                permit, _completed_event(loop.time() - started_at, instance_id)
+            )
+            return result
+        finally:
+            self._end_call(connection.identity, permit)
 
     def _end_call(
         self,
