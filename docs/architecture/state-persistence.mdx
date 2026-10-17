@@ -300,6 +300,12 @@ dendrux db status                        # show the current migration revision
 
 If the tables are missing when a run starts, dendrux raises `SchemaNotInitializedError` carrying these exact commands, rather than letting a raw "relation does not exist" error surface mid-run.
 
+### Upgrading
+
+After you upgrade the `dendrux` package, run `dendrux db migrate` against your database again, then restart your app. If you forget, dendrux does not let the first run fail with a raw `UndefinedColumnError`. On first use of a non-SQLite database (an `Agent` run, `RunStore`, `sweep`, or the dashboard) it compares the tables and columns that exist with the ones this version needs, and raises `SchemaOutOfDateError` naming what is missing, for example `agent_runs.pause_requested` and `table run_inbox` when you move from 0.2.0a23 to 0.3.0.
+
+The check is read-only (it only inspects table and column names), runs once per engine, and does not run on SQLite, which upgrades itself. It does not read Alembic's version table, so it works if you create the schema some other way. Extra tables, extra columns and missing indexes are not errors. If you manage the schema yourself and want to turn the check off, set `DENDRUX_SKIP_SCHEMA_CHECK=1`.
+
 ## Reading runs back through RunStore
 
 You do not query these tables with raw SQL. `RunStore` is the public read API over the same six tables: one method per concern, keyed by `run_id`. Here a run is executed, then read back from a fresh store handle (which could be a different process):

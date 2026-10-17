@@ -11,7 +11,7 @@ Dendrux's runtime methods raise typed exceptions on precondition failures. You c
 from dendrux.errors import (
     RunNotFoundError, RunNotPausedError, PauseStatusMismatchError,
     RunAlreadyClaimedError, RunAlreadyTerminalError, InvalidToolResultError,
-    PersistenceNotConfiguredError, SchemaNotInitializedError,
+    PersistenceNotConfiguredError, SchemaNotInitializedError, SchemaOutOfDateError,
     SkillValidationError, SkillMissingError, SkillMismatchError,
     ContextLengthExceededError,
 )
@@ -31,6 +31,7 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set (unknown or duplicate ids). | 400 |
 | `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` / `DENDRUX_DATABASE_URL` is configured. | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
+| `SchemaOutOfDateError(missing_tables, missing_columns)` | `RuntimeError` | A non-SQLite database is missing tables or columns this version needs, because `dendrux db migrate` was not run after upgrading. Raised once per engine, before the first query. Carries `err.missing_tables`, `err.missing_columns` (`"table.column"`) and `err.missing`. Set `DENDRUX_SKIP_SCHEMA_CHECK=1` to skip the check. See [Upgrading](/docs/architecture/state-persistence#upgrading). | 500 |
 | `ContextLengthExceededError(message, status_code=, provider_code=, model=)` | `RuntimeError` | An OpenAI-compatible endpoint (`OpenAIProvider`, `OpenRouterProvider`) rejected a batch or streaming request as larger than the model's context window. The SDK error is chained as `__cause__`; the message never contains prompt content. See [Models and providers](/docs/architecture/models#request-errors-on-openai-compatible-endpoints). | 413 or 400 |
 | `SkillValidationError(message, field=)` | `ValueError` | A [skill](/docs/architecture/skills) is built with an invalid name, description, file path, metadata, or frontmatter. `field` names the offender. | 400 |
 | `SkillMissingError(run_id, missing=, mismatched=)` | `SkillContinuityError` | A paused run is continued on an agent that lacks a skill the run was created with. The run stays paused. | 409 |
