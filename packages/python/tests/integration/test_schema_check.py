@@ -125,7 +125,7 @@ def _agent(url: str | None = None) -> Agent:
     return Agent(
         name="schema-check",
         prompt="Test.",
-        provider=MockLLM([LLMResponse(text="ok")]),
+        provider=MockLLM([LLMResponse(text="ok")] * 3),
         **kwargs,
     )
 
@@ -233,15 +233,50 @@ async def test_env_var_path_does_not_cache_a_failed_engine(
         await db_session.reset_engine()
 
 
-async def test_run_store_checks_on_first_use_then_recovers(pg_url: str) -> None:
-    await asyncio.to_thread(_alembic, pg_url, PRIOR)
-    async with RunStore.from_database_url(pg_url) as store:
-        with pytest.raises(SchemaOutOfDateError) as info:
-            await store.list_runs()
-        assert set(info.value.missing) == _MISSING
-        await asyncio.to_thread(_alembic, pg_url, "head")
+async def test_run_store_is_not_checked_and_reads_view_backed_tables(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            await conn.execute(text(f"ALTER TABLE {table.name} RENAME TO {table.name}_base"))
+        for table in Base.metadata.sorted_tables:
+            await conn.execute(text(f"CREATE VIEW {table.name} AS SELECT * FROM {table.name}_base"))
+    await engine.dispose()
     async with RunStore.from_database_url(pg_url) as store:
         assert await store.list_runs() == []
+
+
+async def test_wrong_column_type_is_not_detected(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
+        await conn.execute(text("ALTER TABLE agent_runs ADD COLUMN pause_requested text"))
+    await engine.dispose()
+    from dendrux.db._schema_check import ensure_schema_current
+
+    check = create_async_engine(pg_url, poolclass=NullPool)
+    try:
+        await ensure_schema_current(check)  # presence only: types are not compared
+    finally:
+        await check.dispose()
+
+
+async def test_quoted_uppercase_tables_are_reported_missing(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text('ALTER TABLE agent_runs RENAME TO "AGENT_RUNS"'))
+    await engine.dispose()
+    check = create_async_engine(pg_url, poolclass=NullPool)
+    from dendrux.db._schema_check import ensure_schema_current
+
+    try:
+        with pytest.raises(SchemaOutOfDateError) as info:
+            await ensure_schema_current(check)
+    finally:
+        await check.dispose()
+    assert "agent_runs" in info.value.missing_tables
 
 
 async def test_sweep_checks_the_schema(pg_url: str) -> None:
@@ -259,24 +294,65 @@ async def test_sweep_checks_the_schema(pg_url: str) -> None:
     assert result.stale_running == []
 
 
-async def test_check_is_read_only_and_runs_once_per_engine(pg_url: str) -> None:
+def _record_statements(engine: Any, sink: list[str]) -> None:
     from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _record(_c: Any, _cur: Any, statement: str, *_a: Any) -> None:
+        sink.append(statement)
+
+
+def _reflection(statements: list[str]) -> list[str]:
+    return [s for s in statements if "pg_class" in s or "pg_catalog" in s]
+
+
+async def test_check_is_read_only(pg_url: str) -> None:
+    from dendrux.db._schema_check import ensure_schema_current
 
     await _build_current_schema(pg_url)
     statements: list[str] = []
     engine = create_async_engine(pg_url, poolclass=NullPool)
-
-    @event.listens_for(engine.sync_engine, "before_cursor_execute")
-    def _record(_c: Any, _cur: Any, statement: str, *_a: Any) -> None:
-        statements.append(statement.lstrip().split(None, 1)[0].upper())
-
-    from dendrux.db._schema_check import ensure_schema_current
-
+    _record_statements(engine, statements)
     await ensure_schema_current(engine)
     await engine.dispose()
     assert statements
-    assert set(statements) <= {"SELECT", "WITH", "BEGIN"}
+    assert {s.lstrip().split(None, 1)[0].upper() for s in statements} <= {"SELECT", "WITH"}
     assert len(statements) <= 4
+
+
+async def test_agent_reflects_once_per_engine(pg_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlalchemy.ext.asyncio as sa_asyncio
+
+    import dendrux.agent as agent_module
+
+    await _build_current_schema(pg_url)
+    statements: list[str] = []
+    real = sa_asyncio.create_async_engine
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        engine = real(*args, **kwargs)
+        _record_statements(engine, statements)
+        return engine
+
+    monkeypatch.setattr(sa_asyncio, "create_async_engine", recording)
+    verify_calls: list[str] = []
+
+    async def no_verify(*_a: Any) -> None:
+        verify_calls.append("called")
+
+    monkeypatch.setattr(agent_module, "_verify_schema_initialized", no_verify)
+
+    agent = _agent(pg_url)
+    try:
+        await agent.run("one")
+        first = len(_reflection(statements))
+        assert first > 0  # the single check ran
+        await agent.run("two")
+        await agent.run("three")
+    finally:
+        await agent.close()
+    assert len(_reflection(statements)) == first
+    assert verify_calls == []  # the redundant has_table query is gone
 
 
 async def test_sqlite_is_unaffected(tmp_path: Path) -> None:

@@ -876,6 +876,7 @@ class Agent:
         if self._lazy_store is not None:
             return self._lazy_store
 
+        from dendrux.db._schema_check import was_verified
         from dendrux.runtime.state import SQLAlchemyStateStore
 
         if self._database_url is not None:
@@ -883,7 +884,8 @@ class Agent:
                 generation = self._store_generation
             engine = await self._create_private_engine(self._database_url)
             try:
-                await _verify_schema_initialized(engine, self._database_url)
+                if not was_verified(engine):
+                    await _verify_schema_initialized(engine, self._database_url)
             except BaseException:
                 await engine.dispose()
                 raise
@@ -907,7 +909,8 @@ class Agent:
             from dendrux.db.session import get_engine
 
             engine = await get_engine(env_url)
-            await _verify_schema_initialized(engine, env_url)
+            if not was_verified(engine):
+                await _verify_schema_initialized(engine, env_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
             return self._lazy_store
 

@@ -5,10 +5,16 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 import dendrux
 import dendrux.errors as errors
-from dendrux.db._schema_check import SKIP_ENV, compare_schema, ensure_schema_current
+from dendrux.db._schema_check import (
+    SKIP_ENV,
+    compare_schema,
+    ensure_schema_current,
+    was_verified,
+)
 from dendrux.db.models import Base
 from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
 
@@ -40,9 +46,16 @@ def test_extra_tables_and_columns_are_ignored() -> None:
     assert compare_schema(actual) == ([], [])
 
 
-def test_names_compare_case_insensitively() -> None:
-    actual = {name.upper(): [c.upper() for c in cols] for name, cols in _full().items()}
-    assert compare_schema(actual) == ([], [])
+def test_names_must_match_exactly() -> None:
+    uppercase = {name.upper(): list(cols) for name, cols in _full().items()}
+    missing_tables, missing_columns = compare_schema(uppercase)
+    assert set(missing_tables) == set(_full())
+    assert missing_columns == []
+
+    quoted_columns = {name: [c.upper() for c in cols] for name, cols in _full().items()}
+    missing_tables, missing_columns = compare_schema(quoted_columns)
+    assert missing_tables == []
+    assert "agent_runs.pause_requested" in missing_columns
 
 
 def test_error_message_lists_objects_and_the_remedy() -> None:
@@ -120,3 +133,49 @@ def _async_return(value: object):
         return value
 
     return _call
+
+
+class _DriverError(Exception):
+    pass
+
+
+def _failing_engine(error: Exception) -> MagicMock:
+    engine = _engine("postgresql")
+    conn = MagicMock()
+
+    async def run_sync(_fn: object) -> dict[str, list[str]]:
+        raise error
+
+    conn.run_sync = run_sync
+    engine.connect.return_value.__aenter__ = _async_return(conn)
+    engine.connect.return_value.__aexit__ = _async_return(None)
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_catalog_permission_error_warns_and_continues(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv(SKIP_ENV, raising=False)
+    engine = _failing_engine(DBAPIError("SELECT 1", {}, _DriverError("permission denied")))
+    with caplog.at_level("WARNING", logger="dendrux.db._schema_check"):
+        await ensure_schema_current(engine)
+    assert "schema check skipped: _DriverError" in caplog.text
+    assert not was_verified(engine)
+
+
+@pytest.mark.asyncio
+async def test_connection_loss_during_check_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(SKIP_ENV, raising=False)
+    error = OperationalError("SELECT 1", {}, _DriverError("gone"), connection_invalidated=True)
+    with pytest.raises(OperationalError):
+        await ensure_schema_current(_failing_engine(error))
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(SKIP_ENV, raising=False)
+    engine = _engine("postgresql")
+    engine.connect.side_effect = OSError("refused")
+    with pytest.raises(OSError, match="refused"):
+        await ensure_schema_current(engine)

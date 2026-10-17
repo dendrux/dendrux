@@ -41,7 +41,6 @@ import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StateStore, TenantScope
 from dendrux.types import ReplaySummary
@@ -363,18 +362,16 @@ class RunStore:
         SQLite URL the schema is brought up to date once before the first
         query (see the class docstring); an older file that cannot be
         upgraded raises :class:`~dendrux.errors.SqliteSchemaSyncError` from
-        that first call. For any other database the first call checks, once
-        and read-only, that the tables and columns exist, and raises
-        :class:`~dendrux.errors.SchemaOutOfDateError` if you have not run
-        ``dendrux db migrate`` since upgrading (skip with
-        ``DENDRUX_SKIP_SCHEMA_CHECK=1``).
+        that first call.
         """
         from sqlalchemy.ext.asyncio import create_async_engine
 
         engine = create_async_engine(database_url)
         store: Any = SQLAlchemyStateStore(engine)
-        init = create_sqlite_schema if database_url.startswith("sqlite") else ensure_schema_current
-        store = _InitOnFirstUse(store, functools.partial(init, engine), engine.dispose)
+        if database_url.startswith("sqlite"):
+            store = _InitOnFirstUse(
+                store, functools.partial(create_sqlite_schema, engine), engine.dispose
+            )
         instance = cls(store)
         instance._owned_engine = engine
         return instance
