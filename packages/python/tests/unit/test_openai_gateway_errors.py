@@ -350,7 +350,7 @@ class TestClassifier:
         assert self._classify(status_code=500, param="stream") is GatewayErrorKind.OTHER
         assert self._classify(status_code=None, param="stream") is GatewayErrorKind.OTHER
 
-    def test_normalizes_status_and_code_from_body(self) -> None:
+    def test_numeric_body_code_equal_to_status_is_dropped(self) -> None:
         result = classify_gateway_error(
             status_code=400,
             code=None,
@@ -359,7 +359,7 @@ class TestClassifier:
             body={"message": "maximum context length is 4096", "code": 400},
         )
         assert result.kind is GatewayErrorKind.CONTEXT_LENGTH
-        assert (result.status_code, result.provider_code) == (400, "400")
+        assert (result.status_code, result.provider_code) == (400, None)
 
     def test_error_class_exported(self) -> None:
         import dendrux.errors as errors
