@@ -18,13 +18,14 @@ security fix (see Changed) and a database migration (see Migration): run
   server calls execute automatically. `approval.decided` keeps its scalar
   `decision` (`approved|rejected|mixed`, `run_id`) and adds `decisions`: one
   entry per pending call with `approved|denied|not_gated_executed|client_pending`.
-  `approved=True/False` behave as before, including the exact legacy rejection
-  payload. `ApprovalDecision` is exported from `dendrux`.
+  For server-target calls, the batch forms (`approved=True/False`) preserve their
+  legacy approval and rejection payloads; client-target routing changes as
+  described under Changed. `ApprovalDecision` is exported from `dendrux`.
 - **`before_tool` policy hook.** `Agent(before_tool=hook)` (sync or async) is
   called with a `ToolCallContext` (`run_id`, `call_id`, `tool_name`, deep-copied
   `params` and `meta`, `target`, `source` of `local|mcp|skill`, `iteration`,
-  `tenant_id`) before every tool call in `run` and `stream`, after static
-  `deny=` and before approval, and returns a `ToolDecision`: `allow()`,
+  `tenant_id`) once for each parsed tool call that passes static `deny=` and
+  skill preflight, before approval, in `run` and `stream`, and returns a `ToolDecision`: `allow()`,
   `deny(reason)`, `require_approval(reason)`, `substitute(result)` or `None`.
   `require_approval` on a client-target call is denied with a
   `policy.hook_warning`. It fails closed: a hook that raises, returns a
@@ -60,9 +61,10 @@ security fix (see Changed) and a database migration (see Migration): run
   `RunStore.get_notes(run_id, undelivered_only=, tenant_id=)` (`RunNote`).
   `SingleCall` never delivers notes.
 - **Heartbeat.** `dendrux.heartbeat()` (sync, thread-safe, fire-and-forget) and
-  `await dendrux.aheartbeat()` record progress from inside a long-running tool so
-  `sweep(stale_running=...)` does not reap it. Tool start now also touches
-  progress. Both are no-ops outside a run.
+  `await dendrux.aheartbeat()` refresh persisted progress from inside a
+  long-running tool to reduce the risk of `sweep(stale_running=...)` reaping it.
+  Writes are best-effort and failures are logged. Tool start now also touches
+  progress. Both are no-ops outside a persisted run.
 - **Dollar budget.** `Budget(max_cost_usd=..., on_exceed="warn"|"pause"|"cancel",
   include_children=True)`; `max_tokens` is now optional (at least one limit is
   required). `on_exceed="pause"` pauses durably (`pause_reason="budget"`);
@@ -70,7 +72,7 @@ security fix (see Changed) and a database migration (see Migration): run
   With `include_children` the check uses the live root-inclusive subtree rollup.
   Events carry `metric` (`tokens|cost_usd`); `budget.exceeded` adds `action`; new
   `budget.unpriced` fires once per run when the cost limit meets an unpriced call
-  (unknown cost is never counted as zero).
+  (unpriced calls are excluded from the dollar comparison and reported by `budget.unpriced`).
 - **Subtree reads.** `RunStore.get_subtree(run_id, *, tenant_id=)` returns a
   `RunSubtree` (`nodes` with depth and per-node `RunUsage`, plus rolled-up
   `usage`) computed live from `llm_interactions`, so running and paused runs are
@@ -155,10 +157,11 @@ security fix (see Changed) and a database migration (see Migration): run
   Postgres and other migration-managed databases. Downgrade drops both.
 - `RunStatus.PAUSED` is a new status string in an existing varchar column; no
   enum migration. Code that switches over statuses should handle `paused`.
-- SQLite databases created by an earlier release are not altered automatically
-  (`create_all` adds `run_inbox` but not the new column). Add it once with
-  `ALTER TABLE agent_runs ADD COLUMN pause_requested BOOLEAN NOT NULL DEFAULT 0`,
-  or start from a fresh file.
+- SQLite databases created by an earlier release are upgraded in place on
+  startup. The upgrade is add-only: missing nullable or defaulted columns and
+  indexes are added. A column that cannot be added safely raises an error naming
+  the table and column and telling you to run `dendrux db migrate` or recreate
+  the file. Postgres still requires `dendrux db migrate`.
 
 ### Known limitations
 
@@ -179,6 +182,9 @@ security fix (see Changed) and a database migration (see Migration): run
 - `RunStore.get_subtree` reads are best-effort and not one snapshot transaction.
 - `cancel_run` interrupts only a run executing on the same `Agent` instance in
   the same process; elsewhere cancellation is cooperative.
+- The `submit_*` methods (`submit_tool_results`, `submit_input`,
+  `submit_approval`, `submit_resume`) take no `tenant_id`. HTTP routes must
+  verify run ownership before calling them.
 
 ## 0.2.0a23 - 2026-10-15
 

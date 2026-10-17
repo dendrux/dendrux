@@ -57,11 +57,11 @@ When `base_url` points away from the official endpoint, dendrux drops OpenAI-spe
 
 ## Request errors on OpenAI-compatible endpoints
 
-Compatible servers report problems in slightly different ways. `OpenAIProvider` (and so `OpenRouterProvider`) runs every error from the endpoint through one classifier, for batch calls, for stream creation and for errors that arrive in the middle of a stream. There are three outcomes, checked in this order:
+Compatible servers report problems in slightly different ways. `OpenAIProvider` (and therefore `OpenRouterProvider`) classifies API status errors and in-stream error events for batch calls, stream creation, and stream iteration. SDK timeout and connection errors keep Dendrux's existing transport mappings. There are three outcomes for the classified errors, checked in this order:
 
 1. **Context window exceeded** raises `ContextLengthExceededError`.
 2. **Streaming not supported** (streaming calls only) raises `NotImplementedError`, the same as before.
-3. **Anything else** is re-raised untouched, exactly as the SDK raised it.
+3. **Any other status error** is re-raised unchanged, exactly as the SDK raised it.
 
 ```python
 from dendrux import ContextLengthExceededError
@@ -77,7 +77,7 @@ except ContextLengthExceededError as exc:
 
 What counts as a context overflow:
 
-- The provider code `context_length_exceeded`, whatever the HTTP status.
+- The provider code `context_length_exceeded` when the status is absent (an in-stream event) or is 400, 403, 413, or 422. A response with any other status, such as 500, is returned as the original SDK status error.
 - Otherwise a 400, 403, 413 or 422 whose text matches the wording servers use for an oversized request ("maximum context length", "input is too long", and similar, matched case-insensitively). On a 403 only the one documented formula is accepted, because an auth error can describe a model's context length without being one.
 - Errors with a rate-limit, quota, permission or authentication code are never overflows, even if their text mentions tokens. A complaint about the `max_tokens` setting alone is a request-configuration error, not an overflow, unless the text also counts the prompt's input tokens.
 

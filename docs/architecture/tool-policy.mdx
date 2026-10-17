@@ -24,7 +24,7 @@ async def policy(call: ToolCallContext) -> ToolDecision | None:
 agent = Agent(provider=provider, prompt="...", tools=[send_email, delete_rows], before_tool=policy)
 ```
 
-The hook can be sync or async. It runs for every tool call the model makes, in `run()` and in `stream()`.
+The hook can be sync or async. The hook runs once for each parsed tool call that passes static `deny=` and skill preflight, before approval. It applies in `run()` and in `stream()`.
 
 ## What the hook sees
 

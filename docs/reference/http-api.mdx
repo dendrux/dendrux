@@ -354,10 +354,10 @@ Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 
 ### Minimal write-route wrappers
 
-A complete set of write endpoints on top of FastAPI:
+A single-tenant example follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to `request_pause`, `submit_note`, and `cancel_run`; omitting `tenant_id` is unscoped, while explicit `tenant_id=None` means untenanted runs only. The `submit_*` methods have no tenant parameter, so verify run ownership before calling them. The sample below does both: `owned_run` is a dependency that checks the run belongs to the caller's tenant before any route touches it.
 
 ```python
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from dendrux.errors import (
     InvalidToolResultError,
@@ -369,7 +369,20 @@ from dendrux.errors import (
     RunNotPausedError,
 )
 from dendrux import ApprovalDecision
+from dendrux.store import RunNotFoundError as StoreRunNotFoundError
 from dendrux.types import ToolResult
+
+def tenant_of(request: Request) -> str:
+    """Your auth layer: the tenant of the authenticated caller."""
+    return request.state.tenant_id
+
+async def owned_run(run_id: str, tenant_id: str = Depends(tenant_of)) -> str:
+    """Ownership check for every route. The submit_* methods take no tenant_id."""
+    try:
+        await store.get_subtree(run_id, tenant_id=tenant_id)   # root must be in this tenant
+    except StoreRunNotFoundError:
+        raise HTTPException(404, "run not found")
+    return run_id
 
 writes = APIRouter(dependencies=[Depends(authorize)])
 
@@ -382,7 +395,7 @@ class ToolResultBody(BaseModel):
     duration_ms: int = 0
 
 @writes.post("/runs/{run_id}/tool-results")
-async def submit_tool_results(run_id: str, results: list[ToolResultBody]):
+async def submit_tool_results(results: list[ToolResultBody], run_id: str = Depends(owned_run)):
     try:
         result = await agent.submit_tool_results(
             run_id, [ToolResult(**r.model_dump()) for r in results]
@@ -399,13 +412,13 @@ async def submit_tool_results(run_id: str, results: list[ToolResultBody]):
     return {"status": result.status.value, "answer": result.answer}
 
 @writes.post("/runs/{run_id}/input")
-async def submit_input(run_id: str, body: dict):
+async def submit_input(body: dict, run_id: str = Depends(owned_run)):
     # (same try/except shape)
     result = await agent.submit_input(run_id, body["text"])
     return {"status": result.status.value, "answer": result.answer}
 
 @writes.post("/runs/{run_id}/approval")
-async def submit_approval(run_id: str, body: dict):
+async def submit_approval(body: dict, run_id: str = Depends(owned_run)):
     # Whole batch: {"approved": true}. Per call: {"decisions": {"<call_id>": {"approved": false, "reason": "..."}}}
     if "decisions" in body:
         decisions = {
@@ -422,24 +435,36 @@ async def submit_approval(run_id: str, body: dict):
     return {"status": result.status.value, "answer": result.answer}
 
 @writes.post("/runs/{run_id}/pause")
-async def request_pause(run_id: str, body: dict | None = None):
-    outcome = await agent.request_pause(run_id, reason=(body or {}).get("reason"))
+async def request_pause(
+    body: dict | None = None,
+    run_id: str = Depends(owned_run),
+    tenant_id: str = Depends(tenant_of),
+):
+    outcome = await agent.request_pause(
+        run_id, tenant_id=tenant_id, reason=(body or {}).get("reason")
+    )
     return {"status": outcome.status_after.value, "affected": outcome.affected}
 
 @writes.post("/runs/{run_id}/resume")
-async def resume(run_id: str):
+async def resume(run_id: str = Depends(owned_run)):
     result = await agent.submit_resume(run_id)
     return {"status": result.status.value, "answer": result.answer}
 
 @writes.post("/runs/{run_id}/notes")
-async def add_note(run_id: str, body: dict):
-    note_id = await agent.submit_note(run_id, body["text"], metadata=body.get("metadata"))
+async def add_note(
+    body: dict,
+    run_id: str = Depends(owned_run),
+    tenant_id: str = Depends(tenant_of),
+):
+    note_id = await agent.submit_note(
+        run_id, body["text"], metadata=body.get("metadata"), tenant_id=tenant_id
+    )
     return {"note_id": note_id}
 
 @writes.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str):
+async def cancel_run(run_id: str = Depends(owned_run), tenant_id: str = Depends(tenant_of)):
     try:
-        result = await agent.cancel_run(run_id)
+        result = await agent.cancel_run(run_id, tenant_id=tenant_id)
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
     except PersistenceNotConfiguredError:

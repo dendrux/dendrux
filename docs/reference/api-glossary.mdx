@@ -14,7 +14,7 @@ This is the full public surface of Dendrux: everything you import in normal use.
 | `Agent` | `from dendrux import Agent` | The agent: definition + runtime facade. See [Agent](/docs/reference/agent). |
 | `tool` | `from dendrux import tool` | Decorator that turns an async function into a tool. |
 | `Budget` | `from dendrux import Budget` | Per-run token and dollar limits with optional pause or cancel, counting delegated children. See [Budget](/docs/architecture/budget). |
-| `heartbeat` / `aheartbeat` | `from dendrux import heartbeat, aheartbeat` | Call from inside a long-running tool to record progress so the stale sweep does not reap the run. See [State persistence](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep). |
+| `heartbeat` / `aheartbeat` | `from dendrux import heartbeat, aheartbeat` | Call from inside a long-running tool to refresh persisted progress and reduce the risk of the stale sweep reaping the run (best-effort; no-op outside a persisted run). See [State persistence](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep). |
 | `run` | `from dendrux import run` | Low-level functional runner behind `Agent.run` (advanced use). |
 | `sweep` | `from dendrux import sweep` | One-shot reconciliation of stale/abandoned runs (you schedule it). |
 
@@ -105,7 +105,7 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 
 ## Errors
 
-All exceptions live in `dendrux.errors` (and the most common ones are re-exported from `dendrux`). Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`, `ContextLengthExceededError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`.
+Run-control, skill-continuity, schema, and context-length exceptions live in `dendrux.errors`; common ones are re-exported from `dendrux`. MCP exceptions live in `dendrux.mcp`, RunStore read errors in `dendrux.store`, and several validation/idempotency exceptions are exported from `dendrux`. Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`, `ContextLengthExceededError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`.
 
 ## Where to go next
 

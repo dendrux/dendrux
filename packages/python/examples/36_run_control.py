@@ -20,10 +20,11 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from dendrux import Agent, ApprovalDecision, ToolCallContext, ToolDecision, tool
 from dendrux.llm.mock import MockLLM
-from dendrux.store import RunStore
+from dendrux.store import RunStore, StoredEvent
 from dendrux.types import LLMResponse, RunStatus, ToolCall
 
 REFUNDED: list[int] = []
@@ -81,7 +82,7 @@ def policy(call: ToolCallContext) -> ToolDecision | None:
     return None
 
 
-def call(name: str, params: dict, pid: str) -> ToolCall:
+def call(name: str, params: dict[str, Any], pid: str) -> ToolCall:
     return ToolCall(name=name, params=params, provider_tool_call_id=pid)
 
 
@@ -110,10 +111,16 @@ SCRIPT = [
 ]
 
 
-async def pending_calls(store: RunStore, run_id: str) -> list[dict]:
+def data(event: StoredEvent) -> dict[str, Any]:
+    """An event's payload (never None for the events read here)."""
+    return event.data or {}
+
+
+async def pending_calls(store: RunStore, run_id: str) -> list[dict[str, Any]]:
     """The calls a run is waiting on, read from its `run.paused` event."""
     events = await store.get_events(run_id, event_types=["run.paused"])
-    return events[-1].data["pending_tool_calls"]
+    calls: list[dict[str, Any]] = data(events[-1])["pending_tool_calls"]
+    return calls
 
 
 async def per_call_approval(agent: Agent, store: RunStore) -> None:
@@ -132,8 +139,8 @@ async def per_call_approval(agent: Agent, store: RunStore) -> None:
     decided = (await store.get_events(paused.run_id, event_types=["approval.decided"]))[0]
     print("status:", done.status.value)
     print("refunded:", REFUNDED)
-    print("decision:", decided.data["decision"])
-    for item in decided.data["decisions"]:
+    print("decision:", data(decided)["decision"])
+    for item in data(decided)["decisions"]:
         print(f"  {item['tool_name']} -> {item['decision']} ({item['reason']})")
 
 
@@ -143,13 +150,13 @@ async def policy_hook(agent: Agent, store: RunStore) -> None:
     assert paused.status is RunStatus.WAITING_APPROVAL
     gates = await store.get_events(paused.run_id, event_types=["approval.requested"])
     substituted = await store.get_events(paused.run_id, event_types=["policy.substituted"])
-    print("approval requested for:", [g.data["tool_name"] for g in gates])
-    print("reason:", gates[0].data["reason"], "| source:", gates[0].data["source"])
-    print("substituted:", [s.data["tool_name"] for s in substituted])
+    print("approval requested for:", [data(g)["tool_name"] for g in gates])
+    print("reason:", data(gates[0])["reason"], "| source:", data(gates[0])["source"])
+    print("substituted:", [data(s)["tool_name"] for s in substituted])
 
     # Only the hook-gated call needs a decision; the held lookup runs on its own.
     done = await agent.submit_approval(
-        paused.run_id, decisions={gates[0].data["call_id"]: ApprovalDecision.approve()}
+        paused.run_id, decisions={data(gates[0])["call_id"]: ApprovalDecision.approve()}
     )
     print("status:", done.status.value)
     print("emails sent:", EMAILS, "| rows deleted:", DELETED)
@@ -168,7 +175,7 @@ async def pause_and_resume(agent: Agent, store: RunStore) -> None:
     paused = await run_task
     print("run() returned:", paused.status.value)
     event = (await store.get_events(run_id, event_types=["run.paused"]))[-1]
-    print("run.paused:", event.data["reason"], "-", event.data["message"])
+    print("run.paused:", data(event)["reason"], "-", data(event)["message"])
 
     done = await agent.submit_resume(run_id)
     print("after resume:", done.status.value, "|", done.answer)

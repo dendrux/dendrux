@@ -5,7 +5,7 @@ description: Per-run token and dollar limits with threshold events, and an optio
 
 # Budget
 
-A `Budget` on an agent caps what one run may spend, in tokens, in dollars, or both. It emits governance events as usage crosses configurable thresholds and when a limit is reached. What happens at the limit is up to `on_exceed`:
+A `Budget` tracks configurable token and dollar limits for one run; it can warn, pause, or cancel when a limit is reached. It emits governance events as usage crosses configurable thresholds and when a limit is reached. What happens at the limit is up to `on_exceed`:
 
 | `on_exceed` | At the limit |
 | --- | --- |
@@ -73,7 +73,7 @@ Tokens are `input_tokens + output_tokens`, summed over the LLM calls. `input_tok
 {"metric": "cost_usd", "used": 0.0132, "max": 0.5, "unpriced_calls": 1, "known_cost_usd": 0.0132}
 ```
 
-An unknown cost is never counted as zero. If you set `max_cost_usd`, give the agent a price table for every model it uses, or the limit under-counts. See [Cost and pricing](/docs/architecture/pricing).
+An unpriced call contributes no amount to the dollar comparison. `budget.unpriced` exposes that gap; without complete provider pricing or a `PriceTable`, `max_cost_usd` can under-count. Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
 
 ## What the events look like
 
@@ -151,7 +151,7 @@ A child run is a run with its own `Agent`, and its own budget if it has one. Eac
 
 ## Usage source and persistence
 
-- **With persistence** (a database or `state_store`), usage is read live from the recorded LLM calls. This is the exact, restart-safe figure.
+- **With persistence** (a database or `state_store`), usage is read live from successfully recorded `llm_interactions`. Those writes are best-effort, so a failed write can make the rollup under-count; if the live read itself raises, the tracker falls back to in-memory usage.
 - **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
 
 Paused runs write their running totals (tokens and `total_cost_usd`) to the row when they pause, so a paused run no longer reads as zero spend.

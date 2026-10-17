@@ -287,7 +287,7 @@ The schema doesn't use any SQLite-specific or Postgres-specific features. Switch
 
 ## Setting up the schema
 
-SQLite creates its tables automatically on first use, so there is nothing to run for a new file. (A SQLite file created by a release before 0.3.0 needs one manual change, because automatic creation does not alter existing tables: `ALTER TABLE agent_runs ADD COLUMN pause_requested BOOLEAN NOT NULL DEFAULT 0`. The new `run_inbox` table is created for you.) Every other backend needs the tables created once before the first run. Dendrux ships an Alembic migration set and a small CLI for exactly this. Upgrading an existing Postgres database to 0.3.0 is the same command; it applies revision `b5c6d7e8f9a0` (the `pause_requested` column and the `run_inbox` table):
+SQLite creates its tables automatically on first use, so there is nothing to run for a new file. A SQLite file created by an older release is upgraded in place on startup. The upgrade is add-only: it adds missing nullable or defaulted columns and indexes (0.3.0 adds `agent_runs.pause_requested` and the `run_inbox` table). If a column cannot be added safely, Dendrux raises an error naming the table and column and telling you to run `dendrux db migrate` or recreate the file. Every other backend needs the tables created once before the first run. Dendrux ships an Alembic migration set and a small CLI for exactly this. Upgrading an existing Postgres database to 0.3.0 is the same command; it applies revision `b5c6d7e8f9a0` (the `pause_requested` column and the `run_inbox` table):
 
 ```bash
 pip install "dendrux[postgres]"          # asyncpg driver (alembic is already bundled)

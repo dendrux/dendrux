@@ -161,7 +161,7 @@ The keys must be exactly the ids of the **approval-gated** calls: the calls that
 
 How the batch resolves on resume:
 
-1. The runtime walks `pending_tool_calls` in the order the model emitted them and appends exactly one `TOOL` message per call, in that order.
+1. The runtime walks `pending_tool_calls` in model order. It appends one `TOOL` message for each resolved server or denied call; client-target calls remain pending, and their messages are appended later by `submit_tool_results`, after the server results.
 2. **Approved** gated calls execute server-side through the normal executor path.
 3. **Denied** calls are skipped. The model sees a failed tool result `{"denied": "<reason>"}`, and a `tool_calls` row is written with `success=0` and the reason as `error_message`, like the batch reject path.
 4. **Held non-gated** calls, server calls that sat in the batch but never needed approval, execute automatically. They are not part of `decisions`.
@@ -228,7 +228,7 @@ await connection.call_tool("create_issue", {"title": "Rotate the key"})
 
 Two things hold in every form of `submit_approval`:
 
-1. **CAS-guarded.** Like every resume method, it uses `claim_paused_run` to flip the row from `waiting_approval` to `running` atomically. Two concurrent Approve clicks resolve deterministically: one wins; the other raises `PauseStatusMismatchError` or `RunAlreadyClaimedError` and can be shown as "this request has already been decided."
+1. **CAS-guarded.** Batch approve uses `claim_paused_run`; per-call decisions and batch reject use `submit_and_claim`, so the submitted data and the `waiting_approval` to `running` claim commit atomically. Two concurrent Approve clicks resolve deterministically: one wins; the other raises `PauseStatusMismatchError` or `RunAlreadyClaimedError` and can be shown as "this request has already been decided."
 2. **Terminal-safe.** If the run has already been finalized (someone else cancelled it, for example), `submit_approval` raises `RunAlreadyTerminalError`. A run whose cancellation was requested but not yet observed is refused the same way.
 
 After the claim, and before each approved call executes, the runtime checks for a cancel and then a pause request. A cancel finalizes the run before any further side effect; a [requested pause](/docs/architecture/pause-resume#requesting-a-pause) parks the rest of the batch with the decisions already made, and resume continues it without asking again.

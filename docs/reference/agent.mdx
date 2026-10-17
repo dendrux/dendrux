@@ -75,7 +75,7 @@ Agent(
 | `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. `skills_dir` is read lazily at the first run. See [Skills](/docs/architecture/skills). |
 | `skill_executor` | A `SkillExecutor` subclass instance that runs skill scripts. Without it, `run_skill_script` is not offered to the model. See [Running scripts](/docs/architecture/skills#running-scripts). |
 | `tool_result_transform` | Callable that rewrites a server tool's result before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
-| `before_tool` | Sync or async policy hook called with a `ToolCallContext` before every tool call; returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
+| `before_tool` | Sync or async policy hook, run once for each parsed tool call that passes static `deny=` and skill preflight, before approval; called with a `ToolCallContext`, returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
 
 Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, and tools with `SingleCall` all raise `ValueError`.
 
@@ -330,7 +330,7 @@ def heartbeat() -> None            # sync, fire-and-forget, thread-safe
 async def aheartbeat() -> None     # awaits the write
 ```
 
-Call from inside a tool that waits a long time (a human, a slow job) to record progress on the run, so a [stale-run sweep](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep) does not reap it. Both are no-ops outside a persisted run. `heartbeat()` works from async tools and from sync tools (which run in a worker thread) and coalesces calls less than a second apart; `aheartbeat()` must be awaited on the run's event loop and logs, never raises, on failure.
+Call it from inside a tool that waits a long time (a human, a slow job) to refresh persisted progress and reduce the risk of a [stale-run sweep](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep) reaping the run. Writes are best-effort and failures are logged; both helpers are no-ops outside a persisted run. `heartbeat()` works from async tools and from sync tools (which run in a worker thread) and coalesces calls less than a second apart; `aheartbeat()` must be awaited on the run's event loop and logs, never raises, on failure.
 
 ## `retry`
 
