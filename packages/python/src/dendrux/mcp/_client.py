@@ -457,13 +457,7 @@ class MCPClientAdapter:
             error.redirect_target = error.destination
         return error
 
-    async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-        *,
-        timeout: float | None = None,
-    ) -> Any:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         client = self._require_client()
         attempt = _ToolHTTPAttempt(self, name)
         token = _tool_http_attempt.set(attempt)
@@ -471,7 +465,7 @@ class MCPClientAdapter:
             return await client.call_tool(
                 name,
                 arguments,
-                read_timeout_seconds=self.source.call_timeout if timeout is None else timeout,
+                read_timeout_seconds=self.source.call_timeout,
             )
         except Exception as exc:
             failure = exc

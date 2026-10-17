@@ -505,15 +505,24 @@ class MCPConnection:
         telemetry, result normalization, credential redaction and the same
         error mapping — and returns the payload an Agent tool would receive.
 
+        .. warning::
+           This bypasses all Agent governance: tool deny lists, hooks,
+           approvals and guardrails; it is not persisted to any run, counts
+           against no budget, and applies no tenant authorization beyond the
+           connection's own identity. Never expose it directly to a model or
+           an untrusted client; the application must authorize each call.
+
         An unlisted ``name`` raises :class:`MCPToolNotFoundError` before
         anything is sent. A result the server flags as an error raises
-        :class:`MCPToolCallError`. ``timeout`` (seconds) replaces the source's
-        ``call_timeout`` for this call only.
+        :class:`MCPToolCallError`. ``timeout`` (seconds) is an extra outer
+        deadline over the whole operation, queueing and connecting included;
+        on expiry a :class:`TimeoutError` is raised and, if the call had
+        already started, its outcome is unknown. ``timeout=None`` adds no
+        deadline of its own and does not disable the source's transport
+        ``call_timeout``, which always applies.
 
-        This is outside a run, so no Agent governance applies: approvals,
-        guardrails, hooks, budgets and the run store do not see the call. The
-        application owns authorization, retries and audit. Await it on the
-        event loop that runtime is bound to, like :meth:`discover`.
+        The application owns authorization, retries and audit. Await it on
+        the event loop the runtime is bound to, like :meth:`discover`.
         """
         if not isinstance(name, str) or not name:
             raise ValueError("MCP tool name must be a non-empty string.")
@@ -528,27 +537,38 @@ class MCPConnection:
         ):
             raise ValueError("MCP call timeout must be a positive finite number of seconds.")
         runtime = self.runtime
-        entry = await runtime._lease(self)
+        deadline = asyncio.timeout(None if timeout is None else float(timeout))
         try:
-            original_tool = next((tool for tool in entry.raw_tools if tool.name == name), None)
-            if original_tool is None:
-                raise MCPToolNotFoundError(name)
-            return await runtime._execute_call(
-                self,
-                entry,
-                mcp_tool_name=name,
-                original_tool=original_tool,
-                qualified_name=name,
-                namespace=self.source.name,
-                owner=object(),
-                # The lease is held for the whole call and released below, so
-                # there is no view that could close underneath it.
-                check_lease=lambda: None,
-                params=params,
-                timeout=None if timeout is None else float(timeout),
-            )
-        finally:
-            runtime._release(self.identity, entry)
+            async with deadline:
+                entry = await runtime._lease(self)
+                try:
+                    original_tool = next(
+                        (tool for tool in entry.raw_tools if tool.name == name), None
+                    )
+                    if original_tool is None:
+                        raise MCPToolNotFoundError(name)
+                    return await runtime._execute_call(
+                        self,
+                        entry,
+                        mcp_tool_name=name,
+                        original_tool=original_tool,
+                        qualified_name=name,
+                        namespace=self.source.name,
+                        owner=object(),
+                        # The lease is held for the whole call and released
+                        # below, so no view can close underneath it.
+                        check_lease=lambda: None,
+                        params=params,
+                    )
+                finally:
+                    runtime._release(self.identity, entry)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            raise TimeoutError(
+                f"MCP tool '{name}' did not finish within {timeout:g}s. If the call had "
+                "already started, the server may still apply it; do not retry automatically."
+            ) from None
 
     def __repr__(self) -> str:
         return (
@@ -2491,7 +2511,6 @@ class MCPRuntime:
         owner: object,
         check_lease: Callable[[], None],
         params: dict[str, Any],
-        timeout: float | None = None,
     ) -> Any:
         """Run one MCP tool call under the full managed-call contract.
 
@@ -2622,7 +2641,6 @@ class MCPRuntime:
                     mcp_tool_name=mcp_tool_name,
                     max_result_bytes=connection.source.max_result_bytes,
                     exposed_name=qualified_name,
-                    call_timeout=timeout,
                 )
                 rejection: MCPAuthenticationError | None = None
                 try:

@@ -238,14 +238,12 @@ def create_mcp_executor(
     mcp_tool_name: str,
     max_result_bytes: int,
     exposed_name: str | None = None,
-    call_timeout: float | None = None,
 ) -> Callable[..., Any]:
     """Create an async Dendrux executor bound to one live MCP adapter.
 
     ``exposed_name`` is the Agent-visible name used in error text; it defaults
     to the prefixed, sanitized name. The server is always called with
-    ``mcp_tool_name``. ``call_timeout`` overrides the source's call timeout
-    for this executor only.
+    ``mcp_tool_name``.
     """
     display_name = exposed_name or exposed_tool_name(mcp_tool_name, namespace=namespace)
 
@@ -256,10 +254,7 @@ def create_mcp_executor(
         # and tuple credentials keep their exact-substring scrub in full.
         opaque = source_has_opaque_credentials(adapter.source)
         try:
-            if call_timeout is None:
-                result = await adapter.call_tool(mcp_tool_name, params)
-            else:
-                result = await adapter.call_tool(mcp_tool_name, params, timeout=call_timeout)
+            result = await adapter.call_tool(mcp_tool_name, params)
         except Exception as exc:
             failure: Exception = exc
         else:
