@@ -18,6 +18,7 @@ Suggested HTTP mappings:
     PersistenceNotConfiguredError -> 500
     SchemaNotInitializedError   -> 500
     SkillMissingError           -> 409
+    ContextLengthExceededError  -> 413 or 400
     SkillMismatchError          -> 409
 
 ``SkillValidationError`` is raised while building a :class:`~dendrux.skills.Skill`
@@ -244,7 +245,38 @@ class SkillMismatchError(SkillContinuityError):
     """Raised when every skill is attached but some have different content."""
 
 
+class ContextLengthExceededError(RuntimeError):
+    """Raised when an LLM endpoint rejects a request as too large for the model's context window.
+
+    Raised by the OpenAI-compatible providers (and therefore
+    ``OpenRouterProvider``) for both batch and streaming calls. The message
+    never contains prompt content; the original SDK exception is chained as
+    ``__cause__`` for debugging.
+
+    Attributes:
+        status_code: HTTP status the endpoint returned (``None`` for an
+            in-stream error event).
+        provider_code: Provider error code when one was sent
+            (for example ``"context_length_exceeded"``), else ``None``.
+        model: Model name the request targeted, when known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.model = model
+        super().__init__(message)
+
+
 __all__ = [
+    "ContextLengthExceededError",
     "InvalidToolResultError",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",

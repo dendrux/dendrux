@@ -11,6 +11,7 @@ except PackageNotFoundError:  # editable install before metadata exists
 from dendrux.agent import Agent
 from dendrux.context_blocks import ContextBlock
 from dendrux.errors import (
+    ContextLengthExceededError,
     InvalidToolResultError,
     PauseStatusMismatchError,
     PersistenceNotConfiguredError,
@@ -49,6 +50,7 @@ __all__ = [
     "Agent",
     "Budget",
     "ContextBlock",
+    "ContextLengthExceededError",
     "CreateRunResult",
     "DelegationDepthExceededError",
     "GovernanceEventType",

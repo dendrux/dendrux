@@ -1,0 +1,219 @@
+{
+  "_doc": "Recorded-style error responses per OpenAI-compatible backend (OpenAI, vLLM, SGLang flat, Groq, Together, Fireworks, TGI, FastAPI detail, Ollama) used by tests/unit/test_openai_gateway_errors.py.",
+  "context_overflow": {
+    "openai": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.",
+          "type": "invalid_request_error",
+          "param": "messages",
+          "code": "context_length_exceeded"
+        }
+      }
+    },
+    "openai_code_only": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "Too big.",
+          "type": "x",
+          "param": null,
+          "code": "context_length_exceeded"
+        }
+      }
+    },
+    "vllm_classic": {
+      "status": 400,
+      "body": {
+        "object": "error",
+        "message": "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens (4000 in the messages, 1000 in the completion). Please reduce the length of the messages or completion.",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+      }
+    },
+    "vllm_new": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "You passed 5000 input tokens and requested 1000 output tokens. However, the model's context length is only 4096 tokens, resulting in a maximum input length of 3096 tokens. Please reduce the length of the input prompt.",
+          "type": "BadRequestError",
+          "param": "input_tokens",
+          "code": 400
+        }
+      }
+    },
+    "sglang_flat": {
+      "status": 400,
+      "body": {
+        "object": "error",
+        "message": "Requested token count exceeds the model's maximum context length of 4096 tokens. You requested a total of 5000 tokens.",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+      }
+    },
+    "groq": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "Please reduce the length of the messages or completion.",
+          "type": "invalid_request_error",
+          "code": "context_length_exceeded"
+        }
+      }
+    },
+    "together": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 8193. Given: 9000 `inputs` tokens and 100 `max_new_tokens`",
+          "type": "invalid_request_error",
+          "param": null,
+          "code": null
+        }
+      }
+    },
+    "together_403": {
+      "status": 403,
+      "body": {
+        "error": {
+          "message": "Input token count + max_tokens parameter must be less than the context length",
+          "type": "invalid_request_error"
+        }
+      }
+    },
+    "fireworks": {
+      "status": 400,
+      "body": {
+        "error": {
+          "object": "error",
+          "type": "invalid_request_error",
+          "message": "The prompt is too long: 9000, model maximum context length: 8192"
+        }
+      }
+    },
+    "tgi_422": {
+      "status": 422,
+      "body": {
+        "error": "Input validation error: `inputs` must have less than 4096 tokens. Given: 5000",
+        "error_type": "validation"
+      }
+    },
+    "fastapi_detail": {
+      "status": 400,
+      "body": {
+        "detail": "Input length (5000 tokens) exceeds the model's context length (4096)."
+      }
+    },
+    "ollama": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "input length exceeds the context length"
+        }
+      }
+    },
+    "plain_text_body": {
+      "status": 413,
+      "text": "maximum context length exceeded"
+    },
+    "vllm_output_cap_param": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "'max_tokens' or 'max_completion_tokens' is too large: 4000. This model's maximum context length is 4096 tokens and your request has 3000 input tokens (4000 > 4096 - 3000).",
+          "type": "BadRequestError",
+          "param": "max_completion_tokens",
+          "code": 400
+        }
+      }
+    }
+  },
+  "not_context": {
+    "unknown_param": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "Unrecognized request argument supplied: foo",
+          "type": "invalid_request_error"
+        }
+      }
+    },
+    "groq_tpm_413": {
+      "status": 413,
+      "body": {
+        "error": {
+          "message": "Request too large for model `llama` in organization `org` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 9000.",
+          "type": "tokens",
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "max_tokens_too_large": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "max_tokens is too large: 99999. This model supports at most 16384 completion tokens.",
+          "type": "invalid_request_error",
+          "param": "max_tokens"
+        }
+      }
+    },
+    "rate_limit": {
+      "status": 429,
+      "body": {
+        "error": {
+          "message": "Rate limit reached",
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "auth": {
+      "status": 401,
+      "body": {
+        "error": {
+          "message": "Invalid API key",
+          "code": "invalid_api_key"
+        }
+      }
+    },
+    "server": {
+      "status": 500,
+      "body": {
+        "error": {
+          "message": "Internal server error"
+        }
+      }
+    },
+    "review_rate_limit_413": {
+      "status": 413,
+      "body": {
+        "error": {
+          "message": "Input token count exceeds the token rate limit",
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    "review_permission_403": {
+      "status": 403,
+      "body": {
+        "error": {
+          "message": "Access denied to the model with maximum context length 128000; contact your administrator",
+          "code": "permission_denied"
+        }
+      }
+    },
+    "review_output_cap_400": {
+      "status": 400,
+      "body": {
+        "error": {
+          "message": "max_tokens is too large: 32768; the maximum context length supported for output is 16384",
+          "code": "invalid_value",
+          "param": "max_tokens"
+        }
+      }
+    }
+  }
+}
