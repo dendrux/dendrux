@@ -11,6 +11,7 @@ except PackageNotFoundError:  # editable install before metadata exists
 from dendrux.agent import Agent
 from dendrux.context_blocks import ContextBlock
 from dendrux.errors import (
+    ContextLengthExceededError,
     InvalidToolResultError,
     PauseStatusMismatchError,
     PersistenceNotConfiguredError,
@@ -28,33 +29,42 @@ from dendrux.errors import (
 )
 from dendrux.loops.single import SingleCall
 from dendrux.pricing import ModelPricing, PriceTable
-from dendrux.runtime.context import DelegationDepthExceededError
+from dendrux.runtime.context import DelegationDepthExceededError, aheartbeat, heartbeat
 from dendrux.runtime.runner import run
 from dendrux.runtime.sweep import sweep
 from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult, SkillExecutor
 from dendrux.tool import tool
 from dendrux.types import (
+    ApprovalDecision,
+    BeforeToolHook,
     Budget,
     CreateRunResult,
     GovernanceEventType,
     IdempotencyConflictError,
+    PauseOutcome,
     ReplaySummary,
     RunAlreadyActiveError,
     StructuredOutputValidationError,
+    ToolCallContext,
+    ToolDecision,
     ToolResultContext,
     ToolResultTransform,
 )
 
 __all__ = [
     "Agent",
+    "ApprovalDecision",
+    "BeforeToolHook",
     "Budget",
     "ContextBlock",
+    "ContextLengthExceededError",
     "CreateRunResult",
     "DelegationDepthExceededError",
     "GovernanceEventType",
     "IdempotencyConflictError",
     "InvalidToolResultError",
     "ModelPricing",
+    "PauseOutcome",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
     "PriceTable",
@@ -77,8 +87,12 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "StructuredOutputValidationError",
+    "ToolCallContext",
+    "ToolDecision",
     "ToolResultContext",
     "ToolResultTransform",
+    "aheartbeat",
+    "heartbeat",
     "run",
     "sweep",
     "tool",

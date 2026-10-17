@@ -126,13 +126,14 @@ async def test_approved_non_skill_calls_match_main(policy):
         usage=UsageStats(),
     )
     a = Agent(prompt="test", tools=[srv, cli], deny=["srv"] if policy == "deny" else None)
-    results = await _execute_approved_tools(a, state, BaseRecorder(), None, "run")
-    assert [(tc.name, tr.success, json.loads(tr.payload)) for tc, tr in results] == [
+    approval = await _execute_approved_tools(a, state, BaseRecorder(), None, "run")
+    assert [(tc.name, tr.success, json.loads(tr.payload)) for tc, tr in approval.results] == [
         ("srv", True, "server"),
-        ("cli", True, "client-stub"),
     ]
-    assert order == ["srv-start", "srv-end", "cli"]
-    assert [m.name for m in state.history[-2:]] == ["srv", "cli"]
+    # A client-target call is never executed server-side on approval (A-P0-1).
+    assert [tc.name for tc in approval.client_pending] == ["cli"]
+    assert order == ["srv-start", "srv-end"]
+    assert [m.name for m in state.history[-1:]] == ["srv"]
 
 
 @pytest.mark.parametrize("outcome", [None, {"stdout": "x"}, "own_timeout"])

@@ -235,6 +235,8 @@ class ToolResult:
     success: bool = True
     error: str | None = None
     duration_ms: int = 0
+    # Runtime annotations persisted on the tool_calls row (e.g. ``substituted``).
+    meta: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -262,6 +264,93 @@ The return value ALWAYS replaces the result — return ``ctx.result`` to leave
 it unchanged (``None`` is a legitimate new result, not "unchanged"). Sync and
 async callables are both accepted. See ``Agent(tool_result_transform=...)``.
 """
+
+
+@dataclass(frozen=True)
+class ToolCallContext:
+    """What a ``before_tool`` policy hook sees for one tool call.
+
+    ``params`` and ``meta`` are deep copies taken for the hook: mutating
+    them never changes what executes. ``params`` are deanonymized (real
+    values, not guardrail placeholders). ``source`` is ``"local"`` for
+    ``@tool`` functions, ``"mcp"`` for MCP tools and ``"skill"`` for the
+    built-in skill tools. ``tenant_id`` is the run's tenant (``None`` when
+    unset or when the run is not persisted).
+    """
+
+    run_id: str
+    call_id: str
+    tool_name: str
+    params: dict[str, Any]
+    target: ToolTarget
+    source: Literal["local", "mcp", "skill"]
+    meta: dict[str, Any]
+    iteration: int
+    tenant_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolDecision:
+    """A ``before_tool`` hook's verdict for one tool call.
+
+    Build one with :meth:`allow`, :meth:`deny`, :meth:`require_approval`
+    or :meth:`substitute`. Returning ``None`` from the hook means allow.
+    """
+
+    kind: Literal["allow", "deny", "require_approval", "substitute"]
+    reason: str | None = None
+    result: Any = None
+
+    @classmethod
+    def allow(cls) -> ToolDecision:
+        """Run the tool normally."""
+        return cls(kind="allow")
+
+    @classmethod
+    def deny(cls, reason: str) -> ToolDecision:
+        """Do not run the tool; the model receives ``{"denied": reason}``."""
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("ToolDecision.deny() requires a non-empty reason string.")
+        return cls(kind="deny", reason=reason)
+
+    @classmethod
+    def require_approval(cls, reason: str | None = None) -> ToolDecision:
+        """Pause the batch for human approval (server-target tools only)."""
+        return cls(kind="require_approval", reason=reason)
+
+    @classmethod
+    def substitute(cls, result: Any) -> ToolDecision:
+        """Do not run the tool; ``result`` (JSON-serializable) is the tool output."""
+        return cls(kind="substitute", result=result)
+
+
+BeforeToolHook: TypeAlias = Callable[
+    [ToolCallContext], "ToolDecision | None | Awaitable[ToolDecision | None]"
+]
+"""Policy hook evaluated before every tool call. See ``Agent(before_tool=...)``."""
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    """A human decision for one approval-gated tool call.
+
+    Used with ``Agent.submit_approval(run_id, decisions={call_id: ...})``.
+    """
+
+    approved: bool
+    reason: str | None = None
+
+    @classmethod
+    def approve(cls) -> ApprovalDecision:
+        """Run the call."""
+        return cls(approved=True)
+
+    @classmethod
+    def deny(cls, reason: str | None = None) -> ApprovalDecision:
+        """Skip the call; the model receives ``{"denied": reason}``."""
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("ApprovalDecision.deny() reason must be a string or None.")
+        return cls(approved=False, reason=reason)
 
 
 @dataclass
@@ -311,37 +400,88 @@ class UsageStats:
     cost_unknown: bool = False
 
 
+BudgetAction: TypeAlias = Literal["warn", "pause", "cancel"]
+_BUDGET_ACTIONS = ("warn", "pause", "cancel")
+
+
 @dataclass(frozen=True)
 class Budget:
-    """Token budget for advisory spend tracking.
+    """Token and/or dollar budget for a run and, by default, its delegated children.
 
-    Non-blocking in v1 — fires governance events (budget.threshold,
-    budget.exceeded) but does not pause or stop the run. Developers
-    observe events and take action in their own integration.
+    Usage is checked after every LLM response and at the top of every
+    iteration. ``budget.threshold`` fires once per ``(metric, fraction)``
+    when a ``warn_at`` fraction is first crossed and ``budget.exceeded``
+    once per metric when its limit is reached; every payload carries
+    ``metric`` (``"tokens"`` or ``"cost_usd"``), ``used`` and ``max``. Fired
+    keys survive pause/resume, so a resumed run does not re-fire them.
+
+    ``on_exceed`` decides what happens once a limit is reached:
+
+    - ``"warn"`` (default): events only; the run continues.
+    - ``"pause"``: durable pause (``RunStatus.PAUSED``, ``pause_reason="budget"``).
+    - ``"cancel"``: ``RunStatus.CANCELLED`` with ``failure_reason="budget_exceeded"``.
+
+    Pause and cancel take effect at the next top-of-iteration checkpoint,
+    after the tools of the response that crossed the limit have run, so a
+    run can overshoot by up to one iteration. A response that finishes the
+    run still completes. Cancellation and requested pauses take precedence
+    over a budget pause at the same checkpoint. ``SingleCall`` has no
+    checkpoint: pause/cancel degrade to warn there.
+
+    Resuming a budget pause succeeds only if the resuming Agent's limits are
+    strictly above the current live usage; otherwise the run pauses again
+    immediately with the same reason.
+
+    With a state store, usage is read live from recorded LLM calls; with
+    ``include_children=True`` it is the root-inclusive rollup of the run and
+    all its delegated descendants. The cost limit counts priced calls only:
+    unpriced calls (no provider cost and no ``PriceTable`` entry) emit one
+    ``budget.unpriced`` event per run and are otherwise ignored.
 
     Args:
-        max_tokens: Advisory token cap (must be > 0). Events fire when
-            usage crosses warn_at fractions and when usage reaches
-            this value.
-        warn_at: Fractions of max_tokens at which budget.threshold
-            events fire. Each fraction must be in (0, 1) exclusive.
-            Each fraction fires exactly once per run.
+        max_tokens: Token limit (input + output, > 0), or None.
+        warn_at: Fractions of each limit at which ``budget.threshold``
+            fires. Each fraction must be in (0, 1) exclusive.
             Default: (0.5, 0.75, 0.9).
+        max_cost_usd: Dollar limit (> 0), or None.
+        on_exceed: ``"warn"``, ``"pause"`` or ``"cancel"``.
+        include_children: Count delegated descendant runs' usage.
 
     Raises:
-        ValueError: If max_tokens <= 0 or any warn_at fraction is
-            outside (0, 1) exclusive.
+        ValueError: If neither limit is set, a limit is not positive, a
+            ``warn_at`` fraction is outside (0, 1), or ``on_exceed`` is unknown.
     """
 
-    max_tokens: int
+    max_tokens: int | None = None
     warn_at: tuple[float, ...] = (0.5, 0.75, 0.9)
+    max_cost_usd: float | None = None
+    on_exceed: BudgetAction = "warn"
+    include_children: bool = True
 
     def __post_init__(self) -> None:
-        if self.max_tokens <= 0:
+        if self.max_tokens is None and self.max_cost_usd is None:
+            raise ValueError("Budget needs max_tokens and/or max_cost_usd.")
+        if self.max_tokens is not None and (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or self.max_tokens <= 0
+        ):
             raise ValueError(f"Budget max_tokens must be > 0, got {self.max_tokens}.")
+        if self.max_cost_usd is not None and (
+            isinstance(self.max_cost_usd, bool)
+            or not isinstance(self.max_cost_usd, (int, float))
+            or not (0 < self.max_cost_usd < float("inf"))
+        ):
+            raise ValueError(f"Budget max_cost_usd must be > 0, got {self.max_cost_usd}.")
         for f in self.warn_at:
             if not (0 < f < 1):
                 raise ValueError(f"Budget warn_at fractions must be in (0, 1) exclusive, got {f}.")
+        if self.on_exceed not in _BUDGET_ACTIONS:
+            raise ValueError(
+                f"Budget on_exceed must be one of {_BUDGET_ACTIONS}, got {self.on_exceed!r}."
+            )
+        if not isinstance(self.include_children, bool):
+            raise ValueError("Budget include_children must be a bool.")
 
 
 @dataclass
@@ -402,6 +542,8 @@ class RunStatus(StrEnum):
     WAITING_CLIENT_TOOL = "waiting_client_tool"
     WAITING_HUMAN_INPUT = "waiting_human_input"
     WAITING_APPROVAL = "waiting_approval"
+    # Durable cooperative pause requested via ``Agent.request_pause``.
+    PAUSED = "paused"
     SUCCESS = "success"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -429,9 +571,15 @@ class GovernanceEventType(StrEnum):
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
 
+    # before_tool policy hook
+    POLICY_SUBSTITUTED = "policy.substituted"
+    POLICY_HOOK_ERROR = "policy.hook_error"
+    POLICY_HOOK_WARNING = "policy.hook_warning"
+
     # Wave 3: Budget
     BUDGET_THRESHOLD = "budget.threshold"
     BUDGET_EXCEEDED = "budget.exceeded"
+    BUDGET_UNPRICED = "budget.unpriced"
 
     # Wave 4: Guardrails
     GUARDRAIL_DETECTED = "guardrail.detected"
@@ -454,6 +602,9 @@ class GovernanceEventType(StrEnum):
     # Provider transport: vendor-SDK retry observability
     PROVIDER_RETRY = "provider.retry"
 
+    # Run control: inbox note delivered to the model (payload: note_id only)
+    INBOX_DELIVERED = "inbox.delivered"
+
 
 @dataclass
 class RunResult:
@@ -471,8 +622,11 @@ class RunResult:
     a stream early persists that buffer as the run's answer. It can be None
     even if earlier turns produced text. Cancelling the coroutine awaiting run()
     re-raises CancelledError rather than returning a RunResult; it does not
-    capture in-flight model text. Paused runs may carry a clarification
-    question in ``answer``.
+    capture in-flight model text. ``Agent.cancel_run`` from the same process
+    instead makes run() return CANCELLED with ``meta["interrupted"]=True`` and
+    ``meta["partial_output"]=False``. Paused runs may carry a clarification
+    question in ``answer``. ``meta["undelivered_notes"]`` lists inbox note ids
+    a finished run never delivered (only present when there are any).
     """
 
     run_id: str
@@ -486,6 +640,35 @@ class RunResult:
     meta: dict[str, Any] = field(default_factory=dict)
     commentary: list[str] = field(default_factory=list)
     replay: ReplaySummary | None = None
+
+
+PauseRequestOutcome: TypeAlias = Literal[
+    "requested", "already_waiting", "already_paused", "terminal"
+]
+
+
+@dataclass(frozen=True)
+class PauseOutcome:
+    """Result of :meth:`Agent.request_pause`.
+
+    ``status_before`` / ``status_after`` are the root run's status when the
+    request started and after it was recorded. ``affected`` lists every run
+    the request touched as ``(run_id, outcome)``, deepest descendants first
+    and the root last:
+
+    - ``"requested"``: the run was RUNNING; it pauses at its next checkpoint.
+    - ``"already_waiting"``: WAITING_*; already durable, nothing latched.
+    - ``"already_paused"``: already PAUSED.
+    - ``"terminal"``: already finished; nothing to pause.
+
+    Returning is not confirmation that a run paused: ``run.paused`` in the
+    event log (status ``paused``) confirms it.
+    """
+
+    run_id: str
+    status_before: RunStatus
+    status_after: RunStatus
+    affected: list[tuple[str, PauseRequestOutcome]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -547,6 +730,28 @@ class PauseState:
     trace_order_offset: int
     usage: UsageStats
     pending_targets: dict[str, str] = field(default_factory=dict)  # tool_call_id → target
+    # Approval-gated call ids at pause time: {call_id: {"source", "reason"}}.
+    # None on non-approval pauses and on pauses persisted before 0.3.0.
+    approval_gates: dict[str, dict[str, str | None]] | None = None
+    # Why a PAUSED run paused ("requested" or "budget"); None for WAITING_* pauses.
+    pause_reason: str | None = None
+    # Free-text reason given to ``Agent.request_pause(reason=...)``.
+    pause_message: str | None = None
+    # Decisions already made for pending calls of a pause that interrupted an
+    # approval batch: {call_id: {"approved": bool, "reason": str | None}}.
+    # Resume executes them without asking for approval again.
+    pending_decisions: dict[str, dict[str, Any]] | None = None
+    # Budget events already emitted, as (metric, threshold); threshold 1.0 is
+    # "exceeded". Persisted on every pause so a resumed run does not re-fire.
+    budget_fired: list[tuple[str, float]] | None = None
+    # Whether ``budget.unpriced`` was already emitted for this run.
+    budget_unpriced_reported: bool = False
+    # Limits a budget pause hit: [{"metric", "used", "max"}]. Budget pauses only.
+    budget_exceeded: list[dict[str, Any]] | None = None
+    # Own priced spend and unpriced-call count, persisted when the run total
+    # is unknown (mixed priced/unpriced) so stores without live rollups keep it.
+    budget_known_cost_usd: float | None = None
+    budget_unpriced_calls: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -566,6 +771,24 @@ class PauseState:
             "trace_order_offset": self.trace_order_offset,
             "usage": _usage_to_dict(self.usage),
         }
+        if self.approval_gates is not None:
+            d["approval_gates"] = self.approval_gates
+        if self.pause_reason is not None:
+            d["pause_reason"] = self.pause_reason
+        if self.pause_message is not None:
+            d["pause_message"] = self.pause_message
+        if self.pending_decisions is not None:
+            d["pending_decisions"] = self.pending_decisions
+        if self.budget_fired:
+            d["budget_fired"] = [[metric, threshold] for metric, threshold in self.budget_fired]
+        if self.budget_unpriced_reported:
+            d["budget_unpriced_reported"] = True
+        if self.budget_exceeded is not None:
+            d["budget_exceeded"] = self.budget_exceeded
+        if self.budget_known_cost_usd is not None:
+            d["budget_known_cost_usd"] = self.budget_known_cost_usd
+        if self.budget_unpriced_calls:
+            d["budget_unpriced_calls"] = self.budget_unpriced_calls
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -588,6 +811,15 @@ class PauseState:
             iteration=data["iteration"],
             trace_order_offset=data["trace_order_offset"],
             usage=_usage_from_dict(data["usage"]),
+            approval_gates=data.get("approval_gates"),
+            pause_reason=data.get("pause_reason"),
+            pause_message=data.get("pause_message"),
+            pending_decisions=data.get("pending_decisions"),
+            budget_fired=[(str(m), float(t)) for m, t in data.get("budget_fired") or []] or None,
+            budget_unpriced_reported=bool(data.get("budget_unpriced_reported", False)),
+            budget_exceeded=data.get("budget_exceeded"),
+            budget_known_cost_usd=data.get("budget_known_cost_usd"),
+            budget_unpriced_calls=int(data.get("budget_unpriced_calls") or 0),
         )
 
 

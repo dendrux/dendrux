@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
+from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
@@ -37,7 +38,7 @@ from dendrux.loops._helpers import (
     record_message,
 )
 from dendrux.loops.base import Loop
-from dendrux.loops.react import _check_budget, _interrupted_result
+from dendrux.loops.react import _interrupted_result
 from dendrux.types import (
     Message,
     Role,
@@ -61,7 +62,35 @@ if TYPE_CHECKING:
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import AgentStep, LLMResponse
+    from dendrux.types import AgentStep, Budget, LLMResponse
+
+
+async def _single_call_budget(
+    budget: Budget | None,
+    usage: UsageStats,
+    run_id: str,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    warnings: list[str],
+) -> None:
+    """Budget events for the one LLM call.
+
+    There is no checkpoint after it, so ``on_exceed="pause"``/``"cancel"``
+    degrade to warn (``budget.exceeded`` reports ``action="warn"``).
+    """
+    if budget is None:
+        return
+    # The tracker seeds its spend from the usage it is given: here, the call.
+    tracker = BudgetTracker(
+        budget,
+        run_id=run_id,
+        usage=usage,
+        recorder=recorder,
+        notifier=notifier,
+        warnings=warnings,
+        enforce=False,
+    )
+    await tracker.evaluate(1)
 
 
 class SingleCall(Loop):
@@ -376,14 +405,12 @@ class SingleCall(Loop):
                     duration_ms=llm_duration_ms,
                     guardrail_findings=_sc_findings or None,
                 )
-                await _check_budget(
+                await _single_call_budget(
                     agent.budget,
                     response.usage,
-                    [],
+                    resolved_run_id,
                     recorder,
                     notifier,
-                    resolved_run_id,
-                    1,
                     notifier_warnings,
                 )
                 await record_governance(
@@ -454,15 +481,8 @@ class SingleCall(Loop):
             cost_unknown=response.usage.cost_usd is None,
         )
 
-        await _check_budget(
-            agent.budget,
-            usage,
-            [],
-            recorder,
-            notifier,
-            resolved_run_id,
-            1,
-            notifier_warnings,
+        await _single_call_budget(
+            agent.budget, usage, resolved_run_id, recorder, notifier, notifier_warnings
         )
 
         sc_meta = guardrail_meta(g_engine, notifier_warnings)
@@ -721,15 +741,8 @@ class SingleCall(Loop):
             cost_unknown=llm_response.usage.cost_usd is None,
         )
 
-        await _check_budget(
-            agent.budget,
-            usage,
-            [],
-            recorder,
-            notifier,
-            resolved_run_id,
-            1,
-            notifier_warnings,
+        await _single_call_budget(
+            agent.budget, usage, resolved_run_id, recorder, notifier, notifier_warnings
         )
 
         sc_stream_meta: dict[str, Any] = {}

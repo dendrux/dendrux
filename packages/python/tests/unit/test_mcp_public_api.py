@@ -117,6 +117,7 @@ EXPECTED_ALL = (
     "MCPToolCallStarted",
     "MCPToolInfo",
     "MCPToolNameCollisionError",
+    "MCPToolNotFoundError",
     "MCPToolPolicy",
     "MCPToolView",
     "check_oauth_store",

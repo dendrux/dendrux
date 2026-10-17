@@ -13,6 +13,7 @@ from dendrux.errors import (
     RunAlreadyClaimedError, RunAlreadyTerminalError, InvalidToolResultError,
     PersistenceNotConfiguredError, SchemaNotInitializedError,
     SkillValidationError, SkillMissingError, SkillMismatchError,
+    ContextLengthExceededError,
 )
 ```
 
@@ -26,15 +27,16 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | `RunNotPausedError(run_id, current_status)` | `RuntimeError` | A submit method is called on a run that is not paused. | 409 |
 | `PauseStatusMismatchError(run_id, current_status, expected_status)` | `RuntimeError` | Submit called for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). | 409 |
 | `RunAlreadyClaimedError(run_id)` | `RuntimeError` | A concurrent submit already won the CAS claim on this pause. | 409 |
-| `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method targets a run that is already terminal. (`cancel_run` does not raise this.) | 409 |
+| `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method, or `submit_note`, targets a run that is already terminal; also a submit on a run whose cancellation was requested but not yet observed. (`cancel_run` and `request_pause` do not raise this.) | 409 |
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set (unknown or duplicate ids). | 400 |
 | `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` / `DENDRUX_DATABASE_URL` is configured. | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
+| `ContextLengthExceededError(message, status_code=, provider_code=, model=)` | `RuntimeError` | An OpenAI-compatible endpoint (`OpenAIProvider`, `OpenRouterProvider`) rejected a batch or streaming request as larger than the model's context window. The SDK error is chained as `__cause__`; the message never contains prompt content. See [Models and providers](/docs/architecture/models#request-errors-on-openai-compatible-endpoints). | 413 or 400 |
 | `SkillValidationError(message, field=)` | `ValueError` | A [skill](/docs/architecture/skills) is built with an invalid name, description, file path, metadata, or frontmatter. `field` names the offender. | 400 |
 | `SkillMissingError(run_id, missing=, mismatched=)` | `SkillContinuityError` | A paused run is continued on an agent that lacks a skill the run was created with. The run stays paused. | 409 |
 | `SkillMismatchError(run_id, mismatched=)` | `SkillContinuityError` | Every skill is attached, but at least one has different content (digest) than the run was created with. The run stays paused. | 409 |
 
-Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling. `SkillMissingError` and `SkillMismatchError` share the base class `SkillContinuityError` (a `RuntimeError`) and expose `err.missing` and `err.mismatched`; see the [resume contract](/docs/architecture/skills#resume-contract).
+Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling. `ContextLengthExceededError` carries `err.status_code`, `err.provider_code` and `err.model`. `SkillMissingError` and `SkillMismatchError` share the base class `SkillContinuityError` (a `RuntimeError`) and expose `err.missing` and `err.mismatched`; see the [resume contract](/docs/architecture/skills#resume-contract).
 
 ## Also exported from `dendrux`
 
@@ -46,6 +48,22 @@ A few related exceptions live on the package root rather than `dendrux.errors`:
 | `IdempotencyConflictError` | An `idempotency_key` collides with a different request fingerprint. |
 | `StructuredOutputValidationError` | A SingleCall `output_type` fails validation. |
 | `DelegationDepthExceededError` | A sub-agent exceeds `max_delegation_depth`. |
+
+## Errors raised by the new run-control methods
+
+The 0.3.0 methods reuse the hierarchy above. These are the cases worth knowing:
+
+| Call | Raises |
+| --- | --- |
+| `submit_approval(decisions=...)` | `ValueError` for both or neither of `approved=` / `decisions=`, for `rejection_reason` with `decisions`, and for a missing, unknown or duplicate call id. Raised before anything is claimed. |
+| `submit_resume(run_id)` | `PauseStatusMismatchError` when the run is paused for another reason (for example `waiting_approval`), plus the usual resume errors. |
+| `request_pause(run_id)` | `RunNotFoundError`, `ValueError` for a bad `reason`. A `waiting_*`, `paused` or terminal run is a no-op, not an error. |
+| `submit_note(run_id, text)` | `ValueError` for empty or oversized text or bad metadata, `RunNotFoundError`, `RunAlreadyTerminalError`. |
+| `cancel_run(..., cascade=True)`, `request_pause`, `submit_note`, `RunStore.get_notes` or `RunStore.get_subtree` on a custom pre-0.3 `StateStore` | `NotImplementedError` naming the missing store method. Existing flows on such a store keep working. |
+| `RunStore.get_subtree` / `get_notes(tenant_id=...)` | `dendrux.store.RunNotFoundError`, a separate class from `dendrux.errors.RunNotFoundError`. |
+| `MCPConnection.call_tool` | `MCPToolNotFoundError` for an unlisted tool name, `MCPToolCallError` for a server error result, `TimeoutError` when `timeout=` expires. See [MCP](/docs/architecture/mcp#calling-a-tool-directly). |
+| `Agent(before_tool=...)` with `SingleCall` | `ValueError` at construction. |
+| A delegated run with a `tenant_id` different from its parent's | `ValueError` before the child run is created. |
 
 ## MCP errors
 

@@ -21,10 +21,13 @@ Distributed/worker boundaries require explicit propagation (future work).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable
@@ -81,6 +84,11 @@ class DelegationContext:
             parent run. Used to deduplicate warnings when an orchestrator
             fans out to many child runs. Mutable set on a frozen dataclass —
             frozen prevents field reassignment, not mutation of the set.
+        tenant_id: This run's tenant. Delegated runs inherit it.
+        state_store: The store this run persists to (None if ephemeral);
+            used by :func:`heartbeat`.
+        loop: The event loop the run executes on; lets :func:`heartbeat`
+            schedule its write from a sync tool's worker thread.
     """
 
     run_id: str
@@ -89,6 +97,10 @@ class DelegationContext:
     store_identity: str | None = None
     max_delegation_depth: int | None = None
     warned_mismatches: set[str] = field(default_factory=set)
+    tenant_id: str | None = None
+    state_store: Any = field(default=None, compare=False, repr=False)
+    loop: asyncio.AbstractEventLoop | None = field(default=None, compare=False, repr=False)
+    _heartbeat_at: list[float] = field(default_factory=lambda: [0.0], compare=False, repr=False)
 
     def __hash__(self) -> int:
         return hash(self.run_id)
@@ -141,6 +153,101 @@ def get_store_identity(store: object | None) -> str | None:
     if identity is not None:
         return str(identity)
     return str(id(store))
+
+
+# ---------------------------------------------------------------------------
+# Tenant inheritance — delegated runs belong to their parent's tenant
+# ---------------------------------------------------------------------------
+
+
+def resolve_child_tenant(parent_ctx: DelegationContext | None, tenant_id: str | None) -> str | None:
+    """Effective tenant for a new run.
+
+    A root run keeps ``tenant_id``. A delegated run inherits the parent's
+    tenant when ``tenant_id`` is None; an explicit different tenant raises
+    ``ValueError`` before anything is created.
+    """
+    if parent_ctx is None:
+        return tenant_id
+    if tenant_id is None:
+        return parent_ctx.tenant_id
+    if tenant_id != parent_ctx.tenant_id:
+        raise ValueError(
+            f"Delegated run cannot use tenant_id={tenant_id!r}: its parent run "
+            f"{parent_ctx.run_id} belongs to tenant {parent_ctx.tenant_id!r}. "
+            "Child runs inherit the parent's tenant; omit tenant_id."
+        )
+    return tenant_id
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat — keep a long-running tool's run from being swept as stale
+# ---------------------------------------------------------------------------
+
+_HEARTBEAT_MIN_INTERVAL_S = 1.0
+_heartbeat_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _touch(store: Any, run_id: str) -> None:
+    try:
+        await store.touch_progress(run_id)
+    except Exception:
+        logger.warning("Heartbeat failed for run %s", run_id, exc_info=True)
+
+
+def _heartbeat_target() -> DelegationContext | None:
+    """The persisted run executing here, if any, rate-limited per run."""
+    ctx = get_delegation_context()
+    if ctx is None or not ctx.persisted or ctx.state_store is None:
+        return None
+    now = time.monotonic()
+    if now - ctx._heartbeat_at[0] < _HEARTBEAT_MIN_INTERVAL_S:
+        return None
+    ctx._heartbeat_at[0] = now
+    return ctx
+
+
+def heartbeat() -> None:
+    """Record forward progress for the run executing the current tool.
+
+    Fire-and-forget and thread-safe: callable from async tools and from sync
+    tools (which run in a worker thread). It schedules a ``last_progress_at``
+    update on the run's event loop and returns immediately, so a long wait
+    inside a tool is not swept as ``stale_running``. Calls closer than one
+    second apart for the same run are coalesced. No-op outside a persisted
+    run.
+    """
+    ctx = _heartbeat_target()
+    if ctx is None or ctx.loop is None:
+        return
+    loop, store, run_id = ctx.loop, ctx.state_store, ctx.run_id
+
+    def _schedule() -> None:
+        task = loop.create_task(_touch(store, run_id))
+        _heartbeat_tasks.add(task)
+        task.add_done_callback(_heartbeat_tasks.discard)
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        _schedule()
+        return
+    # A closed loop raises RuntimeError: the run is gone, nothing to record.
+    with contextlib.suppress(RuntimeError):
+        loop.call_soon_threadsafe(_schedule)
+
+
+async def aheartbeat() -> None:
+    """Awaitable :func:`heartbeat`: writes ``last_progress_at`` before returning.
+
+    Must be awaited on the run's event loop (inside an async tool). Failures
+    are logged, never raised. No-op outside a persisted run.
+    """
+    ctx = _heartbeat_target()
+    if ctx is not None:
+        await _touch(ctx.state_store, ctx.run_id)
 
 
 # ---------------------------------------------------------------------------

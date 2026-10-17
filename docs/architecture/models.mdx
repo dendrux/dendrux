@@ -55,6 +55,34 @@ OpenAIProvider(model="llama-3.3-70b", base_url="https://api.groq.com/openai/v1",
 
 When `base_url` points away from the official endpoint, dendrux drops OpenAI-specific request fields (the prompt-cache key, the OpenAI-only output-token parameter) that some compatible backends reject. You get the universal request shape automatically.
 
+## Request errors on OpenAI-compatible endpoints
+
+Compatible servers report problems in slightly different ways. `OpenAIProvider` (and therefore `OpenRouterProvider`) classifies API status errors and in-stream error events for batch calls, stream creation, and stream iteration. SDK timeout and connection errors keep Dendrux's existing transport mappings. There are three outcomes for the classified errors, checked in this order:
+
+1. **Context window exceeded** raises `ContextLengthExceededError`.
+2. **Streaming not supported** (streaming calls only) raises `NotImplementedError`, the same as before.
+3. **Any other status error** is re-raised unchanged, exactly as the SDK raised it.
+
+```python
+from dendrux import ContextLengthExceededError
+
+try:
+    result = await agent.run(user_input, history=history)
+except ContextLengthExceededError as exc:
+    # exc.status_code, exc.provider_code, exc.model; the SDK error is exc.__cause__
+    history = history[-6:]          # trim and try again, or tell the user
+```
+
+`ContextLengthExceededError` is a `RuntimeError`, importable from `dendrux` and `dendrux.errors`. It carries `status_code` (`None` for an error event inside a stream), `provider_code` (for example `"context_length_exceeded"`) and `model`. The message names the model and never contains prompt content. As with any provider exception, the run row ends in `error` before the exception reaches you.
+
+What counts as a context overflow:
+
+- The provider code `context_length_exceeded` when the status is absent (an in-stream event) or is 400, 403, 413, or 422. A response with any other status, such as 500, is returned as the original SDK status error.
+- Otherwise a 400, 403, 413 or 422 whose text matches the wording servers use for an oversized request ("maximum context length", "input is too long", and similar, matched case-insensitively). On a 403 only the one documented formula is accepted, because an auth error can describe a model's context length without being one.
+- Errors with a rate-limit, quota, permission or authentication code are never overflows, even if their text mentions tokens. A complaint about the `max_tokens` setting alone is a request-configuration error, not an overflow, unless the text also counts the prompt's input tokens.
+
+Two other gateway fixes ride along. A streaming request that fails with an ordinary 400 (a bad parameter, say) used to be reported as "this endpoint does not support streaming"; now only a 400 that says streaming is unsupported (or whose `param` is `stream`) is mapped that way, and every other error surfaces as itself. And a backend that ends a stream without ever sending a `finish_reason` no longer loses its buffered tool calls: they are flushed when the stream ends.
+
 ## The output-token cap is per-API
 
 Every provider takes a constructor default for the maximum output tokens per call and lets you override it per call via kwargs. The wire parameter name differs by API, and dendrux picks the right one for you:

@@ -37,6 +37,7 @@ from dendrux.mcp import (
     MCPToolCallError,
     MCPToolCallStarted,
     MCPToolNameCollisionError,
+    MCPToolNotFoundError,
     MCPToolPolicy,
     error_code_for,
 )
@@ -634,6 +635,7 @@ _IDENTITY = (None, "c")
         (MCPConnectionEvictingError(_IDENTITY, "evicting"), "connection_state"),
         (MCPConnectionStateError(_IDENTITY, "other"), "connection_state"),
         (MCPToolNameCollisionError("clash"), "tool_name_collision"),
+        (MCPToolNotFoundError("missing"), "tool_not_found"),
         (ValueError("names"), "invalid_tool_names"),
         (MCPToolCallError("failed"), "unknown"),
         (ConnectionError("refused"), "unknown"),

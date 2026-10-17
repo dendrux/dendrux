@@ -50,14 +50,20 @@ async def count_runs(*, status=..., agent_name=..., parent_run_id=...,
 
 async def get_run(run_id: str) -> RunDetail | None
 async def get_events(run_id: str, *, after_sequence_index: int | None = None,
-                     limit: int | None = None) -> list[StoredEvent]
+                     limit: int | None = None, event_types: list[str] | None = None,
+                     before: datetime | None = None) -> list[StoredEvent]
 async def stream_events(run_id: str, *, after_sequence_index: int | None = None,
                         poll_interval_s: float = 0.5) -> AsyncIterator[StoredEvent]
-async def get_llm_calls(run_id: str, *, iteration=None, limit=None, offset=0) -> list[LLMCall]
-async def get_tool_invocations(run_id: str, *, iteration=None, limit=None, offset=0) -> list[ToolInvocation]
+async def get_llm_calls(run_id: str, *, iteration=None, limit=None, offset=0,
+                        before: datetime | None = None) -> list[LLMCall]
+async def get_tool_invocations(run_id: str, *, iteration=None, limit=None, offset=0,
+                               before: datetime | None = None) -> list[ToolInvocation]
 async def get_traces(run_id: str, *, limit=None, offset=0) -> list[TraceEntry]
 async def get_pauses(run_id: str) -> list[PausePair]
 async def get_pii_mapping(run_id: str) -> dict[str, str]
+async def get_subtree(run_id: str, *, tenant_id: str | None = ...) -> RunSubtree
+async def get_notes(run_id: str, *, undelivered_only: bool = False,
+                    tenant_id: str | None = ...) -> list[RunNote]
 ```
 
 | Method | Returns | Notes |
@@ -72,6 +78,47 @@ async def get_pii_mapping(run_id: str) -> dict[str, str]
 | `get_traces` | `TraceEntry` list | Conversation messages in order. |
 | `get_pauses` | `PausePair` list | HITL pause/resume cycles. |
 | `get_pii_mapping` | `dict[str, str]` | Placeholder to real value. See [PII redaction](/docs/architecture/pii-redaction). |
+| `get_subtree` | `RunSubtree` | A run, its delegated descendants and live rolled-up usage. |
+| `get_notes` | `RunNote` list | Inbox notes submitted with `submit_note`, delivered or not. |
+
+### `get_subtree`
+
+A delegated run has child runs, which may have children of their own. `get_subtree` returns the whole tree under a run, with usage rolled up:
+
+```python
+tree = await store.get_subtree(run_id)
+for node in tree.nodes:                       # breadth-first, root first
+    print("  " * node.depth, node.run.run_id, node.run.status, node.usage.known_cost_usd)
+print(tree.usage.input_tokens, tree.usage.output_tokens, tree.usage.cost_usd)
+```
+
+- `RunSubtree` has `root_run_id`, `nodes` (a `SubtreeNode` each: `run` as a `RunSummary`, `depth` below the root, and that run's own `usage`), `usage` (the sum over every node) and a `root` property.
+- `RunUsage` has `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `cost_usd`, `known_cost_usd`, `unpriced_calls` and `llm_calls`. `known_cost_usd` is the sum over the priced calls; `cost_usd` equals it only when every call was priced and is `None` when any was not (an unknown cost is never counted as zero).
+- **`RunSubtree.usage` is the live rollup of successfully recorded `llm_interactions`.** It includes unfinished runs, but interaction writes are best-effort, so it is not a billing guarantee. The `total_*` fields on each node's `RunSummary` are the snapshots persisted on `agent_runs` and may lag, or read 0 for a run still in progress. Use `usage` for live spend; this is also the figure [budgets](/docs/architecture/budget) enforce.
+- The reads are best-effort, not one snapshot transaction. A run that is still writing can make the node list and the usage differ by a call or a child.
+- **Tenancy.** Omit `tenant_id` for a trusted, unscoped read of all descendants. Pass a string to scope to that tenant, or an explicit `None` to scope to untenanted runs. The root must be in scope (otherwise it reads as missing) and so must every descendant; a run outside the scope is excluded together with everything below it.
+- Raises `dendrux.store.RunNotFoundError` if the root does not exist or is out of scope.
+
+### `get_notes`
+
+```python
+notes = await store.get_notes(run_id, undelivered_only=True)
+```
+
+The run's [inbox](/docs/architecture/inbox) notes as `RunNote` records (`note_id`, `run_id`, `text`, `metadata`, `created_at`, `delivered_at`, `delivered_iteration`) in delivery order. `delivered_at` is `None` for a note the model has not seen. With `tenant_id=` the run must belong to exactly that tenant or `dendrux.store.RunNotFoundError` is raised; without it, a missing run gives an empty list.
+
+> `dendrux.store.RunNotFoundError` (raised by `RunStore` reads) is a separate class from `dendrux.errors.RunNotFoundError` (raised by `Agent` methods). Catch the one that matches the API you called.
+
+### Time and type filters
+
+`get_events`, `get_llm_calls` and `get_tool_invocations` accept `before=`, an exclusive upper bound on `created_at`. It must be timezone-aware; a naive datetime raises `ValueError`. `get_events` also accepts `event_types=`, a list of event type strings to keep (an empty list matches nothing):
+
+```python
+from datetime import UTC, datetime
+
+governance = await store.get_events(run_id, event_types=["policy.denied", "approval.requested"])
+old = await store.get_llm_calls(run_id, before=datetime(2026, 10, 1, tzinfo=UTC))
+```
 
 ### `metadata_filter`
 
@@ -90,7 +137,7 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`.
 
-**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status).
+**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status), `pause_requested` (`True` between a `request_pause` request and the run pausing).
 
 **`StoredEvent`** (from `get_events`): `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data`, `created_at`.
 
@@ -99,6 +146,8 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 **`ToolInvocation`** (from `get_tool_invocations`): `iteration`, `tool_name`, `tool_call_id`, `provider_tool_call_id`, `target`, `params`, `result`, `success`, `error`, `duration_ms`, `created_at`.
 
 **`TraceEntry`** (from `get_traces`): `role`, `content`, `order_index`, `meta`, `created_at`, `phase` (`"commentary"` for an assistant message that ended in tool calls, `"final_answer"` for the answer turn, `None` for other roles and rows written before phases were recorded).
+
+**`RunSubtree`**, **`SubtreeNode`**, **`RunUsage`** (from `get_subtree`) and **`RunNote`** (from `get_notes`) are described under [`get_subtree`](#get_subtree) and [`get_notes`](#get_notes).
 
 **`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`.
 

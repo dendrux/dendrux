@@ -18,7 +18,9 @@ Suggested HTTP mappings:
     PersistenceNotConfiguredError -> 500
     SchemaNotInitializedError   -> 500
     SkillMissingError           -> 409
+    ContextLengthExceededError  -> 413 or 400
     SkillMismatchError          -> 409
+    SqliteSchemaSyncError       -> 500 (startup: legacy SQLite file needs migration)
 
 ``SkillValidationError`` is raised while building a :class:`~dendrux.skills.Skill`
 (a configuration error, not a request error).
@@ -244,7 +246,49 @@ class SkillMismatchError(SkillContinuityError):
     """Raised when every skill is attached but some have different content."""
 
 
+class ContextLengthExceededError(RuntimeError):
+    """Raised when an LLM endpoint rejects a request as too large for the model's context window.
+
+    Raised by the OpenAI-compatible providers (and therefore
+    ``OpenRouterProvider``) for both batch and streaming calls. The message
+    never contains prompt content; the original SDK exception is chained as
+    ``__cause__`` for debugging.
+
+    Attributes:
+        status_code: HTTP status the endpoint returned (``None`` for an
+            in-stream error event).
+        provider_code: Provider error code when one was sent
+            (for example ``"context_length_exceeded"``), else ``None``.
+        model: Model name the request targeted, when known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.model = model
+        super().__init__(message)
+
+
+class SqliteSchemaSyncError(RuntimeError):
+    """A SQLite database cannot be upgraded in place to the current schema.
+
+    Raised at startup when an older Dendrux SQLite file is missing a column
+    that SQLite cannot add (NOT NULL without a constant default), when an
+    index the schema needs collides with an unrelated object, or when an
+    ``ALTER`` fails. The message names the table, column or index. Run
+    ``dendrux db migrate`` against the database, or recreate the file.
+    """
+
+
 __all__ = [
+    "ContextLengthExceededError",
     "InvalidToolResultError",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
@@ -259,4 +303,5 @@ __all__ = [
     "SkillMismatchError",
     "SkillMissingError",
     "SkillValidationError",
+    "SqliteSchemaSyncError",
 ]

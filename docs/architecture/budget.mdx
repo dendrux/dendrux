@@ -1,13 +1,21 @@
 ---
 title: Budget
-description: Advisory per-run token caps that emit governance events at configurable thresholds without ever halting the run.
+description: Per-run token and dollar limits with threshold events, and an optional pause or cancel when a limit is reached. Counts delegated child runs too.
 ---
 
 # Budget
 
-A `Budget` on an agent is a soft cap on total tokens spent in one run. It emits governance events when usage crosses configurable thresholds, and one more when usage reaches the max. It does **not** pause the run, kill it, or refuse the next LLM call. In v1, it is advisory: the dev watches the events and decides what to do.
+A `Budget` tracks configurable token and dollar limits for one run; it can warn, pause, or cancel when a limit is reached. It emits governance events as usage crosses configurable thresholds and when a limit is reached. What happens at the limit is up to `on_exceed`:
 
-The reasoning is deliberate. A hard enforcement mechanism that preempts an in-flight LLM call or tool execution would leak cost (the call already happened at the provider) and leave the run in a partially-observed state. A soft mechanism that signals upcoming-or-exceeded spend gives the application agency without those bad shapes.
+| `on_exceed` | At the limit |
+| --- | --- |
+| `"warn"` (default) | Events only. The run keeps going. This is the original, advisory behavior. |
+| `"pause"` | The run pauses durably (`status=paused`, `pause_reason="budget"`). A person raises the limit and calls `submit_resume`. |
+| `"cancel"` | The run ends `cancelled` with `failure_reason="budget_exceeded"`. |
+
+By default a budget also counts the run's delegated child runs (`include_children=True`), so a parent cannot be undercut by the agents it delegates to.
+
+The enforcement is deliberately cooperative. A hard stop that preempted an in-flight LLM call or tool would leak cost (the provider already charged for the call) and leave the run half-observed. Dendrux instead acts at a boundary it controls: the start of the next iteration. The price is a bounded overshoot, described [below](#when-a-pause-or-cancel-takes-effect).
 
 ## Declaring a budget
 
@@ -37,96 +45,135 @@ async def main() -> None:
         print([e.event_type for e in await store.get_events(result.run_id)])
         # ['run.started', 'llm.completed', 'budget.threshold', 'budget.threshold',
         #  'budget.threshold', 'budget.exceeded', 'run.completed']
-    print(result.status.value)   # success  (budget is advisory; the run still finishes)
+    print(result.status.value)   # success  (on_exceed defaults to "warn")
 
 
 asyncio.run(main())
 ```
 
-Two parameters:
+All the arguments:
 
 | Arg | Meaning | Default |
 | --- | --- | --- |
-| `max_tokens` | Total token cap (input + output, across all LLM calls in the run). Must be positive. | Required. |
-| `warn_at` | Fractions of `max_tokens` at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
+| `max_tokens` | Token cap: input plus output tokens across all LLM calls. Positive integer, or `None`. | `None` |
+| `max_cost_usd` | Dollar cap. Positive number, or `None`. | `None` |
+| `warn_at` | Fractions of each limit at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
+| `on_exceed` | `"warn"`, `"pause"` or `"cancel"`. | `"warn"` |
+| `include_children` | Count delegated descendant runs' usage. | `True` |
 
-"Total tokens" is `response.usage.total_tokens` summed across every LLM call on the run. Cache hits and misses all count toward the total (cache read tokens are still billed at the provider, just at a lower rate; the budget pessimistically measures gross usage).
+At least one of `max_tokens` and `max_cost_usd` is required; `Budget()` raises `ValueError`. So does a non-positive limit, a `warn_at` fraction outside `(0, 1)`, or an unknown `on_exceed`.
+
+Tokens are `input_tokens + output_tokens`, summed over the LLM calls. `input_tokens` counts fresh (non-cached) input, so cache reads and writes are not in the token total. The dollar limit is where caching shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes.
+
+## Dollar limits
+
+`max_cost_usd` needs a cost per call, from the provider (OpenRouter reports it) or from a `PriceTable` on the agent. A call with neither is **unpriced**. The dollar check counts the priced calls only, and the first time it sees an unpriced call in a run it writes one `budget.unpriced` event:
+
+```json
+{"metric": "cost_usd", "used": 0.0132, "max": 0.5, "unpriced_calls": 1, "known_cost_usd": 0.0132}
+```
+
+An unpriced call contributes no amount to the dollar comparison. `budget.unpriced` exposes that gap; without complete provider pricing or a `PriceTable`, `max_cost_usd` can under-count. Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
 
 ## What the events look like
 
-A real run with `Budget(max_tokens=500, warn_at=(0.5, 0.75, 0.9))` and a two-iteration ReAct query `"What is 15 + 27?"`:
+A real run, captured against a mock provider: a two-iteration agent with `Budget(max_tokens=500, on_exceed="pause")` whose first LLM call uses 600 tokens and requests a tool:
 
 ```text
-status: success                         (budget is advisory, run still succeeds)
-total tokens used: input=1252  output=82  total=1334
+status: paused            meta["budget_exceeded"] = [{"metric": "tokens", "used": 600, "max": 500}]
 
 run_events:
-  [lifecycle] seq=0  run.started
-  [lifecycle] seq=1  llm.completed        (first LLM call, 654 tokens total so far)
-  [BUDGET]    seq=2  budget.threshold     data={"fraction": 0.5,  "used": 654, "max": 500, "reason": "threshold_crossed"}
-  [BUDGET]    seq=3  budget.threshold     data={"fraction": 0.75, "used": 654, "max": 500, "reason": "threshold_crossed"}
-  [BUDGET]    seq=4  budget.threshold     data={"fraction": 0.9,  "used": 654, "max": 500, "reason": "threshold_crossed"}
-  [BUDGET]    seq=5  budget.exceeded      data={"used": 654, "max": 500, "reason": "budget_exceeded"}
-  [lifecycle] seq=6  tool.completed
-  [lifecycle] seq=7  llm.completed        (second LLM call, 1334 tokens total, no new events)
-  [lifecycle] seq=8  run.completed
+  seq=0  run.started
+  seq=1  llm.completed        (first call, 600 tokens)
+  seq=2  budget.threshold     {"metric": "tokens", "fraction": 0.5,  "used": 600, "max": 500, "reason": "threshold_crossed"}
+  seq=3  budget.threshold     {"metric": "tokens", "fraction": 0.75, "used": 600, "max": 500, "reason": "threshold_crossed"}
+  seq=4  budget.threshold     {"metric": "tokens", "fraction": 0.9,  "used": 600, "max": 500, "reason": "threshold_crossed"}
+  seq=5  budget.exceeded      {"metric": "tokens", "used": 600, "max": 500, "reason": "budget_exceeded", "action": "pause"}
+  seq=6  tool.completed       (the tool from the same response still runs)
+  seq=7  run.paused           {"status": "paused", "pending_tool_calls": [], "reason": "budget",
+                               "exceeded": [{"metric": "tokens", "used": 600, "max": 500}]}
+         <-- later: submit_resume with a higher limit -->
+  seq=8  run.resumed          {"resumed_from": "paused"}
+  seq=9  llm.completed
+  seq=10 run.completed
 ```
 
-Four budget events, all on the same LLM call that first blew past 90% of the cap. Three things to pull out of this trace:
+Things to read out of the trace:
 
-1. **Every fraction fired in one tick.** The first LLM call returned at 654 tokens, already past the 0.9 mark. Instead of emitting only the highest threshold, the runtime fires each threshold the usage crossed. A reader gets the full "we passed 50, 75, 90, and exceeded" story.
-2. **Each threshold fires once per run.** The second LLM call pushed total usage to 1334, more than double the cap. No new `budget.threshold` or `budget.exceeded` events were emitted. Each fraction has already been recorded; repeating them would be noise.
-3. **The run completed successfully.** `run.completed` at seq=8, status=success. Nothing about exceeding the budget changed the lifecycle.
+1. **Every fraction fired in one tick.** The first call returned at 600 tokens, past every threshold. The runtime fires each threshold the usage crossed, so a reader gets the whole "50, 75, 90, exceeded" story.
+2. **Each event fires once per run.** Events are keyed by `(metric, threshold)`, and the keys are saved with every pause. A run that pauses for approval or for the budget and later resumes does not repeat them.
+3. **Payloads say which metric.** `metric` is `"tokens"` or `"cost_usd"`; `used` and `max` are in that metric's unit (dollars as a float). `budget.exceeded` also carries `action`: the `on_exceed` that applies (`warn`, `pause` or `cancel`).
+4. **The tool at seq=6 still ran.** The pause came after the response that crossed the limit had been fully handled.
 
-## How it is implemented
+## When a pause or cancel takes effect
 
-From `dendrux/loops/react.py`:
+Budget usage is evaluated after each LLM response, which is when events fire. (An enforcing budget that counts children also re-reads usage at the checkpoint, since delegated runs may have spent meanwhile.) The *action*, though, is taken at the next **top-of-iteration checkpoint**, after the tools from that response have run and their results are in the history. Acting there means a pause never strands a tool call without its result, and a cancel never abandons a call half-done.
+
+The consequence is **overshoot of up to one iteration**: tokens and dollars spent by the iteration that crossed the limit, and by the tools it ran, still count. If the iteration that crosses the limit also produces the final answer, the run completes normally; there is no next checkpoint.
+
+At the same checkpoint, controls are applied in a fixed order: **cancel, then a requested pause, then the budget action**, then inbox delivery. See [Pause and resume](/docs/architecture/pause-resume#cancel-pause-and-budget-at-the-same-checkpoint). An approval, client-tool or input pause inside an iteration happens first; the budget is re-evaluated after the run resumes.
+
+With `on_exceed="warn"`, budgets are evaluated after each LLM response and never act at a checkpoint.
+
+## Resuming a budget pause
+
+A budget pause is a `paused` run, so it resumes with `submit_resume(run_id)`. Resuming is only useful if there is headroom, so there is a gate:
+
+> The run continues only if the resuming `Agent`'s limits are **strictly above** current usage for every metric that was exceeded. Otherwise it pauses again immediately, with the same reason.
+
+Current usage is read live, not from the pause snapshot, so spending by child runs since the pause counts. If the resuming `Agent` has no limit on a metric that was exceeded (or no budget at all), that metric is not checked. The gate does not look at `on_exceed`: a run that paused for the budget re-pauses until the limit is raised, even if the resuming agent now says `"warn"`.
 
 ```python
-async def _check_budget(budget, total_usage, fired_thresholds, recorder, notifier, iteration, warnings):
-    """Check budget thresholds and exceeded after usage accumulation.
+# The budget pause
+paused = await agent.run("Summarize the corpus.")
+assert paused.status.value == "paused"
+print(paused.meta["budget_exceeded"])      # [{'metric': 'tokens', 'used': 52310, 'max': 50000}]
 
-    Advisory only — fires governance events but does not pause or stop.
-    Each threshold and exceeded fires exactly once per run.
-    """
-    if budget is None:
-        return
-
-    used = total_usage.total_tokens
-    max_t = budget.max_tokens
-    fraction = used / max_t
-
-    # Threshold events — fire once per fraction when first crossed
-    for threshold in budget.warn_at:
-        if fraction >= threshold and threshold not in fired_thresholds:
-            fired_thresholds.append(threshold)
-            ...
-
-    # Exceeded event — fire once when usage first reaches max
-    if used >= max_t and _BUDGET_EXCEEDED_SENTINEL not in fired_thresholds:
-        ...
+# An operator raises the limit. Build the Agent with the higher budget.
+bigger = Agent(provider=provider, prompt="...", tools=[...],
+               budget=Budget(max_tokens=200_000, on_exceed="pause"), database_url=url)
+await bigger.submit_resume(paused.run_id)
 ```
 
-Three design choices worth calling out:
+Because the budget lives on the `Agent`, "raising the limit" means resuming with an `Agent` built with a higher `Budget`.
 
-1. **Checked after each LLM call.** `_check_budget` is invoked right after `provider.complete()` returns and `total_usage` is updated. Tool calls do not cost tokens; only LLM calls do. Checking at the LLM-call boundary is the tightest cadence that catches every increment.
-2. **`fired_thresholds` is carried on the run state.** It is a list that survives pause/resume. A run that pauses for approval mid-budget does not re-fire 0.5 when it resumes.
-3. **No action coupled to the event.** The function fires the event and returns. There is no `if fraction > 1.0: raise BudgetExceededError`. That decision belongs to the application.
+## Budget cancel
+
+`on_exceed="cancel"` finishes the run as `cancelled`. It is distinguishable from a user cancel in two places: the row's `failure_reason` is `"budget_exceeded"`, and the `run.cancelled` event has `{"reason": "budget_exceeded", "exceeded": [{"metric", "used", "max"}]}` instead of `"cancel_requested"`.
+
+## Children and roll-up
+
+With `include_children=True` the number being compared with the limit is the **root-inclusive subtree rollup**: the run's own usage plus every descendant's, read live from `llm_interactions`. There is no double counting. A parent waiting on a delegated child therefore sees the child's spend as it happens, not when the child finishes. This is the same figure `RunStore.get_subtree(run_id).usage` returns.
+
+`include_children=False` limits the run to its own calls.
+
+A child run is a run with its own `Agent`, and its own budget if it has one. Each budget counts its own subtree.
+
+## Usage source and persistence
+
+- **With persistence** (a database or `state_store`), usage is read live from successfully recorded `llm_interactions`. Those writes are best-effort, so a failed write can make the rollup under-count; if the live read itself raises, the tracker falls back to in-memory usage.
+- **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
+
+Paused runs write their running totals (tokens and `total_cost_usd`) to the row when they pause, so a paused run no longer reads as zero spend.
+
+## SingleCall
+
+`SingleCall` makes one LLM call and has no checkpoint after it. Events still fire (`budget.threshold`, `budget.exceeded`), but `"pause"` and `"cancel"` degrade to `"warn"`; the `budget.exceeded` event reports `"action": "warn"`.
 
 ## Applying action from the events
 
-Since the runtime does not stop the run, applications that want behavior have two places to hook in:
+When `on_exceed` is not enough (a custom policy, a per-tenant throttle), the same events are available live and durably.
 
-**In-process, via a notifier.** The [notifier](/docs/architecture/notifier) receives the same callbacks synchronously. A custom notifier that raises on `budget.exceeded` would kill the run with an error (because notifier exceptions are caught, but the app can also set a flag and call `agent.cancel_run(run_id)` from outside the callback).
+**In-process, via a notifier.** The [notifier](/docs/architecture/notifier) receives the same callbacks synchronously. A notifier can set a flag or call `agent.cancel_run(run_id)` or `agent.request_pause(run_id)` from outside the callback.
 
 ```python
 class StopOnBudget:
     def __init__(self, agent):
         self.agent = agent
 
-    async def on_governance_event(self, event_type, iteration, data, correlation_id=None):
+    async def on_governance_event(self, run_id, event_type, iteration, data, *, correlation_id=None):
         if event_type == "budget.exceeded":
-            await self.agent.cancel_run(data.get("run_id"))
+            await self.agent.request_pause(run_id)
 
     # other callbacks are no-ops
     async def on_message_appended(self, *a, **k): pass
@@ -134,24 +181,12 @@ class StopOnBudget:
     async def on_tool_completed(self, *a, **k): pass
 ```
 
-**Out-of-process, via the read router or SSE.** The events also land on `run_events` (because [recorder](/docs/architecture/recorder) always writes), so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and take action there. The same `agent.cancel_run(run_id)` call works from any process with a DB handle.
-
-Both paths use the same signal. The budget itself stays pure.
-
-## Why advisory, not preemptive
-
-A budget that kills the run the instant usage crosses `max_tokens` looks appealing in isolation. In a real system, it creates three problems.
-
-1. **Preemption leaks cost.** By the time the runtime sees a usage number, the provider has already charged for that call. Killing the run does not refund anything; it just loses the response text in addition to the spend.
-2. **Preemption breaks atomic units.** An LLM call that emits a tool call expects the tool to execute. A tool that commits side effects expects the model to see the result. Pulling the plug mid-atom leaves the DB, tool state, and LLM history in partial-and-inconsistent shape. The event log makes that visible; the alternative (aborting) makes it worse.
-3. **Different apps want different policies.** A batch job might want "keep going regardless, I just want the spend recorded." A user-facing session might want "abort if we go past the user's quota." A multi-tenant service might want "throttle this tenant for the next hour." A preemptive budget forces one policy on all of them; an advisory budget + event stream lets each app choose.
-
-Advisory is the general case. The hard-stop case is a thin layer on top: watch for `budget.exceeded` in your notifier, call `cancel_run`, done. Going the other direction (turning a preemptive mechanism into an advisory one) is much harder.
+**Out-of-process, via the read router or SSE.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
 
 ## Where this fits
 
-- Declared on `Agent(budget=Budget(max_tokens=N, warn_at=(...)))`.
-- Checked in `dendrux.loops.react._check_budget` after every LLM call.
-- Emits `budget.threshold` (once per fraction) and `budget.exceeded` (once) on `run_events`.
-- Integrates with [notifier](/docs/architecture/notifier) for live reaction, and [recorder](/docs/architecture/recorder) for durable audit.
-- Does not currently interact with [cancellation](/docs/architecture/cancellation); apps that want hard-stop behavior wire it through `agent.cancel_run(run_id)` in response to the event.
+- Declared on `Agent(budget=Budget(max_tokens=..., max_cost_usd=..., on_exceed=..., include_children=...))`.
+- Evaluated by `dendrux.loops._budget.BudgetTracker` after every LLM call and at the top of every iteration.
+- Emits `budget.threshold`, `budget.exceeded` and `budget.unpriced` on `run_events`.
+- Pauses and cancels through the same machinery as [Pause and resume](/docs/architecture/pause-resume) and [Cancellation](/docs/architecture/cancellation).
+- Costs come from [Cost and pricing](/docs/architecture/pricing); child usage from `RunStore.get_subtree` (see [RunStore](/docs/reference/run-store)).

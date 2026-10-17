@@ -13,7 +13,8 @@ This is the full public surface of Dendrux: everything you import in normal use.
 | --- | --- | --- |
 | `Agent` | `from dendrux import Agent` | The agent: definition + runtime facade. See [Agent](/docs/reference/agent). |
 | `tool` | `from dendrux import tool` | Decorator that turns an async function into a tool. |
-| `Budget` | `from dendrux import Budget` | Advisory per-run token cap. See [Budget](/docs/architecture/budget). |
+| `Budget` | `from dendrux import Budget` | Per-run token and dollar limits with optional pause or cancel, counting delegated children. See [Budget](/docs/architecture/budget). |
+| `heartbeat` / `aheartbeat` | `from dendrux import heartbeat, aheartbeat` | Call from inside a long-running tool to refresh persisted progress and reduce the risk of the stale sweep reaping the run (best-effort; no-op outside a persisted run). See [State persistence](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep). |
 | `run` | `from dendrux import run` | Low-level functional runner behind `Agent.run` (advanced use). |
 | `sweep` | `from dendrux import sweep` | One-shot reconciliation of stale/abandoned runs (you schedule it). |
 
@@ -69,7 +70,7 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
 | `make_read_router` | `from dendrux.http import make_read_router` | Mountable FastAPI read router. See [make_read_router](/docs/reference/read-router). |
 
-`RunStore` read methods return these record types (all from `dendrux.store`): `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`. Fields are documented on the [RunStore](/docs/reference/run-store) page.
+`RunStore` read methods return these record types (all from `dendrux.store`): `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`, plus `RunSubtree`, `SubtreeNode`, `RunUsage` (from `get_subtree`) and `RunNote` (from `get_notes`). Fields are documented on the [RunStore](/docs/reference/run-store) page.
 
 ## Tool sources
 
@@ -78,6 +79,7 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration. See [MCP](/docs/architecture/mcp). |
 | `MCPRuntime` | `from dendrux.mcp import MCPRuntime` | Process-wide managed owner of MCP connections: tenancy, capacity, circuit breaking, telemetry. Recommended for production. |
 | `MCPConnection` | `runtime.bind(...)` / `await runtime.rebind(...)` | Lazy handle for one `(tenant_key, connection_key)` identity; `connection.tools()` creates agent views, `await connection.discover()` returns the server's catalog without an Agent. |
+| `MCPToolNotFoundError` | `from dendrux.mcp import MCPToolNotFoundError` | Raised by `await connection.call_tool(name, arguments)` for a tool the server does not list. `call_tool` runs a server tool directly and bypasses Agent governance; see [MCP](/docs/architecture/mcp#calling-a-tool-directly). |
 | `MCPDiscovery` | `await connection.discover()` | Server name, version, protocol version, instructions, and the raw `MCPToolInfo` catalog of one connection. |
 | `MCPToolView` | `connection.tools(...)` | Namespace and tool policy one agent consumes via `tool_sources=`. |
 | `MCPCredentialProvider` | `from dendrux.mcp import MCPCredentialProvider` | Async protocol returning per-connect authentication (headers or env); resolved lazily, never persisted. |
@@ -90,17 +92,20 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | Symbol | Import | What it is |
 | --- | --- | --- |
 | `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`. |
-| `RunStatus` | `from dendrux.types import RunStatus` | `pending`, `running`, `waiting_*`, `success`, `error`, `cancelled`, `max_iterations`. |
+| `RunStatus` | `from dendrux.types import RunStatus` | `pending`, `running`, `waiting_*`, `paused`, `success`, `error`, `cancelled`, `max_iterations`. |
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
 | `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |
 | `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
-| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 15 governance event types. See [Governance](/docs/architecture/governance). |
+| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 25 governance event types. See [Governance](/docs/architecture/governance). |
+| `ApprovalDecision` | `from dendrux import ApprovalDecision` | One human decision for `submit_approval(decisions=...)`: `approve()` or `deny(reason)`. See [Approval](/docs/architecture/approval#per-call-decisions). |
+| `ToolCallContext` / `ToolDecision` / `BeforeToolHook` | `from dendrux import ToolCallContext, ToolDecision, BeforeToolHook` | Input, verdict and type of `Agent(before_tool=...)`. See [Tool policy hook](/docs/architecture/tool-policy). |
+| `PauseOutcome` | `from dendrux import PauseOutcome` | Returned by `agent.request_pause`: root status before/after and each affected run. See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause). |
 | `CreateRunResult` | `from dendrux import CreateRunResult` | Idempotent-create outcome. |
 
 ## Errors
 
-All exceptions live in `dendrux.errors` (and the most common ones are re-exported from `dendrux`). Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`.
+Run-control, skill-continuity, schema, and context-length exceptions live in `dendrux.errors`; common ones are re-exported from `dendrux`. MCP exceptions live in `dendrux.mcp`, RunStore read errors in `dendrux.store`, and several validation/idempotency exceptions are exported from `dendrux`. Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`, `ContextLengthExceededError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`.
 
 ## Where to go next
 

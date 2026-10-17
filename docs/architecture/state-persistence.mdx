@@ -34,6 +34,8 @@ A **library**, not a service. Dendrux doesn't run a server, doesn't manage worke
 
 The `agent_runs` table is the anchor. Everything else cascades from it: delete a run row and all its traces, tool calls, and events go with it.
 
+> **New in 0.3.0:** a seventh table, `run_inbox`, holds notes submitted to a running agent with `submit_note`. It cascades with the run like the others. See [`run_inbox`](#run_inbox-notes-for-a-running-agent) below. The "six tables" wording elsewhere in these docs counts the original set.
+
 All IDs are **26-character ULIDs** (time-sortable, see [Runs and the lifecycle](/docs/architecture/runs)).
 
 ## `agent_runs`: the anchor
@@ -67,6 +69,7 @@ failure_reason:       None
 idempotency_key:      None
 idempotency_fingerprint: None
 cancel_requested:     0
+pause_requested:      0
 created_at:           2026-04-18 09:10:32
 updated_at:           2026-04-18 09:13:35
 ```
@@ -77,6 +80,9 @@ A few columns deserve a closer look:
 - **`pause_data`** is a JSON blob holding everything needed to resume: pending tool calls, conversation history, step list, current iteration. It's `null` here because the run completed; it's populated when the run is in a `waiting_*` status. Cleared on terminal finalize.
 - **`pii_mapping`** is also JSON, but unlike `pause_data` it is **not** cleared on finalize. It's part of the audit trail. See [PII redaction](/docs/architecture/pii-redaction).
 - **`cancel_requested`** is the cooperative cancellation flag. The runner reads it at safe checkpoints. See [Cancellation](/docs/architecture/cancellation).
+- **`pause_requested`** is its twin for `request_pause` (added in 0.3.0, default false). It is cleared when the run pauses, is claimed for resume, or finishes. See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause).
+- **`status`** also takes the value `paused` for a requested or budget pause. It is a plain string column, so no enum migration was needed.
+- **`last_progress_at`** is the liveness timestamp the stale sweep reads; see [below](#long-running-tools-and-the-stale-sweep).
 - **`meta`** is opaque JSON for *your* application. Dendrux stores it and ships it back; it never reads it. Use it to link a run to your user IDs, request IDs, ticket numbers, anything.
 - **`parent_run_id`** + **`delegation_level`** form the sub-agent tree. When an agent spawns a sub-agent, the child gets its own `agent_runs` row with `parent_run_id` pointing back.
 
@@ -208,9 +214,15 @@ The **`sequence_index`** column is the canonical ordering key inside a run. Two 
 
 `data` is JSON: the event-specific payload. **Privacy**: only observable data goes here. The unredacted execution state lives in `agent_runs.pause_data`, which the dashboard never queries.
 
+## `run_inbox`: notes for a running agent
+
+One row per `submit_note` call. Columns: `id` (ULID), `run_id` (foreign key to `agent_runs`, `ON DELETE CASCADE`), `text`, `metadata` (JSON, yours, never shown to the model), `created_at`, `delivered_at` and `delivered_iteration`. `delivered_at` is `NULL` until the runner delivers the note to the model, which is how an undelivered note is told apart from a delivered one. The index `(run_id, delivered_at, created_at, id)` serves the runner's "what is still pending, in order" query. Read it through `RunStore.get_notes`; see [Inbox notes](/docs/architecture/inbox).
+
+Unlike the append-only tables, `run_inbox` rows are updated once: `delivered_at` and `delivered_iteration` are set at delivery.
+
 ## Append-only is a feature
 
-The four child tables (`react_traces`, `tool_calls`, `llm_interactions`, `run_events`) are **insert-only**. Once a row is written, dendrux never updates it. Only `agent_runs.status` and the roll-up totals change over time.
+The four child tables (`react_traces`, `tool_calls`, `llm_interactions`, `run_events`) are **insert-only**. (`run_inbox` is the one exception, above.) Once a row is written, dendrux never updates it. Only `agent_runs.status` and the roll-up totals change over time.
 
 This is on purpose. An audit trail you can rewrite isn't an audit trail. If something looks wrong in the dashboard, the raw rows are the source of truth. Migrations preserve old rows; bug fixes add new columns rather than rewriting existing data.
 
@@ -231,6 +243,38 @@ The schema ships with four indexes that matter for typical query patterns:
 
 You can add your own indexes if your queries need them. These are the structural ones dendrux relies on.
 
+## Long-running tools and the stale sweep
+
+`sweep()` is the maintenance call you schedule yourself (at startup, from a cron). With `stale_running=timedelta(...)` it finds `running` rows whose `last_progress_at` is older than the threshold, assumes the process died, and marks them `error` (`failure_reason` `stale_running`, or `never_started` if no `run.started` event exists) with a `run.interrupted` event. A stale row with a cancel pending is finalized `cancelled` instead. With `abandoned_waiting=timedelta(...)` it reaps `waiting_*` and `paused` rows nobody resumed.
+
+`last_progress_at` moves forward on every LLM call, every tool start and every tool completion. A tool that blocks longer than the sweep threshold with no other progress (waiting on a human, a long export) looks dead. Call the heartbeat from inside the tool to say it is alive:
+
+```python
+from dendrux import aheartbeat, heartbeat, tool
+
+
+@tool()
+async def export_report(report_id: int) -> str:
+    """Build a large report."""
+    for chunk in range(100):
+        await build_chunk(report_id, chunk)
+        await aheartbeat()        # awaits the write
+    return "done"
+
+
+@tool()
+def slow_sync_tool() -> str:
+    """Sync tools run in a worker thread."""
+    for _ in range(100):
+        do_blocking_work()
+        heartbeat()               # fire-and-forget, thread-safe
+    return "done"
+```
+
+`heartbeat()` is safe from async code and from threads, returns immediately and coalesces calls less than a second apart. `aheartbeat()` must be awaited on the run's event loop and never raises. Both do nothing outside a persisted run.
+
+> **Choose the sweep threshold above the longest gap between progress updates.** If `stale_running` is shorter than the longest stretch a live run can go without an LLM call, a tool start or end, or a heartbeat, the sweep will finalize a run that is still executing. Known limitation: the still-running process keeps writing events with the sequence indexes it already allocated, so those indexes can collide with the sweep's `run.interrupted` event. Size the threshold for your slowest tool, and heartbeat from long ones, so the sweep never touches a live run.
+
 ## Database choice
 
 Dendrux uses **SQLAlchemy 2.x async**. Anything async-SQLAlchemy supports works:
@@ -243,12 +287,12 @@ The schema doesn't use any SQLite-specific or Postgres-specific features. Switch
 
 ## Setting up the schema
 
-SQLite creates its tables automatically on first use, so there is nothing to run. Every other backend needs the tables created once before the first run. Dendrux ships an Alembic migration set and a small CLI for exactly this:
+SQLite creates its tables automatically on first use, so there is nothing to run for a new file. A SQLite file created by an older release is upgraded in place on startup. The upgrade is add-only: it adds missing nullable or defaulted columns and indexes (0.3.0 adds `agent_runs.pause_requested` and the `run_inbox` table). If a column cannot be added safely, Dendrux raises an error naming the table and column and telling you to run `dendrux db migrate` or recreate the file. Every other backend needs the tables created once before the first run. Dendrux ships an Alembic migration set and a small CLI for exactly this. Upgrading an existing Postgres database to 0.3.0 is the same command; it applies revision `b5c6d7e8f9a0` (the `pause_requested` column and the `run_inbox` table):
 
 ```bash
 pip install "dendrux[postgres]"          # asyncpg driver (alembic is already bundled)
 export DENDRUX_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
-dendrux db migrate                       # create / upgrade the six tables
+dendrux db migrate                       # create / upgrade the schema
 dendrux db status                        # show the current migration revision
 ```
 
@@ -297,7 +341,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`RunStore` also exposes `get_tool_invocations`, `get_traces`, `get_pauses`, and `list_runs(metadata_filter=...)`. See [Chatbot threads](/docs/recipes/chatbot-threads) for the metadata-filter query patterns and [Mount the read router](/docs/recipes/mount-read-router) to expose these reads over HTTP.
+`RunStore` also exposes `get_tool_invocations`, `get_traces`, `get_pauses`, `get_notes`, `get_subtree` and `list_runs(metadata_filter=...)`. See [Chatbot threads](/docs/recipes/chatbot-threads) for the metadata-filter query patterns and [Mount the read router](/docs/recipes/mount-read-router) to expose these reads over HTTP.
 
 ## What's next
 

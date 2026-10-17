@@ -22,6 +22,13 @@ Usage:
 fixed set of connections across Agents. :class:`MCPServer` is the directly
 Agent-owned, single-connection facade.
 
+Outside an Agent run, ``await connection.call_tool(name, arguments)`` calls a
+server tool directly through the same managed path (capacity, re-authentication,
+telemetry, redaction). It bypasses all Agent governance (deny lists, hooks,
+approvals, guardrails), run persistence, budgets and tenant authorization, so
+never expose it directly to a model or an untrusted client; the application
+authorizes each call.
+
 Requires the ``mcp`` package: ``pip install dendrux[mcp]``
 """
 
@@ -67,6 +74,7 @@ from dendrux.mcp._errors import (  # noqa: E402
     MCPStaleConnectionError,
     MCPToolCallError,
     MCPToolNameCollisionError,
+    MCPToolNotFoundError,
     error_code_for,
 )
 from dendrux.mcp._host import MCPHost  # noqa: E402
@@ -215,6 +223,7 @@ __all__ = [
     "MCPToolCallStarted",
     "MCPToolInfo",
     "MCPToolNameCollisionError",
+    "MCPToolNotFoundError",
     "MCPToolPolicy",
     "MCPToolView",
     "check_oauth_store",

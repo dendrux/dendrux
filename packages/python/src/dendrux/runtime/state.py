@@ -30,6 +30,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -37,6 +38,35 @@ if TYPE_CHECKING:
     from dendrux.db.models import AgentRun
 
 logger = logging.getLogger(__name__)
+
+
+class _Unscoped:
+    """Type of the ``UNSCOPED`` sentinel."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSCOPED"
+
+
+UNSCOPED = _Unscoped()
+"""Omitted tenant scope: trusted, no tenant predicate. Distinct from ``None``,
+which scopes to untenanted runs only."""
+
+TenantScope = str | None | _Unscoped
+
+PAUSE_REQUEST_META_KEY = "dendrux.pause_request"
+"""``agent_runs.meta`` key holding the latest ``request_pause`` reason."""
+
+_TERMINAL_STATUS_VALUES = (
+    RunStatus.SUCCESS.value,
+    RunStatus.ERROR.value,
+    RunStatus.CANCELLED.value,
+    RunStatus.MAX_ITERATIONS.value,
+)
+
+_COST_DECIMALS = 6  # llm_interactions.cost_usd is Numeric(10, 6)
+_IN_CHUNK = 500  # keep IN (...) lists well under SQLite's variable limit
 
 
 @overload
@@ -61,6 +91,19 @@ def _to_aware_utc(dt: _dt.datetime | None) -> _dt.datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=_dt.UTC)
     return dt.astimezone(_dt.UTC)
+
+
+def _usage_totals(total_usage: UsageStats) -> dict[str, Any]:
+    """``agent_runs.total_*`` columns for a run-level usage total."""
+    return {
+        "total_input_tokens": total_usage.input_tokens,
+        "total_output_tokens": total_usage.output_tokens,
+        "total_cost_usd": total_usage.cost_usd,
+        # Cache/reasoning rollup: None treated as 0 in aggregation
+        "total_cache_read_tokens": total_usage.cache_read_input_tokens or 0,
+        "total_cache_creation_tokens": total_usage.cache_creation_input_tokens or 0,
+        "total_reasoning_tokens": total_usage.reasoning_tokens or 0,
+    }
 
 
 def _require_aware_utc(name: str, value: _dt.datetime | None) -> None:
@@ -113,6 +156,33 @@ class RunRecord:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     tenant_id: str | None = None
+    pause_requested: bool = False
+
+
+@dataclass(frozen=True)
+class RunControl:
+    """Cooperative control flags a runner reads at each checkpoint.
+
+    ``has_pending_notes`` is True when the run's inbox holds undelivered notes.
+    A missing run reads as all False.
+    """
+
+    cancel_requested: bool = False
+    pause_requested: bool = False
+    has_pending_notes: bool = False
+
+
+@dataclass(frozen=True)
+class NoteRecord:
+    """Lightweight read model for a ``run_inbox`` row."""
+
+    id: str
+    run_id: str
+    text: str
+    metadata: Any = None
+    created_at: datetime | None = None
+    delivered_at: datetime | None = None
+    delivered_iteration: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +292,62 @@ class RunEventRecord:
 
 
 @dataclass(frozen=True)
+class UsageRollup:
+    """Token and cost totals summed live from ``llm_interactions``.
+
+    Root inclusive when produced by ``subtree_usage``. ``known_cost_usd`` is
+    the sum of non-null call costs. ``cost_usd`` equals it only when
+    ``unpriced_calls == 0``, else ``None``, so a partial sum never reads as
+    the whole spend. Cache/reasoning columns that
+    are NULL (provider did not report) count as zero.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    known_cost_usd: float = 0.0
+    unpriced_calls: int = 0
+    llm_calls: int = 0
+
+    @property
+    def cost_usd(self) -> float | None:
+        return None if self.unpriced_calls else self.known_cost_usd
+
+    @classmethod
+    def combine(cls, rollups: Iterable[UsageRollup]) -> UsageRollup:
+        items = list(rollups)
+        return cls(
+            input_tokens=sum(r.input_tokens for r in items),
+            output_tokens=sum(r.output_tokens for r in items),
+            cache_read_tokens=sum(r.cache_read_tokens for r in items),
+            cache_write_tokens=sum(r.cache_write_tokens for r in items),
+            reasoning_tokens=sum(r.reasoning_tokens for r in items),
+            known_cost_usd=round(sum(r.known_cost_usd for r in items), _COST_DECIMALS),
+            unpriced_calls=sum(r.unpriced_calls for r in items),
+            llm_calls=sum(r.llm_calls for r in items),
+        )
+
+
+@dataclass(frozen=True)
+class SubtreeNodeRecord:
+    """One run in a subtree with its depth below the root and its own live usage."""
+
+    run: RunRecord
+    depth: int
+    usage: UsageRollup
+
+
+@dataclass(frozen=True)
+class SubtreeRecord:
+    """A root run, its descendants (BFS order, root first) and rolled-up usage."""
+
+    nodes: list[SubtreeNodeRecord]
+    usage: UsageRollup
+
+
+@dataclass(frozen=True)
 class SweptRun:
     """A run that was swept by the stale-run maintenance API."""
 
@@ -231,6 +357,9 @@ class SweptRun:
     failure_reason: str
     last_progress_at: datetime | None
     swept_at: datetime
+    # Status the sweep wrote: "error", or "cancelled" for a stale RUNNING row
+    # whose cancellation had been requested.
+    status: str = "error"
 
 
 @dataclass(frozen=True)
@@ -350,6 +479,7 @@ class StateStore(Protocol):
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[LLMInteractionRecord]: ...
 
     async def finalize_run(
@@ -376,6 +506,7 @@ class StateStore(Protocol):
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
     ) -> bool:
         """Atomic CAS over a set of allowed current statuses.
 
@@ -410,6 +541,117 @@ class StateStore(Protocol):
         """
         ...
 
+    async def get_run_control(self, run_id: str) -> RunControl:
+        """Read cancel / pause flags and whether undelivered notes exist, in one read."""
+        ...
+
+    async def request_pause(self, run_id: str, *, reason: str | None = None) -> bool:
+        """Set ``pause_requested`` on a RUNNING run (atomic, status-guarded).
+
+        Returns False for any other status (WAITING_* / PAUSED / terminal /
+        missing): a pause request never latches on a run that is not running.
+        ``reason`` is kept under ``meta[PAUSE_REQUEST_META_KEY]`` for the
+        runner to copy into the pause.
+        """
+        ...
+
+    async def try_pause_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        iteration_count: int | None = None,
+        pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
+    ) -> bool:
+        """Persist a pause with one CAS: only a RUNNING row without a pending cancel.
+
+        ``UPDATE ... WHERE status='running' AND cancel_requested=false``; also
+        clears ``pause_requested`` (any durable pause satisfies a request).
+        Returns False when the CAS lost — the caller reloads and honors the
+        winning state (cancellation wins over pause).
+        """
+        ...
+
+    async def pause_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        event_data: dict[str, Any] | None = None,
+        iteration_count: int | None = None,
+        pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
+    ) -> int | None:
+        """``try_pause_run`` and the ``run.paused`` event in one transaction.
+
+        ``total_usage`` writes the run's running totals (``total_*``) so a
+        paused run does not read as zero spend.
+
+        Returns the event's sequence index, or None when the CAS lost.
+        """
+        ...
+
+    async def finalize_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        event_type: str,
+        event_data: dict[str, Any] | None = None,
+        answer: str | None = None,
+        error: str | None = None,
+        iteration_count: int | None = None,
+        total_usage: UsageStats | None = None,
+        pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
+    ) -> int | None:
+        """``finalize_run_if_status_in`` and its event in one transaction.
+
+        Returns the event's sequence index, or None when the CAS lost.
+        """
+        ...
+
+    async def add_note(
+        self,
+        run_id: str,
+        *,
+        note_id: str,
+        text: str,
+        metadata: Any = None,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> bool:
+        """Insert an inbox note only if the run exists, is non-terminal and in scope.
+
+        One conditional ``INSERT ... SELECT`` that share-locks the run row, so
+        a concurrent finalize either sees the note or the note sees the
+        terminal status. Returns False when nothing was inserted.
+        """
+        ...
+
+    async def get_notes(
+        self,
+        run_id: str,
+        *,
+        undelivered_only: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[NoteRecord]:
+        """Inbox notes of a run ordered by ``(created_at, id)``.
+
+        A scoped ``tenant_id`` (incl. ``None``) returns nothing unless the run
+        belongs to exactly that tenant.
+        """
+        ...
+
+    async def mark_notes_delivered(
+        self, run_id: str, note_ids: list[str], *, iteration: int
+    ) -> int:
+        """Stamp ``delivered_at`` / ``delivered_iteration`` on undelivered notes."""
+        ...
+
     async def get_next_event_sequence(self, run_id: str) -> int:
         """Return ``max(sequence_index) + 1`` for the run's events.
 
@@ -429,6 +671,7 @@ class StateStore(Protocol):
         pause_data: dict[str, Any],
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> None: ...
 
     async def get_pause_state(self, run_id: str) -> dict[str, Any] | None: ...
@@ -443,6 +686,7 @@ class StateStore(Protocol):
         *,
         expected_status: str,
         submitted_data: dict[str, Any],
+        validate: Callable[[dict[str, Any]], None] | None = None,
     ) -> bool:
         """Atomically save submitted data to pause_data and claim the run.
 
@@ -460,6 +704,11 @@ class StateStore(Protocol):
             expected_status: Guard value (e.g. "waiting_client_tool").
             submitted_data: Keys to merge into pause_data
                 (e.g. ``{"submitted_tool_results": [...]}``)
+            validate: Optional check run on the pause_data being claimed,
+                inside the claiming transaction. If it raises, nothing is
+                written (the run stays in *expected_status*) and the
+                exception propagates. Binds a submission to the exact pause
+                generation it was validated against.
 
         Returns:
             True if saved + claimed, False if another caller already won.
@@ -483,6 +732,7 @@ class StateStore(Protocol):
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[ToolCallReadRecord]: ...
 
     async def save_run_event(
@@ -503,6 +753,7 @@ class StateStore(Protocol):
         after_sequence_index: int | None = None,
         limit: int | None = None,
         event_types: list[str] | None = None,
+        before: datetime | None = None,
     ) -> list[RunEventRecord]: ...
 
     async def list_runs(
@@ -549,8 +800,8 @@ class StateStore(Protocol):
         self,
         older_than: timedelta,
     ) -> list[SweptRun]:
-        """Find WAITING_CLIENT_TOOL/WAITING_HUMAN_INPUT rows older than
-        threshold and mark them ERROR with failure_reason=abandoned_waiting.
+        """Find WAITING_* and PAUSED rows older than threshold and mark them
+        ERROR with failure_reason=abandoned_waiting.
 
         Detection uses updated_at (last state change). Waiting runs have
         no forward progress by design, so last_progress_at is wrong here.
@@ -566,6 +817,28 @@ class StateStore(Protocol):
         Returns parent ref, direct children, ancestry chain, and subtree
         summary with rolled-up metrics. Returns None if the run doesn't exist.
         """
+        ...
+
+    async def get_subtree(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> SubtreeRecord | None:
+        """Root run plus all descendants with per-node and rolled-up live usage.
+
+        Usage is summed from ``llm_interactions`` so running and paused runs
+        count. ``tenant_id`` omitted (``UNSCOPED``) applies no tenant
+        predicate. A string keeps only that tenant's runs; explicit ``None``
+        keeps only untenanted runs. Other-scope nodes (and everything below
+        them) are excluded and a root outside the scope reads as missing.
+        Returns None if the run doesn't exist.
+        """
+        ...
+
+    async def subtree_usage(self, run_id: str) -> UsageRollup:
+        """Live usage rolled up over a run and all its descendants."""
+        ...
+
+    async def run_usage(self, run_id: str) -> UsageRollup:
+        """Live usage of one run only (no descendants)."""
         ...
 
 
@@ -870,8 +1143,11 @@ class SQLAlchemyStateStore:
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[LLMInteractionRecord]:
         from sqlalchemy import select
+
+        _require_aware_utc("before", before)
 
         from dendrux.db.models import LLMInteraction
 
@@ -883,6 +1159,8 @@ class SQLAlchemyStateStore:
             )
             if iteration_index is not None:
                 stmt = stmt.where(LLMInteraction.iteration_index == iteration_index)
+            if before is not None:
+                stmt = stmt.where(LLMInteraction.created_at < _to_aware_utc(before))
             if limit is not None:
                 stmt = stmt.limit(max(1, min(limit, 1000)))
             if offset:
@@ -951,15 +1229,7 @@ class SQLAlchemyStateStore:
                 if error is not None:
                     values["error"] = error
                 if total_usage is not None:
-                    values["total_input_tokens"] = total_usage.input_tokens
-                    values["total_output_tokens"] = total_usage.output_tokens
-                    values["total_cost_usd"] = total_usage.cost_usd
-                    # Cache rollup: None treated as 0 in aggregation
-                    values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
-                    values["total_cache_creation_tokens"] = (
-                        total_usage.cache_creation_input_tokens or 0
-                    )
-                    values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
+                    values.update(_usage_totals(total_usage))
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
 
@@ -968,6 +1238,7 @@ class SQLAlchemyStateStore:
                 # Clear cooperative cancel flag — terminal state is final;
                 # a stale True here would confuse later audits.
                 values["cancel_requested"] = False
+                values["pause_requested"] = False
 
                 # Conditional finalize: only update if status is still 'running'
                 # (or expected_status if provided). Prevents cancel/finalize races.
@@ -1000,6 +1271,7 @@ class SQLAlchemyStateStore:
         iteration_count: int | None = None,
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
     ) -> bool:
         """Atomic CAS finalize over multiple acceptable current statuses.
 
@@ -1008,51 +1280,118 @@ class SQLAlchemyStateStore:
         Mirrors :meth:`finalize_run`'s side-effects: clears ``pause_data``
         and ``cancel_requested``.
         """
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                won = await self._cas_finalize(
+                    session,
+                    run_id,
+                    status=status,
+                    allowed_current_statuses=allowed_current_statuses,
+                    answer=answer,
+                    error=error,
+                    iteration_count=iteration_count,
+                    total_usage=total_usage,
+                    pii_mapping=pii_mapping,
+                    failure_reason=failure_reason,
+                )
+                await session.commit()
+                return won
+
+        return await retry_transient_db(_attempt, label="finalize_run_if_status_in", run_id=run_id)
+
+    async def finalize_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        event_type: str,
+        event_data: dict[str, Any] | None = None,
+        answer: str | None = None,
+        error: str | None = None,
+        iteration_count: int | None = None,
+        total_usage: UsageStats | None = None,
+        pii_mapping: dict[str, str] | None = None,
+        failure_reason: str | None = None,
+    ) -> int | None:
+        """:meth:`finalize_run_if_status_in` plus its lifecycle event, in one transaction.
+
+        The event's sequence index is allocated after the CAS took the row
+        lock, so nothing can observe the new status before the event is
+        durable and no two transition events share an index. Returns the
+        event's sequence index, or None when the CAS lost (nothing written).
+        """
+
+        async def _attempt() -> int | None:
+            async with self._session_factory() as session:
+                won = await self._cas_finalize(
+                    session,
+                    run_id,
+                    status=status,
+                    allowed_current_statuses=allowed_current_statuses,
+                    answer=answer,
+                    error=error,
+                    iteration_count=iteration_count,
+                    total_usage=total_usage,
+                    pii_mapping=pii_mapping,
+                    failure_reason=failure_reason,
+                )
+                if not won:
+                    await session.rollback()
+                    return None
+                seq = await _insert_event_locked(session, run_id, event_type, event_data)
+                await session.commit()
+                return seq
+
+        return await retry_transient_db(_attempt, label="finalize_with_event", run_id=run_id)
+
+    async def _cas_finalize(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        *,
+        status: str,
+        allowed_current_statuses: list[str],
+        answer: str | None,
+        error: str | None,
+        iteration_count: int | None,
+        total_usage: UsageStats | None,
+        pii_mapping: dict[str, str] | None,
+        failure_reason: str | None = None,
+    ) -> bool:
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
 
-        async def _attempt() -> bool:
-            async with self._session_factory() as session:
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
-                values: dict[str, Any] = {
-                    "status": status,
-                    "pause_data": None,
-                    "cancel_requested": False,
-                }
-                if iteration_count is not None:
-                    values["iteration_count"] = iteration_count
-                if answer is not None or total_usage is not None:
-                    values["output_data"] = await _finalized_output_data(
-                        session, run_id, answer, total_usage
-                    )
-                if error is not None:
-                    values["error"] = error
-                if total_usage is not None:
-                    values["total_input_tokens"] = total_usage.input_tokens
-                    values["total_output_tokens"] = total_usage.output_tokens
-                    values["total_cost_usd"] = total_usage.cost_usd
-                    values["total_cache_read_tokens"] = total_usage.cache_read_input_tokens or 0
-                    values["total_cache_creation_tokens"] = (
-                        total_usage.cache_creation_input_tokens or 0
-                    )
-                    values["total_reasoning_tokens"] = total_usage.reasoning_tokens or 0
-                if pii_mapping is not None:
-                    values["pii_mapping"] = pii_mapping
+        # updated_at is filled by the model's onupdate hook (Python aware-UTC).
+        values: dict[str, Any] = {
+            "status": status,
+            "pause_data": None,
+            "cancel_requested": False,
+            "pause_requested": False,
+        }
+        if iteration_count is not None:
+            values["iteration_count"] = iteration_count
+        if answer is not None or total_usage is not None:
+            values["output_data"] = await _finalized_output_data(
+                session, run_id, answer, total_usage
+            )
+        if error is not None:
+            values["error"] = error
+        if total_usage is not None:
+            values.update(_usage_totals(total_usage))
+        if pii_mapping is not None:
+            values["pii_mapping"] = pii_mapping
+        if failure_reason is not None:
+            values["failure_reason"] = failure_reason
 
-                stmt = (
-                    update(AgentRun)
-                    .where(
-                        AgentRun.id == run_id,
-                        AgentRun.status.in_(allowed_current_statuses),
-                    )
-                    .values(**values)
-                )
-                result = await session.execute(stmt)
-                await session.commit()
-                return bool(result.rowcount and result.rowcount > 0)
-
-        return await retry_transient_db(_attempt, label="finalize_run_if_status_in", run_id=run_id)
+        result: Any = await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.status.in_(allowed_current_statuses))
+            .values(**values)
+        )
+        return bool(result.rowcount and result.rowcount > 0)
 
     async def request_cancel(self, run_id: str) -> bool:
         """Set ``cancel_requested=True`` on a non-terminal run.
@@ -1064,13 +1403,6 @@ class SQLAlchemyStateStore:
 
         from dendrux.db.models import AgentRun
 
-        terminal = (
-            RunStatus.SUCCESS.value,
-            RunStatus.ERROR.value,
-            RunStatus.CANCELLED.value,
-            RunStatus.MAX_ITERATIONS.value,
-        )
-
         async def _attempt() -> bool:
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
@@ -1078,7 +1410,7 @@ class SQLAlchemyStateStore:
                     update(AgentRun)
                     .where(
                         AgentRun.id == run_id,
-                        AgentRun.status.notin_(terminal),
+                        AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
                     )
                     .values(cancel_requested=True)
                 )
@@ -1125,6 +1457,285 @@ class SQLAlchemyStateStore:
 
         return await retry_transient_db(_attempt, label="is_cancel_requested", run_id=run_id)
 
+    async def get_run_control(self, run_id: str) -> RunControl:
+        """One read of cancel / pause flags plus an EXISTS over undelivered notes."""
+        from sqlalchemy import literal, select
+
+        from dendrux.db.models import AgentRun, RunInbox
+
+        pending = (
+            select(literal(1))
+            .where(RunInbox.run_id == AgentRun.id, RunInbox.delivered_at.is_(None))
+            .exists()
+        )
+
+        async def _attempt() -> RunControl:
+            async with self._session_factory() as session:
+                stmt = select(AgentRun.cancel_requested, AgentRun.pause_requested, pending).where(
+                    AgentRun.id == run_id
+                )
+                row = (await session.execute(stmt)).first()
+                if row is None:
+                    return RunControl()
+                return RunControl(
+                    cancel_requested=bool(row[0]),
+                    pause_requested=bool(row[1]),
+                    has_pending_notes=bool(row[2]),
+                )
+
+        return await retry_transient_db(_attempt, label="get_run_control", run_id=run_id)
+
+    async def request_pause(self, run_id: str, *, reason: str | None = None) -> bool:
+        """Set ``pause_requested`` on a RUNNING row; status guard in the UPDATE."""
+        from sqlalchemy import select, update
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    update(AgentRun)
+                    .where(AgentRun.id == run_id, AgentRun.status == RunStatus.RUNNING.value)
+                    .values(pause_requested=True)
+                )
+                if not result.rowcount:
+                    await session.rollback()
+                    return False
+                # The UPDATE holds the row lock; record the reason (or clear a
+                # stale one) under it.
+                meta = (
+                    await session.execute(select(AgentRun.meta).where(AgentRun.id == run_id))
+                ).scalar_one_or_none() or {}
+                if reason is not None or PAUSE_REQUEST_META_KEY in meta:
+                    await session.execute(
+                        update(AgentRun)
+                        .where(AgentRun.id == run_id)
+                        .values(meta={**meta, PAUSE_REQUEST_META_KEY: {"reason": reason}})
+                    )
+                await session.commit()
+                return True
+
+        return await retry_transient_db(_attempt, label="request_pause", run_id=run_id)
+
+    async def try_pause_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        iteration_count: int | None = None,
+        pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
+    ) -> bool:
+        """CAS pause: RUNNING and no pending cancel, else False (caller honors winner)."""
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                values: dict[str, Any] = {
+                    "status": status,
+                    "pause_data": pause_data,
+                    "pause_requested": False,
+                }
+                if iteration_count is not None:
+                    values["iteration_count"] = iteration_count
+                if pii_mapping is not None:
+                    values["pii_mapping"] = pii_mapping
+                if total_usage is not None:
+                    values.update(_usage_totals(total_usage))
+                result = await session.execute(
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_id,
+                        AgentRun.status == RunStatus.RUNNING.value,
+                        AgentRun.cancel_requested.is_(False),
+                    )
+                    .values(**values)
+                )
+                await session.commit()
+                return bool(result.rowcount and result.rowcount > 0)
+
+        return await retry_transient_db(_attempt, label="try_pause_run", run_id=run_id)
+
+    async def pause_with_event(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        pause_data: dict[str, Any],
+        event_data: dict[str, Any] | None = None,
+        iteration_count: int | None = None,
+        pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
+    ) -> int | None:
+        """:meth:`try_pause_run` plus the ``run.paused`` event, in one transaction.
+
+        A finalizer of paused runs (``cancel_run``, the sweeper) can only act
+        once this commits, so it always sees ``run.paused`` and allocates a
+        later sequence index. Returns the event's sequence index, or None
+        when the CAS lost (a pending cancel or a non-RUNNING row).
+        """
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        async def _attempt() -> int | None:
+            async with self._session_factory() as session:
+                values: dict[str, Any] = {
+                    "status": status,
+                    "pause_data": pause_data,
+                    "pause_requested": False,
+                }
+                if iteration_count is not None:
+                    values["iteration_count"] = iteration_count
+                if pii_mapping is not None:
+                    values["pii_mapping"] = pii_mapping
+                if total_usage is not None:
+                    values.update(_usage_totals(total_usage))
+                result = await session.execute(
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_id,
+                        AgentRun.status == RunStatus.RUNNING.value,
+                        AgentRun.cancel_requested.is_(False),
+                    )
+                    .values(**values)
+                )
+                if not result.rowcount:
+                    await session.rollback()
+                    return None
+                seq = await _insert_event_locked(
+                    session,
+                    run_id,
+                    "run.paused",
+                    event_data,
+                    iteration_index=iteration_count or 0,
+                )
+                await session.commit()
+                return seq
+
+        return await retry_transient_db(_attempt, label="pause_with_event", run_id=run_id)
+
+    async def add_note(
+        self,
+        run_id: str,
+        *,
+        note_id: str,
+        text: str,
+        metadata: Any = None,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> bool:
+        """Conditional ``INSERT ... SELECT`` guarded by status and tenant, row share-locked."""
+        import datetime as _dt
+
+        from sqlalchemy import JSON, DateTime, String, Text, insert, literal, null, select
+
+        from dendrux.db.models import AgentRun, RunInbox
+
+        async def _attempt() -> bool:
+            async with self._session_factory() as session:
+                source = select(
+                    literal(note_id, String(26)),
+                    AgentRun.id,
+                    literal(text, Text()),
+                    null() if metadata is None else literal(metadata, JSON()),
+                    literal(_dt.datetime.now(_dt.UTC), DateTime(timezone=True)),
+                ).where(
+                    AgentRun.id == run_id,
+                    AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
+                )
+                # FOR SHARE (Postgres; a no-op on SQLite, whose writes are
+                # serialized): a concurrent finalize waits for this insert, or
+                # this insert re-checks the status the finalize committed.
+                source = _apply_tenant_scope(source, tenant_id).with_for_update(read=True)
+                result = await session.execute(
+                    insert(RunInbox).from_select(
+                        [
+                            RunInbox.id,
+                            RunInbox.run_id,
+                            RunInbox.text,
+                            RunInbox.metadata_,
+                            RunInbox.created_at,
+                        ],
+                        source,
+                    )
+                )
+                await session.commit()
+                return bool(result.rowcount and result.rowcount > 0)
+
+        return await retry_transient_db(_attempt, label="add_note", run_id=run_id)
+
+    async def get_notes(
+        self,
+        run_id: str,
+        *,
+        undelivered_only: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[NoteRecord]:
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun, RunInbox
+
+        async with self._session_factory() as session:
+            stmt = select(RunInbox).where(RunInbox.run_id == run_id)
+            if not isinstance(tenant_id, _Unscoped):
+                owner = _apply_tenant_scope(
+                    select(AgentRun.id).where(AgentRun.id == run_id), tenant_id
+                )
+                stmt = stmt.where(owner.exists())
+            if undelivered_only:
+                stmt = stmt.where(RunInbox.delivered_at.is_(None))
+            rows = (
+                (await session.execute(stmt.order_by(RunInbox.created_at, RunInbox.id)))
+                .scalars()
+                .all()
+            )
+            return [
+                NoteRecord(
+                    id=r.id,
+                    run_id=r.run_id,
+                    text=r.text,
+                    metadata=r.metadata_,
+                    created_at=_to_aware_utc(r.created_at),
+                    delivered_at=_to_aware_utc(r.delivered_at),
+                    delivered_iteration=r.delivered_iteration,
+                )
+                for r in rows
+            ]
+
+    async def mark_notes_delivered(
+        self, run_id: str, note_ids: list[str], *, iteration: int
+    ) -> int:
+        import datetime as _dt
+
+        from sqlalchemy import update
+
+        from dendrux.db.models import RunInbox
+
+        if not note_ids:
+            return 0
+
+        async def _attempt() -> int:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    update(RunInbox)
+                    .where(
+                        RunInbox.run_id == run_id,
+                        RunInbox.id.in_(note_ids),
+                        RunInbox.delivered_at.is_(None),
+                    )
+                    .values(
+                        delivered_at=_dt.datetime.now(_dt.UTC),
+                        delivered_iteration=iteration,
+                    )
+                )
+                await session.commit()
+                return int(result.rowcount or 0)
+
+        return await retry_transient_db(_attempt, label="mark_notes_delivered", run_id=run_id)
+
     async def get_next_event_sequence(self, run_id: str) -> int:
         """Return ``max(sequence_index) + 1`` for the run, or 0 if none."""
         from sqlalchemy import func, select
@@ -1151,8 +1762,12 @@ class SQLAlchemyStateStore:
         pause_data: dict[str, Any],
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
+        total_usage: UsageStats | None = None,
     ) -> None:
-        """Persist pause state and set WAITING status."""
+        """Persist pause state and set the paused status.
+
+        ``total_usage`` writes the run's running totals (``total_*``).
+        """
         from sqlalchemy import update
 
         from dendrux.db.models import AgentRun
@@ -1168,6 +1783,8 @@ class SQLAlchemyStateStore:
                     values["iteration_count"] = iteration_count
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
+                if total_usage is not None:
+                    values.update(_usage_totals(total_usage))
                 stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
                 await session.execute(stmt)
                 await session.commit()
@@ -1209,6 +1826,8 @@ class SQLAlchemyStateStore:
         Returns True if the claim succeeded (run was in expected_status).
         Returns False if someone else already claimed it or status didn't match.
         Uses UPDATE ... WHERE status=? for atomicity — no race window.
+        The claim clears ``pause_requested`` in the same statement, so a
+        resumed PAUSED run does not immediately re-pause on a stale flag.
         """
         from sqlalchemy import update
 
@@ -1220,7 +1839,7 @@ class SQLAlchemyStateStore:
                 stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                    .values(status="running")
+                    .values(status="running", pause_requested=False)
                 )
                 result = await session.execute(stmt)
                 await session.commit()
@@ -1234,20 +1853,19 @@ class SQLAlchemyStateStore:
         *,
         expected_status: str,
         submitted_data: dict[str, Any],
+        validate: Callable[[dict[str, Any]], None] | None = None,
     ) -> bool:
         """Atomically save submitted data and claim the run.
 
-        Implementation:
-          1. Read pause_data + status in a session.
-          2. Merge submitted_data into pause_data (Python-side).
-          3. Conditional UPDATE: set merged blob + status='running'
-             WHERE status still equals *expected_status*.
-
-        The CAS on the status column is the concurrency boundary.
-        On SQLite, writes are serialized (single-writer lock) so the
-        second writer's UPDATE sees the first writer's committed status
-        change and matches 0 rows.  On Postgres, the UPDATE takes a
-        row-level lock achieving the same effect.
+        Implementation (one transaction):
+          1. Conditional UPDATE status -> 'running' WHERE status still equals
+             *expected_status*. Losing this CAS returns False. Winning it
+             takes the row's write lock (Postgres row lock / SQLite write
+             lock), so the pause_data read next cannot change underneath.
+          2. Read pause_data and run *validate* on it. A failure rolls the
+             whole transaction back (status stays *expected_status*) and
+             re-raises.
+          3. Merge submitted_data into pause_data and commit.
         """
         from sqlalchemy import select, update
 
@@ -1255,36 +1873,39 @@ class SQLAlchemyStateStore:
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
-                # 1. Read current pause_data
-                stmt = select(AgentRun.pause_data, AgentRun.status).where(AgentRun.id == run_id)
-                result = await session.execute(stmt)
-                row = result.one_or_none()
-                if row is None:
-                    return False
-
-                current_pause_data, current_status = row
-                if current_status != expected_status:
-                    return False
-                if current_pause_data is None:
-                    return False
-
-                # 2. Merge submitted_data into pause_data
-                merged = dict(current_pause_data)
-                merged.update(submitted_data)
-
-                # 3. Conditional UPDATE — CAS on status column. updated_at is
-                # filled by the model's onupdate hook (Python aware-UTC).
-                update_stmt = (
+                # 1. Claim first — the CAS on status is the concurrency
+                # boundary. updated_at is filled by the model's onupdate hook.
+                claim = await session.execute(
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                    .values(
-                        pause_data=merged,
-                        status="running",
-                    )
+                    .values(status="running", pause_requested=False)
                 )
-                update_result = await session.execute(update_stmt)
+                if not claim.rowcount:
+                    await session.rollback()
+                    return False
+
+                # 2. Read the pause being claimed, under the claim's lock.
+                current_pause_data = (
+                    await session.execute(select(AgentRun.pause_data).where(AgentRun.id == run_id))
+                ).scalar_one_or_none()
+                if current_pause_data is None:
+                    await session.rollback()
+                    return False
+                if validate is not None:
+                    try:
+                        validate(current_pause_data)
+                    except BaseException:
+                        await session.rollback()
+                        raise
+
+                # 3. Merge submitted_data into pause_data.
+                merged = dict(current_pause_data)
+                merged.update(submitted_data)
+                await session.execute(
+                    update(AgentRun).where(AgentRun.id == run_id).values(pause_data=merged)
+                )
                 await session.commit()
-                return bool(update_result.rowcount and update_result.rowcount > 0)
+                return True
 
         return await retry_transient_db(_attempt, label="submit_and_claim", run_id=run_id)
 
@@ -1343,8 +1964,11 @@ class SQLAlchemyStateStore:
         iteration_index: int | None = None,
         limit: int | None = None,
         offset: int = 0,
+        before: datetime | None = None,
     ) -> list[ToolCallReadRecord]:
         from sqlalchemy import select
+
+        _require_aware_utc("before", before)
 
         from dendrux.db.models import ToolCallRecord
 
@@ -1356,6 +1980,8 @@ class SQLAlchemyStateStore:
             )
             if iteration_index is not None:
                 stmt = stmt.where(ToolCallRecord.iteration_index == iteration_index)
+            if before is not None:
+                stmt = stmt.where(ToolCallRecord.created_at < _to_aware_utc(before))
             if limit is not None:
                 stmt = stmt.limit(max(1, min(limit, 1000)))
             if offset:
@@ -1412,10 +2038,13 @@ class SQLAlchemyStateStore:
         after_sequence_index: int | None = None,
         limit: int | None = None,
         event_types: list[str] | None = None,
+        before: datetime | None = None,
     ) -> list[RunEventRecord]:
         from sqlalchemy import false, select
 
         from dendrux.db.models import RunEvent
+
+        _require_aware_utc("before", before)
 
         async with self._session_factory() as session:
             stmt = (
@@ -1426,6 +2055,9 @@ class SQLAlchemyStateStore:
 
             if after_sequence_index is not None:
                 stmt = stmt.where(RunEvent.sequence_index > after_sequence_index)
+
+            if before is not None:
+                stmt = stmt.where(RunEvent.created_at < _to_aware_utc(before))
 
             if event_types is not None:
                 if not event_types:
@@ -1484,6 +2116,11 @@ class SQLAlchemyStateStore:
         Detection uses last_progress_at (or created_at if last_progress_at
         is NULL — run never got far enough to record progress).
 
+        A stale row whose cancellation was already requested is finalized
+        CANCELLED instead (never ERROR): the request is honored, the
+        ``failure_reason`` still records the stale classification, and the
+        event is ``run.cancelled`` with ``reason="cancel_requested"``.
+
         Classification is best-effort: absence of a run.started event
         does NOT strictly prove 'never started' because that event is
         emitted through a helper that swallows failures. Useful heuristic
@@ -1491,7 +2128,7 @@ class SQLAlchemyStateStore:
         """
         import datetime as _dt
 
-        from sqlalchemy import func, select, update
+        from sqlalchemy import case, func, select, update
 
         from dendrux.db.models import AgentRun, RunEvent
 
@@ -1524,31 +2161,22 @@ class SQLAlchemyStateStore:
             started_result = await session.execute(started_stmt)
             started_run_ids = {row[0] for row in started_result.all()}
 
-            # Get max sequence_index per run for event ordering
-            seq_stmt = (
-                select(
-                    RunEvent.agent_run_id,
-                    func.max(RunEvent.sequence_index).label("max_seq"),
-                )
-                .where(RunEvent.agent_run_id.in_(stale_ids))
-                .group_by(RunEvent.agent_run_id)
-            )
-            seq_result = await session.execute(seq_stmt)
-            max_seqs: dict[str, int] = {row[0]: row[1] for row in seq_result.all()}
-
             # Process each stale run
             for row in stale_rows:
                 classification = "stale_running" if row.id in started_run_ids else "never_started"
+                flagged = AgentRun.cancel_requested.is_(True)
 
-                # Mark as ERROR with failure_reason; updated_at is filled
-                # by the model's onupdate hook (Python-side aware-UTC).
+                # One CAS: a pending cancel finalizes CANCELLED, else ERROR.
+                # updated_at is filled by the model's onupdate hook.
                 update_stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == row.id, AgentRun.status == "running")
                     .values(
-                        status="error",
+                        status=case((flagged, "cancelled"), else_="error"),
                         failure_reason=classification,
-                        error=f"Run swept as {classification}",
+                        error=case((flagged, None), else_=f"Run swept as {classification}"),
+                        cancel_requested=False,
+                        pause_requested=False,
                     )
                 )
                 update_result = await session.execute(update_stmt)
@@ -1557,17 +2185,18 @@ class SQLAlchemyStateStore:
                 if not (update_result.rowcount and update_result.rowcount > 0):
                     continue
 
-                # Emit run.interrupted event
-                next_seq = max_seqs.get(row.id, -1) + 1
-                event = RunEvent(
-                    id=generate_ulid(),
-                    agent_run_id=row.id,
-                    event_type="run.interrupted",
-                    sequence_index=next_seq,
-                    iteration_index=row.iteration_count or 0,
-                    data={"failure_reason": classification},
+                new_status = (
+                    await session.execute(select(AgentRun.status).where(AgentRun.id == row.id))
+                ).scalar_one()
+                if new_status == "cancelled":
+                    event_type = "run.cancelled"
+                    data = {"reason": "cancel_requested", "failure_reason": classification}
+                else:
+                    event_type = "run.interrupted"
+                    data = {"failure_reason": classification}
+                await _insert_event_locked(
+                    session, row.id, event_type, data, iteration_index=row.iteration_count or 0
                 )
-                session.add(event)
 
                 # Commit per-run so partial progress is durable.
                 # If run N+1 fails, runs 0..N are already committed.
@@ -1581,6 +2210,7 @@ class SQLAlchemyStateStore:
                         failure_reason=classification,
                         last_progress_at=_to_aware_utc(row.last_progress_at),
                         swept_at=_to_aware_utc(now),
+                        status=new_status,
                     )
                 )
 
@@ -1590,15 +2220,15 @@ class SQLAlchemyStateStore:
         self,
         older_than: timedelta,
     ) -> list[SweptRun]:
-        """Find WAITING_CLIENT_TOOL/WAITING_HUMAN_INPUT rows older than
-        threshold and mark them ERROR with failure_reason=abandoned_waiting.
+        """Find WAITING_* and PAUSED rows older than threshold and mark them
+        ERROR with failure_reason=abandoned_waiting.
         """
         import datetime as _dt
 
         from sqlalchemy import select, update
 
         from dendrux.db.enums import AgentRunStatus
-        from dendrux.db.models import AgentRun, RunEvent
+        from dendrux.db.models import AgentRun
 
         now = _dt.datetime.now(_dt.UTC)
         cutoff = now - older_than
@@ -1607,6 +2237,7 @@ class SQLAlchemyStateStore:
             AgentRunStatus.WAITING_CLIENT_TOOL,
             AgentRunStatus.WAITING_HUMAN_INPUT,
             AgentRunStatus.WAITING_APPROVAL,
+            AgentRunStatus.PAUSED,
         ]
 
         swept: list[SweptRun] = []
@@ -1623,21 +2254,6 @@ class SQLAlchemyStateStore:
             if not abandoned_rows:
                 return swept
 
-            # Get max sequence_index per run for event ordering
-            from sqlalchemy import func as sa_func
-
-            run_ids = [r.id for r in abandoned_rows]
-            seq_stmt = (
-                select(
-                    RunEvent.agent_run_id,
-                    sa_func.max(RunEvent.sequence_index),
-                )
-                .where(RunEvent.agent_run_id.in_(run_ids))
-                .group_by(RunEvent.agent_run_id)
-            )
-            seq_result = await session.execute(seq_stmt)
-            max_seqs: dict[str, int] = {row[0]: row[1] for row in seq_result.all()}
-
             # Process each abandoned run
             for row in abandoned_rows:
                 previous_status = row.status
@@ -1650,6 +2266,8 @@ class SQLAlchemyStateStore:
                     .values(
                         status=AgentRunStatus.ERROR,
                         failure_reason="abandoned_waiting",
+                        cancel_requested=False,
+                        pause_requested=False,
                     )
                 )
                 update_result = await session.execute(update_stmt)
@@ -1657,18 +2275,10 @@ class SQLAlchemyStateStore:
                 if update_result.rowcount == 0:
                     continue  # Status changed between SELECT and UPDATE
 
-                # Emit run.abandoned event
-                next_seq = (max_seqs.get(row.id, -1)) + 1
-                max_seqs[row.id] = next_seq
-
-                event = RunEvent(
-                    id=generate_ulid(),
-                    agent_run_id=row.id,
-                    event_type="run.abandoned",
-                    sequence_index=next_seq,
-                    data={"failure_reason": "abandoned_waiting"},
+                # Emit run.abandoned with a sequence allocated under the row lock.
+                await _insert_event_locked(
+                    session, row.id, "run.abandoned", {"failure_reason": "abandoned_waiting"}
                 )
-                session.add(event)
 
                 # Per-run commit for isolation
                 await session.commit()
@@ -1779,6 +2389,57 @@ class SQLAlchemyStateStore:
         ancestry.reverse()
         return ancestry, complete
 
+    async def _bfs_descendants(
+        self,
+        session: AsyncSession,
+        root_id: str,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        light: bool = False,
+    ) -> list[tuple[AgentRun, int]]:
+        """Descendants of ``root_id`` as ``(row, depth)`` in BFS order, root excluded.
+
+        ``depth`` is 1 for direct children. Cycle-safe via a seen set. With
+        ``tenant_id`` set, other tenants' runs are skipped and so is
+        everything below them. ``light`` loads only id / parent / tenant so
+        usage-only callers don't pull large JSON columns.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm import load_only
+
+        from dendrux.db.models import AgentRun
+
+        seen: set[str] = {root_id}
+        current_level = [root_id]
+        found: list[tuple[AgentRun, int]] = []
+        depth = 0
+
+        while current_level:
+            depth += 1
+            rows: list[AgentRun] = []
+            for i in range(0, len(current_level), _IN_CHUNK):
+                stmt = select(AgentRun).where(
+                    AgentRun.parent_run_id.in_(current_level[i : i + _IN_CHUNK])
+                )
+                if light:
+                    stmt = stmt.options(
+                        load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id)
+                    )
+                stmt = _apply_tenant_scope(stmt, tenant_id)
+                result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
+                rows.extend(result.scalars().all())
+
+            next_level: list[str] = []
+            for cr in rows:
+                if cr.id in seen:
+                    continue
+                seen.add(cr.id)
+                next_level.append(cr.id)
+                found.append((cr, depth))
+            current_level = next_level
+
+        return found
+
     async def _traverse_subtree_bfs(
         self,
         session: AsyncSession,
@@ -1788,76 +2449,41 @@ class SQLAlchemyStateStore:
 
         Summary includes the root run itself in token/cost/status counts.
         """
-        from sqlalchemy import select
+        descendants = await self._bfs_descendants(session, run_row.id)
 
-        from dendrux.db.models import AgentRun
-
-        run_id = run_row.id
-        seen: set[str] = {run_id}
-        current_level = [run_id]
-        children: list[RunBrief] = []
-        max_depth = 0
-        depth = 0
-
-        # Seed metrics with the root run
         sum_input = run_row.total_input_tokens or 0
         sum_output = run_row.total_output_tokens or 0
-        sum_cost = 0.0
-        has_cost = run_row.total_cost_usd is not None
+        root_cost = run_row.total_cost_usd
+        has_cost = root_cost is not None
+        sum_cost = float(root_cost) if root_cost is not None else 0.0
         unknown_cost_count = 0 if has_cost else 1
-        if run_row.total_cost_usd is not None:
-            sum_cost = float(run_row.total_cost_usd)
-        descendant_count = 0
-        status_counts: dict[str, int] = {}
-        root_status = _extract_status(run_row)
-        status_counts[root_status] = 1
-        is_first_level = True
+        status_counts: dict[str, int] = {_extract_status(run_row): 1}
+        children: list[RunBrief] = []
 
-        while current_level:
-            stmt = (
-                select(AgentRun)
-                .where(AgentRun.parent_run_id.in_(current_level))
-                .order_by(AgentRun.created_at)
-            )
-            result = await session.execute(stmt)
-            rows = result.scalars().all()
-
-            next_level: list[str] = []
-            for cr in rows:
-                if cr.id in seen:
-                    continue
-                seen.add(cr.id)
-                next_level.append(cr.id)
-                descendant_count += 1
-                sum_input += cr.total_input_tokens or 0
-                sum_output += cr.total_output_tokens or 0
-                if cr.total_cost_usd is not None:
-                    sum_cost += float(cr.total_cost_usd)
-                    has_cost = True
-                else:
-                    unknown_cost_count += 1
-                s = _extract_status(cr)
-                status_counts[s] = status_counts.get(s, 0) + 1
-                if is_first_level:
-                    children.append(
-                        RunBrief(
-                            run_id=cr.id,
-                            agent_name=cr.agent_name,
-                            status=s,
-                            delegation_level=cr.delegation_level,
-                        )
+        for cr, depth in descendants:
+            sum_input += cr.total_input_tokens or 0
+            sum_output += cr.total_output_tokens or 0
+            if cr.total_cost_usd is not None:
+                sum_cost += float(cr.total_cost_usd)
+                has_cost = True
+            else:
+                unknown_cost_count += 1
+            s = _extract_status(cr)
+            status_counts[s] = status_counts.get(s, 0) + 1
+            if depth == 1:
+                children.append(
+                    RunBrief(
+                        run_id=cr.id,
+                        agent_name=cr.agent_name,
+                        status=s,
+                        delegation_level=cr.delegation_level,
                     )
-
-            is_first_level = False
-            if next_level:
-                depth += 1
-                max_depth = depth
-            current_level = next_level
+                )
 
         summary = SubtreeSummary(
             direct_child_count=len(children),
-            descendant_count=descendant_count,
-            max_depth=max_depth,
+            descendant_count=len(descendants),
+            max_depth=max((d for _, d in descendants), default=0),
             subtree_input_tokens=sum_input,
             subtree_output_tokens=sum_output,
             subtree_cost_usd=sum_cost if has_cost else None,
@@ -1865,6 +2491,80 @@ class SQLAlchemyStateStore:
             status_counts=status_counts,
         )
         return children, summary
+
+    async def _usage_by_run(
+        self, session: AsyncSession, run_ids: list[str]
+    ) -> dict[str, UsageRollup]:
+        """Per-run live usage, one grouped query per chunk of ids.
+
+        Runs without any ``llm_interactions`` row are absent from the result.
+        """
+        from sqlalchemy import case, func, select
+
+        from dendrux.db.models import LLMInteraction as L
+
+        out: dict[str, UsageRollup] = {}
+        for i in range(0, len(run_ids), _IN_CHUNK):
+            stmt = (
+                select(
+                    L.agent_run_id,
+                    func.coalesce(func.sum(L.input_tokens), 0),
+                    func.coalesce(func.sum(L.output_tokens), 0),
+                    func.coalesce(func.sum(L.cache_read_input_tokens), 0),
+                    func.coalesce(func.sum(L.cache_creation_input_tokens), 0),
+                    func.coalesce(func.sum(L.reasoning_tokens), 0),
+                    func.coalesce(func.sum(L.cost_usd), 0),
+                    func.coalesce(func.sum(case((L.cost_usd.is_(None), 1), else_=0)), 0),
+                    func.count(),
+                )
+                .where(L.agent_run_id.in_(run_ids[i : i + _IN_CHUNK]))
+                .group_by(L.agent_run_id)
+            )
+            for row in (await session.execute(stmt)).all():
+                out[row[0]] = UsageRollup(
+                    input_tokens=int(row[1]),
+                    output_tokens=int(row[2]),
+                    cache_read_tokens=int(row[3]),
+                    cache_write_tokens=int(row[4]),
+                    reasoning_tokens=int(row[5]),
+                    known_cost_usd=round(float(row[6]), _COST_DECIMALS),
+                    unpriced_calls=int(row[7]),
+                    llm_calls=int(row[8]),
+                )
+        return out
+
+    async def get_subtree(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> SubtreeRecord | None:
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
+            root = (await session.execute(stmt)).scalar_one_or_none()
+            if root is None:
+                return None
+
+            rows = [(root, 0), *await self._bfs_descendants(session, root.id, tenant_id=tenant_id)]
+            usage = await self._usage_by_run(session, [r.id for r, _ in rows])
+            nodes = [
+                SubtreeNodeRecord(
+                    run=_run_to_record(r), depth=d, usage=usage.get(r.id, UsageRollup())
+                )
+                for r, d in rows
+            ]
+            return SubtreeRecord(nodes=nodes, usage=UsageRollup.combine(n.usage for n in nodes))
+
+    async def subtree_usage(self, run_id: str) -> UsageRollup:
+        async with self._session_factory() as session:
+            descendants = await self._bfs_descendants(session, run_id, light=True)
+            usage = await self._usage_by_run(session, [run_id, *(r.id for r, _ in descendants)])
+            return UsageRollup.combine(usage.values())
+
+    async def run_usage(self, run_id: str) -> UsageRollup:
+        async with self._session_factory() as session:
+            return (await self._usage_by_run(session, [run_id])).get(run_id, UsageRollup())
 
     _MAX_LIST_LIMIT = 1000
 
@@ -2053,6 +2753,79 @@ class SQLAlchemyStateStore:
         return stmt
 
 
+async def read_run_control(store: Any, run_id: str) -> RunControl:
+    """Checkpoint read that also works on pre-0.3 custom stores.
+
+    A store without ``get_run_control`` gets the cancel flag from
+    ``is_cancel_requested``; it has no pause flag and no inbox.
+    """
+    getter = getattr(store, "get_run_control", None)
+    if getter is not None:
+        control: RunControl = await getter(run_id)
+        return control
+    return RunControl(cancel_requested=bool(await store.is_cancel_requested(run_id)))
+
+
+def require_store_method(store: Any, name: str) -> Any:
+    """Return ``store.<name>`` or raise a clear error for a pre-0.3 custom store."""
+    method = getattr(store, name, None)
+    if method is None:
+        raise NotImplementedError(
+            f"{type(store).__name__} does not implement StateStore.{name}(), which this "
+            "run-control API needs (added in Dendrux 0.3). Implement it on the custom "
+            "store or use SQLAlchemyStateStore."
+        )
+    return method
+
+
+async def _insert_event_locked(
+    session: AsyncSession,
+    run_id: str,
+    event_type: str,
+    data: dict[str, Any] | None,
+    *,
+    iteration_index: int = 0,
+) -> int:
+    """Append a run event with ``max(sequence_index) + 1``, inside the caller's transaction.
+
+    Called only after the caller's CAS UPDATE on the run row succeeded, so
+    the row lock serializes every transition writer allocating here.
+    """
+    from sqlalchemy import func, select
+
+    from dendrux.db.models import RunEvent
+
+    current = (
+        await session.execute(
+            select(func.max(RunEvent.sequence_index)).where(RunEvent.agent_run_id == run_id)
+        )
+    ).scalar_one_or_none()
+    seq = 0 if current is None else int(current) + 1
+    session.add(
+        RunEvent(
+            id=generate_ulid(),
+            agent_run_id=run_id,
+            event_type=event_type,
+            sequence_index=seq,
+            iteration_index=iteration_index,
+            data=data,
+        )
+    )
+    await session.flush()
+    return seq
+
+
+def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
+    """``UNSCOPED`` adds nothing; ``None`` means untenanted only; a string means that tenant."""
+    from dendrux.db.models import AgentRun
+
+    if isinstance(tenant_id, _Unscoped):
+        return stmt
+    if tenant_id is None:
+        return stmt.where(AgentRun.tenant_id.is_(None))
+    return stmt.where(AgentRun.tenant_id == tenant_id)
+
+
 def _extract_status(row: AgentRun) -> str:
     """Extract status string from an AgentRun, handling enum or raw string."""
     s = row.status
@@ -2091,6 +2864,7 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         created_at=_to_aware_utc(row.created_at),
         updated_at=_to_aware_utc(row.updated_at),
         tenant_id=row.tenant_id,
+        pause_requested=bool(row.pause_requested),
     )
 
 

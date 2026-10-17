@@ -9,6 +9,13 @@ It also holds one interrupt signal per streamed run owned by this
 process. :meth:`cancel` sets the signal so the loop driving the stream
 can abandon an in-flight provider call between tokens.
 
+Batch ``run()`` registers the task it executes on (:meth:`register_current`).
+:meth:`cancel` cancels that task and records the run as interrupted, so the
+runner can tell a ``cancel_run`` interrupt from a caller's own
+``task.cancel()`` (:meth:`take_interrupt`). Several runs can share one task
+(a child run awaited inside its parent's tool); the task is cancelled once
+and every interrupted run on it is recorded.
+
 Cross-process cancellation is not handled here — that requires the run
 to be executing in this process. Runs on other workers can still be
 CAS-finalized in the DB; they just won't be preempted mid-call.
@@ -41,6 +48,10 @@ class RunTaskManager:
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._interrupts: dict[str, asyncio.Event] = {}
+        self._owned: dict[str, asyncio.Task[Any]] = {}
+        # Runs whose owned task this manager cancelled and that have not yet
+        # observed it, per task.
+        self._pending: dict[asyncio.Task[Any], set[str]] = {}
 
     def spawn(self, run_id: str, coro: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
         """Spawn a background task for ``run_id`` and track it.
@@ -83,7 +94,59 @@ class RunTaskManager:
         if signal is not None:
             signal.set()
             delivered = True
+        owned = self._owned.get(run_id)
+        if owned is not None and not owned.done():
+            pending = self._pending.setdefault(owned, set())
+            if run_id not in pending:
+                if not pending:
+                    owned.cancel()
+                pending.add(run_id)
+            delivered = True
         return delivered
+
+    def register_current(self, run_id: str) -> None:
+        """Track the current task as the one executing ``run_id`` (batch run())."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._owned[run_id] = task
+
+    def take_interrupt(self, run_id: str) -> tuple[bool, bool]:
+        """Consume a pending :meth:`cancel` interrupt for ``run_id``.
+
+        Called by the runner when it catches ``CancelledError``. Returns
+        ``(interrupted, others_pending)``: whether this manager cancelled the
+        run's task for ``run_id``, and whether it still owes the same task's
+        cancellation to another run (an ancestor sharing the task), in which
+        case the runner must keep propagating it.
+        """
+        task = self._owned.get(run_id)
+        if task is None:
+            return False, False
+        pending = self._pending.get(task)
+        if not pending or run_id not in pending:
+            return False, bool(pending)
+        pending.discard(run_id)
+        if not pending:
+            del self._pending[task]
+        return True, bool(pending)
+
+    def release_current(self, run_id: str) -> None:
+        """Forget ``run_id``'s task. No-op if unknown.
+
+        An interrupt still pending here was never observed (the tool that
+        received the ``CancelledError`` swallowed it); its cancel request is
+        withdrawn so it cannot leak into the caller's later awaits.
+        """
+        task = self._owned.pop(run_id, None)
+        if task is None:
+            return
+        pending = self._pending.get(task)
+        if pending and run_id in pending:
+            pending.discard(run_id)
+            if not pending:
+                del self._pending[task]
+                if task.cancelling():
+                    task.uncancel()
 
     def register_interrupt(self, run_id: str) -> asyncio.Event:
         """Return the interrupt signal for a streamed run, creating it if needed.

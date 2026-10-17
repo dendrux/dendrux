@@ -52,12 +52,14 @@ async def sweep(
             with ``database_url``.
         stale_running: Threshold for stale RUNNING detection. Runs with
             no forward progress beyond this duration are swept. If None,
-            no stale-running sweep is performed.
+            no stale-running sweep is performed. It must exceed the longest
+            gap between progress updates (LLM calls, tool starts/ends,
+            ``heartbeat()``), otherwise event sequence indexes of a run that
+            is still executing may collide with the sweep's event.
         abandoned_waiting: Threshold for abandoned WAITING detection.
-            WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, and
-            WAITING_APPROVAL runs with no state change beyond this
-            duration are swept. If None, no abandoned-waiting sweep
-            is performed.
+            WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, WAITING_APPROVAL and
+            PAUSED runs with no state change beyond this duration are
+            swept. If None, no abandoned-waiting sweep is performed.
 
     Returns:
         SweepResult with lists of swept runs by category.
@@ -109,7 +111,7 @@ async def _create_temp_store(
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.db.models import Base
+    from dendrux.db._sqlite_sync import create_sqlite_schema
     from dendrux.runtime.state import SQLAlchemyStateStore
 
     connect_args: dict[str, Any] = {}
@@ -129,8 +131,11 @@ async def _create_temp_store(
         db_path = database_url.split("///", 1)[-1] if "///" in database_url else None
         if db_path and db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        try:
+            await create_sqlite_schema(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
 
     store = SQLAlchemyStateStore(engine)
     return store, engine
