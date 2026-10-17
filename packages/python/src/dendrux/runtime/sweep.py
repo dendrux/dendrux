@@ -111,7 +111,7 @@ async def _create_temp_store(
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from dendrux.db.models import Base
+    from dendrux.db._sqlite_sync import create_sqlite_schema
     from dendrux.runtime.state import SQLAlchemyStateStore
 
     connect_args: dict[str, Any] = {}
@@ -132,7 +132,7 @@ async def _create_temp_store(
         if db_path and db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_sqlite_schema)
 
     store = SQLAlchemyStateStore(engine)
     return store, engine

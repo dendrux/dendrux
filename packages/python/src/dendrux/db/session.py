@@ -20,7 +20,7 @@ from sqlalchemy.orm import sessionmaker
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-from dendrux.db.models import Base
+from dendrux.db._sqlite_sync import create_sqlite_schema
 
 _engine: AsyncEngine | None = None
 _engine_url: str | None = None
@@ -98,7 +98,7 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
         if db_path:
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         async with _engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(create_sqlite_schema)
 
     return _engine
 

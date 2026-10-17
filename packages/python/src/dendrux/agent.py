@@ -904,7 +904,7 @@ class Agent:
 
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        from dendrux.db.models import Base
+        from dendrux.db._sqlite_sync import create_sqlite_schema
 
         connect_args: dict[str, Any] = {}
         if url.startswith("sqlite"):
@@ -923,7 +923,7 @@ class Agent:
             if db_path:
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                await conn.run_sync(create_sqlite_schema)
 
         return engine
 
