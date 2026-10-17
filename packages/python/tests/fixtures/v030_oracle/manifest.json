@@ -1,0 +1,8 @@
+{
+"oracle_version":"0.3.0",
+"source":"tag v0.3.0 (e479746)",
+"environment":{"dendrux":"0.3.0","python":"3.12.12","anthropic":"0.84.0","openai":"2.30.0","SQLAlchemy":"2.0.48"},
+"cells":["anthropic__batch","anthropic__stream","anthropic_ttl1h__batch","anthropic_ttl1h__stream","openai_chat__batch","openai_chat__stream","openai_chat_routing__batch","openai_chat_routing__stream","openai_chat_compat__batch","openai_chat_compat__stream","openai_responses__batch","openai_responses__stream","openrouter_anthropic__batch","openrouter_anthropic__stream","openrouter_openai__batch","openrouter_openai__stream"],
+"scenarios":["plain","history","context_absent","context_stable_dynamic","context_stable_only","context_dynamic_only","system_tools","server_tool_text","parallel_tools","client_tool_pause_resume","mixed_server_client_pause","replay_runs","idempotent_repeat","adapter_direct"],
+"adapter_direct":["simple","no_system","stable_head","two_stable_markers","parallel_tool_results","tool_results_last","kwarg_overrides","no_cache_prefix"]
+}
