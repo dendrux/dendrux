@@ -61,12 +61,25 @@ class BudgetCarry:
 
     fired: tuple[tuple[str, float], ...] = ()
     unpriced_reported: bool = False
+    # Own in-memory spend when the run total is unknown (mixed priced/unpriced).
+    known_cost_usd: float | None = None
+    unpriced_calls: int = 0
+    # Metrics a budget pause hit: the resume gate checks exactly these.
+    gate: tuple[str, ...] = ()
 
     @classmethod
     def from_pause(cls, pause: PauseState) -> BudgetCarry:
+        gate = (
+            tuple(str(b.get("metric")) for b in pause.budget_exceeded or ())
+            if pause.pause_reason == "budget"
+            else ()
+        )
         return cls(
             fired=tuple(pause.budget_fired or ()),
             unpriced_reported=pause.budget_unpriced_reported,
+            known_cost_usd=pause.budget_known_cost_usd,
+            unpriced_calls=pause.budget_unpriced_calls,
+            gate=gate,
         )
 
 
@@ -95,6 +108,7 @@ class BudgetTracker:
         state_store: StateStore | None = None,
         carry: BudgetCarry | None = None,
         enforce: bool = True,
+        fresh: bool = False,
     ) -> None:
         self.budget = budget
         self._run_id = run_id
@@ -105,9 +119,18 @@ class BudgetTracker:
         self._enforce = enforce
         self.fired: list[tuple[str, float]] = list(carry.fired) if carry else []
         self.unpriced_reported = carry.unpriced_reported if carry else False
-        # In-memory priced spend: seeded from the restored total when it is
-        # fully priced; an unknown restored total counts as one unpriced call.
-        if usage.cost_usd is not None and not usage.cost_unknown:
+        self._gate = carry.gate if carry else ()
+        self._fresh = fresh
+        self._first_checkpoint = True
+        # Breaches from the latest post-response evaluation (None: none yet).
+        self._last: list[BudgetBreach] | None = None
+        # In-memory priced spend: the carried subtotal when a pause persisted
+        # one; else seeded from the restored total when it is fully priced
+        # (an unknown restored total counts as one unpriced call).
+        if carry is not None and carry.known_cost_usd is not None:
+            self._known_cost = carry.known_cost_usd
+            self._unpriced = carry.unpriced_calls
+        elif usage.cost_usd is not None and not usage.cost_unknown:
             self._known_cost = usage.cost_usd
             self._unpriced = 0
         else:
@@ -149,11 +172,19 @@ class BudgetTracker:
             self._known_cost = round(self._known_cost + usage.cost_usd, _COST_DECIMALS)
 
     def pause_fields(self) -> dict[str, Any]:
-        """``PauseState`` fields that carry the fired keys across a pause."""
-        return {
+        """``PauseState`` fields that carry budget bookkeeping across a pause.
+
+        The in-memory spend is persisted only when the run total cannot
+        reconstruct it (some call unpriced).
+        """
+        fields: dict[str, Any] = {
             "budget_fired": list(self.fired) or None,
             "budget_unpriced_reported": self.unpriced_reported,
         }
+        if self._unpriced:
+            fields["budget_known_cost_usd"] = self._known_cost
+            fields["budget_unpriced_calls"] = self._unpriced
+        return fields
 
     async def _emit(self, event_type: str, iteration: int, data: dict[str, Any]) -> None:
         await record_governance(self._recorder, self._run_id, event_type, iteration, data)
@@ -240,23 +271,51 @@ class BudgetTracker:
                             "action": self.action,
                         },
                     )
+        self._last = breaches
         return breaches
 
-    async def checkpoint(self, iteration: int) -> list[BudgetBreach]:
-        """Top-of-iteration check: limits that require a pause/cancel now.
+    async def checkpoint(self, iteration: int) -> tuple[str, list[BudgetBreach]]:
+        """Top-of-iteration check: ``(action, breaches)``; act when breaches is non-empty.
 
-        Empty for warn (or unenforced) budgets. A warn budget still
-        re-measures here when children can have spent since the last
-        response, so their spend fires events promptly.
+        The first checkpoint after resuming a budget pause is the resume
+        gate: only the persisted exceeded metrics are checked against live
+        usage and this Agent's limits; any not strictly above usage re-pauses
+        whatever ``on_exceed`` now says, otherwise nothing is enforced here.
+        Warn budgets never act at a checkpoint. Enforcing budgets reuse the
+        post-response evaluation unless descendants can have spent since.
         """
+        first, self._first_checkpoint = self._first_checkpoint, False
+        if first and self._gate:
+            return "pause", await self._resume_gate()
         budget = self.budget
-        if budget is None:
+        action = self.action
+        if budget is None or action == "warn":
+            return action, []
+        if self._last is None:
+            if first and self._fresh:
+                return action, []  # nothing has been spent yet
+            return action, await self.evaluate(iteration)
+        if budget.include_children and self._store_reader is not None:
+            return action, await self.evaluate(iteration)
+        return action, self._last
+
+    async def _resume_gate(self) -> list[BudgetBreach]:
+        limits = {
+            TOKENS: self.budget.max_tokens if self.budget else None,
+            COST_USD: self.budget.max_cost_usd if self.budget else None,
+        }
+        gated = [m for m in self._gate if limits.get(m) is not None]
+        if not gated:
             return []
-        if self.action == "warn":
-            if budget.include_children and self._store_reader is not None:
-                await self.evaluate(iteration)
-            return []
-        return await self.evaluate(iteration)
+        usage = await self._measure()
+        used = {TOKENS: usage.tokens, COST_USD: usage.known_cost_usd}
+        breaches = []
+        for metric in gated:
+            limit = limits[metric]
+            assert limit is not None
+            if not limit > used[metric]:
+                breaches.append(BudgetBreach(metric=metric, used=used[metric], max=limit))
+        return breaches
 
 
 def breach_payload(breaches: list[BudgetBreach]) -> list[dict[str, Any]]:

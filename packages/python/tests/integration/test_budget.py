@@ -396,7 +396,7 @@ class TestBudgetChildren:
             if e.data["metric"] == "cost_usd"
         ]
 
-    async def test_warn_budget_reports_child_spend_at_checkpoint(self, store) -> None:
+    async def test_warn_budget_reports_child_spend_after_next_response(self, store) -> None:
         parent, _, _ = _delegating_parent(
             store,
             _text("child done", tokens=1000, cost=0.10),
@@ -405,8 +405,9 @@ class TestBudgetChildren:
         result = await parent.run("go")
         assert result.status == RunStatus.SUCCESS
         (exceeded,) = await _events(store, result.run_id, "budget.exceeded")
-        assert exceeded.iteration_index == 2  # seen at the checkpoint, before call 2
-        assert exceeded.data["used"] == pytest.approx(0.11)
+        # Warn checkpoints are inert: seen by the evaluation after call 2.
+        assert exceeded.iteration_index == 2
+        assert exceeded.data["used"] == pytest.approx(0.12)
 
 
 # ---------------------------------------------------------------------------
@@ -703,3 +704,233 @@ class TestBudgetPre03Store:
         assert record.failure_reason is None
         (cancelled,) = await _events(store, result.run_id, "run.cancelled")
         assert cancelled.data["reason"] == "budget_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# Fix round: resume gate, Track-E-era stores, legacy accounting, read counts
+# ---------------------------------------------------------------------------
+
+
+async def _token_paused(store: Any) -> str:
+    """A run budget-paused on tokens (600 used / 500 max) with $0.10 spent."""
+    agent, _ = _agent(
+        store,
+        [_call("work", "t1", tokens=600, cost=0.10)],
+        Budget(max_tokens=500, on_exceed="pause"),
+        tools=[_work_tool(_Counter())],
+    )
+    result = await agent.run("go")
+    assert result.status == RunStatus.PAUSED
+    return result.run_id
+
+
+async def _resume(agent: Agent, run_id: str, *, stream: bool) -> Any:
+    if not stream:
+        return await agent.resume(run_id)
+    events = [e async for e in agent.resume_stream(run_id)]
+    return events[-1].run_result
+
+
+class TestBudgetResumeGate:
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("on_exceed", ["warn", "cancel"])
+    async def test_gate_repauses_regardless_of_new_action(self, store, on_exceed, stream) -> None:
+        run_id = await _token_paused(store)
+        resumer, llm = _agent(
+            store,
+            [_text("never")],
+            Budget(max_tokens=500, on_exceed=on_exceed),
+            tools=[_work_tool(_Counter())],
+        )
+        result = await _resume(resumer, run_id, stream=stream)
+        assert result.status == RunStatus.PAUSED
+        assert llm.calls == 0
+        pause = await _pause_state(store, run_id)
+        assert pause.pause_reason == "budget"
+        assert [b["metric"] for b in pause.budget_exceeded or []] == ["tokens"]
+        assert (await store.get_run(run_id)).failure_reason is None
+
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_gate_checks_only_previously_exceeded_metrics(self, store, stream) -> None:
+        run_id = await _token_paused(store)
+        # Tokens raised above live use; a newly added cost limit is already
+        # below known spend but was not a previously exceeded metric.
+        resumer, llm = _agent(
+            store,
+            [_text("done", tokens=10, cost=0.0)],
+            Budget(max_tokens=10_000, max_cost_usd=0.05, on_exceed="pause"),
+            tools=[_work_tool(_Counter())],
+        )
+        result = await _resume(resumer, run_id, stream=stream)
+        assert llm.calls == 1
+        assert result.status == RunStatus.SUCCESS
+
+
+def _track_e_store(inner: Any) -> Any:
+    """A store with Track E's atomic signatures (no total_usage / failure_reason)."""
+
+    class TrackEStore:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(inner, name)
+
+        async def pause_with_event(
+            self,
+            run_id: str,
+            *,
+            status: str,
+            pause_data: dict[str, Any],
+            event_data: dict[str, Any] | None = None,
+            iteration_count: int | None = None,
+            pii_mapping: dict[str, str] | None = None,
+        ) -> int | None:
+            return await inner.pause_with_event(
+                run_id,
+                status=status,
+                pause_data=pause_data,
+                event_data=event_data,
+                iteration_count=iteration_count,
+                pii_mapping=pii_mapping,
+            )
+
+        async def finalize_with_event(
+            self,
+            run_id: str,
+            *,
+            status: str,
+            allowed_current_statuses: list[str],
+            event_type: str,
+            event_data: dict[str, Any] | None = None,
+            answer: str | None = None,
+            error: str | None = None,
+            iteration_count: int | None = None,
+            total_usage: UsageStats | None = None,
+            pii_mapping: dict[str, str] | None = None,
+        ) -> int | None:
+            return await inner.finalize_with_event(
+                run_id,
+                status=status,
+                allowed_current_statuses=allowed_current_statuses,
+                event_type=event_type,
+                event_data=event_data,
+                answer=answer,
+                error=error,
+                iteration_count=iteration_count,
+                total_usage=total_usage,
+                pii_mapping=pii_mapping,
+            )
+
+    return TrackEStore()
+
+
+class TestTrackEStoreCompat:
+    async def test_budget_pause_and_approval_pause(self, store) -> None:
+        compat = _track_e_store(store)
+        agent, _ = _agent(
+            compat,
+            [_call("work", "t1", tokens=600)],
+            Budget(max_tokens=500, on_exceed="pause"),
+            tools=[_work_tool(_Counter())],
+        )
+        assert (await agent.run("go")).status == RunStatus.PAUSED
+
+        @tool()
+        async def refund() -> str:
+            """Refund."""
+            return "refunded"
+
+        approver, _ = _agent(
+            compat, [_call("refund", "t1")], None, tools=[refund], require_approval=["refund"]
+        )
+        assert (await approver.run("go")).status == RunStatus.WAITING_APPROVAL
+
+    async def test_budget_cancel_keeps_distinct_reason(self, store) -> None:
+        agent, _ = _agent(
+            _track_e_store(store),
+            [_call("work", "t1", tokens=600)],
+            Budget(max_tokens=500, on_exceed="cancel"),
+            tools=[_work_tool(_Counter())],
+        )
+        result = await agent.run("go")
+        assert result.status == RunStatus.CANCELLED
+        (cancelled,) = await _events(store, result.run_id, "run.cancelled")
+        assert cancelled.data["reason"] == "budget_exceeded"
+
+
+class TestLegacyAccounting:
+    async def test_mixed_priced_spend_survives_pause_without_rollups(self, store) -> None:
+        legacy = Pre03Store(store)
+
+        @tool()
+        async def refund() -> str:
+            """Refund."""
+            return "refunded"
+
+        budget = Budget(max_cost_usd=0.05, on_exceed="pause")
+        agent, _ = _agent(
+            legacy,
+            [
+                _call("work", "t1", tokens=10, cost=0.04),
+                _call("refund", "t2", tokens=10, cost=None),
+                _call("work", "t3", tokens=10, cost=0.02),
+                _text("never"),
+            ],
+            budget,
+            tools=[_work_tool(_Counter()), refund],
+            require_approval=["refund"],
+        )
+        waiting = await agent.run("go")
+        assert waiting.status == RunStatus.WAITING_APPROVAL
+        result = await agent.submit_approval(waiting.run_id, approved=True)
+        assert result.status == RunStatus.PAUSED
+        assert result.meta["budget_exceeded"] == [
+            {"metric": "cost_usd", "used": pytest.approx(0.06), "max": 0.05}
+        ]
+
+
+def _count_reads(store: Any) -> dict[str, int]:
+    counts = {"subtree_usage": 0, "run_usage": 0}
+    for name in counts:
+        original = getattr(store, name)
+
+        async def wrapped(run_id: str, _o: Any = original, _n: str = name) -> Any:
+            counts[_n] += 1
+            return await _o(run_id)
+
+        setattr(store, name, wrapped)
+    return counts
+
+
+class TestBudgetReads:
+    async def test_warn_checkpoints_are_inert(self, store) -> None:
+        counts = _count_reads(store)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10), _call("work", "t2", tokens=10), _text("done")],
+            Budget(max_tokens=10_000),
+            tools=[_work_tool(_Counter())],
+        )
+        assert (await agent.run("go")).status == RunStatus.SUCCESS
+        assert counts["subtree_usage"] == 3  # one per LLM response only
+
+    async def test_enforcing_own_usage_reuses_post_response_read(self, store) -> None:
+        counts = _count_reads(store)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10), _call("work", "t2", tokens=10), _text("done")],
+            Budget(max_tokens=10_000, on_exceed="pause", include_children=False),
+            tools=[_work_tool(_Counter())],
+        )
+        assert (await agent.run("go")).status == RunStatus.SUCCESS
+        assert counts["run_usage"] == 3
+
+    async def test_enforcing_children_skips_fresh_first_checkpoint(self, store) -> None:
+        counts = _count_reads(store)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10), _text("done")],
+            Budget(max_tokens=10_000, on_exceed="pause"),
+            tools=[_work_tool(_Counter())],
+        )
+        assert (await agent.run("go")).status == RunStatus.SUCCESS
+        # 2 post-response reads + 1 checkpoint read before call 2 (children may have spent).
+        assert counts["subtree_usage"] == 3

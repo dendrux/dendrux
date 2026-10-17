@@ -369,10 +369,10 @@ async def _budget_stop(
     meta: dict[str, Any],
 ) -> RunResult | None:
     """Checkpoint budget enforcement: a PAUSED/CANCELLED result, or None to go on."""
-    breaches = await budget.checkpoint(iteration)
+    action, breaches = await budget.checkpoint(iteration)
     if not breaches:
         return None
-    if budget.action == "cancel":
+    if action == "cancel":
         return _budget_cancel_result(
             run_id=run_id,
             steps=steps,
@@ -1081,6 +1081,7 @@ class ReActLoop(Loop):
             warnings=notifier_warnings,
             state_store=state_store,
             carry=budget_carry,
+            fresh=iteration_offset == 0,
         )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
@@ -1602,6 +1603,7 @@ class ReActLoop(Loop):
             warnings=notifier_warnings,
             state_store=state_store,
             carry=budget_carry,
+            fresh=iteration_offset == 0,
         )
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)

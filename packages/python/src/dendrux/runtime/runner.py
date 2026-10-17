@@ -684,6 +684,12 @@ async def _transition_with_event(
     ``failure_reason``; the transition event still carries the reason.
     """
     atomic = getattr(state_store, "finalize_with_event", None)
+    # Stores predating a keyword (e.g. failure_reason) cannot persist it;
+    # the transition and its event (which carries the reason) still happen.
+    if finalize_kwargs.get("failure_reason") is None or not _accepts_kwarg(
+        atomic or state_store.finalize_run_if_status_in, "failure_reason"
+    ):
+        finalize_kwargs.pop("failure_reason", None)
     if atomic is not None:
         seq = await atomic(
             run_id,
@@ -697,10 +703,6 @@ async def _transition_with_event(
             return False
         sequencer.advance_past(seq)
         return True
-    if finalize_kwargs.get("failure_reason") is None or not _accepts_kwarg(
-        state_store.finalize_run_if_status_in, "failure_reason"
-    ):
-        finalize_kwargs.pop("failure_reason", None)
     won = await state_store.finalize_run_if_status_in(
         run_id,
         status=status,
@@ -733,6 +735,8 @@ async def _pause_with_event(
     """
     usage_kwargs: dict[str, Any] = {"total_usage": total_usage} if total_usage else {}
     atomic = getattr(state_store, "pause_with_event", None)
+    if not _accepts_kwarg(atomic or state_store.pause_run, "total_usage"):
+        usage_kwargs = {}
     if atomic is not None:
         seq = await atomic(
             run_id,
@@ -749,8 +753,6 @@ async def _pause_with_event(
         return True
     if await state_store.is_cancel_requested(run_id):
         return False
-    if not _accepts_kwarg(state_store.pause_run, "total_usage"):
-        usage_kwargs = {}
     await state_store.pause_run(
         run_id,
         status=status,
@@ -809,6 +811,8 @@ def _carry_budget_fields(new: PauseState, old: PauseState) -> PauseState:
         new,
         budget_fired=old.budget_fired,
         budget_unpriced_reported=old.budget_unpriced_reported,
+        budget_known_cost_usd=old.budget_known_cost_usd,
+        budget_unpriced_calls=old.budget_unpriced_calls,
     )
 
 

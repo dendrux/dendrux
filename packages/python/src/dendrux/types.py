@@ -748,6 +748,10 @@ class PauseState:
     budget_unpriced_reported: bool = False
     # Limits a budget pause hit: [{"metric", "used", "max"}]. Budget pauses only.
     budget_exceeded: list[dict[str, Any]] | None = None
+    # Own priced spend and unpriced-call count, persisted when the run total
+    # is unknown (mixed priced/unpriced) so stores without live rollups keep it.
+    budget_known_cost_usd: float | None = None
+    budget_unpriced_calls: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -781,6 +785,10 @@ class PauseState:
             d["budget_unpriced_reported"] = True
         if self.budget_exceeded is not None:
             d["budget_exceeded"] = self.budget_exceeded
+        if self.budget_known_cost_usd is not None:
+            d["budget_known_cost_usd"] = self.budget_known_cost_usd
+        if self.budget_unpriced_calls:
+            d["budget_unpriced_calls"] = self.budget_unpriced_calls
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -810,6 +818,8 @@ class PauseState:
             budget_fired=[(str(m), float(t)) for m, t in data.get("budget_fired") or []] or None,
             budget_unpriced_reported=bool(data.get("budget_unpriced_reported", False)),
             budget_exceeded=data.get("budget_exceeded"),
+            budget_known_cost_usd=data.get("budget_known_cost_usd"),
+            budget_unpriced_calls=int(data.get("budget_unpriced_calls") or 0),
         )
 
 

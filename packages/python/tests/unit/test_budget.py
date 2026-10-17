@@ -677,7 +677,8 @@ class TestBudgetTrackerSources:
             state_store=OldStore(),  # type: ignore[arg-type]
         )
         assert "include_children ignored" in caplog.text
-        breaches = await tracker.checkpoint(2)
+        action, breaches = await tracker.checkpoint(2)
+        assert action == "pause"
         assert [b.metric for b in breaches] == ["tokens"]
 
     async def test_failed_live_read_falls_back(self):
@@ -694,7 +695,8 @@ class TestBudgetTrackerSources:
             warnings=[],
             state_store=BrokenStore(),  # type: ignore[arg-type]
         )
-        assert [b.metric for b in await tracker.checkpoint(2)] == ["tokens"]
+        _, breaches = await tracker.checkpoint(2)
+        assert [b.metric for b in breaches] == ["tokens"]
 
     async def test_restored_unknown_cost_counts_as_unpriced(self):
         tracker = BudgetTracker(
@@ -713,7 +715,8 @@ class TestBudgetTrackerSources:
         tracker = BudgetTracker(
             None, run_id="r", usage=UsageStats(), recorder=None, notifier=None, warnings=[]
         )
-        assert await tracker.checkpoint(1) == [] and await tracker.evaluate(1) == []
+        assert await tracker.checkpoint(1) == ("warn", [])
+        assert await tracker.evaluate(1) == []
         assert tracker.action == "warn"
 
 
@@ -756,3 +759,63 @@ class TestRunnerBudgetHelpers:
         assert _accepts_kwarg(var_kw, "total_usage")
         assert not _accepts_kwarg(neither, "total_usage")
         assert not _accepts_kwarg(object(), "total_usage")
+
+
+class TestBudgetCarryFixRound:
+    def _pause(self, **kw) -> PauseState:
+        return PauseState(
+            agent_name="A",
+            pending_tool_calls=[],
+            history=[],
+            steps=[],
+            iteration=1,
+            trace_order_offset=0,
+            usage=UsageStats(),
+            **kw,
+        )
+
+    def test_accounting_round_trip_and_gate_only_for_budget_pauses(self):
+        exceeded = [{"metric": "cost_usd", "used": 0.2, "max": 0.1}]
+        pause = PauseState.from_dict(
+            self._pause(
+                pause_reason="budget",
+                budget_exceeded=exceeded,
+                budget_known_cost_usd=0.04,
+                budget_unpriced_calls=2,
+            ).to_dict()
+        )
+        carry = BudgetCarry.from_pause(pause)
+        assert (carry.known_cost_usd, carry.unpriced_calls, carry.gate) == (0.04, 2, ("cost_usd",))
+        requested = self._pause(pause_reason="requested", budget_exceeded=exceeded)
+        assert BudgetCarry.from_pause(requested).gate == ()
+
+    async def test_carried_subtotal_seeds_fallback_accounting(self):
+        tracker = BudgetTracker(
+            Budget(max_cost_usd=0.05, on_exceed="pause"),
+            run_id="r",
+            usage=UsageStats(total_tokens=20, cost_usd=None, cost_unknown=True),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+            carry=BudgetCarry(known_cost_usd=0.04, unpriced_calls=1),
+        )
+        tracker.add_response(UsageStats(total_tokens=10, cost_usd=0.02))
+        breaches = await tracker.evaluate(3)
+        assert [(b.metric, b.used) for b in breaches] == [("cost_usd", 0.06)]
+        assert tracker.pause_fields()["budget_known_cost_usd"] == 0.06
+        assert tracker.pause_fields()["budget_unpriced_calls"] == 1
+
+    @pytest.mark.parametrize(
+        "budget", [None, Budget(max_tokens=10, on_exceed="pause")], ids=["none", "no-cost-limit"]
+    )
+    async def test_gate_passes_without_a_limit_on_the_metric(self, budget):
+        tracker = BudgetTracker(
+            budget,
+            run_id="r",
+            usage=UsageStats(total_tokens=5, cost_usd=1.0),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+            carry=BudgetCarry(gate=("cost_usd",)),
+        )
+        assert (await tracker.checkpoint(2))[1] == []
