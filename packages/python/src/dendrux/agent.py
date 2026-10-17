@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -408,6 +409,8 @@ class Agent:
         self._before_tool: BeforeToolHook | None = before_tool
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
+        self._store_lock = threading.Lock()
+        self._store_generation = 0
 
         # --- MCP tool sources ---
         self._tool_sources: list[MCPServer] = []
@@ -876,10 +879,27 @@ class Agent:
         from dendrux.runtime.state import SQLAlchemyStateStore
 
         if self._database_url is not None:
+            with self._store_lock:
+                generation = self._store_generation
             engine = await self._create_private_engine(self._database_url)
-            self._private_engine = engine
-            await _verify_schema_initialized(engine, self._database_url)
-            self._lazy_store = SQLAlchemyStateStore(engine)
+            try:
+                await _verify_schema_initialized(engine, self._database_url)
+            except BaseException:
+                await engine.dispose()
+                raise
+            with self._store_lock:
+                if self._store_generation != generation:
+                    closed = True
+                elif self._lazy_store is not None:
+                    closed = False  # a concurrent first use published first
+                else:
+                    self._private_engine = engine
+                    self._lazy_store = SQLAlchemyStateStore(engine)
+                    return self._lazy_store
+            await engine.dispose()
+            if closed:
+                raise RuntimeError("Agent was closed while its database was initializing.")
+            assert self._lazy_store is not None
             return self._lazy_store
 
         env_url = os.environ.get("DENDRUX_DATABASE_URL")
@@ -904,7 +924,7 @@ class Agent:
 
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        from dendrux.db.models import Base
+        from dendrux.db._sqlite_sync import create_sqlite_schema
 
         connect_args: dict[str, Any] = {}
         if url.startswith("sqlite"):
@@ -922,8 +942,11 @@ class Agent:
             db_path = url.split("///", 1)[-1] if "///" in url else None
             if db_path:
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+            try:
+                await create_sqlite_schema(engine)
+            except BaseException:
+                await engine.dispose()
+                raise
 
         return engine
 
@@ -2573,10 +2596,13 @@ class Agent:
         self._denied_skill_names = None
         if self._provider is not None:
             await self._provider.close()
-        if self._private_engine is not None:
-            await self._private_engine.dispose()
-            self._private_engine = None
-            self._lazy_store = None
+        with self._store_lock:
+            self._store_generation += 1
+            engine, self._private_engine = self._private_engine, None
+            if engine is not None:
+                self._lazy_store = None
+        if engine is not None:
+            await engine.dispose()
 
     async def __aenter__(self) -> Agent:
         return self

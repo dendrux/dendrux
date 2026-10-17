@@ -20,12 +20,13 @@ from sqlalchemy.orm import sessionmaker
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-from dendrux.db.models import Base
+from dendrux.db._sqlite_sync import create_sqlite_schema
 
 _engine: AsyncEngine | None = None
 _engine_url: str | None = None
 _session_factory: sessionmaker | None = None  # type: ignore[type-arg]
 _engine_lock = threading.Lock()
+_generation = 0
 
 # Default DB location: ~/.dendrux/dendrux.db
 # Single well-known path so all commands and examples share the same DB.
@@ -42,65 +43,71 @@ def get_database_url() -> str:
     return os.environ.get("DENDRUX_DATABASE_URL", DEFAULT_SQLITE_URL)
 
 
+def _published(resolved_url: str) -> AsyncEngine | None:
+    if _engine is None:
+        return None
+    if _engine_url != resolved_url:
+        raise RuntimeError(
+            f"get_engine() already initialized with URL {_engine_url!r}, "
+            f"cannot reinitialize with {resolved_url!r}. "
+            f"Call reset_engine() first to change databases."
+        )
+    return _engine
+
+
 async def get_engine(url: str | None = None) -> AsyncEngine:
     """Get or create the async engine.
 
-    For SQLite, auto-creates all tables on first call.
-    For Postgres, tables must exist via Alembic migrations.
+    For SQLite, auto-creates all tables on first call and upgrades an older
+    file in place. For Postgres, tables must exist via Alembic migrations.
 
-    Thread-safe: uses threading.Lock with double-check pattern to prevent
-    duplicate engine creation from concurrent calls.
+    A candidate engine is published only after its initialization succeeds
+    and only if ``reset_engine()`` has not run since it started. Concurrent
+    first callers each initialize a candidate (idempotent, serialized by
+    SQLite's write lock); one is published, the rest are disposed. A failed
+    initialization disposes its candidate and caches nothing.
     """
     global _engine, _engine_url, _session_factory  # noqa: PLW0603
     resolved_url = url or get_database_url()
 
-    if _engine is not None:
-        if _engine_url != resolved_url:
-            raise RuntimeError(
-                f"get_engine() already initialized with URL {_engine_url!r}, "
-                f"cannot reinitialize with {resolved_url!r}. "
-                f"Call reset_engine() first to change databases."
-            )
-        return _engine
-
-    with _engine_lock:
-        # Double-check after acquiring lock
-        if _engine is not None:
-            if _engine_url != resolved_url:
-                raise RuntimeError(
-                    f"get_engine() already initialized with URL {_engine_url!r}, "
-                    f"cannot reinitialize with {resolved_url!r}. "
-                    f"Call reset_engine() first to change databases."
-                )
-            return _engine
+    while True:
+        with _engine_lock:
+            ready = _published(resolved_url)
+            generation = _generation
+        if ready is not None:
+            return ready
 
         # SQLite needs connect_args for async support
         connect_args = {}
         if resolved_url.startswith("sqlite"):
             connect_args["check_same_thread"] = False
 
-        _engine = create_async_engine(
+        candidate = create_async_engine(
             resolved_url,
             echo=False,
             connect_args=connect_args,
         )
+        try:
+            if resolved_url.startswith("sqlite"):
+                # Ensure the parent directory exists (e.g. ~/.dendrux/)
+                db_path = resolved_url.split("///", 1)[-1] if "///" in resolved_url else None
+                if db_path:
+                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                await create_sqlite_schema(candidate)
+        except BaseException:
+            await candidate.dispose()
+            raise
 
-        _engine_url = resolved_url
-        _session_factory = sessionmaker(  # type: ignore[call-overload]
-            _engine, class_=AsyncSession, expire_on_commit=False
-        )
-
-    # Auto-create tables for SQLite (zero-config promise)
-    # Outside the lock — idempotent and safe for concurrent calls
-    if resolved_url.startswith("sqlite"):
-        # Ensure the parent directory exists (e.g. ~/.dendrux/)
-        db_path = resolved_url.split("///", 1)[-1] if "///" in resolved_url else None
-        if db_path:
-            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        async with _engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-
-    return _engine
+        with _engine_lock:
+            if _generation == generation and _engine is None:
+                _engine = candidate
+                _engine_url = resolved_url
+                _session_factory = sessionmaker(  # type: ignore[call-overload]
+                    candidate, class_=AsyncSession, expire_on_commit=False
+                )
+                return candidate
+        # Reset ran or another caller published first: drop ours and look again.
+        await candidate.dispose()
 
 
 async def reset_engine() -> None:
@@ -109,8 +116,9 @@ async def reset_engine() -> None:
     Releases the lock before awaiting dispose() to avoid holding a
     synchronous lock across an async suspension point.
     """
-    global _engine, _engine_url, _session_factory  # noqa: PLW0603
+    global _engine, _engine_url, _session_factory, _generation  # noqa: PLW0603
     with _engine_lock:
+        _generation += 1
         engine = _engine
         _engine = None
         _engine_url = None

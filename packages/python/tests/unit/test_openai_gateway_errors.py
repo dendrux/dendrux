@@ -350,7 +350,7 @@ class TestClassifier:
         assert self._classify(status_code=500, param="stream") is GatewayErrorKind.OTHER
         assert self._classify(status_code=None, param="stream") is GatewayErrorKind.OTHER
 
-    def test_normalizes_status_and_code_from_body(self) -> None:
+    def test_numeric_body_code_equal_to_status_is_dropped(self) -> None:
         result = classify_gateway_error(
             status_code=400,
             code=None,
@@ -359,7 +359,7 @@ class TestClassifier:
             body={"message": "maximum context length is 4096", "code": 400},
         )
         assert result.kind is GatewayErrorKind.CONTEXT_LENGTH
-        assert (result.status_code, result.provider_code) == (400, "400")
+        assert (result.status_code, result.provider_code) == (400, None)
 
     def test_error_class_exported(self) -> None:
         import dendrux.errors as errors
@@ -603,3 +603,58 @@ class TestReviewFixRound:
 
         assert dendrux.ContextLengthExceededError is ContextLengthExceededError
         assert "ContextLengthExceededError" in dendrux.__all__
+
+
+class TestProviderCodeIsNeverTheHttpStatus:
+    """OpenRouter sends the HTTP status as an integer ``code`` in the error body."""
+
+    OPENROUTER_BODY = {
+        "error": {
+            "message": "This endpoint's maximum context length is 8192 tokens.",
+            "code": 400,
+            "metadata": {"provider_name": "x"},
+        }
+    }
+
+    def test_integer_status_code_is_not_a_provider_code(self) -> None:
+        err = self.OPENROUTER_BODY["error"]
+        result = classify_gateway_error(
+            status_code=400, code=None, param=None, message=str(err["message"]), body=err
+        )
+        assert result.kind is GatewayErrorKind.CONTEXT_LENGTH
+        assert result.provider_code is None
+
+    @pytest.mark.parametrize("raw", ["400", 400.5, True])
+    def test_string_or_different_numeric_body_code_is_kept(self, raw: Any) -> None:
+        result = classify_gateway_error(
+            status_code=400, code=None, param=None, message="x", body={"code": raw}
+        )
+        assert result.provider_code == str(raw)
+
+    def test_explicit_string_code_equal_to_status_is_kept(self) -> None:
+        result = classify_gateway_error(status_code=400, code="400", param=None, message="x")
+        assert result.provider_code == "400"
+
+    def test_float_status_duplicate_is_dropped(self) -> None:
+        result = classify_gateway_error(
+            status_code=400, code=None, param=None, message="x", body={"code": 400.0}
+        )
+        assert result.provider_code is None
+
+    def test_real_string_code_is_kept(self) -> None:
+        result = classify_gateway_error(
+            status_code=400,
+            code=None,
+            param=None,
+            message="x",
+            body={"code": "context_length_exceeded"},
+        )
+        assert result.provider_code == "context_length_exceeded"
+
+    async def test_openrouter_error_exposes_no_numeric_provider_code(self) -> None:
+        provider = OpenRouterProvider(model="m/x", api_key="test-key", max_retries=0)
+        _wire(provider, _json(400, self.OPENROUTER_BODY))
+        with pytest.raises(ContextLengthExceededError) as info:
+            await provider.complete(MESSAGES)
+        assert info.value.status_code == 400
+        assert info.value.provider_code is None

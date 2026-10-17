@@ -267,6 +267,19 @@ def _body_field(body: object, key: str) -> str | None:
     return None
 
 
+def _body_provider_code(body: object, status_code: int | None) -> str | None:
+    """Body ``code`` as a string, except a number repeating the HTTP status.
+
+    Some gateways (OpenRouter) send the HTTP status as a numeric ``code``;
+    that is not a provider code. A string such as ``"400"`` is kept.
+    """
+    if isinstance(body, dict):
+        value = body.get("code")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return None if value == status_code else str(value)
+    return _body_field(body, "code")
+
+
 def _is_context_length(
     status_code: int | None, code: str | None, param: str | None, text: str
 ) -> bool:
@@ -302,7 +315,7 @@ def classify_gateway_error(
     rejection requires a 400 whose ``param`` is ``stream`` or whose text says
     streaming is unsupported.
     """
-    provider_code = code or _body_field(body, "code")
+    provider_code = code or _body_provider_code(body, status_code)
     text = _error_text(message, body)
 
     lowered_code = provider_code.lower() if provider_code is not None else None

@@ -36,9 +36,12 @@ Example
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StateStore, TenantScope
 from dendrux.types import ReplaySummary
 
@@ -280,8 +283,56 @@ class PausePair:
 # ---------------------------------------------------------------------------
 
 
+class _InitOnFirstUse:
+    """Wrap a state store so ``init`` runs, awaited, before its first call.
+
+    ``init`` is idempotent, so concurrent first calls may each run it. A
+    failed ``init`` is not remembered: the next call retries it. After
+    :meth:`close`, calls raise; an ``init`` that finishes after close
+    disposes the engine again (``dispose``) and raises.
+    """
+
+    def __init__(self, inner: Any, init: Any, dispose: Any) -> None:
+        self._inner = inner
+        self._init = init
+        self._dispose = dispose
+        self._done = False
+        self.closed = False
+
+    async def _ensure(self) -> None:
+        from sqlalchemy.exc import InvalidRequestError
+
+        if self.closed:
+            raise InvalidRequestError("This RunStore is closed.")
+        if self._done:
+            return
+        await self._init()
+        if self.closed:
+            await self._dispose()
+            raise InvalidRequestError("This RunStore was closed during initialization.")
+        self._done = True
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._inner, name)
+        if not inspect.iscoroutinefunction(attr):
+            return attr
+
+        @functools.wraps(attr)
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            await self._ensure()
+            return await attr(*args, **kwargs)
+
+        return guarded
+
+
 class RunStore:
     """Read-only public facade over persisted run state.
+
+    "Read-only" refers to run data: the store never writes runs, events or
+    notes. ``from_database_url`` on a SQLite URL does bring the *schema* of
+    an older Dendrux SQLite file up to date once, before its first query
+    (additive ``ALTER TABLE ... ADD COLUMN`` / index creation only, the same
+    upgrade ``Agent`` runs), and creates the tables in a new file.
 
     Instantiate via ``RunStore.from_database_url(...)`` for the common case,
     or ``RunStore.from_engine(engine)`` when you already own a SQLAlchemy
@@ -307,17 +358,28 @@ class RunStore:
         """Build a RunStore from a SQLAlchemy async URL.
 
         The engine is created and owned by this RunStore. Call
-        ``await store.close()`` or use ``async with`` to dispose it.
+        ``await store.close()`` or use ``async with`` to dispose it. For a
+        SQLite URL the schema is brought up to date once before the first
+        query (see the class docstring); an older file that cannot be
+        upgraded raises :class:`~dendrux.errors.SqliteSchemaSyncError` from
+        that first call.
         """
         from sqlalchemy.ext.asyncio import create_async_engine
 
         engine = create_async_engine(database_url)
-        instance = cls.from_engine(engine)
+        store: Any = SQLAlchemyStateStore(engine)
+        if database_url.startswith("sqlite"):
+            store = _InitOnFirstUse(
+                store, functools.partial(create_sqlite_schema, engine), engine.dispose
+            )
+        instance = cls(store)
         instance._owned_engine = engine
         return instance
 
     async def close(self) -> None:
         """Dispose any engine this store owns. No-op for caller-owned engines."""
+        if isinstance(self._state, _InitOnFirstUse):
+            self._state.closed = True
         if self._owned_engine is not None:
             await self._owned_engine.dispose()
             self._owned_engine = None
@@ -437,7 +499,9 @@ class RunStore:
 
         Raises :class:`RunNotFoundError` if the run does not exist.
         """
-        record = await self._state.get_subtree(run_id, tenant_id=tenant_id)
+        from dendrux.runtime.state import require_store_method
+
+        record = await require_store_method(self._state, "get_subtree")(run_id, tenant_id=tenant_id)
         if record is None:
             raise RunNotFoundError(f"Run '{run_id}' does not exist.")
         return RunSubtree(

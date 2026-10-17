@@ -20,6 +20,7 @@ Suggested HTTP mappings:
     SkillMissingError           -> 409
     ContextLengthExceededError  -> 413 or 400
     SkillMismatchError          -> 409
+    SqliteSchemaSyncError       -> 500 (startup: legacy SQLite file needs migration)
 
 ``SkillValidationError`` is raised while building a :class:`~dendrux.skills.Skill`
 (a configuration error, not a request error).
@@ -275,6 +276,17 @@ class ContextLengthExceededError(RuntimeError):
         super().__init__(message)
 
 
+class SqliteSchemaSyncError(RuntimeError):
+    """A SQLite database cannot be upgraded in place to the current schema.
+
+    Raised at startup when an older Dendrux SQLite file is missing a column
+    that SQLite cannot add (NOT NULL without a constant default), when an
+    index the schema needs collides with an unrelated object, or when an
+    ``ALTER`` fails. The message names the table, column or index. Run
+    ``dendrux db migrate`` against the database, or recreate the file.
+    """
+
+
 __all__ = [
     "ContextLengthExceededError",
     "InvalidToolResultError",
@@ -291,4 +303,5 @@ __all__ = [
     "SkillMismatchError",
     "SkillMissingError",
     "SkillValidationError",
+    "SqliteSchemaSyncError",
 ]
