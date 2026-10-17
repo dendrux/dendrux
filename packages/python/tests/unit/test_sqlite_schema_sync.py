@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import threading
@@ -10,17 +11,19 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, text
+from sqlalchemy import false as sa_false
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from dendrux import Agent
 from dendrux.db._sqlite_sync import (
-    SqliteSchemaSyncError,
     _add_column,
+    _unsafe_reason,
     create_sqlite_schema,
     sync_sqlite_schema,
 )
 from dendrux.db.models import AgentRun, Base
+from dendrux.errors import SqliteSchemaSyncError
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse, RunStatus
 
@@ -450,3 +453,426 @@ def test_unique_violation_still_enforced_on_fresh_db(tmp_path: Path) -> None:
                 {"i": rid},
             )
     eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Review round: RunStore, global engine, index reconciliation, atomicity
+# ---------------------------------------------------------------------------
+
+
+def _dup_key_insert(path: Path) -> None:
+    """Insert two runs sharing a non-NULL idempotency_key; raises if not unique."""
+    con = sqlite3.connect(path)
+    sql = (
+        "INSERT INTO agent_runs (id, agent_name, status, iteration_count, delegation_level,"
+        " total_input_tokens, total_output_tokens, created_at, updated_at, idempotency_key)"
+        " VALUES (?, 'a', 'pending', 0, 0, 0, 0, 'x', 'x', 'dup')"
+    )
+    try:
+        con.execute(sql, ("D1",))
+        con.execute(sql, ("D2",))
+    finally:
+        con.close()
+
+
+class TestRunStoreUpgrade:
+    async def test_run_store_from_database_url_upgrades_legacy_file(self, tmp_path: Path) -> None:
+        from dendrux.store import RunStore
+
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        async with RunStore.from_database_url(f"sqlite+aiosqlite:///{db}") as store:
+            runs = await store.list_runs()
+            assert {r.run_id for r in runs} == {r for r, *_ in _LEGACY_ROWS}
+            assert await store.get_notes("01OLDRUN0000000000000000A1") == []
+        assert "pause_requested" in _columns(db, "agent_runs")
+        assert "run_inbox" in _tables(db)
+
+    async def test_run_store_unsafe_file_raises_clear_error_each_time(self, tmp_path: Path) -> None:
+        from dendrux.store import RunStore
+
+        db = tmp_path / "bad.db"
+        _build_old_db(db, without={"agent_name"})
+        async with RunStore.from_database_url(f"sqlite+aiosqlite:///{db}") as store:
+            for _ in range(2):
+                with pytest.raises(SqliteSchemaSyncError, match="agent_runs.agent_name"):
+                    await store.list_runs()
+
+    async def test_run_store_initialises_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.store as store_mod
+        from dendrux.store import RunStore
+
+        calls = []
+        real = store_mod.create_sqlite_schema
+        monkeypatch.setattr(
+            store_mod, "create_sqlite_schema", lambda c: (calls.append(1), real(c))[1]
+        )
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        async with RunStore.from_database_url(f"sqlite+aiosqlite:///{db}") as store:
+            await asyncio.gather(store.list_runs(), store.list_runs())
+            await store.list_runs()
+        assert len(calls) == 1
+
+    async def test_run_store_non_sqlite_url_does_no_init(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.store as store_mod
+        from dendrux.store import RunStore
+
+        monkeypatch.setattr(
+            store_mod, "create_sqlite_schema", lambda c: pytest.fail("must not run")
+        )
+        store = RunStore.from_database_url("postgresql+asyncpg://u:p@localhost:1/none")
+        await store.close()
+
+
+class TestGlobalEngineInit:
+    async def test_failed_init_publishes_nothing_and_retries(self, tmp_path: Path) -> None:
+        import dendrux.db.session as session
+        from dendrux.db.session import get_engine, reset_engine
+
+        db = tmp_path / "bad.db"
+        _build_old_db(db, without={"agent_name"})
+        url = f"sqlite+aiosqlite:///{db}"
+        await reset_engine()
+        try:
+            for _ in range(2):
+                with pytest.raises(SqliteSchemaSyncError):
+                    await get_engine(url)
+                assert session._engine is None
+                assert session._session_factory is None
+            con = sqlite3.connect(db)
+            con.execute("ALTER TABLE agent_runs ADD COLUMN agent_name VARCHAR(255) DEFAULT 'x'")
+            con.commit()
+            con.close()
+            engine = await get_engine(url)
+            assert engine is session._engine
+        finally:
+            await reset_engine()
+
+    async def test_concurrent_callers_share_one_initialised_engine(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.db.session as session
+        from dendrux.db.session import get_engine, reset_engine
+
+        created = []
+        real = session.create_async_engine
+        monkeypatch.setattr(
+            session, "create_async_engine", lambda *a, **k: (created.append(1), real(*a, **k))[1]
+        )
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        url = f"sqlite+aiosqlite:///{db}"
+        await reset_engine()
+        try:
+            engines = await asyncio.gather(get_engine(url), get_engine(url), get_engine(url))
+            assert len({id(e) for e in engines}) == 1
+            assert len(created) == 1
+            assert "pause_requested" in _columns(db, "agent_runs")
+        finally:
+            await reset_engine()
+
+    async def test_agent_private_engine_failed_init_is_disposed_and_retried(
+        self, tmp_path: Path
+    ) -> None:
+        db = tmp_path / "bad.db"
+        _build_old_db(db, without={"agent_name"})
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="x")]),
+            prompt="p",
+            database_url=f"sqlite+aiosqlite:///{db}",
+        )
+        for _ in range(2):
+            with pytest.raises(SqliteSchemaSyncError):
+                await agent.run("hi")
+            assert agent._private_engine is None
+            assert agent._lazy_store is None
+        await agent.close()
+
+    async def test_agent_concurrent_first_use_creates_one_engine(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        created = []
+        real = Agent._create_private_engine
+
+        async def counting(self: Agent, url: str):  # type: ignore[no-untyped-def]
+            created.append(1)
+            return await real(self, url)
+
+        monkeypatch.setattr(Agent, "_create_private_engine", counting)
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="x")]),
+            prompt="p",
+            database_url=f"sqlite+aiosqlite:///{db}",
+        )
+        try:
+            stores = await asyncio.gather(
+                agent._resolve_state_store(), agent._resolve_state_store()
+            )
+            assert stores[0] is stores[1]
+            assert len(created) == 1
+        finally:
+            await agent.close()
+
+
+class TestIndexReconciliation:
+    def test_interrupted_upgrade_column_added_index_missing(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db, without={"idempotency_key"})
+        con = sqlite3.connect(db)
+        con.execute("ALTER TABLE agent_runs ADD COLUMN idempotency_key VARCHAR(255)")
+        con.commit()
+        con.close()
+        _sync(db)
+        with pytest.raises(sqlite3.IntegrityError):
+            _dup_key_insert(db)
+
+    def test_unique_index_name_owned_by_other_table_is_an_error(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db, without={"idempotency_key"})
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE app_owned (k TEXT)")
+        con.execute("CREATE UNIQUE INDEX uq_agent_runs_idempotency_key ON app_owned (k)")
+        con.commit()
+        con.close()
+        with pytest.raises(SqliteSchemaSyncError, match="uq_agent_runs_idempotency_key"):
+            _sync(db)
+
+    def test_plain_index_name_owned_by_other_table_is_an_error(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE app_owned (k TEXT)")
+        con.execute("CREATE INDEX ix_agent_runs_created_at ON app_owned (k)")
+        con.commit()
+        con.close()
+        with pytest.raises(SqliteSchemaSyncError, match="ix_agent_runs_created_at"):
+            _sync(db)
+
+    def test_same_name_different_columns_is_an_error(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        con = sqlite3.connect(db)
+        con.execute("CREATE INDEX ix_agent_runs_created_at ON agent_runs (agent_name)")
+        con.commit()
+        con.close()
+        with pytest.raises(SqliteSchemaSyncError, match="ix_agent_runs_created_at"):
+            _sync(db)
+
+    def test_existing_duplicates_block_unique_index_with_clear_error(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db, without={"idempotency_key"})
+        con = sqlite3.connect(db)
+        con.execute("ALTER TABLE agent_runs ADD COLUMN idempotency_key VARCHAR(255)")
+        con.execute("UPDATE agent_runs SET idempotency_key = 'same'")
+        con.commit()
+        con.close()
+        with pytest.raises(SqliteSchemaSyncError, match="idempotency_key"):
+            _sync(db)
+
+    def test_partial_unique_index_does_not_satisfy_uniqueness(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db, without={"idempotency_key"})
+        con = sqlite3.connect(db)
+        con.execute("ALTER TABLE agent_runs ADD COLUMN idempotency_key VARCHAR(255)")
+        con.execute(
+            "CREATE UNIQUE INDEX uq_agent_runs_idempotency_key ON agent_runs (idempotency_key)"
+            " WHERE status = 'never'"
+        )
+        con.commit()
+        con.close()
+        with pytest.raises(SqliteSchemaSyncError, match="uq_agent_runs_idempotency_key"):
+            _sync(db)
+
+
+class TestAtomicityAndPreflight:
+    def test_unsafe_column_blocks_before_create_all(self, tmp_path: Path) -> None:
+        db = tmp_path / "bad.db"
+        _build_old_db(db, without={"agent_name"})
+        con = sqlite3.connect(db)
+        con.execute("DROP TABLE run_events")
+        con.commit()
+        con.close()
+        before = _tables(db)
+        eng = create_engine(f"sqlite:///{db}")
+        with pytest.raises(SqliteSchemaSyncError, match="agent_runs.agent_name"), eng.begin() as c:
+            create_sqlite_schema(c)
+        eng.dispose()
+        assert _tables(db) == before
+
+    def test_failure_mid_sync_rolls_everything_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.db._sqlite_sync as mod
+
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        before_cols = _columns(db, "agent_runs")
+        before_tables = _tables(db)
+        before_idx = _indexes(db)
+
+        def boom(*a: object, **k: object) -> None:
+            raise SqliteSchemaSyncError("synthetic failure")
+
+        monkeypatch.setattr(mod, "_reconcile_indexes", boom)
+        eng = create_engine(f"sqlite:///{db}")
+        with pytest.raises(SqliteSchemaSyncError) as exc, eng.begin() as c:
+            create_sqlite_schema(c)
+        eng.dispose()
+        assert _columns(db, "agent_runs") == before_cols
+        assert _tables(db) == before_tables
+        assert _indexes(db) == before_idx
+        assert "pause_requested" in str(exc.value)  # reports what had been applied
+        assert "rolled back" in str(exc.value).lower()
+
+    async def test_failure_mid_sync_rolls_back_on_async_engine(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        import dendrux.db._sqlite_sync as mod
+
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        before_cols = _columns(db, "agent_runs")
+
+        def boom(*a: object, **k: object) -> None:
+            raise SqliteSchemaSyncError("synthetic failure")
+
+        monkeypatch.setattr(mod, "_reconcile_indexes", boom)
+        eng = create_async_engine(f"sqlite+aiosqlite:///{db}")
+        with pytest.raises(SqliteSchemaSyncError):
+            async with eng.begin() as c:
+                await c.run_sync(create_sqlite_schema)
+        await eng.dispose()
+        assert _columns(db, "agent_runs") == before_cols
+
+
+class TestCreateAllRace:
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, side_effect):  # type: ignore[no-untyped-def]
+        real = Base.metadata.create_all
+        calls: list[int] = []
+
+        def fake(bind, *a, **k):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            return side_effect(len(calls), real, bind, *a, **k)
+
+        monkeypatch.setattr(Base.metadata, "create_all", fake)
+        return calls
+
+    def test_transient_non_race_error_is_not_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def effect(n, real, bind, *a, **k):  # type: ignore[no-untyped-def]
+            if n == 1:
+                raise OperationalError("CREATE", {}, Exception("disk I/O error"))
+            return real(bind, *a, **k)
+
+        calls = self._patch(monkeypatch, effect)
+        eng = create_engine(f"sqlite:///{tmp_path / 'x.db'}")
+        with pytest.raises(OperationalError, match="disk I/O"), eng.begin() as c:
+            create_sqlite_schema(c)
+        eng.dispose()
+        assert len(calls) == 1
+
+    def test_persistent_error_surfaces_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def effect(n, real, bind, *a, **k):  # type: ignore[no-untyped-def]
+            raise OperationalError("CREATE", {}, Exception(f"failure {n}"))
+
+        calls = self._patch(monkeypatch, effect)
+        eng = create_engine(f"sqlite:///{tmp_path / 'x.db'}")
+        with pytest.raises(OperationalError, match="failure 1"), eng.begin() as c:
+            create_sqlite_schema(c)
+        eng.dispose()
+        assert len(calls) == 1
+
+    def test_verified_already_exists_race_is_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def effect(n, real, bind, *a, **k):  # type: ignore[no-untyped-def]
+            if n == 1:
+                real(bind, tables=[Base.metadata.tables["run_inbox"]])
+                raise OperationalError("CREATE", {}, Exception("table run_inbox already exists"))
+            return real(bind, *a, **k)
+
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        calls = self._patch(monkeypatch, effect)
+        eng = create_engine(f"sqlite:///{db}")
+        with eng.begin() as c:
+            create_sqlite_schema(c)
+        eng.dispose()
+        assert len(calls) == 2
+        assert "run_inbox" in _tables(db)
+
+
+_NOW = text("CURRENT_TIMESTAMP")
+
+
+class TestServerDefaultClassification:
+    CASES = [
+        ("nullable_plain", {"nullable": True}, True),
+        ("string_default", {"nullable": False, "server_default": "0"}, True),
+        ("text_literal", {"nullable": False, "server_default": text("0")}, True),
+        ("text_quoted", {"nullable": False, "server_default": text("'x'")}, True),
+        ("false", {"nullable": False, "server_default": sa_false()}, True),
+        ("nullable_with_literal", {"nullable": True, "server_default": "7"}, True),
+        ("not_null_no_default", {"nullable": False}, False),
+        ("current_timestamp", {"nullable": False, "server_default": _NOW}, False),
+        ("nullable_current_timestamp", {"nullable": True, "server_default": _NOW}, False),
+        ("func_now", {"nullable": False, "server_default": func.now()}, False),
+        ("paren_expr", {"nullable": False, "server_default": text("(1 + 1)")}, False),
+    ]  # fmt: skip
+
+    @pytest.mark.parametrize(("name", "kwargs", "safe"), CASES, ids=[c[0] for c in CASES])
+    def test_classification_matches_sqlite_on_populated_table(
+        self, tmp_path: Path, name: str, kwargs: dict, safe: bool
+    ) -> None:
+        from sqlalchemy import Column, Integer, MetaData, Table
+        from sqlalchemy.schema import CreateColumn
+
+        table = Table("t", MetaData(), Column("id", Integer, primary_key=True))
+        column = Column("added", Integer, **kwargs)
+        table.append_column(column)
+        assert (_unsafe_reason(column) is None) is safe
+
+        con = sqlite3.connect(tmp_path / "m.db")
+        con.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        con.execute("INSERT INTO t VALUES (1)")
+        spec = str(CreateColumn(column).compile(dialect=create_engine("sqlite://").dialect))
+        if safe:
+            con.execute(f"ALTER TABLE t ADD COLUMN {spec}")
+        else:
+            with pytest.raises(sqlite3.OperationalError):
+                con.execute(f"ALTER TABLE t ADD COLUMN {spec}")
+        con.close()
+
+
+class TestWrapperOnOtherDialects:
+    def test_create_sqlite_schema_is_a_noop_on_postgres(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = MagicMock()
+        conn.dialect.name = "postgresql"
+        monkeypatch.setattr(
+            Base.metadata, "create_all", lambda *a, **k: pytest.fail("create_all must not run")
+        )
+        create_sqlite_schema(conn)
+        conn.exec_driver_sql.assert_not_called()
+        conn.execute.assert_not_called()
+
+
+def test_error_is_public_and_aliased() -> None:
+    import dendrux.db._sqlite_sync as mod
+    import dendrux.errors as errors
+
+    assert "SqliteSchemaSyncError" in errors.__all__
+    assert mod.SqliteSchemaSyncError is errors.SqliteSchemaSyncError

@@ -29,6 +29,7 @@ import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
+from weakref import WeakKeyDictionary
 
 from dendrux._sentinel import _UnsetType
 from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
@@ -408,6 +409,9 @@ class Agent:
         self._before_tool: BeforeToolHook | None = before_tool
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
+        self._store_init_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+            WeakKeyDictionary()
+        )
 
         # --- MCP tool sources ---
         self._tool_sources: list[MCPServer] = []
@@ -876,11 +880,20 @@ class Agent:
         from dendrux.runtime.state import SQLAlchemyStateStore
 
         if self._database_url is not None:
-            engine = await self._create_private_engine(self._database_url)
-            self._private_engine = engine
-            await _verify_schema_initialized(engine, self._database_url)
-            self._lazy_store = SQLAlchemyStateStore(engine)
-            return self._lazy_store
+            from dendrux.db.session import loop_lock
+
+            async with loop_lock(self._store_init_locks):
+                if self._lazy_store is not None:
+                    return self._lazy_store
+                engine = await self._create_private_engine(self._database_url)
+                try:
+                    await _verify_schema_initialized(engine, self._database_url)
+                except BaseException:
+                    await engine.dispose()
+                    raise
+                self._private_engine = engine
+                self._lazy_store = SQLAlchemyStateStore(engine)
+                return self._lazy_store
 
         env_url = os.environ.get("DENDRUX_DATABASE_URL")
         if env_url is not None:
@@ -922,8 +935,12 @@ class Agent:
             db_path = url.split("///", 1)[-1] if "///" in url else None
             if db_path:
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-            async with engine.begin() as conn:
-                await conn.run_sync(create_sqlite_schema)
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(create_sqlite_schema)
+            except BaseException:
+                await engine.dispose()
+                raise
 
         return engine
 
