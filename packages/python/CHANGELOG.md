@@ -162,6 +162,17 @@ security fix (see Changed) and a database migration (see Migration): run
   indexes are added. A column that cannot be added safely raises an error naming
   the table and column and telling you to run `dendrux db migrate` or recreate
   the file. Postgres still requires `dendrux db migrate`.
+- **Upgrading Postgres (and other non-SQLite databases).** After upgrading the
+  package, run `dendrux db migrate` with `DENDRUX_DATABASE_URL` pointing at the
+  database, then restart. If you forget, the first use of the database (agent
+  run, `sweep`) raises `SchemaOutOfDateError` listing the missing tables and
+  columns, instead of a raw `UndefinedColumnError` mid-run. The check is
+  read-only and runs once per engine; it verifies that the required tables and
+  columns are present by exact name (not their types or defaults, and not
+  Alembic's version table), ignores anything extra, and does not run on SQLite
+  or for `RunStore`. If the database refuses the catalog read, it logs a warning
+  and continues. Set `DENDRUX_SKIP_SCHEMA_CHECK=1` to skip it if you manage the
+  schema yourself.
 
 ### Known limitations
 

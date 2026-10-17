@@ -105,12 +105,14 @@ async def _create_temp_store(
 
     For SQLite, auto-creates tables if they don't exist (matching the
     zero-config promise in Agent._create_private_engine). For Postgres
-    or other backends, tables are assumed to exist via migrations.
+    or other backends, tables must already exist via migrations; a database
+    behind the models raises SchemaOutOfDateError.
 
     The caller is responsible for disposing the engine after use.
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
+    from dendrux.db._schema_check import ensure_schema_current
     from dendrux.db._sqlite_sync import create_sqlite_schema
     from dendrux.runtime.state import SQLAlchemyStateStore
 
@@ -124,18 +126,20 @@ async def _create_temp_store(
         connect_args=connect_args,
     )
 
-    # Auto-create tables for SQLite (zero-config promise)
-    if database_url.startswith("sqlite"):
-        from pathlib import Path
+    try:
+        if database_url.startswith("sqlite"):
+            # Auto-create tables for SQLite (zero-config promise)
+            from pathlib import Path
 
-        db_path = database_url.split("///", 1)[-1] if "///" in database_url else None
-        if db_path and db_path != ":memory:":
-            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        try:
+            db_path = database_url.split("///", 1)[-1] if "///" in database_url else None
+            if db_path and db_path != ":memory:":
+                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             await create_sqlite_schema(engine)
-        except BaseException:
-            await engine.dispose()
-            raise
+        else:
+            await ensure_schema_current(engine)
+    except BaseException:
+        await engine.dispose()
+        raise
 
     store = SQLAlchemyStateStore(engine)
     return store, engine

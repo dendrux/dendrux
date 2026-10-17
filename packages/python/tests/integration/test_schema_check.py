@@ -1,0 +1,371 @@
+"""Schema-currency check on Postgres: a database behind the models fails fast.
+
+Uses its own database (``<name>_schema_test``, derived from
+``DENDRUX_TEST_PG_URL``) because it builds deliberately out-of-date schemas.
+Skipped when that variable is unset. SQLite is covered at the end: it upgrades
+itself and must never raise ``SchemaOutOfDateError``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse, urlunparse
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
+
+from dendrux import Agent
+from dendrux.db import session as db_session
+from dendrux.db.models import Base
+from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
+from dendrux.llm.mock import MockLLM
+from dendrux.runtime.sweep import sweep
+from dendrux.store import RunStore
+from dendrux.types import LLMResponse
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+pytestmark = pytest.mark.asyncio
+
+PRIOR = "a4b5c6d7e8f9"
+_MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
+_MISSING = {"agent_runs.pause_requested", "run_inbox"}
+
+
+def _alembic(url: str, rev: str) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(_MIGRATIONS))
+    cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(cfg, rev)
+
+
+def _schema_pg_url() -> str | None:
+    raw = os.environ.get("DENDRUX_TEST_PG_URL")
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    name = parsed.path.lstrip("/").removesuffix("_test") + "_schema_test"
+    return urlunparse(parsed._replace(path=f"/{name}"))
+
+
+@pytest_asyncio.fixture
+async def pg_url(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
+    url = _schema_pg_url()
+    if url is None:
+        pytest.skip("DENDRUX_TEST_PG_URL not set")
+    name = urlparse(url).path.lstrip("/")
+    assert name.endswith("_schema_test")
+    monkeypatch.delenv("DENDRUX_SKIP_SCHEMA_CHECK", raising=False)
+
+    maintenance = create_async_engine(
+        urlunparse(urlparse(url)._replace(path="/postgres")),
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+    async with maintenance.connect() as conn:
+        exists = (
+            await conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name})
+        ).first()
+        if exists is None:
+            await conn.execute(text(f'CREATE DATABASE "{name}"'))
+    await maintenance.dispose()
+
+    admin = create_async_engine(url, poolclass=NullPool)
+    async with admin.begin() as conn:
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
+    await admin.dispose()
+    yield url
+    await db_session.reset_engine()
+
+
+def _admin(url: str) -> AsyncEngine:
+    return create_async_engine(url, poolclass=NullPool)
+
+
+async def _build_previous_schema(url: str) -> None:
+    """create_all, then drop what 0.3.0 added: the 0.2.0a23 shape."""
+    engine = _admin(url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("DROP TABLE run_inbox"))
+        await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
+    await engine.dispose()
+
+
+async def _build_current_schema(url: str) -> None:
+    engine = _admin(url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await engine.dispose()
+
+
+async def _count_runs(url: str) -> int:
+    engine = _admin(url)
+    try:
+        async with engine.connect() as conn:
+            return (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one()
+    finally:
+        await engine.dispose()
+
+
+def _agent(url: str | None = None) -> Agent:
+    kwargs: dict[str, Any] = {"database_url": url} if url else {}
+    return Agent(
+        name="schema-check",
+        prompt="Test.",
+        provider=MockLLM([LLMResponse(text="ok")] * 3),
+        **kwargs,
+    )
+
+
+async def test_agent_run_on_previous_schema_raises_clear_error(pg_url: str) -> None:
+    await _build_previous_schema(pg_url)
+    agent = _agent(pg_url)
+    try:
+        with pytest.raises(SchemaOutOfDateError) as info:
+            await agent.run("hi")
+    finally:
+        await agent.close()
+    err = info.value
+    assert set(err.missing) == _MISSING
+    assert err.missing_columns == ("agent_runs.pause_requested",)
+    assert err.missing_tables == ("run_inbox",)
+    assert "dendrux db migrate" in str(err)
+    assert await _count_runs(pg_url) == 0
+
+
+async def test_agent_recovers_after_alembic_upgrade(pg_url: str) -> None:
+    await asyncio.to_thread(_alembic, pg_url, PRIOR)
+    agent = _agent(pg_url)
+    try:
+        with pytest.raises(SchemaOutOfDateError) as info:
+            await agent.run("hi")
+        assert set(info.value.missing) == _MISSING
+
+        await asyncio.to_thread(_alembic, pg_url, "head")
+        # A failed init is not cached: the same agent works after migrating.
+        result = await agent.run("hi")
+        assert result.answer == "ok"
+    finally:
+        await agent.close()
+    assert await _count_runs(pg_url) == 1
+
+
+async def test_current_schema_passes(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    agent = _agent(pg_url)
+    try:
+        assert (await agent.run("hi")).answer == "ok"
+    finally:
+        await agent.close()
+
+
+async def test_extra_table_column_and_missing_index_are_fine(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE agent_runs ADD COLUMN app_owned text"))
+        await conn.execute(text("CREATE TABLE app_owned (id int primary key)"))
+        await conn.execute(text("DROP INDEX ix_run_inbox_run_pending"))
+    await engine.dispose()
+    agent = _agent(pg_url)
+    try:
+        assert (await agent.run("hi")).answer == "ok"
+    finally:
+        await agent.close()
+
+
+async def test_skip_env_var_bypasses_the_check(
+    pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _build_previous_schema(pg_url)
+    monkeypatch.setenv("DENDRUX_SKIP_SCHEMA_CHECK", "1")
+    agent = _agent(pg_url)
+    try:
+        with pytest.raises(DBAPIError) as info:
+            await agent.run("hi")
+    finally:
+        await agent.close()
+    assert not isinstance(info.value, SchemaOutOfDateError)
+
+
+async def test_empty_database_still_says_not_initialized(pg_url: str) -> None:
+    agent = _agent(pg_url)
+    try:
+        with pytest.raises(SchemaNotInitializedError):
+            await agent.run("hi")
+    finally:
+        await agent.close()
+
+
+async def test_env_var_path_does_not_cache_a_failed_engine(
+    pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _build_previous_schema(pg_url)
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", pg_url)
+    await db_session.reset_engine()
+    agent = _agent()
+    try:
+        with pytest.raises(SchemaOutOfDateError):
+            await agent.run("hi")
+        assert db_session._engine is None
+
+        engine = _admin(pg_url)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        await engine.dispose()
+        await _build_current_schema(pg_url)
+        assert (await agent.run("hi")).answer == "ok"
+    finally:
+        await agent.close()
+        await db_session.reset_engine()
+
+
+async def test_run_store_is_not_checked_and_reads_view_backed_tables(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            await conn.execute(text(f"ALTER TABLE {table.name} RENAME TO {table.name}_base"))
+        for table in Base.metadata.sorted_tables:
+            await conn.execute(text(f"CREATE VIEW {table.name} AS SELECT * FROM {table.name}_base"))
+    await engine.dispose()
+    async with RunStore.from_database_url(pg_url) as store:
+        assert await store.list_runs() == []
+
+
+async def test_wrong_column_type_is_not_detected(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
+        await conn.execute(text("ALTER TABLE agent_runs ADD COLUMN pause_requested text"))
+    await engine.dispose()
+    from dendrux.db._schema_check import ensure_schema_current
+
+    check = create_async_engine(pg_url, poolclass=NullPool)
+    try:
+        await ensure_schema_current(check)  # presence only: types are not compared
+    finally:
+        await check.dispose()
+
+
+async def test_quoted_uppercase_tables_are_reported_missing(pg_url: str) -> None:
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text('ALTER TABLE agent_runs RENAME TO "AGENT_RUNS"'))
+    await engine.dispose()
+    check = create_async_engine(pg_url, poolclass=NullPool)
+    from dendrux.db._schema_check import ensure_schema_current
+
+    try:
+        with pytest.raises(SchemaOutOfDateError) as info:
+            await ensure_schema_current(check)
+    finally:
+        await check.dispose()
+    assert "agent_runs" in info.value.missing_tables
+
+
+async def test_sweep_checks_the_schema(pg_url: str) -> None:
+    from datetime import timedelta
+
+    await _build_previous_schema(pg_url)
+    with pytest.raises(SchemaOutOfDateError):
+        await sweep(database_url=pg_url, stale_running=timedelta(minutes=5))
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+    await _build_current_schema(pg_url)
+    result = await sweep(database_url=pg_url, stale_running=timedelta(minutes=5))
+    assert result.stale_running == []
+
+
+def _record_statements(engine: Any, sink: list[str]) -> None:
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _record(_c: Any, _cur: Any, statement: str, *_a: Any) -> None:
+        sink.append(statement)
+
+
+def _reflection(statements: list[str]) -> list[str]:
+    return [s for s in statements if "pg_class" in s or "pg_catalog" in s]
+
+
+async def test_check_is_read_only(pg_url: str) -> None:
+    from dendrux.db._schema_check import ensure_schema_current
+
+    await _build_current_schema(pg_url)
+    statements: list[str] = []
+    engine = create_async_engine(pg_url, poolclass=NullPool)
+    _record_statements(engine, statements)
+    await ensure_schema_current(engine)
+    await engine.dispose()
+    assert statements
+    assert {s.lstrip().split(None, 1)[0].upper() for s in statements} <= {"SELECT", "WITH"}
+    assert len(statements) <= 4
+
+
+async def test_agent_reflects_once_per_engine(pg_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlalchemy.ext.asyncio as sa_asyncio
+
+    import dendrux.agent as agent_module
+
+    await _build_current_schema(pg_url)
+    statements: list[str] = []
+    real = sa_asyncio.create_async_engine
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        engine = real(*args, **kwargs)
+        _record_statements(engine, statements)
+        return engine
+
+    monkeypatch.setattr(sa_asyncio, "create_async_engine", recording)
+    verify_calls: list[str] = []
+
+    async def no_verify(*_a: Any) -> None:
+        verify_calls.append("called")
+
+    monkeypatch.setattr(agent_module, "_verify_schema_initialized", no_verify)
+
+    agent = _agent(pg_url)
+    try:
+        await agent.run("one")
+        first = len(_reflection(statements))
+        assert first > 0  # the single check ran
+        await agent.run("two")
+        await agent.run("three")
+    finally:
+        await agent.close()
+    assert len(_reflection(statements)) == first
+    assert verify_calls == []  # the redundant has_table query is gone
+
+
+async def test_sqlite_is_unaffected(tmp_path: Path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'old.db'}"
+    engine = create_async_engine(url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("DROP TABLE run_inbox"))
+        await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
+    await engine.dispose()
+
+    agent = _agent(url)
+    try:
+        assert (await agent.run("hi")).answer == "ok"
+    finally:
+        await agent.close()

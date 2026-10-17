@@ -876,6 +876,7 @@ class Agent:
         if self._lazy_store is not None:
             return self._lazy_store
 
+        from dendrux.db._schema_check import was_verified
         from dendrux.runtime.state import SQLAlchemyStateStore
 
         if self._database_url is not None:
@@ -883,7 +884,8 @@ class Agent:
                 generation = self._store_generation
             engine = await self._create_private_engine(self._database_url)
             try:
-                await _verify_schema_initialized(engine, self._database_url)
+                if not was_verified(engine):
+                    await _verify_schema_initialized(engine, self._database_url)
             except BaseException:
                 await engine.dispose()
                 raise
@@ -907,7 +909,8 @@ class Agent:
             from dendrux.db.session import get_engine
 
             engine = await get_engine(env_url)
-            await _verify_schema_initialized(engine, env_url)
+            if not was_verified(engine):
+                await _verify_schema_initialized(engine, env_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
             return self._lazy_store
 
@@ -924,6 +927,7 @@ class Agent:
 
         from sqlalchemy.ext.asyncio import create_async_engine
 
+        from dendrux.db._schema_check import ensure_schema_current
         from dendrux.db._sqlite_sync import create_sqlite_schema
 
         connect_args: dict[str, Any] = {}
@@ -937,16 +941,18 @@ class Agent:
             **self._database_options,
         )
 
-        # Auto-create tables for SQLite (zero-config promise)
-        if url.startswith("sqlite"):
-            db_path = url.split("///", 1)[-1] if "///" in url else None
-            if db_path:
-                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-            try:
+        try:
+            if url.startswith("sqlite"):
+                # Auto-create tables for SQLite (zero-config promise)
+                db_path = url.split("///", 1)[-1] if "///" in url else None
+                if db_path:
+                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
                 await create_sqlite_schema(engine)
-            except BaseException:
-                await engine.dispose()
-                raise
+            else:
+                await ensure_schema_current(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
 
         return engine
 
