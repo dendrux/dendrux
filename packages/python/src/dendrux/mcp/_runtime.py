@@ -86,6 +86,7 @@ from dendrux.mcp._server import (
 )
 from dendrux.mcp._source import (
     MCPSource,
+    redact_source_text,
     safe_source_exception_detail,
     source_has_opaque_credentials,
 )
@@ -143,6 +144,18 @@ def _is_insufficient_scope(error: MCPAuthenticationError) -> bool:
         and challenge is not None
         and challenge.error == "insufficient_scope"
     )
+
+
+def _diagnostic_tool_name(source: MCPSource, name: str) -> str:
+    """Return ``name`` safe for errors and telemetry.
+
+    Tool names come from the caller or the server, and a server can echo a
+    credential back as one. Opaque auth cannot be scrubbed by value, so the
+    name is withheld entirely.
+    """
+    if source_has_opaque_credentials(source):
+        return "[tool name suppressed: opaque auth]"
+    return redact_source_text(source, name)
 
 
 def _recoverable_rejection(
@@ -512,8 +525,9 @@ class MCPConnection:
            connection's own identity. Never expose it directly to a model or
            an untrusted client; the application must authorize each call.
 
-        An unlisted ``name`` raises :class:`MCPToolNotFoundError` before
-        anything is sent. A result the server flags as an error raises
+        An unlisted ``name`` raises :class:`MCPToolNotFoundError`; no
+        ``tools/call`` request is sent (connecting and discovery may have
+        been). A result the server flags as an error raises
         :class:`MCPToolCallError`. ``timeout`` (seconds) is an extra outer
         deadline over the whole operation, queueing and connecting included;
         on expiry a :class:`TimeoutError` is raised and, if the call had
@@ -537,22 +551,28 @@ class MCPConnection:
         ):
             raise ValueError("MCP call timeout must be a positive finite number of seconds.")
         runtime = self.runtime
+        # ``name`` stays raw only for catalog matching and the wire call. A
+        # server can advertise a tool named after the credential it was just
+        # sent, so every error and telemetry event carries a scrubbed name.
+        shown = _diagnostic_tool_name(self.source, name)
         deadline = asyncio.timeout(None if timeout is None else float(timeout))
         try:
             async with deadline:
                 entry = await runtime._lease(self)
                 try:
+                    if entry.adapter is not None:
+                        shown = _diagnostic_tool_name(entry.adapter.source, shown)
                     original_tool = next(
                         (tool for tool in entry.raw_tools if tool.name == name), None
                     )
                     if original_tool is None:
-                        raise MCPToolNotFoundError(name)
+                        raise MCPToolNotFoundError(shown)
                     return await runtime._execute_call(
                         self,
                         entry,
                         mcp_tool_name=name,
                         original_tool=original_tool,
-                        qualified_name=name,
+                        qualified_name=shown,
                         namespace=self.source.name,
                         owner=object(),
                         # The lease is held for the whole call and released
@@ -566,7 +586,7 @@ class MCPConnection:
             if not deadline.expired():
                 raise
             raise TimeoutError(
-                f"MCP tool '{name}' did not finish within {timeout:g}s. If the call had "
+                f"MCP tool '{shown}' did not finish within {timeout:g}s. If the call had "
                 "already started, the server may still apply it; do not retry automatically."
             ) from None
 

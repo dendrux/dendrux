@@ -389,8 +389,10 @@ class MCPToolCallError(MCPError):
 class MCPToolNotFoundError(MCPError):
     """``MCPConnection.call_tool`` named a tool the server does not list.
 
-    Nothing was sent to the server. ``tool_name`` is the name the caller
-    supplied; use ``MCPConnection.discover()`` to see the advertised catalog.
+    No ``tools/call`` request was sent (connecting and discovery may have
+    happened). ``tool_name`` is the caller-supplied name with configured
+    credentials scrubbed, since a name can echo one; use
+    ``MCPConnection.discover()`` to see the advertised catalog.
     """
 
     tool_name: str
@@ -398,7 +400,7 @@ class MCPToolNotFoundError(MCPError):
     def __init__(self, tool_name: str) -> None:
         super().__init__(
             f"MCP server does not list a tool named {tool_name!r}. "
-            "Use discover() to see the advertised tools."
+            "No tools/call request was sent. Use discover() to see the advertised tools."
         )
         self.tool_name = tool_name
 
