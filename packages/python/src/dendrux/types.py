@@ -400,37 +400,88 @@ class UsageStats:
     cost_unknown: bool = False
 
 
+BudgetAction: TypeAlias = Literal["warn", "pause", "cancel"]
+_BUDGET_ACTIONS = ("warn", "pause", "cancel")
+
+
 @dataclass(frozen=True)
 class Budget:
-    """Token budget for advisory spend tracking.
+    """Token and/or dollar budget for a run and, by default, its delegated children.
 
-    Non-blocking in v1 — fires governance events (budget.threshold,
-    budget.exceeded) but does not pause or stop the run. Developers
-    observe events and take action in their own integration.
+    Usage is checked after every LLM response and at the top of every
+    iteration. ``budget.threshold`` fires once per ``(metric, fraction)``
+    when a ``warn_at`` fraction is first crossed and ``budget.exceeded``
+    once per metric when its limit is reached; every payload carries
+    ``metric`` (``"tokens"`` or ``"cost_usd"``), ``used`` and ``max``. Fired
+    keys survive pause/resume, so a resumed run does not re-fire them.
+
+    ``on_exceed`` decides what happens once a limit is reached:
+
+    - ``"warn"`` (default): events only; the run continues.
+    - ``"pause"``: durable pause (``RunStatus.PAUSED``, ``pause_reason="budget"``).
+    - ``"cancel"``: ``RunStatus.CANCELLED`` with ``failure_reason="budget_exceeded"``.
+
+    Pause and cancel take effect at the next top-of-iteration checkpoint,
+    after the tools of the response that crossed the limit have run, so a
+    run can overshoot by up to one iteration. A response that finishes the
+    run still completes. Cancellation and requested pauses take precedence
+    over a budget pause at the same checkpoint. ``SingleCall`` has no
+    checkpoint: pause/cancel degrade to warn there.
+
+    Resuming a budget pause succeeds only if the resuming Agent's limits are
+    strictly above the current live usage; otherwise the run pauses again
+    immediately with the same reason.
+
+    With a state store, usage is read live from recorded LLM calls; with
+    ``include_children=True`` it is the root-inclusive rollup of the run and
+    all its delegated descendants. The cost limit counts priced calls only:
+    unpriced calls (no provider cost and no ``PriceTable`` entry) emit one
+    ``budget.unpriced`` event per run and are otherwise ignored.
 
     Args:
-        max_tokens: Advisory token cap (must be > 0). Events fire when
-            usage crosses warn_at fractions and when usage reaches
-            this value.
-        warn_at: Fractions of max_tokens at which budget.threshold
-            events fire. Each fraction must be in (0, 1) exclusive.
-            Each fraction fires exactly once per run.
+        max_tokens: Token limit (input + output, > 0), or None.
+        warn_at: Fractions of each limit at which ``budget.threshold``
+            fires. Each fraction must be in (0, 1) exclusive.
             Default: (0.5, 0.75, 0.9).
+        max_cost_usd: Dollar limit (> 0), or None.
+        on_exceed: ``"warn"``, ``"pause"`` or ``"cancel"``.
+        include_children: Count delegated descendant runs' usage.
 
     Raises:
-        ValueError: If max_tokens <= 0 or any warn_at fraction is
-            outside (0, 1) exclusive.
+        ValueError: If neither limit is set, a limit is not positive, a
+            ``warn_at`` fraction is outside (0, 1), or ``on_exceed`` is unknown.
     """
 
-    max_tokens: int
+    max_tokens: int | None = None
     warn_at: tuple[float, ...] = (0.5, 0.75, 0.9)
+    max_cost_usd: float | None = None
+    on_exceed: BudgetAction = "warn"
+    include_children: bool = True
 
     def __post_init__(self) -> None:
-        if self.max_tokens <= 0:
+        if self.max_tokens is None and self.max_cost_usd is None:
+            raise ValueError("Budget needs max_tokens and/or max_cost_usd.")
+        if self.max_tokens is not None and (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or self.max_tokens <= 0
+        ):
             raise ValueError(f"Budget max_tokens must be > 0, got {self.max_tokens}.")
+        if self.max_cost_usd is not None and (
+            isinstance(self.max_cost_usd, bool)
+            or not isinstance(self.max_cost_usd, (int, float))
+            or not (0 < self.max_cost_usd < float("inf"))
+        ):
+            raise ValueError(f"Budget max_cost_usd must be > 0, got {self.max_cost_usd}.")
         for f in self.warn_at:
             if not (0 < f < 1):
                 raise ValueError(f"Budget warn_at fractions must be in (0, 1) exclusive, got {f}.")
+        if self.on_exceed not in _BUDGET_ACTIONS:
+            raise ValueError(
+                f"Budget on_exceed must be one of {_BUDGET_ACTIONS}, got {self.on_exceed!r}."
+            )
+        if not isinstance(self.include_children, bool):
+            raise ValueError("Budget include_children must be a bool.")
 
 
 @dataclass
@@ -528,6 +579,7 @@ class GovernanceEventType(StrEnum):
     # Wave 3: Budget
     BUDGET_THRESHOLD = "budget.threshold"
     BUDGET_EXCEEDED = "budget.exceeded"
+    BUDGET_UNPRICED = "budget.unpriced"
 
     # Wave 4: Guardrails
     GUARDRAIL_DETECTED = "guardrail.detected"
@@ -681,7 +733,7 @@ class PauseState:
     # Approval-gated call ids at pause time: {call_id: {"source", "reason"}}.
     # None on non-approval pauses and on pauses persisted before 0.3.0.
     approval_gates: dict[str, dict[str, str | None]] | None = None
-    # Why a PAUSED run paused ("requested"); None for WAITING_* pauses.
+    # Why a PAUSED run paused ("requested" or "budget"); None for WAITING_* pauses.
     pause_reason: str | None = None
     # Free-text reason given to ``Agent.request_pause(reason=...)``.
     pause_message: str | None = None
@@ -689,6 +741,13 @@ class PauseState:
     # approval batch: {call_id: {"approved": bool, "reason": str | None}}.
     # Resume executes them without asking for approval again.
     pending_decisions: dict[str, dict[str, Any]] | None = None
+    # Budget events already emitted, as (metric, threshold); threshold 1.0 is
+    # "exceeded". Persisted on every pause so a resumed run does not re-fire.
+    budget_fired: list[tuple[str, float]] | None = None
+    # Whether ``budget.unpriced`` was already emitted for this run.
+    budget_unpriced_reported: bool = False
+    # Limits a budget pause hit: [{"metric", "used", "max"}]. Budget pauses only.
+    budget_exceeded: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -716,6 +775,12 @@ class PauseState:
             d["pause_message"] = self.pause_message
         if self.pending_decisions is not None:
             d["pending_decisions"] = self.pending_decisions
+        if self.budget_fired:
+            d["budget_fired"] = [[metric, threshold] for metric, threshold in self.budget_fired]
+        if self.budget_unpriced_reported:
+            d["budget_unpriced_reported"] = True
+        if self.budget_exceeded is not None:
+            d["budget_exceeded"] = self.budget_exceeded
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -742,6 +807,9 @@ class PauseState:
             pause_reason=data.get("pause_reason"),
             pause_message=data.get("pause_message"),
             pending_decisions=data.get("pending_decisions"),
+            budget_fired=[(str(m), float(t)) for m, t in data.get("budget_fired") or []] or None,
+            budget_unpriced_reported=bool(data.get("budget_unpriced_reported", False)),
+            budget_exceeded=data.get("budget_exceeded"),
         )
 
 

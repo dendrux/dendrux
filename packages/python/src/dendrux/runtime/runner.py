@@ -18,6 +18,7 @@ Sprint 2 adds optional state_store for persistence. When provided:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -33,6 +34,7 @@ from dendrux.context_blocks import (
     validate_context,
     wire_user_input,
 )
+from dendrux.loops._budget import BUDGET_EXCEEDED, BudgetCarry
 from dendrux.loops._helpers import (
     notify_message,
     notify_run_failed,
@@ -530,7 +532,9 @@ async def _persist_loop_outcome(
             await _attach_undelivered_notes(state_store, run_id, persisted)
         return persisted
 
-    async def _finalize_cancelled(allowed: list[str], payload: dict[str, Any]) -> RunResult:
+    async def _finalize_cancelled(
+        allowed: list[str], payload: dict[str, Any], failure_reason: str | None = None
+    ) -> RunResult:
         won = await _transition_with_event(
             state_store,
             run_id,
@@ -543,6 +547,7 @@ async def _persist_loop_outcome(
             iteration_count=result.iteration_count,
             total_usage=result.usage,
             pii_mapping=result.meta.get("pii_mapping"),
+            failure_reason=failure_reason,
         )
         if not won:
             return await _persisted(RunStatus.CANCELLED)
@@ -550,6 +555,15 @@ async def _persist_loop_outcome(
         cancelled.meta.pop("pause_state", None)
         await _attach_undelivered_notes(state_store, run_id, cancelled)
         return cancelled
+
+    if result.status == RunStatus.CANCELLED and result.meta.get("budget_exceeded"):
+        # Budget cancel from the loop's checkpoint: distinct event reason and
+        # failure_reason so it never reads as a user cancellation.
+        return await _finalize_cancelled(
+            [RunStatus.RUNNING.value],
+            {"reason": BUDGET_EXCEEDED, "exceeded": result.meta["budget_exceeded"]},
+            failure_reason=BUDGET_EXCEEDED,
+        )
 
     if result.status == RunStatus.CANCELLED:
         payload: dict[str, Any] = {"reason": "cancel_requested"}
@@ -588,6 +602,8 @@ async def _persist_loop_outcome(
             paused_data["reason"] = pause_state.pause_reason
         if pause_state.pause_message:
             paused_data["message"] = pause_state.pause_message[:500]
+        if pause_state.budget_exceeded:
+            paused_data["exceeded"] = pause_state.budget_exceeded
         paused = await _pause_with_event(
             state_store,
             run_id,
@@ -597,6 +613,7 @@ async def _persist_loop_outcome(
             event_data=paused_data,
             iteration_count=result.iteration_count,
             pii_mapping=result.meta.get("pii_mapping"),
+            total_usage=result.usage,
         )
         if not paused:
             # CAS lost: honor the winner. On a still-RUNNING row only a
@@ -663,7 +680,8 @@ async def _transition_with_event(
     """CAS-finalize and record the transition event atomically when the store can.
 
     Pre-0.3 stores lack ``finalize_with_event``: fall back to the CAS
-    followed by a separate event write.
+    followed by a separate event write. Their CAS cannot store a
+    ``failure_reason``; the transition event still carries the reason.
     """
     atomic = getattr(state_store, "finalize_with_event", None)
     if atomic is not None:
@@ -679,6 +697,10 @@ async def _transition_with_event(
             return False
         sequencer.advance_past(seq)
         return True
+    if finalize_kwargs.get("failure_reason") is None or not _accepts_kwarg(
+        state_store.finalize_run_if_status_in, "failure_reason"
+    ):
+        finalize_kwargs.pop("failure_reason", None)
     won = await state_store.finalize_run_if_status_in(
         run_id,
         status=status,
@@ -700,12 +722,16 @@ async def _pause_with_event(
     event_data: dict[str, Any],
     iteration_count: int | None,
     pii_mapping: dict[str, str] | None,
+    total_usage: UsageStats | None = None,
 ) -> bool:
     """Persist a pause and its ``run.paused`` event; False when cancellation won.
 
-    Pre-0.3 stores lack ``pause_with_event``: fall back to the legacy
-    cancel read, unconditional ``pause_run`` and a separate event write.
+    ``total_usage`` is written as the run's running totals so a paused run
+    does not read as zero spend. Pre-0.3 stores lack ``pause_with_event``:
+    fall back to the legacy cancel read, unconditional ``pause_run`` (with
+    totals only when it accepts them) and a separate event write.
     """
+    usage_kwargs: dict[str, Any] = {"total_usage": total_usage} if total_usage else {}
     atomic = getattr(state_store, "pause_with_event", None)
     if atomic is not None:
         seq = await atomic(
@@ -715,6 +741,7 @@ async def _pause_with_event(
             event_data=event_data,
             iteration_count=iteration_count,
             pii_mapping=pii_mapping,
+            **usage_kwargs,
         )
         if seq is None:
             return False
@@ -722,12 +749,15 @@ async def _pause_with_event(
         return True
     if await state_store.is_cancel_requested(run_id):
         return False
+    if not _accepts_kwarg(state_store.pause_run, "total_usage"):
+        usage_kwargs = {}
     await state_store.pause_run(
         run_id,
         status=status,
         pause_data=pause_data,
         iteration_count=iteration_count,
         pii_mapping=pii_mapping,
+        **usage_kwargs,
     )
     await _emit_event(state_store, run_id, "run.paused", sequencer, event_data)
     # The read and the pause are separate here: a cancel committed in between
@@ -744,6 +774,42 @@ async def _pause_with_event(
             event_data={"reason": "cancel_requested"},
         )
     return True
+
+
+def _signature_params(fn: Any) -> Any:
+    try:
+        return inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return None
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """Whether ``fn`` takes keyword ``name`` (explicitly or via ``**kwargs``)."""
+    params = _signature_params(fn)
+    if params is None:
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _budget_carry_kwargs(loop_method: Any, pause_state: PauseState) -> dict[str, Any]:
+    """``budget_carry=`` for a loop that accepts it (built-in loops); else nothing.
+
+    Custom loops written against the pre-0.3 ``Loop`` signature keep working;
+    they simply cannot restore fired budget keys.
+    """
+    params = _signature_params(loop_method)
+    if params is None or "budget_carry" not in params:
+        return {}
+    return {"budget_carry": BudgetCarry.from_pause(pause_state)}
+
+
+def _carry_budget_fields(new: PauseState, old: PauseState) -> PauseState:
+    """Copy fired budget keys from the pause being resumed onto a runner-built pause."""
+    return replace(
+        new,
+        budget_fired=old.budget_fired,
+        budget_unpriced_reported=old.budget_unpriced_reported,
+    )
 
 
 _UNSET_DEPTH = _UnsetType()
@@ -2899,6 +2965,7 @@ def _approval_stop_result(
         trace_order_offset=len(history),
         usage=_snapshot_usage(pause_state.usage),
     )
+    client_pause = _carry_budget_fields(client_pause, pause_state)
     return RunResult(
         run_id=run_id,
         status=RunStatus.WAITING_CLIENT_TOOL,
@@ -2955,6 +3022,7 @@ def _barrier_pause_result(
         pause_reason="requested",
         pending_decisions=decisions,
     )
+    pause = _carry_budget_fields(pause, pause_state)
     return RunResult(
         run_id=run_id,
         status=RunStatus.PAUSED,
@@ -3268,6 +3336,7 @@ async def _resume_core(
                 initial_usage=ctx.pause_state.usage,
                 initial_pii_mapping=_saved_pii_mapping,
                 state_store=state_store,
+                **_budget_carry_kwargs(ctx.resolved_loop.run, ctx.pause_state),
             )
 
             _attach_mcp_meta(result, mcp_meta)
@@ -3638,6 +3707,7 @@ def resume_stream(
                 initial_usage=ctx.pause_state.usage,
                 state_store=store,
                 interrupt=interrupt,
+                **_budget_carry_kwargs(ctx.resolved_loop.run_stream, ctx.pause_state),
             )
             async with _closing_loop_stream(loop_stream, run_id):
                 async for event in loop_stream:

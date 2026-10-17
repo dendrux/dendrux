@@ -118,8 +118,8 @@ class TestGovernanceEventTypeEnum:
 
     def test_total_member_count(self) -> None:
         """The seven v2 skill events replace the original three; +3 before_tool events;
-        +1 inbox.delivered."""
-        assert len(GovernanceEventType) == 24
+        +1 inbox.delivered; +1 budget.unpriced."""
+        assert len(GovernanceEventType) == 25
 
     def test_guardrail_unmapped_placeholder_member(self) -> None:
         assert (

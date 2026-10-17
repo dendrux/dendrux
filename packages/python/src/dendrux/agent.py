@@ -537,7 +537,7 @@ class Agent:
 
     @property
     def budget(self) -> Budget | None:
-        """Advisory token budget, or None."""
+        """Token and/or dollar budget (see :class:`~dendrux.types.Budget`), or None."""
         return self._budget
 
     @property
