@@ -20,12 +20,13 @@ Notifier hooks fire at three kinds of points:
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
@@ -70,6 +71,8 @@ from dendrux.types import (
     RunStatus,
     StreamEventType,
     ToolCall,
+    ToolCallContext,
+    ToolDecision,
     ToolResult,
     ToolResultContext,
     ToolTarget,
@@ -87,7 +90,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import ToolResultTransform
+    from dendrux.types import BeforeToolHook, ToolResultTransform
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +123,8 @@ class _ToolCallOutcome(NamedTuple):
     pending_calls: list[ToolCall]
     # True if pending_calls are awaiting approval (vs client tool pause)
     pending_approval: bool = False
+    # Approval-gated call ids → {"source", "reason"} (approval pauses only)
+    approval_gates: dict[str, dict[str, str | None]] | None = None
 
 
 def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
@@ -315,8 +320,9 @@ def _build_pause(
     steps: list[AgentStep],
     iteration: int,
     usage: UsageStats,
+    approval_gates: dict[str, dict[str, str | None]] | None = None,
 ) -> PauseState:
-    """Build PauseState for client tool or clarification pause."""
+    """Build PauseState for client tool, approval or clarification pause."""
     pending_targets = (
         {tc.id: target_lookup.get(tc.name, ToolTarget.SERVER).value for tc in pending_calls}
         if pending_calls
@@ -332,6 +338,7 @@ def _build_pause(
         iteration=iteration,
         trace_order_offset=len(history),
         usage=_snapshot_usage(usage),
+        approval_gates=approval_gates,
     )
 
 
@@ -415,6 +422,8 @@ async def _process_tool_calls(
     guardrail_engine: GuardrailEngine | None = None,
     tool_result_transform: ToolResultTransform | None = None,
     approved_skills: bool = False,
+    before_tool: BeforeToolHook | None = None,
+    tenant_id: str | None = None,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -551,17 +560,49 @@ async def _process_tool_calls(
             all_results.append((tc, failure))
         non_denied = ready
 
-    # --- Phase 1: Approval check (governance) ---
+    # --- Phase 0.75: before_tool policy hook ---
     approval_set = require_approval or frozenset()
-    if approval_set and any(tc.name in approval_set for tc in non_denied):
+    gates: dict[str, dict[str, str | None]] = {
+        tc.id: {"source": "static", "reason": "requires_approval"}
+        for tc in non_denied
+        if tc.name in approval_set
+    }
+    if before_tool is not None:
+        non_denied = await _apply_before_tool(
+            before_tool,
+            non_denied,
+            gates,
+            lookups=lookups,
+            strategy=strategy,
+            recorder=recorder,
+            notifier=notifier,
+            run_id=run_id,
+            iteration=iteration,
+            history=history,
+            warnings=warnings,
+            all_results=all_results,
+            tenant_id=tenant_id,
+        )
+
+    # --- Phase 1: Approval check (governance) ---
+    if gates:
         # Any tool in the batch needs approval → entire remaining batch pauses.
         for tc in non_denied:
-            if tc.name in approval_set:
-                event_data = {
-                    "tool_name": tc.name,
-                    "call_id": tc.id,
-                    "reason": "requires_approval",
-                }
+            gate = gates.get(tc.id)
+            if gate is not None:
+                if gate["source"] == "hook":
+                    event_data = {
+                        "tool_name": tc.name,
+                        "call_id": tc.id,
+                        "reason": gate["reason"] or "requires_approval",
+                        "source": "hook",
+                    }
+                else:
+                    event_data = {
+                        "tool_name": tc.name,
+                        "call_id": tc.id,
+                        "reason": "requires_approval",
+                    }
                 await _record_governance(
                     recorder,
                     run_id,
@@ -583,6 +624,7 @@ async def _process_tool_calls(
             all_results=all_results,
             pending_calls=non_denied,
             pending_approval=True,
+            approval_gates=gates,
         )
 
     # --- Phase 1.5: Validate params against each tool's schema ---
@@ -680,6 +722,195 @@ async def _process_tool_calls(
     return _ToolCallOutcome(all_results=all_results, pending_calls=pending_calls)
 
 
+async def _hook_tenant_id(
+    hook: BeforeToolHook | None, state_store: StateStore | None, run_id: str
+) -> str | None:
+    """The run's tenant for ``ToolCallContext`` (read once, only with a hook)."""
+    if hook is None or state_store is None:
+        return None
+    record = await state_store.get_run(run_id)
+    return record.tenant_id if record is not None else None
+
+
+_HOOK_ERROR_REASON = "policy hook error"
+_CLIENT_APPROVAL_REASON = "approval is not supported for client tools"
+
+
+def _tool_source(name: str, lookups: ToolLookups) -> Literal["local", "mcp", "skill"]:
+    from dendrux.skills._session import SkillTool
+
+    if isinstance(lookups.fn.get(name), SkillTool):
+        return "skill"
+    if "mcp_tool_name" in lookups.meta.get(name, {}):
+        return "mcp"
+    return "local"
+
+
+async def _call_before_tool(
+    hook: BeforeToolHook,
+    tc: ToolCall,
+    lookups: ToolLookups,
+    *,
+    run_id: str,
+    iteration: int,
+    tenant_id: str | None,
+) -> tuple[ToolDecision | None, str | None]:
+    """Run the hook on deep-copied inputs. Returns (decision, error_type).
+
+    Only ``Exception`` is caught: cancellation and other ``BaseException``
+    subclasses propagate. A non-``ToolDecision`` return is an error.
+    """
+    try:
+        ctx = ToolCallContext(
+            run_id=run_id,
+            call_id=tc.id,
+            tool_name=tc.name,
+            params=copy.deepcopy(tc.params),
+            target=lookups.target.get(tc.name, ToolTarget.SERVER),
+            source=_tool_source(tc.name, lookups),
+            meta=copy.deepcopy(lookups.meta.get(tc.name, {})),
+            iteration=iteration,
+            tenant_id=tenant_id,
+        )
+        decision = hook(ctx)
+        if inspect.isawaitable(decision):
+            decision = await decision
+    except Exception as exc:
+        logger.warning(
+            "before_tool hook raised %s for tool '%s'; denying the call",
+            type(exc).__name__,
+            tc.name,
+        )
+        return None, type(exc).__name__
+    if decision is not None and not isinstance(decision, ToolDecision):
+        logger.warning(
+            "before_tool hook returned %s for tool '%s' (expected ToolDecision or None); "
+            "denying the call",
+            type(decision).__name__,
+            tc.name,
+        )
+        return None, "TypeError"
+    return decision, None
+
+
+async def _apply_before_tool(
+    hook: BeforeToolHook,
+    calls: list[ToolCall],
+    gates: dict[str, dict[str, str | None]],
+    *,
+    lookups: ToolLookups,
+    strategy: Strategy,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    history: list[Message],
+    warnings: list[str],
+    all_results: list[tuple[ToolCall, ToolResult]],
+    tenant_id: str | None,
+) -> list[ToolCall]:
+    """Evaluate ``before_tool`` per call; returns the calls that continue.
+
+    Denied and substituted calls get their result appended here. Hook
+    ``require_approval`` adds a gate to ``gates`` (mutated in place).
+    A hook deny overrides a static approval gate; nothing else does.
+    """
+
+    async def governance(event: str, data: dict[str, Any], call_id: str) -> None:
+        await _record_governance(recorder, run_id, event, iteration, data, correlation_id=call_id)
+        await _notify_governance(
+            notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
+        )
+
+    async def append(tc: ToolCall, result: ToolResult, *, record: bool) -> None:
+        if record:
+            await _record_tool(recorder, run_id, tc, result, iteration)
+            await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
+        result_msg = strategy.format_tool_result(result)
+        history.append(result_msg)
+        await _record_message(recorder, run_id, result_msg, iteration)
+        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
+        all_results.append((tc, result))
+
+    async def deny(tc: ToolCall, reason: str) -> None:
+        gates.pop(tc.id, None)
+        await governance(
+            "policy.denied",
+            {"tool_name": tc.name, "call_id": tc.id, "reason": reason, "source": "hook"},
+            tc.id,
+        )
+        result = ToolResult(
+            name=tc.name,
+            call_id=tc.id,
+            payload=json.dumps({"denied": reason}),
+            success=False,
+            error=reason,
+        )
+        # Like static deny: not an execution, no tool_calls row.
+        await append(tc, result, record=False)
+
+    async def hook_error(tc: ToolCall, error_type: str) -> None:
+        await governance(
+            "policy.hook_error",
+            {"tool_name": tc.name, "call_id": tc.id, "error_type": error_type},
+            tc.id,
+        )
+        await deny(tc, _HOOK_ERROR_REASON)
+
+    kept: list[ToolCall] = []
+    for tc in calls:
+        decision, error_type = await _call_before_tool(
+            hook, tc, lookups, run_id=run_id, iteration=iteration, tenant_id=tenant_id
+        )
+        if error_type is not None:
+            await hook_error(tc, error_type)
+            continue
+        if decision is None or decision.kind == "allow":
+            kept.append(tc)
+            continue
+        if decision.kind == "deny":
+            await deny(tc, decision.reason or _HOOK_ERROR_REASON)
+            continue
+        statically_gated = tc.id in gates
+        if decision.kind == "require_approval":
+            if lookups.target.get(tc.name, ToolTarget.SERVER) != ToolTarget.SERVER:
+                await governance(
+                    "policy.hook_warning",
+                    {
+                        "tool_name": tc.name,
+                        "call_id": tc.id,
+                        "warning": _CLIENT_APPROVAL_REASON,
+                    },
+                    tc.id,
+                )
+                await deny(tc, _CLIENT_APPROVAL_REASON)
+                continue
+            if not statically_gated:
+                gates[tc.id] = {"source": "hook", "reason": decision.reason}
+            kept.append(tc)
+            continue
+        # substitute
+        if statically_gated:
+            # Static approval gate stays in place; the call goes to a human.
+            kept.append(tc)
+            continue
+        try:
+            payload = json.dumps(decision.result)
+        except (TypeError, ValueError) as exc:
+            await hook_error(tc, type(exc).__name__)
+            continue
+        substituted = ToolResult(
+            name=tc.name,
+            call_id=tc.id,
+            payload=payload,
+            success=True,
+            meta={"substituted": True},
+        )
+        await governance("policy.substituted", {"tool_name": tc.name, "call_id": tc.id}, tc.id)
+        await append(tc, substituted, record=True)
+    return kept
+
+
 class ReActLoop(Loop):
     """Think → act → observe → repeat.
 
@@ -733,6 +964,8 @@ class ReActLoop(Loop):
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
         budget_fired: list[float] = []
+        before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
+        hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
         g_engine = (
             GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
             if agent.guardrails
@@ -1132,6 +1365,8 @@ class ReActLoop(Loop):
                     require_approval=agent.require_approval,
                     tool_result_transform=agent.tool_result_transform,
                     guardrail_engine=g_engine,
+                    before_tool=before_tool,
+                    tenant_id=hook_tenant_id,
                 )
                 if outcome.pending_calls:
                     pause_status = (
@@ -1147,6 +1382,7 @@ class ReActLoop(Loop):
                         steps=steps,
                         iteration=iteration,
                         usage=total_usage,
+                        approval_gates=outcome.approval_gates,
                     )
                     meta = {"pause_state": pause, **guardrail_meta(g_engine, notifier_warnings)}
                     return RunResult(
@@ -1212,6 +1448,8 @@ class ReActLoop(Loop):
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
         budget_fired: list[float] = []
+        before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
+        hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
 
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
@@ -1508,6 +1746,8 @@ class ReActLoop(Loop):
                     require_approval=agent.require_approval,
                     tool_result_transform=agent.tool_result_transform,
                     guardrail_engine=None,  # streaming + guardrails banned at Agent level
+                    before_tool=before_tool,
+                    tenant_id=hook_tenant_id,
                 )
                 for tc, tool_result in outcome.all_results:
                     yield RunEvent(
@@ -1531,6 +1771,7 @@ class ReActLoop(Loop):
                         steps=steps,
                         iteration=iteration,
                         usage=total_usage,
+                        approval_gates=outcome.approval_gates,
                     )
                     meta = {"pause_state": pause}
                     if notifier_warnings:
