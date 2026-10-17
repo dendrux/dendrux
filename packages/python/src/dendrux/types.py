@@ -12,16 +12,20 @@ Data flow:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import re
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
+
+    from dendrux.media import Image
 
 from ulid import ULID
 
@@ -74,6 +78,185 @@ class ToolCall:
     parse_error: str | None = None
 
 
+# ------------------------------------------------------------------
+# Image content parts (0.4.0)
+# ------------------------------------------------------------------
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ImageDetail: TypeAlias = Literal["auto", "low", "high"]
+_DETAILS = ("auto", "low", "high")
+
+
+@dataclass(frozen=True)
+class ImageRef:
+    """Immutable descriptor of a stored image blob. Never contains bytes.
+
+    ``sha256`` is the lowercase hex digest of the exact stored bytes;
+    ``media_type``, ``width`` and ``height`` were read from the image header at
+    ingest. ``kind`` is always ``"blob"`` in this version.
+    """
+
+    sha256: str
+    media_type: str
+    byte_length: int
+    width: int
+    height: int
+    kind: Literal["blob"] = "blob"
+
+    def __post_init__(self) -> None:
+        if self.kind != "blob":
+            raise ValueError(f"ImageRef.kind must be 'blob', got {self.kind!r}")
+        if not isinstance(self.sha256, str) or not _SHA256_RE.fullmatch(self.sha256):
+            raise ValueError("ImageRef.sha256 must be 64 lowercase hex characters")
+        if not isinstance(self.media_type, str) or not self.media_type:
+            raise ValueError("ImageRef.media_type must be a non-empty string")
+        for name in ("byte_length", "width", "height"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"ImageRef.{name} must be a positive int")
+
+    @property
+    def image_id(self) -> str:
+        """Short display id shown to models and in errors: ``"img_" + sha256[:12]``."""
+        return "img_" + self.sha256[:12]
+
+    def to_dict(self) -> dict[str, Any]:
+        """The persisted image descriptor (``{"type": "image", "v": 1, ...}``)."""
+        return {
+            "type": "image",
+            "v": 1,
+            "kind": self.kind,
+            "sha256": self.sha256,
+            "media_type": self.media_type,
+            "bytes": self.byte_length,
+            "width": self.width,
+            "height": self.height,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ImageRef:
+        """Rebuild from :meth:`to_dict` output.
+
+        Raises:
+            InvalidImageError: ``reason="descriptor_version"`` when ``v`` is not 1
+                or ``kind`` is not ``"blob"``; ``"descriptor_mismatch"`` when a
+                field is missing or malformed.
+        """
+        from dendrux.errors import InvalidImageError
+
+        if not isinstance(d, dict) or d.get("v") != 1 or d.get("kind") != "blob":
+            raise InvalidImageError("descriptor_version")
+        if "type" in d and d["type"] != "image":
+            raise InvalidImageError("descriptor_mismatch")
+        try:
+            return cls(
+                sha256=d["sha256"],
+                media_type=d["media_type"],
+                byte_length=d["bytes"],
+                width=d["width"],
+                height=d["height"],
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+        raise InvalidImageError("descriptor_mismatch")
+
+
+@dataclass(frozen=True)
+class TextPart:
+    """A text content part of a multimodal message. ``text`` is non-empty."""
+
+    text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text:
+            raise ValueError("TextPart.text must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class ImagePart:
+    """An image content part: a stored blob reference plus an optional ``detail``.
+
+    ``detail`` is provider-visible (OpenAI family only). ``data`` holds verified
+    bytes only between request preparation and the provider call; it is never
+    serialised, compared or shown in ``repr``.
+    """
+
+    ref: ImageRef
+    detail: ImageDetail | None = None
+    data: bytes | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, ImageRef):
+            raise TypeError("ImagePart.ref must be an ImageRef")
+        if self.detail is not None and self.detail not in _DETAILS:
+            raise ValueError(f"ImagePart.detail must be one of {_DETAILS} or None")
+
+    @property
+    def image_id(self) -> str:
+        """Short display id of the referenced image."""
+        return self.ref.image_id
+
+
+ContentPart: TypeAlias = TextPart | ImagePart
+ImageKey: TypeAlias = tuple[str, str]
+"""Image identity: ``(tenant_scope, sha256)``."""
+
+
+def content_part_to_dict(part: ContentPart) -> dict[str, Any]:
+    """Serialise one content part to its persisted dict shape."""
+    if isinstance(part, TextPart):
+        return {"type": "text", "text": part.text}
+    if isinstance(part, ImagePart):
+        d = part.ref.to_dict()
+        if part.detail is not None:
+            d["detail"] = part.detail
+        return d
+    raise TypeError(f"Not a content part: {type(part).__name__}")
+
+
+def content_part_from_dict(d: dict[str, Any]) -> ContentPart:
+    """Rebuild one content part from :func:`content_part_to_dict` output."""
+    if d.get("type") == "text":
+        return TextPart(text=d["text"])
+    ref = ImageRef.from_dict(d)
+    return ImagePart(ref=ref, detail=d.get("detail"))
+
+
+def parts_digest(parts: Sequence[ContentPart]) -> list[list[Any]]:
+    """Provider-visible identity of an ordered parts list, for hashing.
+
+    Text -> ``["t", text]``; image -> ``["i", "blob", sha256, media_type, detail]``.
+    Storage location, generation, process and base64 wrapping never enter.
+    """
+    out: list[list[Any]] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            out.append(["t", part.text])
+        elif isinstance(part, ImagePart):
+            out.append(["i", part.ref.kind, part.ref.sha256, part.ref.media_type, part.detail])
+        else:
+            raise TypeError(f"Not a content part: {type(part).__name__}")
+    return out
+
+
+# Identity-keyed memo of parts -> text projection. Entries hold the parts tuple,
+# so an id cannot be reused while its entry lives; ``entry[0] is parts`` validates.
+_PROJECTION_MEMO: dict[int, tuple[tuple[ContentPart, ...], str]] = {}
+_PROJECTION_MEMO_MAX = 1024
+
+
+def _text_projection(parts: tuple[ContentPart, ...]) -> str:
+    entry = _PROJECTION_MEMO.get(id(parts))
+    if entry is not None and entry[0] is parts:
+        return entry[1]
+    projection = "\n\n".join(p.text for p in parts if isinstance(p, TextPart))
+    if len(_PROJECTION_MEMO) >= _PROJECTION_MEMO_MAX:
+        with contextlib.suppress(StopIteration, RuntimeError):
+            _PROJECTION_MEMO.pop(next(iter(_PROJECTION_MEMO)), None)
+    _PROJECTION_MEMO[id(parts)] = (parts, projection)
+    return projection
+
+
 @dataclass(frozen=True)
 class Message:
     """A single message in the conversation.
@@ -99,6 +282,12 @@ class Message:
                     split); ignored for history/scratchpad, which are positioned
                     by the assembly order.
         source:     Optional free-form provenance label (citations/telemetry).
+
+    Multimodal content (USER and TOOL only):
+        parts:      Ordered text and image parts, or None for text-only messages.
+                    A parts message always has at least one ImagePart, and
+                    ``content`` is its text projection (text parts joined by
+                    blank lines). Build one with :meth:`with_parts`.
     """
 
     role: Role
@@ -115,8 +304,11 @@ class Message:
     # provider artifacts replayed verbatim across tool-call iterations.
     reasoning: str | None = None
     reasoning_blocks: list[Any] | None = None
+    parts: tuple[ContentPart, ...] | None = None
 
     def __post_init__(self) -> None:
+        if self.parts is not None:
+            self._validate_parts()
         if self.placement not in ("stable", "dynamic"):
             raise ValueError(f"placement must be 'stable' or 'dynamic', got {self.placement!r}")
         # Derive kind from role when left at the generic default. A TOOL message
@@ -145,6 +337,56 @@ class Message:
                 raise ValueError(f"{self.role.value.upper()} messages cannot have call_id")
             if self.name is not None:
                 raise ValueError(f"{self.role.value.upper()} messages cannot have name")
+
+    def _validate_parts(self) -> None:
+        parts = self.parts
+        assert parts is not None
+        if self.role not in (Role.USER, Role.TOOL):
+            raise ValueError(f"{self.role.value.upper()} messages cannot have parts")
+        if type(parts) is not tuple:
+            if isinstance(parts, (str, bytes)):
+                raise TypeError("Message.parts must be a sequence of content parts")
+            parts = tuple(parts)
+            object.__setattr__(self, "parts", parts)
+        has_image = False
+        for part in parts:
+            if isinstance(part, ImagePart):
+                has_image = True
+            elif not isinstance(part, TextPart):
+                raise TypeError(
+                    f"Message.parts items must be TextPart or ImagePart, got {type(part).__name__}"
+                )
+        if not has_image:
+            raise ValueError(
+                "Message.parts must contain at least one ImagePart; use content= for text-only"
+            )
+        projection = _text_projection(parts)
+        if self.content is not projection and self.content != projection:
+            raise ValueError(
+                "Message.content must equal the text projection of parts; use Message.with_parts()"
+            )
+
+    @classmethod
+    def with_parts(cls, role: Role, parts: Sequence[ContentPart], **kwargs: Any) -> Message:
+        """Build a multimodal message; ``content`` is computed from ``parts``."""
+        if "content" in kwargs:
+            raise TypeError("with_parts() computes content; do not pass content=")
+        if isinstance(parts, (str, bytes)):
+            raise TypeError("parts must be a sequence of content parts")
+        parts_t = tuple(parts)
+        for part in parts_t:
+            if not isinstance(part, (TextPart, ImagePart)):
+                raise TypeError(
+                    f"parts items must be TextPart or ImagePart, got {type(part).__name__}"
+                )
+        return cls(role=role, content=_text_projection(parts_t), parts=parts_t, **kwargs)
+
+    @property
+    def images(self) -> tuple[ImagePart, ...]:
+        """Image parts of this message, in order (empty for text-only messages)."""
+        if self.parts is None:
+            return ()
+        return tuple(p for p in self.parts if isinstance(p, ImagePart))
 
 
 @dataclass(frozen=True)
@@ -237,6 +479,45 @@ class ToolResult:
     duration_ms: int = 0
     # Runtime annotations persisted on the tool_calls row (e.g. ``substituted``).
     meta: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    # Images attached to the result. Client tools pass Image / ImageRef /
+    # ImagePart; after ingest these are canonical ImageParts.
+    images: tuple[Image | ImageRef | ImagePart, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.images) is not tuple:
+            object.__setattr__(self, "images", tuple(self.images))
+
+
+def tool_result_message(result: ToolResult) -> Message:
+    """Build the TOOL message for a tool result.
+
+    Without images this is exactly the v0.3.0 shape (``content=payload``).
+    With images: ``Message.with_parts(TOOL, (TextPart(payload), *image_parts))``.
+    ``result.images`` must already be ingested (``ImagePart`` or ``ImageRef``).
+    """
+    meta: dict[str, Any] = {"is_error": True} if not result.success else {}
+    if not result.images:
+        return Message(
+            role=Role.TOOL,
+            content=result.payload,
+            name=result.name,
+            call_id=result.call_id,
+            meta=meta,
+        )
+    parts: list[ContentPart] = []
+    if result.payload:
+        parts.append(TextPart(result.payload))
+    for img in result.images:
+        if isinstance(img, ImagePart):
+            parts.append(img)
+        elif isinstance(img, ImageRef):
+            parts.append(ImagePart(ref=img))
+        else:
+            raise TypeError(
+                "tool_result_message() needs ingested images (ImagePart or ImageRef); "
+                f"got {type(img).__name__}"
+            )
+    return Message.with_parts(Role.TOOL, parts, name=result.name, call_id=result.call_id, meta=meta)
 
 
 @dataclass(frozen=True)
@@ -275,7 +556,8 @@ class ToolCallContext:
     values, not guardrail placeholders). ``source`` is ``"local"`` for
     ``@tool`` functions, ``"mcp"`` for MCP tools and ``"skill"`` for the
     built-in skill tools. ``tenant_id`` is the run's tenant (``None`` when
-    unset or when the run is not persisted).
+    unset or when the run is not persisted). ``images`` are the run's images
+    whose ``img_...`` id appears as a whole string value in ``params``.
     """
 
     run_id: str
@@ -287,6 +569,7 @@ class ToolCallContext:
     meta: dict[str, Any]
     iteration: int
     tenant_id: str | None = None
+    images: tuple[ImageRef, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -605,6 +888,14 @@ class GovernanceEventType(StrEnum):
     # Run control: inbox note delivered to the model (payload: note_id only)
     INBOX_DELIVERED = "inbox.delivered"
 
+    # Images (payloads never contain bytes)
+    IMAGE_REJECTED = "image.rejected"
+    IMAGE_STATE = "image.state"
+    IMAGE_VIEW_CHANGED = "image.view_changed"
+    IMAGE_DEGRADED = "image.degraded"
+    IMAGE_WARNING = "image.warning"
+    GUARDRAIL_IMAGE_UNSCANNED = "guardrail.image_unscanned"
+
 
 @dataclass
 class RunResult:
@@ -710,6 +1001,107 @@ class ReplaySummary:
         )
 
 
+@dataclass(frozen=True)
+class GuardrailVerdict:
+    """A recorded image-guardrail verdict for one image."""
+
+    action: Literal["pass", "redact", "block", "warn"]
+    entities: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.entities) is not tuple:
+            object.__setattr__(self, "entities", tuple(self.entities))
+
+
+GuardrailVerdictKey: TypeAlias = tuple[str, str, str, str, str, str]
+"""``(tenant_scope, sha256, guardrail_id, guardrail_version, origin, tool_name or "")``."""
+
+
+@dataclass
+class ImageViewState:
+    """Per-run image view bookkeeping, persisted in ``PauseState.image_view``.
+
+    ``sent_through``: slots below it count as history (sent or seeded).
+    ``dropped_through``: eligible slots below it render the drop placeholder.
+    ``rejected`` only grows; ``described`` and ``guardrail_verdicts`` are
+    first-wins; ``warned`` lists warning keys already emitted.
+    """
+
+    epoch: int = 0
+    dropped_through: int = 0
+    sent_through: int = 0
+    rejected: list[ImageKey] = field(default_factory=list)
+    described: dict[ImageKey, str] = field(default_factory=dict)
+    guardrail_verdicts: dict[GuardrailVerdictKey, GuardrailVerdict] = field(default_factory=dict)
+    warned: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Deterministic JSON-safe dict (lists of objects, sorted)."""
+        rejected = sorted({(str(s), str(h)) for s, h in self.rejected})
+        verdicts = sorted(self.guardrail_verdicts.items(), key=lambda kv: kv[0])
+        return {
+            "epoch": self.epoch,
+            "dropped_through": self.dropped_through,
+            "sent_through": self.sent_through,
+            "rejected": [{"tenant_scope": s, "sha256": h} for s, h in rejected],
+            "described": [
+                {"tenant_scope": s, "sha256": h, "text": text}
+                for (s, h), text in sorted(self.described.items(), key=lambda kv: kv[0])
+            ],
+            "guardrail_verdicts": [
+                {
+                    "tenant_scope": k[0],
+                    "sha256": k[1],
+                    "guardrail_id": k[2],
+                    "guardrail_version": k[3],
+                    "origin": k[4],
+                    "tool_name": k[5],
+                    "action": v.action,
+                    "entities": list(v.entities),
+                }
+                for k, v in verdicts
+            ],
+            "warned": sorted(set(self.warned)),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ImageViewState:
+        """Rebuild from :meth:`to_dict` output."""
+        rejected: list[ImageKey] = []
+        seen: set[ImageKey] = set()
+        for item in d.get("rejected") or []:
+            key = (str(item["tenant_scope"]), str(item["sha256"]))
+            if key not in seen:
+                seen.add(key)
+                rejected.append(key)
+        described: dict[ImageKey, str] = {}
+        for item in d.get("described") or []:
+            described.setdefault((str(item["tenant_scope"]), str(item["sha256"])), item["text"])
+        verdicts: dict[GuardrailVerdictKey, GuardrailVerdict] = {}
+        for item in d.get("guardrail_verdicts") or []:
+            vkey: GuardrailVerdictKey = (
+                str(item["tenant_scope"]),
+                str(item["sha256"]),
+                str(item["guardrail_id"]),
+                str(item.get("guardrail_version") or ""),
+                str(item["origin"]),
+                str(item.get("tool_name") or ""),
+            )
+            verdicts.setdefault(
+                vkey,
+                GuardrailVerdict(action=item["action"], entities=tuple(item.get("entities") or ())),
+            )
+        return cls(
+            epoch=int(d.get("epoch") or 0),
+            dropped_through=int(d.get("dropped_through") or 0),
+            sent_through=int(d.get("sent_through") or 0),
+            rejected=rejected,
+            described=described,
+            guardrail_verdicts=verdicts,
+            warned=list(dict.fromkeys(str(w) for w in d.get("warned") or [])),
+        )
+
+
 @dataclass
 class PauseState:
     """Everything needed to resume a paused agent run.
@@ -752,6 +1144,8 @@ class PauseState:
     # is unknown (mixed priced/unpriced) so stores without live rollups keep it.
     budget_known_cost_usd: float | None = None
     budget_unpriced_calls: int = 0
+    # Image view bookkeeping; None until a run has seen an image.
+    image_view: ImageViewState | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -789,6 +1183,8 @@ class PauseState:
             d["budget_known_cost_usd"] = self.budget_known_cost_usd
         if self.budget_unpriced_calls:
             d["budget_unpriced_calls"] = self.budget_unpriced_calls
+        if self.image_view is not None:
+            d["image_view"] = self.image_view.to_dict()
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -820,6 +1216,11 @@ class PauseState:
             budget_exceeded=data.get("budget_exceeded"),
             budget_known_cost_usd=data.get("budget_known_cost_usd"),
             budget_unpriced_calls=int(data.get("budget_unpriced_calls") or 0),
+            image_view=(
+                ImageViewState.from_dict(data["image_view"])
+                if data.get("image_view") is not None
+                else None
+            ),
         )
 
 
@@ -895,6 +1296,8 @@ def _message_to_dict(m: Message) -> dict[str, Any]:
         d["reasoning"] = m.reasoning
     if m.reasoning_blocks is not None:
         d["reasoning_blocks"] = m.reasoning_blocks
+    if m.parts is not None:
+        d["parts"] = [content_part_to_dict(p) for p in m.parts]
     return d
 
 
@@ -902,6 +1305,19 @@ def _message_from_dict(d: dict[str, Any]) -> Message:
     tool_calls = None
     if "tool_calls" in d:
         tool_calls = [_tool_call_from_dict(tc) for tc in d["tool_calls"]]
+    if d.get("parts") is not None:
+        return Message.with_parts(
+            Role(d["role"]),
+            [content_part_from_dict(p) for p in d["parts"]],
+            name=d.get("name"),
+            call_id=d.get("call_id"),
+            meta=d.get("meta", {}),
+            kind=d.get("kind", "chat"),
+            placement=d.get("placement", "dynamic"),
+            source=d.get("source"),
+            reasoning=d.get("reasoning"),
+            reasoning_blocks=d.get("reasoning_blocks"),
+        )
     return Message(
         role=Role(d["role"]),
         content=d["content"],
@@ -1314,6 +1730,7 @@ def compute_idempotency_fingerprint(
     context: list[Any] | None = None,
     replay: dict[str, Any] | None = None,
     skills: dict[str, Any] | None = None,
+    user_input_parts: Sequence[ContentPart] | None = None,
 ) -> str:
     """Deterministic SHA-256 fingerprint for idempotency conflict detection.
 
@@ -1331,12 +1748,19 @@ def compute_idempotency_fingerprint(
     context is treated as a different request. ``replay`` carries the
     ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs when ``runs=`` is
     used; omitted otherwise so existing fingerprints are unchanged.
+
+    Images are additive: ``user_input_parts`` (a multimodal input; ``user_input``
+    is then its text projection) adds ``"user_input_parts"``, and a history
+    message with parts adds ``"parts"``, each as :func:`parts_digest`.
+    Text-only requests hash exactly as in v0.3.0.
     """
     data: dict[str, Any] = {"agent_name": agent_name, "user_input": user_input}
+    if user_input_parts is not None:
+        data["user_input_parts"] = parts_digest(user_input_parts)
     if output_type_name is not None:
         data["output_type"] = output_type_name
     if history:
-        data["history"] = [{"role": m.role.value, "content": m.content} for m in history]
+        data["history"] = [_history_fingerprint_entry(m) for m in history]
     if context:
         data["context"] = [
             {
@@ -1353,3 +1777,10 @@ def compute_idempotency_fingerprint(
         data["skills"] = skills
     payload = json.dumps(data, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _history_fingerprint_entry(m: Message) -> dict[str, Any]:
+    entry: dict[str, Any] = {"role": m.role.value, "content": m.content}
+    if m.parts is not None:
+        entry["parts"] = parts_digest(m.parts)
+    return entry

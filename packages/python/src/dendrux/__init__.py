@@ -29,6 +29,7 @@ from dendrux.errors import (
     SkillValidationError,
 )
 from dendrux.loops.single import SingleCall
+from dendrux.media import Image, ToolOutput
 from dendrux.pricing import ModelPricing, PriceTable
 from dendrux.runtime.context import DelegationDepthExceededError, aheartbeat, heartbeat
 from dendrux.runtime.runner import run
@@ -42,10 +43,13 @@ from dendrux.types import (
     CreateRunResult,
     GovernanceEventType,
     IdempotencyConflictError,
+    ImagePart,
+    ImageRef,
     PauseOutcome,
     ReplaySummary,
     RunAlreadyActiveError,
     StructuredOutputValidationError,
+    TextPart,
     ToolCallContext,
     ToolDecision,
     ToolResultContext,
@@ -63,6 +67,9 @@ __all__ = [
     "DelegationDepthExceededError",
     "GovernanceEventType",
     "IdempotencyConflictError",
+    "Image",
+    "ImagePart",
+    "ImageRef",
     "InvalidToolResultError",
     "ModelPricing",
     "PauseOutcome",
@@ -89,8 +96,10 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "StructuredOutputValidationError",
+    "TextPart",
     "ToolCallContext",
     "ToolDecision",
+    "ToolOutput",
     "ToolResultContext",
     "ToolResultTransform",
     "aheartbeat",
