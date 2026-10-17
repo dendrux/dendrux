@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-17
 
 Run control, per-call governance and subtree reads. This release includes a
 security fix (see Changed) and a database migration (see Migration): run
@@ -185,6 +185,13 @@ security fix (see Changed) and a database migration (see Migration): run
 - The `submit_*` methods (`submit_tool_results`, `submit_input`,
   `submit_approval`, `submit_resume`) take no `tenant_id`. HTTP routes must
   verify run ownership before calling them.
+- `RunStore.from_database_url` on a SQLite path that does not exist creates an
+  empty database on first use instead of raising, so a mistyped path reads as
+  "no runs".
+- The in-place SQLite upgrade needs the write lock only when the file is out of
+  date; if another process holds it longer than the SQLite busy timeout, startup
+  raises `SqliteSchemaSyncError` (raise the timeout with
+  `connect_args={"timeout": N}`).
 
 ## 0.2.0a23 - 2026-10-15
 
