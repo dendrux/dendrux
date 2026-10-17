@@ -386,6 +386,25 @@ class MCPToolCallError(MCPError):
     connection_lost: bool = False
 
 
+class MCPToolNotFoundError(MCPError):
+    """``MCPConnection.call_tool`` named a tool the server does not list.
+
+    No ``tools/call`` request was sent (connecting and discovery may have
+    happened). ``tool_name`` is the caller-supplied name with configured
+    credentials scrubbed, since a name can echo one; use
+    ``MCPConnection.discover()`` to see the advertised catalog.
+    """
+
+    tool_name: str
+
+    def __init__(self, tool_name: str) -> None:
+        super().__init__(
+            f"MCP server does not list a tool named {tool_name!r}. "
+            "No tools/call request was sent. Use discover() to see the advertised tools."
+        )
+        self.tool_name = tool_name
+
+
 class MCPOutcomeUnknownError(MCPError):
     """A tool call was interrupted with an unknown outcome.
 
@@ -419,7 +438,7 @@ def error_code_for(exc: BaseException) -> str:
     ``authorization_required``, ``authentication_failed``, ``credential_error``,
     ``destination_denied``, ``circuit_open``, ``capacity``,
     ``connection_failed``, ``connection_state``, ``tool_name_collision``,
-    ``invalid_tool_names`` or ``unknown``.
+    ``tool_not_found``, ``invalid_tool_names`` or ``unknown``.
     """
     if isinstance(exc, MCPAuthorizationRequired):
         return "authorization_required"
@@ -439,6 +458,8 @@ def error_code_for(exc: BaseException) -> str:
         return "connection_state"
     if isinstance(exc, MCPToolNameCollisionError):
         return "tool_name_collision"
+    if isinstance(exc, MCPToolNotFoundError):
+        return "tool_not_found"
     # Strict view naming raises plain ValueError; MCP failures never do.
     if isinstance(exc, ValueError):
         return "invalid_tool_names"
