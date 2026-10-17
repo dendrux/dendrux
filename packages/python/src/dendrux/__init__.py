@@ -34,6 +34,8 @@ from dendrux.runtime.sweep import sweep
 from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult, SkillExecutor
 from dendrux.tool import tool
 from dendrux.types import (
+    ApprovalDecision,
+    BeforeToolHook,
     Budget,
     CreateRunResult,
     GovernanceEventType,
@@ -41,12 +43,16 @@ from dendrux.types import (
     ReplaySummary,
     RunAlreadyActiveError,
     StructuredOutputValidationError,
+    ToolCallContext,
+    ToolDecision,
     ToolResultContext,
     ToolResultTransform,
 )
 
 __all__ = [
     "Agent",
+    "ApprovalDecision",
+    "BeforeToolHook",
     "Budget",
     "ContextBlock",
     "CreateRunResult",
@@ -77,6 +83,8 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "StructuredOutputValidationError",
+    "ToolCallContext",
+    "ToolDecision",
     "ToolResultContext",
     "ToolResultTransform",
     "run",
