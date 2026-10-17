@@ -1,0 +1,94 @@
+---
+title: Inbox notes
+description: Leave a note for a run that is already in progress. How submit_note stores it, when the model sees it, the at-least-once delivery contract and what happens to notes a finished run never read.
+---
+
+# Inbox notes
+
+Sometimes a person has something to add while an agent is mid-run: "also skip anything older than 2023", "the customer just replied". `submit_note` leaves that message for the run. The model sees it at the next iteration, and the run keeps going. It does not pause the run and it does not need the run to be waiting for anything.
+
+```python
+note_id = await agent.submit_note(run_id, "Skip anything older than 2023.")
+```
+
+```python
+async def submit_note(
+    self,
+    run_id: str,
+    text: str,
+    *,
+    metadata: Any = None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> str                            # the note id
+```
+
+The call returns as soon as the note is stored. It is safe to call from any process that can reach the database; the process running the agent does not have to be the one that submits the note.
+
+## How a note reaches the model
+
+1. `submit_note` inserts a row into the `run_inbox` table in one conditional insert that only succeeds while the run is not terminal.
+2. The runner that owns the run checks its inbox at the **top of each iteration**, after the cancel, pause and budget checks and before it builds the next prompt.
+3. Pending notes are appended to the history in submission order as `USER` messages with the content `"NOTE FROM USER:\n{text}"`. The messages are recorded like any other message (`kind="inbox_note"`, `source="run_inbox"`), so they appear in `RunStore.get_traces` and in the next LLM call.
+4. For each note an `inbox.delivered` event is written with `{"note_id": ...}` and the note id as `correlation_id`. The event never carries the note text.
+
+Only the runner that owns a run delivers its notes, which the resume claims guarantee is a single process at a time. A submitter never writes to `run_events`; the log stays in order.
+
+A run that is waiting (`waiting_client_tool`, `waiting_human_input`, `waiting_approval`) or `paused` does not reach a checkpoint, so its notes wait. They are delivered at the first iteration after the run resumes. A note is not an answer: use `submit_input` to answer a clarification, `submit_approval` to decide a gate.
+
+## Delivery is at-least-once
+
+The runner appends and records the message first, then marks the note delivered. If the process crashes between the two steps, the note is delivered again on the next iteration. Treat note text as idempotent instructions ("skip anything older than 2023"), not as commands with side effects.
+
+## Notes a run never reads
+
+A note submitted while the run makes its last LLM call (or after its final iteration began) may never be delivered. When a run ends, the result lists the notes it did not deliver:
+
+```python
+result = await agent.run("...")
+print(result.meta.get("undelivered_notes"))   # ['01M5...'] or missing
+```
+
+`meta["undelivered_notes"]` appears only when there are any. The same list is available later, with the text and your metadata, from the store:
+
+```python
+notes = await store.get_notes(run_id, undelivered_only=True)
+for n in notes:
+    print(n.note_id, n.text, n.metadata, n.delivered_at)   # delivered_at is None
+```
+
+`get_notes` returns `RunNote` records in delivery order (`created_at`, then id) with `note_id`, `run_id`, `text`, `metadata`, `created_at`, `delivered_at` and `delivered_iteration`. What to do with an undelivered note (start a follow-up run, show it to the user as unread) is your decision.
+
+## Errors and limits
+
+| Condition | Result |
+| --- | --- |
+| Empty or non-string `text` | `ValueError` |
+| `text` over 32 KiB as UTF-8 | `ValueError` |
+| `metadata` not JSON-serializable, or over 8 KiB encoded | `ValueError` |
+| `run_id` does not exist (or is outside `tenant_id`) | `RunNotFoundError` |
+| The run is already terminal | `RunAlreadyTerminalError` |
+| No persistence configured | `PersistenceNotConfiguredError` |
+
+`metadata` is for your application: a user id, a UI message id, a source. It is stored with the note and returned by `get_notes`. It is **never shown to the model**.
+
+## Guardrails apply
+
+A delivered note is an ordinary user message in the history, so incoming [guardrails](/docs/architecture/guardrails) scan it before each LLM call. A PII guardrail redacts it for the model; a guardrail set to block ends the run in `error` as it would for any message. The note is stored as submitted: the database is ground truth, and redaction happens at the call boundary.
+
+## Tenants
+
+Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it for trusted, single-tenant use. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `dendrux.store.RunNotFoundError` (the store module has its own not-found error, separate from `dendrux.errors.RunNotFoundError`). Delegated child runs inherit their parent's tenant (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
+
+## Limits to know
+
+- **`SingleCall` never delivers notes.** It makes one LLM call, so there is no next iteration. A note on a `SingleCall` run is listed as undelivered when the run ends.
+- Delivery is at the iteration boundary. A run in the middle of a long tool call sees the note after the tool returns.
+- Notes go to one run. To brief a delegated child, submit the note to the child's `run_id` (`RunStore.get_subtree` lists them).
+- A custom `StateStore` written before 0.3.0 does not implement `add_note`, `get_notes` or `mark_notes_delivered`; `submit_note` and `get_notes` raise `NotImplementedError` naming the missing method, and runs on such a store finish normally without an inbox.
+
+## Where this fits
+
+- Written with `agent.submit_note(...)`; read with `RunStore.get_notes(...)` and `RunResult.meta["undelivered_notes"]`.
+- Stored in the `run_inbox` table (`id`, `run_id`, `text`, `metadata`, `created_at`, `delivered_at`, `delivered_iteration`), which cascades with the run. Created by the 0.3.0 migration; run `dendrux db migrate`.
+- Delivered by the loop at the top of each iteration. Emits `inbox.delivered` on `run_events`.
+- Pairs with [Pause and resume](/docs/architecture/pause-resume) (notes wait while paused) and [Cancellation](/docs/architecture/cancellation).

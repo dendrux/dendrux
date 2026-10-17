@@ -9,17 +9,18 @@ A dendrux run is not a long-lived in-memory task. When it hits a pause point, th
 
 This is the pattern that makes agents work across HTTP requests, queue workers, and human-in-the-loop approvals without a sticky connection.
 
-## The three pause statuses
+## The pause statuses
 
-A run can be paused in exactly three ways. Each maps to a status on the `agent_runs` row and a corresponding `submit_*` method to resume.
+A run can be paused in four ways. Each maps to a status on the `agent_runs` row and a way to resume it. The first three are *waiting* pauses: the run needs something from outside. The fourth, `paused`, is a [cooperative pause](#requesting-a-pause) that you (or a budget) ask for.
 
 | Status | Triggered by | Resume method |
 | --- | --- | --- |
 | `waiting_client_tool` | A tool declared with `target="client"` is called. The runtime stops before executing it and expects the client to run it and submit the result. | `submit_tool_results(run_id, results=...)` |
 | `waiting_human_input` | The loop returns a `Clarification` action, signalling that the model needs free-text input from a human to continue. | `submit_input(run_id, text=...)` |
-| `waiting_approval` | A tool declared in `require_approval=[...]` is about to run. The runtime pauses to gate the call. | `submit_approval(run_id, approved=True)` |
+| `waiting_approval` | A tool declared in `require_approval=[...]`, or a call the [`before_tool` hook](/docs/architecture/tool-policy) gated, is about to run. The runtime pauses to gate the call. | `submit_approval(run_id, approved=True)` or `submit_approval(run_id, decisions={...})` |
+| `paused` | `request_pause(run_id)` was called, or a [budget](/docs/architecture/budget) with `on_exceed="pause"` was reached. Nothing is pending; the run simply stopped at a checkpoint. | `submit_resume(run_id)` |
 
-All three follow the same shape: runtime hits a pause point, persists pending metadata, writes `run.paused`, and returns. A later call to the matching `submit_*` method loads the row, atomically flips the status back to `running`, and re-enters the loop.
+All four follow the same shape: runtime hits a pause point, persists pending metadata, writes `run.paused`, and returns. A later call to the matching `submit_*` method loads the row, atomically flips the status back to `running`, and re-enters the loop.
 
 ## What gets persisted at pause
 
@@ -48,6 +49,8 @@ pause_data:
 ```
 
 Each pause status populates `pause_data` with the shape that matching `submit_*` method needs. For `waiting_approval`, that is the pending tool calls and their routing targets. For `waiting_client_tool`, it is the list of client tool invocations the runner is expecting back. For `waiting_human_input`, it is the clarification prompt and any context the loop produced.
+
+Since 0.3.0 the blob can carry a few more keys when they apply. For `waiting_approval`: `approval_gates` (which calls are gated, and by the static list or the hook) and, after a decision is submitted, `submitted_decisions`. For `paused`: `pending_tool_calls` is empty, plus `pause_reason` (`"requested"` or `"budget"`) and `pause_message` (the text from `request_pause(reason=...)`). Budget bookkeeping (which threshold events already fired) rides along on every pause so a resumed run does not repeat them.
 
 The `react_traces` table still holds the conversation up to the pause, the `llm_interactions` table still holds every turn's I/O, and `run_events` still holds the timeline. `pause_data` does not duplicate any of that. It only carries what the runner itself needs to resume.
 
@@ -91,7 +94,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The other two pause statuses resume the same way, with the method that matches the pause: `submit_tool_results(run_id, results=...)` for `waiting_client_tool` and `submit_input(run_id, text=...)` for `waiting_human_input`.
+The other pause statuses resume the same way, with the method that matches the pause: `submit_tool_results(run_id, results=...)` for `waiting_client_tool`, `submit_input(run_id, text=...)` for `waiting_human_input` and `submit_resume(run_id)` for `paused`.
 
 The DB row above after calling `submit_approval(run_id, approved=True)`:
 
@@ -129,10 +132,102 @@ UPDATE agent_runs
        output_data = :output,
        updated_at = now()
  WHERE id = :run_id
-   AND status IN ('running', 'waiting_approval', 'waiting_client_tool', 'waiting_human_input');
+   AND status IN ('running', 'waiting_approval', 'waiting_client_tool', 'waiting_human_input', 'paused');
 ```
 
 This collapses "check the status is something I can finalize, then finalize it" into a single atomic statement. A cancel request arriving during that window either wins or loses based on whose UPDATE commits first. There is no in-between state.
+
+## Requesting a pause
+
+A waiting pause happens because the run needs input. A **requested pause** is for the opposite case: the run is healthy and running, and your application wants it to stop where it is (a deploy window, an operator's "hold on", a tenant that hit a limit) and continue later, in this process or another.
+
+```python
+outcome = await agent.request_pause(run_id, reason="deploy window")
+print(outcome.status_before, "->", outcome.affected)   # running -> [('01M5...', 'requested')]
+```
+
+```python
+async def request_pause(
+    self,
+    run_id: str,
+    *,
+    cascade: bool = True,
+    tenant_id: str | None = ...,    # omitted = unscoped
+    reason: str | None = None,       # at most 1000 characters
+) -> PauseOutcome
+```
+
+`request_pause` is cooperative, like [cancellation](/docs/architecture/cancellation). On a `running` run it sets a durable `pause_requested` flag and returns. The runner that owns the run sees the flag at its next checkpoint, writes its full history to `pause_data`, and the run becomes `paused`:
+
+- **Top of every iteration**, right after the cancel check.
+- **Between the approved calls** of a resumed approval batch, before any further side effect. The rest of the batch is saved with the decisions already made and continues on resume without asking again.
+
+Nothing is preempted. An LLM call already in flight and a tool already running both finish first, and then the pause lands. The waiting `run()` call (or stream) returns a `RunResult` with `status == PAUSED`; the log gets a `run.paused` event with `reason="requested"` and, if you gave one, `message` (capped at 500 characters). The event's `pending_tool_calls` is empty.
+
+What `request_pause` does by run state:
+
+| Run state | Result |
+| --- | --- |
+| `running` | Flag set; the run pauses at its next checkpoint (`outcome` is `requested`). |
+| `waiting_*` | No-op (`already_waiting`). The run is already durably paused, so the request does not latch: the next `submit_*` continues normally. |
+| `paused` | No-op (`already_paused`). |
+| terminal | No-op (`terminal`). |
+
+A request does not wait for the pause. It returns when the flag is recorded. `PauseOutcome` has `status_before`, `status_after` and `affected`, a list of `(run_id, outcome)` pairs. The confirmation is the `run.paused` event, or `status == "paused"` from `RunStore.get_run` (which also exposes `pause_requested`).
+
+If the run reaches a waiting pause first (it asks for approval, say), that pause satisfies the request and clears the flag. If the iteration in flight produces the final answer, the run completes and the flag is cleared.
+
+### Resuming
+
+```python
+result = await agent.submit_resume(run_id)      # blocks to the next pause or terminal state
+```
+
+`submit_resume`, `agent.resume(run_id)` and `agent.resume_stream(run_id)` all continue a `paused` run when given no payload. The resumed loop starts the next iteration with the full recorded history. Claiming a `paused` run is a CAS like every other resume and also clears `pause_requested`, so the resumed run does not pause again straight away.
+
+`submit_resume` follows the `submit_*` contract: `RunNotFoundError` for an unknown id, `RunAlreadyTerminalError` for a finished run, `RunAlreadyClaimedError` when a concurrent resume won, and `PauseStatusMismatchError` when the run is paused for another reason (a `waiting_approval` run needs `submit_approval`). Skills are verified before the claim, as for the other resume methods.
+
+`cancel_run` on a `paused` run finalizes it as `cancelled` in one step. `sweep(abandoned_waiting=...)` also reaps `paused` runs that nobody resumes. [Inbox](/docs/architecture/inbox) notes that arrive while a run is paused are delivered at the first iteration after resume.
+
+A budget pause is a `paused` run with `pause_reason="budget"`. It resumes the same way, but only continues if the resuming `Agent`'s budget limits are above current usage; see [Budget](/docs/architecture/budget#resuming-a-budget-pause).
+
+### Cascade
+
+`cascade=True` (the default) also flags every non-terminal descendant, the delegated child runs, over a point-in-time snapshot of the subtree: deepest first, `run_id` last. A child created after the snapshot is not flagged.
+
+**Cascade is flag propagation, not a resumable call stack.** Be precise about what it gives you:
+
+- Each flagged run pauses at its *own* next checkpoint, independently.
+- A paused child returns a paused `RunResult` to the tool that delegated to it. The parent's tool records whatever that tool returns, and the parent pauses at its own next checkpoint.
+- **Resume is per run.** `submit_resume(child_id)` continues the child, but it never rewrites the tool result the parent already recorded. Dendrux does not re-inject the child's eventual answer into the parent.
+- If the parent's delegation tool needs the child's final answer, the tool or your application owns that correlation: resume the child, wait for it to finish, then supply the outcome to the parent however your design requires (a note via [`submit_note`](/docs/architecture/inbox) is one option).
+
+> Nested delegation is the case to plan for. A parent that delegates to a child, and a child that delegates to a grandchild, gives you three separate runs to resume. Use `RunStore.get_subtree(run_id)` to list them with their statuses, and resume them one by one.
+
+`tenant_id=` scopes the request: when given, `run_id` must belong to exactly that tenant (`None` means untenanted) or `RunNotFoundError` is raised, and the cascade only reaches descendants of the same tenant. Omit it for trusted, single-tenant use.
+
+External callers only set flags on running rows; they never write `run.paused` themselves. The event comes from the runner that wins the pause, so the log has one `run.paused` per pause.
+
+### Cancel, pause and budget at the same checkpoint
+
+More than one control can be pending at once. Precedence is fixed:
+
+1. **Cancel** wins over everything. A cancelled run never lands in `paused`.
+2. A **requested pause** comes next.
+3. A **budget** pause or cancel comes after that.
+4. Then pending inbox notes are delivered.
+
+The pause itself is one conditional `UPDATE ... WHERE status = 'running' AND cancel_requested = false`. If a cancel commits first, the pause loses and the run finalizes as `cancelled`.
+
+Cancellation is cooperative in both directions. A cancel (or pause) that arrives *after* the run's last checkpoint does not stop a run that then completes successfully: if the iteration already in flight produces the final answer, the run finishes as `success`, its work and side effects happened, and the flags are cleared. See [Cancellation](/docs/architecture/cancellation#which-wins-completion-or-cancellation).
+
+### Paused runs show their spend
+
+When a run pauses, its running totals (`total_*` tokens and `total_cost_usd`) are written to the row at the same time. Before 0.3.0 a paused run could read zero until it finished; now `RunStore.get_run` and the dashboard show what it has spent so far.
+
+### SingleCall
+
+`SingleCall` makes one LLM call, so it has no iteration boundary at which to pause. A pause request on a `SingleCall` run is not observed; the run completes and the request is cleared.
 
 ## Why this shape
 

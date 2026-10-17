@@ -16,24 +16,28 @@ This page is the map. Each concern has its own page for the details.
 | Concern | What it does | Reference |
 | --- | --- | --- |
 | [Guardrails](/docs/architecture/guardrails) | Scan every message before and after the LLM. Built-in detectors for [PII](/docs/architecture/pii-redaction), secrets, and [prompt injection](/docs/recipes/prompt-injection-patterns), plus custom regex patterns. Redact, block, or warn. | `dendrux.guardrails` |
-| [Approval](/docs/architecture/approval) | Pause the run before a gated tool executes. A human decides approve or deny. | `require_approval=[...]` |
-| [Access control](/docs/architecture/access-control) | Policy gate on tool calls, skill invocations, and MCP connections. Denies at the boundary before state changes. | `deny=[...]`, `deny_skills=[...]` |
-| Budget | Track per-run spend and token usage. Raise threshold events at configurable ratios, abort at the hard cap. | `budget=Budget(...)` |
+| [Approval](/docs/architecture/approval) | Pause the run before a gated tool executes. A human decides approve or deny, for the whole batch or call by call. | `require_approval=[...]` |
+| [Access control](/docs/architecture/access-control) | Policy gate on tool calls, skill invocations, and MCP connections. Denies at the boundary before state changes. A [`before_tool` hook](/docs/architecture/tool-policy) adds argument-aware decisions (deny, require approval, substitute a result). | `deny=[...]`, `deny_skills=[...]`, `before_tool=...` |
+| [Budget](/docs/architecture/budget) | Track per-run token and dollar spend, including delegated child runs. Raise threshold events at configurable ratios and, if you choose, pause or cancel the run at the cap. | `budget=Budget(...)` |
 
-Guardrails, approval, and access control are independent. You can use any one, any two, any three, or all four on the same run. The runtime applies them in a fixed order (incoming guardrail → access check → approval → tool execute → outgoing guardrail), but each layer does not know or care about the others. Their only coupling is the shared event log.
+Guardrails, approval, and access control are independent. You can use any one, any two, any three, or all four on the same run. The runtime applies them in a fixed order (incoming guardrail → static deny → `before_tool` hook → approval → tool execute → outgoing guardrail), but each layer does not know or care about the others. Their only coupling is the shared event log.
 
 ## The event types
 
 Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
 
-All 20 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+All 25 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
 
 ```text
 POLICY_DENIED           = 'policy.denied'
+POLICY_SUBSTITUTED      = 'policy.substituted'
+POLICY_HOOK_ERROR       = 'policy.hook_error'
+POLICY_HOOK_WARNING     = 'policy.hook_warning'
 APPROVAL_REQUESTED      = 'approval.requested'
 APPROVAL_DECIDED        = 'approval.decided'
 BUDGET_THRESHOLD        = 'budget.threshold'
 BUDGET_EXCEEDED         = 'budget.exceeded'
+BUDGET_UNPRICED         = 'budget.unpriced'
 GUARDRAIL_DETECTED      = 'guardrail.detected'
 GUARDRAIL_REDACTED      = 'guardrail.redacted'
 GUARDRAIL_BLOCKED       = 'guardrail.blocked'
@@ -49,6 +53,7 @@ MCP_CONNECTED           = 'mcp.connected'
 MCP_ERROR               = 'mcp.error'
 MCP_TOOLS_SKIPPED       = 'mcp.tools_skipped'
 PROVIDER_RETRY          = 'provider.retry'
+INBOX_DELIVERED         = 'inbox.delivered'
 ```
 
 `guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction and an error string; that error includes the blocked finding's entity type and a bounded snippet. A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
@@ -178,6 +183,6 @@ The cost is a JSON `data` column on `run_events` that is typed per `event_type`,
 
 - Code: `dendrux.guardrails`, `dendrux.runtime.runner` (approval and policy checks), `dendrux.types.GovernanceEventType`
 - DB: `run_events.data` (per-event payload), `agent_runs.pii_mapping` (guardrail redaction table)
-- Public API: `Agent(guardrails=[...], require_approval=[...], policy=..., budget=...)`
+- Public API: `Agent(guardrails=[...], require_approval=[...], deny=[...], before_tool=..., budget=...)`
 
-Each of the four concerns has its own page: [Guardrails](/docs/architecture/guardrails), [Approval](/docs/architecture/approval), [Access control](/docs/architecture/access-control). Budget is currently covered inline where it appears in other pages. They all share this pipeline.
+Each of the four concerns has its own page: [Guardrails](/docs/architecture/guardrails), [Approval](/docs/architecture/approval), [Access control](/docs/architecture/access-control) (with the [tool policy hook](/docs/architecture/tool-policy)) and [Budget](/docs/architecture/budget). They all share this pipeline.

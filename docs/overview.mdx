@@ -39,7 +39,7 @@ Everything in dendrux serves one of these. Each has a front-door page:
 
 **[Pause and resume](/docs/architecture/pause-resume)**: the differentiator. A run can stop for an approval, a human answer, or a client-side tool, persist to your database, and resume in a *different* process, by ID.
 
-**[Governance](/docs/architecture/governance)**: four protective layers (tool deny, human approval, advisory budgets, content guardrails with PII redaction) you turn on per agent as kwargs, not per call.
+**[Governance](/docs/architecture/governance)**: four protective layers (tool deny and policy hooks, human approval, token and dollar budgets, content guardrails with PII redaction) you turn on per agent as kwargs, not per call.
 
 **[Evidence and observability](/docs/recipes/observability)**: one stack: a fail-closed recorder, a fail-open notifier, OpenTelemetry, a dashboard, and a read API. Every LLM call, tool execution, and pause is recorded.
 

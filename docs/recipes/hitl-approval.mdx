@@ -31,7 +31,7 @@ agent = Agent(
 )
 ```
 
-`require_approval=` is a list of tool names that must pause for human approval. Approval applies to the whole batch: if the LLM emits three tool calls and any one of them is in the approval set, every call in that iteration pauses. (See [Approval](/docs/architecture/approval) for why this is batch-scoped.)
+`require_approval=` is a list of tool names that must pause for human approval. If the LLM emits three tool calls and any one of them is in the approval set, the whole batch pauses together, and the tool results go back to the model together. You can then decide the batch at once or each gated call on its own (see [Deciding call by call](#deciding-call-by-call)).
 
 ## Pausing
 
@@ -102,6 +102,26 @@ Compare the two `tool_calls` shapes:
 
 The third row is for contrast. `deny=` is a hard policy block (tool never reaches an executor at all) and writes nothing to `tool_calls`. Approval rejection writes a row because the audit needs to show *why* the refund didn't happen.
 
+## Deciding call by call
+
+When the model asks for several gated calls in one turn, decide each one:
+
+```python
+from dendrux import ApprovalDecision
+
+result = await agent.submit_approval(
+    first.run_id,
+    decisions={
+        call_a: ApprovalDecision.approve(),
+        call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
+    },
+)
+```
+
+The keys must be exactly the gated call ids, which you can read from the `approval.requested` events (`data.call_id`) or the `run.paused` event's `pending_tool_calls`. A denied call reaches the model as a failed result `{"denied": "<reason>"}`. Non-gated calls in the same batch run on their own. `approval.decided` records the outcome of every call. A tool can also be gated by code instead of by name with a [`before_tool` policy hook](/docs/architecture/tool-policy), for example only when a refund is over a threshold; the decision call is the same.
+
+To approve something *later*, after the run has moved on, deny it with a reason like "held for review" and run the action from your own code when someone signs off. See [Approve later](/docs/architecture/approval#approve-later).
+
 ## Wiring it up over HTTP
 
 Approval decisions usually arrive over HTTP from a UI. The route is a thin wrapper:
@@ -138,7 +158,8 @@ See [HTTP API surface](/docs/reference/http-api) for the full set of write route
 
 - **Approval requires persistence.** No `database_url` (or `state_store`, or `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
 - **The agent instance does not have to be the same one that started the run.** Any agent process with the same DB and same tool definitions can serve the approval. That is what makes pause/resume crash-resilient and worker-friendly.
-- **Approval applies to the batch, not to individual calls.** If you need per-call decisions, pre-split the batch upstream of the agent or follow up with a clarification turn.
+- **One decision per pause.** Decide the batch with `approved=`, or each gated call with `decisions=`; either way the whole pause resolves in one `submit_approval` call.
+- **Client tools never run server-side on approval.** If the batch also holds client-target calls, the run moves on to `waiting_client_tool` for them.
 - **Server tools only.** `require_approval` rejects client tools at construction. Approval is about human judgement before a server-side action; client-tool execution already involves the user.
 
 ## Where this fits
