@@ -1,5 +1,185 @@
 # Changelog
 
+## Unreleased
+
+Run control, per-call governance and subtree reads. This release includes a
+security fix (see Changed) and a database migration (see Migration): run
+`dendrux db migrate` before upgrading a Postgres deployment.
+
+### Added
+
+- **Per-call approvals.** `agent.submit_approval(run_id, decisions={call_id:
+  ApprovalDecision.approve() | ApprovalDecision.deny(reason)})` decides each
+  approval-gated call on its own. Pass exactly one of `approved=` and
+  `decisions=` (otherwise `ValueError`); `rejection_reason` is not allowed with
+  `decisions`. Decision ids must be exactly the gated call ids, validated against
+  an `approval_gates` snapshot persisted at pause time, so another `Agent`
+  instance can decide. A denied call gets `{"denied": reason}`; held non-gated
+  server calls execute automatically. `approval.decided` keeps its scalar
+  `decision` (`approved|rejected|mixed`, `run_id`) and adds `decisions`: one
+  entry per pending call with `approved|denied|not_gated_executed|client_pending`.
+  `approved=True/False` behave as before, including the exact legacy rejection
+  payload. `ApprovalDecision` is exported from `dendrux`.
+- **`before_tool` policy hook.** `Agent(before_tool=hook)` (sync or async) is
+  called with a `ToolCallContext` (`run_id`, `call_id`, `tool_name`, deep-copied
+  `params` and `meta`, `target`, `source` of `local|mcp|skill`, `iteration`,
+  `tenant_id`) before every tool call in `run` and `stream`, after static
+  `deny=` and before approval, and returns a `ToolDecision`: `allow()`,
+  `deny(reason)`, `require_approval(reason)`, `substitute(result)` or `None`.
+  `require_approval` on a client-target call is denied with a
+  `policy.hook_warning`. It fails closed: a hook that raises, returns a
+  non-decision, or substitutes a non-JSON value denies the call
+  (`policy.hook_error`, exception type only). It is not re-run on resume and not
+  supported with `SingleCall` (`ValueError`). New events: `policy.substituted`,
+  `policy.hook_error`, `policy.hook_warning`; `policy.denied` and
+  `approval.requested` gain `source="hook"` and a reason. A substituted call
+  writes a `tool_calls` row with `meta.substituted = true`. `ToolCallContext`,
+  `ToolDecision` and `BeforeToolHook` are exported from `dendrux`.
+- **Durable pause.** New `RunStatus.PAUSED` (`"paused"`).
+  `await agent.request_pause(run_id, *, cascade=True, tenant_id=..., reason=None)
+  -> PauseOutcome` flags a running run; it pauses at the top of its next
+  iteration (or between the approved calls of a resumed batch), writes
+  `run.paused` with `reason="requested"`, and `run()` / streams return a paused
+  result. `await agent.submit_resume(run_id)`, `agent.resume(run_id)` and
+  `agent.resume_stream(run_id)` continue it. `cancel_run` finalizes a paused run;
+  `sweep(abandoned_waiting=...)` includes it. `RunDetail.pause_requested` mirrors
+  the flag. Cancel wins over pause. `cascade=True` is flag propagation only,
+  not a resumable call stack: a paused child returns a paused result to the
+  delegating tool and resuming it never rewrites the parent's recorded tool
+  result. `PauseOutcome` is exported from `dendrux`.
+- **Cascade cancel.** `cancel_run(run_id, *, cascade=False, tenant_id=...)`;
+  `cascade=True` cancels non-terminal descendants over a point-in-time snapshot,
+  deepest first, `run_id` last, with per-run outcomes in `meta["cascade"]`.
+- **Inbox notes.** `await agent.submit_note(run_id, text, *, metadata=None,
+  tenant_id=...) -> note_id` leaves a note for a non-terminal run. The runner
+  delivers pending notes at the top of its next iteration as a user message
+  `NOTE FROM USER:\n{text}` and writes `inbox.delivered` (note id only). Delivery
+  is at-least-once. Text is limited to 32 KiB and metadata (never shown to the
+  model) to 8 KiB. Notes a finished run never delivered are listed in
+  `RunResult.meta["undelivered_notes"]` and readable with
+  `RunStore.get_notes(run_id, undelivered_only=, tenant_id=)` (`RunNote`).
+  `SingleCall` never delivers notes.
+- **Heartbeat.** `dendrux.heartbeat()` (sync, thread-safe, fire-and-forget) and
+  `await dendrux.aheartbeat()` record progress from inside a long-running tool so
+  `sweep(stale_running=...)` does not reap it. Tool start now also touches
+  progress. Both are no-ops outside a run.
+- **Dollar budget.** `Budget(max_cost_usd=..., on_exceed="warn"|"pause"|"cancel",
+  include_children=True)`; `max_tokens` is now optional (at least one limit is
+  required). `on_exceed="pause"` pauses durably (`pause_reason="budget"`);
+  `"cancel"` ends the run `cancelled` with `failure_reason="budget_exceeded"`.
+  With `include_children` the check uses the live root-inclusive subtree rollup.
+  Events carry `metric` (`tokens|cost_usd`); `budget.exceeded` adds `action`; new
+  `budget.unpriced` fires once per run when the cost limit meets an unpriced call
+  (unknown cost is never counted as zero).
+- **Subtree reads.** `RunStore.get_subtree(run_id, *, tenant_id=)` returns a
+  `RunSubtree` (`nodes` with depth and per-node `RunUsage`, plus rolled-up
+  `usage`) computed live from `llm_interactions`, so running and paused runs are
+  counted. `RunStore.get_events(event_types=, before=)`, and `before=` on
+  `get_llm_calls` / `get_tool_invocations` (timezone-aware, exclusive).
+- **`MCPConnection.call_tool(name, arguments=None, *, timeout=None)`** runs a
+  server tool directly through the managed call path (lease, capacity, 401
+  re-auth, telemetry, redaction, error mapping). Unknown names raise the new
+  `MCPToolNotFoundError` (error code `tool_not_found`). It bypasses all Agent
+  governance, persistence, budgets and tenant authorization; never expose it to a
+  model or untrusted client.
+- **`ContextLengthExceededError`** (`dendrux`, `dendrux.errors`) for
+  context-window overflows from OpenAI-compatible endpoints, batch and streaming,
+  with `status_code`, `provider_code` and `model`.
+- New governance event types: `policy.substituted`, `policy.hook_error`,
+  `policy.hook_warning`, `budget.unpriced`, `inbox.delivered` (25 in total).
+- `tenant_id=` on `cancel_run`, `request_pause`, `submit_note`, `get_subtree` and
+  `get_notes` scopes the call to one tenant (omitted means unscoped).
+- Docs: new Tool policy hook and Inbox notes pages; rewritten Budget; Approval,
+  Pause and resume, Cancellation, MCP, Models, State persistence, RunStore, Agent,
+  HTTP API and Errors updated. New example `examples/36_run_control.py` (mock
+  provider, no API key).
+
+### Changed
+
+- **Security fix: client-target calls are no longer executed server-side on
+  approval resume.** Previously an approved batch executed every pending call on
+  the server, including calls to tools declared `target="client"`. Each pending
+  call is now routed by its persisted target: server calls (approved or
+  non-gated) execute, client-target calls stay pending and the run moves to
+  `waiting_client_tool`. This applies to the batch and per-call forms. If you
+  relied on approval running client tools on the server, expose them as server
+  tools.
+- **`run()` is interruptible by `cancel_run`.** `agent.cancel_run(run_id)` on the
+  same `Agent` instance and process now cancels the in-flight model call or tool;
+  `run()` returns `RunResult(status=CANCELLED)` with `meta["interrupted"] = True`
+  and `meta["partial_output"] = False` instead of finishing the call first.
+  Cancelling the awaiting task yourself still raises `CancelledError`.
+  Interrupted tools receive `CancelledError`.
+- **Delegated runs inherit the parent's tenant** and reject a different one: a
+  child started with a `tenant_id` other than its parent's raises `ValueError`
+  before the run is created. Child runs previously stored an unset tenant as
+  untenanted.
+- **`StateStore` protocol additions** (all optional for custom stores):
+  `get_run_control`, `request_pause`, `try_pause_run`, `pause_with_event`,
+  `finalize_with_event`, `add_note`, `get_notes`, `mark_notes_delivered`,
+  `get_subtree`, `subtree_usage`, `run_usage`, plus `event_types=` / `before=` /
+  `total_usage=` / `failure_reason=` keywords. Pre-0.3 custom stores keep working
+  for existing flows through legacy fallbacks; `request_pause`, `submit_note`,
+  `get_notes` and cascade operations raise `NotImplementedError` naming the
+  missing method.
+- **Budget:** a fired threshold no longer fires again after a pause and resume
+  (fired `(metric, fraction)` keys are persisted in the pause); pause and cancel
+  act at the next top-of-iteration checkpoint, so a run can overshoot by up to
+  one iteration; `SingleCall` degrades pause/cancel to warn. Budget resume
+  continues only if the resuming Agent's limits are strictly above current usage
+  for every exceeded metric, otherwise it pauses again immediately. Event
+  payloads gained `metric`.
+- **Paused runs show running totals** (`total_*` tokens and `total_cost_usd`)
+  instead of zero until they finish.
+- A stale `running` row with a cancel pending is swept as `cancelled`, not
+  `error`. `sweep(abandoned_waiting=...)` includes `paused` runs.
+
+### Fixed
+
+- OpenAI-compatible gateway (`OpenAIProvider`, `OpenRouterProvider`):
+  - A streaming request failing with any 400 was reported as "streaming
+    unsupported". Only a 400 that actually says streaming is unsupported (or whose
+    `param` is `stream`) is mapped now; other errors surface unchanged.
+  - Tool calls buffered by a backend that ends a stream without a `finish_reason`
+    are flushed at end of stream instead of being lost.
+  - Context-window overflows are detected for batch calls, stream creation and
+    in-stream errors and raise `ContextLengthExceededError`; rate-limit, quota and
+    auth errors that mention tokens are never classified as overflows.
+
+### Migration
+
+- New Alembic revision `b5c6d7e8f9a0` (down revision `a4b5c6d7e8f9`): adds
+  `agent_runs.pause_requested` (boolean, not null, default false) and the
+  `run_inbox` table (foreign key to `agent_runs` with `ON DELETE CASCADE`, index
+  on `run_id, delivered_at, created_at, id`). Run `dendrux db migrate` for
+  Postgres and other migration-managed databases. Downgrade drops both.
+- `RunStatus.PAUSED` is a new status string in an existing varchar column; no
+  enum migration. Code that switches over statuses should handle `paused`.
+- SQLite databases created by an earlier release are not altered automatically
+  (`create_all` adds `run_inbox` but not the new column). Add it once with
+  `ALTER TABLE agent_runs ADD COLUMN pause_requested BOOLEAN NOT NULL DEFAULT 0`,
+  or start from a fresh file.
+
+### Known limitations
+
+- A cancel that arrives after a run's last checkpoint does not stop a run that
+  then completes successfully; the request is cleared.
+- `sweep(stale_running=...)` must be longer than the longest gap between progress
+  updates (LLM calls, tool starts and ends, `heartbeat()`); otherwise the event
+  sequence indexes of a still-running run can collide with the sweep's event.
+- Pause cascade is flag propagation, not a resumable call stack. Resuming a child
+  does not rewrite the parent's recorded tool result.
+- Budget pause and cancel take effect at the next top-of-iteration checkpoint,
+  so a run can overshoot by up to one iteration. They degrade to warn on
+  `SingleCall`.
+- Inbox delivery is at-least-once, and a note accepted while a run makes its last
+  LLM call may never be delivered (it is reported as undelivered).
+- The MCP SDK's own DEBUG logging may echo raw tool names. Dendrux's logs, errors
+  and telemetry scrub credential-shaped names.
+- `RunStore.get_subtree` reads are best-effort and not one snapshot transaction.
+- `cancel_run` interrupts only a run executing on the same `Agent` instance in
+  the same process; elsewhere cancellation is cooperative.
+
 ## 0.2.0a23 - 2026-10-15
 
 - Runs started from a stream consumer's own loop body are no longer linked as delegation children of the stream run; this previously happened because delegation context leaked between yields.

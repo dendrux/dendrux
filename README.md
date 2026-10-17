@@ -26,6 +26,18 @@
 
 ---
 
+## What's new in 0.3.0
+
+- **Per-call approvals**: `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve() | .deny(reason)})` decides each gated call on its own. Client-target calls are never executed server-side on approval (a security fix).
+- **`before_tool` policy hook**: one function sees every tool call (local, MCP, skill) and returns allow, deny, require approval or a substituted result. Fails closed.
+- **Run control**: `agent.request_pause(run_id)` parks a running run as `paused` and `agent.submit_resume(run_id)` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too, and `cancel_run` now interrupts an in-flight `run()` in the same process.
+- **Inbox notes**: `agent.submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next iteration.
+- **Dollar budgets**: `Budget(max_cost_usd=..., on_exceed="pause" | "cancel", include_children=True)` enforces token and dollar limits across a run and its children.
+- **Subtree reads**: `RunStore.get_subtree(run_id)` returns a delegation tree with live rolled-up usage, plus `get_notes`, `event_types=` and `before=` filters.
+- **`MCPConnection.call_tool`** runs a server tool directly from your app (outside Agent governance).
+- **Gateway fixes** for OpenAI-compatible endpoints, including a typed `ContextLengthExceededError`.
+- **Migration**: run `dendrux db migrate` (new revision `b5c6d7e8f9a0`). See the [CHANGELOG](packages/python/CHANGELOG.md).
+
 ## Why Dendrux?
 
 Agent frameworks assume tools run on the server and finish instantly. Real agents crash mid-run, need human approval, interact with browsers and spreadsheets, and must explain what they did after the fact.
@@ -108,7 +120,7 @@ Dendrux is built around six design commitments:
 |---|--------|---------------|
 | 1 | **Survive failure** | Durable writes, sweep, retry, idempotency. Runs never lie about state. |
 | 2 | **Control execution** | Tool constraints, timeouts, parallel/sequential policy, delegation depth guards. |
-| 3 | **Govern behavior** | Tool deny/approval, advisory budgets, PII redaction, secret detection. Four layers of runtime governance. |
+| 3 | **Govern behavior** | Tool deny/approval/policy hook, token and dollar budgets, PII redaction, secret detection. Four layers of runtime governance. |
 | 4 | **Explain everything** | Every LLM call, tool execution, pause, and lifecycle event is persisted as evidence. |
 | 5 | **Coordinate agents** | Parent-child delegation with automatic linking, depth guards, and lifecycle coupling. |
 | 6 | **Pause for the real world** | Client-side tool pause/resume for spreadsheets, browsers, and desktops with domain-aware constraints. |
@@ -188,7 +200,7 @@ agent = Agent(
     prompt="You are a customer support agent.",
     deny=["delete_account"],                     # block tools deterministically
     require_approval=["refund"],                 # pause for human sign-off
-    budget=Budget(max_tokens=30_000),            # advisory spend tracking
+    budget=Budget(max_tokens=30_000),            # spend limit (warn / pause / cancel)
     guardrails=[                                 # content scanning at LLM boundary
         PII(extra_patterns=[Pattern("EMPLOYEE_ID", r"EMP-\d{6}")]),
         SecretDetection(action="block"),
@@ -198,9 +210,11 @@ agent = Agent(
 
 **Tool deny**: `deny=["tool_name"]` blocks tools deterministically. The model gets a synthesized error and adapts. The tool never executes.
 
-**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True)`, reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`.
+**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True)`, reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `decisions={call_id: ApprovalDecision.approve()}`.
 
-**Advisory budget**: `budget=Budget(max_tokens=N)` fires governance events at configurable thresholds (50%, 75%, 90%) and when usage exceeds the cap. Advisory only - the run continues. Developers observe and act.
+**Tool policy**: `before_tool=hook` decides each call from its arguments: `ToolDecision.deny(...)`, `.require_approval(...)`, `.substitute(result)` or `None` to allow.
+
+**Budget**: `budget=Budget(max_tokens=N, max_cost_usd=D)` fires governance events at configurable thresholds (50%, 75%, 90%) and when usage reaches a limit, counting delegated child runs. By default (`on_exceed="warn"`) it is advisory and the run continues; `on_exceed="pause"` parks the run for a person to raise the limit and resume, and `"cancel"` ends it. Pause and cancel take effect at the next iteration boundary.
 
 **Guardrails**: `guardrails=[PII(), SecretDetection()]` scans content crossing the LLM boundary. Three actions:
 - `redact` - PII replaced with `<<EMAIL_ADDRESS_1>>` placeholders. Tools receive real values (deanonymized). Run-scoped mapping persisted for audit.
@@ -227,7 +241,7 @@ Custom patterns via `Pattern("NAME", r"regex")`. Extensible `Guardrail` protocol
   ┌───────┐   ┌──────────────┐   ┌──────────┐   ┌─────────┐   ┌────────┐
   │ Deny  │──▶│ Deanonymize  │──▶│ Approval │──▶│ Execute │──▶│ Budget │
   └───────┘   └──────────────┘   └──────────┘   └─────────┘   └────────┘
-  block by    placeholders →     HITL           server /       advisory
+  block by    placeholders →     HITL           server /       spend
   policy      real values        sign-off       client tools   tracking
 
   ─────────────────────────────────────────────────────────────────────────
@@ -457,10 +471,11 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`16_cache_efficiency_openai.py`](packages/python/examples/16_cache_efficiency_openai.py) | OpenAI prompt-cache hit measurement |
 | [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |
 | [`30_mcp_agent.py`](packages/python/examples/30_mcp_agent.py) | Local tools + an SDK v2 MCP source with shared `MCPHost` lifecycle |
+| [`36_run_control.py`](packages/python/examples/36_run_control.py) | Per-call approvals, a `before_tool` policy hook and `request_pause` / `submit_resume`, with a mock provider (no API key) |
 | **Governance** | |
 | [`governance/01_tool_deny.py`](packages/python/examples/governance/01_tool_deny.py) | Block tools deterministically (batch + streaming) |
 | [`governance/02_approval.py`](packages/python/examples/governance/02_approval.py) | Human-in-the-loop approval with approve/reject CLI |
-| [`governance/03_budget.py`](packages/python/examples/governance/03_budget.py) | Advisory token budget with threshold warnings |
+| [`governance/03_budget.py`](packages/python/examples/governance/03_budget.py) | Token budget with threshold warnings |
 | [`governance/04_guardrails.py`](packages/python/examples/governance/04_guardrails.py) | PII redaction, secret detection, warn mode |
 | [`governance/05_dashboard.py`](packages/python/examples/governance/05_dashboard.py) | Dashboard pointed at a seeded run database |
 
