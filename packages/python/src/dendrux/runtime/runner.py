@@ -21,6 +21,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, overload
 
 from dendrux._sentinel import _UnsetType
@@ -49,6 +50,7 @@ from dendrux.runtime.context import (
     get_delegation_context,
     get_store_identity,
     reset_delegation_context,
+    resolve_child_tenant,
     resolve_parent_link,
     set_delegation_context,
 )
@@ -389,6 +391,38 @@ _WAITING_STATUSES = (
     RunStatus.WAITING_HUMAN_INPUT,
     RunStatus.WAITING_APPROVAL,
 )
+# Every status a loop result can durably pause in.
+_PAUSE_STATUSES = (*_WAITING_STATUSES, RunStatus.PAUSED)
+
+
+async def _attach_undelivered_notes(
+    state_store: StateStore, run_id: str, result: RunResult
+) -> None:
+    """List inbox notes the run ended without delivering in ``meta["undelivered_notes"]``.
+
+    Only set when there are any, so runs that never get notes are unchanged.
+    """
+    try:
+        notes = await state_store.get_notes(run_id, undelivered_only=True)
+    except Exception:
+        logger.warning("Failed to read undelivered notes for run %s", run_id, exc_info=True)
+        return
+    if notes:
+        result.meta["undelivered_notes"] = [n.id for n in notes]
+
+
+async def _pause_request_message(state_store: StateStore, run_id: str) -> str | None:
+    """The ``reason=`` text of the latest ``request_pause`` on this run, if any."""
+    from dendrux.runtime.state import PAUSE_REQUEST_META_KEY
+
+    try:
+        record = await state_store.get_run(run_id)
+    except Exception:
+        logger.warning("Failed to read pause request for run %s", run_id, exc_info=True)
+        return None
+    request = ((record.meta if record else None) or {}).get(PAUSE_REQUEST_META_KEY)
+    reason = request.get("reason") if isinstance(request, dict) else None
+    return reason if isinstance(reason, str) else None
 
 
 @asynccontextmanager
@@ -494,19 +528,41 @@ async def _persist_loop_outcome(
                 payload["interrupted"] = True
                 payload["partial_output"] = bool(result.meta.get("partial_output"))
             await _emit_event(state_store, run_id, "run.cancelled", sequencer, payload)
-        return _wrap(status=RunStatus.CANCELLED, won=won)
+        cancelled = _wrap(status=RunStatus.CANCELLED, won=won)
+        await _attach_undelivered_notes(state_store, run_id, cancelled)
+        return cancelled
 
-    if result.status in _WAITING_STATUSES:
-        # Pre-pause checkpoint: cancel may have arrived during the iteration
-        # that just returned WAITING_*. Finalize cancelled instead of pausing.
-        if await state_store.is_cancel_requested(run_id):
+    if result.status in _PAUSE_STATUSES:
+        # Pre-pause checkpoint as one CAS: the pause persists only while the
+        # row is RUNNING with no pending cancel. Cancellation wins over pause;
+        # any durable pause (incl. WAITING_*) satisfies a pause request.
+        pause_state: PauseState = result.meta["pause_state"]
+        if pause_state.pause_reason == "requested" and pause_state.pause_message is None:
+            pause_state = replace(
+                pause_state, pause_message=await _pause_request_message(state_store, run_id)
+            )
+            result.meta["pause_state"] = pause_state
+        _run_pii = result.meta.get("pii_mapping")
+        paused = await state_store.try_pause_run(
+            run_id,
+            status=result.status.value,
+            pause_data=pause_state.to_dict(),
+            iteration_count=result.iteration_count,
+            pii_mapping=_run_pii,
+        )
+        if not paused:
+            # CAS lost: honor the winner. On a still-RUNNING row only a
+            # pending cancel makes the CAS miss, so finalize cancelled.
+            record = await state_store.get_run(run_id)
+            if record is not None and record.status != RunStatus.RUNNING.value:
+                return _wrap(status=RunStatus(record.status), won=False)
             won = await state_store.finalize_run_if_status_in(
                 run_id,
                 status=RunStatus.CANCELLED.value,
                 allowed_current_statuses=[RunStatus.RUNNING.value],
                 iteration_count=result.iteration_count,
                 total_usage=result.usage,
-                pii_mapping=result.meta.get("pii_mapping"),
+                pii_mapping=_run_pii,
             )
             if won:
                 await _emit_event(
@@ -516,35 +572,28 @@ async def _persist_loop_outcome(
                     sequencer,
                     {"reason": "cancel_requested"},
                 )
-            return _wrap(status=RunStatus.CANCELLED, won=won)
+            cancelled = _wrap(status=RunStatus.CANCELLED, won=won)
+            cancelled.meta.pop("pause_state", None)
+            await _attach_undelivered_notes(state_store, run_id, cancelled)
+            return cancelled
 
-        pause_state: PauseState = result.meta["pause_state"]
-        _run_pii = result.meta.get("pii_mapping")
-        await state_store.pause_run(
-            run_id,
-            status=result.status.value,
-            pause_data=pause_state.to_dict(),
-            iteration_count=result.iteration_count,
-            pii_mapping=_run_pii,
-        )
-        await _emit_event(
-            state_store,
-            run_id,
-            "run.paused",
-            sequencer,
-            {
-                "status": result.status.value,
-                "pending_tool_calls": [
-                    {
-                        "id": tc.id,
-                        "name": tc.name,
-                        "target": pause_state.pending_targets.get(tc.id),
-                        "params": tc.params,
-                    }
-                    for tc in pause_state.pending_tool_calls
-                ],
-            },
-        )
+        paused_data: dict[str, Any] = {
+            "status": result.status.value,
+            "pending_tool_calls": [
+                {
+                    "id": tc.id,
+                    "name": tc.name,
+                    "target": pause_state.pending_targets.get(tc.id),
+                    "params": tc.params,
+                }
+                for tc in pause_state.pending_tool_calls
+            ],
+        }
+        if pause_state.pause_reason is not None:
+            paused_data["reason"] = pause_state.pause_reason
+        if pause_state.pause_message:
+            paused_data["message"] = pause_state.pause_message[:500]
+        await _emit_event(state_store, run_id, "run.paused", sequencer, paused_data)
         return _wrap(status=result.status, won=True)
 
     # Terminal: success / max_iterations / error.
@@ -574,7 +623,9 @@ async def _persist_loop_outcome(
             sequencer,
             {"status": result.status.value},
         )
-    return _wrap(status=result.status, won=finalize_won)
+    finished = _wrap(status=result.status, won=finalize_won)
+    await _attach_undelivered_notes(state_store, run_id, finished)
+    return finished
 
 
 _UNSET_DEPTH = _UnsetType()
@@ -759,6 +810,7 @@ async def run(
         # is limited to dedup warning state on parent_ctx.warned_mismatches.
         parent_ctx = get_delegation_context()
         effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
+        tenant_id = resolve_child_tenant(parent_ctx, tenant_id)
 
         resolved_strategy = strategy or NativeToolCalling()
         resolved_loop = loop or agent.loop or ReActLoop()
@@ -814,6 +866,8 @@ async def run(
         recorder_closed = False
         notifier_closed = False
         result: RunResult | None = None
+        task_manager = getattr(agent, "_task_manager", None)
+        registered = False
 
         try:
             try:
@@ -874,6 +928,12 @@ async def run(
                     # "created" — use the run_id from the result (same as generated)
                     run_id = create_result.run_id
 
+                    # The run is durable: from here cancel_run in this process
+                    # interrupts this task (E-P0-4).
+                    if task_manager is not None:
+                        task_manager.register_current(run_id)
+                        registered = True
+
                     # Create persistence recorder with shared sequencer
                     from dendrux.runtime.persistence import PersistenceRecorder
                     from dendrux.tool import get_tool_def
@@ -914,6 +974,9 @@ async def run(
                     persisted=state_store is not None,
                     store_identity=get_store_identity(state_store),
                     max_delegation_depth=effective_max_depth,
+                    tenant_id=tenant_id,
+                    state_store=state_store,
+                    loop=asyncio.get_running_loop(),
                 )
                 ctx_token = set_delegation_context(this_ctx)
 
@@ -1043,10 +1106,22 @@ async def run(
                 raise
 
         except asyncio.CancelledError:
+            # cancel_run in this process cancels the registered task. Tell
+            # that apart from the caller's own task.cancel(): only a
+            # cancel_run interrupt that no other cancellation shares returns
+            # a CANCELLED result; everything else re-raises as before.
+            interrupted = False
+            swallow = False
+            if registered and task_manager is not None:
+                interrupted, others_pending = task_manager.take_interrupt(run_id)
+                current_task = asyncio.current_task()
+                if interrupted and not others_pending and current_task is not None:
+                    swallow = current_task.uncancel() == 0
+
             # Retain and drain the write task: shielding alone would let run()
             # return while cleanup is still pending after another cancellation.
             cleanup_task = asyncio.create_task(
-                _persist_task_cancellation(state_store, run_id, sequencer),
+                _persist_task_cancellation(state_store, run_id, sequencer, interrupted=interrupted),
                 name=f"cancel-run:{run_id}",
             )
             while not cleanup_task.done():
@@ -1074,9 +1149,14 @@ async def run(
                 if not notifier_closed:
                     notifier_closed = True
                     await notify_run_finished(extra_notifier, run_id, cancelled_result)
+            current_task = asyncio.current_task()
+            if swallow and (current_task is None or current_task.cancelling() == 0):
+                return cancelled_result
             raise
 
         finally:
+            if registered and task_manager is not None:
+                task_manager.release_current(run_id)
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
@@ -1129,10 +1209,19 @@ async def _persist_task_cancellation(
     state_store: StateStore | None,
     run_id: str,
     sequencer: EventSequencer,
+    *,
+    interrupted: bool = False,
 ) -> RunResult:
+    """Finalize a still-RUNNING run as CANCELLED after its task was cancelled.
+
+    ``interrupted`` marks a ``cancel_run`` interrupt of a batch ``run()``:
+    the result and the ``run.cancelled`` event carry ``interrupted=True`` and
+    ``partial_output=False`` (a batch provider call has no partial text).
+    """
     from dendrux.types import RunResult
 
-    result = RunResult(run_id=run_id, status=RunStatus.CANCELLED)
+    interrupt_meta = {"interrupted": True, "partial_output": False} if interrupted else {}
+    result = RunResult(run_id=run_id, status=RunStatus.CANCELLED, meta=dict(interrupt_meta))
     if state_store is None:
         return result
     try:
@@ -1147,8 +1236,11 @@ async def _persist_task_cancellation(
                 run_id,
                 "run.cancelled",
                 sequencer,
-                {"reason": "task_cancelled"},
+                {"reason": "cancel_requested", **interrupt_meta}
+                if interrupted
+                else {"reason": "task_cancelled"},
             )
+            await _attach_undelivered_notes(state_store, run_id, result)
         elif await state_store.get_run(run_id) is not None:
             result = await _build_cached_result(state_store, run_id)
         # No row: cancelled before create_run committed, or while resolving an
@@ -1304,6 +1396,7 @@ async def retry(
     if source_run is None:
         raise ValueError(f"Run '{original_run_id}' not found.")
 
+    tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
     if source_run.tenant_id != tenant_id:
         from dendrux.errors import ReplayRunError
 
@@ -1352,8 +1445,6 @@ async def retry(
         )
 
         if explicit:
-            from dataclasses import replace
-
             from dendrux.types import Role
 
             first_user = next(i for i, m in enumerate(initial_history) if m.role == Role.USER)
@@ -1457,6 +1548,9 @@ async def retry(
             persisted=True,
             store_identity=get_store_identity(state_store),
             max_delegation_depth=effective_max_depth,
+            tenant_id=tenant_id,
+            state_store=state_store,
+            loop=asyncio.get_running_loop(),
         )
         ctx_token = set_delegation_context(this_ctx)
         mcp_meta: dict[str, Any] = {}
@@ -1738,6 +1832,7 @@ def run_stream(
             parent_ctx = get_delegation_context()
             parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
             eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
+            eff_tenant = resolve_child_tenant(parent_ctx, tenant_id)
 
             # Resolve system prompt BEFORE create_run() so skill loading
             # failures don't leave a DB row stuck in running.
@@ -1758,7 +1853,7 @@ def run_stream(
                         "runs= requires persistence (database_url, state_store, or "
                         "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
                     )
-                replay_runs = await load_replay_runs(store, replay_req, tenant_id=tenant_id)
+                replay_runs = await load_replay_runs(store, replay_req, tenant_id=eff_tenant)
                 _shared["existing_run"] = False
 
             if store is not None:
@@ -1796,7 +1891,7 @@ def run_stream(
                         strategy=type(resolved_strategy).__name__,
                         parent_run_id=parent_run_id,
                         delegation_level=delegation_level,
-                        tenant_id=tenant_id,
+                        tenant_id=eff_tenant,
                         meta=run_meta,
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=fingerprint,
@@ -1850,6 +1945,9 @@ def run_stream(
                 persisted=store is not None,
                 store_identity=get_store_identity(store),
                 max_delegation_depth=eff_max_depth,
+                tenant_id=eff_tenant,
+                state_store=store,
+                loop=asyncio.get_running_loop(),
             )
             stream_context.set_delegation(this_ctx)
 
@@ -2402,27 +2500,33 @@ class _ApprovalResume(NamedTuple):
     decided: dict[str, Any]
     # Set when a resume barrier stopped execution before a side effect.
     barrier: RunStatus | None
+    # Calls not yet resolved when the barrier hit (client calls excluded),
+    # as (call, outcome, denial reason) in pending order.
+    remaining: tuple[tuple[ToolCall, str, str | None], ...] = ()
 
 
 async def _resume_pause_barrier(state_store: StateStore, run_id: str) -> RunStatus | None:
-    """Pause half of the resume barrier — seam for durable pause (Track E).
+    """Cancel-then-pause read of the run's control flags (one query).
 
-    Returns ``RunStatus.PAUSED`` when a pause was requested. No-op until
-    durable pause exists.
+    Returns ``CANCELLED`` when cancellation was requested, else ``PAUSED``
+    when a pause was requested, else None. Cancellation wins over pause.
     """
+    control = await state_store.get_run_control(run_id)
+    if control.cancel_requested:
+        return RunStatus.CANCELLED
+    if control.pause_requested:
+        return RunStatus.PAUSED
     return None
 
 
 async def _resume_barrier(state_store: StateStore | None, run_id: str) -> RunStatus | None:
     """Cancel-then-pause check before an approved side effect (E-P0-3).
 
-    Runs after an approval claim, before each approved/held server call.
+    Runs after a resume claim, before each approved/held server call.
     Cancellation wins over pause.
     """
     if state_store is None:
         return None
-    if await state_store.is_cancel_requested(run_id):
-        return RunStatus.CANCELLED
     return await _resume_pause_barrier(state_store, run_id)
 
 
@@ -2567,7 +2671,7 @@ async def _execute_approved_tools(
         await _ntfy_msg(notifier, run_id, result_msg, iteration)
         results.append((tc, tr))
 
-    for tc, outcome, reason in outcomes:
+    for index, (tc, outcome, reason) in enumerate(outcomes):
         if outcome == "client_pending":
             continue
         if outcome == "denied":
@@ -2586,7 +2690,8 @@ async def _execute_approved_tools(
 
         barrier = await _resume_barrier(state_store, run_id)
         if barrier is not None:
-            return _ApprovalResume(results, client_pending, decided, barrier)
+            remaining = tuple(o for o in outcomes[index:] if o[1] != "client_pending")
+            return _ApprovalResume(results, client_pending, decided, barrier, remaining)
 
         if isinstance(lookups.fn.get(tc.name), SkillTool):
             outcome_s = await _process_tool_calls(
@@ -2648,10 +2753,9 @@ def _approval_stop_result(
     from dendrux.loops.react import _commentary, _snapshot_usage
     from dendrux.types import RunResult
 
+    if approval.barrier == RunStatus.PAUSED:
+        return _barrier_pause_result(run_id, pause_state, history, approval)
     if approval.barrier is not None:
-        # Track E seam: a PAUSED barrier must persist a PauseState holding the
-        # unexecuted remainder (with its resolved decisions) instead of this
-        # bare result; only CANCELLED is produced today.
         return RunResult(
             run_id=run_id,
             status=approval.barrier,
@@ -2684,6 +2788,75 @@ def _approval_stop_result(
         usage=pause_state.usage,
         meta={"pause_state": client_pause},
     )
+
+
+def _barrier_pause_result(
+    run_id: str,
+    pause_state: PauseState,
+    history: list[Message],
+    approval: _ApprovalResume,
+) -> RunResult:
+    """PAUSED result for a pause observed between approved calls.
+
+    Holds every call that has no result yet (the unexecuted remainder plus
+    held client calls) in pending order, with the decisions already made for
+    the gated ones; resume executes them without asking again.
+    """
+    from dendrux.loops.react import _commentary, _snapshot_usage
+    from dendrux.types import RunResult
+
+    old_gates = pause_state.approval_gates or {}
+    gates: dict[str, dict[str, str | None]] = {}
+    decisions: dict[str, dict[str, Any]] = {}
+    for tc, outcome, reason in approval.remaining:
+        if outcome in ("approved", "denied"):
+            gates[tc.id] = dict(old_gates.get(tc.id) or {"source": "legacy", "reason": None})
+            decisions[tc.id] = {"approved": outcome == "approved", "reason": reason}
+    client_ids = {tc.id for tc in approval.client_pending}
+    open_ids = {tc.id for tc, _, _ in approval.remaining} | client_ids
+    pending = [tc for tc in pause_state.pending_tool_calls if tc.id in open_ids]
+    targets: dict[str, str] = {}
+    for tc in pending:
+        target = pause_state.pending_targets.get(tc.id)
+        if target is None and tc.id in client_ids:
+            target = "client"
+        if target is not None:
+            targets[tc.id] = target
+    pause = PauseState(
+        agent_name=pause_state.agent_name,
+        pending_tool_calls=pending,
+        pending_targets=targets,
+        history=list(history),
+        steps=list(pause_state.steps),
+        iteration=pause_state.iteration,
+        trace_order_offset=len(history),
+        usage=_snapshot_usage(pause_state.usage),
+        approval_gates=gates,
+        pause_reason="requested",
+        pending_decisions=decisions,
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.PAUSED,
+        steps=pause_state.steps,
+        commentary=_commentary(pause_state.steps),
+        iteration_count=pause_state.iteration,
+        usage=pause_state.usage,
+        meta={"pause_state": pause},
+    )
+
+
+def _pending_decision_map(pause_state: PauseState) -> dict[str, ApprovalDecision] | None:
+    """Decisions persisted with a pause that interrupted an approval batch."""
+    if pause_state.pending_decisions is None:
+        return None
+    return {
+        call_id: ApprovalDecision(
+            approved=bool(d.get("approved")),
+            reason=d.get("reason") if isinstance(d.get("reason"), str) else None,
+        )
+        for call_id, d in pause_state.pending_decisions.items()
+    }
 
 
 async def _resume_core(
@@ -2788,6 +2961,19 @@ async def _resume_core(
                 claimed = await state_store.claim_paused_run(run_id, expected_status=alt)
                 if claimed:
                     expected_status = alt
+            # Fallback: a no-payload resume also continues a PAUSED run.
+            if (
+                not claimed
+                and tool_results is None
+                and user_input is None
+                and decisions is None
+                and expected_status == RunStatus.WAITING_APPROVAL.value
+            ):
+                claimed = await state_store.claim_paused_run(
+                    run_id, expected_status=RunStatus.PAUSED.value
+                )
+                if claimed:
+                    expected_status = RunStatus.PAUSED.value
             if not claimed:
                 await _raise_resume_claim_failure(state_store, run_id, expected_status)
 
@@ -2850,6 +3036,9 @@ async def _resume_core(
                 persisted=True,
                 store_identity=get_store_identity(state_store),
                 max_delegation_depth=resume_max_depth,
+                tenant_id=run_record.tenant_id if run_record else None,
+                state_store=state_store,
+                loop=asyncio.get_running_loop(),
             )
             ctx_token = set_delegation_context(resume_ctx)
 
@@ -2861,7 +3050,11 @@ async def _resume_core(
                 and user_input is None
                 and expected_status == RunStatus.WAITING_APPROVAL.value
             )
-            if _is_approval_approve:
+            # A pause that interrupted an approval batch resumes its remainder.
+            _is_paused_batch = expected_status == RunStatus.PAUSED.value and bool(
+                pause_state.pending_tool_calls
+            )
+            if _is_approval_approve or _is_paused_batch:
                 from dendrux.loops._helpers import (
                     notify_governance as _ntfy_gov,
                 )
@@ -2869,8 +3062,10 @@ async def _resume_core(
                     record_governance as _rec_gov,
                 )
 
-                decision_map = await _validated_decisions(
-                    agent, ctx, run_id, pause_state, decisions
+                decision_map = (
+                    await _validated_decisions(agent, ctx, run_id, pause_state, decisions)
+                    if _is_approval_approve
+                    else _pending_decision_map(pause_state)
                 )
                 approval = await _execute_approved_tools(
                     agent,
@@ -2884,20 +3079,21 @@ async def _resume_core(
                     state_store=state_store,
                 )
 
-                await _rec_gov(
-                    ctx.recorder,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    approval.decided,
-                )
-                await _ntfy_gov(
-                    ctx.notifier,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    approval.decided,
-                )
+                if _is_approval_approve:
+                    await _rec_gov(
+                        ctx.recorder,
+                        run_id,
+                        "approval.decided",
+                        pause_state.iteration,
+                        approval.decided,
+                    )
+                    await _ntfy_gov(
+                        ctx.notifier,
+                        run_id,
+                        "approval.decided",
+                        pause_state.iteration,
+                        approval.decided,
+                    )
 
                 stop = _approval_stop_result(run_id, pause_state, ctx.history, approval)
                 if stop is not None:
@@ -3119,7 +3315,7 @@ def resume_stream(
             elif user_input is not None:
                 expected = RunStatus.WAITING_HUMAN_INPUT.value
             else:
-                # No-arg = approval-approve
+                # No-arg = approval-approve, or continue a PAUSED run
                 expected = RunStatus.WAITING_APPROVAL.value
 
             claimed = await store.claim_paused_run(run_id, expected_status=expected)
@@ -3133,6 +3329,12 @@ def resume_stream(
                 claimed = await store.claim_paused_run(run_id, expected_status=alt)
                 if claimed:
                     expected = alt
+            if not claimed and tool_results is None and user_input is None:
+                claimed = await store.claim_paused_run(
+                    run_id, expected_status=RunStatus.PAUSED.value
+                )
+                if claimed:
+                    expected = RunStatus.PAUSED.value
             if not claimed:
                 await _raise_resume_claim_failure(store, run_id, expected)
 
@@ -3193,6 +3395,9 @@ def resume_stream(
                 persisted=True,
                 store_identity=get_store_identity(store),
                 max_delegation_depth=resume_max_depth,
+                tenant_id=run_record.tenant_id if run_record else None,
+                state_store=store,
+                loop=asyncio.get_running_loop(),
             )
             stream_context.set_delegation(resume_ctx)
 
@@ -3205,7 +3410,10 @@ def resume_stream(
                 and user_input is None
                 and expected == RunStatus.WAITING_APPROVAL.value
             )
-            if _is_approval_approve:
+            _is_paused_batch = expected == RunStatus.PAUSED.value and bool(
+                pause_state.pending_tool_calls
+            )
+            if _is_approval_approve or _is_paused_batch:
                 approval = await _execute_approved_tools(
                     agent,
                     pause_state,
@@ -3214,6 +3422,7 @@ def resume_stream(
                     run_id,
                     history=ctx.history,
                     resolved_loop=ctx.resolved_loop,
+                    decisions=None if _is_approval_approve else _pending_decision_map(pause_state),
                     state_store=store,
                 )
                 for tc, tr in approval.results:
@@ -3232,20 +3441,21 @@ def resume_stream(
                     record_governance as _rec_gov_s,
                 )
 
-                await _rec_gov_s(
-                    ctx.recorder,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    approval.decided,
-                )
-                await _ntfy_gov_s(
-                    ctx.notifier,
-                    run_id,
-                    "approval.decided",
-                    pause_state.iteration,
-                    approval.decided,
-                )
+                if _is_approval_approve:
+                    await _rec_gov_s(
+                        ctx.recorder,
+                        run_id,
+                        "approval.decided",
+                        pause_state.iteration,
+                        approval.decided,
+                    )
+                    await _ntfy_gov_s(
+                        ctx.notifier,
+                        run_id,
+                        "approval.decided",
+                        pause_state.iteration,
+                        approval.decided,
+                    )
 
                 stop = _approval_stop_result(run_id, pause_state, ctx.history, approval)
                 if stop is not None:
@@ -3625,6 +3835,31 @@ async def resume_approval_approved_claim(
         expected_status=RunStatus.WAITING_APPROVAL.value,
         tool_results=None,
         user_input=None,
+        extra_notifier=extra_notifier,
+        _skip_claim=True,
+    )
+
+
+async def resume_paused_claim(
+    run_id: str,
+    *,
+    state_store: StateStore,
+    agent: Agent,
+    provider: LLMProvider,
+    extra_notifier: LoopNotifier | None = None,
+) -> RunResult:
+    """Continue a PAUSED run that :meth:`Agent.submit_resume` already claimed.
+
+    The claim cleared ``pause_requested``. The loop resumes with the full
+    history; a pause that interrupted an approval batch first executes the
+    batch's remainder with its persisted decisions.
+    """
+    return await _resume_core(
+        run_id,
+        state_store=state_store,
+        agent=agent,
+        provider=provider,
+        expected_status=RunStatus.PAUSED.value,
         extra_notifier=extra_notifier,
         _skip_claim=True,
     )

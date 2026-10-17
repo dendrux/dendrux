@@ -564,6 +564,7 @@ class _FakeRunRecord:
         self.status = "running"
         self.delegation_level = delegation_level
         self.meta: dict[str, Any] | None = None
+        self.tenant_id: str | None = None
 
 
 class ResumeStateStore(CancellationStubsMixin):

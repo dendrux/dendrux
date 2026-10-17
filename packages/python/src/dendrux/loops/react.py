@@ -61,6 +61,7 @@ from dendrux.types import (
     Budget,
     Clarification,
     Finish,
+    GovernanceEventType,
     LLMResponse,
     Message,
     PauseState,
@@ -340,6 +341,97 @@ def _build_pause(
         usage=_snapshot_usage(usage),
         approval_gates=approval_gates,
     )
+
+
+INBOX_NOTE_PREFIX = "NOTE FROM USER:\n"
+
+
+def _requested_pause_result(
+    *,
+    agent_name: str,
+    run_id: str,
+    history: list[Message],
+    steps: list[AgentStep],
+    iteration: int,
+    usage: UsageStats,
+    meta: dict[str, Any],
+) -> RunResult:
+    """PAUSED result for a requested pause observed at the top of ``iteration``.
+
+    Nothing of ``iteration`` has run, so the pause records ``iteration - 1``
+    and resume continues at ``iteration`` with the full history.
+    """
+    pause = PauseState(
+        agent_name=agent_name,
+        pending_tool_calls=[],
+        history=list(history),
+        steps=list(steps),
+        iteration=iteration - 1,
+        trace_order_offset=len(history),
+        usage=_snapshot_usage(usage),
+        pause_reason="requested",
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.PAUSED,
+        steps=steps,
+        commentary=_commentary(steps),
+        iteration_count=iteration - 1,
+        usage=usage,
+        meta={"pause_state": pause, **meta},
+    )
+
+
+async def _deliver_inbox(
+    state_store: StateStore,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    history: list[Message],
+    warnings: list[str],
+) -> None:
+    """Append undelivered inbox notes to history as USER messages, then mark them.
+
+    At-least-once: each message is appended and recorded before the notes
+    are marked delivered, so a crash in between redelivers rather than
+    loses. Only the runner that owns the run calls this (claims guarantee a
+    single owner). Note text never enters the ``inbox.delivered`` payload.
+    """
+    notes = await state_store.get_notes(run_id, undelivered_only=True)
+    if not notes:
+        return
+    for note in notes:
+        msg = Message(
+            role=Role.USER,
+            content=f"{INBOX_NOTE_PREFIX}{note.text}",
+            kind="inbox_note",
+            source="run_inbox",
+            meta={"note_id": note.id},
+        )
+        history.append(msg)
+        await _record_message(recorder, run_id, msg, iteration)
+        await _notify_message(notifier, run_id, msg, iteration, warnings)
+    await state_store.mark_notes_delivered(run_id, [n.id for n in notes], iteration=iteration)
+    for note in notes:
+        data = {"note_id": note.id}
+        await _record_governance(
+            recorder,
+            run_id,
+            GovernanceEventType.INBOX_DELIVERED,
+            iteration,
+            data,
+            correlation_id=note.id,
+        )
+        await _notify_governance(
+            notifier,
+            run_id,
+            GovernanceEventType.INBOX_DELIVERED,
+            iteration,
+            data,
+            correlation_id=note.id,
+            warnings=warnings,
+        )
 
 
 class _LoopState(NamedTuple):
@@ -975,19 +1067,42 @@ class ReActLoop(Loop):
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
-            # Cooperative cancellation: observe before starting next iteration.
-            # Current iteration's LLM/tools are not preempted — cancel is seen
-            # at this checkpoint or the runner's pre-pause checkpoint.
-            if state_store is not None and await state_store.is_cancel_requested(resolved_run_id):
-                return RunResult(
-                    run_id=resolved_run_id,
-                    status=RunStatus.CANCELLED,
-                    steps=steps,
-                    commentary=_commentary(steps),
-                    iteration_count=iteration - 1,
-                    usage=total_usage,
-                    meta=guardrail_meta(g_engine, notifier_warnings),
-                )
+            # Cooperative checkpoint before starting the next iteration:
+            # cancel wins over pause; then inbox notes are delivered. The
+            # current iteration's LLM/tools are not preempted — flags are seen
+            # here or at the runner's pre-pause checkpoint.
+            if state_store is not None:
+                control = await state_store.get_run_control(resolved_run_id)
+                if control.cancel_requested:
+                    return RunResult(
+                        run_id=resolved_run_id,
+                        status=RunStatus.CANCELLED,
+                        steps=steps,
+                        commentary=_commentary(steps),
+                        iteration_count=iteration - 1,
+                        usage=total_usage,
+                        meta=guardrail_meta(g_engine, notifier_warnings),
+                    )
+                if control.pause_requested:
+                    return _requested_pause_result(
+                        agent_name=agent.name,
+                        run_id=resolved_run_id,
+                        history=history,
+                        steps=steps,
+                        iteration=iteration,
+                        usage=total_usage,
+                        meta=guardrail_meta(g_engine, notifier_warnings),
+                    )
+                if control.has_pending_notes:
+                    await _deliver_inbox(
+                        state_store,
+                        recorder,
+                        notifier,
+                        resolved_run_id,
+                        iteration,
+                        history,
+                        notifier_warnings,
+                    )
 
             messages, tools = strategy.build_messages(
                 system_prompt=agent.get_system_prompt(loop=self),
@@ -1454,13 +1569,17 @@ class ReActLoop(Loop):
         start_iteration = iteration_offset + 1
         end_iteration = agent.max_iterations + 1
         for iteration in range(start_iteration, end_iteration):
-            # Cooperative cancellation checkpoint (see run() for rationale).
-            # The in-process interrupt is checked first: it is free, and it
-            # lets a cancel that landed during tool execution stop the run
-            # before the next provider call is even started.
-            if (interrupt is not None and interrupt.is_set()) or (
-                state_store is not None and await state_store.is_cancel_requested(resolved_run_id)
-            ):
+            # Cooperative checkpoint (see run() for rationale). The in-process
+            # interrupt is checked first: it is free, and it lets a cancel
+            # that landed during tool execution stop the run before the next
+            # provider call is even started.
+            interrupted_here = interrupt is not None and interrupt.is_set()
+            control = (
+                await state_store.get_run_control(resolved_run_id)
+                if state_store is not None and not interrupted_here
+                else None
+            )
+            if interrupted_here or (control is not None and control.cancel_requested):
                 cancel_meta: dict[str, Any] = (
                     {"notifier_warnings": notifier_warnings} if notifier_warnings else {}
                 )
@@ -1477,6 +1596,31 @@ class ReActLoop(Loop):
                     ),
                 )
                 return
+            if control is not None and control.pause_requested:
+                yield RunEvent(
+                    type=RunEventType.RUN_PAUSED,
+                    run_result=_requested_pause_result(
+                        agent_name=agent.name,
+                        run_id=resolved_run_id,
+                        history=history,
+                        steps=steps,
+                        iteration=iteration,
+                        usage=total_usage,
+                        meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                    ),
+                )
+                return
+            if control is not None and control.has_pending_notes:
+                assert state_store is not None
+                await _deliver_inbox(
+                    state_store,
+                    recorder,
+                    notifier,
+                    resolved_run_id,
+                    iteration,
+                    history,
+                    notifier_warnings,
+                )
 
             messages, tools = strategy.build_messages(
                 system_prompt=agent.get_system_prompt(loop=self),

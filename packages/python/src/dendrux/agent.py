@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux._sentinel import _UnsetType
+from dendrux.runtime.state import UNSCOPED, TenantScope
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
         ApprovalDecision,
         BeforeToolHook,
         Budget,
+        PauseOutcome,
         RunResult,
         RunStream,
         ToolDef,
@@ -72,6 +74,27 @@ _agent_logger = logging.getLogger(__name__)
 MAX_ITERATIONS_CEILING = 200
 
 _UNSET = _UnsetType()
+
+# Inbox note limits (E-P2-3): text is UTF-8 bytes; metadata is encoded JSON.
+MAX_NOTE_TEXT_BYTES = 32 * 1024
+MAX_NOTE_METADATA_BYTES = 8 * 1024
+MAX_PAUSE_REASON_CHARS = 1000
+
+_TERMINAL_STATUS_VALUES = frozenset({"success", "error", "cancelled", "max_iterations"})
+_WAITING_STATUS_VALUES = frozenset(
+    {"waiting_client_tool", "waiting_human_input", "waiting_approval"}
+)
+
+
+def _in_tenant_scope(record: Any, tenant_id: TenantScope) -> bool:
+    """Omitted scope matches everything; otherwise the tenant must match exactly."""
+    return tenant_id is UNSCOPED or record.tenant_id == tenant_id
+
+
+def _cascade_order(subtree: Any) -> list[str]:
+    """Run ids of a subtree snapshot: deepest descendants first, root last."""
+    descendants = sorted((node for node in subtree.nodes if node.depth > 0), key=lambda n: -n.depth)
+    return [node.run.id for node in descendants] + [subtree.nodes[0].run.id]
 
 
 def _validate_max_delegation_depth(value: int | None | _UnsetType) -> None:
@@ -1039,7 +1062,12 @@ class Agent:
             current text buffer (reset at each TOOL_RESULT), possibly None.
             Cancelling this coroutine finalizes a still-running persisted run
             as cancelled and re-raises CancelledError; no RunResult or in-flight
-            model text is returned.
+            model text is returned. :meth:`cancel_run` from the same process
+            (same Agent instance) instead interrupts the run wherever it is
+            awaiting — provider call or tool — and this call returns
+            ``RunResult(status=CANCELLED)`` with ``meta["interrupted"]=True``
+            and ``meta["partial_output"]=False``. A run paused via
+            :meth:`request_pause` returns with ``status=PAUSED``.
 
         Raises:
             ValueError: If no provider is configured, if idempotency_key
@@ -1178,9 +1206,11 @@ class Agent:
     ) -> RunResult:
         """Resume a paused run.
 
-        Two modes:
+        Three modes:
           - tool_results provided -> store + resume with tool results
           - user_input provided -> resume with clarification answer
+          - neither -> approve a WAITING_APPROVAL batch, or continue a
+            PAUSED run (see :meth:`request_pause`) with its full history
 
         Args:
             run_id: The paused run's ID.
@@ -1532,19 +1562,32 @@ class Agent:
             )
             return await task
 
-    async def cancel_run(self, run_id: str) -> RunResult:
+    async def cancel_run(
+        self,
+        run_id: str,
+        *,
+        cascade: bool = False,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> RunResult:
         """Request cancellation for ``run_id``.
 
         Behavior by run state:
 
-        - **Paused run (any process):** atomic CAS finalize to
-          ``CANCELLED`` in one round-trip. Deterministic.
+        - **Paused run (any process; WAITING_* or PAUSED):** atomic CAS
+          finalize to ``CANCELLED`` in one round-trip. Deterministic.
         - **Running run (any process, persisted):** sets
           ``cancel_requested=True`` on the DB row. The runner observes
           this flag at the top of the next iteration (and at the
           pre-pause checkpoint after the current iteration's loop body
-          returns) and exits cleanly as ``CANCELLED``. In-flight tool
-          executions are never preempted.
+          returns) and exits cleanly as ``CANCELLED``. Cancellation wins
+          over a pending pause request.
+        - **Batch** :meth:`run` **executing in this process on this Agent
+          instance:** additionally cancels the task awaiting it, so an
+          in-flight provider call or tool is interrupted. That ``run()``
+          call returns ``RunResult(status=CANCELLED)`` with
+          ``meta["interrupted"] = True`` and ``meta["partial_output"] =
+          False`` (a batch call has no partial text). A caller cancelling
+          its own task still gets ``CancelledError``.
         - **Streamed run owned by this Agent instance** (``stream()`` /
           ``resume_stream()``): additionally sets an in-process interrupt
           signal. The loop races every provider pull against it, so an
@@ -1556,12 +1599,26 @@ class Agent:
           the run finishes as ``success``.
         - **In-process submit/resume task on this Agent instance:** the
           asyncio task spawned by :meth:`submit_tool_results`,
-          :meth:`submit_input`, or :meth:`submit_approval` is cancelled
-          synchronously in addition to the DB-level cancel signal.
+          :meth:`submit_input`, :meth:`submit_approval` or
+          :meth:`submit_resume` is cancelled synchronously in addition to
+          the DB-level cancel signal.
         - **Terminal run:** no-op; returns the current persisted state.
           Does not raise.
         - **Non-persisted runs:** unsupported. ``cancel_run`` requires a
           configured DB. Raises ``PersistenceNotConfiguredError``.
+
+        ``cascade=True`` also cancels every non-terminal descendant run
+        (delegated child runs), deepest first and ``run_id`` last, over a
+        point-in-time snapshot of the subtree: a child created after the
+        snapshot is not included. Per-run outcomes are listed in
+        ``meta["cascade"]`` as ``{"run_id", "outcome"}`` with outcome
+        ``cancelled`` (finalized now), ``cancel_requested`` (running;
+        stops at its next checkpoint) or ``terminal``.
+
+        ``tenant_id``: when given, ``run_id`` must belong to exactly that
+        tenant (``None`` = untenanted) or ``RunNotFoundError`` is raised,
+        and the cascade only reaches descendants of the same tenant.
+        Omitted means unscoped (trusted single-tenant use).
 
         Returning is *not* confirmation that the run stopped. A result
         with a non-terminal ``status`` and ``meta["cancel_requested"]``
@@ -1570,15 +1627,15 @@ class Agent:
         log, ``status == "cancelled"`` in the store) confirms it.
 
         Returns:
-            :class:`RunResult` reflecting the persisted state after the
-            cancel attempt.
+            :class:`RunResult` reflecting the persisted state of ``run_id``
+            after the cancel attempt.
 
         Raises:
             PersistenceNotConfiguredError: Agent has no DB.
-            RunNotFoundError: ``run_id`` does not exist.
+            RunNotFoundError: ``run_id`` does not exist (or is outside
+                ``tenant_id``).
         """
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
-        from dendrux.types import RunStatus
 
         store = await self._resolve_state_store()
         if store is None:
@@ -1587,24 +1644,47 @@ class Agent:
         # Preflight: distinguish missing from terminal so callers get
         # specific errors / no-op behavior without ambiguity.
         record = await store.get_run(run_id)
-        if record is None:
+        if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
 
-        terminal = {
-            RunStatus.SUCCESS.value,
-            RunStatus.ERROR.value,
-            RunStatus.CANCELLED.value,
-            RunStatus.MAX_ITERATIONS.value,
-        }
-        if record.status in terminal:
-            return _record_to_run_result(record)
+        outcomes: list[dict[str, str]] = []
+        if cascade:
+            subtree = await store.get_subtree(run_id, tenant_id=tenant_id)
+            if subtree is not None:
+                for rid in _cascade_order(subtree)[:-1]:
+                    outcome = await self._cancel_one(store, rid)
+                    outcomes.append({"run_id": rid, "outcome": outcome})
 
-        # Set cooperative cancel flag (observed by runner checkpoints)
-        # AND attempt atomic CAS finalize over the cancellable statuses.
-        # If paused: CAS wins instantly. If running: CAS misses, runner
-        # sees the flag at its next checkpoint and finalizes itself.
-        await store.request_cancel(run_id)
+        if record.status in _TERMINAL_STATUS_VALUES:
+            result = _record_to_run_result(record)
+            outcomes.append({"run_id": run_id, "outcome": "terminal"})
+        else:
+            outcome = await self._cancel_one(store, run_id, signal=False)
+            outcomes.append({"run_id": run_id, "outcome": outcome})
+            record = await store.get_run(run_id)
+            if record is None:  # pragma: no cover — we just preflight-checked
+                raise RunNotFoundError(run_id)
+            # In-process signals last, after the durable request is recorded
+            # and the returned snapshot is read: a locally owned run or task is
+            # preempted from here on, and the returned RunResult
+            # deterministically reflects "requested" (non-terminal status +
+            # meta.cancel_requested) rather than racing the loop's own finalize.
+            self._task_manager.cancel(run_id)
+            result = _record_to_run_result(record)
+        if cascade:
+            result.meta["cascade"] = outcomes
+        return result
 
+    async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
+        """Cancel one run: set the flag, CAS-finalize it if paused, signal in-process."""
+        from dendrux.types import RunStatus
+
+        # Set cooperative cancel flag (observed by runner checkpoints) AND
+        # attempt atomic CAS finalize over the paused statuses. If paused:
+        # CAS wins instantly. If running: CAS misses, the runner sees the
+        # flag at its next checkpoint and finalizes itself.
+        if not await store.request_cancel(run_id):
+            return "terminal"
         cancel_won = await store.finalize_run_if_status_in(
             run_id,
             status=RunStatus.CANCELLED.value,
@@ -1612,12 +1692,12 @@ class Agent:
                 RunStatus.WAITING_CLIENT_TOOL.value,
                 RunStatus.WAITING_HUMAN_INPUT.value,
                 RunStatus.WAITING_APPROVAL.value,
+                RunStatus.PAUSED.value,
             ],
         )
         if cancel_won:
-            # Paused-run cancel: we own the terminal event.
-            # Running-run cancel: the runner emits run.cancelled when
-            # it observes the flag at a checkpoint.
+            # Paused-run cancel: we own the terminal event. Running-run
+            # cancel: the runner emits run.cancelled at a checkpoint.
             # Sequence the event AFTER existing run.started/run.paused so
             # SSE clients reading by after_sequence_index don't miss it.
             from dendrux.runtime.runner import EventSequencer, _emit_event
@@ -1627,18 +1707,241 @@ class Agent:
             await _emit_event(
                 store, run_id, "run.cancelled", sequencer, {"reason": "cancel_requested"}
             )
+        if signal:
+            self._task_manager.cancel(run_id)
+        return "cancelled" if cancel_won else "cancel_requested"
+
+    async def request_pause(
+        self,
+        run_id: str,
+        *,
+        cascade: bool = True,
+        tenant_id: TenantScope = UNSCOPED,
+        reason: str | None = None,
+    ) -> PauseOutcome:
+        """Ask a running run to pause durably at its next checkpoint.
+
+        Cooperative, like :meth:`cancel_run`: a RUNNING run gets a
+        ``pause_requested`` flag and the runner that owns it pauses at the
+        top of its next iteration — or between the approved calls of a
+        resumed approval batch — before any further side effect. The run
+        becomes ``PAUSED`` with its full history persisted, emits
+        ``run.paused`` with ``reason="requested"``, and the waiting
+        ``run()`` / stream returns that paused result. In-flight LLM calls
+        and tools are never preempted. Cancellation wins over pause.
+
+        - WAITING_* run: no-op (already durable); nothing latches, so the
+          next submit continues normally.
+        - PAUSED or terminal run: no-op; returns the current status.
+        - If the run reaches a WAITING_* pause first, that pause satisfies
+          the request and clears it.
+
+        Resume a PAUSED run with :meth:`submit_resume`, ``resume(run_id)``
+        or ``resume_stream(run_id)`` (no payload); :meth:`cancel_run`
+        finalizes it as cancelled. Notes submitted while paused are
+        delivered after resume.
+
+        ``cascade=True`` (default) also flags every non-terminal descendant
+        over a point-in-time snapshot (deepest first, root last). This is
+        flag propagation only, not a resumable call stack: a paused child
+        returns its paused ``RunResult`` to the parent's delegating tool,
+        which records whatever the tool returns; the parent pauses at its
+        own next checkpoint. Resuming the child later never rewrites the
+        parent's recorded tool result — the delegating tool or the app owns
+        correlating and re-injecting the child's outcome. Resume is per run
+        (``RunStore.get_subtree`` lists them).
+
+        Args:
+            run_id: The run to pause.
+            cascade: Also flag descendants (default True).
+            tenant_id: When given, ``run_id`` must belong to exactly this
+                tenant (``None`` = untenanted) or ``RunNotFoundError`` is
+                raised; the cascade reaches only that tenant's descendants.
+                Omitted means unscoped (trusted single-tenant use).
+            reason: Optional free text (≤ 1000 chars) stored in the pause
+                and on the ``run.paused`` event as ``message``.
+
+        Returns:
+            :class:`PauseOutcome` with the root's status before/after and
+            each affected run's outcome.
+
+        Raises:
+            PersistenceNotConfiguredError: Agent has no DB.
+            RunNotFoundError: ``run_id`` does not exist (or is outside
+                ``tenant_id``).
+            ValueError: ``reason`` is not a string or is too long.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.types import PauseOutcome, RunStatus
+
+        if reason is not None and (
+            not isinstance(reason, str) or len(reason) > MAX_PAUSE_REASON_CHARS
+        ):
+            raise ValueError(
+                f"reason must be a string of at most {MAX_PAUSE_REASON_CHARS} characters."
+            )
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
 
         record = await store.get_run(run_id)
-        if record is None:  # pragma: no cover — we just preflight-checked
+        if record is None or not _in_tenant_scope(record, tenant_id):
             raise RunNotFoundError(run_id)
 
-        # In-process signals last, after the durable request is recorded and
-        # the returned snapshot is read: a locally owned stream or submit task
-        # is preempted from here on, and the returned RunResult deterministically
-        # reflects "requested" (non-terminal status + meta.cancel_requested)
-        # rather than racing the loop's own finalize.
-        self._task_manager.cancel(run_id)
-        return _record_to_run_result(record)
+        order = [run_id]
+        if cascade:
+            subtree = await store.get_subtree(run_id, tenant_id=tenant_id)
+            if subtree is not None:
+                order = _cascade_order(subtree)
+
+        affected: list[tuple[str, Any]] = []
+        for rid in order:
+            if await store.request_pause(rid, reason=reason):
+                affected.append((rid, "requested"))
+                continue
+            current = await store.get_run(rid)
+            status = current.status if current is not None else "cancelled"
+            if status in _WAITING_STATUS_VALUES:
+                affected.append((rid, "already_waiting"))
+            elif status == RunStatus.PAUSED.value:
+                affected.append((rid, "already_paused"))
+            else:
+                affected.append((rid, "terminal"))
+
+        after = await store.get_run(run_id)
+        return PauseOutcome(
+            run_id=run_id,
+            status_before=RunStatus(record.status),
+            status_after=RunStatus(after.status if after is not None else record.status),
+            affected=affected,
+        )
+
+    async def submit_resume(
+        self,
+        run_id: str,
+        *,
+        notifier: LoopNotifier | None = None,
+    ) -> RunResult:
+        """Resume a PAUSED run and block until its next pause or terminal state.
+
+        Race-safe like the other ``submit_*`` methods: a status preflight,
+        then an atomic claim (PAUSED → RUNNING) that also clears
+        ``pause_requested``. The run continues with its full history; a
+        pause that interrupted an approval batch first executes the rest of
+        that batch with the decisions already made. Pending inbox notes are
+        delivered at the first iteration.
+
+        Raises:
+            PersistenceNotConfiguredError, RunNotFoundError,
+            RunNotPausedError, PauseStatusMismatchError (paused for another
+            reason, e.g. WAITING_APPROVAL), RunAlreadyClaimedError,
+            RunAlreadyTerminalError.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError
+        from dendrux.runtime.runner import resume_paused_claim
+        from dendrux.runtime.submit import claim_or_raise
+        from dendrux.types import RunStatus
+
+        provider = self._require_provider()
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        skill_session = await continuation(self, store, run_id)
+        with skill_session.bind():
+            await claim_or_raise(store, run_id, expected_status=RunStatus.PAUSED)
+            task = self._task_manager.spawn(
+                run_id,
+                resume_paused_claim(
+                    run_id,
+                    state_store=store,
+                    agent=self,
+                    provider=provider,
+                    extra_notifier=notifier,
+                ),
+            )
+            return await task
+
+    async def submit_note(
+        self,
+        run_id: str,
+        text: str,
+        *,
+        metadata: Any = None,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> str:
+        """Leave a note for a non-terminal run; the model sees it at the next iteration.
+
+        The note is stored in the run's inbox in one conditional insert
+        (only while the run is non-terminal). The runner that owns the run
+        delivers pending notes at the top of its next iteration, in
+        submission order, as a USER message ``"NOTE FROM USER:\n{text}"``
+        (``kind="inbox_note"``, ``source="run_inbox"``) and records an
+        ``inbox.delivered`` event carrying only the note id. Incoming
+        guardrails apply to the note text like any other message.
+
+        Notes on a WAITING_* or PAUSED run wait until it resumes. Delivery
+        is at-least-once (a crash between recording the message and marking
+        the note delivered can redeliver it). A note accepted while the run
+        makes its last LLM call may never be delivered: the run's result
+        then lists it in ``meta["undelivered_notes"]`` and
+        ``RunStore.get_notes`` shows it undelivered.
+
+        Args:
+            run_id: The run to notify.
+            text: Note text, non-empty, at most 32 KiB as UTF-8.
+            metadata: Optional JSON-serializable app data (at most 8 KiB
+                encoded). Stored with the note, never shown to the model.
+            tenant_id: When given, ``run_id`` must belong to exactly this
+                tenant (``None`` = untenanted) or ``RunNotFoundError`` is
+                raised. Omitted means unscoped.
+
+        Returns:
+            The note id.
+
+        Raises:
+            ValueError: empty/oversized text or invalid/oversized metadata.
+            PersistenceNotConfiguredError: Agent has no DB.
+            RunNotFoundError: ``run_id`` does not exist (or is outside
+                ``tenant_id``).
+            RunAlreadyTerminalError: the run already finished.
+        """
+        import json
+
+        from dendrux.errors import (
+            PersistenceNotConfiguredError,
+            RunAlreadyTerminalError,
+            RunNotFoundError,
+        )
+        from dendrux.types import RunStatus, generate_ulid
+
+        if not isinstance(text, str) or not text:
+            raise ValueError("Note text must be a non-empty string.")
+        if len(text.encode("utf-8")) > MAX_NOTE_TEXT_BYTES:
+            raise ValueError(f"Note text exceeds {MAX_NOTE_TEXT_BYTES} bytes as UTF-8.")
+        if metadata is not None:
+            try:
+                encoded = json.dumps(metadata, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Note metadata must be JSON-serializable.") from exc
+            if len(encoded.encode("utf-8")) > MAX_NOTE_METADATA_BYTES:
+                raise ValueError(
+                    f"Note metadata exceeds {MAX_NOTE_METADATA_BYTES} bytes as encoded JSON."
+                )
+
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+
+        note_id = generate_ulid()
+        if await store.add_note(
+            run_id, note_id=note_id, text=text, metadata=metadata, tenant_id=tenant_id
+        ):
+            return note_id
+        record = await store.get_run(run_id)
+        if record is None or not _in_tenant_scope(record, tenant_id):
+            raise RunNotFoundError(run_id)
+        raise RunAlreadyTerminalError(run_id, RunStatus(record.status))
 
     @overload
     def stream(
