@@ -33,7 +33,7 @@ The agent also assigns the run an **owner** (the agent's name). This isn't authe
 
 ## A run has exactly one status at a time
 
-A run is always in one of nine statuses (these come straight from the `RunStatus` enum in `dendrux.types`):
+A run is always in one of ten statuses (these come straight from the `RunStatus` enum in `dendrux.types`):
 
 | Status | What it means |
 |---|---|
@@ -42,16 +42,18 @@ A run is always in one of nine statuses (these come straight from the `RunStatus
 | `waiting_client_tool` | Paused, expecting a tool result from elsewhere (e.g. a browser). |
 | `waiting_human_input` | Paused, expecting a free-form text input from a human. |
 | `waiting_approval` | Paused, expecting a yes/no decision from a human on a tool call. |
+| `paused` | Paused on request (`request_pause`) or by a [budget](/docs/architecture/budget). Nothing is pending; `submit_resume` continues it. |
 | `success` | Terminal. The agent produced a final answer. |
 | `error` | Terminal. An unrecoverable error stopped the run. |
 | `cancelled` | Terminal. Someone called `cancel_run` and the runner observed the flag. |
 | `max_iterations` | Terminal. The run hit its iteration cap without finishing. |
 
-Three of those, `waiting_client_tool`, `waiting_human_input`, and `waiting_approval`, are the **paused** statuses. They differ in what kind of submission unfreezes them:
+Four of those, `waiting_client_tool`, `waiting_human_input`, `waiting_approval` and `paused`, are the **paused** statuses. They differ in what kind of submission unfreezes them:
 
 - `waiting_client_tool`: `agent.submit_tool_results(run_id, [...])`
 - `waiting_human_input`: `agent.submit_input(run_id, "text")`
-- `waiting_approval`: `agent.submit_approval(run_id, approved=True)`
+- `waiting_approval`: `agent.submit_approval(run_id, approved=True)` (or `decisions={...}` per call)
+- `paused`: `agent.submit_resume(run_id)`
 
 The runtime checks the pause type before accepting a submission. Submitting an approval to a run that's waiting for tool results raises `PauseStatusMismatchError`. This isn't pedantry; it catches a whole class of bugs where the wrong submit endpoint fires and silently corrupts the run.
 
@@ -63,7 +65,7 @@ A run is more than its status. Three things about it are persisted.
 
 **Events** are atomic moments emitted as the run progresses: `run.started`, `llm.completed`, `tool.completed`, `run.paused`, `run.resumed`, `run.completed`. Each event has a monotonic `sequence_index` so SSE clients can reconnect and ask "give me everything after sequence 47" without losing or duplicating events. Events drive the live dashboard and any custom UI you build.
 
-**Pause data** is the small payload attached to a run when it pauses. For `waiting_client_tool` it's the list of pending tool calls the LLM made. For `waiting_human_input` it's the question being shown to the human. For `waiting_approval` it's the action the agent wants to take. Pause data is what your write endpoint reads to know what to render to the user.
+**Pause data** is the small payload attached to a run when it pauses. (A `paused` run has none outstanding: its pending call list is empty, and resume simply continues the loop.) For `waiting_client_tool` it's the list of pending tool calls the LLM made. For `waiting_human_input` it's the question being shown to the human. For `waiting_approval` it's the action the agent wants to take. Pause data is what your write endpoint reads to know what to render to the user.
 
 Steps and events are append-only. Once written, they're never modified. Only the `status` field on the run row changes over time. This is on purpose: an audit trail you can rewrite isn't an audit trail.
 
@@ -88,6 +90,9 @@ Here's the whole state machine in one picture:
                      ├──────────► [waiting_approval]
                      │                   │ submit_approval
                      │                   │
+                     ├──────────► [paused]
+                     │                   │ submit_resume
+                     │                   │
                      │  cancel_run observed at next checkpoint
                      ├─────────────────────────────────► [cancelled]
                      │
@@ -103,7 +108,7 @@ Two things to notice.
 
 **Pauses aren't errors.** A run that's `waiting_client_tool` is a successful, in-progress run that happens to be paused. Your code shouldn't treat pause statuses as failures; they're the contract between the agent and your application.
 
-**Cancellation is cooperative, with one controlled exception.** When you call `cancel_run`, dendrux sets a flag in the database. The runner observes that flag at two safe checkpoints: the top of every iteration, and right before pausing. In-flight tool calls always finish first. For a streamed run owned by the same `Agent` instance, `cancel_run` also interrupts the in-flight model stream between tokens and keeps the partial text as the run's `answer`, so a one-turn chat reply can be stopped mid-sentence. Either way the run ends with a `run.cancelled` event. See [Cancellation](/docs/architecture/cancellation) for the full story.
+**Cancellation is cooperative, with one controlled exception.** When you call `cancel_run`, dendrux sets a flag in the database. The runner observes that flag at two safe checkpoints: the top of every iteration, and right before pausing. For a run executing in the same process on the same `Agent` instance, `cancel_run` also interrupts the in-flight call: a streamed run abandons its model stream between tokens and keeps the partial text as the run's `answer` (so a one-turn chat reply can be stopped mid-sentence), and a batch `run()` returns a `cancelled` result at once, tools included. Everywhere else, in-flight tool calls finish first. Either way the run ends with a `run.cancelled` event. A related control, `request_pause`, works the same cooperative way but parks the run as `paused` instead of ending it; see [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause). See [Cancellation](/docs/architecture/cancellation) for the full story.
 
 ## Verified end-to-end
 

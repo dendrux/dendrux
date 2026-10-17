@@ -5,7 +5,7 @@ description: Human-in-the-loop gating on gated tool calls, with a persist-and-re
 
 # Approval
 
-Approval is the governance layer that gates a specific tool call on an explicit human decision. The agent is declared with `require_approval=["tool_name"]`. When the LLM emits that tool call, the runtime does not execute it. Instead, the run pauses with `status=waiting_approval`, persists the pending call in `pause_data`, and returns. A later call to `submit_approval(run_id, approved=...)` either lets the call execute or synthesizes a rejection, and the loop continues.
+Approval is the governance layer that gates a specific tool call on an explicit human decision. The agent is declared with `require_approval=["tool_name"]`. When the LLM emits that tool call, the runtime does not execute it. Instead, the run pauses with `status=waiting_approval`, persists the pending call in `pause_data`, and returns. A later call to `submit_approval` either lets each call execute or synthesizes a denial for it, and the loop continues. You can decide the whole batch at once (`approved=True` or `False`) or call by call (`decisions={call_id: ApprovalDecision...}`).
 
 The power of this design is that the two halves of the flow do not have to share a process, a server, or a memory space. The starter can return an HTTP response while the run sits paused in the DB; a reviewer can open a separate request hours later and approve or reject. Nothing about the handoff depends on in-memory continuity.
 
@@ -68,7 +68,7 @@ Five things to notice:
 1. The `approval.requested` event (seq=2) and the `tool.completed` event (seq=5) share the same `correlation_id`. That id is the `tool_call.id`, so a reader can join the approval decision to the specific call it authorized.
 2. The pause at seq=3 and the resume at seq=4 are adjacent in the log but written by two different processes. [Event ordering](/docs/architecture/event-ordering) explains why `sequence_index` still runs straight through.
 3. The tool function ran only once, between seq=4 and seq=5, after the approval was in hand. No speculative execution.
-4. `approval.decided` (seq=6) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "..."}`. This row is the audit record of the human's choice.
+4. `approval.decided` (seq=6) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "...", "decisions": [...]}`, with one entry per pending call (see [What `approval.decided` records](#what-approvaldecided-records)). This row is the audit record of the human's choice.
 5. The run finishes as `status=success`. Approval did not need to be terminal.
 
 ## The reject path
@@ -127,25 +127,111 @@ async def submit_approval(
     self,
     run_id: str,
     *,
-    approved: bool,
+    approved: bool | None = None,
+    decisions: Mapping[str, ApprovalDecision] | None = None,
     rejection_reason: str | None = None,
     notifier: LoopNotifier | None = None,
 ) -> RunResult:
-    """
-    - approved=True: claims and resumes; the approval-gated tool
-      executes server-side and its output is fed to the LLM.
-    - approved=False: the pending batch is treated as all rejected.
-      Every pending tool call receives a synthetic failed ToolResult
-      carrying rejection_reason (default: "User declined to run this tool.").
-      The LLM decides what to do next.
-    """
+    """Pass exactly one of approved= (whole batch) or decisions= (per call)."""
 ```
 
-Three constraints that shape how callers build around this method:
+Pass exactly one of `approved=` or `decisions=`; passing both or neither raises `ValueError`, as does `rejection_reason` together with `decisions=`.
 
-1. **The decision is per-batch, not per-call.** If the LLM emits two tool calls in one turn and both are gated, one `submit_approval` decides the fate of both. The source comment is explicit: "Per-tool approve/reject within a batch is not supported." If finer-grained approval is needed, the caller has to split the batch upstream (e.g., with a different prompt shape that produces one gated call at a time).
-2. **CAS-guarded.** Like every resume method, `submit_approval` uses `claim_paused_run` to flip the row from `waiting_approval` to `running` atomically. Two concurrent Approve clicks resolve deterministically: one wins and runs the tool; the other raises `PauseStatusMismatchError` and can be shown as "this request has already been decided."
-3. **Idempotent against terminal runs.** If the run has already been finalized (someone else cancelled it, for example), `submit_approval` will either raise `RunAlreadyTerminalError` or short-circuit with the current state, depending on exactly how the race unfolded.
+| Form | What happens |
+| --- | --- |
+| `approved=True` | Every approval-gated server call executes, and so does every held non-gated server call. |
+| `approved=False` | Every pending call receives a synthetic failed `ToolResult` whose payload is `rejection_reason` as a JSON string (default `"User declined to run this tool."`). Same bytes as before 0.3. |
+| `decisions={call_id: ApprovalDecision.approve() \| ApprovalDecision.deny(reason)}` | Each gated call is decided on its own. A denied call gets a failed result whose payload is `{"denied": reason}`. |
+
+## Per-call decisions
+
+```python
+from dendrux import ApprovalDecision
+
+await agent.submit_approval(
+    run_id,
+    decisions={
+        call_a: ApprovalDecision.approve(),
+        call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
+    },
+)
+```
+
+The keys must be exactly the ids of the **approval-gated** calls: the calls that fired `approval.requested`. A missing id, an unknown id, or a duplicate raises `ValueError` before anything is claimed, so a wrong request leaves the run waiting. Call ids are in the `approval.requested` events (`correlation_id` and `data.call_id`) and in the `run.paused` event's `pending_tool_calls`.
+
+How the batch resolves on resume:
+
+1. The runtime walks `pending_tool_calls` in model order. It appends one `TOOL` message for each resolved server or denied call; client-target calls remain pending, and their messages are appended later by `submit_tool_results`, after the server results.
+2. **Approved** gated calls execute server-side through the normal executor path.
+3. **Denied** calls are skipped. The model sees a failed tool result `{"denied": "<reason>"}`, and a `tool_calls` row is written with `success=0` and the reason as `error_message`, like the batch reject path.
+4. **Held non-gated** calls, server calls that sat in the batch but never needed approval, execute automatically. They are not part of `decisions`.
+5. **Client-target** calls never execute on the server (see below).
+
+The decisions are saved in `pause_data["submitted_decisions"]` in the same step that claims the run. No migration is involved.
+
+### Which calls are gated
+
+When a batch pauses for approval, the runtime saves a snapshot of the gated calls in `pause_data["approval_gates"]`, as `{call_id: {"source": "static" | "hook", "reason": ...}}`. `source="static"` means the tool is in `require_approval=[...]`; `source="hook"` means a [`before_tool`](/docs/architecture/tool-policy) hook returned `require_approval`.
+
+`submit_approval(decisions=...)` validates only against that snapshot. Policy is never recomputed at decision time, so the process that submits the decision may be a different `Agent` instance, with a different (or no) `before_tool` hook, and still validates correctly. A pause saved by an earlier release has no snapshot; for those, every server call in the batch counts as gated, so nothing runs without an explicit decision.
+
+One gated call pauses the whole remaining batch: the non-gated calls are held until the human decides, so the model's tool results go back together.
+
+### Mixed server and client batches
+
+A batch can contain server calls and client-target calls (see [Pause and resume](/docs/architecture/pause-resume)). Each pending call is routed by its saved target on resume:
+
+- Server calls (approved or non-gated) execute.
+- **Client-target calls are never executed on the server**, whichever form you use, `approved=True` included. They stay pending and the run moves to `waiting_client_tool` so the client can run them and call `submit_tool_results`.
+
+> Before 0.3.0, an approved batch executed every pending call server-side, including client-target ones. That was a bug and a security risk: a tool meant to run in the user's environment ran on the server. It is fixed; see the CHANGELOG.
+
+`approved=False` rejects every pending call, client calls included, so the model gets a denial for each.
+
+## What `approval.decided` records
+
+`approval.decided` keeps its scalar `decision` and `run_id`. The scalar is `approved`, `rejected` or `mixed`. A new `decisions` list has one entry per pending call, whatever the form:
+
+```json
+{
+  "decision": "mixed",
+  "run_id": "01KPG17P8XNWVJC1EN0M3XKCK4",
+  "decisions": [
+    {"call_id": "01KPG...A", "tool_name": "refund", "decision": "approved", "reason": null},
+    {"call_id": "01KPG...B", "tool_name": "refund", "decision": "denied", "reason": "Order 2 is outside the refund window"},
+    {"call_id": "01KPG...C", "tool_name": "lookup", "decision": "not_gated_executed", "reason": null}
+  ]
+}
+```
+
+Each entry's `decision` is one of `approved`, `denied`, `not_gated_executed` or `client_pending`. The payload carries tool names and call ids, never params.
+
+## Approve later
+
+The decision belongs to the pause. Once a run has moved on, there is no way to approve a call after the fact. When "not now, but maybe later" is a real workflow (a review queue, a daily batch), deny the call with a reason that says so, and let your application run the action itself when someone signs it off:
+
+```python
+# 1. Hold the call now. The model is told the action is queued.
+await agent.submit_approval(
+    run_id,
+    decisions={call_id: ApprovalDecision.deny("Held for review: ticket 4412")},
+)
+
+# 2. Later, after a reviewer approves, run the action yourself.
+#    For an MCP tool, call it straight on the connection:
+await connection.call_tool("create_issue", {"title": "Rotate the key"})
+```
+
+`call_tool` bypasses all Agent governance, so authorize the call in your own code first. See [Calling a tool directly](/docs/architecture/mcp#calling-a-tool-directly). The run itself carries on with the model's view that the action is pending.
+
+## CAS-guarded and idempotent
+
+Two things hold in every form of `submit_approval`:
+
+1. **CAS-guarded.** Batch approve uses `claim_paused_run`; per-call decisions and batch reject use `submit_and_claim`, so the submitted data and the `waiting_approval` to `running` claim commit atomically. Two concurrent Approve clicks resolve deterministically: one wins; the other raises `PauseStatusMismatchError` or `RunAlreadyClaimedError` and can be shown as "this request has already been decided."
+2. **Terminal-safe.** If the run has already been finalized (someone else cancelled it, for example), `submit_approval` raises `RunAlreadyTerminalError`. A run whose cancellation was requested but not yet observed is refused the same way.
+
+After the claim, and before each approved call executes, the runtime checks for a cancel and then a pause request. A cancel finalizes the run before any further side effect; a [requested pause](/docs/architecture/pause-resume#requesting-a-pause) parks the rest of the batch with the decisions already made, and resume continues it without asking again.
 
 The `notifier=` kwarg lets the submit call attach its own notifier for the rest of the run. The notifier passed to the original `run()` call is not remembered across processes (the resumer is a different process), so the resumer supplies one explicitly if it wants live observability.
 
@@ -163,6 +249,7 @@ The pause-and-resume flow is a superset of the callback flow: anything a callbac
 
 - Declared on `Agent(require_approval=[...], tools=[...])`.
 - Enforced in `dendrux.runtime.runner` and `dendrux.loops.react.ReActLoop` (the pause and re-dispatch logic).
-- Resolved with `agent.submit_approval(run_id, approved=...)`.
-- Emits `approval.requested` (on pause) and `approval.decided` (when approved) on `run_events`.
+- Resolved with `agent.submit_approval(run_id, approved=...)` or `agent.submit_approval(run_id, decisions={...})`.
+- Gates can also come from a [`before_tool` policy hook](/docs/architecture/tool-policy).
+- Emits `approval.requested` (one per gated call, on pause) and `approval.decided` (once, on resume) on `run_events`.
 - Persists the pending batch in `agent_runs.pause_data` until resume. See [Pause and resume](/docs/architecture/pause-resume) for the state-machine side.

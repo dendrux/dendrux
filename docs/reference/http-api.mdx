@@ -232,11 +232,12 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | `event_type` | When | `data` payload |
 | --- | --- | --- |
 | `run.started` | First event on any run | `{"agent_name": str, "system_prompt": str}` |
-| `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval", "pending_tool_calls": [{"id", "name", "target", "params"}]}` |
-| `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}` |
+| `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval" \| "paused", "pending_tool_calls": [{"id", "name", "target", "params"}]}`. A `paused` status adds `"reason": "requested" \| "budget"` and, if `request_pause(reason=...)` gave one, `"message"` (up to 500 chars); a budget pause adds `"exceeded": [{"metric", "used", "max"}]`. `pending_tool_calls` is empty for a pause with nothing outstanding |
+| `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}`; `resumed_from` is `"paused"` after `submit_resume` |
 | `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str}` |
-| `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, or streamed run interrupted / closed | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when a model stream was abandoned mid-generation; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream |
+| `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, run or stream interrupted, or a budget cancel | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when `cancel_run` abandoned a model call (`partial_output` is always `false` for batch `run()`); `{"reason": "task_cancelled"}` when the task awaiting `run()` was cancelled; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream; `{"reason": "budget_exceeded", "exceeded": [{"metric", "used", "max"}]}` for `Budget(on_exceed="cancel")` |
 | `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars) |
+| `run.interrupted` | `sweep(stale_running=...)` finalized a stale `running` run | `{"failure_reason": "stale_running" \| "never_started"}` |
 | `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens", "cost_usd", "cost_source", "usage_reported", "model", "has_tool_calls", "phase"}` |
 | `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`; malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
 
@@ -246,11 +247,16 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 
 | `event_type` | Fires when | `data` payload |
 | --- | --- | --- |
-| `policy.denied` | LLM called a tool in the agent's `deny=` set | `{"tool_name", "call_id", "reason": "denied_by_policy"}`, `correlation_id` = tool call id |
-| `approval.requested` | Tool in `require_approval=` set reached the executor | `{"tool_name", "call_id", "reason": "requires_approval"}`, `correlation_id` = tool call id |
-| `approval.decided` | Human submitted approval decision | `{"decision": "approved" \| "rejected", "run_id": str}` |
-| `budget.threshold` | Usage crossed a `warn_at` fraction | `{"fraction": float, "used": int, "max": int, "reason": "threshold_crossed"}` |
-| `budget.exceeded` | Usage reached `max_tokens` | `{"used": int, "max": int, "reason": "budget_exceeded"}` |
+| `policy.denied` | LLM called a tool in the agent's `deny=` set, or the `before_tool` hook denied the call | Static: `{"tool_name", "call_id", "reason": "denied_by_policy"}`. Hook: `{"tool_name", "call_id", "reason": str, "source": "hook"}`. `correlation_id` = tool call id |
+| `policy.substituted` | The `before_tool` hook returned `ToolDecision.substitute(...)`; the tool did not run | `{"tool_name", "call_id"}`, `correlation_id` = tool call id |
+| `policy.hook_error` | The hook raised, returned a non-decision, or substituted a non-JSON value; the call was denied | `{"tool_name", "call_id", "error_type": str}` (exception type only), `correlation_id` = tool call id |
+| `policy.hook_warning` | The hook asked for approval on a client-target tool; the call was denied | `{"tool_name", "call_id", "warning": "approval is not supported for client tools"}`, `correlation_id` = tool call id |
+| `approval.requested` | A gated call reached the approval gate: a tool in `require_approval=`, or a hook `require_approval` | Static: `{"tool_name", "call_id", "reason": "requires_approval"}`. Hook: `{"tool_name", "call_id", "reason": str, "source": "hook"}`. One event per gated call; `correlation_id` = tool call id |
+| `approval.decided` | Human submitted approval decision | `{"decision": "approved" \| "rejected" \| "mixed", "run_id": str, "decisions": [{"call_id", "tool_name", "decision": "approved" \| "denied" \| "not_gated_executed" \| "client_pending", "reason": str \| null}]}`. `decisions` lists every pending call, in order |
+| `inbox.delivered` | The runner delivered an inbox note to the model | `{"note_id": str}`, `correlation_id` = note id. Never carries the note text |
+| `budget.threshold` | Usage crossed a `warn_at` fraction of a limit | `{"metric": "tokens" \| "cost_usd", "fraction": float, "used": number, "max": number, "reason": "threshold_crossed"}` |
+| `budget.exceeded` | Usage reached a limit | `{"metric": "tokens" \| "cost_usd", "used": number, "max": number, "reason": "budget_exceeded", "action": "warn" \| "pause" \| "cancel"}` |
+| `budget.unpriced` | A `max_cost_usd` budget met its first unpriced LLM call in the run (once per run) | `{"metric": "cost_usd", "used": float, "max": float, "unpriced_calls": int, "known_cost_usd": float}` |
 | `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
 | `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "outgoing", "error": str}` |
@@ -267,11 +273,11 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 | `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
 
-Each `budget.threshold` fraction fires at most once per run. `budget.exceeded` fires at most once per run. Pause/resume persists the fired set, so resumed runs do not re-fire.
+Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and `budget.exceeded` at most once per metric. Every pause persists the fired set, so resumed runs do not re-fire.
 
 ## Write-side agent methods
 
-Dendrux does not ship HTTP write routes. You wrap these four methods in your own endpoints so auth, validation, and transport stay yours.
+Dendrux does not ship HTTP write routes. You wrap these methods in your own endpoints so auth, validation, and transport stay yours.
 
 ### `agent.submit_tool_results(run_id, results, *, notifier=None) -> RunResult`
 
@@ -298,38 +304,60 @@ Submit a clarification for a run paused in `WAITING_HUMAN_INPUT`. Same race-safe
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`.
 
-### `agent.submit_approval(run_id, *, approved, rejection_reason=None, notifier=None) -> RunResult`
+### `agent.submit_approval(run_id, *, approved=None, decisions=None, rejection_reason=None, notifier=None) -> RunResult`
 
-Submit an approval decision for a run paused in `WAITING_APPROVAL`.
+Submit an approval decision for a run paused in `WAITING_APPROVAL`. Pass exactly one of `approved=` and `decisions=`.
 
-- `approved=True`: CAS-claims, executes the pending tools server-side, feeds results back to the LLM.
-- `approved=False`: builds one synthetic failed `ToolResult` per pending call, each carrying `rejection_reason` (default: `"User declined to run this tool."`). The LLM decides what to do next.
+- `approved=True`: CAS-claims, executes the approval-gated and held non-gated server calls, feeds results back to the LLM.
+- `approved=False`: builds one synthetic failed `ToolResult` per pending call, each carrying `rejection_reason` (default: `"User declined to run this tool."`) as a JSON string. The LLM decides what to do next.
+- `decisions={call_id: ApprovalDecision.approve() | ApprovalDecision.deny(reason)}`: per-call decisions. The keys must be exactly the approval-gated call ids (the `approval.requested` events); a missing, unknown or duplicate id raises `ValueError` before anything is claimed. A denied call gets a failed result `{"denied": reason}`. `rejection_reason` is not allowed with `decisions`.
 
-Per-tool approve/reject within a batch is not supported. Pre-split upstream if you need finer granularity.
+Client-target calls in the batch never execute on the server in any form; the run pauses again as `waiting_client_tool` for them.
 
-Raises: same set as the other submit methods.
+Raises: the same set as the other submit methods, plus `ValueError` for an invalid argument combination or decision ids.
 
-### `agent.cancel_run(run_id) -> RunResult`
+### `agent.submit_resume(run_id, *, notifier=None) -> RunResult`
+
+Continue a run in status `PAUSED` (a requested or budget pause) with its full history. Same race-safety as the other submit methods. Blocks until the next pause or terminal state.
+
+Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError` (the run is paused for another reason), `RunAlreadyClaimedError`, `RunAlreadyTerminalError`.
+
+### `agent.request_pause(run_id, *, cascade=True, tenant_id=..., reason=None) -> PauseOutcome`
+
+Ask a running run to pause at its next checkpoint. Returns once the request is recorded, not once the run has paused; `run.paused` confirms. A `waiting_*`, `paused` or terminal run is a no-op. `cascade=True` flags descendants too (flag propagation only). `tenant_id` scopes the request to one tenant.
+
+Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `ValueError` (bad `reason`).
+
+### `agent.submit_note(run_id, text, *, metadata=None, tenant_id=...) -> str`
+
+Leave a note for a non-terminal run. Returns the note id. Delivered at the next iteration; at-least-once.
+
+Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunAlreadyTerminalError`, `ValueError` (empty text, text over 32 KiB, metadata not JSON or over 8 KiB).
+
+### `agent.cancel_run(run_id, *, cascade=False, tenant_id=...) -> RunResult`
 
 Cooperative cancellation with atomic finalize on the paused path.
 
 Behavior by current state:
 
-- **Paused** (any process): atomic CAS finalize to `CANCELLED` in one round-trip. Emits `run.cancelled` with `{"reason": "cancel_requested"}` (sequenced after any prior paused event so SSE clients reading by `after_sequence_index` do not miss it).
+- **Paused** (any process; `waiting_*` or `paused`): atomic CAS finalize to `CANCELLED` in one round-trip. Emits `run.cancelled` with `{"reason": "cancel_requested"}` (sequenced after any prior paused event so SSE clients reading by `after_sequence_index` do not miss it).
 - **Running** (any process, persisted): sets `cancel_requested=True`. The runner observes the flag at the top of the next iteration and at the pre-pause checkpoint. Tool calls complete; cancel is observed between steps.
+- **Batch `run()` on this agent instance**: also cancels the awaiting task. The in-flight model call or tool is interrupted, and `run()` returns `CANCELLED` with `meta["interrupted"] = True`.
 - **Streamed run on this agent instance** (`stream()` / `resume_stream()`): also fires an in-process interrupt. The in-flight model stream is abandoned immediately and the stream yields `RUN_CANCELLED` with the partial `answer` (persisted on the row). Once the model's final event is in hand, completion wins.
 - **In-process submit/resume task on this agent instance**: the asyncio task is also cancelled synchronously.
 - **Terminal**: no-op. Returns current persisted state. Does not raise.
 - **Non-persisted**: unsupported. Raises `PersistenceNotConfiguredError`.
 
+A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. `cascade=True` also cancels non-terminal descendants (deepest first, per-run outcomes in `meta["cascade"]`); `tenant_id` scopes the call.
+
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 
 ### Minimal write-route wrappers
 
-A complete set of write endpoints on top of FastAPI:
+A single-tenant example follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to `request_pause`, `submit_note`, and `cancel_run`; omitting `tenant_id` is unscoped, while explicit `tenant_id=None` means untenanted runs only. The `submit_*` methods have no tenant parameter, so verify run ownership before calling them. The sample below does both: `owned_run` is a dependency that checks the run belongs to the caller's tenant before any route touches it.
 
 ```python
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from dendrux.errors import (
     InvalidToolResultError,
@@ -340,7 +368,21 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
+from dendrux import ApprovalDecision
+from dendrux.store import RunNotFoundError as StoreRunNotFoundError
 from dendrux.types import ToolResult
+
+def tenant_of(request: Request) -> str:
+    """Your auth layer: the tenant of the authenticated caller."""
+    return request.state.tenant_id
+
+async def owned_run(run_id: str, tenant_id: str = Depends(tenant_of)) -> str:
+    """Ownership check for every route. The submit_* methods take no tenant_id."""
+    try:
+        await store.get_subtree(run_id, tenant_id=tenant_id)   # root must be in this tenant
+    except StoreRunNotFoundError:
+        raise HTTPException(404, "run not found")
+    return run_id
 
 writes = APIRouter(dependencies=[Depends(authorize)])
 
@@ -353,7 +395,7 @@ class ToolResultBody(BaseModel):
     duration_ms: int = 0
 
 @writes.post("/runs/{run_id}/tool-results")
-async def submit_tool_results(run_id: str, results: list[ToolResultBody]):
+async def submit_tool_results(results: list[ToolResultBody], run_id: str = Depends(owned_run)):
     try:
         result = await agent.submit_tool_results(
             run_id, [ToolResult(**r.model_dump()) for r in results]
@@ -370,24 +412,59 @@ async def submit_tool_results(run_id: str, results: list[ToolResultBody]):
     return {"status": result.status.value, "answer": result.answer}
 
 @writes.post("/runs/{run_id}/input")
-async def submit_input(run_id: str, body: dict):
+async def submit_input(body: dict, run_id: str = Depends(owned_run)):
     # (same try/except shape)
     result = await agent.submit_input(run_id, body["text"])
     return {"status": result.status.value, "answer": result.answer}
 
 @writes.post("/runs/{run_id}/approval")
-async def submit_approval(run_id: str, body: dict):
-    result = await agent.submit_approval(
-        run_id,
-        approved=body["approved"],
-        rejection_reason=body.get("rejection_reason"),
-    )
+async def submit_approval(body: dict, run_id: str = Depends(owned_run)):
+    # Whole batch: {"approved": true}. Per call: {"decisions": {"<call_id>": {"approved": false, "reason": "..."}}}
+    if "decisions" in body:
+        decisions = {
+            call_id: ApprovalDecision(approved=d["approved"], reason=d.get("reason"))
+            for call_id, d in body["decisions"].items()
+        }
+        result = await agent.submit_approval(run_id, decisions=decisions)
+    else:
+        result = await agent.submit_approval(
+            run_id,
+            approved=body["approved"],
+            rejection_reason=body.get("rejection_reason"),
+        )
     return {"status": result.status.value, "answer": result.answer}
 
+@writes.post("/runs/{run_id}/pause")
+async def request_pause(
+    body: dict | None = None,
+    run_id: str = Depends(owned_run),
+    tenant_id: str = Depends(tenant_of),
+):
+    outcome = await agent.request_pause(
+        run_id, tenant_id=tenant_id, reason=(body or {}).get("reason")
+    )
+    return {"status": outcome.status_after.value, "affected": outcome.affected}
+
+@writes.post("/runs/{run_id}/resume")
+async def resume(run_id: str = Depends(owned_run)):
+    result = await agent.submit_resume(run_id)
+    return {"status": result.status.value, "answer": result.answer}
+
+@writes.post("/runs/{run_id}/notes")
+async def add_note(
+    body: dict,
+    run_id: str = Depends(owned_run),
+    tenant_id: str = Depends(tenant_of),
+):
+    note_id = await agent.submit_note(
+        run_id, body["text"], metadata=body.get("metadata"), tenant_id=tenant_id
+    )
+    return {"note_id": note_id}
+
 @writes.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str):
+async def cancel_run(run_id: str = Depends(owned_run), tenant_id: str = Depends(tenant_of)):
     try:
-        result = await agent.cancel_run(run_id)
+        result = await agent.cancel_run(run_id, tenant_id=tenant_id)
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
     except PersistenceNotConfiguredError:
@@ -412,6 +489,7 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids). No partial claim. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
+| `ContextLengthExceededError` | `RuntimeError` | 413 or 400 | An OpenAI-compatible endpoint rejected the request as larger than the model's context window. Raised by `run()` / `stream()`, not by a submit method. |
 | `SkillMissingError` | `SkillContinuityError` | 409 | The run was created with a skill this agent does not have. Run stays paused; attach the skill and retry. |
 | `SkillMismatchError` | `SkillContinuityError` | 409 | A skill the run was created with has different content now. Run stays paused; attach the original content and retry. |
 
@@ -421,6 +499,8 @@ From `dendrux.store`:
 
 - `RunSummary` - list view row.
 - `RunDetail` - single run detail.
+- `RunSubtree`, `SubtreeNode`, `RunUsage` - a run's delegation tree with live usage (`RunStore.get_subtree`).
+- `RunNote` - one inbox note (`RunStore.get_notes`).
 - `StoredEvent` - one `run_events` row.
 - `LLMCall` - one `llm_interactions` row.
 - `ToolInvocation` - one `tool_calls` row.
@@ -457,7 +537,7 @@ async with RunStore.from_database_url("...") as store:
 
 - Read endpoints and SSE: `dendrux/http/read_router.py`, mounted via `make_read_router(store=, authorize=)`.
 - Read types: `dendrux/store/__init__.py` (`RunStore`, `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`).
-- Write-side agent methods: `dendrux/agent.py` (`submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`).
+- Write-side agent methods: `dendrux/agent.py` (`submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `request_pause`, `submit_note`, `cancel_run`).
 - Exceptions: `dendrux/errors.py`.
 - Event type enum: `dendrux/types.py` (`GovernanceEventType`, `RunStatus`).
 - Lifecycle event strings: `dendrux/runtime/runner.py` and `dendrux/runtime/persistence.py`.

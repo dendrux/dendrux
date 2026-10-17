@@ -671,6 +671,34 @@ for tool in discovery.tools:          # raw server names, before namespacing or 
 
 It takes the same path an Agent lease takes — credential resolution, circuit breaker, capacity, single-flight connect — and raises the same errors, so `MCPAuthenticationError` here means the same thing it means at run time. The lease is released before it returns, which leaves the connection warm for `idle_timeout`: the next Agent reuses it without reconnecting. Calling `discover()` ahead of a user's first turn is therefore also the warm-up for first-connect latency, including after idle retirement. The returned catalog is the live physical connection's; to force rediscovery, evict.
 
+## Calling a tool directly
+
+An application sometimes needs to run a server tool itself, outside any Agent run: executing an action a reviewer just signed off (the [approve-later recipe](/docs/architecture/approval#approve-later)), a health check, a scheduled job. `call_tool` on a managed connection does that:
+
+```python
+result = await connection.call_tool("create_issue", {"title": "Rotate the key"})
+result = await connection.call_tool("export_report", {"id": 7}, timeout=30)
+```
+
+```python
+async def call_tool(
+    self,
+    name: str,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    timeout: float | None = None,
+) -> Any
+```
+
+- **`name` is the server's own tool name**, as `discover()` lists it, not the prefixed or renamed name an Agent view exposes. A name the server does not list raises `MCPToolNotFoundError` (error code `tool_not_found`) without sending a `tools/call` request. The error carries the name with any configured credential scrubbed.
+- **It takes the same path as an Agent-run call.** The connection lease, the runtime-wide in-flight cap (`max_in_flight_calls`), the stale-definition check, one recoverable 401 re-authentication, telemetry, result normalization, credential redaction and the error mapping are all shared. You get back the payload an Agent tool would receive, and a result the server flags as an error raises `MCPToolCallError`.
+- **`timeout` is an outer deadline in seconds**, covering queueing, connecting and the call. On expiry you get a `TimeoutError`, and if the call had already started its outcome is unknown: the server may still apply it, so do not retry automatically. `timeout=None` adds no deadline of its own but does **not** disable the source's transport `call_timeout`, which always applies.
+- Like `discover()`, await it on the event loop the runtime is bound to.
+
+> **`call_tool` bypasses all Agent governance.** There is no `deny=`, no `require_approval=`, no `before_tool` hook, no guardrails, no tenant authorization beyond the connection's own identity, no run row, no `tool_calls` record and no budget. It is your application's call and your application's audit. Authorize each call in your own code, and never expose `call_tool` (or a route wrapping it with caller-chosen names and arguments) directly to a model or an untrusted client.
+
+A malicious or buggy server can advertise a tool whose name echoes the credential it was just sent. Dendrux's own logs, error messages and telemetry scrub credential-shaped tool names. The MCP SDK's own DEBUG logging is outside Dendrux's control and may echo raw tool names, so keep SDK loggers above DEBUG in production.
+
 ## Failure modes at discovery
 
 Each source chooses how discovery failure affects the run:
@@ -703,6 +731,7 @@ Branch on `code`, never on `error` text. It is derived from the exception class 
 | `MCPConnectionLostError`, any other `MCPConnectionError` | `connection_failed` |
 | `MCPStaleConnectionError`, `MCPConnectionEvictingError`, any other `MCPConnectionStateError` | `connection_state` |
 | `MCPToolNameCollisionError` (an exposed name equals another source's tool, a local tool, or a reserved skill tool name) | `tool_name_collision` |
+| `MCPToolNotFoundError` (`connection.call_tool` named an unlisted tool) | `tool_not_found` |
 | `ValueError` from tool naming with `strict=True` | `invalid_tool_names` |
 | anything else | `unknown` |
 
@@ -759,7 +788,7 @@ An Agent caches discovery for its lifetime, so a source skipped once stays skipp
 
 ## Calls, errors, and result limits
 
-MCP calls pass through the ordinary Dendrux server-tool execution path: deny rules, approval pauses, guardrails, call limits, timeouts, persisted tool calls, [`tool_result_transform`](/docs/reference/agent#transforming-tool-results), and completion/error events work the same way as for local tools.
+MCP calls made by the model pass through the ordinary Dendrux server-tool execution path: deny rules, the [`before_tool` policy hook](/docs/architecture/tool-policy), approval pauses, guardrails, call limits, timeouts, persisted tool calls, [`tool_result_transform`](/docs/reference/agent#transforming-tool-results), and completion/error events work the same way as for local tools.
 
 The integration preserves:
 
@@ -774,6 +803,7 @@ The integration preserves:
 | --- | --- | --- |
 | `MCPToolCallError` | An admitted tool call failed; some local lifecycle rejections also use this base type. | Usually. Do not infer delivery from this base type alone. |
 | `MCPOutcomeUnknownError` | The call was interrupted; the server may have applied it. | Maybe — never retry automatically. |
+| `MCPToolNotFoundError` | `connection.call_tool` named a tool the server does not list. | No `tools/call` request. |
 | `MCPCircuitOpenError` | Connect attempts are failing fast; carries `retry_after`. | No. |
 | `MCPConnectionCapacityError` / `MCPCallCapacityError` | Capacity limit reached within the wait budget. | No. |
 | `MCPConnectionError` | The connection could not be established. | No. |

@@ -1,6 +1,6 @@
 ---
 title: Agent
-description: The Agent constructor and every public runtime method (run, resume, the submit family, stream, cancel, retry, close) with exact signatures.
+description: The Agent constructor and every public runtime method (run, resume, the submit family, pause, notes, stream, cancel, retry, close) with exact signatures.
 ---
 
 # Agent
@@ -49,6 +49,7 @@ Agent(
     deny_skills: list[str] | None = None,
     skill_executor: SkillExecutor | None = None,
     tool_result_transform: ToolResultTransform | None = None,
+    before_tool: BeforeToolHook | None = None,
 )
 ```
 
@@ -68,12 +69,13 @@ Agent(
 | `state_store` | An explicit `StateStore` instead of `database_url` (mutually exclusive). |
 | `deny` | Tool names that can never execute. See [Access control](/docs/architecture/access-control). |
 | `require_approval` | Server-tool names that pause for approval. See [Approval](/docs/architecture/approval). |
-| `budget` | A `Budget(max_tokens=..., warn_at=...)`. See [Budget](/docs/architecture/budget). |
+| `budget` | A `Budget(max_tokens=..., max_cost_usd=..., warn_at=..., on_exceed=..., include_children=...)`. Token and dollar limits with an optional pause or cancel. See [Budget](/docs/architecture/budget). |
 | `pricing` | A `PriceTable` of USD-per-million-token rates used to fill `cost_usd` for providers that report tokens only. See [Cost and pricing](/docs/architecture/pricing). |
 | `guardrails` | List of guardrails scanned each turn. See [Guardrails](/docs/architecture/guardrails). |
 | `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. `skills_dir` is read lazily at the first run. See [Skills](/docs/architecture/skills). |
 | `skill_executor` | A `SkillExecutor` subclass instance that runs skill scripts. Without it, `run_skill_script` is not offered to the model. See [Running scripts](/docs/architecture/skills#running-scripts). |
 | `tool_result_transform` | Callable that rewrites a server tool's result before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
+| `before_tool` | Sync or async policy hook, run once for each parsed tool call that passes static `deny=` and skill preflight, before approval; called with a `ToolCallContext`, returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
 
 Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, and tools with `SingleCall` all raise `ValueError`.
 
@@ -132,12 +134,21 @@ for runs with no narration, and for idempotent cached results. Persisted traces
 carry the same split as `TraceEntry.phase`. A paused run may instead carry a
 clarification question.
 
-Cancelling the coroutine awaiting `run()` (including via `asyncio.wait_for`)
-atomically finalizes a still-running persisted run as `cancelled`, emits
-`run.cancelled`, and re-raises `CancelledError` (`wait_for` raises `TimeoutError`).
-It returns no `RunResult` and captures no in-flight model text. Existing paused
-or terminal outcomes are preserved. Stream cancellation has the partial-answer
-semantics described below.
+Two ways to stop a `run()` in flight behave differently. Cancelling the task
+awaiting it yourself (including via `asyncio.wait_for`) atomically finalizes a
+still-running persisted run as `cancelled`, emits `run.cancelled` (reason
+`task_cancelled`), and re-raises `CancelledError` (`wait_for` raises
+`TimeoutError`); no `RunResult` is returned. Calling `agent.cancel_run(run_id)`
+on the **same `Agent` instance in the same process** instead interrupts the
+in-flight model call or tool and makes `run()` *return*
+`RunResult(status=CANCELLED)` with `meta["interrupted"] = True` and
+`meta["partial_output"] = False`. Existing paused or terminal outcomes are
+preserved. Stream cancellation has the partial-answer semantics described below.
+See [Cancellation](/docs/architecture/cancellation#interrupting-run).
+
+A finished run's `RunResult.meta["undelivered_notes"]` lists inbox note ids it
+never delivered (present only when there are any); see
+[Inbox notes](/docs/architecture/inbox).
 
 ## `stream`
 
@@ -224,14 +235,22 @@ not reconstruct the original steps.
 
 [`examples/33_cost_cancel_idempotency.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/33_cost_cancel_idempotency.py) exercises the cache hit and the conflict path against a persisted store.
 
-## `resume`, `submit_tool_results`, `submit_input`, `submit_approval`
+## `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`
 
 The submit family resumes a paused run. Each one matches a pause status (see [Pause and resume](/docs/architecture/pause-resume)). All require persistence and the run to exist.
 
 ```python
 async def submit_tool_results(run_id: str, results: list[ToolResult], *, notifier=None) -> RunResult
 async def submit_input(run_id: str, text: str, *, notifier=None) -> RunResult
-async def submit_approval(run_id: str, *, approved: bool, rejection_reason: str | None = None, notifier=None) -> RunResult
+async def submit_approval(
+    run_id: str,
+    *,
+    approved: bool | None = None,
+    decisions: Mapping[str, ApprovalDecision] | None = None,
+    rejection_reason: str | None = None,
+    notifier=None,
+) -> RunResult
+async def submit_resume(run_id: str, *, notifier=None) -> RunResult
 async def resume(run_id: str, *, tool_results=None, user_input=None, notifier=None) -> RunResult
 ```
 
@@ -239,10 +258,13 @@ async def resume(run_id: str, *, tool_results=None, user_input=None, notifier=No
 | --- | --- | --- |
 | `submit_tool_results` | `waiting_client_tool` | `InvalidToolResultError` on id mismatch; the shared resume errors below. |
 | `submit_input` | `waiting_human_input` | the shared resume errors below. |
-| `submit_approval` | `waiting_approval` | the shared resume errors below. |
-| `resume` | generic resume entry point | same. |
+| `submit_approval` | `waiting_approval` | `ValueError` for an invalid argument combination or decision ids (before anything is claimed); the shared resume errors below. |
+| `submit_resume` | `paused` (requested or budget pause) | the shared resume errors below. |
+| `resume` | generic resume entry point; with no payload it continues a `paused` run or approves a `waiting_approval` batch | same. |
 
-If the run was created with skills, these methods first compare them with the skills on this agent and raise `SkillMissingError` or `SkillMismatchError` (leaving the run paused) when they differ; `resume_stream` ends with a `RUN_ERROR` instead of raising. See [Resume contract](/docs/architecture/skills#resume-contract).
+`submit_approval` takes exactly one of `approved=` (whole batch) or `decisions=` (per call, `ApprovalDecision.approve()` / `ApprovalDecision.deny(reason)` keyed by call id). Client-target calls in the batch are never executed on the server; the run pauses again as `waiting_client_tool` for them. See [Approval](/docs/architecture/approval).
+
+If the run was created with skills, these methods first compare them with the skills on this agent and raise `SkillMissingError` or `SkillMismatchError` (leaving the run paused) when they differ; `resume_stream` ends with a `RUN_ERROR` instead. See [Resume contract](/docs/architecture/skills#resume-contract).
 
 Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `PersistenceNotConfiguredError`. See [Errors](/docs/reference/errors).
 
@@ -257,10 +279,58 @@ Streaming variant of resume: returns a `RunStream` for the resumed run.
 ## `cancel_run`
 
 ```python
-async def cancel_run(run_id: str) -> RunResult
+async def cancel_run(
+    run_id: str,
+    *,
+    cascade: bool = False,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> RunResult
 ```
 
-Request cancellation. Works for paused runs (atomic CAS to `cancelled`), running runs (cooperative flag), streamed runs this instance owns (in-process interrupt: the model stream is abandoned immediately and `RUN_CANCELLED` carries the partial `answer`), and terminal runs (no-op, never raises). Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped". Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
+Request cancellation. Works for paused runs (atomic CAS to `cancelled`, including `paused`), running runs (cooperative flag), batch `run()` calls and streamed runs this instance owns (in-process interrupt: the in-flight model call or tool is abandoned; `run()` returns `CANCELLED` with `meta["interrupted"]`, a stream ends with `RUN_CANCELLED` carrying the partial `answer`), and terminal runs (no-op, never raises). Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped".
+
+`cascade=True` also cancels every non-terminal descendant, deepest first and `run_id` last, over a point-in-time snapshot; per-run outcomes are in `meta["cascade"]`. `tenant_id=` requires the run to belong to exactly that tenant (`None` = untenanted) or `RunNotFoundError` is raised, and limits the cascade to the same tenant. A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
+
+## `request_pause`
+
+```python
+async def request_pause(
+    run_id: str,
+    *,
+    cascade: bool = True,
+    tenant_id: str | None = ...,    # omitted = unscoped
+    reason: str | None = None,       # at most 1000 characters
+) -> PauseOutcome
+```
+
+Ask a running run to pause durably at its next checkpoint (the top of its next iteration, or between the approved calls of a resumed batch). It never preempts a model call or tool. The run becomes `paused`, `run.paused` is written with `reason="requested"`, and the waiting `run()` or stream returns a paused result. Resume with `submit_resume`. A `waiting_*`, `paused` or terminal run is a no-op; cancellation wins over a pause. `cascade=True` (the default) flags every non-terminal descendant too, which is **flag propagation only, not a resumable call stack**: a paused child returns its paused result to the delegating tool, and resuming the child never rewrites what the parent recorded.
+
+`PauseOutcome` has `run_id`, `status_before`, `status_after` and `affected`, a list of `(run_id, outcome)` with outcome `requested`, `already_waiting`, `already_paused` or `terminal`, deepest descendants first and `run_id` last. Raises `RunNotFoundError`, `PersistenceNotConfiguredError` and `ValueError` (bad `reason`). See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause).
+
+## `submit_note`
+
+```python
+async def submit_note(
+    run_id: str,
+    text: str,
+    *,
+    metadata: Any = None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> str
+```
+
+Leave a note for a non-terminal run; returns the note id. The runner delivers pending notes at the top of its next iteration as a user message `NOTE FROM USER:\n{text}` and writes an `inbox.delivered` event. Delivery is at-least-once; notes still pending when the run ends are listed in `RunResult.meta["undelivered_notes"]` and readable with `RunStore.get_notes`. `text` is non-empty and at most 32 KiB as UTF-8; `metadata` must be JSON and at most 8 KiB encoded, and is never shown to the model. Raises `ValueError`, `PersistenceNotConfiguredError`, `RunNotFoundError` and `RunAlreadyTerminalError`. See [Inbox notes](/docs/architecture/inbox).
+
+## Heartbeat
+
+```python
+from dendrux import heartbeat, aheartbeat
+
+def heartbeat() -> None            # sync, fire-and-forget, thread-safe
+async def aheartbeat() -> None     # awaits the write
+```
+
+Call it from inside a tool that waits a long time (a human, a slow job) to refresh persisted progress and reduce the risk of a [stale-run sweep](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep) reaping the run. Writes are best-effort and failures are logged; both helpers are no-ops outside a persisted run. `heartbeat()` works from async tools and from sync tools (which run in a worker thread) and coalesces calls less than a second apart; `aheartbeat()` must be awaited on the run's event loop and logs, never raises, on failure.
 
 ## `retry`
 

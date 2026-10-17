@@ -16,6 +16,9 @@ docs/
 │   ├── event-ordering.mdx
 │   ├── pause-resume.mdx
 │   ├── cancellation.mdx
+│   ├── inbox.mdx
+│   ├── budget.mdx
+│   ├── tool-policy.mdx
 │   ├── governance.mdx
 │   ├── pii-redaction.mdx
 │   ├── access-control.mdx

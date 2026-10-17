@@ -7,15 +7,16 @@ description: Deny-listing tools and skills at the agent level, how the runtime e
 
 Access control in dendrux is the set of rules that decide whether a tool call is even allowed to execute. If a denied tool is attempted, the runtime short-circuits: it never calls the function, it emits a `policy.denied` governance event, and it hands a synthetic failure back to the model so the loop can continue. The tool's side effects never happen.
 
-Three knobs cover the common cases:
+Four knobs cover the common cases:
 
 | Parameter | Scope | Event emitted |
 | --- | --- | --- |
 | `deny=["tool_name"]` | Per-agent list of tools that cannot execute, even if the LLM calls them | `policy.denied` |
+| `before_tool=hook` | A function that decides each call from its arguments and context: allow, deny, require approval or substitute a result. See [Tool policy hook](/docs/architecture/tool-policy) | `policy.denied`, `policy.substituted`, `approval.requested`, `policy.hook_error` |
 | `deny_skills=["skill_name"]` | Per-agent list of [skills](/docs/architecture/skills) removed from every run | Names listed in `skill.catalog_resolved` |
 | MCP server auth / errors | Network-layer failures reaching an [MCP](/docs/architecture/mcp) server | `mcp.error` |
 
-The rest of this page focuses on `deny`, which is the most commonly used. The other two share the same shape: decide at the gate, emit a typed event, keep going. The three tools that skills add (`use_skill`, `read_skill_resource`, `run_skill_script`) are ordinary names for `deny`; see [Skills](/docs/architecture/skills#approvals-and-deny).
+The rest of this page focuses on `deny`, which is the most commonly used. For rules that depend on the call's arguments or on something outside the agent, use the [tool policy hook](/docs/architecture/tool-policy); a static `deny` is always applied first and the hook cannot undo it. The others share the same shape: decide at the gate, emit a typed event, keep going. The three tools that skills add (`use_skill`, `read_skill_resource`, `run_skill_script`) are ordinary names for `deny`; see [Skills](/docs/architecture/skills#approvals-and-deny).
 
 ## A real deny in action
 
@@ -144,6 +145,32 @@ Skills and MCP connections enter the governance pipeline at different points, bu
 
 All three layers share `run_events` as the audit surface. Querying `WHERE event_type IN ('policy.denied', 'skill.catalog_resolved', 'skill.activation_failed', 'mcp.error')` on a run returns the full access-control story in one query, in order.
 
+## Tenants and delegated runs
+
+A run can carry a `tenant_id` (`agent.run(..., tenant_id="acme")`) so one database can serve many customers. Since 0.3.0 a delegated child run **always belongs to its parent's tenant**:
+
+- A child started without a `tenant_id` inherits the parent's.
+- A child started with the **same** `tenant_id` as its parent is fine.
+- A child started with a **different** `tenant_id` raises `ValueError` before the child run is created. The message names the parent run and its tenant. Nothing is written, so a tool that tries to move work across tenants cannot do it by accident.
+
+The rule applies to `run()`, `stream()` and `retry()` when they are called from inside a tool that is itself running under a parent run. A root run (no parent) keeps whatever `tenant_id` you gave it, including `None`.
+
+Before 0.3.0 a child run with no `tenant_id` was stored untenanted, so tenant-scoped reads of the parent's subtree missed it. If you list child runs by tenant, those older rows still have a `NULL` tenant.
+
+The run-control and read APIs take a `tenant_id=` argument that makes a call behave as "this run, in this tenant, or not found":
+
+| API | With `tenant_id=` | Omitted |
+| --- | --- | --- |
+| `agent.cancel_run(run_id, cascade=True)` | Root must be in the tenant; the cascade only reaches descendants in the same tenant. | Unscoped (trusted single-tenant use). |
+| `agent.request_pause(run_id, cascade=True)` | Same. | Unscoped. |
+| `agent.submit_note(run_id, text)` | Run must be in the tenant, else `RunNotFoundError`. | Unscoped. |
+| `RunStore.get_subtree(run_id)` | Root and every descendant must be in the tenant; others are excluded with everything below them. | Unscoped. |
+| `RunStore.get_notes(run_id)` | Run must be in the tenant, else `dendrux.store.RunNotFoundError`. | Unscoped. |
+
+`tenant_id=None` is a real value meaning "untenanted runs only", which is different from leaving the argument out. A `before_tool` hook sees the run's tenant as `ToolCallContext.tenant_id`.
+
+Passing `tenant_id` is how your route handlers keep one customer from touching another's runs. Dendrux does not decide who the caller is; derive the tenant from the authenticated request and pass it in.
+
 ## Why a synthetic result instead of an exception
 
 The most obvious alternative is to raise a Python exception when a denied tool is called. The loop could catch it, mark the run failed, and stop.
@@ -157,7 +184,7 @@ The synthetic tool result is the cheapest way to give the model enough informati
 
 ## Where this fits
 
-- Declared on `Agent(deny=[...], deny_skills=[...])`.
+- Declared on `Agent(deny=[...], deny_skills=[...], before_tool=...)`.
 - Enforced in `dendrux.loops.react.ReActLoop` (phase 0 of tool dispatch) and when the run's skill set is resolved.
-- Emits `policy.denied`, `skill.catalog_resolved`, `skill.activation_failed`, `mcp.error` events on `run_events`.
+- Emits `policy.denied`, `policy.substituted`, `policy.hook_error`, `skill.catalog_resolved`, `skill.activation_failed`, `mcp.error` events on `run_events`.
 - Sits alongside the other [governance](/docs/architecture/governance) layers: guardrails, approval, budget. Nothing about access control fights any of them.

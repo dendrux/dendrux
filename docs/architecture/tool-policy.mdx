@@ -1,0 +1,126 @@
+---
+title: Tool policy hook
+description: Decide every tool call in code with before_tool. Allow, deny, require approval or substitute a result, with fail-closed errors and the same coverage for local, MCP and skill tools.
+---
+
+# Tool policy hook
+
+`deny=` and `require_approval=` are static: they key on a tool name. Real policy usually depends on the arguments, the run, or something outside the agent ("this email goes to more than ten people", "this tenant is locked", "a prompt-injection flag fired on this run"). `Agent(before_tool=...)` takes a function that sees each tool call before it runs and returns a decision.
+
+```python
+from dendrux import Agent, ToolCallContext, ToolDecision
+
+
+async def policy(call: ToolCallContext) -> ToolDecision | None:
+    if call.tool_name == "send_email" and len(call.params.get("to", [])) > 10:
+        return ToolDecision.require_approval("More than 10 recipients")
+    if injection_flagged(call.run_id):
+        return ToolDecision.deny("Tools locked: prompt injection detected")
+    if call.tool_name == "delete_rows" and call.params.get("count", 0) > 100:
+        return ToolDecision.substitute({"status": "held_for_review"})
+    return None   # allow
+
+
+agent = Agent(provider=provider, prompt="...", tools=[send_email, delete_rows], before_tool=policy)
+```
+
+The hook can be sync or async. The hook runs once for each parsed tool call that passes static `deny=` and skill preflight, before approval. It applies in `run()` and in `stream()`.
+
+## What the hook sees
+
+`ToolCallContext` is a frozen dataclass:
+
+| Field | Meaning |
+| --- | --- |
+| `run_id`, `call_id` | The run and the model's tool call. `call_id` is the `correlation_id` on the call's events. |
+| `tool_name` | The name the model used (for MCP tools, the exposed name). |
+| `params` | The call's arguments, **deanonymized**: real values, not [guardrail](/docs/architecture/guardrails) placeholders. |
+| `target` | `"server"` or `"client"`. |
+| `source` | `"local"` for `@tool` functions, `"mcp"` for MCP tools, `"skill"` for the built-in skill tools. |
+| `meta` | The tool's metadata. For MCP tools this includes the server's annotations and `mcp_tool_name`. |
+| `iteration` | The loop iteration that produced the call. |
+| `tenant_id` | The run's tenant, or `None`. |
+
+`params` and `meta` are deep-copied for each call. Mutating them cannot change what executes.
+
+## The four decisions
+
+| Return | Effect | Event |
+| --- | --- | --- |
+| `None` or `ToolDecision.allow()` | The call continues down the normal path (approval gate, validation, execution). | none |
+| `ToolDecision.deny(reason)` | The tool does not run. The model gets a failed result `{"denied": reason}`. `reason` must be a non-empty string. | `policy.denied` with `source="hook"` and the reason |
+| `ToolDecision.require_approval(reason=None)` | The call joins the approval pause, together with any other gated calls in the batch. | `approval.requested` with `source="hook"` and `reason` |
+| `ToolDecision.substitute(result)` | The tool does not run. `result` is serialized as JSON and returned to the model as a **successful** tool result. | `policy.substituted` |
+
+A denied call writes no `tool_calls` row, like a static `deny=`: it is a policy decision, not an execution. A substituted call does write a row, with `success=1` and `meta.substituted = true` in the row's `meta` column, so an audit query can tell a real result from a canned one. `RunStore.get_tool_invocations` does not return that column; read it from the table.
+
+`require_approval` is for **server-target tools only**. On a client-target call there is no server-side action to gate, so the call is denied with the reason `"approval is not supported for client tools"` and a `policy.hook_warning` event is written.
+
+The `reason` strings you give to `deny` and `require_approval` are shown to the model (deny) and stored on events. Keep them free of secrets.
+
+## Where it sits in the pipeline
+
+For one batch of tool calls, in order:
+
+1. Malformed JSON arguments are rejected (the model needs the parse error).
+2. **Static `deny=`** is applied. A tool in `deny=` is dead here; the hook never sees it and cannot un-deny it.
+3. Parameters are deanonymized.
+4. Skill preflight checks run for the built-in skill tools.
+5. **`before_tool`** is called once per remaining call, in the order the model emitted them.
+6. The approval gate: any gated call (static `require_approval=` or hook `require_approval`) pauses the batch.
+7. Schema validation and execution.
+
+How the hook combines with a static approval gate:
+
+- A hook `deny` wins over a static `require_approval=` entry. The call is denied and nothing is asked of a human.
+- Hook `allow`, `substitute` and `require_approval` leave a static gate in place. A statically gated tool still goes to a human, even if the hook would have substituted a result.
+
+## MCP and skill tools
+
+The hook covers every tool source the same way. For an MCP tool, `call.source == "mcp"` and `call.meta` carries what the server declared (`annotations` is `None` when the server sent none), so you can write policy on MCP annotations:
+
+```python
+async def policy(call: ToolCallContext) -> ToolDecision | None:
+    annotations = call.meta.get("annotations") or {}
+    if call.source == "mcp" and annotations.get("destructiveHint"):
+        return ToolDecision.require_approval("Destructive MCP tool")
+    return None
+```
+
+The built-in `use_skill`, `read_skill_resource` and `run_skill_script` tools arrive with `source="skill"`. Branch on `call.source` or `call.tool_name` if you only want to govern some of them.
+
+## Fail closed
+
+The hook is a safety layer, so a broken hook denies instead of allowing. A call is denied with the reason `"policy hook error"` and a `policy.hook_error` event (the event carries the **exception type only**, never the message) when:
+
+- the hook raises an exception,
+- the hook returns anything other than a `ToolDecision` or `None`, or
+- a `substitute` result cannot be serialized to JSON. Nothing is written for the bad result.
+
+The run continues, and the model sees an ordinary denial. Cancellation is never treated as a hook error: if the task is cancelled while the hook is running, the cancellation propagates.
+
+Sync hooks run on the event loop. Keep them cheap, and use an `async def` hook if you need to read a database or call a service.
+
+## Not re-run on resume
+
+The hook is evaluated once per call, when the model emits it. It is **not** evaluated again when the run resumes after an approval pause:
+
+- A call a human approved executes. The human decision wins; re-running the hook could deny what a person just approved.
+- A held non-gated call in the same batch was already evaluated before the pause, and runs on resume.
+
+If conditions change while a run waits (the tenant is locked, say), block the run through a cancel or through the approval decision, not through the hook.
+
+The hook is not persisted. Pass `before_tool=` to every `Agent` that starts or resumes runs, the same as `tools=`. The approval decision itself does not need the hook: the gated call ids come from the [snapshot saved at pause time](/docs/architecture/approval#which-calls-are-gated), so a resuming `Agent` without the hook still accepts a valid decision.
+
+## Limits
+
+- `before_tool` is not supported with `SingleCall` (it has no tool calls). Combining them raises `ValueError` at construction.
+- The hook sees tool calls, not model text. Use [guardrails](/docs/architecture/guardrails) for content.
+- The hook decides; it does not mutate. There is no way to rewrite arguments. To change what a tool does, deny the call and let the model retry, or substitute a result.
+
+## Where this fits
+
+- Declared on `Agent(before_tool=...)`. Types: `ToolCallContext`, `ToolDecision`, `BeforeToolHook` from `dendrux`.
+- Evaluated in `dendrux.loops.react` between static deny and the approval gate.
+- Emits `policy.denied`, `policy.substituted`, `policy.hook_error`, `policy.hook_warning` and (for gating) `approval.requested` on `run_events`.
+- Works with [Approval](/docs/architecture/approval), [Access control](/docs/architecture/access-control) and [MCP](/docs/architecture/mcp).
