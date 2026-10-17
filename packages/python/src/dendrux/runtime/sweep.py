@@ -131,8 +131,11 @@ async def _create_temp_store(
         db_path = database_url.split("///", 1)[-1] if "///" in database_url else None
         if db_path and db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        async with engine.begin() as conn:
-            await conn.run_sync(create_sqlite_schema)
+        try:
+            await create_sqlite_schema(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
 
     store = SQLAlchemyStateStore(engine)
     return store, engine

@@ -20,6 +20,7 @@ from dendrux.db._sqlite_sync import (
     _add_column,
     _unsafe_reason,
     create_sqlite_schema,
+    create_sqlite_schema_sync,
     sync_sqlite_schema,
 )
 from dendrux.db.models import AgentRun, Base
@@ -153,7 +154,7 @@ def _indexes(path: Path) -> set[str]:
 def _sync(path: Path) -> list[str]:
     eng = create_engine(f"sqlite:///{path}")
     try:
-        with eng.begin() as conn:
+        with eng.connect() as conn:
             return sync_sqlite_schema(conn)
     finally:
         eng.dispose()
@@ -267,20 +268,20 @@ class TestSyncBehaviour:
         db = tmp_path / "old.db"
         _build_old_db(db)
         eng = create_engine(f"sqlite:///{db}")
-        with eng.begin() as conn:
-            create_sqlite_schema(conn)
-        with eng.begin() as conn:
+        with eng.connect() as conn:
+            create_sqlite_schema_sync(conn)
+        with eng.connect() as conn:
             assert sync_sqlite_schema(conn) == []
-        with eng.begin() as conn:
-            create_sqlite_schema(conn)
+        with eng.connect() as conn:
+            create_sqlite_schema_sync(conn)
             assert sync_sqlite_schema(conn) == []
         eng.dispose()
 
     def test_fresh_database_needs_no_sync(self, tmp_path: Path) -> None:
         db = tmp_path / "fresh.db"
         eng = create_engine(f"sqlite:///{db}")
-        with eng.begin() as conn:
-            create_sqlite_schema(conn)
+        with eng.connect() as conn:
+            create_sqlite_schema_sync(conn)
             assert sync_sqlite_schema(conn) == []
         eng.dispose()
 
@@ -363,18 +364,6 @@ class TestSyncBehaviour:
 
 
 class TestConcurrency:
-    def test_duplicate_column_race_is_tolerated(self, tmp_path: Path) -> None:
-        db = tmp_path / "old.db"
-        _build_old_db(db)
-        column = Base.metadata.tables["agent_runs"].columns["pause_requested"]
-        eng = create_engine(f"sqlite:///{db}")
-        with eng.begin() as conn:
-            assert _add_column(conn, Base.metadata.tables["agent_runs"], column) is True
-        with eng.begin() as conn:
-            # Another process won the race: ALTER fails with "duplicate column".
-            assert _add_column(conn, Base.metadata.tables["agent_runs"], column) is False
-        eng.dispose()
-
     def test_two_concurrent_startups(self, tmp_path: Path) -> None:
         db = tmp_path / "old.db"
         _build_old_db(db)
@@ -385,8 +374,8 @@ class TestConcurrency:
             eng = create_engine(f"sqlite:///{db}", connect_args={"timeout": 30})
             try:
                 barrier.wait()
-                with eng.begin() as conn:
-                    create_sqlite_schema(conn)
+                with eng.connect() as conn:
+                    create_sqlite_schema_sync(conn)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -418,17 +407,30 @@ class TestConcurrency:
             _add_column(conn, table, column)
 
 
-class TestOtherBackends:
-    def test_non_sqlite_dialect_is_untouched(self) -> None:
+class TestWrapperOnOtherDialects:
+    async def test_create_sqlite_schema_is_a_noop_on_postgres(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
+        monkeypatch.setattr(
+            Base.metadata, "create_all", lambda *a, **k: pytest.fail("create_all must not run")
+        )
+        await create_sqlite_schema(engine)
+        engine.connect.assert_not_called()
+
+    def test_sync_wrapper_is_a_noop_on_postgres(self, monkeypatch: pytest.MonkeyPatch) -> None:
         conn = MagicMock()
         conn.dialect.name = "postgresql"
-        assert sync_sqlite_schema(conn) == []
+        monkeypatch.setattr(
+            Base.metadata, "create_all", lambda *a, **k: pytest.fail("create_all must not run")
+        )
+        assert create_sqlite_schema_sync(conn) == []
         conn.exec_driver_sql.assert_not_called()
-        conn.execute.assert_not_called()
 
     def test_sync_after_create_all_is_noop_for_models(self, tmp_path: Path) -> None:
         eng = create_engine(f"sqlite:///{tmp_path / 'x.db'}")
-        with eng.begin() as conn:
+        with eng.connect() as conn:
             Base.metadata.create_all(conn)
             assert sync_sqlite_schema(conn) == []
             assert conn.execute(text("SELECT COUNT(*) FROM run_inbox")).scalar() == 0
@@ -437,8 +439,8 @@ class TestOtherBackends:
 
 def test_unique_violation_still_enforced_on_fresh_db(tmp_path: Path) -> None:
     eng = create_engine(f"sqlite:///{tmp_path / 'f.db'}")
-    with eng.begin() as conn:
-        create_sqlite_schema(conn)
+    with eng.connect() as conn:
+        create_sqlite_schema_sync(conn)
     with pytest.raises(IntegrityError), eng.begin() as conn:
         for rid in ("A", "B"):
             conn.execute(
@@ -506,13 +508,16 @@ class TestRunStoreUpgrade:
 
         calls = []
         real = store_mod.create_sqlite_schema
-        monkeypatch.setattr(
-            store_mod, "create_sqlite_schema", lambda c: (calls.append(1), real(c))[1]
-        )
+
+        async def counting(engine):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            await real(engine)
+
+        monkeypatch.setattr(store_mod, "create_sqlite_schema", counting)
         db = tmp_path / "old.db"
         _build_old_db(db)
         async with RunStore.from_database_url(f"sqlite+aiosqlite:///{db}") as store:
-            await asyncio.gather(store.list_runs(), store.list_runs())
+            await store.list_runs()
             await store.list_runs()
         assert len(calls) == 1
 
@@ -522,9 +527,10 @@ class TestRunStoreUpgrade:
         import dendrux.store as store_mod
         from dendrux.store import RunStore
 
-        monkeypatch.setattr(
-            store_mod, "create_sqlite_schema", lambda c: pytest.fail("must not run")
-        )
+        async def forbidden(engine):  # type: ignore[no-untyped-def]
+            pytest.fail("must not run")
+
+        monkeypatch.setattr(store_mod, "create_sqlite_schema", forbidden)
         store = RunStore.from_database_url("postgresql+asyncpg://u:p@localhost:1/none")
         await store.close()
 
@@ -553,7 +559,7 @@ class TestGlobalEngineInit:
         finally:
             await reset_engine()
 
-    async def test_concurrent_callers_share_one_initialised_engine(
+    async def test_concurrent_callers_share_one_published_engine(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import dendrux.db.session as session
@@ -571,7 +577,7 @@ class TestGlobalEngineInit:
         try:
             engines = await asyncio.gather(get_engine(url), get_engine(url), get_engine(url))
             assert len({id(e) for e in engines}) == 1
-            assert len(created) == 1
+            assert engines[0] is session._engine
             assert "pause_requested" in _columns(db, "agent_runs")
         finally:
             await reset_engine()
@@ -593,7 +599,7 @@ class TestGlobalEngineInit:
             assert agent._lazy_store is None
         await agent.close()
 
-    async def test_agent_concurrent_first_use_creates_one_engine(
+    async def test_agent_concurrent_first_use_shares_one_store(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         created = []
@@ -616,7 +622,6 @@ class TestGlobalEngineInit:
                 agent._resolve_state_store(), agent._resolve_state_store()
             )
             assert stores[0] is stores[1]
-            assert len(created) == 1
         finally:
             await agent.close()
 
@@ -701,8 +706,11 @@ class TestAtomicityAndPreflight:
         con.close()
         before = _tables(db)
         eng = create_engine(f"sqlite:///{db}")
-        with pytest.raises(SqliteSchemaSyncError, match="agent_runs.agent_name"), eng.begin() as c:
-            create_sqlite_schema(c)
+        with (
+            pytest.raises(SqliteSchemaSyncError, match="agent_runs.agent_name"),
+            eng.connect() as c,
+        ):
+            create_sqlite_schema_sync(c)
         eng.dispose()
         assert _tables(db) == before
 
@@ -722,8 +730,8 @@ class TestAtomicityAndPreflight:
 
         monkeypatch.setattr(mod, "_reconcile_indexes", boom)
         eng = create_engine(f"sqlite:///{db}")
-        with pytest.raises(SqliteSchemaSyncError) as exc, eng.begin() as c:
-            create_sqlite_schema(c)
+        with pytest.raises(SqliteSchemaSyncError) as exc, eng.connect() as c:
+            create_sqlite_schema_sync(c)
         eng.dispose()
         assert _columns(db, "agent_runs") == before_cols
         assert _tables(db) == before_tables
@@ -748,8 +756,7 @@ class TestAtomicityAndPreflight:
         monkeypatch.setattr(mod, "_reconcile_indexes", boom)
         eng = create_async_engine(f"sqlite+aiosqlite:///{db}")
         with pytest.raises(SqliteSchemaSyncError):
-            async with eng.begin() as c:
-                await c.run_sync(create_sqlite_schema)
+            await create_sqlite_schema(eng)
         await eng.dispose()
         assert _columns(db, "agent_runs") == before_cols
 
@@ -776,8 +783,8 @@ class TestCreateAllRace:
 
         calls = self._patch(monkeypatch, effect)
         eng = create_engine(f"sqlite:///{tmp_path / 'x.db'}")
-        with pytest.raises(OperationalError, match="disk I/O"), eng.begin() as c:
-            create_sqlite_schema(c)
+        with pytest.raises(OperationalError, match="disk I/O"), eng.connect() as c:
+            create_sqlite_schema_sync(c)
         eng.dispose()
         assert len(calls) == 1
 
@@ -789,29 +796,10 @@ class TestCreateAllRace:
 
         calls = self._patch(monkeypatch, effect)
         eng = create_engine(f"sqlite:///{tmp_path / 'x.db'}")
-        with pytest.raises(OperationalError, match="failure 1"), eng.begin() as c:
-            create_sqlite_schema(c)
+        with pytest.raises(OperationalError, match="failure 1"), eng.connect() as c:
+            create_sqlite_schema_sync(c)
         eng.dispose()
         assert len(calls) == 1
-
-    def test_verified_already_exists_race_is_retried(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def effect(n, real, bind, *a, **k):  # type: ignore[no-untyped-def]
-            if n == 1:
-                real(bind, tables=[Base.metadata.tables["run_inbox"]])
-                raise OperationalError("CREATE", {}, Exception("table run_inbox already exists"))
-            return real(bind, *a, **k)
-
-        db = tmp_path / "old.db"
-        _build_old_db(db)
-        calls = self._patch(monkeypatch, effect)
-        eng = create_engine(f"sqlite:///{db}")
-        with eng.begin() as c:
-            create_sqlite_schema(c)
-        eng.dispose()
-        assert len(calls) == 2
-        assert "run_inbox" in _tables(db)
 
 
 _NOW = text("CURRENT_TIMESTAMP")
@@ -856,23 +844,189 @@ class TestServerDefaultClassification:
         con.close()
 
 
-class TestWrapperOnOtherDialects:
-    def test_create_sqlite_schema_is_a_noop_on_postgres(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        conn = MagicMock()
-        conn.dialect.name = "postgresql"
-        monkeypatch.setattr(
-            Base.metadata, "create_all", lambda *a, **k: pytest.fail("create_all must not run")
-        )
-        create_sqlite_schema(conn)
-        conn.exec_driver_sql.assert_not_called()
-        conn.execute.assert_not_called()
-
-
 def test_error_is_public_and_aliased() -> None:
     import dendrux.db._sqlite_sync as mod
     import dendrux.errors as errors
 
     assert "SqliteSchemaSyncError" in errors.__all__
     assert mod.SqliteSchemaSyncError is errors.SqliteSchemaSyncError
+
+
+# ---------------------------------------------------------------------------
+# Re-check round: lock only when needed, lifecycle fences
+# ---------------------------------------------------------------------------
+
+
+def _hold_writer(path: Path) -> sqlite3.Connection:
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    return holder
+
+
+class TestWriteLockOnlyWhenNeeded:
+    def test_current_schema_needs_no_write_lock(self, tmp_path: Path) -> None:
+        db = tmp_path / "cur.db"
+        eng = create_engine(f"sqlite:///{db}", connect_args={"timeout": 0.05})
+        with eng.connect() as conn:
+            create_sqlite_schema_sync(conn)
+        holder = _hold_writer(db)
+        try:
+            with eng.connect() as conn:
+                assert create_sqlite_schema_sync(conn) == []
+                assert sync_sqlite_schema(conn) == []
+        finally:
+            holder.close()
+            eng.dispose()
+
+    def test_busy_writer_gives_actionable_error_when_work_is_needed(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        eng = create_engine(f"sqlite:///{db}", connect_args={"timeout": 0.05})
+        holder = _hold_writer(db)
+        try:
+            with eng.connect() as conn, pytest.raises(SqliteSchemaSyncError, match="busy timeout"):
+                create_sqlite_schema_sync(conn)
+        finally:
+            holder.close()
+            eng.dispose()
+        assert "pause_requested" not in _columns(db, "agent_runs")
+
+    def test_work_finished_by_another_process_while_waiting_is_not_redone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.db._sqlite_sync as mod
+
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        real = mod._begin_immediate
+
+        def upgrade_elsewhere_then_lock(conn):  # type: ignore[no-untyped-def]
+            monkeypatch.setattr(mod, "_begin_immediate", real)
+            other = create_engine(f"sqlite:///{db}")
+            with other.connect() as c2:
+                create_sqlite_schema_sync(c2)
+            other.dispose()
+            real(conn)
+
+        monkeypatch.setattr(mod, "_begin_immediate", upgrade_elsewhere_then_lock)
+        eng = create_engine(f"sqlite:///{db}")
+        with eng.connect() as conn:
+            assert create_sqlite_schema_sync(conn) == []
+        eng.dispose()
+        assert "pause_requested" in _columns(db, "agent_runs")
+
+    async def test_async_helper_owns_its_transaction(self, tmp_path: Path) -> None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        eng = create_async_engine(f"sqlite+aiosqlite:///{db}")
+        await create_sqlite_schema(eng)
+        await eng.dispose()
+        assert "pause_requested" in _columns(db, "agent_runs")
+
+
+class TestLifecycleFences:
+    @staticmethod
+    def _gate(
+        monkeypatch: pytest.MonkeyPatch, module: object, real_name: str = "create_sqlite_schema"
+    ):  # type: ignore[no-untyped-def]
+        """Make the first schema init block until released."""
+        entered, release = asyncio.Event(), asyncio.Event()
+        real = getattr(module, real_name)
+        first = []
+
+        async def gated(engine):  # type: ignore[no-untyped-def]
+            if not first:
+                first.append(1)
+                entered.set()
+                await release.wait()
+            await real(engine)
+
+        monkeypatch.setattr(module, real_name, gated)
+        return entered, release
+
+    async def test_reset_during_init_discards_the_stale_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.db.session as session
+        from dendrux.db.session import get_engine, reset_engine
+
+        created = []
+        real_engine = session.create_async_engine
+        monkeypatch.setattr(
+            session,
+            "create_async_engine",
+            lambda *a, **k: (created.append(real_engine(*a, **k)), created[-1])[1],
+        )
+        entered, release = self._gate(monkeypatch, session)
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        url = f"sqlite+aiosqlite:///{db}"
+        await reset_engine()
+        try:
+            task = asyncio.create_task(get_engine(url))
+            await entered.wait()
+            await reset_engine()
+            release.set()
+            engine = await task
+            assert len(created) == 2
+            assert engine is created[1] is session._engine
+        finally:
+            await reset_engine()
+
+    async def test_agent_close_during_init_disposes_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.db._sqlite_sync as sync_mod
+
+        entered, release = self._gate(monkeypatch, sync_mod)
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        agent = Agent(
+            provider=MockLLM([LLMResponse(text="x")]),
+            prompt="p",
+            database_url=f"sqlite+aiosqlite:///{db}",
+        )
+        task = asyncio.create_task(agent._resolve_state_store())
+        await entered.wait()
+        await agent.close()
+        release.set()
+        with pytest.raises(RuntimeError, match="closed"):
+            await task
+        assert agent._private_engine is None
+        assert agent._lazy_store is None
+
+    async def test_run_store_close_during_init_raises_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sqlalchemy.exc import SQLAlchemyError
+
+        import dendrux.store as store_mod
+        from dendrux.store import RunStore
+
+        entered, release = self._gate(monkeypatch, store_mod)
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        store = RunStore.from_database_url(f"sqlite+aiosqlite:///{db}")
+        task = asyncio.create_task(store.list_runs())
+        await entered.wait()
+        await store.close()
+        release.set()
+        with pytest.raises(SQLAlchemyError, match="closed"):
+            await task
+
+
+class TestPartialIndexAndNoDemotion:
+    def test_partial_ordinary_index_does_not_satisfy_full_model_index(self, tmp_path: Path) -> None:
+        db = tmp_path / "old.db"
+        _build_old_db(db)
+        con = sqlite3.connect(db)
+        con.execute(
+            "CREATE INDEX ix_agent_runs_created_at ON agent_runs (created_at)"
+            " WHERE status = 'never'"
+        )
+        con.commit()
+        con.close()
+        with pytest.raises(SqliteSchemaSyncError, match="ix_agent_runs_created_at"):
+            _sync(db)

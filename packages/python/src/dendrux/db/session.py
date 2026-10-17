@@ -8,13 +8,11 @@ Postgres users set DENDRUX_DATABASE_URL and use Alembic migrations.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
-from weakref import WeakKeyDictionary
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -28,6 +26,7 @@ _engine: AsyncEngine | None = None
 _engine_url: str | None = None
 _session_factory: sessionmaker | None = None  # type: ignore[type-arg]
 _engine_lock = threading.Lock()
+_generation = 0
 
 # Default DB location: ~/.dendrux/dendrux.db
 # Single well-known path so all commands and examples share the same DB.
@@ -42,18 +41,6 @@ def get_database_url() -> str:
     Override: set DENDRUX_DATABASE_URL for Postgres or custom path.
     """
     return os.environ.get("DENDRUX_DATABASE_URL", DEFAULT_SQLITE_URL)
-
-
-def loop_lock(registry: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]) -> asyncio.Lock:
-    """The asyncio lock for the running loop (asyncio locks are loop-bound)."""
-    loop = asyncio.get_running_loop()
-    lock = registry.get(loop)
-    if lock is None:
-        lock = registry[loop] = asyncio.Lock()
-    return lock
-
-
-_init_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
 
 
 def _published(resolved_url: str) -> AsyncEngine | None:
@@ -74,19 +61,19 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
     For SQLite, auto-creates all tables on first call and upgrades an older
     file in place. For Postgres, tables must exist via Alembic migrations.
 
-    The engine is published only after initialization succeeds: concurrent
-    callers wait for the first one, and a failed initialization disposes its
-    candidate engine and leaves nothing cached, so the next call retries.
+    A candidate engine is published only after its initialization succeeds
+    and only if ``reset_engine()`` has not run since it started. Concurrent
+    first callers each initialize a candidate (idempotent, serialized by
+    SQLite's write lock); one is published, the rest are disposed. A failed
+    initialization disposes its candidate and caches nothing.
     """
     global _engine, _engine_url, _session_factory  # noqa: PLW0603
     resolved_url = url or get_database_url()
 
-    ready = _published(resolved_url)
-    if ready is not None:
-        return ready
-
-    async with loop_lock(_init_locks):
-        ready = _published(resolved_url)
+    while True:
+        with _engine_lock:
+            ready = _published(resolved_url)
+            generation = _generation
         if ready is not None:
             return ready
 
@@ -106,25 +93,21 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
                 db_path = resolved_url.split("///", 1)[-1] if "///" in resolved_url else None
                 if db_path:
                     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-                async with candidate.begin() as conn:
-                    await conn.run_sync(create_sqlite_schema)
+                await create_sqlite_schema(candidate)
         except BaseException:
             await candidate.dispose()
             raise
 
         with _engine_lock:
-            if _engine is None:
+            if _generation == generation and _engine is None:
                 _engine = candidate
                 _engine_url = resolved_url
                 _session_factory = sessionmaker(  # type: ignore[call-overload]
                     candidate, class_=AsyncSession, expire_on_commit=False
                 )
                 return candidate
-        # Another thread's loop published first; use theirs.
+        # Reset ran or another caller published first: drop ours and look again.
         await candidate.dispose()
-        ready = _published(resolved_url)
-        assert ready is not None
-        return ready
 
 
 async def reset_engine() -> None:
@@ -133,8 +116,9 @@ async def reset_engine() -> None:
     Releases the lock before awaiting dispose() to avoid holding a
     synchronous lock across an async suspension point.
     """
-    global _engine, _engine_url, _session_factory  # noqa: PLW0603
+    global _engine, _engine_url, _session_factory, _generation  # noqa: PLW0603
     with _engine_lock:
+        _generation += 1
         engine = _engine
         _engine = None
         _engine_url = None

@@ -624,6 +624,23 @@ class TestProviderCodeIsNeverTheHttpStatus:
         assert result.kind is GatewayErrorKind.CONTEXT_LENGTH
         assert result.provider_code is None
 
+    @pytest.mark.parametrize("raw", ["400", 400.5, True])
+    def test_string_or_different_numeric_body_code_is_kept(self, raw: Any) -> None:
+        result = classify_gateway_error(
+            status_code=400, code=None, param=None, message="x", body={"code": raw}
+        )
+        assert result.provider_code == str(raw)
+
+    def test_explicit_string_code_equal_to_status_is_kept(self) -> None:
+        result = classify_gateway_error(status_code=400, code="400", param=None, message="x")
+        assert result.provider_code == "400"
+
+    def test_float_status_duplicate_is_dropped(self) -> None:
+        result = classify_gateway_error(
+            status_code=400, code=None, param=None, message="x", body={"code": 400.0}
+        )
+        assert result.provider_code is None
+
     def test_real_string_code_is_kept(self) -> None:
         result = classify_gateway_error(
             status_code=400,

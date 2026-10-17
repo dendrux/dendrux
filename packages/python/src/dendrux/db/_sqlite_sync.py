@@ -30,8 +30,14 @@ from dendrux.errors import SqliteSchemaSyncError
 
 if TYPE_CHECKING:
     from sqlalchemy import Column, Connection, Table
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
-__all__ = ["SqliteSchemaSyncError", "create_sqlite_schema", "sync_sqlite_schema"]
+__all__ = [
+    "SqliteSchemaSyncError",
+    "create_sqlite_schema",
+    "create_sqlite_schema_sync",
+    "sync_sqlite_schema",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -41,29 +47,43 @@ _CONSTANT_DEFAULT = re.compile(
 )
 
 
-def create_sqlite_schema(sync_conn: Connection) -> None:
+async def create_sqlite_schema(engine: AsyncEngine) -> None:
     """Create missing tables, then sync columns and indexes of existing ones.
 
-    Pass to ``AsyncConnection.run_sync`` at every SQLite schema-init site.
-    A no-op on non-SQLite connections.
+    Owns its connection and transaction: pass the engine, never call it from
+    inside a caller's transaction. A no-op on non-SQLite engines.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+    async with engine.connect() as conn:
+        await conn.run_sync(create_sqlite_schema_sync)
+
+
+def create_sqlite_schema_sync(sync_conn: Connection) -> list[str]:
+    """Synchronous form of :func:`create_sqlite_schema` on a dedicated connection.
+
+    The connection must not be inside an open transaction: this function
+    starts and commits (or rolls back) its own.
     """
     if sync_conn.dialect.name != "sqlite":
-        return
-    _run(sync_conn, create_tables=True)
+        return []
+    return _run(sync_conn, create_tables=True)
 
 
 def sync_sqlite_schema(sync_conn: Connection) -> list[str]:
     """Add model columns and indexes missing from existing SQLite tables.
 
     Returns a description of every change made (empty when already current).
-    Idempotent and safe under concurrent startup. A no-op on non-SQLite
+    Takes the write lock only when there is work; owns its transaction, so
+    the connection must not be inside an open one. A no-op on non-SQLite
     connections.
 
     Raises:
         SqliteSchemaSyncError: A missing column cannot be added safely, an
-            index the schema needs collides with an unrelated object, or
-            SQLite rejected a statement. Nothing is applied for an unsafe
-            column; any other failure rolls back what was applied.
+            index the schema needs collides with an unrelated object, the
+            write lock stayed busy, or SQLite rejected a statement. Nothing is
+            applied for an unsafe column; any other failure rolls back what
+            was applied.
     """
     if sync_conn.dialect.name != "sqlite":
         return []
@@ -74,42 +94,57 @@ def sync_sqlite_schema(sync_conn: Connection) -> list[str]:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+_LOCK_ATTEMPTS = 3
+
 
 def _run(conn: Connection, *, create_tables: bool) -> list[str]:
-    owns_transaction = _begin_immediate(conn)
+    if not _has_work(conn, create_tables):
+        return []
+    _begin_immediate(conn)
     changes: list[str] = []
     try:
-        _raise_if_unsafe(conn)
-        if create_tables:
-            _create_all(conn)
-        _apply(conn, changes)
+        # Another process may have finished the job while we waited for the lock.
+        if _has_work(conn, create_tables):
+            if create_tables:
+                Base.metadata.create_all(conn)
+            _apply(conn, changes)
     except BaseException as exc:
-        if owns_transaction:
-            _rollback(conn)
+        _rollback(conn)
         if isinstance(exc, SqliteSchemaSyncError) and changes:
-            fate = (
-                "All of these were rolled back."
-                if owns_transaction
-                else "They are part of the caller's transaction and were not rolled back."
-            )
             raise SqliteSchemaSyncError(
-                f"{exc} Applied before the failure: {'; '.join(changes)}. {fate}"
+                f"{exc} Applied before the failure: {'; '.join(changes)}. "
+                f"All of these were rolled back."
             ) from exc
         raise
-    if owns_transaction:
-        conn.exec_driver_sql("COMMIT")
+    conn.exec_driver_sql("COMMIT")
     for change in changes:
         logger.info("SQLite schema sync: %s", change)
     return changes
 
 
-def _begin_immediate(conn: Connection) -> bool:
-    """Start an explicit write transaction; False if one is already open."""
-    driver = conn.connection.driver_connection
-    if getattr(driver, "in_transaction", True):
-        return False
-    conn.exec_driver_sql("BEGIN IMMEDIATE")
-    return True
+def _has_work(conn: Connection, create_tables: bool) -> bool:
+    """Read-only plan: does the database still differ from the models?"""
+    _raise_if_unsafe(conn)
+    tables = _existing_model_tables(conn)
+    if create_tables and len(tables) != len(Base.metadata.tables):
+        return True
+    return bool(_unmet(conn, tables))
+
+
+def _begin_immediate(conn: Connection) -> None:
+    for attempt in range(_LOCK_ATTEMPTS):
+        try:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            return
+        except OperationalError as exc:
+            if attempt == _LOCK_ATTEMPTS - 1:
+                raise SqliteSchemaSyncError(
+                    f"Could not take the SQLite write lock to upgrade this database's "
+                    f"schema after {_LOCK_ATTEMPTS} attempts: another connection is "
+                    f"holding it ({exc.orig}). Each attempt waits for the connection's "
+                    f"busy timeout (5 seconds by default; raise it with "
+                    f"connect_args={{'timeout': N}}). Retry once the other writer finishes."
+                ) from exc
 
 
 def _rollback(conn: Connection) -> None:
@@ -119,25 +154,13 @@ def _rollback(conn: Connection) -> None:
         logger.warning("SQLite schema sync: ROLLBACK failed", exc_info=True)
 
 
-def _create_all(conn: Connection) -> None:
-    before = _table_names(conn)
-    try:
-        Base.metadata.create_all(conn)
-    except OperationalError:
-        # Retry only a verified "already exists" race: another connection
-        # created one of our tables between create_all's check and its CREATE.
-        if _table_names(conn) - before:
-            Base.metadata.create_all(conn)
-        else:
-            raise
-
-
 def _apply(conn: Connection, changes: list[str]) -> None:
     tables = _existing_model_tables(conn)
     for table in tables:
         db_columns = _column_names(conn, table)
         for column in table.columns:
-            if column.name.lower() not in db_columns and _add_column(conn, table, column):
+            if column.name.lower() not in db_columns:
+                _add_column(conn, table, column)
                 changes.append(f"added column {table.name}.{column.name}")
     for table in tables:
         _reconcile_indexes(conn, table, changes)
@@ -236,8 +259,7 @@ def _raise_if_unsafe(conn: Connection) -> None:
         )
 
 
-def _add_column(conn: Connection, table: Table, column: Column[Any]) -> bool:
-    """Add one column; return False if a concurrent process added it first."""
+def _add_column(conn: Connection, table: Table, column: Column[Any]) -> None:
     spec = str(CreateColumn(column).compile(dialect=conn.dialect))
     for fk in column.foreign_keys:
         target = fk.column
@@ -247,13 +269,10 @@ def _add_column(conn: Connection, table: Table, column: Column[Any]) -> bool:
     try:
         conn.exec_driver_sql(f"ALTER TABLE {_quote(conn, table.name)} ADD COLUMN {spec}")
     except OperationalError as exc:
-        if column.name.lower() in _column_names(conn, table):
-            return False
         raise SqliteSchemaSyncError(
             f"Could not add column {table.name}.{column.name} to the existing SQLite "
             f"database ({exc.orig}). {_MIGRATE_HINT}"
         ) from exc
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +306,9 @@ def _wanted_indexes(table: Table) -> list[_Want]:
 
 
 def _enforces(index: _DbIndex, want: _Want) -> bool:
-    if index.columns != want.columns:
+    if index.columns != want.columns or index.partial:
         return False
-    return not want.unique or (index.unique and not index.partial)
+    return index.unique or not want.unique
 
 
 def _state(

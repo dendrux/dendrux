@@ -40,7 +40,6 @@ import functools
 import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from weakref import WeakKeyDictionary
 
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StateStore, TenantScope
@@ -285,33 +284,33 @@ class PausePair:
 
 
 class _InitOnFirstUse:
-    """Wrap a state store so ``init`` runs once, awaited, before its first call.
+    """Wrap a state store so ``init`` runs, awaited, before its first call.
 
-    A failed ``init`` is not remembered: the next call retries it.
+    ``init`` is idempotent, so concurrent first calls may each run it. A
+    failed ``init`` is not remembered: the next call retries it. After
+    :meth:`close`, calls raise; an ``init`` that finishes after close
+    disposes the engine again (``dispose``) and raises.
     """
 
-    def __init__(self, inner: Any, init: Any) -> None:
+    def __init__(self, inner: Any, init: Any, dispose: Any) -> None:
         self._inner = inner
         self._init = init
+        self._dispose = dispose
         self._done = False
         self.closed = False
-        self._locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
-            WeakKeyDictionary()
-        )
 
     async def _ensure(self) -> None:
-        if self.closed:
-            from sqlalchemy.exc import InvalidRequestError
+        from sqlalchemy.exc import InvalidRequestError
 
+        if self.closed:
             raise InvalidRequestError("This RunStore is closed.")
         if self._done:
             return
-        from dendrux.db.session import loop_lock
-
-        async with loop_lock(self._locks):
-            if not self._done:
-                await self._init()
-                self._done = True
+        await self._init()
+        if self.closed:
+            await self._dispose()
+            raise InvalidRequestError("This RunStore was closed during initialization.")
+        self._done = True
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._inner, name)
@@ -370,12 +369,9 @@ class RunStore:
         engine = create_async_engine(database_url)
         store: Any = SQLAlchemyStateStore(engine)
         if database_url.startswith("sqlite"):
-
-            async def upgrade_schema() -> None:
-                async with engine.begin() as conn:
-                    await conn.run_sync(create_sqlite_schema)
-
-            store = _InitOnFirstUse(store, upgrade_schema)
+            store = _InitOnFirstUse(
+                store, functools.partial(create_sqlite_schema, engine), engine.dispose
+            )
         instance = cls(store)
         instance._owned_engine = engine
         return instance
