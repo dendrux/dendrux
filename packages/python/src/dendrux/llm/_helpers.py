@@ -303,6 +303,9 @@ def classify_gateway_error(
     streaming is unsupported.
     """
     provider_code = code or _body_field(body, "code")
+    if provider_code is not None and status_code is not None and provider_code == str(status_code):
+        # Some gateways (OpenRouter) put the HTTP status in the body ``code`` field.
+        provider_code = None
     text = _error_text(message, body)
 
     lowered_code = provider_code.lower() if provider_code is not None else None

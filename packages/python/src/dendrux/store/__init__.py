@@ -437,7 +437,11 @@ class RunStore:
 
         Raises :class:`RunNotFoundError` if the run does not exist.
         """
-        record = await self._state.get_subtree(run_id, tenant_id=tenant_id)
+        from dendrux.runtime.state import require_store_method
+
+        record = await require_store_method(self._state, "get_subtree")(
+            run_id, tenant_id=tenant_id
+        )
         if record is None:
             raise RunNotFoundError(f"Run '{run_id}' does not exist.")
         return RunSubtree(

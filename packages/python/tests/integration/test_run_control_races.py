@@ -486,4 +486,6 @@ class TestPre03Store:
         with pytest.raises(NotImplementedError, match="get_notes"):
             await RunStore(legacy).get_notes("r1")  # type: ignore[arg-type]
         with pytest.raises(NotImplementedError, match="get_subtree"):
+            await RunStore(legacy).get_subtree("r1")  # type: ignore[arg-type]
+        with pytest.raises(NotImplementedError, match="get_subtree"):
             await agent.cancel_run("r1", cascade=True)
