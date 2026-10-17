@@ -21,6 +21,7 @@ Suggested HTTP mappings:
     ContextLengthExceededError  -> 413 or 400
     SkillMismatchError          -> 409
     SqliteSchemaSyncError       -> 500 (startup: legacy SQLite file needs migration)
+    SchemaOutOfDateError        -> 500 (startup: run `dendrux db migrate`)
 
 ``SkillValidationError`` is raised while building a :class:`~dendrux.skills.Skill`
 (a configuration error, not a request error).
@@ -287,6 +288,45 @@ class SqliteSchemaSyncError(RuntimeError):
     """
 
 
+class SchemaOutOfDateError(RuntimeError):
+    """A non-SQLite database is missing tables or columns this Dendrux version needs.
+
+    Raised once per engine, before the first query, when the database was
+    migrated by an older Dendrux and ``dendrux db migrate`` has not been run
+    since upgrading. The check is read-only: it compares the live tables and
+    columns with the models, ignores anything extra in the database, and does
+    not depend on Alembic's version table. Run ``dendrux db migrate`` with
+    ``DENDRUX_DATABASE_URL`` pointing at the database, then restart. If the
+    schema is managed some other way, set ``DENDRUX_SKIP_SCHEMA_CHECK=1`` to
+    skip the check.
+
+    Attributes:
+        missing_tables: Names of model tables absent from the database.
+        missing_columns: ``"table.column"`` entries for columns absent from
+            tables that do exist.
+    """
+
+    def __init__(
+        self,
+        missing_tables: Iterable[str] = (),
+        missing_columns: Iterable[str] = (),
+    ) -> None:
+        self.missing_tables: tuple[str, ...] = tuple(missing_tables)
+        self.missing_columns: tuple[str, ...] = tuple(missing_columns)
+        missing = [*self.missing_columns, *(f"table {t}" for t in self.missing_tables)]
+        super().__init__(
+            f"The database schema is behind this version of dendrux (missing: "
+            f"{', '.join(missing)}). Run `dendrux db migrate` with DENDRUX_DATABASE_URL "
+            f"pointing at this database, then restart. If you manage the schema yourself "
+            f"and want to skip this check, set DENDRUX_SKIP_SCHEMA_CHECK=1."
+        )
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        """Every missing object: columns as ``table.column``, tables by name."""
+        return (*self.missing_columns, *self.missing_tables)
+
+
 __all__ = [
     "ContextLengthExceededError",
     "InvalidToolResultError",
@@ -298,6 +338,7 @@ __all__ = [
     "RunNotFoundError",
     "RunNotPausedError",
     "SchemaNotInitializedError",
+    "SchemaOutOfDateError",
     "SkillContinuityError",
     "SkillDigestMismatch",
     "SkillMismatchError",

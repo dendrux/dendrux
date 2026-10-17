@@ -924,6 +924,7 @@ class Agent:
 
         from sqlalchemy.ext.asyncio import create_async_engine
 
+        from dendrux.db._schema_check import ensure_schema_current
         from dendrux.db._sqlite_sync import create_sqlite_schema
 
         connect_args: dict[str, Any] = {}
@@ -937,16 +938,18 @@ class Agent:
             **self._database_options,
         )
 
-        # Auto-create tables for SQLite (zero-config promise)
-        if url.startswith("sqlite"):
-            db_path = url.split("///", 1)[-1] if "///" in url else None
-            if db_path:
-                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-            try:
+        try:
+            if url.startswith("sqlite"):
+                # Auto-create tables for SQLite (zero-config promise)
+                db_path = url.split("///", 1)[-1] if "///" in url else None
+                if db_path:
+                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
                 await create_sqlite_schema(engine)
-            except BaseException:
-                await engine.dispose()
-                raise
+            else:
+                await ensure_schema_current(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
 
         return engine
 
