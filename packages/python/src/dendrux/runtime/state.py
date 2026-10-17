@@ -39,6 +39,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class _Unscoped:
+    """Type of the ``UNSCOPED`` sentinel."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSCOPED"
+
+
+UNSCOPED = _Unscoped()
+"""Omitted tenant scope: trusted, no tenant predicate. Distinct from ``None``,
+which scopes to untenanted runs only."""
+
+TenantScope = str | None | _Unscoped
+
 _COST_DECIMALS = 6  # llm_interactions.cost_usd is Numeric(10, 6)
 _IN_CHUNK = 500  # keep IN (...) lists well under SQLite's variable limit
 
@@ -632,13 +648,15 @@ class StateStore(Protocol):
         ...
 
     async def get_subtree(
-        self, run_id: str, *, tenant_id: str | None = None
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
     ) -> SubtreeRecord | None:
         """Root run plus all descendants with per-node and rolled-up live usage.
 
         Usage is summed from ``llm_interactions`` so running and paused runs
-        count. With ``tenant_id``, nodes of other tenants (and everything
-        below them) are excluded; a root of another tenant reads as missing.
+        count. ``tenant_id`` omitted (``UNSCOPED``) applies no tenant
+        predicate. A string keeps only that tenant's runs; explicit ``None``
+        keeps only untenanted runs. Other-scope nodes (and everything below
+        them) are excluded and a root outside the scope reads as missing.
         Returns None if the run doesn't exist.
         """
         ...
@@ -1883,7 +1901,7 @@ class SQLAlchemyStateStore:
         session: AsyncSession,
         root_id: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         light: bool = False,
     ) -> list[tuple[AgentRun, int]]:
         """Descendants of ``root_id`` as ``(row, depth)`` in BFS order, root excluded.
@@ -1914,8 +1932,7 @@ class SQLAlchemyStateStore:
                     stmt = stmt.options(
                         load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id)
                     )
-                if tenant_id is not None:
-                    stmt = stmt.where(AgentRun.tenant_id == tenant_id)
+                stmt = _apply_tenant_scope(stmt, tenant_id)
                 result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
                 rows.extend(result.scalars().all())
 
@@ -2024,16 +2041,14 @@ class SQLAlchemyStateStore:
         return out
 
     async def get_subtree(
-        self, run_id: str, *, tenant_id: str | None = None
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
     ) -> SubtreeRecord | None:
         from sqlalchemy import select
 
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = select(AgentRun).where(AgentRun.id == run_id)
-            if tenant_id is not None:
-                stmt = stmt.where(AgentRun.tenant_id == tenant_id)
+            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
             root = (await session.execute(stmt)).scalar_one_or_none()
             if root is None:
                 return None
@@ -2243,6 +2258,17 @@ class SQLAlchemyStateStore:
         for key, value in metadata_filter.items():
             stmt = stmt.where(func.json_extract(AgentRun.meta, f"$.{key}") == value)
         return stmt
+
+
+def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
+    """``UNSCOPED`` adds nothing; ``None`` means untenanted only; a string means that tenant."""
+    from dendrux.db.models import AgentRun
+
+    if isinstance(tenant_id, _Unscoped):
+        return stmt
+    if tenant_id is None:
+        return stmt.where(AgentRun.tenant_id.is_(None))
+    return stmt.where(AgentRun.tenant_id == tenant_id)
 
 
 def _extract_status(row: AgentRun) -> str:

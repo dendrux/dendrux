@@ -213,6 +213,38 @@ class TestGetSubtree:
             await store.get_subtree("root", tenant_id="t1")
         assert (await store.get_subtree("root")).root.run.run_id == "root"
 
+    async def test_explicit_none_scopes_to_untenanted_runs(self, store, internal_store) -> None:
+        await internal_store.create_run("null-root", "N")
+        await internal_store.create_run("null-kid", "N", parent_run_id="null-root")
+        await internal_store.create_run("b-kid", "B", parent_run_id="null-root", tenant_id="b")
+        await internal_store.create_run("b-grandkid", "B", parent_run_id="b-kid")
+        await _call(internal_store, "null-kid", inp=1)
+        await _call(internal_store, "b-kid", inp=10)
+        await _call(internal_store, "b-grandkid", inp=100)
+
+        scoped = await store.get_subtree("null-root", tenant_id=None)
+        assert {n.run.run_id for n in scoped.nodes} == {"null-root", "null-kid"}
+        assert scoped.usage.input_tokens == 1
+
+        unscoped = await store.get_subtree("null-root")
+        assert len(unscoped.nodes) == 4
+        assert unscoped.usage.input_tokens == 111
+
+    async def test_untenanted_root_with_foreign_child_returns_only_root(
+        self, store, internal_store
+    ) -> None:
+        await internal_store.create_run("null-root", "N")
+        await internal_store.create_run("b-kid", "B", parent_run_id="null-root", tenant_id="b")
+        tree = await store.get_subtree("null-root", tenant_id=None)
+        assert [n.run.run_id for n in tree.nodes] == ["null-root"]
+
+    async def test_tenanted_root_with_explicit_none_is_not_found(
+        self, store, internal_store
+    ) -> None:
+        await internal_store.create_run("a-root", "A", tenant_id="a")
+        with pytest.raises(RunNotFoundError):
+            await store.get_subtree("a-root", tenant_id=None)
+
     async def test_missing_run_raises(self, store) -> None:
         with pytest.raises(RunNotFoundError):
             await store.get_subtree("nope")

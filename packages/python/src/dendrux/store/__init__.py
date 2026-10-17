@@ -39,7 +39,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from dendrux.runtime.state import SQLAlchemyStateStore, StateStore
+from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StateStore, TenantScope
 from dendrux.types import ReplaySummary
 
 if TYPE_CHECKING:
@@ -397,7 +397,7 @@ class RunStore:
         )
         return [_event_to_stored(r) for r in rows]
 
-    async def get_subtree(self, run_id: str, *, tenant_id: str | None = None) -> RunSubtree:
+    async def get_subtree(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunSubtree:
         """Return a run, all its descendants, and live rolled-up usage.
 
         ``RunSubtree.usage`` is the authoritative usage: it is summed from
@@ -409,10 +409,11 @@ class RunStore:
         transaction: a run that is still writing can make nodes and usage
         differ by a call or a child.
 
-        Tenancy: with ``tenant_id`` the root must belong to that tenant
-        (otherwise it reads as missing) and every descendant must too; other
-        tenants' runs are excluded together with everything below them.
-        Omitted (``None``) means unscoped: all descendants are returned.
+        Tenancy: omit ``tenant_id`` for a trusted, unscoped read (all
+        descendants). Pass a string to scope to that tenant, or an explicit
+        ``None`` to scope to untenanted runs only. The root must be in scope
+        (otherwise it reads as missing) and so must every descendant; runs
+        outside the scope are excluded together with everything below them.
 
         Raises :class:`RunNotFoundError` if the run does not exist.
         """
