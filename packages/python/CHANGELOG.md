@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 - 2026-10-18
 
 Image input across the run lifecycle. This release includes a database
 migration (see Migration): run `dendrux db migrate` before upgrading a
