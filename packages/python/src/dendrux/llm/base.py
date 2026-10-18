@@ -170,6 +170,10 @@ class LLMProvider(ABC):
 
         Returns:
             Normalized LLMResponse with text, tool_calls, and usage stats.
+            Set ``stop_reason`` (normalized :data:`~dendrux.types.StopReason`)
+            and ``raw_stop_reason`` when the vendor reports why the call
+            stopped; leave both ``None`` otherwise. ``"max_tokens"`` marks a
+            run's final answer as truncated (``RunResult.truncated``).
         """
 
     async def complete_stream(
