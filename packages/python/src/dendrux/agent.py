@@ -1912,15 +1912,23 @@ class Agent:
             raise RunNotFoundError(run_id)
 
         outcomes: list[dict[str, str]] = []
+        # Descendants are signalled together with the root, after every
+        # durable request: a parent and child sharing one task must both
+        # register their interrupt before the task sees the cancellation.
+        to_signal: list[str] = []
         if cascade:
             get_subtree = require_store_method(store, "get_subtree")
             subtree = await get_subtree(run_id, tenant_id=tenant_id)
             if subtree is not None:
                 for rid in _cascade_order(subtree)[:-1]:
-                    outcome = await self._cancel_one(store, rid)
+                    outcome = await self._cancel_one(store, rid, signal=False)
                     outcomes.append({"run_id": rid, "outcome": outcome})
+                    if outcome != "terminal":
+                        to_signal.append(rid)
 
         if record.status in _TERMINAL_STATUS_VALUES:
+            for rid in to_signal:
+                self._task_manager.cancel(rid)
             result = _record_to_run_result(record)
             outcomes.append({"run_id": run_id, "outcome": "terminal"})
         else:
@@ -1934,6 +1942,8 @@ class Agent:
             # preempted from here on, and the returned RunResult
             # deterministically reflects "requested" (non-terminal status +
             # meta.cancel_requested) rather than racing the loop's own finalize.
+            for rid in to_signal:
+                self._task_manager.cancel(rid)
             self._task_manager.cancel(run_id)
             result = _record_to_run_result(record)
         if result.status.value in _TERMINAL_STATUS_VALUES:

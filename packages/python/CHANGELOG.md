@@ -76,6 +76,11 @@ behaviour differences.
 - OpenAI Responses streaming: a truncated response (`response.incomplete`)
   lost its usage, provider payload and reasoning items, so it couldn't be
   priced.
+- `cancel_run(cascade=True)` on a parent and child sharing one task (same
+  Agent, in-process delegation) could record the parent as cancelled without
+  `meta["interrupted"]` when store writes were slow: the child was signalled
+  before the parent's interrupt was registered. All in-process signals are
+  now sent together after the durable cancel requests.
 
 ## 0.4.0 - 2026-10-18
 

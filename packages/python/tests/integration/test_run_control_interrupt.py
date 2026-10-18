@@ -361,6 +361,40 @@ class TestCascade:
         current = asyncio.current_task()
         assert current is not None and current.cancelling() == 0
 
+    @_INTERRUPTIBLE
+    async def test_cascade_cancel_shared_task_survives_slow_store(self, store) -> None:
+        """Slow durable writes after the child's request must not let the shared
+        task see the cancellation before the parent's interrupt is registered."""
+        holder: dict[str, Agent] = {}
+
+        @tool()
+        async def delegate() -> str:
+            return (await holder["agent"].run("sub")).status.value
+
+        llm = ScriptedLLM([tool_call("delegate", pid="p1"), LLMResponse(text="child")], gate_at=1)
+        agent = Agent(provider=llm, prompt="T.", tools=[delegate], state_store=store)
+        holder["agent"] = agent
+        task = asyncio.create_task(agent.run("go"))
+        await asyncio.wait_for(llm.entered.wait(), 5)
+        parent_id = await _only_run_id(store)
+        child_id = await _only_run_id(store, parent=parent_id)
+
+        real_request_cancel = store.request_cancel
+
+        async def slow_request_cancel(rid: str) -> bool:
+            if rid == parent_id:
+                await asyncio.sleep(0.2)
+            return await real_request_cancel(rid)
+
+        store.request_cancel = slow_request_cancel
+        await agent.cancel_run(parent_id, cascade=True)
+        result = await asyncio.wait_for(task, 5)
+        assert result.status == RunStatus.CANCELLED
+        assert result.meta["interrupted"] is True
+        for rid in (child_id, parent_id):
+            evt = (await _events(store, rid, "run.cancelled"))[0]
+            assert evt.data["interrupted"] is True
+
     async def test_pause_cascade_respects_tenant(self, store) -> None:
         await store.create_run("p", "a", tenant_id="t1")
         await store.create_run("c1", "a", parent_run_id="p", delegation_level=1, tenant_id="t1")
