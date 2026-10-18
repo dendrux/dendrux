@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
 
@@ -140,6 +141,12 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
         async with get_session(engine) as session:
             session.add(run)
             await session.commit()
+
+    On a single-connection pool (in-memory SQLite) the session holds the
+    pool's lock until it is closed, so Dendrux's other sessions wait for it.
+    Never hold such a session across a call that runs an agent or starts
+    tasks using the same engine (for example for a whole web request that
+    calls ``agent.run()``): those tasks wait for the lock and the call hangs.
     """
     resolved_engine = engine or await get_engine()
     # Use cached factory when using the default engine, create ad-hoc for custom engines
@@ -149,10 +156,22 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
         factory = sessionmaker(  # type: ignore[call-overload]
             resolved_engine, class_=AsyncSession, expire_on_commit=False
         )
-    async with factory() as session:
+    if not shares_one_connection(resolved_engine):
+        async with factory() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+        return
+    async with serialized(resolved_engine):
+        session = factory()
         try:
             yield session
             await session.commit()
         except Exception:
             await session.rollback()
             raise
+        finally:
+            await close_fully(session.close)

@@ -20,6 +20,7 @@ from dendrux.types import (
     Finish,
     Message,
     Role,
+    tool_result_message,
 )
 
 if TYPE_CHECKING:
@@ -96,12 +97,7 @@ class NativeToolCalling(Strategy):
         """Format tool result as a TOOL message with call_id correlation.
 
         The provider adapter will convert this to its native format
-        (e.g., Anthropic tool_result block in a user message).
+        (e.g., Anthropic tool_result block in a user message). Results with
+        images become a parts message (payload text first, then the images).
         """
-        return Message(
-            role=Role.TOOL,
-            content=result.payload,
-            name=result.name,
-            call_id=result.call_id,
-            meta={"is_error": True} if not result.success else {},
-        )
+        return tool_result_message(result)

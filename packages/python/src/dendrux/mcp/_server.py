@@ -17,10 +17,11 @@ from dendrux.mcp._errors import (
     MCPDestinationDeniedError,
     MCPToolCallError,
 )
-from dendrux.mcp._result import normalize_mcp_result
+from dendrux.mcp._result import error_text, has_image_blocks, normalize_mcp_result
 from dendrux.mcp._source import (
     MCPFailureMode,
     MCPSource,
+    redact_source_text,
     redact_source_value,
     redact_transport_text,
     safe_source_exception_detail,
@@ -238,12 +239,15 @@ def create_mcp_executor(
     mcp_tool_name: str,
     max_result_bytes: int,
     exposed_name: str | None = None,
+    images: Literal["parts", "inline"] = "parts",
 ) -> Callable[..., Any]:
     """Create an async Dendrux executor bound to one live MCP adapter.
 
     ``exposed_name`` is the Agent-visible name used in error text; it defaults
     to the prefixed, sanitized name. The server is always called with
-    ``mcp_tool_name``.
+    ``mcp_tool_name``. ``images="parts"`` (Agent runs) returns image content
+    as a ``ToolOutput``; ``"inline"`` keeps the legacy base64 envelope
+    (``MCPConnection.call_tool``).
     """
     display_name = exposed_name or exposed_tool_name(mcp_tool_name, namespace=namespace)
 
@@ -258,17 +262,24 @@ def create_mcp_executor(
         except Exception as exc:
             failure: Exception = exc
         else:
-            normalized = normalize_mcp_result(result, max_result_bytes=max_result_bytes)
+            normalized = normalize_mcp_result(
+                result, max_result_bytes=max_result_bytes, images=images
+            )
             redacted = redact_source_value(adapter.source, normalized)
             is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
             if is_error:
                 # Server-authored text lands in the same sink, so it gets the
                 # same scrub in case the server echoes a credential back.
-                message = (
-                    "MCP tool returned an error (detail suppressed: opaque auth)."
-                    if opaque
-                    else str(redacted or "MCP tool returned an error")
-                )
+                if opaque:
+                    message = "MCP tool returned an error (detail suppressed: opaque auth)."
+                elif images == "parts" and has_image_blocks(result):
+                    # Never str() a ToolOutput: text blocks only, images omitted.
+                    message = (
+                        redact_source_text(adapter.source, error_text(result))
+                        or "MCP tool returned an error"
+                    )
+                else:
+                    message = str(redacted or "MCP tool returned an error")
                 raise MCPToolCallError(message)
             return redacted
         # Unlike a connect failure, this text is worth keeping: the model reads

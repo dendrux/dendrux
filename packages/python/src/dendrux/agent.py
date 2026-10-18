@@ -28,6 +28,7 @@ import os
 import threading
 import warnings
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -38,7 +39,7 @@ from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -52,6 +53,10 @@ if TYPE_CHECKING:
     from dendrux.mcp._runtime import MCPToolView
     from dendrux.mcp._server import MCPServer
     from dendrux.mcp._source import MCPSource
+    from dendrux.media._catalog import BlobCatalog, BlobResolver
+    from dendrux.media._image import UserContent
+    from dendrux.media._policy import ImagePolicy
+    from dendrux.media._store import BlobAccessor, BlobInfo, BlobReference, BlobStore, GcResult
     from dendrux.pricing import PriceTable
     from dendrux.runtime.state import StateStore
     from dendrux.skills import Skill, SkillExecutor
@@ -60,6 +65,7 @@ if TYPE_CHECKING:
         ApprovalDecision,
         BeforeToolHook,
         Budget,
+        ImageRef,
         PauseOutcome,
         RunResult,
         RunStream,
@@ -214,6 +220,59 @@ def _build_provider_from_spec(spec: str) -> LLMProvider:
     )
 
 
+def _blob_services_factory() -> Any:
+    """``BlobServices`` from the persistence layer (the single wiring point).
+
+    ``BlobServices.for_state_store(store, blob_store=)`` and
+    ``BlobServices.in_memory(blob_store=)``; tests substitute fakes here.
+    """
+    from dendrux.runtime._blob_catalog import BlobServices
+
+    return BlobServices
+
+
+class _AgentBlobs:
+    """``agent.blobs``: resolves the agent's store lazily, then delegates.
+
+    Delegates to the blob services' accessor for this agent's database (or
+    the process-local in-memory services without one).
+    """
+
+    def __init__(self, agent: Agent) -> None:
+        self._agent = agent
+
+    async def _target(self) -> BlobAccessor:
+        from dendrux.errors import ImagePersistenceUnsupportedError
+
+        store = await self._agent._resolve_state_store()
+        services = self._agent._blob_services(store)
+        if services is None:
+            raise ImagePersistenceUnsupportedError(
+                "state_store", store_type=type(store).__name__ if store is not None else None
+            )
+        accessor: BlobAccessor = services.accessor
+        return accessor
+
+    async def read(self, image: ImageRef | str, *, tenant_id: str | None = None) -> bytes:
+        return await (await self._target()).read(image, tenant_id=tenant_id)
+
+    async def info(self, sha256: str, *, tenant_id: str | None = None) -> BlobInfo | None:
+        return await (await self._target()).info(sha256, tenant_id=tenant_id)
+
+    async def references(self, sha256: str, *, tenant_id: str | None = None) -> list[BlobReference]:
+        return await (await self._target()).references(sha256, tenant_id=tenant_id)
+
+    async def purge(
+        self, sha256: str, *, tenant_id: str | None = None, reason: str | None = None
+    ) -> bool:
+        return await (await self._target()).purge(sha256, tenant_id=tenant_id, reason=reason)
+
+    async def collect_garbage(
+        self, *, older_than: timedelta = timedelta(hours=24), limit: int = 1000
+    ) -> GcResult:
+        return await (await self._target()).collect_garbage(older_than=older_than, limit=limit)
+
+
 class Agent:
     """Dendrux agent — definition and runtime facade.
 
@@ -273,6 +332,8 @@ class Agent:
         skill_executor: SkillExecutor | None = ...,
         tool_result_transform: ToolResultTransform | None = ...,
         before_tool: BeforeToolHook | None = ...,
+        images: ImagePolicy | None = ...,
+        blob_store: BlobStore | None = ...,
     ) -> None: ...
 
     @overload
@@ -302,6 +363,8 @@ class Agent:
         skill_executor: SkillExecutor | None = ...,
         tool_result_transform: ToolResultTransform | None = ...,
         before_tool: BeforeToolHook | None = ...,
+        images: ImagePolicy | None = ...,
+        blob_store: BlobStore | None = ...,
     ) -> None: ...
 
     def __init__(
@@ -330,6 +393,8 @@ class Agent:
         skill_executor: SkillExecutor | None = None,
         tool_result_transform: ToolResultTransform | None = None,
         before_tool: BeforeToolHook | None = None,
+        images: ImagePolicy | None = None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -407,6 +472,25 @@ class Agent:
                 f"got {type(before_tool).__name__}."
             )
         self._before_tool: BeforeToolHook | None = before_tool
+
+        # --- Images ---
+        from dendrux.media._policy import ImagePolicy as _ImagePolicy
+        from dendrux.media._store import BlobStore as _BlobStore
+
+        if images is not None and not isinstance(images, _ImagePolicy):
+            raise ValueError(
+                f"Agent '{self.name}' images must be an ImagePolicy, got {type(images).__name__}."
+            )
+        if blob_store is not None and not isinstance(blob_store, _BlobStore):
+            raise ValueError(
+                f"Agent '{self.name}' blob_store must implement BlobStore "
+                f"(put/get/delete), got {type(blob_store).__name__}."
+            )
+        self._image_policy: ImagePolicy = images if images is not None else _ImagePolicy()
+        self._blob_store: BlobStore | None = blob_store
+        # Blob services per state store (catalog, resolver cache, accessor);
+        # key None = process-local in-memory services when there is no database.
+        self._services: dict[int | None, tuple[Any, Any]] = {}
         self._lazy_store: StateStore | None = None
         self._private_engine: AsyncEngine | None = None
         self._store_lock = threading.Lock()
@@ -574,6 +658,69 @@ class Agent:
         - Sync transforms run inline on the event loop — keep them cheap.
         """
         return self._tool_result_transform
+
+    @property
+    def image_policy(self) -> ImagePolicy:
+        """Image input policy (``Agent(images=...)``; defaults to ``ImagePolicy()``)."""
+        return self._image_policy
+
+    @property
+    def blobs(self) -> BlobAccessor:
+        """Blob reads and lifecycle (read, info, references, purge, collect_garbage).
+
+        Uses this agent's database and ``blob_store``; without a database,
+        the process-local in-memory store.
+        """
+        return _AgentBlobs(self)
+
+    def _blob_services(self, state_store: StateStore | None) -> Any:
+        """Blob services for ``state_store`` (cached per store), or None when unavailable."""
+        key = None if state_store is None else id(state_store)
+        cached = self._services.get(key)
+        if cached is not None and cached[0] is state_store:
+            return cached[1]
+        factory = _blob_services_factory()
+        if factory is None:
+            return None
+        if state_store is None:
+            services = factory.in_memory(blob_store=self._blob_store)
+        else:
+            services = factory.for_state_store(state_store, blob_store=self._blob_store)
+        self._services[key] = (state_store, services)
+        return services
+
+    def _image_backend(
+        self, state_store: StateStore | None
+    ) -> tuple[BlobCatalog | None, BlobStore | None, BlobResolver | None]:
+        """Catalog, blob store and resolver for one run's ``ImageRuntime``.
+
+        With a database the state store is the catalog when it implements
+        ``BlobCatalog`` (else ``None``: ingest then raises
+        ``ImagePersistenceUnsupportedError``). Without one, process-local
+        in-memory services (non-durable).
+        """
+        services = self._blob_services(state_store)
+        if services is None:
+            return None, self._blob_store, None
+        return services.catalog, services.blob_store, services.resolver
+
+    def _image_gc(self, state_store: StateStore | None) -> Callable[[], Awaitable[object]] | None:
+        """One GC pass (``older_than=1h``) that ingest runs when the blob store is full (§5.12).
+
+        Database-backed agents only: the in-memory services (no database)
+        wrap their store so a full ``put`` already runs that single pass.
+        """
+        if state_store is None:
+            return None
+        services = self._blob_services(state_store)
+        accessor = getattr(services, "accessor", None)
+        if accessor is None:
+            return None
+
+        async def _collect() -> object:
+            return await accessor.collect_garbage(older_than=timedelta(hours=1))
+
+        return _collect
 
     @property
     def before_tool(self) -> BeforeToolHook | None:
@@ -963,7 +1110,7 @@ class Agent:
     @overload
     async def run(
         self,
-        user_input: str,
+        user_input: UserContent,
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
@@ -983,7 +1130,7 @@ class Agent:
     @overload
     async def run(
         self,
-        user_input: str,
+        user_input: UserContent,
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
@@ -1001,7 +1148,7 @@ class Agent:
 
     async def run(
         self,
-        user_input: str,
+        user_input: UserContent,
         *,
         history: list[ChatMessage] | None = None,
         context: list[ContextBlock] | None = None,
@@ -1023,10 +1170,17 @@ class Agent:
         config.
 
         Args:
-            user_input: The user's input to process.
+            user_input: The user's input: a string, or a sequence of strings
+                and images (``Image``, ``ImageRef``, ``ImagePart``) in order.
+                Images are validated and stored before the run is created;
+                an image error (``ImageError``, ``UnsupportedModalityError``
+                for a model that cannot take images, ...) raises before any
+                run row exists.
             history: Optional prior conversation turns to seed the run with —
                 for building chatbots on top of Dendrux. Each ``ChatMessage``
-                is a ``role`` (USER or ASSISTANT) plus ``content``. The dev's
+                is a ``role`` (USER or ASSISTANT) plus ``content``; user turns
+                may carry images (``ChatMessage.user([...])``), which count as
+                already sent. The dev's
                 app owns conversation storage; Dendrux only reads ``history``
                 as input for this turn and does NOT persist it to
                 ``react_traces``. Validation rules: must start with USER, end
@@ -1230,7 +1384,7 @@ class Agent:
         run_id: str,
         *,
         tool_results: list[ToolResult] | None = None,
-        user_input: str | None = None,
+        user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
     ) -> RunResult:
         """Resume a paused run.
@@ -1244,7 +1398,9 @@ class Agent:
         Args:
             run_id: The paused run's ID.
             tool_results: Results for pending tool calls (for client tool runs).
-            user_input: Clarification answer (for human-in-the-loop runs).
+                ``ToolResult.images`` are ingested before the run is claimed.
+            user_input: Clarification answer (for human-in-the-loop runs): a
+                string, or strings and images.
             notifier: Optional additional loop notifier. Composed with
                 PersistenceRecorder internally.
 
@@ -1316,7 +1472,10 @@ class Agent:
             run_id: A run in status ``WAITING_CLIENT_TOOL``.
             results: One :class:`ToolResult` per pending tool call. Must
                 cover every pending call; unknown or missing ids raise
-                ``InvalidToolResultError``.
+                ``InvalidToolResultError``. ``ToolResult.images`` are
+                validated and stored before the claim; an image error
+                (``ImageError``, ``UnsupportedModalityError``) raises with the
+                run still waiting.
             notifier: Optional additional notifier composed during resume.
 
         Returns:
@@ -1347,12 +1506,20 @@ class Agent:
 
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
-            await validate_tool_results(store, run_id, results)
+            pause = await validate_tool_results(store, run_id, results)
+            claim_kwargs: dict[str, Any] = {}
+            if any(r.images for r in results):
+                from dendrux.runtime.runner import ingest_submitted_tool_images
+
+                results, claim_kwargs = await ingest_submitted_tool_images(
+                    self, provider, store, run_id, pause, results
+                )
             await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_CLIENT_TOOL,
                 submitted_data={"submitted_tool_results": serialize_tool_results(results)},
+                **claim_kwargs,
             )
 
             task = self._task_manager.spawn(
@@ -1371,7 +1538,7 @@ class Agent:
     async def submit_input(
         self,
         run_id: str,
-        text: str,
+        text: UserContent,
         *,
         notifier: LoopNotifier | None = None,
     ) -> RunResult:
@@ -1382,7 +1549,8 @@ class Agent:
 
         Args:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
-            text: The user's clarification answer.
+            text: The user's clarification answer: a string, or strings and
+                images (ingested before the claim).
             notifier: Optional additional notifier composed during resume.
 
         Raises:
@@ -1400,13 +1568,25 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        from dendrux.chat import split_user_content
+
+        projection, items = split_user_content(text, owner="text")
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
+            submitted: dict[str, Any] = {"submitted_user_input": projection}
+            claim_kwargs: dict[str, Any] = {}
+            if items:
+                from dendrux.runtime.runner import ingest_submitted_user_parts
+
+                submitted, claim_kwargs = await ingest_submitted_user_parts(
+                    self, provider, store, run_id, projection, items
+                )
             await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_HUMAN_INPUT,
-                submitted_data={"submitted_user_input": text},
+                submitted_data=submitted,
+                **claim_kwargs,
             )
 
             task = self._task_manager.spawn(
@@ -1986,7 +2166,7 @@ class Agent:
     @overload
     def stream(
         self,
-        user_input: str,
+        user_input: UserContent,
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
@@ -2005,7 +2185,7 @@ class Agent:
     @overload
     def stream(
         self,
-        user_input: str,
+        user_input: UserContent,
         *,
         history: list[ChatMessage] | None = ...,
         context: list[ContextBlock] | None = ...,
@@ -2022,7 +2202,7 @@ class Agent:
 
     def stream(
         self,
-        user_input: str,
+        user_input: UserContent,
         *,
         history: list[ChatMessage] | None = None,
         context: list[ContextBlock] | None = None,
@@ -2071,7 +2251,11 @@ class Agent:
         answer.
 
         Args:
-            user_input: The user's input to process.
+            user_input: The user's input — a string, or strings and images
+                (see :meth:`run`). Item types are checked synchronously
+                (``TypeError``); image ingest runs on first iteration before
+                the run row is created, and its errors are raised from the
+                first ``__anext__`` (not as ``RUN_ERROR``), with no run row.
             history: Optional prior conversation turns to seed the run with —
                 for building chatbots on top of Dendrux. Each ``ChatMessage``
                 is a ``role`` (USER or ASSISTANT) plus ``content``. The dev's
@@ -2165,7 +2349,7 @@ class Agent:
         run_id: str,
         *,
         tool_results: list[ToolResult] | None = None,
-        user_input: str | None = None,
+        user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
     ) -> RunStream:
         """Stream a resumed run as RunEvents.

@@ -26,6 +26,16 @@ from dendrux.llm._helpers import (
     resolve_tool_message_call,
     timeout_error,
 )
+from dendrux.llm._images import (
+    WireImageRegistry,
+    anthropic_image,
+    anthropic_image_support,
+    anthropic_text,
+    convert_parts,
+    normalize_base_url,
+    sdk_image_request_error,
+    transport_image_error,
+)
 from dendrux.llm._retry_telemetry import (
     begin_call_attempt_tracking,
     call_attempt_tracking,
@@ -47,6 +57,7 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from dendrux.llm.base import ImageSupport
     from dendrux.types import Message, ToolDef
 
 # Anthropic-specific kwargs that complete() will forward to the API.
@@ -93,13 +104,16 @@ class AnthropicProvider(LLMProvider):
     tool call events.
 
     Capabilities reflect what this adapter *implements*, not what the
-    Anthropic API can theoretically do. Thinking and multimodal will be
-    enabled when their corresponding code paths are added.
+    Anthropic API can theoretically do. Image parts are sent as base64
+    ``image`` blocks; images in tool results go inside the ``tool_result``
+    block (native mapping).
 
     Usage:
         provider = AnthropicProvider(api_key="sk-...", model="claude-sonnet-4-6")
         response = await provider.complete(messages, tools=tools)
     """
+
+    tool_result_images = "native"
 
     capabilities = ProviderCapabilities(
         supports_native_tools=True,
@@ -107,7 +121,7 @@ class AnthropicProvider(LLMProvider):
         supports_streaming=True,
         supports_streaming_tool_deltas=True,
         supports_thinking=True,
-        supports_multimodal=False,  # Not implemented yet
+        supports_multimodal=True,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
         supports_structured_output=True,
@@ -184,6 +198,26 @@ class AnthropicProvider(LLMProvider):
     async def close(self) -> None:
         """Close the underlying HTTP client and release connections."""
         await self._client.close()
+
+    # ------------------------------------------------------------------
+    # Image input (0.4.0)
+    # ------------------------------------------------------------------
+
+    async def image_input_support(self, model: str) -> ImageSupport:
+        """``"yes"`` for ``claude-*`` models; ``"unknown"`` for any other name."""
+        return anthropic_image_support(model)
+
+    @property
+    def thinking_enabled(self) -> bool:
+        """True when the provider was configured with ``thinking=True``."""
+        return bool(self._thinking)
+
+    def many_image_rule(self, model: str) -> tuple[int, int] | None:
+        """More than 20 images in a request => every image's long side <= 2000 px."""
+        return (20, 2000)
+
+    def image_capability_key(self, model: str) -> tuple[str, str, str]:
+        return ("anthropic", normalize_base_url(self._client.base_url), model)
 
     async def __aenter__(self) -> AnthropicProvider:
         return self
@@ -265,12 +299,18 @@ class AnthropicProvider(LLMProvider):
         messages: list[Message],
         tools: list[ToolDef] | None,
         kwargs: dict[str, Any],
+        *,
+        registry: WireImageRegistry | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build Anthropic API kwargs from Dendrux messages and caller kwargs.
 
         Returns (api_kwargs, captured_request) where captured_request is the
-        serializable subset for the evidence layer.
+        serializable subset for the evidence layer. On an image-bearing request
+        every base64 payload in captured_request is replaced by
+        ``"dendrux-image:sha256:<hex>"`` (``registry`` records the images).
         """
+        if registry is None:
+            registry = WireImageRegistry()
         # Model + thinking resolve first: they decide whether stored thinking
         # blocks may be replayed on assistant turns.
         model = kwargs.pop("model", self._model)
@@ -280,6 +320,7 @@ class AnthropicProvider(LLMProvider):
             messages,
             replay_reasoning_for=model if thinking_on else None,
             stable_indices=stable_indices,
+            registry=registry,
         )
         api_tools = self._convert_tools(tools) if tools else anthropic.NOT_GIVEN
         # Messages tagged placement="stable" (a stable context head, the end of
@@ -319,6 +360,8 @@ class AnthropicProvider(LLMProvider):
                 api_kwargs[key] = kwargs.pop(key)
 
         captured_request = {k: v for k, v in api_kwargs.items() if v is not anthropic.NOT_GIVEN}
+        if registry.has_images:
+            captured_request = registry.sanitize(captured_request)
         return api_kwargs, captured_request
 
     @staticmethod
@@ -380,7 +423,10 @@ class AnthropicProvider(LLMProvider):
         and normalized into LLMResponse.text as a JSON string, with
         tool_calls set to None (preserving the SingleCall invariant).
         """
-        api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+        registry = WireImageRegistry()
+        api_kwargs, captured_request = self._build_api_kwargs(
+            messages, tools, kwargs, registry=registry
+        )
 
         # Structured output: inject synthetic tool + forced tool_choice
         is_structured = output_schema is not None
@@ -397,13 +443,36 @@ class AnthropicProvider(LLMProvider):
             captured_request["tools"] = api_kwargs["tools"]
             captured_request["tool_choice"] = api_kwargs["tool_choice"]
 
+        # Image-bearing requests never chain SDK errors (they carry the request
+        # body): the typed error is built in the handler, raised after it.
+        failure: Exception | None = None
         try:
             with call_attempt_tracking():
                 response = await self._client.messages.create(**api_kwargs)
         except anthropic.APITimeoutError:
-            raise timeout_error("AnthropicProvider", self._timeout) from None
+            if not registry.has_images:
+                raise timeout_error("AnthropicProvider", self._timeout) from None
+            failure = transport_image_error(
+                "timeout",
+                provider_name="anthropic",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("AnthropicProvider", self._timeout)),
+            )
         except anthropic.APIConnectionError as exc:
-            raise connection_error("Anthropic API", self._model, exc) from exc
+            if not registry.has_images:
+                raise connection_error("Anthropic API", self._model, exc) from exc
+            failure = transport_image_error(
+                "connection", provider_name="anthropic", model=api_kwargs["model"]
+            )
+        except anthropic.APIError as exc:
+            if not registry.has_images:
+                raise
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
+        if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
+            raise failure
 
         if is_structured:
             llm_response = self._normalize_structured_response(response)
@@ -439,7 +508,10 @@ class AnthropicProvider(LLMProvider):
         At stream end, yields a DONE event carrying the full LLMResponse
         (with usage stats and provider payloads) for the loop to consume.
         """
-        api_kwargs, captured_request = self._build_api_kwargs(messages, tools, kwargs)
+        registry = WireImageRegistry()
+        api_kwargs, captured_request = self._build_api_kwargs(
+            messages, tools, kwargs, registry=registry
+        )
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
@@ -453,6 +525,7 @@ class AnthropicProvider(LLMProvider):
         _current_tool_id: str | None = None
         _current_tool_json_parts: list[str] = []
 
+        failure: Exception | None = None
         attempt_token = begin_call_attempt_tracking()
         try:
             async with self._client.messages.stream(**api_kwargs) as stream:
@@ -522,11 +595,32 @@ class AnthropicProvider(LLMProvider):
                 final_message = await stream.get_final_message()
 
         except anthropic.APITimeoutError:
-            raise timeout_error("AnthropicProvider", self._timeout) from None
+            if not registry.has_images:
+                raise timeout_error("AnthropicProvider", self._timeout) from None
+            failure = transport_image_error(
+                "timeout",
+                provider_name="anthropic",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("AnthropicProvider", self._timeout)),
+            )
         except anthropic.APIConnectionError as exc:
-            raise connection_error("Anthropic API", self._model, exc, streaming=True) from exc
+            if not registry.has_images:
+                raise connection_error("Anthropic API", self._model, exc, streaming=True) from exc
+            failure = transport_image_error(
+                "connection", provider_name="anthropic", model=api_kwargs["model"]
+            )
+        except anthropic.APIError as exc:
+            # Includes in-stream ``error`` events, which can follow deltas.
+            if not registry.has_images:
+                raise
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
         finally:
             end_call_attempt_tracking(attempt_token)
+        if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
+            raise failure
 
         usage = self._usage_from_response(final_message.usage)
         if usage.reasoning_tokens is None and stream_reasoning_tokens is not None:
@@ -557,6 +651,7 @@ class AnthropicProvider(LLMProvider):
         *,
         replay_reasoning_for: str | None = None,
         stable_indices: list[int] | None = None,
+        registry: WireImageRegistry | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Convert Dendrux messages to Anthropic format.
 
@@ -574,7 +669,14 @@ class AnthropicProvider(LLMProvider):
 
         When ``stable_indices`` is given, the API-message index of every
         ``placement="stable"`` message is appended to it.
+
+        Messages with image ``parts`` become content-block lists in part order
+        (text blocks + base64 ``image`` blocks); a TOOL message's parts go inside
+        its ``tool_result`` block. Each image's wire path is recorded in
+        ``registry``. Text-only messages take the unchanged v0.3.0 path.
         """
+        if registry is None:
+            registry = WireImageRegistry()
         system_parts: list[str] = []
         api_messages: list[dict[str, Any]] = []
         call_index = build_call_index(messages)
@@ -584,7 +686,10 @@ class AnthropicProvider(LLMProvider):
                 system_parts.append(msg.content)
 
             elif msg.role == Role.USER:
-                api_messages.append({"role": "user", "content": msg.content})
+                if msg.parts is None:
+                    api_messages.append({"role": "user", "content": msg.content})
+                else:
+                    api_messages.append(self._user_parts_message(msg, api_messages, registry))
 
             elif msg.role == Role.ASSISTANT:
                 thinking = replayable_reasoning_blocks(
@@ -616,19 +721,39 @@ class AnthropicProvider(LLMProvider):
                 original_call = resolve_tool_message_call(msg, call_index)
 
                 if original_call.provider_tool_call_id:
-                    # Native tool correlation path — emit tool_result block
-                    self._append_tool_result(
-                        api_messages,
-                        tool_use_id=original_call.provider_tool_call_id,
-                        content=msg.content,
-                        is_error=bool(msg.meta.get("is_error")),
-                    )
-                else:
+                    if msg.parts is None:
+                        # Native tool correlation path — emit tool_result block
+                        self._append_tool_result(
+                            api_messages,
+                            tool_use_id=original_call.provider_tool_call_id,
+                            content=msg.content,
+                            is_error=bool(msg.meta.get("is_error")),
+                        )
+                    else:
+                        # Native tool-result images: text + image blocks nested
+                        # in the tool_result, in part order.
+                        i, j = self._tool_result_position(api_messages)
+                        blocks = convert_parts(
+                            msg.parts,
+                            registry=registry,
+                            prefix=("messages", i, "content", j, "content"),
+                            text_block=anthropic_text,
+                            image_block=anthropic_image,
+                        )
+                        self._append_tool_result(
+                            api_messages,
+                            tool_use_id=original_call.provider_tool_call_id,
+                            content=blocks,
+                            is_error=bool(msg.meta.get("is_error")),
+                        )
+                elif msg.parts is None:
                     # No native correlation (e.g. PromptBasedReAct via
                     # NativeToolCalling — shouldn't happen, but be safe).
                     # Emit as plain user message so the strategy's text
                     # formatting is preserved.
                     api_messages.append({"role": "user", "content": msg.content})
+                else:
+                    api_messages.append(self._user_parts_message(msg, api_messages, registry))
 
             if stable_indices is not None and msg.placement == "stable" and api_messages:
                 stable_indices.append(len(api_messages) - 1)
@@ -636,12 +761,61 @@ class AnthropicProvider(LLMProvider):
         system_prompt = "\n\n".join(system_parts)
         return system_prompt, api_messages
 
+    @staticmethod
+    def _user_parts_message(
+        msg: Message, api_messages: list[dict[str, Any]], registry: WireImageRegistry
+    ) -> dict[str, Any]:
+        """A user message whose content is the parts as blocks, in caller order."""
+        assert msg.parts is not None
+        content = convert_parts(
+            msg.parts,
+            registry=registry,
+            prefix=("messages", len(api_messages), "content"),
+            text_block=anthropic_text,
+            image_block=anthropic_image,
+        )
+        return {"role": "user", "content": content}
+
+    @staticmethod
+    def _tool_result_position(api_messages: list[dict[str, Any]]) -> tuple[int, int]:
+        """``(message index, block index)`` the next tool_result block will take.
+
+        Mirrors the merge rule of :meth:`_append_tool_result`.
+        """
+        if (
+            api_messages
+            and api_messages[-1]["role"] == "user"
+            and isinstance(api_messages[-1]["content"], list)
+            and api_messages[-1]["content"]
+            and api_messages[-1]["content"][0].get("type") == "tool_result"
+        ):
+            return len(api_messages) - 1, len(api_messages[-1]["content"])
+        return len(api_messages), 0
+
+    def _image_error(
+        self,
+        exc: anthropic.APIError,
+        registry: WireImageRegistry,
+        model: str,
+        *,
+        streaming: bool,
+    ) -> Exception:
+        """Typed, sanitised error for a failed image-bearing request (not raised)."""
+        return sdk_image_request_error(
+            exc,
+            provider=self,
+            provider_name="anthropic",
+            model=model,
+            registry=registry,
+            streaming=streaming,
+        )
+
     def _append_tool_result(
         self,
         api_messages: list[dict[str, Any]],
         *,
         tool_use_id: str,
-        content: str,
+        content: str | list[dict[str, Any]],
         is_error: bool,
     ) -> None:
         """Append a tool_result block, merging with the previous user message if consecutive."""

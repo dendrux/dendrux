@@ -6,8 +6,9 @@ Provides a default complete_stream() fallback that wraps complete().
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.types import ProviderCapabilities, StreamEvent, StreamEventType
 
@@ -15,6 +16,15 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from dendrux.types import LLMResponse, Message, ToolDef
+
+ImageSupport = Literal["yes", "no", "unknown"]
+ImageCapabilitySource = Literal["capability", "catalog", "adapter"]
+
+# Guards every provider instance's learned-capability set. Providers are shared
+# across concurrent runs, threads and event loops; learns are rare, so one lock
+# is enough.
+_LEARNED_LOCK = threading.Lock()
+_LEARNED_ATTR = "_dendrux_learned_image_no"
 
 
 class LLMProvider(ABC):
@@ -39,6 +49,70 @@ class LLMProvider(ABC):
     """
 
     capabilities: ProviderCapabilities = ProviderCapabilities()
+
+    tool_result_images: Literal["native", "portable"] = "portable"
+    """How images in tool results reach the model: inside the vendor's
+    tool-result block (``"native"``) or as a text tool message plus one framed
+    user message after the tool block (``"portable"``)."""
+
+    # ------------------------------------------------------------------
+    # Image input (0.4.0)
+    # ------------------------------------------------------------------
+
+    async def image_input_support(self, model: str) -> ImageSupport:
+        """Whether ``model`` accepts image input on this adapter: yes / no / unknown.
+
+        Default: ``"unknown"`` when the adapter converts image parts
+        (``capabilities.supports_multimodal``), else ``"no"`` — a custom
+        provider that never opted in can never silently drop image parts.
+        """
+        return "unknown" if self.capabilities.supports_multimodal else "no"
+
+    def image_capability_source(self) -> ImageCapabilitySource:
+        """What :meth:`image_input_support` is based on, for typed errors.
+
+        ``"capability"`` (static table), ``"catalog"`` (a provider model
+        catalogue) or ``"adapter"`` (the adapter cannot convert images).
+        """
+        return "capability" if self.capabilities.supports_multimodal else "adapter"
+
+    @property
+    def thinking_enabled(self) -> bool:
+        """True when this provider sends thinking/reasoning blocks by default."""
+        return False
+
+    def many_image_rule(self, model: str) -> tuple[int, int] | None:
+        """``(max_images, max_long_side)`` rule for many-image requests, or None.
+
+        When a request carries more than ``max_images`` visible images, every
+        image must have a long side of at most ``max_long_side`` pixels.
+        """
+        return None
+
+    def image_capability_key(self, model: str) -> tuple[str, str, str]:
+        """``(api_surface, normalised base URL, model)`` keying the learned cache."""
+        return (type(self).__name__, "", model)
+
+    def learned_image_support(self, model: str) -> Literal["no"] | None:
+        """``"no"`` when this instance learned that ``model`` rejects images, else None.
+
+        Learned only from a vendor "image input unsupported" response on this
+        instance; process lifetime, never shared or persisted.
+        """
+        learned: set[tuple[str, str, str]] | None = self.__dict__.get(_LEARNED_ATTR)
+        if not learned:
+            return None
+        key = self.image_capability_key(model)
+        with _LEARNED_LOCK:
+            return "no" if key in learned else None
+
+    def learn_image_unsupported(self, model: str) -> None:
+        """Record that ``model`` rejected image input (called by adapters on
+        an ``IMAGE_UNSUPPORTED`` classification). Thread-safe and idempotent."""
+        key = self.image_capability_key(model)
+        with _LEARNED_LOCK:
+            learned = self.__dict__.setdefault(_LEARNED_ATTR, set())
+            learned.add(key)
 
     @property
     @abstractmethod

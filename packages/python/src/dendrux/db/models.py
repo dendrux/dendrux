@@ -1,4 +1,4 @@
-"""SQLAlchemy models — the 6 core tables.
+"""SQLAlchemy models — the core tables.
 
 Tables:
     agent_runs       — One row per run() call. The anchor for everything.
@@ -8,6 +8,8 @@ Tables:
     llm_interactions — Per-LLM-call record with semantic + provider payloads (Sprint 3.5).
     run_events       — Append-only state transition log for observability.
     run_inbox        — Notes submitted to a run, delivered at its next iteration.
+    dendrux_blobs    — Content-addressed, tenant-scoped image blobs (0.4.0).
+    dendrux_blob_refs — Which run record references which blob (GC reachability).
 
 Each sub-agent spawn gets its own agent_run linked via parent_run_id.
 No instance_id or delegation columns on react_traces — isolation is
@@ -23,15 +25,19 @@ import datetime  # noqa: TC003 — needed at runtime for SQLAlchemy Mapped[] res
 from typing import Any
 
 from sqlalchemy import (
+    CHAR,
     JSON,
     Boolean,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -399,4 +405,82 @@ class RunInbox(Base):
 
     __table_args__ = (
         Index("ix_run_inbox_run_pending", "run_id", "delivered_at", "created_at", "id"),
+    )
+
+
+class Blob(Base):
+    """One stored image, keyed by ``(tenant_scope, sha256)``.
+
+    ``state`` is the durable work item of the blob lifecycle (``pending``,
+    ``live``, ``purging``, ``purged``, ``deleting``); ``generation`` names the
+    external object and changes whenever the row is (re)created or revived.
+    ``data`` holds the bytes only when ``storage='db'`` and the row is live
+    (it is kept while ``deleting`` so a GC that loses a race can revert).
+    On Postgres the blob catalog writes every timestamp with the database
+    clock (``now()``), unlike the other tables.
+    """
+
+    __tablename__ = "dendrux_blobs"
+
+    tenant_scope: Mapped[str] = mapped_column(String(260), primary_key=True)
+    sha256: Mapped[str] = mapped_column(CHAR(64), primary_key=True)
+    generation: Mapped[str] = mapped_column(String(26))
+    state: Mapped[str] = mapped_column(String(16))
+    media_type: Mapped[str] = mapped_column(String(32))
+    byte_length: Mapped[int] = mapped_column(Integer)
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    frame_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    storage: Mapped[str] = mapped_column(String(16))
+    data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    ingest_transform: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    last_used_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now
+    )
+    state_changed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now
+    )
+    purged_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    purge_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    __table_args__ = (
+        Index("ix_dendrux_blobs_gc", "state", "last_used_at"),
+        Index("ix_dendrux_blobs_work", "state", "state_changed_at"),
+    )
+
+
+class BlobRef(Base):
+    """An edge: run ``run_id`` references blob ``(tenant_scope, sha256)`` from one record.
+
+    ``(owner_kind, owner_id, ordinal)`` names the record and the position in
+    its persisted parts/images list. Edges are written in the same
+    transaction as the record; the run's tenant is asserted there, not by a
+    foreign key. No ORM relationship: the run cascade is database-level.
+    """
+
+    __tablename__ = "dendrux_blob_refs"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)
+    tenant_scope: Mapped[str] = mapped_column(String(260))
+    sha256: Mapped[str] = mapped_column(CHAR(64))
+    run_id: Mapped[str] = mapped_column(String(26), ForeignKey("agent_runs.id", ondelete="CASCADE"))
+    owner_kind: Mapped[str] = mapped_column(String(32))
+    owner_id: Mapped[str] = mapped_column(String(64))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_scope", "sha256"],
+            ["dendrux_blobs.tenant_scope", "dendrux_blobs.sha256"],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "run_id", "owner_kind", "owner_id", "ordinal", name="uq_dendrux_blob_refs_owner"
+        ),
+        Index("ix_dendrux_blob_refs_blob", "tenant_scope", "sha256"),
+        Index("ix_dendrux_blob_refs_run", "run_id", "tenant_scope"),
     )

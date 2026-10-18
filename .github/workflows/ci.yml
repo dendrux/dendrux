@@ -8,13 +8,21 @@ on:
 
 jobs:
   python:
+    name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: packages/python
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+        # pyproject allows sqlalchemy>=2.0,<3.0: test both minors. 2.1 on every
+        # Python, 2.0 on the oldest and newest only (5 jobs).
+        sqlalchemy-version: ["2.0.*", "2.1.*"]
+        exclude:
+          - python-version: "3.12"
+            sqlalchemy-version: "2.0.*"
 
     services:
       # Postgres backend matrix — integration tests parametrize across
@@ -47,6 +55,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install -e ".[dev,all]"
+
+      - name: Pin SQLAlchemy ${{ matrix.sqlalchemy-version }}
+        run: |
+          pip install "sqlalchemy[asyncio]==${{ matrix.sqlalchemy-version }}"
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
 
       - name: Lint
         run: ruff check .

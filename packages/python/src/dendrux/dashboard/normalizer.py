@@ -191,6 +191,13 @@ GOVERNANCE_EVENT_META: dict[str, tuple[str, str]] = {
     _GovType.MCP_CONNECTED: ("info", "MCP connected"),
     _GovType.MCP_ERROR: ("error", "MCP error"),
     _GovType.MCP_TOOLS_SKIPPED: ("warning", "MCP tools skipped"),
+    # Images
+    _GovType.IMAGE_REJECTED: ("warning", "Image rejected by provider"),
+    _GovType.IMAGE_STATE: ("info", "Image state recorded"),
+    _GovType.IMAGE_VIEW_CHANGED: ("info", "Image view changed"),
+    _GovType.IMAGE_DEGRADED: ("warning", "Images replaced by placeholders"),
+    _GovType.IMAGE_WARNING: ("warning", "Image warning"),
+    _GovType.GUARDRAIL_IMAGE_UNSCANNED: ("warning", "Images not scanned by guardrails"),
 }
 
 _GOVERNANCE_EVENT_TYPES = frozenset(GOVERNANCE_EVENT_META)

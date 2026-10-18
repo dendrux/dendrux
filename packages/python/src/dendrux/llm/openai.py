@@ -31,6 +31,19 @@ from dendrux.llm._helpers import (
     resolve_tool_message_call,
     timeout_error,
 )
+from dendrux.llm._images import (
+    WireImageRegistry,
+    chat_image,
+    chat_text,
+    close_stream_quietly,
+    convert_parts,
+    normalize_base_url,
+    openai_image_support,
+    portable_framing,
+    portable_tool_text,
+    sdk_image_request_error,
+    transport_image_error,
+)
 from dendrux.llm._retry_telemetry import (
     begin_call_attempt_tracking,
     call_attempt_tracking,
@@ -51,7 +64,8 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from dendrux.types import Message, ToolDef
+    from dendrux.llm.base import ImageSupport
+    from dendrux.types import ImagePart, Message, ToolDef
 
 logger = logging.getLogger(__name__)
 
@@ -203,12 +217,22 @@ class OpenAIProvider(LLMProvider):
         supports_streaming=True,
         supports_streaming_tool_deltas=True,
         supports_thinking=True,
-        supports_multimodal=False,
+        supports_multimodal=True,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
         supports_structured_output=True,
         max_context_tokens=128_000,
     )
+
+    # Images in tool results go in ONE framed user message after the tool
+    # block: Chat tool messages accept text only (live probe: 400 or silently
+    # dropped).
+    tool_result_images = "portable"
+
+    # Name reported on typed image errors, and whether a rejected image may be
+    # located from the vendor error's request path.
+    _image_provider_name = "openai"
+    _locate_rejected_images = True
 
     def __init__(
         self,
@@ -302,6 +326,41 @@ class OpenAIProvider(LLMProvider):
         """Close the underlying HTTP client and release connections."""
         await self._client.close()
 
+    # ------------------------------------------------------------------
+    # Image input (0.4.0)
+    # ------------------------------------------------------------------
+
+    async def image_input_support(self, model: str) -> ImageSupport:
+        """Static table on the official OpenAI endpoint; ``"unknown"`` elsewhere."""
+        if str(self._client.base_url) != _OPENAI_DEFAULT_BASE_URL:
+            return "unknown"
+        return openai_image_support(model)
+
+    def image_capability_key(self, model: str) -> tuple[str, str, str]:
+        return ("chat", normalize_base_url(self._client.base_url), model)
+
+    def _image_error(
+        self, exc: openai.APIError, registry: WireImageRegistry, model: str, *, streaming: bool
+    ) -> Exception:
+        """Typed, sanitised error for a failed image-bearing request (not raised)."""
+        return sdk_image_request_error(
+            exc,
+            provider=self,
+            provider_name=self._image_provider_name,
+            model=model,
+            registry=registry,
+            streaming=streaming,
+            locate=self._locate_rejected_images,
+        )
+
+    def _transport_image_error(
+        self, kind: Literal["timeout", "connection"], model: str
+    ) -> Exception:
+        hint = str(timeout_error(type(self).__name__, self._timeout)) if kind == "timeout" else None
+        return transport_image_error(
+            kind, provider_name=self._image_provider_name, model=model, hint=hint
+        )
+
     async def __aenter__(self) -> OpenAIProvider:
         return self
 
@@ -316,11 +375,14 @@ class OpenAIProvider(LLMProvider):
         *,
         run_id: str | None = None,
         cache_key_prefix: str | None = None,
+        registry: WireImageRegistry | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build OpenAI API kwargs from Dendrux messages and caller kwargs.
 
         Returns (api_kwargs, captured_request) where captured_request is the
-        serializable subset for the evidence layer.
+        serializable subset for the evidence layer. On an image-bearing request
+        every data URL in captured_request is replaced by
+        ``"dendrux-image:sha256:<hex>"`` (``registry`` records the images).
 
         Cache routing: ``prompt_cache_key`` is sent only when a prefix is
         known — the constructor ``cache_key_prefix`` first, then the per-call
@@ -329,7 +391,9 @@ class OpenAIProvider(LLMProvider):
         provider's ``prompt_cache_retention`` is forwarded only when set, so
         vendor defaults apply otherwise.
         """
-        api_messages = self._convert_messages(messages)
+        if registry is None:
+            registry = WireImageRegistry()
+        api_messages = self._convert_messages(messages, registry=registry)
         api_tools = self._convert_tools(tools) if tools else openai.NOT_GIVEN
 
         # Resolve the output-token cap: per-call kwargs override constructor default.
@@ -402,6 +466,8 @@ class OpenAIProvider(LLMProvider):
             api_kwargs["extra_body"] = {**(self._extra_body or {}), **(call_extra_body or {})}
 
         captured_request = {k: v for k, v in api_kwargs.items() if v is not openai.NOT_GIVEN}
+        if registry.has_images:
+            captured_request = registry.sanitize(captured_request)
         return api_kwargs, captured_request
 
     def _inject_structured_output(
@@ -449,25 +515,50 @@ class OpenAIProvider(LLMProvider):
         When output_schema is provided, sets response_format to json_schema
         with strict mode. The response is a JSON string in message.content.
         """
+        registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
-            messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
+            messages,
+            tools,
+            kwargs,
+            run_id=run_id,
+            cache_key_prefix=cache_key_prefix,
+            registry=registry,
         )
 
         if output_schema is not None:
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
 
+        # Image-bearing requests never chain SDK errors (they carry the request
+        # body): the typed error is built in the handler, raised after it.
+        failure: Exception | None = None
         try:
             with call_attempt_tracking():
                 response = await self._client.chat.completions.create(**api_kwargs)
         except openai.APIStatusError as exc:
-            translated = self._translate_error(exc, streaming=False, model=api_kwargs["model"])
-            if translated is not None:
-                raise translated from exc
-            raise
+            if registry.has_images:
+                failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
+            else:
+                translated = self._translate_error(exc, streaming=False, model=api_kwargs["model"])
+                if translated is not None:
+                    raise translated from exc
+                raise
         except openai.APITimeoutError:
-            raise timeout_error("OpenAIProvider", self._timeout) from None
+            if not registry.has_images:
+                raise timeout_error("OpenAIProvider", self._timeout) from None
+            failure = self._transport_image_error("timeout", api_kwargs["model"])
         except openai.APIConnectionError as exc:
-            raise connection_error("OpenAI API", self._model, exc) from exc
+            if not registry.has_images:
+                raise connection_error("OpenAI API", self._model, exc) from exc
+            failure = self._transport_image_error("connection", api_kwargs["model"])
+        except openai.APIError as exc:
+            if not registry.has_images:
+                raise
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
+        if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
+            raise failure
 
         llm_response = self._normalize_response(response)
 
@@ -506,8 +597,14 @@ class OpenAIProvider(LLMProvider):
         ContextLengthExceededError if the request overflows the context window.
         Other request errors propagate unchanged.
         """
+        registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
-            messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
+            messages,
+            tools,
+            kwargs,
+            run_id=run_id,
+            cache_key_prefix=cache_key_prefix,
+            registry=registry,
         )
 
         if output_schema is not None:
@@ -515,23 +612,40 @@ class OpenAIProvider(LLMProvider):
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
 
+        failure: Exception | None = None
         attempt_token = begin_call_attempt_tracking()
         try:
             stream = await self._client.chat.completions.create(**api_kwargs)
         except openai.APIStatusError as exc:
-            translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
-            if translated is not None:
-                raise translated from exc
-            raise
+            if registry.has_images:
+                failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
+            else:
+                translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
+                if translated is not None:
+                    raise translated from exc
+                raise
         except openai.APITimeoutError:
-            raise timeout_error("OpenAIProvider", self._timeout) from None
+            if not registry.has_images:
+                raise timeout_error("OpenAIProvider", self._timeout) from None
+            failure = self._transport_image_error("timeout", api_kwargs["model"])
         except openai.APIConnectionError as exc:
-            raise connection_error("OpenAI API", self._model, exc, streaming=True) from exc
+            if not registry.has_images:
+                raise connection_error("OpenAI API", self._model, exc, streaming=True) from exc
+            failure = self._transport_image_error("connection", api_kwargs["model"])
+        except openai.APIError as exc:
+            if not registry.has_images:
+                raise
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
         finally:
             # Counter only spans the request-establishing call. Once the
             # stream is open the SDK no longer retries, so iteration below
             # does not need the counter.
             end_call_attempt_tracking(attempt_token)
+        if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
+            raise failure
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
@@ -553,6 +667,10 @@ class OpenAIProvider(LLMProvider):
             except StopAsyncIteration:
                 break
             except openai.APIError as exc:
+                if registry.has_images:
+                    # In-stream error: may follow deltas already yielded.
+                    failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
+                    break
                 translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
                 if translated is not None:
                     raise translated from exc
@@ -622,6 +740,13 @@ class OpenAIProvider(LLMProvider):
                 finish_reason = choice.finish_reason
                 for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
                     yield flush_event
+
+        if failure is not None:
+            await close_stream_quietly(stream)
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry, stream, chunk_iter
+            raise failure
 
         # Some compatible backends end the stream without ever sending a
         # finish_reason; flush whatever is still buffered so calls are not lost.
@@ -742,7 +867,9 @@ class OpenAIProvider(LLMProvider):
     # Outbound conversions: Dendrux → OpenAI
     # ------------------------------------------------------------------
 
-    def _convert_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+    def _convert_messages(
+        self, messages: list[Message], *, registry: WireImageRegistry | None = None
+    ) -> list[dict[str, Any]]:
         """Convert Dendrux messages to OpenAI Chat Completions format.
 
         Role mapping:
@@ -750,16 +877,41 @@ class OpenAIProvider(LLMProvider):
           - USER → "user"
           - ASSISTANT → "assistant", with tool_calls array if present
           - TOOL → "tool" with tool_call_id correlation
+
+        Image parts (portable mapping): a USER message becomes a content-part
+        list (``text`` / ``image_url``) in caller order. A TOOL message with
+        images keeps text-only content (payload, notes, placeholders, then the
+        image note); after the last TOOL message of the block ONE framed user
+        message carries every visible tool image in call order. Text-only
+        messages take the unchanged v0.3.0 path.
         """
+        if registry is None:
+            registry = WireImageRegistry()
         api_messages: list[dict[str, Any]] = []
         call_index = build_call_index(messages)
+        # Visible tool images of the current tool block, flushed as one framed
+        # user message before the next non-TOOL message (or at the end).
+        pending: list[tuple[str, str, tuple[ImagePart, ...]]] = []
 
         for msg in messages:
+            if pending and msg.role != Role.TOOL:
+                self._flush_tool_images(api_messages, pending, registry)
+
             if msg.role == Role.SYSTEM:
                 api_messages.append({"role": "system", "content": msg.content})
 
             elif msg.role == Role.USER:
-                api_messages.append({"role": "user", "content": msg.content})
+                if msg.parts is None:
+                    api_messages.append({"role": "user", "content": msg.content})
+                else:
+                    content = convert_parts(
+                        msg.parts,
+                        registry=registry,
+                        prefix=("messages", len(api_messages), "content"),
+                        text_block=chat_text,
+                        image_block=chat_image,
+                    )
+                    api_messages.append({"role": "user", "content": content})
 
             elif msg.role == Role.ASSISTANT:
                 if msg.tool_calls:
@@ -795,15 +947,46 @@ class OpenAIProvider(LLMProvider):
             elif msg.role == Role.TOOL:
                 original_call = resolve_tool_message_call(msg, call_index)
 
-                api_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": original_call.provider_tool_call_id or original_call.id,
-                        "content": msg.content,
-                    }
-                )
+                if msg.parts is None:
+                    api_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": original_call.provider_tool_call_id or original_call.id,
+                            "content": msg.content,
+                        }
+                    )
+                else:
+                    wire_call_id = original_call.provider_tool_call_id or original_call.id
+                    api_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": wire_call_id,
+                            "content": portable_tool_text(msg),
+                        }
+                    )
+                    if msg.images:
+                        pending.append((original_call.name, wire_call_id, msg.images))
 
+        if pending:
+            self._flush_tool_images(api_messages, pending, registry)
         return api_messages
+
+    @staticmethod
+    def _flush_tool_images(
+        api_messages: list[dict[str, Any]],
+        pending: list[tuple[str, str, tuple[ImagePart, ...]]],
+        registry: WireImageRegistry,
+    ) -> None:
+        """Append the framed user message for a tool block's images; clear ``pending``."""
+        content = portable_framing(
+            pending,
+            registry=registry,
+            prefix=("messages", len(api_messages), "content"),
+            text_block=chat_text,
+            image_block=chat_image,
+        )
+        api_messages.append({"role": "user", "content": content})
+        pending.clear()
 
     def _convert_tools(self, tools: list[ToolDef]) -> list[dict[str, Any]]:
         """Convert Dendrux ToolDefs to OpenAI function tool format."""

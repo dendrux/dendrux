@@ -578,6 +578,8 @@ class MCPConnection:
                         # The lease is held for the whole call and released
                         # below, so no view can close underneath it.
                         check_lease=lambda: None,
+                        # Public return shape unchanged: base64 image blocks inline.
+                        images="inline",
                         params=params,
                     )
                 finally:
@@ -2531,6 +2533,7 @@ class MCPRuntime:
         owner: object,
         check_lease: Callable[[], None],
         params: dict[str, Any],
+        images: Literal["parts", "inline"] = "parts",
     ) -> Any:
         """Run one MCP tool call under the full managed-call contract.
 
@@ -2661,6 +2664,7 @@ class MCPRuntime:
                     mcp_tool_name=mcp_tool_name,
                     max_result_bytes=connection.source.max_result_bytes,
                     exposed_name=qualified_name,
+                    images=images,
                 )
                 rejection: MCPAuthenticationError | None = None
                 try:

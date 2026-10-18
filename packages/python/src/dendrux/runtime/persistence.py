@@ -7,6 +7,12 @@ Write classification:
   - Fail-closed (retry with backoff, then propagate): save_trace, save_tool_call, save_run_event
   - Best-effort (exceptions swallowed): save_usage, save_llm_interaction, touch_progress
 
+Images (0.4.0): parts messages persist ``meta["dendrux.parts"]`` on traces
+and ``parts`` in ``semantic_request.messages``; tool results with images
+persist ``meta["dendrux.images"]``. Every image a record references gets a
+blob edge written in the record's transaction, scoped to ``tenant_scope``.
+Text-only records are byte-identical to v0.3.0 (no new keys, no new kwargs).
+
 Lifecycle hooks (``on_run_started``, ``on_run_finished``, ``on_run_failed``,
 ``on_llm_call_started``, ``on_llm_call_failed``, ``on_tool_started``) are
 inherited as no-ops from :class:`BaseRecorder`. The runner writes the
@@ -21,13 +27,28 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from dendrux.errors import ImagePersistenceUnsupportedError
 from dendrux.loops.base import BaseRecorder
+from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime.durability import retry_critical
-from dendrux.types import generate_ulid, tool_call_parse_meta
+from dendrux.types import (
+    ImagePart,
+    ImageRef,
+    content_part_to_dict,
+    generate_ulid,
+    tool_call_parse_meta,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from dendrux.media import BlobEdge
     from dendrux.runtime.state import StateStore
     from dendrux.types import LLMResponse, Message, ToolCall, ToolDef, ToolResult, ToolTarget
+
+PARTS_META_KEY = "dendrux.parts"
+IMAGES_META_KEY = "dendrux.images"
+IMAGE_NOTES_META_KEY = "dendrux.image_notes"
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +75,78 @@ def _serialize_message(m: Message) -> dict[str, Any]:
         d["name"] = m.name
     if m.meta:
         d["meta"] = m.meta
+    if m.parts is not None:
+        d["parts"] = [content_part_to_dict(p) for p in m.parts]
     return d
+
+
+def image_dict(image: object) -> dict[str, Any]:
+    """Persisted descriptor of an ingested tool-result image (``ImagePart`` / ``ImageRef``)."""
+    if isinstance(image, ImagePart):
+        return content_part_to_dict(image)
+    if isinstance(image, ImageRef):
+        return image.to_dict()
+    raise TypeError(
+        f"tool result images must be ingested before they are recorded, got {type(image).__name__}"
+    )
+
+
+# image_capability_key() api_surface -> estimate_image_tokens provider family.
+_SURFACE_FAMILY = {
+    "anthropic": "anthropic",
+    "chat": "openai",
+    "responses": "openai",
+    "openrouter": "openrouter",
+}
+
+
+def provider_family(provider: Any, model: str | None) -> str | None:
+    """Token-estimate family of ``provider`` (from its image capability key), or None.
+
+    Uses ``provider.image_capability_key(model)[0]`` (the API surface the
+    built-in adapters report); a custom provider without a known surface
+    gives None, so estimates stay unknown rather than guessed.
+    """
+    key_fn = getattr(provider, "image_capability_key", None)
+    if key_fn is None or not model:
+        return None
+    try:
+        surface = key_fn(model)[0]
+    except Exception:
+        return None
+    return _SURFACE_FAMILY.get(surface) if isinstance(surface, str) else None
+
+
+def image_stats(
+    messages: Sequence[Message], *, provider: Any = None, model: str | None
+) -> dict[str, Any] | None:
+    """``{"count", "bytes", "estimated_tokens"}`` over the visible images of a request.
+
+    Visible images are the ``ImagePart``s left in the request view (placeholders
+    are text). ``estimated_tokens`` is None when any estimate is unknown.
+    Returns None for a request without visible images.
+    """
+    from dendrux.media import estimate_image_tokens
+
+    parts = [
+        p for m in messages if m.parts is not None for p in m.parts if isinstance(p, ImagePart)
+    ]
+    if not parts:
+        return None
+    family = provider_family(provider, model)
+    total: int | None = 0
+    for p in parts:
+        est = (
+            estimate_image_tokens(p.ref, provider_family=family, model=model, detail=p.detail)
+            if family is not None and model
+            else None
+        )
+        total = None if est is None or total is None else total + est
+    return {
+        "count": len(parts),
+        "bytes": sum(p.ref.byte_length for p in parts),
+        "estimated_tokens": total,
+    }
 
 
 class PersistenceRecorder(BaseRecorder):
@@ -72,6 +164,11 @@ class PersistenceRecorder(BaseRecorder):
 
     The loop calls record_* helpers which let exceptions from this class
     propagate. If a fail-closed write fails, the run stops.
+
+    ``tenant_scope`` (0.4.0) scopes every blob edge this recorder writes;
+    ``None`` is valid only for runs without images. ``provider`` (the run's
+    LLM provider) lets ``semantic_request.image_stats`` estimate image tokens
+    from its ``image_capability_key``; without it the estimate is ``None``.
     """
 
     def __init__(
@@ -84,14 +181,33 @@ class PersistenceRecorder(BaseRecorder):
         target_lookup: dict[str, ToolTarget] | None = None,
         initial_order_index: int = 0,
         event_sequencer: Any | None = None,
+        tenant_scope: str | None = None,
+        provider: Any | None = None,
     ) -> None:
         self._store = state_store
+        self._tenant_scope = tenant_scope
+        self._provider = provider
         self._run_id = run_id
         self._model = model
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
         self._order_index = initial_order_index
         self._event_sequencer = event_sequencer
+
+    def _edge_kwargs(self, edges: list[BlobEdge]) -> dict[str, Any]:
+        """``blob_refs`` kwargs for a store write, only when there are edges."""
+        if not edges:
+            return {}
+        if self._tenant_scope is None:
+            raise ImagePersistenceUnsupportedError(
+                "state_store", store_type=type(self._store).__name__
+            )
+        return {"blob_refs": edges, "blob_refs_scope": self._tenant_scope}
+
+    def _edges(self, kind: str, owner_id: str, dicts: Sequence[dict[str, Any]]) -> list[BlobEdge]:
+        if not dicts:
+            return []
+        return edges_for_parts(self._tenant_scope or "-", kind, owner_id, dicts)
 
     async def _emit_event(
         self,
@@ -131,9 +247,14 @@ class PersistenceRecorder(BaseRecorder):
             # Opaque replay blocks (producing model is already in message.meta)
             # so retry() can rebuild a tool loop with its reasoning intact.
             meta["reasoning_blocks"] = message.reasoning_blocks
+        if message.parts is not None and PARTS_META_KEY not in meta:
+            meta[PARTS_META_KEY] = [content_part_to_dict(p) for p in message.parts]
 
         content = message.content
         order_idx = self._order_index
+        edge_kwargs = self._edge_kwargs(
+            self._edges("trace", str(order_idx), meta.get(PARTS_META_KEY) or [])
+        )
 
         # FAIL-CLOSED with retry
         async def _write() -> None:
@@ -143,6 +264,7 @@ class PersistenceRecorder(BaseRecorder):
                 content,
                 order_index=order_idx,
                 meta=meta,
+                **edge_kwargs,
             )
 
         await retry_critical(_write, label="save_trace", run_id=self._run_id)
@@ -160,11 +282,13 @@ class PersistenceRecorder(BaseRecorder):
         guardrail_findings: dict[str, Any] | None = None,
     ) -> None:
         """Persist LLM interaction + usage + event."""
-        semantic_request = None
+        semantic_request: dict[str, Any] | None = None
+        has_parts = False
         if semantic_messages is not None:
             semantic_request = {
                 "messages": [_serialize_message(m) for m in semantic_messages],
             }
+            has_parts = any(m.parts is not None for m in semantic_messages)
             if semantic_tools is not None:
                 semantic_request["tools"] = [
                     {
@@ -176,6 +300,14 @@ class PersistenceRecorder(BaseRecorder):
                     }
                     for t in semantic_tools
                 ]
+            if has_parts:
+                stats = image_stats(
+                    semantic_messages,
+                    provider=self._provider,
+                    model=response.model or self._model,
+                )
+                if stats is not None:
+                    semantic_request["image_stats"] = stats
 
         semantic_response: dict[str, Any] | None = None
         if (
@@ -220,7 +352,11 @@ class PersistenceRecorder(BaseRecorder):
                 duration_ms=duration_ms,
                 semantic_request=semantic_request,
                 semantic_response=semantic_response,
-                provider_request=response.provider_request,
+                provider_request=(
+                    scrub_inline_images(response.provider_request)
+                    if has_parts
+                    else response.provider_request
+                ),
                 provider_response=response.provider_response,
                 guardrail_findings=guardrail_findings,
                 interaction_id=interaction_id,
@@ -299,6 +435,14 @@ class PersistenceRecorder(BaseRecorder):
         """Persist tool call record + event."""
         params = tool_call.params if tool_call.params else None
         target = self._target_lookup.get(tool_call.name, "server")
+        meta = dict(tool_result.meta) if tool_result.meta else {}
+        images = [image_dict(i) for i in tool_result.images]
+        if images:
+            meta[IMAGES_META_KEY] = images
+        if tool_result.notes:
+            meta[IMAGE_NOTES_META_KEY] = list(tool_result.notes)
+        extra: dict[str, Any] = {"meta": meta} if meta else {}
+        extra.update(self._edge_kwargs(self._edges("tool_call", tool_call.id, images)))
 
         # FAIL-CLOSED with retry: save_tool_call (proof of side effects)
         async def _write_tool() -> None:
@@ -314,7 +458,7 @@ class PersistenceRecorder(BaseRecorder):
                 duration_ms=tool_result.duration_ms,
                 iteration_index=iteration,
                 error_message=tool_result.error,
-                **({"meta": dict(tool_result.meta)} if tool_result.meta else {}),
+                **extra,
             )
 
         await retry_critical(_write_tool, label="save_tool_call", run_id=self._run_id)
@@ -329,6 +473,7 @@ class PersistenceRecorder(BaseRecorder):
                 "success": tool_result.success,
                 "duration_ms": tool_result.duration_ms,
                 **tool_call_parse_meta(tool_call),
+                **({"image_count": len(images)} if images else {}),
             },
             correlation_id=tool_call.id,
         )

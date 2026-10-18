@@ -346,6 +346,10 @@ agent = Agent(
 
 With that configuration, a message containing an AWS key is blocked first. A message containing "ignore previous instructions" is blocked next. A message with only PII has the PII redacted. A message with only an internal ticket id produces a `guardrail.detected` event but is otherwise unchanged.
 
+## Guardrails for images
+
+Text guardrails scan strings only. They never see image bytes or base64, and they do not read text drawn inside an image. To screen images, write a guardrail with an `async scan_image(image: ImageScanInput) -> list[Finding]` method and an `action`; it runs once per distinct image (per guardrail id and version, origin and tool name), the verdict is stored with the run, and `redact` replaces the image with a placeholder, `block` ends the run, `warn` emits `guardrail.detected`. Image guardrails run on batch `run()` paths; `stream()` does not support guardrails. If guardrails are set and none scans images, a `guardrail.image_unscanned` event records the gap. See [Images](/docs/recipes/images#guardrails).
+
 ## Why pattern-based instead of LLM-as-judge
 
 The built-ins ship as regex scanners. That choice is deliberate for three reasons.

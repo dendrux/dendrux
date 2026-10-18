@@ -233,13 +233,13 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | --- | --- | --- |
 | `run.started` | First event on any run | `{"agent_name": str, "system_prompt": str}` |
 | `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval" \| "paused", "pending_tool_calls": [{"id", "name", "target", "params"}]}`. A `paused` status adds `"reason": "requested" \| "budget"` and, if `request_pause(reason=...)` gave one, `"message"` (up to 500 chars); a budget pause adds `"exceeded": [{"metric", "used", "max"}]`. `pending_tool_calls` is empty for a pause with nothing outstanding |
-| `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}`; `resumed_from` is `"paused"` after `submit_resume` |
+| `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}`; a result that carried images adds `"image_count"` to its entry, and an input with images adds `"image_count"` to the payload; `resumed_from` is `"paused"` after `submit_resume` |
 | `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str}` |
 | `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, run or stream interrupted, or a budget cancel | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when `cancel_run` abandoned a model call (`partial_output` is always `false` for batch `run()`); `{"reason": "task_cancelled"}` when the task awaiting `run()` was cancelled; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream; `{"reason": "budget_exceeded", "exceeded": [{"metric", "used", "max"}]}` for `Budget(on_exceed="cancel")` |
 | `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars) |
 | `run.interrupted` | `sweep(stale_running=...)` finalized a stale `running` run | `{"failure_reason": "stale_running" \| "never_started"}` |
 | `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens", "cost_usd", "cost_source", "usage_reported", "model", "has_tool_calls", "phase"}` |
-| `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`; malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
+| `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}` (plus `"image_count"` when the result has images); malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
 
 ### Governance events
 
@@ -257,9 +257,15 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `budget.threshold` | Usage crossed a `warn_at` fraction of a limit | `{"metric": "tokens" \| "cost_usd", "fraction": float, "used": number, "max": number, "reason": "threshold_crossed"}` |
 | `budget.exceeded` | Usage reached a limit | `{"metric": "tokens" \| "cost_usd", "used": number, "max": number, "reason": "budget_exceeded", "action": "warn" \| "pause" \| "cancel"}` |
 | `budget.unpriced` | A `max_cost_usd` budget met its first unpriced LLM call in the run (once per run) | `{"metric": "cost_usd", "used": float, "max": float, "unpriced_calls": int, "known_cost_usd": float}` |
-| `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "outgoing", "findings_count": int, "entities": list[str]}` |
+| `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
-| `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "outgoing", "error": str}` |
+| `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "error": str}` |
+| `guardrail.image_unscanned` | Guardrails are configured, a request carries images, and none scans images (once per run) | `{"count": int}` |
+| `image.rejected` | The provider refused an image; one event per candidate image | `{"image_id", "sha256", "tenant_scope", "provider", "model", "status_code", "located": bool, "retried": bool}` |
+| `image.state` | A request recorded new image descriptions, guardrail verdicts or placeholders | `{"tenant_scope", "described": [{"sha256", "text"}], "guardrail_verdicts": [{"sha256", "guardrail_id", "guardrail_version", "origin", "tool_name", "action", "entities"}], "placeholders": [{"slot", "reason"}]}` |
+| `image.view_changed` | The drop-old-images window advanced | `{"epoch": int, "dropped_through": int, "visible": int}` (`visible` = eligible images still shown) |
+| `image.degraded` | Images were replaced by placeholders | `{"reason": "purged" \| "policy" \| "rejected" \| "unsupported" \| "described" \| "guardrail" \| "drop", "count": int, "slots": [int]}`; once per image slot |
+| `image.warning` | Drop policy combined with provider thinking (Anthropic, or OpenAI Responses `thinking=True`; once per run) | `{"warning": "drop_with_thinking"}` |
 | `guardrail.unmapped_placeholder` | Final output contains placeholders that cannot be deanonymized | `{"placeholders": list[str]}` |
 | `skill.catalog_resolved` | Run start, when skills are configured | `{"delivery": "progressive" \| "inlined", "skills": [{"name", "revision", "digest"}], "denied": list[str]}` |
 | `skill.activated` | A skill's body was delivered to the model | `{"name": str, "digest": str, "origin": "model" \| "explicit" \| "inlined"}` |

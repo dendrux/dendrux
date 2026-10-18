@@ -12,10 +12,11 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from dendrux.guardrails._protocol import Finding
+from dendrux.guardrails._protocol import Finding, scans_images, scans_text
 
 if TYPE_CHECKING:
     from dendrux.guardrails._protocol import Guardrail
+    from dendrux.types import Message
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,12 @@ class GuardrailEngine:
         pii_mapping: dict[str, str] | None = None,
     ) -> None:
         self._guardrails = list(guardrails)
+        # Image-only guardrails (``ImageGuardrail`` without ``scan``) are
+        # handled by the request view; text scanning skips them.
+        # Objects with neither method keep the v0.3.0 failure (AttributeError).
+        self._text_guardrails: list[Guardrail] = [
+            g for g in self._guardrails if scans_text(g) or not scans_images(g)
+        ]
         # Forward: <<EMAIL_ADDRESS_1>> → real value
         self._pii_mapping: dict[str, str] = dict(pii_mapping) if pii_mapping else {}
         # Reverse: real value → <<EMAIL_ADDRESS_1>>
@@ -102,7 +109,7 @@ class GuardrailEngine:
         """
         all_findings: list[Finding] = []
 
-        for guardrail in self._guardrails:
+        for guardrail in self._text_guardrails:
             findings = _deoverlap(await guardrail.scan(text))
             if not findings:
                 continue
@@ -121,6 +128,47 @@ class GuardrailEngine:
 
         return text, all_findings, None
 
+    async def scan_incoming_message(
+        self, msg: Message
+    ) -> tuple[Message, list[Finding], str | None]:
+        """Scan one outgoing-to-LLM message; parts-aware.
+
+        Text-only messages scan ``content`` exactly like :meth:`scan_incoming`.
+        Multimodal messages scan each text part separately; redaction rebuilds
+        the parts (image parts untouched) so ``content`` stays the projection.
+
+        Returns:
+            (possibly_replaced_message, all_findings, block_error_or_none)
+        """
+        from dataclasses import replace
+
+        if msg.parts is None:
+            cleaned, findings, block_err = await self.scan_incoming(msg.content)
+            if block_err is None and cleaned != msg.content:
+                # replace() preserves the origin envelope (kind/placement/source).
+                msg = replace(msg, content=cleaned)
+            return msg, findings, block_err
+
+        from dendrux.types import TextPart
+
+        all_findings: list[Finding] = []
+        new_parts = list(msg.parts)
+        changed = False
+        for index, part in enumerate(msg.parts):
+            if not isinstance(part, TextPart):
+                continue
+            cleaned, findings, block_err = await self.scan_incoming(part.text)
+            all_findings.extend(findings)
+            if block_err is not None:
+                return msg, all_findings, block_err
+            if cleaned != part.text:
+                changed = True
+                new_parts[index] = TextPart(cleaned)
+        if changed:
+            parts = tuple(new_parts)
+            msg = replace(msg, parts=parts, content=_projection(parts))
+        return msg, all_findings, None
+
     async def scan_outgoing(
         self,
         text: str,
@@ -137,7 +185,7 @@ class GuardrailEngine:
         """
         all_findings: list[Finding] = []
 
-        for guardrail in self._guardrails:
+        for guardrail in self._text_guardrails:
             findings = _deoverlap(await guardrail.scan(text))
             if findings:
                 all_findings.extend(findings)
@@ -149,7 +197,7 @@ class GuardrailEngine:
 
         if tool_call_params:
             for params in tool_call_params:
-                p_findings, p_block = await _scan_params_for_findings(params, self._guardrails)
+                p_findings, p_block = await _scan_params_for_findings(params, self._text_guardrails)
                 all_findings.extend(p_findings)
                 if p_block is not None:
                     return all_findings, p_block
@@ -184,6 +232,12 @@ class GuardrailEngine:
     @property
     def has_guardrails(self) -> bool:
         return len(self._guardrails) > 0
+
+
+def _projection(parts: tuple[Any, ...]) -> str:
+    from dendrux.types import TextPart
+
+    return "\n\n".join(p.text for p in parts if isinstance(p, TextPart))
 
 
 def _deoverlap(findings: list[Finding]) -> list[Finding]:

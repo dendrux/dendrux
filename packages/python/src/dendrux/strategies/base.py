@@ -78,5 +78,11 @@ class Strategy(ABC):
             result: The result of executing a tool.
 
         Returns:
-            Message to append to conversation history.
+            Message to append to conversation history. When ``result.images``
+            is non-empty the message must keep them as image parts (use
+            ``dendrux.types.tool_result_message``); the loop raises
+            ``TypeError`` if a strategy drops them. Images must stay in a TOOL
+            message: the request view treats images in USER messages as user
+            input (never retried after a rejection, never dropped by
+            ``ImageDropPolicy(scope="tool_results")``).
         """

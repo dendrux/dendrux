@@ -28,6 +28,20 @@ from dendrux.llm._helpers import (
     resolve_tool_message_call,
     timeout_error,
 )
+from dendrux.llm._images import (
+    WireImageRegistry,
+    close_stream_quietly,
+    convert_parts,
+    image_request_error,
+    normalize_base_url,
+    openai_image_support,
+    portable_framing,
+    portable_tool_text,
+    responses_image,
+    responses_text,
+    sdk_image_request_error,
+    transport_image_error,
+)
 from dendrux.llm._retry_telemetry import (
     begin_call_attempt_tracking,
     call_attempt_tracking,
@@ -48,12 +62,17 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from dendrux.types import Message, ToolDef
+    from dendrux.llm.base import ImageSupport
+    from dendrux.types import ImagePart, Message, ToolDef
 
 logger = logging.getLogger(__name__)
 
 
 _EFFORT_ALIASES = {"extra": "xhigh"}
+
+_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1/"
+
+_TOOL_RESULT_IMAGE_MODES = ("native", "portable")
 
 _REASONING_ITEM_TYPES = frozenset({"reasoning"})
 
@@ -165,7 +184,7 @@ class OpenAIResponsesProvider(LLMProvider):
         supports_streaming=True,
         supports_streaming_tool_deltas=True,
         supports_thinking=True,
-        supports_multimodal=False,
+        supports_multimodal=True,
         supports_system_prompt=True,
         supports_parallel_tool_calls=True,
         supports_structured_output=True,
@@ -188,6 +207,7 @@ class OpenAIResponsesProvider(LLMProvider):
         max_retries: int = 3,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
         cache_key_prefix: str | None = None,
+        tool_result_images: Literal["native", "portable"] = "native",
     ) -> None:
         """Create an OpenAI Responses API provider.
 
@@ -219,7 +239,16 @@ class OpenAIResponsesProvider(LLMProvider):
                 per-call prefix the agent loop derives (``"{agent}:{model}"``).
                 ``None`` (default) leaves routing to the per-call prefix, and
                 sends no key when there is none.
+            tool_result_images: How images returned by tools reach the model.
+                ``"native"`` (default) puts them inside ``function_call_output``
+                as ``input_image`` items; ``"portable"`` sends a text tool output
+                plus one framed user message after the tool outputs (the Chat
+                Completions mapping).
         """
+        if tool_result_images not in _TOOL_RESULT_IMAGE_MODES:
+            raise ValueError(
+                f"tool_result_images must be 'native' or 'portable', got {tool_result_images!r}"
+            )
         for t in builtin_tools or []:
             if t not in _BUILTIN_TOOL_TYPES:
                 raise ValueError(
@@ -249,6 +278,7 @@ class OpenAIResponsesProvider(LLMProvider):
         self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
         self._cache_key_prefix = cache_key_prefix
+        self.tool_result_images = tool_result_images
 
     @property
     def model(self) -> str:
@@ -265,6 +295,63 @@ class OpenAIResponsesProvider(LLMProvider):
         """Close the underlying HTTP client and release connections."""
         await self._client.close()
 
+    # ------------------------------------------------------------------
+    # Image input (0.4.0)
+    # ------------------------------------------------------------------
+
+    async def image_input_support(self, model: str) -> ImageSupport:
+        """Static table on the official OpenAI endpoint; ``"unknown"`` elsewhere."""
+        if str(self._client.base_url) != _OPENAI_DEFAULT_BASE_URL:
+            return "unknown"
+        return openai_image_support(model)
+
+    @property
+    def thinking_enabled(self) -> bool:
+        """True when the provider was configured with ``thinking=True``."""
+        return bool(self._thinking)
+
+    def image_capability_key(self, model: str) -> tuple[str, str, str]:
+        return ("responses", normalize_base_url(self._client.base_url), model)
+
+    def _image_error(
+        self, exc: openai.APIError, registry: WireImageRegistry, model: str, *, streaming: bool
+    ) -> Exception:
+        """Typed, sanitised error for a failed image-bearing request (not raised)."""
+        return sdk_image_request_error(
+            exc,
+            provider=self,
+            provider_name="openai_responses",
+            model=model,
+            registry=registry,
+            streaming=streaming,
+        )
+
+    def _stream_event_image_error(
+        self, error: Any, registry: WireImageRegistry, model: str
+    ) -> Exception:
+        """Typed error for an in-stream ``error`` / ``response.failed`` event."""
+
+        def field(name: str) -> str | None:
+            value = error.get(name) if isinstance(error, dict) else getattr(error, name, None)
+            return value if isinstance(value, str) and value else None
+
+        # An ``error`` stream event's ``type`` is the event name, not an error type.
+        error_type = field("type")
+        if error_type == "error":
+            error_type = None
+        return image_request_error(
+            provider=self,
+            provider_name="openai_responses",
+            model=model,
+            registry=registry,
+            status_code=None,
+            code=field("code"),
+            error_type=error_type,
+            param=field("param"),
+            message=field("message") or "",
+            streaming=True,
+        )
+
     async def __aenter__(self) -> OpenAIResponsesProvider:
         return self
 
@@ -279,19 +366,26 @@ class OpenAIResponsesProvider(LLMProvider):
         *,
         run_id: str | None = None,
         cache_key_prefix: str | None = None,
+        registry: WireImageRegistry | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build Responses API kwargs from Dendrux messages and caller kwargs.
 
         Returns (api_kwargs, captured_request) where captured_request is the
-        serializable subset for the evidence layer.
+        serializable subset for the evidence layer. On an image-bearing request
+        every data URL in captured_request is replaced by
+        ``"dendrux-image:sha256:<hex>"`` (``registry`` records the images).
 
         Cache routing: ``prompt_cache_key`` is sent only when a prefix is
         known — the constructor ``cache_key_prefix`` first, then the per-call
         one (the agent loop passes ``"{agent_name}:{model}"``). ``run_id`` is
         accepted for interface compatibility and never used as a key.
         """
+        if registry is None:
+            registry = WireImageRegistry()
         model = kwargs.pop("model", self._model)
-        instructions, input_items = self._convert_messages(messages, replay_reasoning_for=model)
+        instructions, input_items = self._convert_messages(
+            messages, replay_reasoning_for=model, registry=registry
+        )
         api_tools = self._build_tools(tools)
 
         max_output_tokens = kwargs.pop(
@@ -363,6 +457,8 @@ class OpenAIResponsesProvider(LLMProvider):
             api_kwargs["prompt_cache_retention"] = self._prompt_cache_retention
 
         captured_request = dict(api_kwargs)
+        if registry.has_images:
+            captured_request = registry.sanitize(captured_request)
         return api_kwargs, captured_request
 
     def _inject_structured_output(
@@ -409,20 +505,49 @@ class OpenAIResponsesProvider(LLMProvider):
         When output_schema is provided, sets text.format to json_schema
         with strict mode.
         """
+        registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
-            messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
+            messages,
+            tools,
+            kwargs,
+            run_id=run_id,
+            cache_key_prefix=cache_key_prefix,
+            registry=registry,
         )
 
         if output_schema is not None:
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
 
+        # Image-bearing requests never chain SDK errors (they carry the request
+        # body): the typed error is built in the handler, raised after it.
+        failure: Exception | None = None
         try:
             with call_attempt_tracking():
                 response = await self._client.responses.create(**api_kwargs)
         except openai.APITimeoutError:
-            raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
+            if not registry.has_images:
+                raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
+            failure = transport_image_error(
+                "timeout",
+                provider_name="openai_responses",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("OpenAIResponsesProvider", self._timeout)),
+            )
         except openai.APIConnectionError as exc:
-            raise connection_error("OpenAI Responses API", self._model, exc) from exc
+            if not registry.has_images:
+                raise connection_error("OpenAI Responses API", self._model, exc) from exc
+            failure = transport_image_error(
+                "connection", provider_name="openai_responses", model=api_kwargs["model"]
+            )
+        except openai.APIError as exc:
+            if not registry.has_images:
+                raise
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
+        if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
+            raise failure
 
         llm_response = self._normalize_response(response)
 
@@ -457,36 +582,65 @@ class OpenAIResponsesProvider(LLMProvider):
 
         Raises NotImplementedError if the endpoint rejects streaming.
         """
+        registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
-            messages, tools, kwargs, run_id=run_id, cache_key_prefix=cache_key_prefix
+            messages,
+            tools,
+            kwargs,
+            run_id=run_id,
+            cache_key_prefix=cache_key_prefix,
+            registry=registry,
         )
 
         if output_schema is not None:
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
         api_kwargs["stream"] = True
 
+        failure: Exception | None = None
         attempt_token = begin_call_attempt_tracking()
         try:
             stream = await self._client.responses.create(**api_kwargs)
         except openai.BadRequestError as exc:
-            raise NotImplementedError(
-                f"Streaming request rejected by the Responses API endpoint. "
-                f"Use agent.run() for batch completion. "
-                f"Original error: {exc.message}"
-            ) from exc
+            if not registry.has_images:
+                raise NotImplementedError(
+                    f"Streaming request rejected by the Responses API endpoint. "
+                    f"Use agent.run() for batch completion. "
+                    f"Original error: {exc.message}"
+                ) from exc
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
         except openai.APITimeoutError:
-            raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
+            if not registry.has_images:
+                raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
+            failure = transport_image_error(
+                "timeout",
+                provider_name="openai_responses",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("OpenAIResponsesProvider", self._timeout)),
+            )
         except openai.APIConnectionError as exc:
-            raise connection_error(
-                "OpenAI Responses API",
-                self._model,
-                exc,
-                streaming=True,
-            ) from exc
+            if not registry.has_images:
+                raise connection_error(
+                    "OpenAI Responses API",
+                    self._model,
+                    exc,
+                    streaming=True,
+                ) from exc
+            failure = transport_image_error(
+                "connection", provider_name="openai_responses", model=api_kwargs["model"]
+            )
+        except openai.APIError as exc:
+            if not registry.has_images:
+                raise
+            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
         finally:
             # Counter only spans the request-establishing call. Once the
             # stream is open the SDK no longer retries.
             end_call_attempt_tracking(attempt_token)
+        if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
+            raise failure
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
@@ -499,6 +653,14 @@ class OpenAIResponsesProvider(LLMProvider):
         # Native message phase ("commentary" | "final_answer"): item_id → phase
         _message_phase: dict[str, str | None] = {}
         _completed_response: Any = None
+
+        if registry.has_images:
+            # Image-bearing: SDK errors raised mid-iteration and in-stream error
+            # events become typed, sanitised errors (they may follow deltas).
+            stream = self._guard_image_stream(stream, registry, api_kwargs["model"])
+            # This frame stays on the traceback of an in-stream failure; the
+            # request kwargs (base64 payloads) are not needed past this point.
+            del api_kwargs, registry
 
         async for event in stream:
             event_type = getattr(event, "type", None)
@@ -606,6 +768,39 @@ class OpenAIResponsesProvider(LLMProvider):
 
         yield StreamEvent(type=StreamEventType.DONE, raw=llm_response)
 
+    async def _guard_image_stream(
+        self, stream: Any, registry: WireImageRegistry, model: str
+    ) -> AsyncGenerator[Any, None]:
+        """Re-yield stream events; turn failures into typed errors raised cleanly.
+
+        Covers an SDK ``APIError`` raised during iteration, an ``error`` event
+        and a ``response.failed`` event. The typed error is raised outside any
+        ``except`` block, so it chains nothing that holds the request body.
+        """
+        failure: Exception | None = None
+        iterator = stream.__aiter__()
+        while True:
+            try:
+                event = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except openai.APIError as exc:
+                failure = self._image_error(exc, registry, model, streaming=True)
+                break
+            event_type = getattr(event, "type", None)
+            if event_type == "error":
+                failure = self._stream_event_image_error(event, registry, model)
+                break
+            if event_type == "response.failed":
+                error = getattr(getattr(event, "response", None), "error", None)
+                failure = self._stream_event_image_error(error, registry, model)
+                break
+            yield event
+        if failure is not None:
+            await close_stream_quietly(stream)
+            del stream, iterator, registry
+            raise failure
+
     # ------------------------------------------------------------------
     # Outbound conversions: Dendrux → OpenAI Responses API
     # ------------------------------------------------------------------
@@ -615,6 +810,7 @@ class OpenAIResponsesProvider(LLMProvider):
         messages: list[Message],
         *,
         replay_reasoning_for: str | None = None,
+        registry: WireImageRegistry | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Convert Dendrux messages to Responses API input format.
 
@@ -628,17 +824,41 @@ class OpenAIResponsesProvider(LLMProvider):
           - ASSISTANT ``reasoning_blocks`` → reasoning items ahead of that
             message's text/function_call items, when ``replay_reasoning_for``
             names the request model and it matches the producing model
+
+        Image parts: a USER message becomes ``input_text`` / ``input_image``
+        items in caller order. TOOL images follow ``tool_result_images``:
+        ``"native"`` emits them inside ``function_call_output.output``;
+        ``"portable"`` emits a text output and, after the tool block, ONE framed
+        user message (as Chat Completions). Text-only messages take the
+        unchanged v0.3.0 path.
         """
+        if registry is None:
+            registry = WireImageRegistry()
+        native = self.tool_result_images == "native"
         instructions_parts: list[str] = []
         input_items: list[dict[str, Any]] = []
         call_index = build_call_index(messages)
+        pending: list[tuple[str, str, tuple[ImagePart, ...]]] = []
 
         for msg in messages:
+            if pending and msg.role != Role.TOOL:
+                self._flush_tool_images(input_items, pending, registry)
+
             if msg.role == Role.SYSTEM:
                 instructions_parts.append(msg.content)
 
             elif msg.role == Role.USER:
-                input_items.append({"role": "user", "content": msg.content})
+                if msg.parts is None:
+                    input_items.append({"role": "user", "content": msg.content})
+                else:
+                    content = convert_parts(
+                        msg.parts,
+                        registry=registry,
+                        prefix=("input", len(input_items), "content"),
+                        text_block=responses_text,
+                        image_block=responses_image,
+                    )
+                    input_items.append({"role": "user", "content": content})
 
             elif msg.role == Role.ASSISTANT:
                 # The API rejects null-valued fields (e.g. ``status: None``
@@ -666,16 +886,62 @@ class OpenAIResponsesProvider(LLMProvider):
 
             elif msg.role == Role.TOOL:
                 original_call = resolve_tool_message_call(msg, call_index)
-                input_items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": original_call.provider_tool_call_id or original_call.id,
-                        "output": msg.content,
-                    }
-                )
+                if msg.parts is None:
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": original_call.provider_tool_call_id or original_call.id,
+                            "output": msg.content,
+                        }
+                    )
+                elif native:
+                    output = convert_parts(
+                        msg.parts,
+                        registry=registry,
+                        prefix=("input", len(input_items), "output"),
+                        text_block=responses_text,
+                        image_block=responses_image,
+                    )
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": original_call.provider_tool_call_id or original_call.id,
+                            "output": output,
+                        }
+                    )
+                else:
+                    wire_call_id = original_call.provider_tool_call_id or original_call.id
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": wire_call_id,
+                            "output": portable_tool_text(msg),
+                        }
+                    )
+                    if msg.images:
+                        pending.append((original_call.name, wire_call_id, msg.images))
 
+        if pending:
+            self._flush_tool_images(input_items, pending, registry)
         instructions = "\n\n".join(instructions_parts)
         return instructions, input_items
+
+    @staticmethod
+    def _flush_tool_images(
+        input_items: list[dict[str, Any]],
+        pending: list[tuple[str, str, tuple[ImagePart, ...]]],
+        registry: WireImageRegistry,
+    ) -> None:
+        """Append the framed user message for a tool block's images (portable mode)."""
+        content = portable_framing(
+            pending,
+            registry=registry,
+            prefix=("input", len(input_items), "content"),
+            text_block=responses_text,
+            image_block=responses_image,
+        )
+        input_items.append({"role": "user", "content": content})
+        pending.clear()
 
     def _build_tools(self, dendrux_tools: list[ToolDef] | None) -> list[dict[str, Any]]:
         """Build the tools array: built-in tools + Dendrux function tools."""

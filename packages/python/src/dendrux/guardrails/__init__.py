@@ -21,13 +21,21 @@ Usage:
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.guardrails._pii import PII
 from dendrux.guardrails._prompt_injection import PromptInjection
-from dendrux.guardrails._protocol import Finding, Guardrail, Pattern
+from dendrux.guardrails._protocol import (
+    Finding,
+    Guardrail,
+    ImageGuardrail,
+    ImageScanInput,
+    Pattern,
+)
 from dendrux.guardrails._secrets import SecretDetection
 
 __all__ = [
     "Finding",
     "Guardrail",
     "GuardrailEngine",
+    "ImageGuardrail",
+    "ImageScanInput",
     "PII",
     "Pattern",
     "PromptInjection",

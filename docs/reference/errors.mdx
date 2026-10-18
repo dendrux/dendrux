@@ -14,6 +14,9 @@ from dendrux.errors import (
     PersistenceNotConfiguredError, SchemaNotInitializedError, SchemaOutOfDateError,
     SkillValidationError, SkillMissingError, SkillMismatchError,
     ContextLengthExceededError,
+    ImageError, InvalidImageError, ImageLimitError, ImageFetchError, UnsupportedModalityError,
+    ImageRejectedError, ProviderError, BlobNotFoundError, BlobIntegrityError,
+    ImagePersistenceUnsupportedError, BlobContentionError,
 )
 ```
 
@@ -33,11 +36,22 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
 | `SchemaOutOfDateError(missing_tables, missing_columns)` | `RuntimeError` | A non-SQLite database is missing tables or columns this version needs, because `dendrux db migrate` was not run after upgrading. Raised once per engine, before the first run (`Agent`, `sweep`, dashboard; `RunStore` is not checked). Only presence of tables and columns is verified, not their types or defaults. Carries `err.missing_tables`, `err.missing_columns` (`"table.column"`) and `err.missing`. Set `DENDRUX_SKIP_SCHEMA_CHECK=1` to skip the check. See [Upgrading](/docs/architecture/state-persistence#upgrading). | 500 |
 | `ContextLengthExceededError(message, status_code=, provider_code=, model=)` | `RuntimeError` | An OpenAI-compatible endpoint (`OpenAIProvider`, `OpenRouterProvider`) rejected a batch or streaming request as larger than the model's context window. The SDK error is chained as `__cause__`; the message never contains prompt content. See [Models and providers](/docs/architecture/models#request-errors-on-openai-compatible-endpoints). | 413 or 400 |
+| `ImageError(ValueError)` | `ValueError` | Base class of `InvalidImageError`, `ImageLimitError` and `ImageFetchError`; catch it for any bad image input. | 400 |
+| `InvalidImageError(reason=, index=, media_type=, byte_length=)` | `ImageError` (`ValueError`) | An image failed validation at ingest: `reason` is `unsupported_type`, `type_mismatch`, `corrupt`, `animated`, `empty`, `purged`, `descriptor_version`, `descriptor_mismatch`, `bad_base64` or `path`. See [Images](/docs/recipes/images#errors). | 400 |
+| `ImageLimitError(scope=, limit=, actual=, index=)` | `ImageError` | An image cap was exceeded (`image_bytes`, `source_bytes`, `image_side`, `image_pixels`, `message_count`, `request_count`, `request_bytes`, `estimated_tokens`, `many_image_dimension`, and `store_bytes` for a full in-memory store). | 413 |
+| `ImageFetchError(reason=, host=, status_code=)` | `ImageError` | `Image.from_url` was refused or failed (`scheme`, `port`, `credentials`, `host_not_allowed`, `blocked_address`, `dns`, `redirect`, `timeout`, `too_large`, `http_status`, `content_encoding`, `disabled`, `connect`). Carries the host only, never the path or query. | 502 for `http_status` and `timeout`; otherwise 400 |
+| `UnsupportedModalityError(provider=, model=, source=, ...)` | `RuntimeError` | The model cannot take images. `source` is `capability`, `catalog`, `adapter` or `provider_response`. | 400 |
+| `ImageRejectedError(image_ids=, located=, retried=)` | `RuntimeError` | The provider refused a specific image. | 422 |
+| `ProviderError(provider=, model=, status_code=, provider_code=, message=)` | `RuntimeError` | Any other provider failure on a request that carried images; sanitised, at most 500 characters. Text-only requests keep their existing errors. | 502 |
+| `BlobNotFoundError(image_id)` | `LookupError` | The blob is missing, belongs to another tenant, or the run has no reference to it. The same error for all three. | 404 |
+| `BlobIntegrityError(image_id, check=)` | `RuntimeError` | Stored bytes or a persisted descriptor do not match the catalog. | 500 |
+| `ImagePersistenceUnsupportedError(reason=)` | `RuntimeError` | The state store has no blob catalog, an external blob row is read with no `blob_store`, or a tool returned images in a loop run without an image runtime. | 500 |
+| `BlobContentionError(image_id)` | `RuntimeError` | Image storage lost a race with a concurrent purge or garbage collection. Transient; safe to retry. | 503 |
 | `SkillValidationError(message, field=)` | `ValueError` | A [skill](/docs/architecture/skills) is built with an invalid name, description, file path, metadata, or frontmatter. `field` names the offender. | 400 |
 | `SkillMissingError(run_id, missing=, mismatched=)` | `SkillContinuityError` | A paused run is continued on an agent that lacks a skill the run was created with. The run stays paused. | 409 |
 | `SkillMismatchError(run_id, mismatched=)` | `SkillContinuityError` | Every skill is attached, but at least one has different content (digest) than the run was created with. The run stays paused. | 409 |
 
-Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling. `ContextLengthExceededError` carries `err.status_code`, `err.provider_code` and `err.model`. `SkillMissingError` and `SkillMismatchError` share the base class `SkillContinuityError` (a `RuntimeError`) and expose `err.missing` and `err.mismatched`; see the [resume contract](/docs/architecture/skills#resume-contract).
+None of the image errors contain image bytes, base64 or a URL's query string, and they are raised without a chained exception. Each carries its arguments as attributes (`err.run_id`, `err.current_status`, etc.) for structured handling. `ContextLengthExceededError` carries `err.status_code`, `err.provider_code` and `err.model`. `SkillMissingError` and `SkillMismatchError` share the base class `SkillContinuityError` (a `RuntimeError`) and expose `err.missing` and `err.mismatched`; see the [resume contract](/docs/architecture/skills#resume-contract).
 
 ## Also exported from `dendrux`
 

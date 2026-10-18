@@ -9,12 +9,15 @@ from dendrux.types import (
     AgentStep,
     Clarification,
     Finish,
+    ImagePart,
+    ImageRef,
     LLMResponse,
     Message,
     ProviderCapabilities,
     Role,
     RunResult,
     RunStatus,
+    TextPart,
     ToolCall,
     ToolDef,
     ToolResult,
@@ -22,6 +25,7 @@ from dendrux.types import (
     UsageStats,
     _message_from_dict,
     _message_to_dict,
+    tool_result_message,
 )
 
 
@@ -420,3 +424,54 @@ class TestRunResult:
             iteration_count=15,
         )
         assert result.status == RunStatus.MAX_ITERATIONS
+
+
+# ---------------------------------------------------------------------------
+# 0.4.0 image parts (U-03): new cases only; the cases above are unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _image_ref(seed: str) -> ImageRef:
+    import hashlib
+
+    return ImageRef(
+        sha256=hashlib.sha256(seed.encode()).hexdigest(),
+        media_type="image/png",
+        byte_length=10,
+        width=4,
+        height=2,
+    )
+
+
+class TestMessagePartsShapes:
+    def test_text_image_text(self) -> None:
+        parts = (TextPart("before"), ImagePart(_image_ref("a")), TextPart("after"))
+        msg = Message.with_parts(Role.USER, parts)
+        assert msg.content == "before\n\nafter"
+        assert msg.parts == parts
+
+    def test_multiple_images_keep_order(self) -> None:
+        refs = [_image_ref(s) for s in "abc"]
+        msg = Message.with_parts(Role.USER, [ImagePart(r) for r in refs])
+        assert [p.ref for p in msg.images] == refs
+        assert msg.content == ""
+
+    def test_image_only(self) -> None:
+        msg = Message.with_parts(Role.USER, [ImagePart(_image_ref("a"))])
+        assert msg.content == "" and len(msg.images) == 1
+
+    def test_tool_text_plus_images(self) -> None:
+        result = ToolResult(
+            name="shot",
+            call_id="c1",
+            payload='"Captured."',
+            images=(ImagePart(_image_ref("a")), ImagePart(_image_ref("b"))),
+        )
+        msg = tool_result_message(result)
+        assert msg.role == Role.TOOL and msg.kind == "tool_result"
+        assert msg.content == '"Captured."'
+        assert isinstance(msg.parts[0], TextPart) and len(msg.images) == 2  # type: ignore[index]
+
+    def test_text_only_message_has_no_parts(self) -> None:
+        msg = Message(role=Role.USER, content="plain")
+        assert msg.parts is None and msg.images == ()

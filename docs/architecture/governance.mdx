@@ -26,7 +26,7 @@ Guardrails, approval, and access control are independent. You can use any one, a
 
 Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
 
-All 25 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+All 31 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
 
 ```text
 POLICY_DENIED           = 'policy.denied'
@@ -54,7 +54,15 @@ MCP_ERROR               = 'mcp.error'
 MCP_TOOLS_SKIPPED       = 'mcp.tools_skipped'
 PROVIDER_RETRY          = 'provider.retry'
 INBOX_DELIVERED         = 'inbox.delivered'
+IMAGE_REJECTED          = 'image.rejected'
+IMAGE_STATE             = 'image.state'
+IMAGE_VIEW_CHANGED      = 'image.view_changed'
+IMAGE_DEGRADED          = 'image.degraded'
+IMAGE_WARNING           = 'image.warning'
+GUARDRAIL_IMAGE_UNSCANNED = 'guardrail.image_unscanned'
 ```
+
+The six image events (`image.*` and `guardrail.image_unscanned`) record what happened to images the runtime sent, dropped, replaced or could not scan. Their payloads carry ids, counts and verdicts, never image bytes. See [Images](/docs/recipes/images#what-is-recorded).
 
 `guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction and an error string; that error includes the blocked finding's entity type and a bounded snippet. A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
 

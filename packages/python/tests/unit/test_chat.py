@@ -285,3 +285,78 @@ class TestNormalizeChatHistory:
                     ChatMessage.assistant("hi"),
                 ]
             )
+
+
+class TestChatMessageImagesAndTypes:
+    """Spec §2.3: assistant turns never carry images; content is always a str."""
+
+    @staticmethod
+    def _image():
+        from pathlib import Path
+
+        from dendrux.media import Image
+
+        png = Path(__file__).resolve().parents[1] / "fixtures" / "images" / "zebra42.png"
+        return Image.from_bytes(png.read_bytes())
+
+    def test_assistant_factory_with_images_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="assistant chat messages cannot carry images"):
+            ChatMessage.assistant(["x", self._image()])  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="cannot carry images"):
+            ChatMessage.assistant(self._image())  # type: ignore[arg-type]
+
+    def test_assistant_with_parts_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="cannot carry images"):
+            ChatMessage(role="assistant", content="x", parts=("x", self._image()))  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="cannot carry images"):
+            ChatMessage(ChatRole.ASSISTANT, "x", parts=("x", self._image()))
+
+    def test_system_and_unknown_roles_raise_value_error(self) -> None:
+        with pytest.raises(ValueError, match="'user' or 'assistant'"):
+            ChatMessage(role="system", content="x", parts=("x", self._image()))  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="'user' or 'assistant'"):
+            ChatMessage(role="tool", content="x")  # type: ignore[arg-type]
+
+    def test_string_role_is_normalised(self) -> None:
+        msg = ChatMessage(role="assistant", content="hi")  # type: ignore[arg-type]
+        assert msg.role is ChatRole.ASSISTANT
+        assert msg == ChatMessage.assistant("hi")
+
+    @pytest.mark.parametrize("content", [None, 3, b"bytes", ["a", "b"], {"a": 1}])
+    def test_non_str_content_raises_type_error(self, content) -> None:
+        with pytest.raises(TypeError, match="content must be a str"):
+            ChatMessage.assistant(content)
+        with pytest.raises(TypeError, match="content must be a str"):
+            ChatMessage(role=ChatRole.USER, content=content)
+
+    def test_user_list_content_hints_at_user_factory(self) -> None:
+        with pytest.raises(TypeError, match=r"ChatMessage\.user"):
+            ChatMessage(role=ChatRole.USER, content=["x", self._image()])  # type: ignore[arg-type]
+
+    def test_bad_part_element_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match=r"ChatMessage\.parts\[1\]"):
+            ChatMessage(ChatRole.USER, "x", parts=("x", 42))  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            ChatMessage.user(["x", 42])  # type: ignore[list-item]
+
+    def test_user_parts_still_fine(self) -> None:
+        img = self._image()
+        msg = ChatMessage.user(["look", img])
+        assert msg.role is ChatRole.USER and msg.content == "look" and msg.parts == ("look", img)
+
+    def test_text_only_unchanged(self) -> None:
+        msg = ChatMessage.user("hello")
+        assert (msg.role, msg.content, msg.parts) == (ChatRole.USER, "hello", None)
+        assert ChatMessage.assistant("") == ChatMessage(ChatRole.ASSISTANT, "")
+
+    async def test_assistant_images_never_reach_a_run(self) -> None:
+        from dendrux.agent import Agent
+        from dendrux.llm.mock import MockLLM
+        from dendrux.types import LLMResponse
+
+        agent = Agent(prompt="p", provider=MockLLM([LLMResponse(text="x")]))
+        with pytest.raises(ValueError, match="cannot carry images"):
+            await agent.run(
+                "q", history=[ChatMessage.user("hi"), ChatMessage.assistant(["x", self._image()])]
+            )
+        assert agent.provider.calls_made == 0  # type: ignore[union-attr]

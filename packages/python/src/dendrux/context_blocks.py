@@ -39,7 +39,12 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from dendrux.skills._session import SkillSession
 
-from dendrux.types import Message, Role
+from dendrux.types import Message, Role, TextPart
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from dendrux.types import ContentPart
 
 STABLE_HEADER = "STABLE CONTEXT:"
 DYNAMIC_HEADER = "ADDITIONAL CONTEXT:"
@@ -104,6 +109,7 @@ def fold_context(
     user_input: str,
     *,
     session: SkillSession | None = None,
+    user_parts: Sequence[ContentPart] | None = None,
 ) -> list[Message] | None:
     """Fold context blocks into user-message content per the locked format.
 
@@ -112,8 +118,12 @@ def fold_context(
     Labels are added only when a band is non-empty, so the no-context path
     is byte-identical to a plain history + user_input assembly.
 
-    Returns ``None`` only when there is no history AND no context — the
-    single-turn path where the loop builds the ``user_input`` message itself.
+    ``user_parts`` (a multimodal input; ``user_input`` is then its text
+    projection) builds the current message with :func:`wire_user_parts`.
+
+    Returns ``None`` only when there is no history AND no context AND no
+    image input — the single-turn path where the loop builds the
+    ``user_input`` message itself.
     """
     activations = session.envelopes() if session else []
     validate_context(context)
@@ -122,19 +132,29 @@ def fold_context(
 
     if history_messages:
         first = history_messages[0]
-        if stable:
-            # placement="stable" marks the frozen-prefix boundary for the
-            # provider translator's cross-run cache breakpoint.
-            first_folded = replace(
-                first, content=_fold_first(stable, first.content), placement="stable"
+        # placement="stable" marks the frozen-prefix boundary for the
+        # provider translator's cross-run cache breakpoint.
+        first_folded = fold_first_message(first, stable) if stable else first
+        if user_parts is not None:
+            current = Message.with_parts(
+                Role.USER,
+                wire_user_parts(user_parts, activations, context, include_stable=False),
             )
         else:
-            first_folded = first
-        current = Message(
-            role=Role.USER,
-            content=wire_user_input(user_input, activations, context, include_stable=False),
-        )
+            current = Message(
+                role=Role.USER,
+                content=wire_user_input(user_input, activations, context, include_stable=False),
+            )
         return [first_folded, *history_messages[1:], current]
+
+    if user_parts is not None:
+        return [
+            Message.with_parts(
+                Role.USER,
+                wire_user_parts(user_parts, activations, context),
+                placement="stable" if stable else "dynamic",
+            )
+        ]
 
     if not stable and not dynamic and not activations:
         return None
@@ -150,6 +170,29 @@ def fold_context(
             placement="stable" if stable else "dynamic",
         )
     ]
+
+
+def fold_first_message(first: Message, stable: str) -> Message:
+    """Fold the stable band into the first history message (text or parts)."""
+    if first.parts is None:
+        return replace(first, content=_fold_first(stable, first.content), placement="stable")
+    return Message.with_parts(
+        first.role,
+        fold_first_parts(stable, first.parts),
+        meta=first.meta,
+        kind=first.kind,
+        placement="stable",
+        source=first.source,
+    )
+
+
+def fold_first_parts(stable: str, parts: Sequence[ContentPart]) -> tuple[ContentPart, ...]:
+    """``_fold_first`` for a parts message: the stable header precedes the first part."""
+    if not stable:
+        return tuple(parts)
+    if parts and isinstance(parts[0], TextPart):
+        return (TextPart(_fold_first(stable, parts[0].text)), *parts[1:])
+    return (TextPart(_fold_first(stable, "")), *parts)
 
 
 def _fold_first(stable: str, original: str) -> str:
@@ -176,3 +219,25 @@ def wire_user_input(
     if include_stable:
         content = _fold_first(render_band(context_blocks, "stable"), content)
     return "\n\n".join([*activations, content])
+
+
+def wire_user_parts(
+    parts: Sequence[ContentPart],
+    activations: list[str],
+    context_blocks: list[ContextBlock] | None,
+    *,
+    include_stable: bool = True,
+) -> tuple[ContentPart, ...]:
+    """:func:`wire_user_input` for a multimodal input; caller part order is kept.
+
+    A leading text part is replaced by its framed form; otherwise the framing
+    (when non-empty) is prepended as its own text part, so framing text always
+    precedes the caller's first part and stable-band bytes never depend on images.
+    """
+    if parts and isinstance(parts[0], TextPart):
+        framed = wire_user_input(
+            parts[0].text, activations, context_blocks, include_stable=include_stable
+        )
+        return (TextPart(framed), *parts[1:])
+    framing = wire_user_input("", activations, context_blocks, include_stable=include_stable)
+    return (TextPart(framing), *parts) if framing else tuple(parts)

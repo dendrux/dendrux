@@ -26,14 +26,21 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, overload
 
 from dendrux._sentinel import _UnsetType
-from dendrux.chat import normalize_chat_history
+from dendrux.chat import (
+    history_has_images,
+    normalize_chat_history,
+    split_user_content,
+    validate_chat_history,
+)
 from dendrux.context_blocks import (
     ContextBlock,
     fold_context,
     render_band,
     validate_context,
     wire_user_input,
+    wire_user_parts,
 )
+from dendrux.errors import BlobNotFoundError, InvalidImageError
 from dendrux.loops._budget import BUDGET_EXCEEDED, BudgetCarry
 from dendrux.loops._helpers import (
     notify_message,
@@ -57,6 +64,7 @@ from dendrux.runtime.context import (
     set_delegation_context,
 )
 from dendrux.runtime.replay import (
+    PARTS_KEY,
     REPLAY_META_KEY,
     ReplayLast,
     ReplayPlan,
@@ -64,7 +72,12 @@ from dendrux.runtime.replay import (
     build_seed,
     current_prefix,
     expand_replay,
+    has_images,
+    image_slot_count,
+    initial_image_view,
+    load_image_sources,
     load_replay_runs,
+    parts_to_dicts,
     rebuild_messages,
     record_run_prefix,
     user_trace_message,
@@ -77,16 +90,23 @@ from dendrux.types import (
     ApprovalDecision,
     GovernanceEventType,
     IdempotencyConflictError,
+    ImagePart,
+    ImageRef,
+    ImageViewState,
     Message,
     PauseState,
     ReplaySummary,
+    Role,
     RunAlreadyActiveError,
     RunEventType,
     RunStatus,
+    TextPart,
     UsageStats,
     _usage_from_dict,
     compute_idempotency_fingerprint,
+    content_part_from_dict,
     generate_ulid,
+    tool_result_message,
 )
 
 if TYPE_CHECKING:
@@ -96,9 +116,12 @@ if TYPE_CHECKING:
     from dendrux.chat import ChatMessage
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
+    from dendrux.media._catalog import BlobEdge
+    from dendrux.media._image import UserContent
+    from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import RunEvent, RunResult, RunStream, ToolCall, ToolResult
+    from dendrux.types import ContentPart, RunEvent, RunResult, RunStream, ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -816,6 +839,272 @@ def _carry_budget_fields(new: PauseState, old: PauseState) -> PauseState:
     )
 
 
+def _carry_image_view(new: PauseState, old: PauseState) -> PauseState:
+    """Carry the image view of the pause being resumed onto a runner-built pause.
+
+    A runner-built pause is created between requests, so the view is
+    unchanged. A pause predating any image (``image_view is None``) whose new
+    history gained images (approved server tools) starts a view in which
+    the old history's slots count as sent.
+    """
+    view = old.image_view
+    if view is None:
+        if not has_images(new.history):
+            return new
+        view = ImageViewState(sent_through=image_slot_count(old.history))
+    return replace(new, image_view=ImageViewState.from_dict(view.to_dict()))
+
+
+def _image_runtime(
+    agent: Agent, state_store: StateStore | None, tenant_id: str | None, run_id: str | None
+) -> ImageRuntime:
+    """The per-run :class:`ImageRuntime` (explicit; never a ContextVar)."""
+    from dendrux.media._policy import ImagePolicy
+    from dendrux.media._runtime import ImageRuntime, tenant_scope_for
+
+    backend = getattr(agent, "_image_backend", None)
+    catalog, blob_store, resolver = backend(state_store) if backend else (None, None, None)
+    gc = getattr(agent, "_image_gc", None)
+    return ImageRuntime(
+        collect_garbage=gc(state_store) if gc else None,
+        policy=getattr(agent, "image_policy", None) or ImagePolicy(),
+        catalog=catalog,
+        blob_store=blob_store,
+        resolver=resolver,
+        tenant_scope=tenant_scope_for(tenant_id),
+        run_id=run_id,
+    )
+
+
+def _recorder_image_kwargs(tenant_id: str | None, provider: LLMProvider) -> dict[str, Any]:
+    """``tenant_scope=`` (edge scope) and ``provider=`` (image token estimates) for
+    ``PersistenceRecorder`` when it takes them (§8)."""
+    from dendrux.media._runtime import tenant_scope_for
+    from dendrux.runtime.persistence import PersistenceRecorder
+
+    init = PersistenceRecorder.__init__
+    out: dict[str, Any] = {}
+    if _accepts_kwarg(init, "tenant_scope"):
+        out["tenant_scope"] = tenant_scope_for(tenant_id)
+    if _accepts_kwarg(init, "provider"):
+        out["provider"] = provider
+    return out
+
+
+def _image_loop_kwargs(
+    loop_method: Any, runtime: ImageRuntime | None, state: ImageViewState | None
+) -> dict[str, Any]:
+    """``image_runtime=`` / ``image_view_state=`` for a loop method that accepts them."""
+    out: dict[str, Any] = {}
+    if runtime is not None and _accepts_kwarg(loop_method, "image_runtime"):
+        out["image_runtime"] = runtime
+        if state is not None and _accepts_kwarg(loop_method, "image_view_state"):
+            out["image_view_state"] = state
+    return out
+
+
+def _require_image_loop(loop: Loop, method: str = "run") -> None:
+    """A loop that cannot take ``image_runtime`` cannot run image input."""
+    if not _accepts_kwarg(getattr(loop, method, None), "image_runtime"):
+        raise TypeError(
+            f"{type(loop).__name__}.{method}() does not accept image_runtime, so it "
+            "cannot run image input; use ReActLoop or SingleCall, or add the parameter."
+        )
+
+
+def _tool_image_kwargs(fn: Any, runtime: ImageRuntime | None) -> dict[str, Any]:
+    if runtime is None or not _accepts_kwarg(fn, "image_runtime"):
+        return {}
+    return {"image_runtime": runtime}
+
+
+def _resume_image_view(pause_state: PauseState, history: list[Message]) -> ImageViewState | None:
+    """The view a resumed run continues with; fresh (old history = sent) for older pauses."""
+    if pause_state.image_view is not None:
+        return pause_state.image_view
+    if not has_images(history):
+        return None
+    return ImageViewState(sent_through=image_slot_count(pause_state.history))
+
+
+async def _write_edges(
+    runtime: ImageRuntime | None, run_id: str, edges: Sequence[BlobEdge]
+) -> None:
+    """Seed / user-trace edges via the catalog (idempotent per owner key)."""
+    if not edges:
+        return
+    if runtime is None or runtime.catalog is None:
+        from dendrux.errors import ImagePersistenceUnsupportedError
+
+        raise ImagePersistenceUnsupportedError("state_store")
+    await runtime.catalog.add_blob_refs(run_id, runtime.tenant_scope, list(edges))
+
+
+async def _live_edges(runtime: ImageRuntime | None, edges: list[BlobEdge]) -> list[BlobEdge]:
+    """Keep edges whose blob row is ``live`` (purged/missing refs degrade at request time)."""
+    if not edges or runtime is None or runtime.catalog is None:
+        return edges
+    rows = await runtime.catalog.get_current(
+        runtime.tenant_scope, list(dict.fromkeys(e.sha256 for e in edges))
+    )
+    return [e for e in edges if (row := rows.get(e.sha256)) is not None and row.state == "live"]
+
+
+def _seed_edges(runtime: ImageRuntime, seeded: Sequence[Message]) -> list[BlobEdge]:
+    """``seed`` edges: one per image slot of the seeded prefix (ordinal = slot)."""
+    from dendrux.media._catalog import BlobEdge
+
+    edges: list[BlobEdge] = []
+    slot = 0
+    for msg in seeded:
+        if msg.role == Role.SYSTEM:
+            continue
+        for part in msg.images:
+            edges.append(BlobEdge(runtime.tenant_scope, part.ref.sha256, "seed", "seed", slot))
+            slot += 1
+    return edges
+
+
+async def _start_image_view(
+    runtime: ImageRuntime | None,
+    store: StateStore | None,
+    run_id: str,
+    *,
+    seeded: Sequence[Message],
+    sources: Sequence[tuple[str, str | None, dict[str, Any] | None]],
+    single_full: bool,
+    input_images: bool,
+) -> ImageViewState | None:
+    """New-run image view (§5.14) plus seed edges; None for a run without images.
+
+    ``seeded`` is the prefix the run starts with (history=, replayed runs,
+    retry rebuild); its slots all count as sent. ``sources`` are the replayed
+    / retried runs whose image decisions carry over, in order.
+    """
+    if not has_images(seeded):
+        return ImageViewState() if input_images else None
+    if runtime is None:
+        raise TypeError(
+            "the loop does not accept image_runtime, so it cannot run a seeded prefix with images"
+        )
+    image_sources = (
+        await load_image_sources(store, sources) if store is not None and sources else []
+    )
+    state = initial_image_view(
+        sent_through=image_slot_count(seeded),
+        sources=image_sources,
+        tenant_scope=runtime.tenant_scope,
+        single_full=single_full,
+    )
+    if store is not None or _memory_catalog(runtime, store) is not None:
+        await _write_edges(
+            runtime, run_id, await _live_edges(runtime, _seed_edges(runtime, seeded))
+        )
+    return state
+
+
+def _memory_catalog(runtime: ImageRuntime | None, store: StateStore | None) -> Any:
+    """The in-memory catalog of a run without a database (it tracks run edges)."""
+    if store is not None or runtime is None or runtime.catalog is None:
+        return None
+    return runtime.catalog if hasattr(runtime.catalog, "release_run") else None
+
+
+async def _register_memory_input(
+    runtime: ImageRuntime | None,
+    store: StateStore | None,
+    run_id: str,
+    user_parts: tuple[ContentPart, ...] | None,
+) -> None:
+    """No database: register the input's edges with the in-memory catalog (GC safety)."""
+    if _memory_catalog(runtime, store) is None:
+        return
+    edges = _input_edge_kwargs(runtime, user_parts).get("blob_refs")
+    if edges:
+        await _write_edges(runtime, run_id, edges)
+
+
+def _release_memory_edges(
+    runtime: ImageRuntime | None, store: StateStore | None, run_id: str
+) -> None:
+    """No database: drop the run's in-memory edges once it ends (it cannot pause)."""
+    catalog = _memory_catalog(runtime, store)
+    if catalog is not None:
+        try:
+            catalog.release_run(run_id)
+        except Exception:
+            logger.warning(
+                "Failed to release in-memory blob edges of run %s", run_id, exc_info=True
+            )
+
+
+class _EntryImages(NamedTuple):
+    """Ingested image input of a new run (before ``create_run``)."""
+
+    runtime: ImageRuntime
+    user_parts: tuple[ContentPart, ...] | None
+    history: list[Message]
+
+
+async def _ingest_entry_images(
+    agent: Agent,
+    provider: LLMProvider,
+    model: str,
+    *,
+    state_store: StateStore | None,
+    tenant_id: str | None,
+    run_id: str,
+    items: tuple[Any, ...],
+    history: list[ChatMessage] | None,
+) -> _EntryImages:
+    """Ingest run input + ``history=`` images before any run row exists (§5.2).
+
+    The input's capability check runs between ingest phase 1 and phase 2, so a
+    non-vision model rejects new images before any blob row is written.
+    History images are seeded (already sent) and never capability-checked.
+    """
+    from dendrux.runtime.submit import (
+        check_new_image_capability,
+        ingest_groups,
+        merge_user_items,
+        user_items_group,
+    )
+
+    runtime = _image_runtime(agent, state_store, tenant_id, run_id)
+    turns = [(i, msg.parts) for i, msg in enumerate(history or []) if msg.parts]
+    image_count = sum(1 for item in items if not isinstance(item, str))
+
+    async def _capability() -> None:
+        await check_new_image_capability(
+            provider, model, runtime.policy, image_count=image_count, origin="user"
+        )
+
+    # One phase 1 over the input and every history turn before any blob write.
+    ingested = await ingest_groups(
+        [user_items_group(items), *(user_items_group(parts) for _, parts in turns)],
+        runtime=runtime,
+        before_store=_capability,
+    )
+    user_parts = merge_user_items(items, ingested[0]) if items else None
+    parts_for = {
+        i: merge_user_items(parts, images)
+        for (i, parts), images in zip(turns, ingested[1:], strict=True)
+    }
+    return _EntryImages(runtime, user_parts, normalize_chat_history(history, parts_for))
+
+
+async def _record_user_trace(
+    recorder: LoopRecorder | None, notifier: LoopNotifier | None, run_id: str, user_msg: Message
+) -> None:
+    """Record the run's own user message (order 0).
+
+    Its image parts (``meta["dendrux.parts"]``) are edged by the recorder in
+    the trace transaction (non-live blobs skipped there).
+    """
+    await record_message(recorder, run_id, user_msg, 0)
+    await notify_message(notifier, run_id, user_msg, 0)
+
+
 _UNSET_DEPTH = _UnsetType()
 
 
@@ -878,7 +1167,7 @@ async def run(
     agent: Agent,
     *,
     provider: LLMProvider,
-    user_input: str,
+    user_input: UserContent,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
     activate_skills: Sequence[str] | None = ...,
@@ -903,7 +1192,7 @@ async def run(
     agent: Agent,
     *,
     provider: LLMProvider,
-    user_input: str,
+    user_input: UserContent,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
     activate_skills: Sequence[str] | None = ...,
@@ -926,7 +1215,7 @@ async def run(
     agent: Agent,
     *,
     provider: LLMProvider,
-    user_input: str,
+    user_input: UserContent,
     history: list[ChatMessage] | None = None,
     context: list[ContextBlock] | None = None,
     activate_skills: Sequence[str] | None = None,
@@ -1004,12 +1293,79 @@ async def run(
         resolved_loop = loop or agent.loop or ReActLoop()
         _validate_loop_skill_compat(agent, resolved_loop)
 
-        # Validate + normalize chat history before any side effects.
-        # Raises ValueError on bad input so no DB row is created.
-        normalized_history = normalize_chat_history(history)
+        # Validate input + chat history before any side effects. Raises
+        # TypeError / ValueError on bad input so no DB row is created.
+        user_input, input_items = split_user_content(user_input)
+        validate_chat_history(history)
+        image_input = bool(input_items) or history_has_images(history)
+        if image_input:
+            _require_image_loop(resolved_loop)
+        normalized_history = [] if image_input else normalize_chat_history(history)
         replay_req = validate_replay_args(
             runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
         )
+        if replay_req is not None:
+            validate_context(context)
+            if state_store is None:
+                raise ValueError(
+                    "runs= requires persistence (database_url, state_store, or "
+                    "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
+                )
+        else:
+            validate_context(context)
+        replay_runs = (
+            await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
+            if replay_req is not None and state_store is not None
+            else []
+        )
+        if _replay_has_images(replay_runs):
+            _require_image_loop(resolved_loop)
+        replay_plan: ReplayPlan | None = None
+
+        provider_kwargs = dict(kwargs) if kwargs else {}
+
+        run_id = generate_ulid()
+
+        # Images: ingest before the first durable write (§5.2). Typed errors
+        # raise here, before any run row or claim exists.
+        image_runtime: ImageRuntime | None = None
+        user_parts: tuple[ContentPart, ...] | None = None
+        if image_input:
+            try:
+                entry = await _ingest_entry_images(
+                    agent,
+                    provider,
+                    provider_kwargs.get("model") or provider.model,
+                    state_store=state_store,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    items=input_items,
+                    history=history,
+                )
+            except (InvalidImageError, BlobNotFoundError) as exc:
+                hit = await _idempotent_hit_after_image_error(
+                    exc,
+                    state_store,
+                    idempotency_key,
+                    agent_name=agent.name,
+                    user_input=user_input,
+                    items=input_items,
+                    history=history,
+                    output_type=output_type,
+                    context=context,
+                    replay=replay_req.fingerprint() if replay_req else None,
+                    skills=skill_session.fingerprint(),
+                )
+                if hit is None:
+                    raise
+                if hit.outcome == "existing_terminal":
+                    assert state_store is not None  # a hit implies a store
+                    return await _build_cached_result(state_store, hit.run_id, output_type)
+                raise RunAlreadyActiveError(hit.run_id, hit.status) from None
+            image_runtime, user_parts, normalized_history = entry
+        elif _accepts_kwarg(resolved_loop.run, "image_runtime"):
+            image_runtime = _image_runtime(agent, state_store, tenant_id, run_id)
+
         # When chat history is provided, the loop expects initial_history to
         # be the COMPLETE message list (loops use initial_history as-is and
         # do not separately append user_input — same contract as resume).
@@ -1018,26 +1374,14 @@ async def run(
         # With runs=, the replayed prefix is folded in after expansion.
         if replay_req is None:
             seeded_history = fold_context(
-                normalized_history, context, user_input, session=skill_session
+                normalized_history,
+                context,
+                user_input,
+                session=skill_session,
+                user_parts=user_parts,
             )
         else:
-            validate_context(context)
             seeded_history = None
-            if state_store is None:
-                raise ValueError(
-                    "runs= requires persistence (database_url, state_store, or "
-                    "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
-                )
-        replay_runs = (
-            await load_replay_runs(state_store, replay_req, tenant_id=tenant_id)
-            if replay_req is not None and state_store is not None
-            else []
-        )
-        replay_plan: ReplayPlan | None = None
-
-        provider_kwargs = dict(kwargs) if kwargs else {}
-
-        run_id = generate_ulid()
         recorder: LoopRecorder | None = None
         sequencer = EventSequencer()
 
@@ -1089,12 +1433,13 @@ async def run(
                             context=context or None,
                             replay=replay_req.fingerprint() if replay_req else None,
                             skills=skill_session.fingerprint(),
+                            user_input_parts=user_parts,
                         )
 
                     create_result = await state_store.create_run(
                         run_id,
                         agent.name,
-                        input_data={"input": user_input},
+                        input_data=_input_data(user_input, user_parts),
                         model=provider.model,
                         strategy=type(resolved_strategy).__name__,
                         parent_run_id=parent_run_id,
@@ -1103,6 +1448,7 @@ async def run(
                         meta=run_meta,
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=idem_fingerprint,
+                        **_input_edge_kwargs(image_runtime, user_parts),
                     )
 
                     # Handle idempotency outcomes
@@ -1137,6 +1483,7 @@ async def run(
                         provider_name=type(provider).__name__,
                         target_lookup=target_lookup,
                         event_sequencer=sequencer,
+                        **_recorder_image_kwargs(tenant_id, provider),
                     )
 
                 await _emit_event(
@@ -1207,6 +1554,17 @@ async def run(
                     context=context,
                     user_input=user_input,
                     seeded_history=seeded_history,
+                    user_parts=user_parts,
+                )
+                await _register_memory_input(image_runtime, state_store, run_id, user_parts)
+                image_view = await _start_image_view(
+                    image_runtime,
+                    state_store,
+                    run_id,
+                    seeded=(seeded_history or [])[:-1],
+                    sources=_replay_sources(replay_runs),
+                    single_full=_single_full_source(replay_plan),
+                    input_images=user_parts is not None,
                 )
 
                 # When chat history was provided, the loop receives a complete
@@ -1222,8 +1580,7 @@ async def run(
                         context,
                         session=skill_session,
                     )
-                    await record_message(recorder, run_id, user_msg, 0)
-                    await notify_message(extra_notifier, run_id, user_msg, 0)
+                    await _record_user_trace(recorder, extra_notifier, run_id, user_msg)
 
                 result = await resolved_loop.run(
                     agent=agent,
@@ -1237,6 +1594,7 @@ async def run(
                     provider_kwargs=provider_kwargs or None,
                     output_type=output_type,
                     state_store=state_store,
+                    **_image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
                 )
 
                 if replay_plan is not None:
@@ -1343,6 +1701,7 @@ async def run(
             raise
 
         finally:
+            _release_memory_edges(image_runtime, state_store, run_id)
             if registered and task_manager is not None:
                 task_manager.release_current(run_id)
             if ctx_token is not None:
@@ -1363,6 +1722,7 @@ async def _apply_replay(
     context: list[ContextBlock] | None,
     user_input: str,
     seeded_history: list[Message] | None,
+    user_parts: tuple[ContentPart, ...] | None = None,
 ) -> tuple[ReplayPlan | None, list[Message] | None]:
     """Expand ``runs=`` into the seeded history and record the prefix descriptor.
 
@@ -1382,6 +1742,7 @@ async def _apply_replay(
             context,
             user_input,
             session=current_skill_session(agent),
+            user_parts=user_parts,
         )
     await record_run_prefix(
         state_store,
@@ -1389,8 +1750,146 @@ async def _apply_replay(
         current=current,
         seed=build_seed(plan, normalized_history),
         plan=plan,
+        seeded_image_slots=image_slot_count((seeded_history or [])[:-1]),
     )
     return plan, seeded_history
+
+
+def _stream_error_meta(mcp_meta: dict[str, Any], exc: BaseException) -> dict[str, Any]:
+    """``RUN_ERROR`` result meta; an image rejection also lists the rejected image ids."""
+    from dendrux.errors import ImageRejectedError
+
+    meta = {**deepcopy(mcp_meta), "error_type": type(exc).__name__}
+    if isinstance(exc, ImageRejectedError):
+        meta["image_rejected"] = list(exc.image_ids)
+    return meta
+
+
+def _input_data(user_input: str, user_parts: tuple[ContentPart, ...] | None) -> dict[str, Any]:
+    """``agent_runs.input_data``: the text, plus raw parts for a multimodal input."""
+    if user_parts is None:
+        return {"input": user_input}
+    return {"input": user_input, PARTS_KEY: parts_to_dicts(user_parts)}
+
+
+def _input_edge_kwargs(
+    runtime: ImageRuntime | None, user_parts: tuple[ContentPart, ...] | None
+) -> dict[str, Any]:
+    """``blob_refs`` for ``create_run`` (``input`` edges), only when there are images."""
+    if runtime is None or not user_parts:
+        return {}
+    from dendrux.runtime.submit import parts_edges
+
+    edges = parts_edges(
+        user_parts, tenant_scope=runtime.tenant_scope, owner_kind="input", owner_id="input"
+    )
+    if not edges:
+        return {}
+    return {"blob_refs": edges, "blob_refs_scope": runtime.tenant_scope}
+
+
+def _stored_parts(raw: Any) -> tuple[ContentPart, ...] | None:
+    """Parts persisted as dicts, or None when absent or text-only."""
+    if not isinstance(raw, list) or not raw:
+        return None
+    parts = tuple(content_part_from_dict(d) for d in raw)
+    return parts if any(isinstance(p, ImagePart) for p in parts) else None
+
+
+async def _idempotent_hit_after_image_error(
+    exc: Exception,
+    store: StateStore | None,
+    idempotency_key: str | None,
+    *,
+    agent_name: str,
+    user_input: str,
+    items: tuple[Any, ...],
+    history: list[ChatMessage] | None,
+    output_type: type | None,
+    context: list[ContextBlock] | None,
+    replay: dict[str, Any] | None,
+    skills: Any,
+) -> Any:
+    """The existing run of a keyed request whose image was purged or is gone since.
+
+    Ingest runs before the idempotency lookup, so a retried keyed request whose
+    image has since been purged cannot be re-validated. When the key's run
+    stored the same input (same text items, same image positions, same
+    caller-given refs), the fingerprint is rebuilt from that run's stored
+    descriptors and the store's normal idempotency check decides (cached
+    terminal result / active / conflict). Image bytes that can no longer be
+    read cannot be compared, so a request differing only in which purged
+    image it sends is treated as the same request (documented).
+    """
+    purged = isinstance(exc, InvalidImageError) and exc.reason == "purged"
+    if (
+        idempotency_key is None
+        or store is None
+        or not (purged or isinstance(exc, BlobNotFoundError))
+    ):
+        return None
+    if history_has_images(history) or not items:
+        return None
+    check = getattr(store, "_check_idempotency", None)
+    if check is None:
+        return None
+    try:
+        existing = await check(idempotency_key, "")
+    except IdempotencyConflictError as found:
+        existing_id = found.run_id
+    else:
+        return existing
+    conflict = IdempotencyConflictError(run_id=existing_id, idempotency_key=idempotency_key)
+    record = await store.get_run(existing_id)
+    stored = _stored_parts((record.input_data or {}).get(PARTS_KEY)) if record else None
+    if stored is None or len(stored) != len(items):
+        raise conflict
+    candidate: list[ContentPart] = []
+    for item, part in zip(items, stored, strict=True):
+        if isinstance(item, str):
+            if not isinstance(part, TextPart) or part.text != item:
+                raise conflict
+            candidate.append(part)
+            continue
+        if not isinstance(part, ImagePart):
+            raise conflict
+        ref = getattr(item, "ref", item)
+        if isinstance(ref, ImageRef) and ref.sha256 != part.ref.sha256:
+            raise conflict
+        candidate.append(ImagePart(part.ref, detail=getattr(item, "detail", None)))
+    fingerprint = compute_idempotency_fingerprint(
+        agent_name,
+        user_input,
+        output_type_name=(
+            f"{output_type.__module__}.{output_type.__qualname__}" if output_type else None
+        ),
+        history=normalize_chat_history(history) or None,
+        context=context or None,
+        replay=replay,
+        skills=skills,
+        user_input_parts=candidate,
+    )
+    return await check(idempotency_key, fingerprint)
+
+
+def _replay_sources(replay_runs: Sequence[Any]) -> list[tuple[str, str | None, Any]]:
+    """``(run_id, tenant_id, meta)`` of each replayed run, in order."""
+    return [(r.record.id, r.record.tenant_id, r.record.meta) for r in replay_runs]
+
+
+def _replay_has_images(replay_runs: Sequence[Any]) -> bool:
+    """Whether any replayed run's input or traces carry image parts."""
+    for run in replay_runs:
+        if _stored_parts((run.record.input_data or {}).get(PARTS_KEY)) is not None:
+            return True
+        if any(_stored_parts((t.meta or {}).get(PARTS_KEY)) is not None for t in run.traces):
+            return True
+    return False
+
+
+def _single_full_source(plan: ReplayPlan | None) -> bool:
+    """Exactly one replayed run, seeded in full (its slots map 1:1)."""
+    return plan is not None and len(plan.summary.runs_full) == 1 and not plan.summary.runs_text
 
 
 async def _persist_task_cancellation(
@@ -1631,10 +2130,10 @@ async def retry(
             (t.content for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"),
             "Continue from previous attempt.",
         )
+        # Raw parts of a multimodal source input (refs; canonicalised per request).
+        source_parts = _stored_parts((source_run.input_data or {}).get(PARTS_KEY))
 
         if explicit:
-            from dendrux.types import Role
-
             first_user = next(i for i, m in enumerate(initial_history) if m.role == Role.USER)
             raw_user = next(
                 t for t in sorted(traces, key=lambda t: t.order_index) if t.role == "user"
@@ -1642,10 +2141,18 @@ async def retry(
             retry_context = [
                 ContextBlock(**b) for b in (raw_user.meta or {}).get("dendrux.skills.context", [])
             ]
-            retry_user = initial_history[first_user] = replace(
-                initial_history[first_user],
-                content=wire_user_input(user_input, skill_session.envelopes(), retry_context),
-            )
+            first_msg = initial_history[first_user]
+            if first_msg.parts is not None and source_parts is not None:
+                retry_user = initial_history[first_user] = Message.with_parts(
+                    Role.USER,
+                    wire_user_parts(source_parts, skill_session.envelopes(), retry_context),
+                    placement=first_msg.placement,
+                )
+            else:
+                retry_user = initial_history[first_user] = replace(
+                    first_msg,
+                    content=wire_user_input(user_input, skill_session.envelopes(), retry_context),
+                )
 
         # 4a. A source run that used runs= re-expands the same runs, same knobs.
         replay_req: ReplayRequest | None = None
@@ -1681,10 +2188,28 @@ async def retry(
             run_meta[META_KEY] = skill_session.manifest()
         run_meta["dendrux.retry_of"] = original_run_id
 
+        image_runtime: ImageRuntime | None = None
+        if (
+            source_parts is not None
+            or has_images(initial_history)
+            or _replay_has_images(replay_runs)
+        ):
+            _require_image_loop(resolved_loop)
+            image_runtime = _image_runtime(agent, state_store, tenant_id, run_id)
+        elif _accepts_kwarg(resolved_loop.run, "image_runtime"):
+            image_runtime = _image_runtime(agent, state_store, tenant_id, run_id)
+        input_edges: dict[str, Any] = {}
+        if source_parts is not None and image_runtime is not None:
+            live = await _live_edges(
+                image_runtime, _input_edge_kwargs(image_runtime, source_parts).get("blob_refs", [])
+            )
+            if live:
+                input_edges = {"blob_refs": live, "blob_refs_scope": image_runtime.tenant_scope}
+
         create_result = await state_store.create_run(
             run_id,
             agent.name,
-            input_data={"input": user_input},
+            input_data=_input_data(user_input, source_parts),
             model=provider.model,
             strategy=type(resolved_strategy).__name__,
             parent_run_id=parent_run_id,
@@ -1692,6 +2217,7 @@ async def retry(
             tenant_id=tenant_id,
             meta=run_meta,
             retry_of_run_id=original_run_id,
+            **input_edges,
         )
         run_id = create_result.run_id
 
@@ -1710,6 +2236,7 @@ async def retry(
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
             event_sequencer=sequencer,
+            **_recorder_image_kwargs(tenant_id, provider),
         )
 
         await _emit_event(
@@ -1773,12 +2300,29 @@ async def retry(
                     replay_runs, replay_req, current=current, guardrails=bool(agent.guardrails)
                 )
                 initial_history = [*replay_plan.messages, *initial_history]
+            seeded_slots = image_slot_count(initial_history)
             await record_run_prefix(
                 state_store,
                 run_id,
                 current=current,
                 seed={"retry_of": original_run_id},
                 plan=replay_plan,
+                # An explicit-skills retry also traces its rebuilt first user
+                # message, so its slot mapping is not a plain offset: unknown.
+                seeded_image_slots=None if explicit and seeded_slots else seeded_slots,
+            )
+            # A retry has no new input: every seeded slot counts as sent.
+            image_view = await _start_image_view(
+                image_runtime,
+                state_store,
+                run_id,
+                seeded=initial_history,
+                sources=[
+                    *_replay_sources(replay_runs),
+                    (original_run_id, source_run.tenant_id, source_run.meta),
+                ],
+                single_full=replay_plan is None,
+                input_images=False,
             )
 
             if explicit:
@@ -1789,8 +2333,7 @@ async def retry(
                     retry_context,
                     session=skill_session,
                 )
-                await record_message(recorder, run_id, trace_user, 0)
-                await notify_message(extra_notifier, run_id, trace_user, 0)
+                await _record_user_trace(recorder, extra_notifier, run_id, trace_user)
 
             result = await resolved_loop.run(
                 agent=agent,
@@ -1803,6 +2346,7 @@ async def retry(
                 initial_history=initial_history,
                 provider_kwargs=provider_kwargs or None,
                 state_store=state_store,
+                **_image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
             )
 
             if replay_plan is not None:
@@ -1852,7 +2396,7 @@ def run_stream(
     agent: Agent,
     *,
     provider: LLMProvider,
-    user_input: str,
+    user_input: UserContent,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
     activate_skills: Sequence[str] | None = ...,
@@ -1878,7 +2422,7 @@ def run_stream(
     agent: Agent,
     *,
     provider: LLMProvider,
-    user_input: str,
+    user_input: UserContent,
     history: list[ChatMessage] | None = ...,
     context: list[ContextBlock] | None = ...,
     activate_skills: Sequence[str] | None = ...,
@@ -1902,7 +2446,7 @@ def run_stream(
     agent: Agent,
     *,
     provider: LLMProvider,
-    user_input: str,
+    user_input: UserContent,
     history: list[ChatMessage] | None = None,
     context: list[ContextBlock] | None = None,
     activate_skills: Sequence[str] | None = None,
@@ -1959,12 +2503,19 @@ def run_stream(
     from dendrux.types import RunEvent, RunResult
     from dendrux.types import RunStream as _RunStream
 
-    # Validate + normalize chat history synchronously so ValueError surfaces
-    # to the caller immediately, not as a RUN_ERROR event.
-    normalized_history = normalize_chat_history(history)
+    # Validate input + chat history synchronously so TypeError / ValueError
+    # surfaces to the caller immediately, not as a RUN_ERROR event. Image
+    # ingest is async: it runs on first iteration, before create_run, and
+    # its errors are raised from the first ``__anext__`` (no run row).
+    user_input, input_items = split_user_content(user_input)
+    validate_chat_history(history)
+    image_input = bool(input_items) or history_has_images(history)
+    normalized_history = [] if image_input else normalize_chat_history(history)
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
+    if image_input:
+        _require_image_loop(resolved_loop, "run_stream")
     replay_req = validate_replay_args(
         runs, replay_last, replay_reasoning, loop=resolved_loop, context=context
     )
@@ -1975,7 +2526,7 @@ def run_stream(
     # prefix is folded in after expansion.
     skill_session = SkillSession.prepare(agent, loop=resolved_loop, explicit=activate_skills)
     with skill_session.bind():
-        if replay_req is None:
+        if replay_req is None and not image_input:
             initial_seeded = fold_context(
                 normalized_history, context, user_input, session=skill_session
             )
@@ -2009,6 +2560,71 @@ def run_stream(
         seeded_history = initial_seeded
         replay_plan: ReplayPlan | None = None
         sequencer = _shared["sequencer"]
+        image_runtime: ImageRuntime | None = None
+        user_parts: tuple[ContentPart, ...] | None = None
+        history_messages = normalized_history
+
+        if image_input:
+            # Image setup raises (no RUN_ERROR event, no run row, no hooks).
+            _shared["existing_run"] = True
+            if store is None and state_store_resolver is not None:
+                store = await state_store_resolver()
+            _shared["state_store"] = store
+            try:
+                entry = await _ingest_entry_images(
+                    agent,
+                    provider,
+                    provider_kwargs.get("model") or provider.model,
+                    state_store=store,
+                    tenant_id=resolve_child_tenant(get_delegation_context(), tenant_id),
+                    run_id=run_id,
+                    items=input_items,
+                    history=history,
+                )
+            except (InvalidImageError, BlobNotFoundError) as exc:
+                hit = await _idempotent_hit_after_image_error(
+                    exc,
+                    store,
+                    idempotency_key,
+                    agent_name=agent.name,
+                    user_input=user_input,
+                    items=input_items,
+                    history=history,
+                    output_type=output_type,
+                    context=context,
+                    replay=replay_req.fingerprint() if replay_req else None,
+                    skills=skill_session.fingerprint(),
+                )
+                if hit is None:
+                    raise
+                if hit.outcome != "existing_terminal":
+                    raise RunAlreadyActiveError(hit.run_id, hit.status) from None
+                assert store is not None
+                cached = await _build_cached_result(store, hit.run_id, output_type)
+                run_id = hit.run_id
+                stream.run_id = run_id
+                yield RunEvent(
+                    type={
+                        RunStatus.ERROR: RunEventType.RUN_ERROR,
+                        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+                    }.get(cached.status, RunEventType.RUN_COMPLETED),
+                    run_id=run_id,
+                    run_result=cached,
+                    error=cached.error if cached.status == RunStatus.ERROR else None,
+                    phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
+                )
+                return
+            image_runtime, user_parts, history_messages = entry
+            if replay_req is None:
+                with skill_session.bind():
+                    seeded_history = fold_context(
+                        history_messages,
+                        context,
+                        user_input,
+                        session=skill_session,
+                        user_parts=user_parts,
+                    )
+            _shared["existing_run"] = False
 
         try:
             # 1. Resolve state store lazily (may create DB engine)
@@ -2021,6 +2637,8 @@ def run_stream(
             parent_run_id, delegation_level = resolve_parent_link(parent_ctx, store)
             eff_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
             eff_tenant = resolve_child_tenant(parent_ctx, tenant_id)
+            if image_runtime is None and _accepts_kwarg(resolved_loop.run_stream, "image_runtime"):
+                image_runtime = _image_runtime(agent, store, eff_tenant, run_id)
 
             # Resolve system prompt BEFORE create_run() so skill loading
             # failures don't leave a DB row stuck in running.
@@ -2042,6 +2660,8 @@ def run_stream(
                         "DENDRUX_DATABASE_URL): replay reads the earlier runs' traces."
                     )
                 replay_runs = await load_replay_runs(store, replay_req, tenant_id=eff_tenant)
+                if _replay_has_images(replay_runs):
+                    _require_image_loop(resolved_loop, "run_stream")
                 _shared["existing_run"] = False
 
             if store is not None:
@@ -2065,16 +2685,17 @@ def run_stream(
                             if output_type is not None
                             else None
                         ),
-                        history=normalized_history or None,
+                        history=history_messages or None,
                         context=context or None,
                         replay=replay_req.fingerprint() if replay_req else None,
                         skills=skill_session.fingerprint(),
+                        user_input_parts=user_parts,
                     )
                 try:
                     create_result = await store.create_run(
                         run_id,
                         agent.name,
-                        input_data={"input": user_input},
+                        input_data=_input_data(user_input, user_parts),
                         model=provider.model,
                         strategy=type(resolved_strategy).__name__,
                         parent_run_id=parent_run_id,
@@ -2083,6 +2704,7 @@ def run_stream(
                         meta=run_meta,
                         idempotency_key=idempotency_key,
                         idempotency_fingerprint=fingerprint,
+                        **_input_edge_kwargs(image_runtime, user_parts),
                     )
                 except IdempotencyConflictError:
                     # No row was created and no lifecycle opened; the error
@@ -2124,6 +2746,7 @@ def run_stream(
                     provider_name=type(provider).__name__,
                     target_lookup=target_lookup,
                     event_sequencer=sequencer,
+                    **_recorder_image_kwargs(eff_tenant, provider),
                 )
 
             # 2. Set delegation context for the generator lifetime
@@ -2193,10 +2816,21 @@ def run_stream(
                 run_id=run_id,
                 replay_req=replay_req,
                 replay_runs=replay_runs,
-                normalized_history=normalized_history,
+                normalized_history=history_messages,
                 context=context,
                 user_input=user_input,
                 seeded_history=seeded_history,
+                user_parts=user_parts,
+            )
+            await _register_memory_input(image_runtime, store, run_id, user_parts)
+            image_view = await _start_image_view(
+                image_runtime,
+                store,
+                run_id,
+                seeded=(seeded_history or [])[:-1],
+                sources=_replay_sources(replay_runs),
+                single_full=_single_full_source(replay_plan),
+                input_images=user_parts is not None,
             )
 
             # When chat history was provided, the loop receives a complete
@@ -2211,8 +2845,7 @@ def run_stream(
                     context,
                     session=skill_session,
                 )
-                await record_message(recorder, run_id, user_msg, 0)
-                await notify_message(extra_notifier, run_id, user_msg, 0)
+                await _record_user_trace(recorder, extra_notifier, run_id, user_msg)
 
             # 3. Stream the loop. The interrupt signal lets cancel_run reach
             # an in-flight provider stream owned by this process; the closing
@@ -2232,6 +2865,7 @@ def run_stream(
                 output_type=output_type,
                 state_store=store,
                 interrupt=interrupt,
+                **_image_loop_kwargs(resolved_loop.run_stream, image_runtime, image_view),
             )
             async with _closing_loop_stream(loop_stream, run_id):
                 async for event in loop_stream:
@@ -2313,13 +2947,14 @@ def run_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
-                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
+                    meta=_stream_error_meta(mcp_meta, exc),
                 ),
                 run_id=run_id,
                 error=str(exc),
             )
 
         finally:
+            _release_memory_edges(image_runtime, store, run_id)
             if not _shared.get("existing_run"):
                 agent._task_manager.release_interrupt(run_id)
 
@@ -2453,7 +3088,7 @@ async def resume(
 
 async def resume_with_input(
     run_id: str,
-    user_input: str,
+    user_input: UserContent,
     *,
     state_store: StateStore,
     agent: Agent,
@@ -2541,6 +3176,8 @@ async def _prepare_resume(
     tool_results: list[ToolResult] | None = None,
     user_input: str | None = None,
     extra_notifier: LoopNotifier | None = None,
+    user_parts: tuple[ContentPart, ...] | None = None,
+    tenant_id: str | None = None,
 ) -> _ResumeContext:
     """Build everything needed to re-enter the loop after a resume.
 
@@ -2558,7 +3195,6 @@ async def _prepare_resume(
     """
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.tool import get_tool_def
-    from dendrux.types import Message, Role
 
     resolved_strategy = strategy or NativeToolCalling()
     resolved_loop = loop or agent.loop or ReActLoop()
@@ -2572,11 +3208,17 @@ async def _prepare_resume(
     # 2. Record resume event with enriched payload for dashboard
     resume_data: dict[str, Any] = {"resumed_from": expected_status}
     if tool_results is not None:
-        resume_data["submitted_results"] = [
-            {"call_id": tr.call_id, "name": tr.name, "success": tr.success} for tr in tool_results
-        ]
+        submitted: list[dict[str, Any]] = []
+        for tr in tool_results:
+            entry: dict[str, Any] = {"call_id": tr.call_id, "name": tr.name, "success": tr.success}
+            if tr.images:
+                entry["image_count"] = len(tr.images)
+            submitted.append(entry)
+        resume_data["submitted_results"] = submitted
     elif user_input is not None:
         resume_data["user_input"] = user_input
+        if user_parts is not None:
+            resume_data["image_count"] = sum(1 for p in user_parts if isinstance(p, ImagePart))
     await _emit_event(state_store, run_id, "run.resumed", sequencer, resume_data)
 
     # 3. Build resume history
@@ -2584,14 +3226,9 @@ async def _prepare_resume(
 
     if tool_results is not None:
         for tr in tool_results:
-            result_msg = Message(
-                role=Role.TOOL,
-                content=tr.payload,
-                name=tr.name,
-                call_id=tr.call_id,
-                meta={"is_error": True} if not tr.success else {},
-            )
-            history.append(result_msg)
+            history.append(tool_result_message(tr))
+    elif user_parts is not None:
+        history.append(Message.with_parts(Role.USER, user_parts))
     elif user_input is not None:
         history.append(Message(role=Role.USER, content=user_input))
 
@@ -2611,6 +3248,7 @@ async def _prepare_resume(
         target_lookup=target_lookup,
         initial_order_index=trace_order_offset,
         event_sequencer=sequencer,
+        **_recorder_image_kwargs(tenant_id, provider),
     )
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
@@ -2792,6 +3430,7 @@ async def _execute_approved_tools(
     resolved_loop: Loop | None = None,
     decisions: dict[str, ApprovalDecision] | None = None,
     state_store: StateStore | None = None,
+    image_runtime: ImageRuntime | None = None,
 ) -> _ApprovalResume:
     """Resolve an approval batch on resume, routing each call by target.
 
@@ -2824,7 +3463,7 @@ async def _execute_approved_tools(
     from dendrux.loops.react import _execute_tool, _process_tool_calls
     from dendrux.skills._session import SkillTool
     from dendrux.tools._validate import check_tool_call
-    from dendrux.types import AgentStep, Message, Role, ToolResult
+    from dendrux.types import AgentStep, ToolResult
 
     target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
@@ -2849,13 +3488,7 @@ async def _execute_approved_tools(
     async def _append(tc: ToolCall, tr: ToolResult) -> None:
         await recorder.on_tool_completed(run_id, tc, tr, iteration)
         await _ntfy_tool(notifier, run_id, tc, tr, iteration)
-        result_msg = Message(
-            role=Role.TOOL,
-            content=tr.payload,
-            name=tr.name,
-            call_id=tr.call_id,
-            meta={"is_error": True} if not tr.success else {},
-        )
+        result_msg = tool_result_message(tr)
         target_history.append(result_msg)
         await recorder.on_message_appended(run_id, result_msg, iteration)
         await _ntfy_msg(notifier, run_id, result_msg, iteration)
@@ -2898,6 +3531,7 @@ async def _execute_approved_tools(
                 deny=agent._deny,
                 tool_result_transform=agent.tool_result_transform,
                 approved_skills=True,
+                **_tool_image_kwargs(_process_tool_calls, image_runtime),
             )
             results.extend(outcome_s.all_results)
             continue
@@ -2905,7 +3539,12 @@ async def _execute_approved_tools(
         if invalid_result is None:
             await _rec_tool_started(recorder, run_id, tc, iteration)
             await _ntfy_tool_started(notifier, run_id, tc, iteration)
-            tr = await _execute_tool(tc, lookups, agent.tool_result_transform)
+            tr = await _execute_tool(
+                tc,
+                lookups,
+                agent.tool_result_transform,
+                **_tool_image_kwargs(_execute_tool, image_runtime),
+            )
         else:
             tr = invalid_result
         await _append(tc, tr)
@@ -2968,8 +3607,10 @@ def _approval_stop_result(
         iteration=pause_state.iteration,
         trace_order_offset=len(history),
         usage=_snapshot_usage(pause_state.usage),
+        image_view=pause_state.image_view,
     )
     client_pause = _carry_budget_fields(client_pause, pause_state)
+    client_pause = _carry_image_view(client_pause, pause_state)
     return RunResult(
         run_id=run_id,
         status=RunStatus.WAITING_CLIENT_TOOL,
@@ -3025,8 +3666,10 @@ def _barrier_pause_result(
         approval_gates=gates,
         pause_reason="requested",
         pending_decisions=decisions,
+        image_view=pause_state.image_view,
     )
     pause = _carry_budget_fields(pause, pause_state)
+    pause = _carry_image_view(pause, pause_state)
     return RunResult(
         run_id=run_id,
         status=RunStatus.PAUSED,
@@ -3051,6 +3694,187 @@ def _pending_decision_map(pause_state: PauseState) -> dict[str, ApprovalDecision
     }
 
 
+async def _ingest_resume_images(
+    agent: Agent,
+    provider: LLMProvider,
+    state_store: StateStore,
+    run_id: str,
+    *,
+    loop: Loop | None,
+    tool_results: list[ToolResult] | None,
+    input_items: tuple[Any, ...],
+    loop_method: str = "run",
+) -> tuple[list[ToolResult] | None, tuple[ContentPart, ...] | None]:
+    """Ingest resume-time images (direct ``resume`` / ``resume_stream``) before the claim.
+
+    The run, its pause status and the submitted call ids are checked first,
+    so a resume that cannot claim writes no blob.
+    """
+    from dendrux.errors import RunNotFoundError
+    from dendrux.runtime.submit import (
+        check_new_image_capability,
+        ingest_tool_result_images,
+        ingest_user_items,
+    )
+
+    _require_image_loop(loop or agent.loop or ReActLoop(), loop_method)
+    record = await state_store.get_run(run_id)
+    if record is None:
+        raise RunNotFoundError(run_id)
+    allowed = (
+        (RunStatus.WAITING_CLIENT_TOOL.value, RunStatus.WAITING_APPROVAL.value)
+        if tool_results is not None
+        else (RunStatus.WAITING_HUMAN_INPUT.value,)
+    )
+    if record.status not in allowed:
+        await _raise_resume_claim_failure(state_store, run_id, allowed[0])
+    if tool_results is not None:
+        raw_pause = await state_store.get_pause_state(run_id)
+        if raw_pause is None:
+            raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
+        pending_ids = {tc["id"] for tc in raw_pause.get("pending_tool_calls", [])}
+        provided_ids = {tr.call_id for tr in tool_results}
+        if provided_ids != pending_ids:
+            raise ValueError(
+                f"Tool result call_ids {provided_ids} do not match "
+                f"pending tool call_ids {pending_ids}."
+            )
+    runtime = _image_runtime(agent, state_store, record.tenant_id, run_id)
+    if input_items:
+        count = sum(1 for item in input_items if not isinstance(item, str))
+
+        async def _user_capability() -> None:
+            await check_new_image_capability(
+                provider, provider.model, runtime.policy, image_count=count, origin="user"
+            )
+
+        return tool_results, await ingest_user_items(
+            input_items, runtime=runtime, before_store=_user_capability
+        )
+    assert tool_results is not None
+    count = sum(len(tr.images) for tr in tool_results)
+
+    async def _tool_capability() -> None:
+        await check_new_image_capability(
+            provider, provider.model, runtime.policy, image_count=count, origin="client_tool"
+        )
+
+    return (
+        await ingest_tool_result_images(
+            tool_results, runtime=runtime, before_store=_tool_capability
+        ),
+        None,
+    )
+
+
+async def _submit_image_runtime(
+    agent: Agent, store: StateStore, run_id: str, expected_status: RunStatus
+) -> ImageRuntime:
+    """Runtime for a submit: status preflight first, so a bad run stores nothing."""
+    from dendrux.runtime.submit import preflight_status
+
+    await preflight_status(store, run_id, expected_status)
+    record = await store.get_run(run_id)
+    return _image_runtime(agent, store, record.tenant_id if record else None, run_id)
+
+
+async def ingest_submitted_tool_images(
+    agent: Agent,
+    provider: LLMProvider,
+    store: StateStore,
+    run_id: str,
+    pause: PauseState,
+    results: list[ToolResult],
+) -> tuple[list[ToolResult], dict[str, Any]]:
+    """Ingest client-tool images before the claim; return results + claim edge kwargs.
+
+    Internal helper for :meth:`Agent.submit_tool_results`. Submission edges
+    (``f"{pause.iteration}:{call_id}"``) are written in the claim transaction.
+    """
+    from dendrux.runtime.submit import (
+        check_new_image_capability,
+        ingest_tool_result_images,
+        tool_result_edges,
+    )
+
+    runtime = await _submit_image_runtime(agent, store, run_id, RunStatus.WAITING_CLIENT_TOOL)
+    count = sum(len(r.images) for r in results)
+
+    async def _capability() -> None:
+        await check_new_image_capability(
+            provider, provider.model, runtime.policy, image_count=count, origin="client_tool"
+        )
+
+    ingested = await ingest_tool_result_images(results, runtime=runtime, before_store=_capability)
+    edges = tool_result_edges(
+        ingested, tenant_scope=runtime.tenant_scope, iteration=pause.iteration
+    )
+    return ingested, {
+        "blob_refs": edges,
+        "blob_refs_scope": runtime.tenant_scope,
+        "validate": _same_pause(run_id, pause.iteration),
+    }
+
+
+def _same_pause(run_id: str, iteration: int) -> Callable[[dict[str, Any]], None]:
+    """Claim-time check that the pause is the one whose iteration keyed the submission edges."""
+
+    def _check(pause_data: dict[str, Any]) -> None:
+        if pause_data.get("iteration") != iteration:
+            from dendrux.errors import RunAlreadyClaimedError
+
+            raise RunAlreadyClaimedError(run_id)
+
+    return _check
+
+
+async def ingest_submitted_user_parts(
+    agent: Agent,
+    provider: LLMProvider,
+    store: StateStore,
+    run_id: str,
+    projection: str,
+    items: tuple[Any, ...],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Ingest ``submit_input`` images before the claim; return submitted data + edge kwargs.
+
+    ``submitted_user_input`` keeps the text projection; the parts go to
+    ``submitted_user_parts`` with ``f"{pause.iteration}:input"`` edges.
+    """
+    from dendrux.runtime.submit import (
+        check_new_image_capability,
+        ingest_user_items,
+        parts_edges,
+        raise_for_non_paused_status,
+    )
+
+    runtime = await _submit_image_runtime(agent, store, run_id, RunStatus.WAITING_HUMAN_INPUT)
+    raw_pause = await store.get_pause_state(run_id)
+    if raw_pause is None:
+        await raise_for_non_paused_status(store, run_id)
+    iteration = int(raw_pause.get("iteration") or 0)
+    count = sum(1 for item in items if not isinstance(item, str))
+
+    async def _capability() -> None:
+        await check_new_image_capability(
+            provider, provider.model, runtime.policy, image_count=count, origin="user"
+        )
+
+    parts = await ingest_user_items(items, runtime=runtime, before_store=_capability)
+    edges = parts_edges(
+        parts,
+        tenant_scope=runtime.tenant_scope,
+        owner_kind="submission",
+        owner_id=f"{iteration}:input",
+    )
+    submitted = {"submitted_user_input": projection, "submitted_user_parts": parts_to_dicts(parts)}
+    return submitted, {
+        "blob_refs": edges,
+        "blob_refs_scope": runtime.tenant_scope,
+        "validate": _same_pause(run_id, iteration),
+    }
+
+
 async def _resume_core(
     run_id: str,
     *,
@@ -3061,10 +3885,11 @@ async def _resume_core(
     loop: Loop | None = None,
     expected_status: str,
     tool_results: list[ToolResult] | None = None,
-    user_input: str | None = None,
+    user_input: UserContent | None = None,
     extra_notifier: LoopNotifier | None = None,
     _skip_claim: bool = False,
     decisions: list[tuple[str, ApprovalDecision]] | None = None,
+    user_parts: tuple[ContentPart, ...] | None = None,
 ) -> RunResult:
     """Shared resume logic for tool results and clarification input.
 
@@ -3077,7 +3902,12 @@ async def _resume_core(
             handles observation side-effects.
         _skip_claim: Internal flag — skip the atomic claim step when the caller
             has already claimed via submit_and_claim(). Used by resume_claimed().
+        user_parts: Already-ingested parts of a multimodal user input (the
+            claimed path); ``user_input`` is then their text projection.
     """
+    input_items: tuple[Any, ...] = ()
+    if user_input is not None:
+        user_input, input_items = split_user_content(user_input)
     if decisions is not None and (
         tool_results is not None
         or user_input is not None
@@ -3140,6 +3970,18 @@ async def _resume_core(
                     f"pending tool call_ids {pending_ids}."
                 )
 
+        # 2a. Images: ingest before the claim; typed errors leave the run waiting.
+        if not _skip_claim and (input_items or any(tr.images for tr in tool_results or ())):
+            tool_results, user_parts = await _ingest_resume_images(
+                agent,
+                provider,
+                state_store,
+                run_id,
+                loop=loop,
+                tool_results=tool_results,
+                input_items=input_items,
+            )
+
         # 3. Atomic claim — transition WAITING → RUNNING
         if not _skip_claim:
             claimed = await state_store.claim_paused_run(run_id, expected_status=expected_status)
@@ -3177,6 +4019,8 @@ async def _resume_core(
         mcp_meta: dict[str, Any] = {}
 
         try:
+            run_record = await state_store.get_run(run_id)
+            run_tenant = run_record.tenant_id if run_record else None
             # 4-8. Prepare history, notifier, sequencer (shared with resume_stream).
             #      Does NOT fire any lifecycle hooks — that's the caller's job.
             ctx = await _prepare_resume(
@@ -3191,7 +4035,10 @@ async def _resume_core(
                 tool_results=tool_results,
                 user_input=user_input,
                 extra_notifier=extra_notifier,
+                user_parts=user_parts,
+                tenant_id=run_tenant,
             )
+            image_runtime = _image_runtime(agent, state_store, run_tenant, run_id)
 
             # 8a. Fire run-level lifecycle hooks. AFTER this point, any failure
             #     must pair with on_run_failed in the except handler.
@@ -3215,7 +4062,6 @@ async def _resume_core(
             #    nested agent.run() calls spawned during this resume cycle.
             #    Read max_delegation_depth from persisted metadata so the depth
             #    guard survives pause/resume cycles.
-            run_record = await state_store.get_run(run_id)
             resume_delegation_level = run_record.delegation_level if run_record else 0
             resume_max_depth: int | None = None
             if run_record and run_record.meta:
@@ -3269,6 +4115,7 @@ async def _resume_core(
                     resolved_loop=ctx.resolved_loop,
                     decisions=decision_map,
                     state_store=state_store,
+                    image_runtime=image_runtime,
                 )
 
                 if _is_approval_approve:
@@ -3341,6 +4188,11 @@ async def _resume_core(
                 initial_pii_mapping=_saved_pii_mapping,
                 state_store=state_store,
                 **_budget_carry_kwargs(ctx.resolved_loop.run, ctx.pause_state),
+                **_image_loop_kwargs(
+                    ctx.resolved_loop.run,
+                    image_runtime,
+                    _resume_image_view(ctx.pause_state, ctx.history),
+                ),
             )
 
             _attach_mcp_meta(result, mcp_meta)
@@ -3438,7 +4290,7 @@ def resume_stream(
     state_store: StateStore | None = None,
     state_store_resolver: Callable[[], Any] | None = None,
     tool_results: list[ToolResult] | None = None,
-    user_input: str | None = None,
+    user_input: UserContent | None = None,
     extra_notifier: LoopNotifier | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
@@ -3450,9 +4302,18 @@ def resume_stream(
     and yielded as RUN_ERROR events. No exception is raised to the consumer.
 
     First event is RUN_RESUMED (not RUN_STARTED) carrying the existing run_id.
+
+    Image inputs (``tool_results[i].images`` or a multimodal ``user_input``)
+    are ingested before the claim; an image error is raised from the first
+    ``__anext__`` and leaves the run waiting.
     """
     from dendrux.types import RunEvent, RunResult
     from dendrux.types import RunStream as _RunStream
+
+    input_items: tuple[Any, ...] = ()
+    if user_input is not None:
+        user_input, input_items = split_user_content(user_input)
+    image_input = bool(input_items) or any(tr.images for tr in tool_results or ())
 
     _shared: dict[str, Any] = {"state_store": state_store, "sequencer": None, "ctx": None}
 
@@ -3462,6 +4323,27 @@ def resume_stream(
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
+        stream_results = tool_results
+        user_parts: tuple[ContentPart, ...] | None = None
+
+        if image_input:
+            # Image setup raises (the run stays waiting; no RUN_ERROR event).
+            if store is None and state_store_resolver is not None:
+                store = await state_store_resolver()
+            if store is None:
+                from dendrux.errors import PersistenceNotConfiguredError
+
+                raise PersistenceNotConfiguredError()
+            stream_results, user_parts = await _ingest_resume_images(
+                agent,
+                provider,
+                store,
+                run_id,
+                loop=None,
+                tool_results=tool_results,
+                input_items=input_items,
+                loop_method="run_stream",
+            )
 
         try:
             # 1. Resolve state store
@@ -3493,9 +4375,9 @@ def resume_stream(
                 )
 
             # 3. Validate tool results
-            if tool_results is not None:
+            if stream_results is not None:
                 pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
-                provided_ids = {tr.call_id for tr in tool_results}
+                provided_ids = {tr.call_id for tr in stream_results}
                 if provided_ids != pending_ids:
                     raise ValueError(
                         f"Tool result call_ids {provided_ids} do not match "
@@ -3503,7 +4385,7 @@ def resume_stream(
                     )
 
             # 4. Determine expected status and claim
-            if tool_results is not None:
+            if stream_results is not None:
                 expected = RunStatus.WAITING_CLIENT_TOOL.value
             elif user_input is not None:
                 expected = RunStatus.WAITING_HUMAN_INPUT.value
@@ -3515,14 +4397,14 @@ def resume_stream(
             # Fallback: tool_results might be for approval-reject
             if (
                 not claimed
-                and tool_results is not None
+                and stream_results is not None
                 and expected != RunStatus.WAITING_APPROVAL.value
             ):
                 alt = RunStatus.WAITING_APPROVAL.value
                 claimed = await store.claim_paused_run(run_id, expected_status=alt)
                 if claimed:
                     expected = alt
-            if not claimed and tool_results is None and user_input is None:
+            if not claimed and stream_results is None and user_input is None:
                 claimed = await store.claim_paused_run(
                     run_id, expected_status=RunStatus.PAUSED.value
                 )
@@ -3535,6 +4417,8 @@ def resume_stream(
             #    Does NOT fire any lifecycle hooks; that's done below inside
             #    the same try block so on_run_failed pairs with any failure
             #    after on_run_started fires.
+            run_record = await store.get_run(run_id)
+            run_tenant = run_record.tenant_id if run_record else None
             ctx = await _prepare_resume(
                 run_id,
                 pause_state,
@@ -3542,10 +4426,13 @@ def resume_stream(
                 agent=agent,
                 provider=provider,
                 expected_status=expected,
-                tool_results=tool_results,
+                tool_results=stream_results,
                 user_input=user_input,
                 extra_notifier=extra_notifier,
+                user_parts=user_parts,
+                tenant_id=run_tenant,
             )
+            image_runtime = _image_runtime(agent, store, run_tenant, run_id)
             _shared["sequencer"] = ctx.sequencer
             _shared["ctx"] = ctx
 
@@ -3569,13 +4456,12 @@ def resume_stream(
             # 5b. tool/user-input history. Inside the try
             #     so a recorder failure here fires on_run_failed.
             await _replay_resume_injected_history(
-                ctx, run_id, tool_results=tool_results, user_input=user_input
+                ctx, run_id, tool_results=stream_results, user_input=user_input
             )
 
             # 6. Set delegation context for the generator lifetime.
             #    Read max_delegation_depth from persisted metadata so the
             #    depth guard survives pause/resume cycles.
-            run_record = await store.get_run(run_id)
             resume_level = run_record.delegation_level if run_record else 0
             resume_max_depth: int | None = None
             if run_record and run_record.meta:
@@ -3599,7 +4485,7 @@ def resume_stream(
 
             # 8. Approval-execute (inside try/except for proper error handling)
             _is_approval_approve = (
-                tool_results is None
+                stream_results is None
                 and user_input is None
                 and expected == RunStatus.WAITING_APPROVAL.value
             )
@@ -3617,6 +4503,7 @@ def resume_stream(
                     resolved_loop=ctx.resolved_loop,
                     decisions=None if _is_approval_approve else _pending_decision_map(pause_state),
                     state_store=store,
+                    image_runtime=image_runtime,
                 )
                 for tc, tr in approval.results:
                     yield RunEvent(
@@ -3671,7 +4558,7 @@ def resume_stream(
                     )
                     return
 
-            if tool_results is not None and expected == RunStatus.WAITING_APPROVAL.value:
+            if stream_results is not None and expected == RunStatus.WAITING_APPROVAL.value:
                 from dendrux.loops._helpers import (
                     notify_governance as _ntfy_gov_r,
                 )
@@ -3679,7 +4566,7 @@ def resume_stream(
                     record_governance as _rec_gov_r,
                 )
 
-                _rejected_data_s = _rejection_decided_payload(run_id, pause_state, tool_results)
+                _rejected_data_s = _rejection_decided_payload(run_id, pause_state, stream_results)
                 await _rec_gov_r(
                     ctx.recorder,
                     run_id,
@@ -3712,6 +4599,11 @@ def resume_stream(
                 state_store=store,
                 interrupt=interrupt,
                 **_budget_carry_kwargs(ctx.resolved_loop.run_stream, ctx.pause_state),
+                **_image_loop_kwargs(
+                    ctx.resolved_loop.run_stream,
+                    image_runtime,
+                    _resume_image_view(ctx.pause_state, ctx.history),
+                ),
             )
             async with _closing_loop_stream(loop_stream, run_id):
                 async for event in loop_stream:
@@ -3790,7 +4682,7 @@ def resume_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
-                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
+                    meta=_stream_error_meta(mcp_meta, exc),
                 ),
                 error=str(exc),
             )
@@ -3906,7 +4798,7 @@ async def resume_claimed(
         ValueError: If pause_data is missing, no submitted data found,
             or submitted call_ids don't match pending tool calls.
     """
-    from dendrux.types import ToolResult as ToolResultType
+    from dendrux.runtime.submit import deserialize_tool_results
 
     # 1. Load pause_data (submit_and_claim merged submitted data into it)
     raw_pause = await state_store.get_pause_state(run_id)
@@ -3929,18 +4821,8 @@ async def resume_claimed(
     submitted_input = raw_pause.get("submitted_user_input")
 
     if submitted_results is not None:
-        # 3a. Convert dicts to typed ToolResult objects
-        tool_results = [
-            ToolResultType(
-                name=r["name"],
-                call_id=r["call_id"],
-                payload=r["payload"],
-                success=r.get("success", True),
-                error=r.get("error"),
-                duration_ms=r.get("duration_ms", 0),
-            )
-            for r in submitted_results
-        ]
+        # 3a. Convert dicts to typed ToolResult objects (images as stored refs)
+        tool_results = deserialize_tool_results(submitted_results)
 
         # 3b. Validate call_ids match pending tool calls
         pending_ids = {tc["id"] for tc in raw_pause.get("pending_tool_calls", [])}
@@ -3989,6 +4871,7 @@ async def resume_claimed(
             user_input=submitted_input,
             extra_notifier=extra_notifier,
             _skip_claim=True,
+            user_parts=_stored_parts(raw_pause.get("submitted_user_parts")),
         )
 
     # No submitted data found. Approval-approve flows do not go through

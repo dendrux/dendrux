@@ -28,22 +28,33 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from dendrux.context_blocks import _fold_first
+from dendrux.context_blocks import _fold_first, fold_first_parts
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     REPLAYED_META_KEY,
+    ContentPart,
+    GuardrailVerdict,
+    GuardrailVerdictKey,
+    ImageKey,
+    ImagePart,
+    ImageViewState,
     Message,
     ReplaySummary,
     Role,
     ToolCall,
+    content_part_from_dict,
+    content_part_to_dict,
     generate_ulid,
+    parts_digest,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from dendrux.context_blocks import ContextBlock
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop
-    from dendrux.runtime.state import RunRecord, StateStore, TraceRecord
+    from dendrux.runtime.state import RunEventRecord, RunRecord, StateStore, TraceRecord
     from dendrux.skills._session import SkillSession
     from dendrux.types import ToolDef
 
@@ -57,6 +68,12 @@ REPLAY_META_KEY = "dendrux.replay"
 WIRE_CONTENT_KEY = "wire_content"
 STABLE_CONTEXT_KEY = "stable_context"
 PLACEMENT_KEY = "placement"
+# Multimodal parts on traces / input_data (absent for text-only data).
+PARTS_KEY = "dendrux.parts"
+# agent_runs.meta: image slots of a run's seeded prefix that its own traces do not
+# reproduce (history=, its runs= prefix, a retry rebuild). Written only when
+# non-zero; ``None`` = unknown (no slot mapping for a later single-source carry).
+IMAGE_SEEDED_KEY = "dendrux.images.seeded_slots"
 
 _TERMINAL_STATUSES = frozenset({"success", "error", "cancelled", "max_iterations"})
 
@@ -244,7 +261,16 @@ def history_seed(history: list[Message]) -> dict[str, Any]:
     """Seed for a run created with ``history=`` (or ``{}`` without)."""
     if not history:
         return {}
-    return {"history_hash": _hash([[m.role.value, m.content] for m in history])}
+    return {
+        "history_hash": _hash(
+            [
+                [m.role.value, m.content]
+                if m.parts is None
+                else [m.role.value, m.content, parts_digest(m.parts)]
+                for m in history
+            ]
+        )
+    }
 
 
 def _seed_key(seed: Any) -> str:
@@ -288,7 +314,9 @@ def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) ->
     ``reasoning_for`` names the model reasoning blocks may be replayed to:
     blocks are kept when their producing model matches (or is unrecorded);
     ``None`` strips all reasoning. A run's user message is rebuilt as it was
-    sent on the wire (folded context included).
+    sent on the wire (folded context included). A trace carrying
+    ``meta["dendrux.parts"]`` is rebuilt as a parts message from it (for a
+    user message these are the wire parts, superseding ``wire_content``).
     """
     messages: list[Message] = []
     for trace in sorted(traces, key=lambda t: t.order_index):
@@ -339,8 +367,27 @@ def rebuild_messages(traces: list[TraceRecord], *, reasoning_for: str | None) ->
 
         if msg_meta:
             msg_kwargs["meta"] = msg_meta
+        parts = _trace_parts(meta) if role in (Role.USER, Role.TOOL) else None
+        if parts is not None:
+            del msg_kwargs["content"]
+            messages.append(Message.with_parts(**msg_kwargs, parts=parts))
+            continue
         messages.append(Message(**msg_kwargs))
     return messages
+
+
+def _trace_parts(meta: dict[str, Any]) -> tuple[ContentPart, ...] | None:
+    """Parts persisted on a trace / input row, or None when absent or text-only."""
+    raw = meta.get(PARTS_KEY)
+    if not isinstance(raw, list) or not raw:
+        return None
+    parts = tuple(content_part_from_dict(d) for d in raw)
+    return parts if any(isinstance(p, ImagePart) for p in parts) else None
+
+
+def parts_to_dicts(parts: Sequence[ContentPart]) -> list[dict[str, Any]]:
+    """Persisted dict shape of a parts list."""
+    return [content_part_to_dict(p) for p in parts]
 
 
 def _pair_tool_calls(messages: list[Message]) -> list[Message]:
@@ -379,14 +426,28 @@ def _raw_input(run: LoadedRun) -> str:
     return first.content if first is not None else ""
 
 
+def _raw_parts(run: LoadedRun) -> tuple[ContentPart, ...] | None:
+    return _trace_parts(run.record.input_data or {})
+
+
+def _raw_user_message(run: LoadedRun, stable: str | None = None) -> Message:
+    parts = _raw_parts(run)
+    if parts is not None:
+        if stable:
+            return Message.with_parts(
+                Role.USER, fold_first_parts(stable, parts), placement="stable"
+            )
+        return Message.with_parts(Role.USER, parts)
+    raw = _raw_input(run)
+    if stable:
+        return Message(role=Role.USER, content=_fold_first(stable, raw), placement="stable")
+    return Message(role=Role.USER, content=raw)
+
+
 def _text_turn(run: LoadedRun) -> list[Message]:
     first = _first_user_trace(run.traces)
     stable = (first.meta or {}).get(STABLE_CONTEXT_KEY) if first is not None else None
-    raw = _raw_input(run)
-    if isinstance(stable, str) and stable:
-        messages = [Message(role=Role.USER, content=_fold_first(stable, raw), placement="stable")]
-    else:
-        messages = [Message(role=Role.USER, content=raw)]
+    messages = [_raw_user_message(run, stable if isinstance(stable, str) and stable else None)]
     if run.record.answer:
         messages.append(
             Message(role=Role.ASSISTANT, content=run.record.answer, meta={"phase": "final_answer"})
@@ -397,7 +458,7 @@ def _text_turn(run: LoadedRun) -> list[Message]:
 def _full_turn(run: LoadedRun, *, reasoning_for: str | None) -> list[Message]:
     messages = _pair_tool_calls(rebuild_messages(run.traces, reasoning_for=reasoning_for))
     if not messages or messages[0].role != Role.USER:
-        messages.insert(0, Message(role=Role.USER, content=_raw_input(run)))
+        messages.insert(0, _raw_user_message(run))
     return messages
 
 
@@ -557,7 +618,9 @@ def user_trace_message(
 
     Content stays the raw ``user_input``; when folded context changed what
     went on the wire, the wire form is kept in meta so a later replay can
-    send it byte-for-byte.
+    send it byte-for-byte. For a multimodal input ``user_input`` is the raw
+    text projection and ``meta["dendrux.parts"]`` holds the wire parts
+    (framing included), which a replay uses instead of ``wire_content``.
     """
     from dataclasses import asdict
 
@@ -567,7 +630,9 @@ def user_trace_message(
         meta["dendrux.skills.context"] = [
             asdict(b) for b in context or [] if b.placement == "dynamic" or len(seeded_history) == 1
         ]
-    if current.content != user_input:
+    if current.parts is not None:
+        meta[PARTS_KEY] = parts_to_dicts(current.parts)
+    elif current.content != user_input:
         meta[WIRE_CONTENT_KEY] = current.content
     if len(seeded_history) == 1 and current.placement == "stable" and stable_band:
         meta[PLACEMENT_KEY] = "stable"
@@ -582,11 +647,14 @@ async def record_run_prefix(
     current: CurrentPrefix,
     seed: dict[str, Any],
     plan: ReplayPlan | None,
+    seeded_image_slots: int | None = 0,
 ) -> None:
     """Merge the prefix descriptor (and replay summary) into ``agent_runs.meta``.
 
     Best-effort: a store without ``update_run_meta`` or a failed write only
     means later replays treat this run as predating replay metadata.
+    ``seeded_image_slots`` (non-zero, or ``None`` = unknown) is recorded in the
+    same patch, so a later single-source replay can align its slots (§5.14).
     """
     if store is None:
         return
@@ -596,7 +664,167 @@ async def record_run_prefix(
     patch: dict[str, Any] = {PREFIX_META_KEY: prefix_descriptor(current, seed)}
     if plan is not None:
         patch[REPLAY_META_KEY] = plan.meta
+    if seeded_image_slots != 0:
+        patch[IMAGE_SEEDED_KEY] = seeded_image_slots
     try:
         await update(run_id, patch)
     except Exception:
         logger.warning("Failed to record prefix descriptor for run %s", run_id, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Image view initialisation for seeded runs (history=, runs=, retry())
+# ---------------------------------------------------------------------------
+
+IMAGE_EVENT_TYPES = ("image.rejected", "image.state", "image.view_changed")
+
+
+def image_slot_count(messages: Sequence[Message]) -> int:
+    """Number of image slots in ``messages`` (message order, then part order)."""
+    return sum(len(m.images) for m in messages if m.role != Role.SYSTEM)
+
+
+def has_images(messages: Sequence[Message]) -> bool:
+    """Whether any message carries an image part."""
+    return any(m.parts is not None and m.images for m in messages)
+
+
+@dataclass(frozen=True)
+class ImageSource:
+    """One run whose image decisions carry over into a new run, in source order."""
+
+    tenant_scope: str
+    events: list[RunEventRecord]
+    # Source slot s is new-run slot ``s - slot_offset`` (the source's untraced
+    # seeded slots come first); None = unknown, so no slot-keyed state carries.
+    slot_offset: int | None = 0
+
+
+def source_slot_offset(meta: dict[str, Any] | None) -> int | None:
+    """A source run's seeded-slot offset from its ``agent_runs.meta`` (None = unknown)."""
+    meta = meta or {}
+    if PREFIX_META_KEY not in meta:
+        return None  # predates replay metadata, or its prefix write failed
+    value = meta.get(IMAGE_SEEDED_KEY, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+async def load_image_sources(
+    store: StateStore, runs: Sequence[tuple[str, str | None, dict[str, Any] | None]]
+) -> list[ImageSource]:
+    """Image governance events of each ``(run_id, tenant_id, meta)`` source, in order."""
+    from dendrux.media._runtime import tenant_scope_for
+
+    out: list[ImageSource] = []
+    for run_id, tenant_id, meta in runs:
+        events = await store.get_run_events(run_id, event_types=list(IMAGE_EVENT_TYPES))
+        out.append(
+            ImageSource(
+                tenant_scope=tenant_scope_for(tenant_id),
+                events=sorted(events, key=lambda e: e.sequence_index),
+                slot_offset=source_slot_offset(meta),
+            )
+        )
+    return out
+
+
+def initial_image_view(
+    *,
+    sent_through: int,
+    sources: Sequence[ImageSource],
+    tenant_scope: str,
+    single_full: bool,
+) -> ImageViewState:
+    """The ``ImageViewState`` a seeded run starts from (§5.14).
+
+    ``rejected`` = union and ``described`` / ``guardrail_verdicts`` = first
+    wins, folded over the sources' ``image.rejected`` / ``image.state``
+    events in source order, keeping only this tenant's entries. With exactly
+    one source seeded in full (``single_full``) its traced slots map onto the
+    new run's leading slots, shifted by the source's own seeded slots
+    (``slot_offset``), so the drop view (``epoch``, ``dropped_through``) and
+    sticky ``placeholders`` carry over too. With an unknown offset the view
+    starts fresh (the first request may miss the provider cache once).
+    """
+    state = ImageViewState(sent_through=sent_through)
+    offset = sources[0].slot_offset if single_full and len(sources) == 1 else None
+    carry_view = offset is not None
+    seen_rejected: set[ImageKey] = set()
+    for source in sources:
+        if source.tenant_scope != tenant_scope:
+            continue
+        for event in source.events:
+            data = event.data or {}
+            if event.event_type == "image.rejected":
+                key = _event_key(data, source.tenant_scope)
+                if key is not None and key[0] == tenant_scope and key not in seen_rejected:
+                    seen_rejected.add(key)
+                    state.rejected.append(key)
+            elif event.event_type == "image.state":
+                event_scope = data.get("tenant_scope")
+                scope = event_scope if isinstance(event_scope, str) else source.tenant_scope
+                if scope == tenant_scope:
+                    _fold_state_event(state, data, scope, tenant_scope, offset)
+            elif event.event_type == "image.view_changed" and carry_view:
+                epoch = data.get("epoch")
+                dropped = data.get("dropped_through")
+                if isinstance(epoch, int):
+                    state.epoch = max(state.epoch, epoch)
+                if isinstance(dropped, int):
+                    state.dropped_through = max(state.dropped_through, dropped - (offset or 0))
+    return state
+
+
+def _event_key(data: dict[str, Any], default_scope: str) -> ImageKey | None:
+    sha = data.get("sha256")
+    if not isinstance(sha, str):
+        return None
+    scope = data.get("tenant_scope")
+    return (scope if isinstance(scope, str) else default_scope, sha)
+
+
+def _fold_state_event(
+    state: ImageViewState,
+    data: dict[str, Any],
+    source_scope: str,
+    tenant_scope: str,
+    slot_offset: int | None,
+) -> None:
+    for item in data.get("described") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        key = _event_key(item, source_scope)
+        if key is not None and key[0] == tenant_scope:
+            state.described.setdefault(key, item["text"])
+    for item in data.get("guardrail_verdicts") or []:
+        if not isinstance(item, dict):
+            continue
+        key = _event_key(item, source_scope)
+        if key is None or key[0] != tenant_scope or not isinstance(item.get("action"), str):
+            continue
+        vkey: GuardrailVerdictKey = (
+            key[0],
+            key[1],
+            str(item.get("guardrail_id") or ""),
+            str(item.get("guardrail_version") or ""),
+            str(item.get("origin") or ""),
+            str(item.get("tool_name") or ""),
+        )
+        state.guardrail_verdicts.setdefault(
+            vkey,
+            GuardrailVerdict(action=item["action"], entities=tuple(item.get("entities") or ())),
+        )
+    if slot_offset is None:
+        return
+    for item in data.get("placeholders") or []:
+        if not isinstance(item, dict):
+            continue
+        slot, reason = item.get("slot"), item.get("reason")
+        if not isinstance(slot, int) or not isinstance(reason, str):
+            continue
+        slot -= slot_offset  # the source's untraced seeded slots are not replayed
+        if slot < 0:
+            continue
+        # Sticky: the first reason wins, except that "purged" replaces any other.
+        if slot not in state.placeholders or reason == "purged":
+            state.placeholders[slot] = reason

@@ -103,7 +103,8 @@ their stored cost but may have no source information.
 
 - **Bundled prices.** None, by design. Nothing is fetched at runtime either.
 - **Batch and long-context tiers.** If you use them, key separate table entries for the model ids involved; dendrux does not pick a tier for you.
-- **Images, audio, and per-request surcharges.** The table prices tokens only.
+- **Audio and per-request surcharges.** The table prices tokens only.
+- **Images.** Image tokens are billed inside the provider's input tokens, so they are priced through the input rate with no separate entry, and `UsageStats` reports the provider's numbers unchanged. Dendrux's own per-image estimate (`image_stats.estimated_tokens`) is for planning and caps, and is never added to usage or cost. See [Images](/docs/recipes/images#cost-and-usage).
 - **Budget.** `cost_usd` is for reporting. `Budget` thresholds are still in tokens. See [Budget](/docs/architecture/budget).
 
 ## Where this fits

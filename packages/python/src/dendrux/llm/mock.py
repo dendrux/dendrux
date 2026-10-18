@@ -6,11 +6,13 @@ no API key needed. Every test in Dendrux uses this.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Any
 
 from dendrux.llm.base import LLMProvider
 
 if TYPE_CHECKING:
+    from dendrux.llm.base import ImageSupport
     from dendrux.types import LLMResponse, Message, ToolDef
 
 
@@ -24,18 +26,42 @@ class MockLLM(LLMProvider):
         ])
         response = await llm.complete(messages)  # returns first response
         response = await llm.complete(messages)  # returns second response
+
+    ``image_support`` is what :meth:`image_input_support` reports (default
+    ``"yes"``); ``"no"`` also turns ``supports_multimodal`` off, like a custom
+    provider that never opted in. ``wire_messages`` records the exact message
+    lists each call received (image parts carry their wire bytes there).
     """
 
-    def __init__(self, responses: list[LLMResponse], *, model: str = "mock") -> None:
+    def __init__(
+        self,
+        responses: list[LLMResponse],
+        *,
+        model: str = "mock",
+        image_support: ImageSupport = "yes",
+    ) -> None:
+        if image_support not in ("yes", "no", "unknown"):
+            raise ValueError(f"image_support must be yes/no/unknown, got {image_support!r}")
         self._responses = list(responses)
         self._model = model
         self._call_count = 0
+        self._image_support: ImageSupport = image_support
+        # Derived from the class attribute, so a subclass's declared
+        # capabilities are kept; only supports_multimodal follows image_support.
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, supports_multimodal=image_support != "no"
+        )
         self.call_history: list[dict[str, Any]] = []
+        self.wire_messages: list[list[Message]] = []
 
     @property
     def model(self) -> str:
         """The model identifier (default ``"mock"``)."""
         return self._model
+
+    async def image_input_support(self, model: str) -> ImageSupport:
+        """The configured ``image_support`` (for any model)."""
+        return self._image_support
 
     async def complete(
         self,
@@ -59,6 +85,7 @@ class MockLLM(LLMProvider):
             )
             raise IndexError(msg)
 
+        self.wire_messages.append(list(messages))
         self.call_history.append(
             {
                 "messages": list(messages),

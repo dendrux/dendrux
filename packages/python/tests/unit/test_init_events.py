@@ -118,8 +118,10 @@ class TestGovernanceEventTypeEnum:
 
     def test_total_member_count(self) -> None:
         """The seven v2 skill events replace the original three; +3 before_tool events;
-        +1 inbox.delivered; +1 budget.unpriced."""
-        assert len(GovernanceEventType) == 25
+        +1 inbox.delivered; +1 budget.unpriced; +6 image events (0.4.0): image.rejected,
+        image.state, image.view_changed, image.degraded, image.warning,
+        guardrail.image_unscanned."""
+        assert len(GovernanceEventType) == 31
 
     def test_guardrail_unmapped_placeholder_member(self) -> None:
         assert (

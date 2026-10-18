@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.schema import CreateColumn, DefaultClause
 from sqlalchemy.sql.elements import False_, Null, TextClause, True_
 
+from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
 from dendrux.db.models import Base
 from dendrux.errors import SqliteSchemaSyncError
 
@@ -55,8 +56,16 @@ async def create_sqlite_schema(engine: AsyncEngine) -> None:
     """
     if engine.dialect.name != "sqlite":
         return
-    async with engine.connect() as conn:
-        await conn.run_sync(create_sqlite_schema_sync)
+    if not shares_one_connection(engine):
+        async with engine.connect() as conn:
+            await conn.run_sync(create_sqlite_schema_sync)
+        return
+    async with serialized(engine):
+        conn = await engine.connect()
+        try:
+            await conn.run_sync(create_sqlite_schema_sync)
+        finally:
+            await close_fully(conn.close)
 
 
 def create_sqlite_schema_sync(sync_conn: Connection) -> list[str]:

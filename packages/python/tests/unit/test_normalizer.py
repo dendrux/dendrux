@@ -699,3 +699,65 @@ class TestTimelineToDict:
         import json
 
         json.dumps(d)  # Raises if not serializable
+
+
+class TestImageGovernanceEvents:
+    """0.4.0 image events map to governance nodes with fixed severity/title."""
+
+    EXPECTED = {
+        "image.rejected": ("warning", "Image rejected by provider"),
+        "image.state": ("info", "Image state recorded"),
+        "image.view_changed": ("info", "Image view changed"),
+        "image.degraded": ("warning", "Images replaced by placeholders"),
+        "image.warning": ("warning", "Image warning"),
+        "guardrail.image_unscanned": ("warning", "Images not scanned by guardrails"),
+    }
+
+    def test_meta_entries(self) -> None:
+        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
+
+        for event_type, meta in self.EXPECTED.items():
+            assert GOVERNANCE_EVENT_META[event_type] == meta
+
+    async def test_events_become_governance_nodes(self) -> None:
+        from dendrux.dashboard.normalizer import GovernanceEventNode
+
+        payloads = {
+            "image.rejected": {"image_id": "img_0123456789ab", "located": True, "retried": False},
+            "image.state": {"described": [], "guardrail_verdicts": [], "placeholders": []},
+            "image.view_changed": {"epoch": 1, "dropped_through": 4, "visible": 3},
+            "image.degraded": {"reason": "drop", "count": 2, "slots": [0, 1]},
+            "image.warning": {"warning": "drop_with_thinking"},
+            "guardrail.image_unscanned": {"count": 1},
+        }
+        events = [
+            _Event(
+                id="e0",
+                event_type="run.started",
+                sequence_index=0,
+                data={"agent_name": "A"},
+                created_at=_T0,
+            )
+        ]
+        for i, (etype, data) in enumerate(payloads.items(), start=1):
+            events.append(
+                _Event(
+                    id=f"e{i}",
+                    event_type=etype,
+                    sequence_index=i,
+                    iteration_index=1,
+                    data=data,
+                    created_at=_T0 + timedelta(seconds=i),
+                )
+            )
+        store = NormalizerMockStore(
+            _run=_Run(id="r_img", agent_name="A", status="success", created_at=_T0),
+            _events=events,
+        )
+        result = await normalize_timeline("r_img", store)
+        assert result is not None
+        nodes = [n for n in result.nodes if isinstance(n, GovernanceEventNode)]
+        assert [n.event_type for n in nodes] == list(payloads)
+        for node in nodes:
+            assert (node.severity, node.title) == self.EXPECTED[node.event_type]
+            assert node.data == payloads[node.event_type]

@@ -3,7 +3,9 @@
 ``RunStore`` is the stable contract developers use to build dashboards,
 monitoring, billing, and any other observation layer on top of Dendrux.
 
-It is read-only. Write paths remain on ``runtime.state.SQLAlchemyStateStore``.
+It is read-only for run data. Write paths remain on
+``runtime.state.SQLAlchemyStateStore``; the one exception is image blob
+maintenance through ``RunStore.blobs`` (``purge()`` / ``collect_garbage()``).
 Response types are frozen dataclasses defined in this module; runtime read
 records stay internal and are converted at the facade boundary so runtime
 internals can evolve without breaking the public contract.
@@ -42,7 +44,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from dendrux.db._sqlite_sync import create_sqlite_schema
-from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore, StateStore, TenantScope
+from dendrux.errors import BlobNotFoundError
+from dendrux.media._ids import image_id
+from dendrux.media._runtime import tenant_scope_for
+from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
+from dendrux.runtime.state import (
+    UNSCOPED,
+    SQLAlchemyStateStore,
+    StateStore,
+    TenantScope,
+    _Unscoped,
+)
 from dendrux.types import ReplaySummary
 
 if TYPE_CHECKING:
@@ -50,6 +62,8 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from dendrux.media import BlobStore
 
 
 class RunNotFoundError(Exception):
@@ -329,7 +343,13 @@ class RunStore:
     """Read-only public facade over persisted run state.
 
     "Read-only" refers to run data: the store never writes runs, events or
-    notes. ``from_database_url`` on a SQLite URL does bring the *schema* of
+    notes. It does write image blob state, and only through ``blobs``:
+    ``blobs.purge()`` erases an image's bytes and ``blobs.collect_garbage()``
+    deletes unreferenced blobs (and finishes interrupted purges/deletes).
+    ``read_image(run_id, sha256)`` reads an image a run references.
+    ``blob_store=`` must be the same external store the agents use, when
+    they use one (rows record only ``storage="external"``, not which store).
+    ``from_database_url`` on a SQLite URL does bring the *schema* of
     an older Dendrux SQLite file up to date once, before its first query
     (additive ``ALTER TABLE ... ADD COLUMN`` / index creation only, the same
     upgrade ``Agent`` runs), and creates the tables in a new file.
@@ -344,17 +364,20 @@ class RunStore:
     engine ownership with the caller; ``close()`` is then a no-op.
     """
 
-    def __init__(self, state_store: StateStore) -> None:
+    def __init__(self, state_store: StateStore, *, blob_store: BlobStore | None = None) -> None:
         self._state = state_store
         self._owned_engine: AsyncEngine | None = None
+        self._blob_services = BlobServices.for_state_store(state_store, blob_store=blob_store)
 
     @classmethod
-    def from_engine(cls, engine: AsyncEngine) -> RunStore:
+    def from_engine(cls, engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore:
         """Build a RunStore over an engine the caller owns and disposes."""
-        return cls(SQLAlchemyStateStore(engine))
+        return cls(SQLAlchemyStateStore(engine), blob_store=blob_store)
 
     @classmethod
-    def from_database_url(cls, database_url: str) -> RunStore:
+    def from_database_url(
+        cls, database_url: str, *, blob_store: BlobStore | None = None
+    ) -> RunStore:
         """Build a RunStore from a SQLAlchemy async URL.
 
         The engine is created and owned by this RunStore. Call
@@ -372,9 +395,53 @@ class RunStore:
             store = _InitOnFirstUse(
                 store, functools.partial(create_sqlite_schema, engine), engine.dispose
             )
-        instance = cls(store)
+        instance = cls(store, blob_store=blob_store)
         instance._owned_engine = engine
         return instance
+
+    @property
+    def blobs(self) -> CatalogBlobAccessor:
+        """Image blob reads and maintenance (``read``, ``info``, ``references``,
+        ``purge``, ``collect_garbage``); ``tenant_id`` is the authorisation boundary."""
+        return self._blob_services.accessor
+
+    async def read_image(
+        self, run_id: str, sha256: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> bytes:
+        """Verified bytes of an image the run references.
+
+        The run must exist (and belong to ``tenant_id`` when given) and have
+        a recorded reference to ``sha256`` in its own tenant scope.
+
+        Tenant defaults differ on purpose, and match the rest of ``RunStore``:
+        ``read_image`` is run-scoped, so omitting ``tenant_id`` (``UNSCOPED``)
+        trusts the caller and reads in *the run's own* tenant scope (like
+        ``get_run``); pass ``tenant_id`` to enforce a tenant. The blob-scoped
+        ``blobs.read(sha256)`` has no run to take a scope from, so its default
+        ``tenant_id=None`` means the untenanted scope only (``"-"``), never
+        "any tenant"; pass the tenant explicitly for tenanted blobs.
+
+        Raises:
+            BlobNotFoundError: unknown run, other tenant, no reference, or the
+                image is not live (absence and mismatch are indistinguishable).
+            BlobIntegrityError: the stored bytes failed verification.
+        """
+        services = self._blob_services
+        accessor = services.accessor
+        catalog = services.catalog
+        record = await self._state.get_run(run_id)
+        missing = BlobNotFoundError(image_id(sha256 if isinstance(sha256, str) else ""))
+        if record is None or (
+            not isinstance(tenant_id, _Unscoped) and record.tenant_id != tenant_id
+        ):
+            raise missing
+        run_scope = tenant_scope_for(record.tenant_id)
+        if catalog is None:
+            accessor._require_catalog()
+            raise missing  # pragma: no cover - _require_catalog raised
+        if not await catalog.run_references(run_scope, run_id, sha256):
+            raise missing
+        return await accessor.read(sha256, tenant_id=record.tenant_id)
 
     async def close(self) -> None:
         """Dispose any engine this store owns. No-op for caller-owned engines."""

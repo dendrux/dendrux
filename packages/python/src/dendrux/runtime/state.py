@@ -16,9 +16,11 @@ import datetime as _dt
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, overload
 
+from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import (
     CreateRunResult,
@@ -30,12 +32,13 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
     from dendrux.db.models import AgentRun
+    from dendrux.media import BlobEdge
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +400,10 @@ class StateStore(Protocol):
 
     Implement this protocol to use a custom storage backend.
     The SQLAlchemy implementation is the default.
+
+    ``blob_refs`` / ``blob_refs_scope`` (0.4.0) are passed only when a record
+    references images; a custom store that never sees images can ignore them.
+    Images need the blob catalog, which only the built-in store implements.
     """
 
     async def create_run(
@@ -414,6 +421,8 @@ class StateStore(Protocol):
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
         retry_of_run_id: str | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> CreateRunResult: ...
 
     async def save_trace(
@@ -424,6 +433,8 @@ class StateStore(Protocol):
         *,
         order_index: int,
         meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> None: ...
 
     async def save_tool_call(
@@ -441,6 +452,8 @@ class StateStore(Protocol):
         iteration_index: int,
         error_message: str | None = None,
         meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> None: ...
 
     async def save_usage(
@@ -687,6 +700,8 @@ class StateStore(Protocol):
         expected_status: str,
         submitted_data: dict[str, Any],
         validate: Callable[[dict[str, Any]], None] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> bool:
         """Atomically save submitted data to pause_data and claim the run.
 
@@ -842,20 +857,56 @@ class StateStore(Protocol):
         ...
 
 
-class SQLAlchemyStateStore:
+class _SerializedSessionFactory:
+    """Session factory that holds the pool's session lock for each session's life.
+
+    The session is closed (ROLLBACK and pool reset included) before the lock
+    is released, even when the caller is cancelled during the close.
+    """
+
+    def __init__(self, engine: AsyncEngine, factory: Callable[[], AsyncSession]) -> None:
+        self._engine = engine
+        self._factory = factory
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[AsyncSession]:
+        from dendrux.db._pool_guard import close_fully, serialized
+
+        async with serialized(self._engine):
+            session = self._factory()
+            try:
+                yield session
+            finally:
+                await close_fully(session.close)
+
+
+class SQLAlchemyStateStore(SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
     Works with SQLite (zero-config) and Postgres (via DENDRUX_DATABASE_URL).
+    Also the blob catalog (``dendrux.media.BlobCatalog``) for image blobs.
+
+    ``create_run``, ``save_trace``, ``save_tool_call`` and ``submit_and_claim``
+    take optional ``blob_refs`` + ``blob_refs_scope``: the record's blob edges,
+    written in the record's transaction after asserting the run's tenant and
+    claiming each blob row (``write_blob_refs``). Passed only when non-empty.
     """
 
     def __init__(self, engine: AsyncEngine) -> None:
         from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy.orm import sessionmaker
 
+        from dendrux.db._pool_guard import shares_one_connection, warn_if_shared_connection
+
         self._engine = engine
         self._session_factory = sessionmaker(  # type: ignore[call-overload]
             engine, class_=AsyncSession, expire_on_commit=False
         )
+        if shares_one_connection(engine):
+            # One shared connection = one shared transaction: overlapping sessions
+            # would roll back each other's pending writes (see db/_pool_guard.py).
+            warn_if_shared_connection(engine)
+            self._session_factory = _SerializedSessionFactory(engine, self._session_factory)
 
     @property
     def store_identity(self) -> str:
@@ -883,6 +934,8 @@ class SQLAlchemyStateStore:
         idempotency_key: str | None = None,
         idempotency_fingerprint: str | None = None,
         retry_of_run_id: str | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> CreateRunResult:
         import datetime as _dt
 
@@ -917,6 +970,15 @@ class SQLAlchemyStateStore:
                 )
                 session.add(run)
                 try:
+                    if blob_refs:
+                        await session.flush()
+                        await write_blob_refs(
+                            session,
+                            run_id=run_id,
+                            blob_refs=blob_refs,
+                            blob_refs_scope=blob_refs_scope,
+                            run_tenant_id=tenant_id,
+                        )
                     await session.commit()
                 except IntegrityError as exc:
                     await session.rollback()
@@ -999,6 +1061,8 @@ class SQLAlchemyStateStore:
         *,
         order_index: int,
         meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> None:
         from dendrux.db.models import ReactTrace
 
@@ -1012,6 +1076,11 @@ class SQLAlchemyStateStore:
                 meta=meta,
             )
             session.add(trace)
+            if blob_refs:
+                await session.flush()
+                await write_blob_refs(
+                    session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
+                )
             await session.commit()
 
     async def save_tool_call(
@@ -1029,6 +1098,8 @@ class SQLAlchemyStateStore:
         iteration_index: int,
         error_message: str | None = None,
         meta: dict[str, Any] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> None:
         from dendrux.db.models import ToolCallRecord
 
@@ -1061,6 +1132,11 @@ class SQLAlchemyStateStore:
                 meta=meta,
             )
             session.add(record)
+            if blob_refs:
+                await session.flush()
+                await write_blob_refs(
+                    session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
+                )
             await session.commit()
 
     async def save_usage(
@@ -1854,6 +1930,8 @@ class SQLAlchemyStateStore:
         expected_status: str,
         submitted_data: dict[str, Any],
         validate: Callable[[dict[str, Any]], None] | None = None,
+        blob_refs: Sequence[BlobEdge] | None = None,
+        blob_refs_scope: str | None = None,
     ) -> bool:
         """Atomically save submitted data and claim the run.
 
@@ -1865,7 +1943,9 @@ class SQLAlchemyStateStore:
           2. Read pause_data and run *validate* on it. A failure rolls the
              whole transaction back (status stays *expected_status*) and
              re-raises.
-          3. Merge submitted_data into pause_data and commit.
+          3. Merge submitted_data into pause_data.
+          4. Write ``blob_refs`` (tenant asserted, blobs claimed) and commit.
+             A failure rolls the claim back too.
         """
         from sqlalchemy import select, update
 
@@ -1904,6 +1984,13 @@ class SQLAlchemyStateStore:
                 await session.execute(
                     update(AgentRun).where(AgentRun.id == run_id).values(pause_data=merged)
                 )
+                if blob_refs:
+                    await write_blob_refs(
+                        session,
+                        run_id=run_id,
+                        blob_refs=blob_refs,
+                        blob_refs_scope=blob_refs_scope,
+                    )
                 await session.commit()
                 return True
 

@@ -22,6 +22,21 @@ Suggested HTTP mappings:
     SkillMismatchError          -> 409
     SqliteSchemaSyncError       -> 500 (startup: legacy SQLite file needs migration)
     SchemaOutOfDateError        -> 500 (startup: run `dendrux db migrate`)
+    ImageError                  -> 400 (base of the next three)
+    InvalidImageError           -> 400
+    ImageLimitError             -> 413
+    ImageFetchError             -> 400 (502 when reason is "http_status" or "timeout")
+    UnsupportedModalityError    -> 400
+    ImageRejectedError          -> 422
+    ProviderError               -> 502
+    BlobNotFoundError           -> 404
+    BlobIntegrityError          -> 500
+    ImagePersistenceUnsupportedError -> 500
+    BlobContentionError         -> 503 (transient; safe to retry)
+
+Image errors never carry image bytes, base64, data URLs, file paths or URL
+paths/queries/credentials, and are raised with no ``__cause__`` and no
+``__context__``.
 
 ``SkillValidationError`` is raised while building a :class:`~dendrux.skills.Skill`
 (a configuration error, not a request error).
@@ -327,8 +342,337 @@ class SchemaOutOfDateError(RuntimeError):
         return (*self.missing_columns, *self.missing_tables)
 
 
+# ---------------------------------------------------------------------------
+# Images (0.4.0)
+# ---------------------------------------------------------------------------
+
+
+def _rebuild_error(cls: type[BaseException], kwargs: dict[str, object]) -> BaseException:
+    return cls(**kwargs)
+
+
+class _KwargsReduceMixin:
+    """Pickle/copy support for errors whose ``__init__`` takes named fields.
+
+    ``_init_fields`` lists the constructor parameters, each stored as an
+    attribute of the same name; the rebuilt error has no traceback or chain.
+    """
+
+    _init_fields: tuple[str, ...] = ()
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (
+            _rebuild_error,
+            (type(self), {name: getattr(self, name) for name in self._init_fields}),
+        )
+
+
+class ImageError(ValueError):
+    """Base class of image input errors (bad input -> HTTP 400 family).
+
+    Subclasses :class:`ValueError` so existing "bad input" handlers keep working.
+    """
+
+
+class InvalidImageError(_KwargsReduceMixin, ImageError):
+    """An image input failed validation at ingest.
+
+    ``reason`` is one of ``"unsupported_type"``, ``"type_mismatch"``,
+    ``"corrupt"``, ``"animated"``, ``"empty"``, ``"purged"``,
+    ``"descriptor_version"``, ``"descriptor_mismatch"``, ``"bad_base64"``,
+    ``"path"``. ``index`` is the position of the offending input when known.
+    """
+
+    _init_fields = ("reason", "index", "media_type", "byte_length", "detail")
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        index: int | None = None,
+        media_type: str | None = None,
+        byte_length: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        self.reason = reason
+        self.detail = detail
+        self.index = index
+        self.media_type = media_type
+        self.byte_length = byte_length
+        msg = f"Invalid image ({reason})"
+        if index is not None:
+            msg += f" at index {index}"
+        extras = []
+        if media_type is not None:
+            extras.append(f"media_type={media_type}")
+        if byte_length is not None:
+            extras.append(f"bytes={byte_length}")
+        if extras:
+            msg += " [" + ", ".join(extras) + "]"
+        if detail:
+            msg += f": {detail}"
+        super().__init__(msg + ".")
+
+
+class ImageLimitError(_KwargsReduceMixin, ImageError):
+    """An image or request exceeded an :class:`~dendrux.media.ImagePolicy` cap.
+
+    ``scope`` is one of ``"image_bytes"``, ``"source_bytes"``, ``"image_side"``,
+    ``"image_pixels"``, ``"message_count"``, ``"request_count"``,
+    ``"request_bytes"``, ``"estimated_tokens"``, ``"many_image_dimension"``,
+    or ``"store_bytes"`` (an :class:`~dendrux.media.InMemoryBlobStore` is full
+    even after one garbage-collection pass).
+    """
+
+    _init_fields = ("scope", "limit", "actual", "index")
+
+    def __init__(
+        self,
+        scope: str,
+        *,
+        limit: int,
+        actual: int,
+        index: int | None = None,
+    ) -> None:
+        self.scope = scope
+        self.limit = limit
+        self.actual = actual
+        self.index = index
+        where = f" at index {index}" if index is not None else ""
+        super().__init__(f"Image limit exceeded ({scope}){where}: {actual} > {limit}.")
+
+
+class ImageFetchError(_KwargsReduceMixin, ImageError):
+    """Fetching an ``Image.from_url`` source failed or was refused.
+
+    ``reason`` is one of ``"scheme"``, ``"port"``, ``"credentials"``,
+    ``"host_not_allowed"``, ``"blocked_address"``, ``"dns"``, ``"redirect"``,
+    ``"timeout"``, ``"too_large"``, ``"http_status"``, ``"content_encoding"``,
+    ``"disabled"``, ``"connect"``. Only the host is ever reported, never the
+    URL path, query or credentials.
+    """
+
+    _init_fields = ("reason", "host", "status_code")
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        host: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        self.reason = reason
+        self.host = host
+        self.status_code = status_code
+        msg = f"Image fetch failed ({reason})"
+        if host:
+            msg += f" for host {host!r}"
+        if status_code is not None:
+            msg += f" with HTTP status {status_code}"
+        super().__init__(msg + ".")
+
+
+class UnsupportedModalityError(_KwargsReduceMixin, RuntimeError):
+    """The target model does not accept image input.
+
+    ``source`` says how that was decided: ``"capability"`` (static table or
+    override), ``"catalog"`` (provider model catalogue), ``"adapter"`` (the
+    provider adapter cannot convert images) or ``"provider_response"`` (the
+    vendor refused the request).
+    """
+
+    _init_fields = (
+        "provider",
+        "model",
+        "image_count",
+        "origin",
+        "source",
+        "status_code",
+        "provider_code",
+        "modality",
+    )
+
+    def __init__(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        image_count: int = 0,
+        origin: str | None = None,
+        source: str = "capability",
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        modality: str = "image",
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.modality = modality
+        self.image_count = image_count
+        self.origin = origin
+        self.source = source
+        self.status_code = status_code
+        self.provider_code = provider_code
+        super().__init__(
+            f"Model {model!r} on provider {provider!r} does not accept {modality} input "
+            f"({image_count} {modality}(s), source={source})."
+        )
+
+
+class ImageRejectedError(_KwargsReduceMixin, RuntimeError):
+    """The provider rejected a specific image in a request.
+
+    ``image_ids`` lists the rejected images when the provider error could be
+    located (``located=True``); ``retried`` is True when the call had already
+    been retried once with the image replaced by a placeholder.
+    """
+
+    _init_fields = (
+        "provider",
+        "model",
+        "image_ids",
+        "located",
+        "retried",
+        "status_code",
+        "provider_code",
+    )
+
+    def __init__(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        image_ids: tuple[str, ...] = (),
+        located: bool = False,
+        retried: bool = False,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.image_ids = tuple(image_ids)
+        self.located = located
+        self.retried = retried
+        self.status_code = status_code
+        self.provider_code = provider_code
+        ids = ", ".join(self.image_ids) if self.image_ids else "unlocated"
+        super().__init__(
+            f"Provider {provider!r} rejected image(s) for model {model!r}: {ids}"
+            f"{' (after retry)' if retried else ''}."
+        )
+
+
+class ProviderError(_KwargsReduceMixin, RuntimeError):
+    """A provider failure on an image-bearing request, with a sanitised message.
+
+    Text-only requests keep their v0.3.0 exception types. ``message`` is the
+    vendor message truncated to 500 characters with base64 runs and data
+    URLs replaced by ``[redacted]``.
+    """
+
+    _init_fields = ("provider", "model", "status_code", "provider_code", "error_type", "message")
+
+    def __init__(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        error_type: str | None = None,
+        message: str = "",
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.error_type = error_type
+        self.message = message[:500]
+        status = f" (HTTP {status_code})" if status_code is not None else ""
+        super().__init__(f"Provider {provider!r} error{status}: {self.message}")
+
+
+class BlobNotFoundError(_KwargsReduceMixin, LookupError):
+    """The image does not exist for this tenant (or this run has no reference to it).
+
+    Absence and a tenant mismatch are reported identically, so the error is
+    never an existence oracle.
+    """
+
+    _init_fields = ("image_id",)
+
+    def __init__(self, image_id: str | None = None) -> None:
+        self.image_id = image_id
+        what = f"Image {image_id!r}" if image_id else "Image"
+        super().__init__(f"{what} not found.")
+
+
+class BlobIntegrityError(_KwargsReduceMixin, RuntimeError):
+    """Stored image bytes or a persisted descriptor failed verification.
+
+    ``check`` is one of ``"length"``, ``"sha256"``, ``"media_type"``,
+    ``"dimensions"``, ``"descriptor"``.
+    """
+
+    _init_fields = ("image_id", "check")
+
+    def __init__(self, image_id: str | None, check: str) -> None:
+        self.image_id = image_id
+        self.check = check
+        super().__init__(f"Image {image_id!r} failed integrity check ({check}).")
+
+
+class ImagePersistenceUnsupportedError(_KwargsReduceMixin, RuntimeError):
+    """The configured store, blob store or loop cannot handle images.
+
+    ``reason`` is one of ``"state_store"`` (custom ``StateStore`` without the
+    blob catalog), ``"blob_store_not_configured"`` (an external blob row with
+    no ``blob_store``) or ``"loop"`` (a loop that does not accept
+    ``image_runtime``).
+    """
+
+    _init_fields = ("reason", "store_type")
+
+    def __init__(self, reason: str, *, store_type: str | None = None) -> None:
+        self.reason = reason
+        self.store_type = store_type
+        hint = {
+            "state_store": "the configured state store has no blob catalog; "
+            "use the built-in SQLAlchemy store",
+            "blob_store_not_configured": "an image is stored externally but no "
+            "blob_store is configured",
+            "loop": "the loop does not accept image_runtime",
+        }.get(reason, reason)
+        store = f" ({store_type})" if store_type else ""
+        super().__init__(f"Images are not supported here{store}: {hint}.")
+
+
+class BlobContentionError(_KwargsReduceMixin, RuntimeError):
+    """Storing an image lost too many races with concurrent purge, GC or ingest.
+
+    Transient: retrying the same call is safe.
+    """
+
+    _init_fields = ("image_id",)
+
+    def __init__(self, image_id: str | None = None) -> None:
+        self.image_id = image_id
+        what = f"image {image_id!r}" if image_id else "an image"
+        super().__init__(f"Could not store {what} due to concurrent changes; retry the call.")
+
+
 __all__ = [
+    "BlobContentionError",
+    "BlobIntegrityError",
+    "BlobNotFoundError",
     "ContextLengthExceededError",
+    "ImageError",
+    "ImageFetchError",
+    "ImageLimitError",
+    "ImagePersistenceUnsupportedError",
+    "ImageRejectedError",
+    "InvalidImageError",
+    "ProviderError",
+    "UnsupportedModalityError",
     "InvalidToolResultError",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
