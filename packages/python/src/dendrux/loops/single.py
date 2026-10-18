@@ -127,12 +127,28 @@ async def _record_rejected_call(
     and its ``llm_interactions`` row) and checked against the budget like any
     other call. ``exc.usage`` / ``exc.model`` are updated to the priced usage.
     The caller re-raises, so the run still fails.
+
+    With guardrails configured the output was never scanned, so it is
+    recorded scrubbed (like a guardrail block): placeholder text and no
+    provider response, keeping usage, model, cost and stop reason.
     """
     response = exc._response or LLMResponse(
         text=exc.raw_response,
         usage=exc.usage or UsageStats(usage_reported=False),
         model=exc.model,
+        stop_reason=exc.stop_reason,
     )
+    if agent.guardrails:
+        response = LLMResponse(
+            text="[structured output rejected]",
+            tool_calls=None,
+            usage=response.usage,
+            provider_request=response.provider_request,
+            provider_response=None,
+            model=response.model,
+            stop_reason=response.stop_reason,
+            raw_stop_reason=response.raw_stop_reason,
+        )
     response = price_response(response, pricing=agent.pricing, default_model=provider.model)
     exc.usage = response.usage
     exc.model = response.model or provider.model

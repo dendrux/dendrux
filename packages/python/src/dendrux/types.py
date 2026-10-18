@@ -1856,9 +1856,11 @@ class StructuredOutputValidationError(RuntimeError):
     """Raised when the LLM response fails validation against the requested output_type.
 
     Carries the raw response text and the validation error for debugging.
-    ``usage`` and ``model`` describe the LLM call that produced the invalid
-    response (``None`` when unknown), so its tokens and cost are not lost:
-    the call was made and billed even though its output was rejected.
+    ``usage``, ``model`` and ``stop_reason`` describe the LLM call that
+    produced the invalid response (``None`` when unknown), so its tokens and
+    cost are not lost: the call was made and billed even though its output was
+    rejected. ``stop_reason == "max_tokens"`` means the JSON was cut off at
+    the output-token limit.
     """
 
     def __init__(
@@ -1869,12 +1871,14 @@ class StructuredOutputValidationError(RuntimeError):
         *,
         usage: UsageStats | None = None,
         model: str | None = None,
+        stop_reason: StopReason | None = None,
     ) -> None:
         self.raw_response = raw_response
         self.output_type_name = output_type_name
         self.validation_error = validation_error
         self.usage = usage
         self.model = model
+        self.stop_reason = stop_reason
         # The full rejected response, set by ``structured_complete`` so the
         # loop can record the call with its evidence. Internal.
         self._response: LLMResponse | None = None

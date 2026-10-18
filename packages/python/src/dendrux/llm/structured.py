@@ -40,7 +40,8 @@ async def structured_complete(
         ValueError: If the provider does not support structured output.
         StructuredOutputValidationError: If the response fails Pydantic
             validation (malformed JSON, wrong types, missing fields). It
-            carries the call's ``usage`` and ``model`` (unpriced here; the
+            carries the call's ``usage``, ``model`` and ``stop_reason``
+            (usage unpriced here; the
             SingleCall loop prices and records the call before re-raising).
 
     Args:
@@ -78,6 +79,7 @@ async def structured_complete(
             validation_error=str(exc),
             usage=response.usage,
             model=response.model,
+            stop_reason=response.stop_reason,
         )
         error._response = response
         raise error from exc

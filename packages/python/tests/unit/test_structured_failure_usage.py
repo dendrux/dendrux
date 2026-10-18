@@ -78,3 +78,95 @@ class TestFailedStructuredCall:
             await structured_complete(llm, [Message(role=Role.USER, content="x")], Out)
         assert info.value.usage == _usage()
         assert info.value.model == "mock"
+
+    async def test_error_exposes_stop_reason(self) -> None:
+        from dendrux.llm.structured import structured_complete
+        from dendrux.types import Message, Role
+
+        llm = _structured(LLMResponse(text='{"lab', usage=_usage(), stop_reason="max_tokens"))
+        with pytest.raises(StructuredOutputValidationError) as info:
+            await structured_complete(llm, [Message(role=Role.USER, content="x")], Out)
+        assert info.value.stop_reason == "max_tokens"
+
+    def test_stop_reason_is_keyword_only_and_optional(self) -> None:
+        assert StructuredOutputValidationError("x", "Out", "bad").stop_reason is None
+        err = StructuredOutputValidationError("x", "Out", "bad", stop_reason="max_tokens")
+        assert err.stop_reason == "max_tokens"
+
+
+def _rejected(
+    text: str = "secret sk-live-123 and alice@example.com",
+) -> StructuredOutputValidationError:
+    response = LLMResponse(
+        text=text,
+        usage=_usage(),
+        model="mock",
+        stop_reason="max_tokens",
+        raw_stop_reason="length",
+        provider_request={"messages": []},
+        provider_response={"choices": [{"message": {"content": text}}]},
+    )
+    err = StructuredOutputValidationError(
+        text, "Out", "bad", usage=response.usage, model="mock", stop_reason="max_tokens"
+    )
+    err._response = response
+    return err
+
+
+async def _record(agent: Agent) -> tuple[LLMResponse, StructuredOutputValidationError]:
+    from dendrux.loops.single import _record_rejected_call
+
+    notifier = _Calls()
+    err = _rejected()
+    await _record_rejected_call(
+        err,
+        agent=agent,
+        provider=agent.provider,
+        run_id="run1",
+        recorder=None,
+        notifier=notifier,
+        warnings=[],
+        semantic_messages=None,
+        duration_ms=1,
+    )
+    assert len(notifier.completed) == 1
+    return notifier.completed[0], err
+
+
+class TestRejectedCallGuardrails:
+    """With output guardrails, the rejected output is never recorded raw."""
+
+    async def test_scrubbed_when_guardrails_configured(self) -> None:
+        from dendrux.guardrails import PII
+
+        agent = Agent(
+            provider=MockLLM([]),
+            prompt="t",
+            loop=SingleCall(),
+            guardrails=[PII()],
+            pricing=PriceTable({"mock": ModelPricing(input=1.0, output=2.0)}),
+        )
+        recorded, err = await _record(agent)
+        assert recorded.text == "[structured output rejected]"
+        assert recorded.provider_response is None
+        assert recorded.tool_calls is None
+        # Accounting survives the scrub.
+        assert recorded.usage.output_tokens == 10
+        assert recorded.usage.cost_usd == pytest.approx(120 / 1_000_000)
+        assert recorded.model == "mock"
+        assert recorded.stop_reason == "max_tokens"
+        assert recorded.raw_stop_reason == "length"
+        assert err.usage is not None and err.usage.cost_usd == pytest.approx(120 / 1_000_000)
+
+    async def test_raw_without_guardrails(self) -> None:
+        agent = Agent(
+            provider=MockLLM([]),
+            prompt="t",
+            loop=SingleCall(),
+            pricing=PriceTable({"mock": ModelPricing(input=1.0, output=2.0)}),
+        )
+        recorded, _ = await _record(agent)
+        assert recorded.text == "secret sk-live-123 and alice@example.com"
+        assert recorded.provider_response is not None
+        assert recorded.stop_reason == "max_tokens"
+        assert recorded.usage.cost_usd == pytest.approx(120 / 1_000_000)
