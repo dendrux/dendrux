@@ -913,8 +913,8 @@ class ImageCallSite:
         ``control_reader`` is an async callable returning the run control
         (cancel/pause flags) or None; it is read only right before a retry.
         A ``"raise"`` decision carries a fresh, cause-free error; a cancel or
-        pause seen before the retry returns ``"propagate"`` with ``error`` set
-        to the control object so the loop can honour it.
+        pause seen before the retry returns ``"propagate"`` with ``control`` set
+        (read it with :func:`control_stop`) so the loop can honour it.
         """
         if isinstance(exc, ImageRejectedError) and prepared.slots:
             return await self._on_rejected(
