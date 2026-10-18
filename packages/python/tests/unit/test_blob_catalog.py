@@ -544,7 +544,14 @@ async def test_recorder_llm_interaction_parts_stats_and_scrub() -> None:
     ]
     provider_request = {
         "messages": [
-            {"content": [{"type": "image", "source": {"type": "base64", "data": b64}}]},
+            {
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": b64},
+                    }
+                ]
+            },
             {"content": [{"image_url": {"url": f"data:image/png;base64,{b64}"}}]},
             {"content": "plain text stays"},
         ]
@@ -626,8 +633,8 @@ def test_edges_for_parts_and_scrub_edge_cases() -> None:
     assert edges == [BlobEdge("-", ref.sha256, "input", "input", 1)]
     same = {"a": [1, "x"], "b": {"type": "base64", "data": "dendrux-image:sha256:" + "0" * 64}}
     assert scrub_inline_images(same) is same
-    bad = scrub_inline_images({"type": "base64", "data": "!!!"})
-    assert bad == {"type": "base64", "data": "dendrux-image:redacted"}
+    bad = scrub_inline_images({"type": "base64", "media_type": "image/png", "data": "!!!"})
+    assert bad == {"type": "base64", "media_type": "image/png", "data": "dendrux-image:redacted"}
 
 
 # ---------------------------------------------------------------------------
@@ -732,31 +739,83 @@ async def test_in_memory_owner_key_collision_is_typed() -> None:
     assert await memory.blob_references("-", b) == []
 
 
-def test_scrub_covers_all_inline_shapes() -> None:
+def test_scrub_covers_all_image_shapes() -> None:
     png = make_png(40, pad=300)
     b64 = base64.b64encode(png).decode()
     marker = "dendrux-image:sha256:" + sha(png)
     request = {
-        "a": f"data:image/png;base64,{b64}",  # plain data URL
+        "a": f"data:image/png;base64,{b64}",  # plain image data URL
         "b": f"data:image/png;charset=utf-8;base64,{b64}",  # with parameters
-        "c": f"data:application/octet-stream;base64,{b64}",  # non-image media type
+        "c": f'see <img src="data:image/jpeg;base64,{b64}"> (inline)',  # embedded in text
         "d": {"type": "base64", "media_type": "image/png", "data": b64},  # Anthropic source
-        "e": b64,  # bare base64 value
-        "f": f"see this: {b64} (inline)",  # embedded in text
-        "g": "short text, not base64",
-        "h": "x" * 50,
+        "e": {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},  # Chat
+        "f": {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},  # Responses
+        # Image slots trust the slot, not the declared type.
+        "g": {
+            "type": "image_url",
+            "image_url": {"url": f"data:application/octet-stream;base64,{b64}", "detail": "low"},
+        },
+        "h": "short text, not base64",
     }
     out = scrub_inline_images(request)
-    assert out["a"] == out["b"] == out["c"] == out["e"] == marker
-    assert out["d"]["data"] == marker
-    assert out["f"] == f"see this: {marker} (inline)"
-    assert out["g"] is request["g"] and out["h"] is request["h"]
+    assert out["a"] == out["b"] == marker
+    assert out["c"] == f'see <img src="{marker}"> (inline)'
+    assert out["d"]["data"] == marker and out["d"]["media_type"] == "image/png"
+    assert out["e"] == {"type": "image_url", "image_url": {"url": marker}}
+    assert out["f"] == {"type": "input_image", "image_url": marker}
+    assert out["g"]["image_url"] == {"url": marker, "detail": "low"}
+    assert out["h"] is request["h"]
     dumped = json.dumps(out)
-    assert b64[:40] not in dumped and "base64,i" not in dumped
+    assert b64[:40] not in dumped and "data:image" not in dumped
     tiny = "data:image/gif;base64,R0lGODlhAQABAAAAACw="
     assert scrub_inline_images(tiny).startswith("dendrux-image:")
-    long_text = "word " * 100
-    assert scrub_inline_images(long_text) is long_text
+    https = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+    assert scrub_inline_images(https) is https
+
+
+def test_scrub_keeps_forensic_payloads_byte_faithful() -> None:
+    """Only image structures are scrubbed: reasoning blobs, signatures and tokens survive."""
+    png = make_png(41, pad=300)
+    b64 = base64.b64encode(png).decode()
+    opaque = base64.b64encode(bytes(range(256)) * 3).decode()  # 1024 base64 chars
+    token = "tok_" + "A1b2C3d4" * 37  # 300 chars, base64-like
+    request = {
+        "input": [
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": opaque, "summary": []},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": opaque},
+                    {"type": "redacted_thinking", "data": opaque},
+                ],
+            },
+            {
+                "role": "assistant",
+                "reasoning_details": [
+                    {"type": "reasoning.encrypted", "data": opaque, "format": "anthropic-claude-v1"}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": f"session token: {token}"},
+            {"type": "base64", "media_type": "application/pdf", "data": opaque},
+            {"note": f"data:application/octet-stream;base64,{opaque}"},
+            {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
+        ]
+    }
+    snapshot = json.dumps(request)
+    out = scrub_inline_images(request)
+    assert json.dumps(request) == snapshot  # caller object untouched
+    items = out["input"]
+    assert items[0] is request["input"][0]
+    assert items[1] is request["input"][1]
+    assert items[2] is request["input"][2]
+    assert items[3] is request["input"][3]
+    assert items[4] is request["input"][4]
+    assert items[5] is request["input"][5]
+    assert items[0]["encrypted_content"] == opaque
+    assert items[1]["content"][0]["signature"] == opaque
+    assert items[2]["reasoning_details"][0]["data"] == opaque
+    assert token in items[3]["content"]
+    assert items[6]["image_url"] == "dendrux-image:sha256:" + sha(png)
 
 
 async def test_in_memory_trace_edges_skip_non_live() -> None:

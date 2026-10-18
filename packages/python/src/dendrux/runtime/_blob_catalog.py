@@ -1931,10 +1931,13 @@ class BlobServices:
 # provider_request scrub (defence in depth; adapters sanitise first)
 # ---------------------------------------------------------------------------
 
-# Any data URL with a base64 payload (any media type, any parameters).
-_DATA_URL_RE = re.compile(r"data:[^,\s\"'<>]*?;base64,([A-Za-z0-9+/_=-]*)", re.IGNORECASE)
-# A base64 run long enough to be payload, not prose (the §5.5 >= 200 rule).
-_B64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{200,}={0,2}")
+# Structural only: forensic payloads (reasoning ``encrypted_content``, thinking
+# ``signature``s, ``reasoning_details``, tokens in text) must stay byte-faithful,
+# so nothing is redacted just for looking like base64.
+# An image data URL (any image/* type, any parameters), anywhere in a string.
+_IMAGE_DATA_URL_RE = re.compile(r"data:image/[^,\s\"'<>]*?;base64,([A-Za-z0-9+/=]*)", re.IGNORECASE)
+# A whole-value data URL of any type, for vendor image slots (image_url).
+_SLOT_DATA_URL_RE = re.compile(r"data:[^,\s\"'<>]*?;base64,([A-Za-z0-9+/=]*)", re.IGNORECASE)
 IMAGE_MARKER_PREFIX = "dendrux-image:sha256:"
 REDACTED_MARKER = "dendrux-image:redacted"
 
@@ -1948,37 +1951,63 @@ def _marker_for_b64(b64: str) -> str:
 
 
 def _scrub_str(text: str) -> str:
-    if len(text) < 200 and ";base64," not in text.lower():
+    if ";base64," not in text.lower():
         return text
-    out = _DATA_URL_RE.sub(lambda m: _marker_for_b64(m.group(1)), text)
-    out = _B64_RUN_RE.sub(lambda m: _marker_for_b64(m.group(0)), out)
+    out = _IMAGE_DATA_URL_RE.sub(lambda m: _marker_for_b64(m.group(1)), text)
     return text if out == text else out
 
 
-def scrub_inline_images(value: Any) -> Any:
-    """Replace any inline base64 payload left in a captured request by a marker.
+def _scrub_image_slot(value: Any) -> Any:
+    """A vendor image slot: a whole-value data URL of any media type is an image."""
+    if isinstance(value, str):
+        match = _SLOT_DATA_URL_RE.fullmatch(value)
+        return _marker_for_b64(match.group(1)) if match else _scrub_str(value)
+    return scrub_inline_images(value)
 
-    Covers data URLs of any media type and parameters
-    (``data:image/png;charset=x;base64,...``), Anthropic base64 sources
-    (``{"type": "base64", "data": ...}``, any length), and any base64 run of
-    200+ characters anywhere in a string (bare values or embedded in text).
+
+def _is_marker(value: str) -> bool:
+    return value.startswith((IMAGE_MARKER_PREFIX, REDACTED_MARKER))
+
+
+def scrub_inline_images(value: Any) -> Any:
+    """Replace inline image payloads left in a captured request by a marker.
+
+    Structural, so other forensic data stays byte-faithful:
+
+    - image data URLs (``data:image/<type>[;params];base64,...``) anywhere in a string;
+    - Anthropic image sources ``{"type": "base64", "media_type": "image/...", "data": ...}``;
+    - Chat ``image_url.url`` and Responses ``input_image.image_url`` values that are
+      data URLs (any declared media type: the slot says it is an image).
+
     Each payload becomes ``"dendrux-image:sha256:<hex>"`` (hash of the decoded
-    bytes) or ``"dendrux-image:redacted"`` when it does not decode. Returns
-    the input object itself when nothing changed.
+    bytes) or ``"dendrux-image:redacted"`` when it does not decode. Returns the
+    input object itself when nothing changed.
     """
     if isinstance(value, str):
         return _scrub_str(value)
     if isinstance(value, dict):
         changed = False
         out: dict[Any, Any] = {}
-        is_b64_source = value.get("type") == "base64" and isinstance(value.get("data"), str)
+        media_type = value.get("media_type")
+        is_image_source = (
+            value.get("type") == "base64"
+            and isinstance(media_type, str)
+            and media_type.lower().startswith("image/")
+            and isinstance(value.get("data"), str)
+        )
         for k, v in value.items():
-            if (
-                is_b64_source
-                and k == "data"
-                and not v.startswith((IMAGE_MARKER_PREFIX, REDACTED_MARKER))
-            ):
-                new: Any = _marker_for_b64(v)
+            new: Any
+            if is_image_source and k == "data" and not _is_marker(v):
+                new = _marker_for_b64(v)
+            elif k == "image_url":
+                if isinstance(v, dict):  # Chat: {"image_url": {"url": ...}}
+                    url = v.get("url")
+                    slot = {**v, "url": _scrub_image_slot(url)} if isinstance(url, str) else v
+                    new = scrub_inline_images(slot)
+                    if new == v:
+                        new = v
+                else:  # Responses: {"type": "input_image", "image_url": ...}
+                    new = _scrub_image_slot(v)
             else:
                 new = scrub_inline_images(v)
             changed = changed or new is not v
