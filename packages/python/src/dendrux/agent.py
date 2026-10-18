@@ -161,14 +161,22 @@ def _record_to_run_result(record: Any) -> RunResult:
         cache_read_input_tokens=record.total_cache_read_tokens,
         cache_creation_input_tokens=record.total_cache_creation_tokens,
     )
+    from dendrux.runtime.runner import _stop_reason_from_meta
+
+    status = RunStatus(record.status)
     return RunResult(
         run_id=record.id,
-        status=RunStatus(record.status),
+        status=status,
         answer=record.answer,
         error=record.error,
         iteration_count=record.iteration_count,
         usage=usage,
         meta={"cancel_requested": bool(record.cancel_requested)},
+        stop_reason=(
+            _stop_reason_from_meta(getattr(record, "meta", None))
+            if status == RunStatus.SUCCESS
+            else None
+        ),
     )
 
 

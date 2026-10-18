@@ -164,3 +164,12 @@ async def test_cached_result_before_041_has_no_stop_reason(store) -> None:
     await store.finalize_run("old", status="success", answer="x")
     cached = await _build_cached_result(store, "old")
     assert cached.stop_reason is None
+
+
+async def test_cancel_run_on_finished_run_reports_stop_reason(store) -> None:
+    agent = _agent(store, MockLLM([_cut()]))
+    first = await agent.run("hi")
+    again = await agent.cancel_run(first.run_id)
+    assert again.status == RunStatus.SUCCESS
+    assert again.stop_reason == "max_tokens"
+    assert again.truncated is True
