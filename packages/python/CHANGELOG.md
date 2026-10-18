@@ -187,14 +187,20 @@ image results reach the model (see Changed).
 ### Fixed
 
 - In-memory SQLite (and any engine on `StaticPool` / `SingletonThreadPool`)
-  could silently lose `tool_calls`, `run_events` and trace rows when parallel
-  tool calls, heartbeats or readers used the database at the same time: the
-  sessions shared one connection and one transaction, so one session's
-  end-of-session rollback discarded another's pending write, with no error.
-  The bug predates 0.4.0 and became much more frequent on SQLAlchemy 2.1.
-  Sessions on such engines are now serialised, and creating a store on one
-  logs a single warning that writes are serialised and the data is not
-  durable. File SQLite and Postgres were never affected and are unchanged.
+  could silently lose rows when parallel tool calls, heartbeats or readers used
+  the database at the same time: tool calls, run events, traces, progress
+  updates, run rows, and image blob rows and references (image runs could then
+  fail with `BlobNotFoundError`). The sessions shared one connection and one
+  transaction, so one session's end-of-session rollback discarded another's
+  pending write, with no error. The bug predates 0.4.0 and became much more
+  frequent on SQLAlchemy 2.1. Dendrux's own database sessions on such engines
+  (stores, `RunStore`, `get_session`, SQLite schema sync) are now serialised
+  per connection pool; your own `engine.connect()` calls on the same engine are
+  not. Creating a store on such an engine logs one warning that sessions are
+  serialised and the data is not durable. Do not hold a Dendrux session across
+  a call that runs an agent on such an engine (it waits for itself; a warning
+  names the holder after 10 seconds). File SQLite and Postgres were never
+  affected and are unchanged.
 - SQLAlchemy 2.1 is supported (the existing `>=2.0,<3.0` range). CI tests
   both 2.0 and 2.1.
 
