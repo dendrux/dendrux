@@ -7,7 +7,7 @@ import re
 # Public class and factory annotations are resolved at runtime by
 # documentation and dependency-injection tooling.
 from collections.abc import Mapping, Sequence  # noqa: TC003
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -153,7 +153,25 @@ def redact_source_text(source: MCPSource, text: str) -> str:
 
 
 def redact_source_value(source: MCPSource, value: Any) -> Any:
-    """Recursively redact configured credentials while preserving value shape."""
+    """Recursively redact configured credentials while preserving value shape.
+
+    A ``ToolOutput`` keeps its images (bytes are not text); its ``result`` is
+    scrubbed, and a declared image media type that carried a credential is
+    dropped (ingest sniffs the real type anyway).
+    """
+    from dendrux.media._image import Image, ToolOutput
+
+    if isinstance(value, ToolOutput):
+        kept: list[Any] = []
+        for image in value.images:
+            if (
+                isinstance(image, Image)
+                and image.media_type is not None
+                and redact_source_text(source, image.media_type) != image.media_type
+            ):
+                image = replace(image, media_type=None)
+            kept.append(image)
+        return ToolOutput(redact_source_value(source, value.result), images=kept)
     if isinstance(value, str):
         return redact_source_text(source, value)
     if isinstance(value, list):
