@@ -25,6 +25,7 @@ import inspect
 import json
 import logging
 import time
+import traceback
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -98,7 +99,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Sequence
+    from collections.abc import AsyncGenerator, Callable, Sequence
 
     from pydantic import BaseModel
 
@@ -226,6 +227,11 @@ async def _append_assistant(
     await _record_message(recorder, run_id, msg, iteration)
     await _notify_message(notifier, run_id, msg, iteration, warnings)
     return msg
+
+
+def _drop_frame_locals(exc: BaseException) -> None:
+    """Clear finished frames' locals in ``exc``'s traceback (they may hold wire bytes)."""
+    traceback.clear_frames(exc.__traceback__)
 
 
 def _format_result(strategy: Strategy, result: ToolResult) -> Message:
@@ -436,9 +442,12 @@ async def _budget_stop(
     iteration: int,
     usage: UsageStats,
     meta: dict[str, Any],
-    image_view: ImageViewState | None = None,
+    image_view: Callable[[], ImageViewState | None] | None = None,
 ) -> RunResult | None:
-    """Checkpoint budget enforcement: a PAUSED/CANCELLED result, or None to go on."""
+    """Checkpoint budget enforcement: a PAUSED/CANCELLED result, or None to go on.
+
+    ``image_view`` builds the pause's image view lazily (only when pausing).
+    """
     action, breaches = await budget.checkpoint(iteration)
     if not breaches:
         return None
@@ -461,7 +470,7 @@ async def _budget_stop(
         meta=meta,
         budget=budget,
         breaches=breaches,
-        image_view=image_view,
+        image_view=image_view() if image_view is not None else None,
     )
 
 
@@ -1363,7 +1372,7 @@ class ReActLoop(Loop):
                 iteration=iteration,
                 usage=total_usage,
                 meta=guardrail_meta(g_engine, notifier_warnings),
-                image_view=pause_image_view(image_state, history),
+                image_view=lambda: pause_image_view(image_state, history),
             )
             if budget_result is not None:
                 return budget_result
@@ -1569,6 +1578,7 @@ class ReActLoop(Loop):
                         image_view=pause_image_view(image_state, history),
                     )
                 if decision.action == "propagate":
+                    _drop_frame_locals(failure)
                     raise failure
                 if decision.action == "raise":
                     assert decision.error is not None
@@ -1941,6 +1951,10 @@ class ReActLoop(Loop):
         )
 
         async def _control_reader() -> Any:
+            # An in-process cancel (cancel_run in this process) wins, as at the
+            # top-of-iteration checkpoint.
+            if interrupt is not None and interrupt.is_set():
+                return _LegacyControl(cancel_requested=True)
             if state_store is None:
                 return await no_control()
             return await _read_control(state_store, resolved_run_id)
@@ -2014,7 +2028,7 @@ class ReActLoop(Loop):
                 iteration=iteration,
                 usage=total_usage,
                 meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
-                image_view=pause_image_view(image_state, history),
+                image_view=lambda: pause_image_view(image_state, history),
             )
             if budget_result is not None:
                 yield RunEvent(
@@ -2178,6 +2192,7 @@ class ReActLoop(Loop):
                     if stop_control is not None:
                         break
                     if decision.action == "propagate":
+                        _drop_frame_locals(failure)
                         raise failure
                     if decision.action == "raise":
                         assert decision.error is not None
@@ -2640,12 +2655,24 @@ async def _execute_tool(
                 f"(str, int, float, bool, list, dict, or None).{hint}"
             ) from ser_err
         if output is not None and output.images:
-            if _tool_source(tool_call.name, lookups) == "mcp":
-                images, notes = await _ingest_mcp_images(
-                    output.images, tool_call.name, image_runtime
+            try:
+                if _tool_source(tool_call.name, lookups) == "mcp":
+                    images, notes = await _ingest_mcp_images(
+                        output.images, tool_call.name, image_runtime
+                    )
+                else:
+                    images = await _ingest_tool_images(output.images, tool_call.name, image_runtime)
+            except TimeoutError:
+                # Not the tool's timeout: an image source (e.g. a URL) timed out.
+                error_msg = f"Image ingest for tool '{tool_call.name}' timed out"
+                return ToolResult(
+                    name=tool_call.name,
+                    call_id=tool_call.id,
+                    payload=json.dumps({"error": error_msg}),
+                    success=False,
+                    error=error_msg,
+                    duration_ms=int((time.monotonic() - start) * 1000),
                 )
-            else:
-                images = await _ingest_tool_images(output.images, tool_call.name, image_runtime)
 
         return ToolResult(
             name=tool_call.name,

@@ -38,7 +38,12 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops._images import ImageCallSite, control_stop, release_wire
 from dendrux.loops.base import Loop
-from dendrux.loops.react import _image_policy, _interrupted_result, _read_control
+from dendrux.loops.react import (
+    _drop_frame_locals,
+    _image_policy,
+    _interrupted_result,
+    _read_control,
+)
 from dendrux.types import (
     ImageViewState,
     Message,
@@ -390,6 +395,7 @@ class SingleCall(Loop):
                     meta=guardrail_meta(g_engine, notifier_warnings),
                 )
             if decision.action == "propagate":
+                _drop_frame_locals(failure)
                 raise failure
             if decision.action == "raise":
                 assert decision.error is not None
@@ -649,7 +655,7 @@ class SingleCall(Loop):
             resolved_run_id,
             notifier_warnings,
         )
-        control_reader = _cancel_reader(state_store, resolved_run_id)
+        control_reader = _cancel_reader(state_store, resolved_run_id, interrupt)
 
         if interrupt is not None and interrupt.is_set():
             # cancel_run landed before the provider call started — don't spend it.
@@ -785,6 +791,7 @@ class SingleCall(Loop):
                     cancelled = True
                     break
                 if decision.action == "propagate":
+                    _drop_frame_locals(failure)
                     raise failure
                 if decision.action == "raise":
                     assert decision.error is not None
@@ -947,13 +954,27 @@ def _image_site(
     )
 
 
-def _cancel_reader(state_store: StateStore | None, run_id: str) -> Callable[[], Awaitable[Any]]:
-    """Control reader for an image retry: SingleCall honours cancel only (it never pauses)."""
+def _cancel_reader(
+    state_store: StateStore | None,
+    run_id: str,
+    interrupt: asyncio.Event | None = None,
+) -> Callable[[], Awaitable[Any]]:
+    """Control reader for an image retry: SingleCall honours cancel only (it never pauses).
+
+    An in-process ``interrupt`` (stream) counts as cancel.
+    """
 
     async def read() -> Any:
+        if interrupt is not None and interrupt.is_set():
+            return _InProcessCancel()
         if state_store is None:
             return None
         control = await _read_control(state_store, run_id)
         return control if control.cancel_requested else None
 
     return read
+
+
+class _InProcessCancel:
+    cancel_requested = True
+    pause_requested = False

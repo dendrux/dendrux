@@ -76,7 +76,14 @@ _DESCRIBE_MAX_CHARS = 2000
 # ---------------------------------------------------------------------------
 
 _learned_lock = threading.Lock()
-_learned_no: weakref.WeakKeyDictionary[Any, set[tuple[str, str, str]]] = weakref.WeakKeyDictionary()
+# id(provider) -> learned keys. Keyed by id (not the object) so unhashable
+# providers work too; a weakref finalizer forgets the entry with the instance.
+_learned_no: dict[int, set[tuple[str, str, str]]] = {}
+
+
+def _forget_provider(pid: int) -> None:
+    with _learned_lock:
+        _learned_no.pop(pid, None)
 
 
 def _capability_key(provider: LLMProvider, model: str) -> tuple[str, str, str]:
@@ -98,20 +105,21 @@ def learn_image_unsupported(provider: LLMProvider, model: str) -> None:
     if callable(learner):
         learner(model)
     key = _capability_key(provider, model)
+    pid = id(provider)
     with _learned_lock:
+        fresh = pid not in _learned_no
+        _learned_no.setdefault(pid, set()).add(key)
+    if fresh:
         try:
-            _learned_no.setdefault(provider, set()).add(key)
-        except TypeError:  # pragma: no cover — provider not weak-referenceable
-            return
+            weakref.finalize(provider, _forget_provider, pid)
+        except TypeError:  # pragma: no cover — no weakref support: kept for the process
+            logger.debug("learned image capability kept for a non-weakref provider")
 
 
 def _is_learned_no(provider: LLMProvider, model: str) -> bool:
     key = _capability_key(provider, model)
     with _learned_lock:
-        try:
-            return key in _learned_no.get(provider, ())
-        except TypeError:  # pragma: no cover
-            return False
+        return key in _learned_no.get(id(provider), ())
 
 
 async def effective_capability(
@@ -1044,7 +1052,13 @@ def _rejected(
 
 
 def rejection_candidates(exc: ImageRejectedError, prepared: PreparedRequest) -> list[SlotInfo]:
-    """Visible slots to tombstone for a provider rejection (§5.7, N-10)."""
+    """Visible slots to tombstone for a provider rejection (§5.7, N-10).
+
+    Located → exactly the matching slots. Unlocated → new visible slots, else
+    tool-result history slots; either way an image whose bytes also appear in
+    a visible USER history slot is never chosen (tombstones are keyed by
+    image identity, so it would hide that accepted user image too).
+    """
     visible = [s for s in prepared.slots if s.visible]
     if exc.located and exc.image_ids:
         wanted = set(exc.image_ids)
@@ -1052,10 +1066,11 @@ def rejection_candidates(exc: ImageRejectedError, prepared: PreparedRequest) -> 
         if located:
             return located
     new = set(prepared.new_slots)
-    new_visible = [s for s in visible if s.slot in new]
+    user_history = {s.key for s in visible if s.origin == "user" and s.slot not in new}
+    new_visible = [s for s in visible if s.slot in new and s.key not in user_history]
     if new_visible:
         return new_visible
-    return [s for s in visible if s.origin == "tool"]
+    return [s for s in visible if s.origin == "tool" and s.key not in user_history]
 
 
 async def no_control() -> None:
