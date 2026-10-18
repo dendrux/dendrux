@@ -37,10 +37,10 @@ async with Agent(
 
 | Constructor | Source |
 | --- | --- |
-| `Image.from_bytes(data, media_type=None, detail=None)` | Bytes you already hold. |
-| `Image.from_path(path, media_type=None, detail=None)` | A regular file. Size is checked with `stat` before it is read. |
-| `Image.from_base64(text, media_type=None, detail=None)` | Base64 or a `data:image/png;base64,...` URL. Strict, bounded decode. |
-| `Image.from_url(url, detail=None)` | Fetched once at ingest, then stored. See [URLs](#urls). |
+| `Image.from_bytes(data, *, media_type=None, detail=None)` | Bytes you already hold. |
+| `Image.from_path(path, *, media_type=None, detail=None)` | A regular file. Size is checked with `stat` before it is read. |
+| `Image.from_base64(data, *, media_type=None, detail=None)` | Base64 or a `data:image/png;base64,...` URL. Strict, bounded decode. |
+| `Image.from_url(url, *, detail=None)` | Fetched once at ingest, then stored. See [URLs](#urls). |
 
 The format is detected from the file's magic bytes. The `media_type` you pass, the file name and a URL's `Content-Type` are never trusted; a declared type that disagrees with the bytes raises `InvalidImageError("type_mismatch")`. Animated GIF and WebP are rejected unless `ImagePolicy(allow_animated=True)`, and then providers read the first frame. `Image` never prints its bytes or a URL's query string in `repr`.
 
@@ -163,7 +163,7 @@ user:  <tool_output tool_name="take_screenshot" tool_call_id="call_P1">
 
 The framing is fixed text with no counters or timestamps, so it is cache-stable. The synthetic user message exists only on the wire; your stored history keeps the tool message with its image. The model is told the images are tool output, not a user instruction, which matters when a screenshot contains text.
 
-Images in the assistant role are not supported (assistant `ChatMessage` with images raises `ValueError`). Image bytes never enter the system prompt, the tool definitions or `ContextBlock`s.
+Images in the assistant role are not supported: `ChatMessage.assistant()` takes a string only, images are supported in user turns only, and `ChatMessage(role="assistant", ..., parts=...)` raises `ValueError`. Image bytes never enter the system prompt, the tool definitions or `ContextBlock`s.
 
 `OpenAIResponsesProvider(..., tool_result_images="native" | "portable")` is the only per-provider image option.
 
@@ -176,7 +176,7 @@ Dendrux decides before it calls the provider. Capability resolves in this order:
 | Anthropic | `claude-*` | n/a | any other name (proxies) |
 | OpenAI Chat and Responses (official base URL) | `gpt-4o`, `gpt-4.1`, `gpt-5`, `o1`, `o3`, `o4-mini` and similar families | `gpt-3.5*`, `gpt-4`, `o1-mini`, `o1-preview`, `o3-mini` | any other model, and any non-official base URL |
 | OpenRouter | model catalogue lists `image` input | catalogue lists the model without `image` | not in the catalogue, or catalogue unavailable |
-| Custom `LLMProvider` | n/a | always, unless it sets `supports_multimodal=True` | n/a |
+| Custom `LLMProvider` | only if it overrides `image_input_support` | always, unless it sets `supports_multimodal=True` | when it sets `supports_multimodal=True` (the default answer) |
 
 What happens when the answer is **no**:
 
@@ -233,11 +233,11 @@ agent = Agent(..., images=ImagePolicy(drop=ImageDropPolicy(keep_recent=3, interv
 
 - `keep_recent` (default 3): the model always sees at least this many of the most recent eligible images.
 - `interval` (default 25): how far the window may grow before it advances. The model sees between `keep_recent` and `keep_recent + interval - 1` eligible images. It is count-based and soft, not "after N turns".
-- `scope` (default `"tool_results"`): which images are eligible. `"all"` also includes user images. The current turn is never dropped.
+- `scope` (default `"tool_results"`): which images are eligible. `"all"` also includes user images. The model sees between `keep_recent` and `keep_recent + interval - 1` of these; images from the current turn (after the last assistant message) are not counted and are always shown.
 
 When the window advances, older images become `[image img_... omitted from context]` in the request. The decision is sticky and stored with the run, so the same history renders the same bytes after pause, resume, retry and replay. Your stored history still has every image reference, and `agent.blobs` can still read them. Each advance invalidates the provider cache from the first newly dropped image, once; between advances the cache hits normally, which is why the policy advances in steps (`interval`) instead of every turn.
 
-With Anthropic extended thinking on, dropping interacts with thinking blocks that are bound to the prefix; Dendrux logs a warning once and emits `image.warning` (`drop_with_thinking`).
+With thinking enabled on the provider (Anthropic, or OpenAI Responses with `thinking=True`), dropping interacts with thinking blocks that are bound to the prefix; Dendrux logs a warning once and emits `image.warning` (`drop_with_thinking`).
 
 ## Storage
 
@@ -255,6 +255,8 @@ The tenant scope is `t:<tenant_id>` or `-` when a run has no tenant. The same by
 **A heavier store.** For high volume, keep bytes in object storage and only metadata in the database. Implement the three-method `BlobStore` protocol and pass it to the Agent (and to every `RunStore` that reads or purges):
 
 ```python
+from typing import Protocol
+
 from dendrux.media import BlobKey
 
 class BlobStore(Protocol):
@@ -298,7 +300,7 @@ The bytes are deleted (also from your external store), the row stays as a tombst
 - `Accept-Encoding: identity`, a hard size cap of `max_source_bytes` whatever `Content-Length` says, and connect, read and total timeouts (5, 10 and 20 seconds).
 - Errors name the host only, never the path or query.
 
-Tune it with `ImagePolicy(urls=UrlPolicy(...))`: `allowed_hosts=("images.example.com", "*.cdn.example.com")`, `allow_private_networks=True` for an internal service, `fetch=False` to turn URL fetching off. A corporate CA, an egress proxy or a signed-URL scheme belongs in your own fetcher: `UrlPolicy(fetcher=my_fetch)` where `my_fetch(url: str, max_bytes: int) -> bytes` replaces all of the above and must honour `max_bytes` itself.
+Tune it with `ImagePolicy(urls=UrlPolicy(...))`: `allowed_hosts=("images.example.com", "*.cdn.example.com")`, `allow_private_networks=True` for an internal service, `fetch=False` to turn URL fetching off. A corporate CA, an egress proxy or a signed-URL scheme belongs in your own fetcher: `UrlPolicy(fetcher=my_fetch)` where `async def my_fetch(url: str, max_bytes: int) -> bytes` (it must be async) replaces all of the above and must honour `max_bytes` itself.
 
 ## Resizing and your own checks
 
@@ -337,8 +339,8 @@ Image tokens are billed inside the provider's input tokens. Dendrux reports the 
 For planning, Dendrux estimates image tokens from size and the model family (Anthropic by 28 px patches, OpenAI tile and patch models by their documented formulas; an unknown model gives `None`, never 0):
 
 - `llm_interactions.semantic_request.image_stats` is `{"count", "bytes", "estimated_tokens"}` for each call.
-- `from dendrux.media import estimate_image_tokens` gives the same number for an `ImageRef`.
-- `ImagePolicy(max_estimated_image_tokens_per_request=...)` turns the estimate into a cap that raises `ImageLimitError(scope="estimated_tokens")`.
+- `estimate_image_tokens(ref, provider_family="anthropic", model="claude-sonnet-4-6")` from `dendrux.media` gives the same number for an `ImageRef` (`None` when the model is unknown).
+- `ImagePolicy(max_estimated_image_tokens_per_request=...)` turns the estimate into a cap that raises `ImageLimitError(scope="estimated_tokens")`. When the model's family is unknown (the estimate is `None`), the cap is not applied.
 - Chat spans in the [OpenTelemetry notifier](/docs/recipes/opentelemetry) carry `dendrux.images.count` and `dendrux.images.estimated_tokens`.
 
 Estimates are approximations; the provider's usage is the bill.
@@ -348,7 +350,7 @@ Estimates are approximations; the provider's usage is the bill.
 | Where | What |
 | --- | --- |
 | `agent_runs.input_data["dendrux.parts"]`, `react_traces.meta["dendrux.parts"]` | The ordered text and image parts, images as descriptors. |
-| `tool_calls.meta["dendrux.images"]` | The tool result's images. The `result` column keeps the text payload. |
+| `tool_calls.meta["dendrux.images"]`, `["dendrux.image_notes"]` | The tool result's images and any MCP image notes. The `result` column keeps the text payload. |
 | `llm_interactions.provider_request` | The exact request, with every image replaced by `dendrux-image:sha256:<hex>`. Base64 never reaches the database. |
 | Pause snapshot | History parts and the image view state (drops, rejections, descriptions, guardrail verdicts), about 512 bytes per image. |
 | `run.resumed`, `tool.completed` | `image_count`, only when images are present. |
@@ -378,7 +380,7 @@ All in `dendrux.errors`. None of them contains image bytes, base64 or a URL's qu
 | `ProviderError` | `RuntimeError` | Any other provider failure on a request that carried images, with a sanitised message of at most 500 characters. Text-only requests keep the errors they had before. | 502 |
 | `BlobNotFoundError` | `LookupError` | Missing blob, another tenant's blob, or no reference from that run | 404 |
 | `BlobIntegrityError` | `RuntimeError` | Stored bytes or descriptor do not match the catalog | 500 |
-| `ImagePersistenceUnsupportedError` | `RuntimeError` | A custom `StateStore`, a missing `BlobStore` for external rows, or a custom loop that cannot carry images | 500 |
+| `ImagePersistenceUnsupportedError` | `RuntimeError` | A custom `StateStore`, a missing `BlobStore` for external rows, or a tool returned images in a loop run without an image runtime | 500 |
 | `BlobContentionError` | `RuntimeError` | Storage lost a race with a concurrent purge or garbage collection; transient, safe to retry | 503 |
 
 ## Logging
@@ -390,6 +392,7 @@ Do not turn on DEBUG logging for the `openai`, `anthropic` or `httpx` libraries 
 - **Postgres: run `dendrux db migrate` after upgrading**, even if you never use images. 0.4.0 adds `dendrux_blobs` and `dendrux_blob_refs` (revision `c6d7e8f9a0b1`); until you migrate, the first run raises `SchemaOutOfDateError` naming both tables. SQLite files upgrade themselves. See [State persistence](/docs/architecture/state-persistence#upgrading).
 - **Custom providers** report that they cannot read images unless they set `supports_multimodal=True` and convert `Message.parts` (an ordered tuple of `TextPart` and `ImagePart`; `Message.content` is always the text projection). Such a provider can never silently drop an image by reading only `content`.
 - **Custom strategies**: `format_tool_result` must keep image parts in the tool message it returns; dropping them raises `TypeError`. Use `tool_result_message(result)` from `dendrux.types`.
+- **Custom loops**: a `Loop` whose `run()` (or `run_stream()`) does not accept `image_runtime` raises `TypeError` for image input, image replay (`runs=`) and `retry()`. Text-only runs are unaffected.
 - **Custom `StateStore`**: text-only runs are unaffected; images need the built-in store.
 - **Testing**: `MockLLM(responses, image_support="yes" | "no" | "unknown")` simulates a vision or text-only model, and `provider.wire_messages` records exactly what each call received, image bytes included.
 

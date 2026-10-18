@@ -477,7 +477,7 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |
 | [`30_mcp_agent.py`](packages/python/examples/30_mcp_agent.py) | Local tools + an SDK v2 MCP source with shared `MCPHost` lifecycle |
 | [`36_run_control.py`](packages/python/examples/36_run_control.py) | Per-call approvals, a `before_tool` policy hook and `request_pause` / `submit_resume`, with a mock provider (no API key) |
-| [`37_images.py`](packages/python/examples/37_images.py) | A user image plus a tool that returns an image, stored and read back (mock provider by default, no API key) |
+| [`37_images.py`](packages/python/examples/37_images.py) | A user image plus a tool that returns an image, stored and inspected (mock provider by default, no API key) |
 | [`38_images_client_tool.py`](packages/python/examples/38_images_client_tool.py) | Client-tool screenshot: pause, submit the image from a second Agent, resume (mock provider by default) |
 | **Governance** | |
 | [`governance/01_tool_deny.py`](packages/python/examples/governance/01_tool_deny.py) | Block tools deterministically (batch + streaming) |

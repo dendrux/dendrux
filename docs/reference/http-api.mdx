@@ -257,7 +257,7 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `budget.threshold` | Usage crossed a `warn_at` fraction of a limit | `{"metric": "tokens" \| "cost_usd", "fraction": float, "used": number, "max": number, "reason": "threshold_crossed"}` |
 | `budget.exceeded` | Usage reached a limit | `{"metric": "tokens" \| "cost_usd", "used": number, "max": number, "reason": "budget_exceeded", "action": "warn" \| "pause" \| "cancel"}` |
 | `budget.unpriced` | A `max_cost_usd` budget met its first unpriced LLM call in the run (once per run) | `{"metric": "cost_usd", "used": float, "max": float, "unpriced_calls": int, "known_cost_usd": float}` |
-| `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "outgoing", "findings_count": int, "entities": list[str]}` |
+| `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
 | `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "error": str}` |
 | `guardrail.image_unscanned` | Guardrails are configured, a request carries images, and none scans images (once per run) | `{"count": int}` |
@@ -265,7 +265,7 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `image.state` | A request recorded new image descriptions, guardrail verdicts or placeholders | `{"tenant_scope", "described": [{"sha256", "text"}], "guardrail_verdicts": [{"sha256", "guardrail_id", "guardrail_version", "origin", "tool_name", "action", "entities"}], "placeholders": [{"slot", "reason"}]}` |
 | `image.view_changed` | The drop-old-images window advanced | `{"epoch": int, "dropped_through": int, "visible": int}` (`visible` = eligible images still shown) |
 | `image.degraded` | Images were replaced by placeholders | `{"reason": "purged" \| "policy" \| "rejected" \| "unsupported" \| "described" \| "guardrail" \| "drop", "count": int, "slots": [int]}`; once per image slot |
-| `image.warning` | Drop policy combined with extended thinking (once per run) | `{"warning": "drop_with_thinking"}` |
+| `image.warning` | Drop policy combined with provider thinking (Anthropic, or OpenAI Responses `thinking=True`; once per run) | `{"warning": "drop_with_thinking"}` |
 | `guardrail.unmapped_placeholder` | Final output contains placeholders that cannot be deanonymized | `{"placeholders": list[str]}` |
 | `skill.catalog_resolved` | Run start, when skills are configured | `{"delivery": "progressive" \| "inlined", "skills": [{"name", "revision", "digest"}], "denied": list[str]}` |
 | `skill.activated` | A skill's body was delivered to the model | `{"name": str, "digest": str, "origin": "model" \| "explicit" \| "inlined"}` |

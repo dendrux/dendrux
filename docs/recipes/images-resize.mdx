@@ -25,14 +25,19 @@ from PIL import Image as PILImage, ImageOps
 from dendrux import Agent
 from dendrux.media import ImageIngestRequest, ImagePolicy
 
-PILImage.MAX_IMAGE_PIXELS = 8000 * 8000          # decompression-bomb guard for decode
+MAX_PIXELS = 8000 * 8000                          # Dendrux's own max_pixels applies only after the hook
 MAX_SIDE = 1568                                   # Claude's standard tier; 2000 also satisfies
                                                   # Anthropic's more-than-20-images rule
 
 
 def shrink(req: ImageIngestRequest) -> bytes | None:
     try:
-        im = PILImage.open(io.BytesIO(req.data))
+        im = PILImage.open(io.BytesIO(req.data))  # reads the header only
+    except Exception:
+        raise ValueError("image could not be decoded") from None
+    if im.width * im.height > MAX_PIXELS:         # bound the decode before it starts
+        raise ValueError("image too large")
+    try:
         im.load()                                 # full decode: raises on truncated or corrupt data
     except Exception:
         raise ValueError("image could not be decoded") from None
@@ -65,7 +70,7 @@ How it behaves:
 - **A sync hook runs on the event loop.** Decoding a large image takes tens to hundreds of milliseconds and blocks every other request in the process. Use the async wrapper above, or a process pool.
 - **Errors are yours.** An exception from the hook propagates unchanged: an entry point such as `agent.run(...)` raises it before any run exists, and a tool that returned the image fails that call. Raise your own short message, as above; a library error can echo parts of the data.
 - **The request tells you where the image came from.** `req.origin` is `"user"`, `"tool"`, `"client_tool"` or `"mcp"`, `req.tool_name` names the tool, and `req.max_output_bytes` is the cap your output must fit. Return `None` for origins you do not want touched.
-- **The hook sees the bytes after the source-size check** (`max_source_bytes`, 25 MiB by default) and before the per-image caps, so it can bring an oversized file under `max_image_bytes`.
+- **The hook sees the bytes after the source-size check** (`max_source_bytes`, 25 MiB by default) and before the per-image caps, including `max_pixels`, so it can bring an oversized file under `max_image_bytes`. Because the pixel cap is applied after the hook, the hook must bound its own decoding: Pillow only warns above `Image.MAX_IMAGE_PIXELS` and raises at twice that, so the recipe checks `im.width * im.height` before `im.load()`.
 
 ## When to skip it
 
