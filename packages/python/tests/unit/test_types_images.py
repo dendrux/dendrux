@@ -708,3 +708,122 @@ def test_top_level_exports() -> None:
     for name in ("Image", "ImageRef", "ImagePart", "TextPart", "ToolOutput"):
         assert name in dendrux.__all__ and hasattr(dendrux, name)
     assert dendrux.Image is media.Image
+
+
+# ---------------------------------------------------------------------------
+# Fix round (review-A): P1 memo retention, error pickling, small robustness items
+# ---------------------------------------------------------------------------
+
+
+def test_projection_memo_never_pins_wire_bytes() -> None:
+    import gc
+    import tracemalloc
+
+    from dendrux import types as t
+
+    tracemalloc.start()
+    try:
+        baseline, _ = tracemalloc.get_traced_memory()
+        messages = [
+            Message.with_parts(
+                Role.USER,
+                [TextPart(f"q{i}"), ImagePart(ref(), data=bytes([i % 256]) * (4 * 1024 * 1024))],
+            )
+            for i in range(50)
+        ]
+        held, _ = tracemalloc.get_traced_memory()
+        assert held - baseline > 150 * 1024 * 1024
+        del messages
+        gc.collect()
+        retained, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert retained - baseline < 4 * 1024 * 1024  # less than one image survives
+    assert not any(
+        isinstance(p, ImagePart) and p.data is not None
+        for parts, _ in t._PROJECTION_MEMO.values()
+        for p in parts
+    )
+
+
+def test_semantic_parts_still_memoised() -> None:
+    from dendrux import types as t
+
+    parts = (TextPart("memo me"), img())
+    Message(Role.USER, "memo me", parts=parts)
+    assert t._PROJECTION_MEMO[id(parts)][0] is parts
+
+
+def _all_image_errors() -> list[BaseException]:
+    from dendrux import errors as e
+
+    return [
+        e.InvalidImageError("corrupt", index=1, media_type="image/png", byte_length=9, detail="d"),
+        e.ImageLimitError("image_bytes", limit=1, actual=2, index=0),
+        e.ImageFetchError("http_status", host="h.example", status_code=404),
+        e.UnsupportedModalityError(
+            provider="openai",
+            model="gpt-3.5-turbo",
+            image_count=2,
+            origin="user",
+            source="capability",
+            status_code=400,
+            provider_code="x",
+        ),
+        e.ImageRejectedError(
+            provider="anthropic",
+            model="claude-x",
+            image_ids=("img_0123456789ab",),
+            located=True,
+            retried=True,
+            status_code=400,
+            provider_code="invalid_request_error",
+        ),
+        e.ProviderError(
+            provider="openai",
+            model="m",
+            status_code=500,
+            provider_code="c",
+            error_type="t",
+            message="boom",
+        ),
+        e.BlobNotFoundError("img_0123456789ab"),
+        e.BlobIntegrityError("img_0123456789ab", "sha256"),
+        e.ImagePersistenceUnsupportedError("state_store", store_type="Custom"),
+        e.BlobContentionError("img_0123456789ab"),
+    ]
+
+
+@pytest.mark.parametrize("err", _all_image_errors(), ids=lambda x: type(x).__name__)
+def test_image_errors_pickle_and_copy(err: BaseException) -> None:
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+        assert type(clone) is type(err)
+        assert str(clone) == str(err)
+        assert vars(clone) == vars(err)
+
+
+def test_invalid_persisted_detail_is_descriptor_mismatch() -> None:
+    d = content_part_to_dict(img())
+    d["detail"] = "ultra"
+    with pytest.raises(InvalidImageError) as ei:
+        content_part_from_dict(d)
+    assert ei.value.reason == "descriptor_mismatch"
+
+
+def test_tool_result_rejects_string_sequences() -> None:
+    with pytest.raises(TypeError):
+        ToolResult(name="t", call_id="c", payload="1", images="abc")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ToolResult(name="t", call_id="c", payload="1", notes="note")  # type: ignore[arg-type]
+
+
+def test_message_signature_shows_factory_for_meta() -> None:
+    assert repr(inspect.signature(Message).parameters["meta"].default) == "<factory>"
+
+
+def test_from_base64_non_ascii_bytes_has_no_chained_input() -> None:
+    from dendrux.media import Image
+
+    with pytest.raises(TypeError) as ei:
+        Image.from_base64(b"\xff\xfe secret")  # type: ignore[arg-type]
+    assert ei.value.__context__ is None and ei.value.__cause__ is None

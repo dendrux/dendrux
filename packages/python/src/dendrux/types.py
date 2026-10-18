@@ -78,8 +78,16 @@ class ToolCall:
     parse_error: str | None = None
 
 
-# Sentinel for Message.meta's default (keeps dataclass default_factory semantics).
-_META_UNSET: Any = object()
+class _MetaUnset:
+    """Sentinel for Message.meta's default (keeps dataclass default_factory semantics)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<factory>"
+
+
+_META_UNSET: Any = _MetaUnset()
 _ROLE_TOOL = Role.TOOL
 _ROLE_SYSTEM = Role.SYSTEM
 _ROLE_ASSISTANT = Role.ASSISTANT
@@ -226,7 +234,12 @@ def content_part_from_dict(d: dict[str, Any]) -> ContentPart:
     if d.get("type") == "text":
         return TextPart(text=d["text"])
     ref = ImageRef.from_dict(d)
-    return ImagePart(ref=ref, detail=d.get("detail"))
+    detail = d.get("detail")
+    if detail is not None and detail not in _DETAILS:
+        from dendrux.errors import InvalidImageError
+
+        raise InvalidImageError("descriptor_mismatch")
+    return ImagePart(ref=ref, detail=detail)
 
 
 def parts_digest(parts: Sequence[ContentPart]) -> list[list[Any]]:
@@ -248,6 +261,8 @@ def parts_digest(parts: Sequence[ContentPart]) -> list[list[Any]]:
 
 # Identity-keyed memo of parts -> text projection. Entries hold the parts tuple,
 # so an id cannot be reused while its entry lives; ``entry[0] is parts`` validates.
+# Parts carrying wire bytes (``ImagePart.data``) are never memoised, so the memo
+# can never keep image bytes alive past the provider call.
 _PROJECTION_MEMO: dict[int, tuple[tuple[ContentPart, ...], str]] = {}
 _PROJECTION_MEMO_MAX = 1024
 
@@ -257,6 +272,8 @@ def _text_projection(parts: tuple[ContentPart, ...]) -> str:
     if entry is not None and entry[0] is parts:
         return entry[1]
     projection = "\n\n".join(p.text for p in parts if isinstance(p, TextPart))
+    if any(isinstance(p, ImagePart) and p.data is not None for p in parts):
+        return projection
     if len(_PROJECTION_MEMO) >= _PROJECTION_MEMO_MAX:
         with contextlib.suppress(StopIteration, RuntimeError):
             _PROJECTION_MEMO.pop(next(iter(_PROJECTION_MEMO)), None)
@@ -531,8 +548,12 @@ class ToolResult:
 
     def __post_init__(self) -> None:
         if type(self.images) is not tuple:
+            if isinstance(self.images, (str, bytes, bytearray)):
+                raise TypeError("ToolResult.images must be a sequence of images")
             object.__setattr__(self, "images", tuple(self.images))
         if type(self.notes) is not tuple:
+            if isinstance(self.notes, (str, bytes)):
+                raise TypeError("ToolResult.notes must be a sequence of strings")
             object.__setattr__(self, "notes", tuple(self.notes))
 
 
