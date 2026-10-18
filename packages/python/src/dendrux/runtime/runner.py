@@ -1726,6 +1726,16 @@ async def _apply_replay(
     return plan, seeded_history
 
 
+def _stream_error_meta(mcp_meta: dict[str, Any], exc: BaseException) -> dict[str, Any]:
+    """``RUN_ERROR`` result meta; an image rejection also lists the rejected image ids."""
+    from dendrux.errors import ImageRejectedError
+
+    meta = {**deepcopy(mcp_meta), "error_type": type(exc).__name__}
+    if isinstance(exc, ImageRejectedError):
+        meta["image_rejected"] = list(exc.image_ids)
+    return meta
+
+
 def _input_data(user_input: str, user_parts: tuple[ContentPart, ...] | None) -> dict[str, Any]:
     """``agent_runs.input_data``: the text, plus raw parts for a multimodal input."""
     if user_parts is None:
@@ -2782,7 +2792,7 @@ def run_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
-                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
+                    meta=_stream_error_meta(mcp_meta, exc),
                 ),
                 run_id=run_id,
                 error=str(exc),
@@ -4470,7 +4480,7 @@ def resume_stream(
                     run_id=run_id,
                     status=RunStatus.ERROR,
                     error=str(exc),
-                    meta={**deepcopy(mcp_meta), "error_type": type(exc).__name__},
+                    meta=_stream_error_meta(mcp_meta, exc),
                 ),
                 error=str(exc),
             )

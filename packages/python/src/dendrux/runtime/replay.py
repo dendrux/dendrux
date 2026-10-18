@@ -735,7 +735,10 @@ def initial_image_view(
                     seen_rejected.add(key)
                     state.rejected.append(key)
             elif event.event_type == "image.state":
-                _fold_state_event(state, data, source.tenant_scope, tenant_scope, single_full)
+                event_scope = data.get("tenant_scope")
+                scope = event_scope if isinstance(event_scope, str) else source.tenant_scope
+                if scope == tenant_scope:
+                    _fold_state_event(state, data, scope, tenant_scope, single_full)
             elif event.event_type == "image.view_changed" and single_full:
                 epoch = data.get("epoch")
                 dropped = data.get("dropped_through")

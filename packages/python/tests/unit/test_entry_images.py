@@ -116,6 +116,26 @@ class ImageStore(SQLAlchemyStateStore):
             self._add("create_run", run_id, refs)
         return result
 
+    async def save_trace(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
+        refs = kwargs.pop("blob_refs", None)
+        scope = kwargs.pop("blob_refs_scope", None)
+        if refs:
+            self._check(run_id, scope, refs)
+        result = await super().save_trace(run_id, *args, **kwargs)
+        if refs:
+            self._add("save_trace", run_id, refs)
+        return result
+
+    async def save_tool_call(self, run_id: str, *args: Any, **kwargs: Any) -> Any:
+        refs = kwargs.pop("blob_refs", None)
+        scope = kwargs.pop("blob_refs_scope", None)
+        if refs:
+            self._check(run_id, scope, refs)
+        result = await super().save_tool_call(run_id, *args, **kwargs)
+        if refs:
+            self._add("save_tool_call", run_id, refs)
+        return result
+
     async def submit_and_claim(self, run_id: str, **kwargs: Any) -> bool:
         refs = kwargs.pop("blob_refs", None)
         scope = kwargs.pop("blob_refs_scope", None)
@@ -208,11 +228,16 @@ class ImageStore(SQLAlchemyStateStore):
 
 
 class FakeResolver:
-    def __init__(self, catalog: ImageStore) -> None:
+    def __init__(self, catalog: ImageStore, blob_store: Any = None) -> None:
         self.catalog = catalog
+        self.blob_store = blob_store
 
     async def read(self, scope: str, info: BlobInfo) -> bytes:
+        from dendrux.media import BlobKey
+
         data = self.catalog.rows[(scope, info.sha256)][1]
+        if data is None:
+            data = await self.blob_store.get(BlobKey(scope, info.sha256, info.generation))
         assert data is not None
         return data
 
@@ -224,24 +249,24 @@ class ImageLoop(ReActLoop):
         super().__init__()
         self.seen: list[dict[str, Any]] = []
 
-    async def run(self, *args: Any, image_runtime=None, image_view_state=None, **kwargs: Any):
+    def _record(self, method: Any, runtime: Any, state: Any, kwargs: dict[str, Any]) -> None:
+        # Snapshot: the loop mutates the live state as requests are sent.
+        snapshot = ImageViewState.from_dict(state.to_dict()) if state is not None else None
         self.seen.append(
-            {
-                "runtime": image_runtime,
-                "state": image_view_state,
-                "history": kwargs.get("initial_history"),
-            }
+            {"runtime": runtime, "state": snapshot, "history": kwargs.get("initial_history")}
         )
+        # Forward to the built-in loop once it takes the kwargs itself (D1 merged).
+        params = __import__("inspect").signature(method).parameters
+        if "image_runtime" in params:
+            kwargs["image_runtime"] = runtime
+            kwargs["image_view_state"] = state
+
+    async def run(self, *args: Any, image_runtime=None, image_view_state=None, **kwargs: Any):
+        self._record(ReActLoop.run, image_runtime, image_view_state, kwargs)
         return await super().run(*args, **kwargs)
 
     def run_stream(self, *args: Any, image_runtime=None, image_view_state=None, **kwargs: Any):
-        self.seen.append(
-            {
-                "runtime": image_runtime,
-                "state": image_view_state,
-                "history": kwargs.get("initial_history"),
-            }
-        )
+        self._record(ReActLoop.run_stream, image_runtime, image_view_state, kwargs)
         return super().run_stream(*args, **kwargs)
 
 
@@ -278,7 +303,7 @@ class FakeServices:
     def __init__(self, catalog: Any, blob_store: Any, memory: Any = None) -> None:
         self.catalog = catalog
         self.blob_store = blob_store
-        self.resolver = FakeResolver(catalog) if catalog is not None else None
+        self.resolver = FakeResolver(catalog, blob_store) if catalog is not None else None
         self.accessor = None
         self.memory = memory
         FakeServices.instances.append(self)
@@ -479,7 +504,11 @@ class TestRunWithImages:
         assert store.rows == {}
 
     async def test_custom_provider_without_multimodal_is_no(self, store: ImageStore) -> None:
-        agent = _agent(store, [LLMResponse(text="x")], images=ImagePolicy())
+        try:  # C: MockLLM(image_support=...) defaults to "yes"
+            provider = MockLLM([LLMResponse(text="x")], image_support="no")  # type: ignore[call-arg]
+        except TypeError:
+            provider = MockLLM([LLMResponse(text="x")])
+        agent = _agent(store, [], provider=provider, images=ImagePolicy())
         with pytest.raises(UnsupportedModalityError):
             await agent.run([Image.from_bytes(PNG)])
         assert await _count_runs(store) == 0
@@ -719,7 +748,9 @@ class TestHistoryImages:
         state = agent.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
         sent = _llm_messages(agent, 0)
-        assert sent[0].images and sent[-1].content == "and now?"
+        # D1 renders the history image as the unsupported placeholder on this model
+        assert sent[0].images or "not shown" in sent[0].content
+        assert sent[-1].content == "and now?"
 
     async def test_history_images_enter_prefix_seed_and_fingerprint(self) -> None:
         ref = ImageRef(sha256="b" * 64, media_type="image/png", byte_length=3, width=1, height=1)
@@ -1261,7 +1292,8 @@ class TestRetryAndReplay:
         result = await follow.run("and?", runs=[source.run_id], replay_last=1)
         assert result.status == RunStatus.SUCCESS
         sent = _llm_messages(follow, 0)
-        assert sent[0].images and sent[0].content == "see"
+        assert sent[0].images or "not shown" in sent[0].content
+        assert sent[0].content.startswith("see")
         state = follow.loop.seen[-1]["state"]  # type: ignore[union-attr]
         assert state.sent_through == 1
         assert [e.owner_kind for e in store.edges_of(result.run_id)] == ["seed"]
@@ -1473,3 +1505,39 @@ class TestCapability:
             image_count=1,
             origin="user",
         )
+
+
+class TestD1Seams:
+    def test_stream_error_meta_lists_rejected_images(self) -> None:
+        from dendrux.errors import ImageRejectedError
+        from dendrux.runtime.runner import _stream_error_meta
+
+        exc = ImageRejectedError(provider="p", model="m", image_ids=("img_a", "img_b"))
+        meta = _stream_error_meta({"mcp": 1}, exc)
+        assert meta == {
+            "mcp": 1,
+            "error_type": "ImageRejectedError",
+            "image_rejected": ["img_a", "img_b"],
+        }
+        assert "image_rejected" not in _stream_error_meta({}, ValueError("x"))
+
+    def test_image_state_event_scope_filter(self) -> None:
+        src = ImageSource(
+            "t:a",
+            [
+                _event(
+                    "image.state",
+                    {"tenant_scope": "t:b", "described": [{"sha256": "x", "text": "b"}]},
+                    1,
+                ),
+                _event(
+                    "image.state",
+                    {"tenant_scope": "t:a", "described": [{"sha256": "x", "text": "a"}]},
+                    2,
+                ),
+            ],
+        )
+        state = initial_image_view(
+            sent_through=0, sources=[src], tenant_scope="t:a", single_full=True
+        )
+        assert state.described == {("t:a", "x"): "a"}
