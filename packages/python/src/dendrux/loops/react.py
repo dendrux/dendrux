@@ -2577,6 +2577,25 @@ async def _execute_record_notify(
     return tool_call, result
 
 
+_UNKNOWN_TOOL_LIST_LIMIT = 50
+
+
+def _unknown_tool_message(name: str, lookups: ToolLookups) -> str:
+    """``Unknown tool: <name>`` plus the tools the model was offered.
+
+    ``lookups.defs`` holds the same tools the request's tool defs carry
+    (local, MCP and skill tools). Sorted, at most 50 names.
+    """
+    offered = sorted(lookups.defs)
+    if not offered:
+        return f"Unknown tool: {name}. No tools are available."
+    listed = ", ".join(offered[:_UNKNOWN_TOOL_LIST_LIMIT])
+    extra = len(offered) - _UNKNOWN_TOOL_LIST_LIMIT
+    if extra > 0:
+        listed += f", … and {extra} more"
+    return f"Unknown tool: {name}. Available tools: {listed}"
+
+
 async def _execute_tool(
     tool_call: ToolCall,
     lookups: ToolLookups,
@@ -2603,12 +2622,13 @@ async def _execute_tool(
 
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
+        message = _unknown_tool_message(tool_call.name, lookups)
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,
-            payload=json.dumps({"error": f"Unknown tool: {tool_call.name}"}),
+            payload=json.dumps({"error": message}, ensure_ascii=False),
             success=False,
-            error=f"Unknown tool: {tool_call.name}",
+            error=message,
         )
 
     if isinstance(fn, SkillTool):
