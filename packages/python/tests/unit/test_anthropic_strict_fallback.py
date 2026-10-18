@@ -177,22 +177,59 @@ class TestBatchFallback:
         assert len(warned) == 1 and "lookup_code" in warned[0]
 
     @pytest.mark.parametrize(
-        ("message", "kind"),
-        [
-            (UNRELATED, "invalid_request_error"),
-            (THINKING_FORCED, "invalid_request_error"),
-            (REGEX_BUDGET.format(i=0), "invalid_request_error"),  # index 0 is not strict
-            (GRAMMAR_TOO_LARGE, "overloaded_error"),
-        ],
+        "message",
+        [UNRELATED, THINKING_FORCED, REGEX_BUDGET.format(i=0)],  # tools.0 is not strict
     )
-    async def test_unrelated_errors_raise_unchanged(
-        self, claude: AnthropicProvider, message: str, kind: str
+    async def test_unmatched_400_retries_once_without_remembering(
+        self, claude: AnthropicProvider, message: str, caplog: pytest.LogCaptureFixture
     ) -> None:
-        status = 529 if kind == "overloaded_error" else 400
-        wire = Wire(claude, (status, _error(message, kind)))
+        wire = Wire(
+            claude,
+            (400, _error(message)),
+            (200, _message_body()),
+            (200, _message_body()),
+        )
+        with caplog.at_level(logging.WARNING, logger="dendrux.llm.anthropic"):
+            result = await claude.complete(TEXT, tools=[PLAIN_TOOL, STRICT_TOOL])
+            await claude.complete(TEXT, tools=[PLAIN_TOOL, STRICT_TOOL])
+        assert result.text == "ok"
+        assert wire.tools(1) == [_legacy(PLAIN_TOOL), _legacy(STRICT_TOOL)]
+        assert result.provider_request["tools"] == wire.tools(1)
+        assert wire.tools(2)[1]["strict"] is True  # not remembered
+        assert not anthropic_mod._STRICT_REJECTED
+        warned = _warnings(caplog)
+        assert len(warned) == 1 and message[:40] in warned[0] and "lookup_code" in warned[0]
+
+    async def test_unmatched_400_second_failure_raises_second(
+        self, claude: AnthropicProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        wire = Wire(claude, (400, _error(UNRELATED)), (400, _error(THINKING_FORCED)))
+        with (
+            caplog.at_level(logging.WARNING, logger="dendrux.llm.anthropic"),
+            pytest.raises(anthropic.BadRequestError) as info,
+        ):
+            await claude.complete(TEXT, tools=[STRICT_TOOL])
+        assert THINKING_FORCED in str(info.value)
+        assert UNRELATED not in _chained(info.value)
+        assert len(wire.bodies) == 2
+        assert not anthropic_mod._STRICT_REJECTED
+        assert not _warnings(caplog)
+
+    async def test_gateway_shaped_400_retries(self, claude: AnthropicProvider) -> None:
+        wire = Wire(
+            claude,
+            (400, {"detail": "Extra inputs are not permitted: tools.0.strict"}),
+            (200, _message_body()),
+        )
+        result = await claude.complete(TEXT, tools=[STRICT_TOOL])
+        assert result.text == "ok"
+        assert wire.tools(1) == [_legacy(STRICT_TOOL)]
+
+    async def test_non_400_errors_raise_unchanged(self, claude: AnthropicProvider) -> None:
+        wire = Wire(claude, (529, _error(GRAMMAR_TOO_LARGE, "overloaded_error")))
         with pytest.raises(anthropic.APIStatusError) as info:
             await claude.complete(TEXT, tools=[PLAIN_TOOL, STRICT_TOOL])
-        assert message in str(info.value)
+        assert GRAMMAR_TOO_LARGE in str(info.value)
         assert len(wire.bodies) == 1
 
     async def test_no_strict_entries_never_retry(self, claude: AnthropicProvider) -> None:
@@ -294,10 +331,21 @@ class TestStreamFallback:
         assert events[-1].raw.provider_request["tools"] == wire.tools(1)
         assert len(_warnings(caplog)) == 1
 
-    async def test_unrelated_error_raises(self, claude: AnthropicProvider) -> None:
+    async def test_unmatched_400_retries_in_stream(
+        self, claude: AnthropicProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        wire = Wire(claude, (400, _error(UNRELATED)), (200, _stream_ok()))
+        with caplog.at_level(logging.WARNING, logger="dendrux.llm.anthropic"):
+            events = await drain(claude.complete_stream(TEXT, tools=[STRICT_TOOL]))
+        assert events[-1].type is StreamEventType.DONE
+        assert wire.tools(1) == [_legacy(STRICT_TOOL)]
+        assert not anthropic_mod._STRICT_REJECTED
+        assert len(_warnings(caplog)) == 1
+
+    async def test_no_strict_stream_error_raises(self, claude: AnthropicProvider) -> None:
         wire = Wire(claude, (400, _error(UNRELATED)))
         with pytest.raises(anthropic.BadRequestError):
-            await drain(claude.complete_stream(TEXT, tools=[STRICT_TOOL]))
+            await drain(claude.complete_stream(TEXT, tools=[PLAIN_TOOL]))
         assert len(wire.bodies) == 1
 
     async def test_retries_once_then_raises(self, claude: AnthropicProvider) -> None:
@@ -382,6 +430,87 @@ class TestPreSendDowngradeWarning:
             "required": ["d"],
         }
         with caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"):
-            AnthropicProvider._structured_output_tool(schema)
+            AnthropicProvider(model="m", api_key="k")._structured_output_tool(schema, model="m")
         assert not _warnings(caplog)
         assert any(r.levelno == logging.DEBUG for r in caplog.records)
+
+
+class TestStrictOptOut:
+    async def test_strict_false_sends_0_4_0_payloads(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        claude = AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", strict=False)
+        schema = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+        tool_use = [
+            {"type": "tool_use", "id": "t1", "name": "structured_output", "input": {"n": 1}}
+        ]
+        wire = Wire(claude, (200, _message_body()), (200, _message_body(tool_use)))
+        with caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"):
+            await claude.complete(TEXT, tools=[PLAIN_TOOL, STRICT_TOOL])
+            await claude.complete(TEXT, output_schema=schema)
+        assert wire.tools(0) == [_legacy(PLAIN_TOOL), _legacy(STRICT_TOOL)]
+        assert wire.tools(1) == [
+            {
+                "name": "structured_output",
+                "description": "Return your response in this exact format.",
+                "input_schema": schema,
+            }
+        ]
+        assert not caplog.records
+
+    async def test_strict_false_never_retries(self) -> None:
+        claude = AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", strict=False)
+        wire = Wire(claude, (400, _error(GRAMMAR_TOO_LARGE)))
+        with pytest.raises(anthropic.BadRequestError):
+            await claude.complete(TEXT, tools=[STRICT_TOOL])
+        assert len(wire.bodies) == 1
+
+
+class TestRejectedMemory:
+    async def test_keyed_by_model(self, claude: AnthropicProvider) -> None:
+        wire = Wire(
+            claude,
+            (400, _error(GRAMMAR_TOO_LARGE)),
+            (200, _message_body()),
+            (200, _message_body()),
+            (200, _message_body()),
+        )
+        await claude.complete(TEXT, tools=[STRICT_TOOL])
+        await claude.complete(TEXT, tools=[STRICT_TOOL], model="claude-haiku-4-5")
+        await claude.complete(TEXT, tools=[STRICT_TOOL])
+        assert wire.tools(2)[0]["strict"] is True  # other model still strict
+        assert wire.tools(3) == [_legacy(STRICT_TOOL)]  # same model remembered
+
+    async def test_bounded_and_evicts_oldest(
+        self, claude: AnthropicProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(anthropic_mod, "_STRICT_REJECTED_MAX", 2)
+        tools = [
+            ToolDef(name=f"t{i}", description="T", parameters=STRICT_PARAMS, strict=True)
+            for i in range(3)
+        ]
+        replies: list[tuple[int, Any]] = []
+        for _ in tools:
+            replies += [(400, _error(GRAMMAR_TOO_LARGE)), (200, _message_body())]
+        replies.append((200, _message_body()))
+        wire = Wire(claude, *replies)
+        for td in tools:
+            await claude.complete(TEXT, tools=[td])
+        assert len(anthropic_mod._STRICT_REJECTED) == 2
+        await claude.complete(TEXT, tools=tools)
+        sent = wire.tools(len(wire.bodies) - 1)
+        assert [t.get("strict") for t in sent] == [True, None, None]
+
+
+async def test_fallback_warning_redacts_echoed_image_data(
+    claude: AnthropicProvider, caplog: pytest.LogCaptureFixture
+) -> None:
+    from tests.unit.test_provider_images_errors import ECHO, LEAK_MARKERS
+
+    Wire(claude, (400, {"detail": ECHO}), (200, _message_body()))
+    with caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"):
+        await claude.complete(USER_IMAGE, tools=[STRICT_TOOL])
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "[redacted]" in logged
+    for marker in LEAK_MARKERS:
+        assert marker not in logged

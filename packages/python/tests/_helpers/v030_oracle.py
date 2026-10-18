@@ -887,8 +887,8 @@ def _v030_anthropic_tool_shape(provider: Any) -> None:
     if real_convert is None:
         return
 
-    def convert(tools: list[Any]) -> list[dict[str, Any]]:
-        out = real_convert(tools)
+    def convert(tools: list[Any], **kw: Any) -> list[dict[str, Any]]:
+        out = real_convert(tools, **kw)
         return [
             {"name": e["name"], "description": e["description"], "input_schema": td.parameters}
             if td.strict and e.get("strict") is True
