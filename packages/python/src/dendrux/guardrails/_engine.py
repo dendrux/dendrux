@@ -12,7 +12,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from dendrux.guardrails._protocol import Finding, scans_text
+from dendrux.guardrails._protocol import Finding, scans_images, scans_text
 
 if TYPE_CHECKING:
     from dendrux.guardrails._protocol import Guardrail
@@ -63,7 +63,10 @@ class GuardrailEngine:
         self._guardrails = list(guardrails)
         # Image-only guardrails (``ImageGuardrail`` without ``scan``) are
         # handled by the request view; text scanning skips them.
-        self._text_guardrails: list[Guardrail] = [g for g in self._guardrails if scans_text(g)]
+        # Objects with neither method keep the v0.3.0 failure (AttributeError).
+        self._text_guardrails: list[Guardrail] = [
+            g for g in self._guardrails if scans_text(g) or not scans_images(g)
+        ]
         # Forward: <<EMAIL_ADDRESS_1>> → real value
         self._pii_mapping: dict[str, str] = dict(pii_mapping) if pii_mapping else {}
         # Reverse: real value → <<EMAIL_ADDRESS_1>>
