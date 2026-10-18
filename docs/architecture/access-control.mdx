@@ -164,10 +164,19 @@ The run-control and read APIs take a `tenant_id=` argument that makes a call beh
 | `agent.cancel_run(run_id, cascade=True)` | Root must be in the tenant; the cascade only reaches descendants in the same tenant. | Unscoped (trusted single-tenant use). |
 | `agent.request_pause(run_id, cascade=True)` | Same. | Unscoped. |
 | `agent.submit_note(run_id, text)` | Run must be in the tenant, else `RunNotFoundError`. | Unscoped. |
+| `agent.submit_tool_results(...)`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream` | Run must be in the tenant, else `RunNotFoundError`, raised before any result, input, decision, claim, status change or event is written. | Unscoped. |
 | `RunStore.get_subtree(run_id)` | Root and every descendant must be in the tenant; others are excluded with everything below them. | Unscoped. |
 | `RunStore.get_notes(run_id)` | Run must be in the tenant, else `dendrux.store.RunNotFoundError`. | Unscoped. |
 
 `tenant_id=None` is a real value meaning "untenanted runs only", which is different from leaving the argument out. A `before_tool` hook sees the run's tenant as `ToolCallContext.tenant_id`.
+
+Since 0.4.1 the submit and resume methods take the same keyword-only `tenant_id=`. A run outside the tenant raises `RunNotFoundError`, indistinguishable from a missing run, so a caller cannot learn that another tenant's run exists. The check is a read that happens first, and a run's tenant never changes, so it cannot race. Nothing is persisted on a mismatch.
+
+```python
+await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
+```
+
+`resume_stream` differs in how it reports the failure. A scoped `resume_stream` raises `RunNotFoundError` from the first iteration, before any event, instead of yielding a `RUN_ERROR` event as the unscoped call does. A store error during the tenant check (for example a database outage) is raised from the first iteration too. Wrap the `async for` in a `try` when you pass `tenant_id=`.
 
 Passing `tenant_id` is how your route handlers keep one customer from touching another's runs. Dendrux does not decide who the caller is; derive the tenant from the authenticated request and pass it in.
 
