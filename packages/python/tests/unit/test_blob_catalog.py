@@ -357,7 +357,24 @@ async def test_full_store_triggers_one_gc_pass() -> None:
         await store_png(services, "-", make_png(15, pad=600))
 
 
-async def test_in_memory_gc_orphan_edges_and_reverts() -> None:
+def _slip_edge_after_mark(memory: InMemoryBlobCatalog, s: str) -> None:
+    from dendrux.runtime._blob_catalog import _MemEdge
+
+    real = memory.mark_deleting_row
+
+    async def mark_then_edge(*args: Any, **kwargs: Any) -> tuple[str, str] | None:
+        marked = await real(*args, **kwargs)
+        memory._run_scopes["R2"] = "-"
+        memory._add_edge(
+            ("R2", "seed", "seed", 0),
+            _MemEdge(BlobEdge("-", s, "seed", "seed", 0), "R2", part_created()),
+        )
+        return marked
+
+    memory.mark_deleting_row = mark_then_edge  # type: ignore[method-assign]
+
+
+async def test_in_memory_orphan_edges() -> None:
     services = BlobServices.in_memory()
     memory = services.memory
     assert memory is not None
@@ -366,26 +383,49 @@ async def test_in_memory_gc_orphan_edges_and_reverts() -> None:
     await memory.add_blob_refs("R", "-", [BlobEdge("-", s, "input", "input", 0)])
     memory._run_scopes.pop("R")  # run gone without release
     assert await memory.delete_orphan_edges(10) == 1
-    # Edge appears after mark_deleting: reverted, counted, object kept.
+    assert await memory.has_edges("-", s) is False
+    assert memory._by_blob == {} and memory._by_run == {}
+
+
+async def test_gc_edge_after_mark_external_stays_deleting() -> None:
+    """P2-1: never revert an external row (an ingest may have deleted its object)."""
+    services = BlobServices.in_memory()
+    memory = services.memory
+    assert memory is not None
+    part = await store_png(services, "-", make_png(17))
+    s = part.ref.sha256
     _age(services, "-", s, 30)
-    real = memory.mark_deleting
-
-    async def mark_then_edge(*args: Any, **kwargs: Any) -> str | None:
-        gen = await real(*args, **kwargs)
-        memory._run_scopes["R2"] = "-"
-        from dendrux.runtime._blob_catalog import _MemEdge
-
-        memory._edges[("R2", "seed", "seed", 0)] = _MemEdge(
-            BlobEdge("-", s, "seed", "seed", 0), "R2", part_created()
-        )
-        return gen
-
-    memory.mark_deleting = mark_then_edge  # type: ignore[method-assign]
+    _slip_edge_after_mark(memory, s)
     result = await services.accessor.collect_garbage()
     assert result.skipped_referenced == 1 and result.deleted_blobs == 0
     info = await memory.get_row("-", s)
+    assert info is not None and info.state == "deleting"
+    assert len(services.blob_store.inner.object_names()) == 1  # type: ignore[union-attr]
+    # Not listed for recovery while referenced (no starvation), and a re-ingest revives it.
+    assert await memory.stuck_rows(part_created(), 10) == []
+    assert (await store_png(services, "-", make_png(17))).ref == part.ref
+    assert await services.accessor.read(part.ref) == make_png(17)
+
+
+async def test_gc_edge_after_mark_db_storage_reverts() -> None:
+    catalog = InMemoryBlobCatalog()
+    rt = ImageRuntime(
+        policy=ImagePolicy(), catalog=catalog, blob_store=None, resolver=None, tenant_scope="-"
+    )
+    data = make_png(18)
+    (part,) = await ingest([Image.from_bytes(data)], policy=rt.policy, runtime=rt, origin="user")
+    s = part.ref.sha256
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    row = catalog._rows[("-", s)]
+    row.info = replace(row.info, last_used_at=datetime.now(UTC) - timedelta(hours=30))
+    _slip_edge_after_mark(catalog, s)
+    result = await CatalogBlobAccessor(catalog).collect_garbage()
+    assert result.skipped_referenced == 1
+    info = await catalog.get_row("-", s)
     assert info is not None and info.state == "live"
-    assert await services.accessor.read(part.ref) is not None
+    assert await CatalogBlobAccessor(catalog).read(part.ref) == data
 
 
 def part_created() -> Any:
@@ -491,6 +531,7 @@ async def test_recorder_llm_interaction_parts_stats_and_scrub() -> None:
         model="claude-sonnet-4-6",
         provider_name="AnthropicProvider",
         tenant_scope="t:acme",
+        provider=_SurfaceProvider("anthropic"),
     )
     png = make_png(20)
     ref = ImageRef(
@@ -543,19 +584,33 @@ async def test_recorder_text_only_llm_interaction_untouched() -> None:
     assert "image_stats" not in kwargs["semantic_request"]
 
 
-def test_image_stats_unknown_family_is_none() -> None:
+class _SurfaceProvider:
+    def __init__(self, surface: str) -> None:
+        self.surface = surface
+
+    def image_capability_key(self, model: str) -> tuple[str, str, str]:
+        return (self.surface, "", model)
+
+
+def test_image_stats_family_from_capability_key() -> None:
     msgs = [Message.with_parts(Role.USER, [ImagePart(_ref())])]
-    assert image_stats(msgs, provider_name="MockLLM", model="m") == {
-        "count": 1,
-        "bytes": 1000,
-        "estimated_tokens": None,
-    }
-    assert (
-        image_stats([Message(role=Role.USER, content="x")], provider_name=None, model=None) is None
-    )
-    stats = image_stats(
-        msgs, provider_name="OpenRouterProvider", model="anthropic/claude-haiku-4.5"
-    )
+    unknown = {"count": 1, "bytes": 1000, "estimated_tokens": None}
+    assert image_stats(msgs, provider=None, model="claude-sonnet-4-6") == unknown
+    assert image_stats(msgs, provider=object(), model="claude-sonnet-4-6") == unknown
+    assert image_stats(msgs, provider=_SurfaceProvider("CustomLLM"), model="m") == unknown
+    assert image_stats([Message(role=Role.USER, content="x")], provider=None, model=None) is None
+    for surface, model in (
+        ("anthropic", "claude-sonnet-4-6"),
+        ("openrouter", "anthropic/claude-haiku-4.5"),
+    ):
+        stats = image_stats(msgs, provider=_SurfaceProvider(surface), model=model)
+        assert stats is not None and stats["estimated_tokens"] == 120
+    stats = image_stats(msgs, provider=_SurfaceProvider("chat"), model="gpt-5-mini")
+    assert stats is not None and stats["estimated_tokens"] == 110
+    from dendrux.llm.anthropic import AnthropicProvider
+
+    real = AnthropicProvider(model="claude-sonnet-4-6", api_key="sk-test")
+    stats = image_stats(msgs, provider=real, model="claude-sonnet-4-6")
     assert stats is not None and stats["estimated_tokens"] == 120
 
 
@@ -573,3 +628,144 @@ def test_edges_for_parts_and_scrub_edge_cases() -> None:
     assert scrub_inline_images(same) is same
     bad = scrub_inline_images({"type": "base64", "data": "!!!"})
     assert bad == {"type": "base64", "data": "dendrux-image:redacted"}
+
+
+# ---------------------------------------------------------------------------
+# Fix round (review-B)
+# ---------------------------------------------------------------------------
+
+
+class _PgError(Exception):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(f"pg error {sqlstate}")
+        self.sqlstate = sqlstate
+
+
+async def test_retry_treats_deadlock_and_serialization_as_transient(monkeypatch) -> None:
+    from sqlalchemy.exc import DBAPIError, IntegrityError
+
+    import dendrux.runtime.durability as durability
+
+    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0.0)
+    for code in ("40P01", "40001"):
+        calls: list[int] = []
+
+        async def flaky(code: str = code, calls: list[int] = calls) -> str:
+            calls.append(1)
+            if len(calls) == 1:
+                raise DBAPIError("UPDATE dendrux_blobs", None, _PgError(code))
+            return "ok"
+
+        assert await durability.retry_transient_db(flaky, label="t", run_id="r") == "ok"
+        assert len(calls) == 2
+    for exc in (
+        DBAPIError("x", None, _PgError("23505")),
+        IntegrityError("x", None, _PgError("23503")),
+    ):
+        calls = []
+
+        async def fails(exc: Exception = exc, calls: list[int] = calls) -> None:
+            calls.append(1)
+            raise exc
+
+        with pytest.raises(type(exc)):
+            await durability.retry_transient_db(fails, label="t", run_id="r")
+        assert len(calls) == 1
+    assert durability.is_transient_db_error(DBAPIError("x", None, _PgError("40P01")))
+    assert not durability.is_transient_db_error(ValueError("x"))
+
+
+async def test_purge_evicts_resolver_cache() -> None:
+    services = BlobServices.in_memory()
+    part = await store_png(services, "-", make_png(30))
+    assert await services.accessor.read(part.ref)
+    resolver = services.resolver
+    assert isinstance(resolver, CachingBlobResolver) and resolver.cached_bytes > 0
+    assert await services.accessor.purge(part.ref.sha256)
+    assert resolver.cached_bytes == 0
+
+
+async def test_purge_external_without_store_records_intent_first() -> None:
+    services = BlobServices.in_memory()
+    part = await store_png(services, "-", make_png(31))
+    s = part.ref.sha256
+    bare = CatalogBlobAccessor(services.catalog)
+    with pytest.raises(ImagePersistenceUnsupportedError) as info:
+        await bare.purge(s, reason="erase")
+    assert info.value.reason == "blob_store_not_configured"
+    row = await services.catalog.get_row("-", s)  # type: ignore[union-attr]
+    assert row is not None and row.state == "purging"  # bytes unreadable, re-ingest blocked
+    with pytest.raises(InvalidImageError):
+        await store_png(services, "-", make_png(31))
+    # GC without a store leaves it alone; with the store it finishes the purge.
+    assert (await bare.collect_garbage()).completed_purges == 0
+    assert (await services.accessor.collect_garbage()).completed_purges == 1
+    assert services.blob_store.inner.object_names() == []  # type: ignore[union-attr]
+    assert await services.accessor.purge(s) is True
+
+
+async def test_mark_purging_row_reports_storage() -> None:
+    services = BlobServices.in_memory()
+    part = await store_png(services, "-", make_png(32))
+    memory = services.memory
+    assert memory is not None
+    marked = await memory.mark_purging_row("-", part.ref.sha256, None)
+    assert marked is not None and marked[1] == "external"
+    assert await memory.mark_purging_row("-", part.ref.sha256, None) is None
+
+
+async def test_in_memory_owner_key_collision_is_typed() -> None:
+    services = BlobServices.in_memory()
+    memory = services.memory
+    assert memory is not None
+    a = (await store_png(services, "-", make_png(33))).ref.sha256
+    b = (await store_png(services, "-", make_png(34))).ref.sha256
+    await memory.add_blob_refs("R", "-", [BlobEdge("-", a, "trace", "0", 0)])
+    await memory.add_blob_refs("R", "-", [BlobEdge("-", a, "trace", "0", 0)])  # retry: no-op
+    with pytest.raises(BlobNotFoundError):
+        await memory.add_blob_refs("R", "-", [BlobEdge("-", b, "trace", "0", 0)])
+    with pytest.raises(ValueError):
+        await memory.add_blob_refs(
+            "R", "-", [BlobEdge("-", a, "trace", "1", 0), BlobEdge("-", b, "trace", "1", 0)]
+        )
+    assert [r.owner_id for r in await memory.blob_references("-", a)] == ["0"]
+    assert await memory.blob_references("-", b) == []
+
+
+def test_scrub_covers_all_inline_shapes() -> None:
+    png = make_png(40, pad=300)
+    b64 = base64.b64encode(png).decode()
+    marker = "dendrux-image:sha256:" + sha(png)
+    request = {
+        "a": f"data:image/png;base64,{b64}",  # plain data URL
+        "b": f"data:image/png;charset=utf-8;base64,{b64}",  # with parameters
+        "c": f"data:application/octet-stream;base64,{b64}",  # non-image media type
+        "d": {"type": "base64", "media_type": "image/png", "data": b64},  # Anthropic source
+        "e": b64,  # bare base64 value
+        "f": f"see this: {b64} (inline)",  # embedded in text
+        "g": "short text, not base64",
+        "h": "x" * 50,
+    }
+    out = scrub_inline_images(request)
+    assert out["a"] == out["b"] == out["c"] == out["e"] == marker
+    assert out["d"]["data"] == marker
+    assert out["f"] == f"see this: {marker} (inline)"
+    assert out["g"] is request["g"] and out["h"] is request["h"]
+    dumped = json.dumps(out)
+    assert b64[:40] not in dumped and "base64,i" not in dumped
+    tiny = "data:image/gif;base64,R0lGODlhAQABAAAAACw="
+    assert scrub_inline_images(tiny).startswith("dendrux-image:")
+    long_text = "word " * 100
+    assert scrub_inline_images(long_text) is long_text
+
+
+async def test_in_memory_trace_edges_skip_non_live() -> None:
+    services = BlobServices.in_memory()
+    memory = services.memory
+    assert memory is not None
+    s = (await store_png(services, "-", make_png(41))).ref.sha256
+    assert await services.accessor.purge(s)
+    await memory.add_blob_refs("R", "-", [BlobEdge("-", s, "trace", "0", 0)])
+    assert await memory.blob_references("-", s) == []
+    with pytest.raises(InvalidImageError):
+        await memory.add_blob_refs("R", "-", [BlobEdge("-", s, "seed", "seed", 0)])

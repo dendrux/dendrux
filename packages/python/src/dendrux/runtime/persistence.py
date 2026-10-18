@@ -91,19 +91,34 @@ def image_dict(image: object) -> dict[str, Any]:
     )
 
 
-def _provider_family(provider_name: str | None) -> str | None:
-    name = (provider_name or "").lower()
-    if "openrouter" in name:
-        return "openrouter"
-    if "anthropic" in name:
-        return "anthropic"
-    if "openai" in name:
-        return "openai"
-    return None
+# image_capability_key() api_surface -> estimate_image_tokens provider family.
+_SURFACE_FAMILY = {
+    "anthropic": "anthropic",
+    "chat": "openai",
+    "responses": "openai",
+    "openrouter": "openrouter",
+}
+
+
+def provider_family(provider: Any, model: str | None) -> str | None:
+    """Token-estimate family of ``provider`` (from its image capability key), or None.
+
+    Uses ``provider.image_capability_key(model)[0]`` (the API surface the
+    built-in adapters report); a custom provider without a known surface
+    gives None, so estimates stay unknown rather than guessed.
+    """
+    key_fn = getattr(provider, "image_capability_key", None)
+    if key_fn is None or not model:
+        return None
+    try:
+        surface = key_fn(model)[0]
+    except Exception:
+        return None
+    return _SURFACE_FAMILY.get(surface) if isinstance(surface, str) else None
 
 
 def image_stats(
-    messages: Sequence[Message], *, provider_name: str | None, model: str | None
+    messages: Sequence[Message], *, provider: Any = None, model: str | None
 ) -> dict[str, Any] | None:
     """``{"count", "bytes", "estimated_tokens"}`` over the visible images of a request.
 
@@ -118,7 +133,7 @@ def image_stats(
     ]
     if not parts:
         return None
-    family = _provider_family(provider_name)
+    family = provider_family(provider, model)
     total: int | None = 0
     for p in parts:
         est = (
@@ -149,6 +164,11 @@ class PersistenceRecorder(BaseRecorder):
 
     The loop calls record_* helpers which let exceptions from this class
     propagate. If a fail-closed write fails, the run stops.
+
+    ``tenant_scope`` (0.4.0) scopes every blob edge this recorder writes;
+    ``None`` is valid only for runs without images. ``provider`` (the run's
+    LLM provider) lets ``semantic_request.image_stats`` estimate image tokens
+    from its ``image_capability_key``; without it the estimate is ``None``.
     """
 
     def __init__(
@@ -162,9 +182,11 @@ class PersistenceRecorder(BaseRecorder):
         initial_order_index: int = 0,
         event_sequencer: Any | None = None,
         tenant_scope: str | None = None,
+        provider: Any | None = None,
     ) -> None:
         self._store = state_store
         self._tenant_scope = tenant_scope
+        self._provider = provider
         self._run_id = run_id
         self._model = model
         self._provider_name = provider_name
@@ -281,7 +303,7 @@ class PersistenceRecorder(BaseRecorder):
             if has_parts:
                 stats = image_stats(
                     semantic_messages,
-                    provider_name=self._provider_name,
+                    provider=self._provider,
                     model=response.model or self._model,
                 )
                 if stats is not None:

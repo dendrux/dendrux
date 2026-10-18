@@ -51,6 +51,7 @@ from dendrux.media._store import (
     GcResult,
     InMemoryBlobStore,
 )
+from dendrux.runtime.durability import retry_transient_db
 from dendrux.types import ImagePart, ImageRef, generate_ulid
 
 if TYPE_CHECKING:
@@ -206,6 +207,32 @@ def _dialect_insert(dialect_name: str, table: Any) -> Any:
     return sqlite_insert(table)
 
 
+async def _lock_in_sha_order(
+    session: Any, dialect_name: str, scope: str, shas: Sequence[str]
+) -> None:
+    """Postgres: lock the blob rows in ``sha256`` order before a multi-row UPDATE.
+
+    A multi-row ``UPDATE ... WHERE sha256 IN (...)`` locks rows in plan order,
+    so two transactions claiming overlapping sets can deadlock. Taking
+    ``FOR NO KEY UPDATE`` row locks in one global order first makes the
+    following UPDATE wait instead. ``NO KEY UPDATE`` does not conflict with
+    the ``KEY SHARE`` locks foreign-key checks take. SQLite serialises writers
+    on the database lock and needs nothing.
+    """
+    if dialect_name != "postgresql" or not shas:
+        return
+    from sqlalchemy import select
+
+    from dendrux.db.models import Blob
+
+    await session.execute(
+        select(Blob.sha256)
+        .where(Blob.tenant_scope == scope, Blob.sha256.in_(list(shas)))
+        .order_by(Blob.sha256)
+        .with_for_update(key_share=True)
+    )
+
+
 def _tenant_matches(column: Any, scope: str) -> Any:
     """SQL predicate: ``agent_runs.tenant_id`` belongs to ``scope``."""
     if scope == "-":
@@ -266,44 +293,54 @@ class SQLBlobCatalog:
         return out
 
     async def touch_live(self, scope: str, sha256s: Sequence[str]) -> dict[str, BlobInfo]:
+        shas = sorted(set(sha256s))
+        if not shas:
+            return {}
+
+        async def _attempt() -> dict[str, BlobInfo]:
+            out: dict[str, BlobInfo] = {}
+            async with self._session_factory() as session:
+                await self._touch_live_in(session, scope, shas, out)
+                await session.commit()
+            return out
+
+        return await retry_transient_db(_attempt, label="touch_live", run_id="-")
+
+    async def _touch_live_in(
+        self, session: Any, scope: str, shas: list[str], out: dict[str, BlobInfo]
+    ) -> None:
         from sqlalchemy import select, update
 
         from dendrux.db.models import Blob
 
-        shas = list(dict.fromkeys(sha256s))
-        out: dict[str, BlobInfo] = {}
-        if not shas:
-            return out
-        async with self._session_factory() as session:
-            now = _db_now(self._dialect)
-            for chunk in _chunks(shas):
-                stmt = (
-                    update(Blob)
-                    .where(
+        now = _db_now(self._dialect)
+        for chunk in _chunks(shas):
+            await _lock_in_sha_order(session, self._dialect, scope, chunk)
+            stmt = (
+                update(Blob)
+                .where(
+                    Blob.tenant_scope == scope,
+                    Blob.sha256.in_(chunk),
+                    Blob.state == "live",
+                )
+                .values(last_used_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if self._engine.dialect.update_returning:
+                rows = await session.execute(stmt.returning(*_blob_info_columns()))
+                for row in rows:
+                    out[row.sha256] = _row_to_info(row)
+            else:  # pragma: no cover - every supported backend has RETURNING
+                await session.execute(stmt)
+                rows = await session.execute(
+                    select(*_blob_info_columns()).where(
                         Blob.tenant_scope == scope,
                         Blob.sha256.in_(chunk),
                         Blob.state == "live",
                     )
-                    .values(last_used_at=now)
-                    .execution_options(synchronize_session=False)
                 )
-                if self._engine.dialect.update_returning:
-                    rows = await session.execute(stmt.returning(*_blob_info_columns()))
-                    for row in rows:
-                        out[row.sha256] = _row_to_info(row)
-                else:  # pragma: no cover - every supported backend has RETURNING
-                    await session.execute(stmt)
-                    rows = await session.execute(
-                        select(*_blob_info_columns()).where(
-                            Blob.tenant_scope == scope,
-                            Blob.sha256.in_(chunk),
-                            Blob.state == "live",
-                        )
-                    )
-                    for row in rows:
-                        out[row.sha256] = _row_to_info(row)
-            await session.commit()
-        return out
+                for row in rows:
+                    out[row.sha256] = _row_to_info(row)
 
     # --- lifecycle --------------------------------------------------------
 
@@ -448,6 +485,25 @@ class SQLBlobCatalog:
     async def mark_deleting(
         self, scope: str, sha256: str, cutoff: datetime, *, stale_pending_cutoff: datetime
     ) -> str | None:
+        marked = await self.mark_deleting_row(
+            scope, sha256, cutoff, stale_pending_cutoff=stale_pending_cutoff
+        )
+        return None if marked is None else marked[0]
+
+    async def mark_deleting_row(
+        self, scope: str, sha256: str, cutoff: datetime, *, stale_pending_cutoff: datetime
+    ) -> tuple[str, str] | None:
+        """:meth:`mark_deleting` returning ``(generation, storage)`` of the marked row.
+
+        On Postgres the ``last_used_at < cutoff`` predicate is the real guard
+        against a concurrent edge claim: an UPDATE that waited on the claimed
+        row re-evaluates its WHERE against the new row version (the claim
+        refreshed ``last_used_at``), but the ``NOT EXISTS`` subquery keeps the
+        statement snapshot and cannot see the just-committed edge. Correctness
+        therefore relies on the GC grace (``MIN_GC_AGE``, 1 h) exceeding any
+        edge transaction; never lower it. The edge re-check and ``delete_row``'s
+        ``NOT EXISTS`` (and the FK RESTRICT) are the backstops.
+        """
         from sqlalchemy import and_, or_, update
 
         from dendrux.db.models import Blob
@@ -464,13 +520,13 @@ class SQLBlobCatalog:
                 self._no_edge(scope, sha256),
             )
             .values(state="deleting", state_changed_at=_db_now(self._dialect))
-            .returning(Blob.generation)
+            .returning(Blob.generation, Blob.storage)
             .execution_options(synchronize_session=False)
         )
         async with self._session_factory() as session:
             row = (await session.execute(stmt)).first()
             await session.commit()
-        return None if row is None else str(row.generation)
+        return None if row is None else (str(row.generation), str(row.storage))
 
     async def revert_deleting(self, scope: str, sha256: str, generation: str) -> bool:
         """``deleting → live`` for this generation (GC lost a race at the edge re-check)."""
@@ -508,6 +564,13 @@ class SQLBlobCatalog:
         return bool(result.rowcount == 1)
 
     async def mark_purging(self, scope: str, sha256: str, reason: str | None) -> str | None:
+        marked = await self.mark_purging_row(scope, sha256, reason)
+        return None if marked is None else marked[0]
+
+    async def mark_purging_row(
+        self, scope: str, sha256: str, reason: str | None
+    ) -> tuple[str, str] | None:
+        """:meth:`mark_purging` returning ``(generation, storage)`` of the row it updated."""
         from sqlalchemy import update
 
         from dendrux.db.models import Blob
@@ -527,13 +590,13 @@ class SQLBlobCatalog:
                 purge_reason=reason,
                 state_changed_at=now,
             )
-            .returning(Blob.generation)
+            .returning(Blob.generation, Blob.storage)
             .execution_options(synchronize_session=False)
         )
         async with self._session_factory() as session:
             row = (await session.execute(stmt)).first()
             await session.commit()
-        return None if row is None else str(row.generation)
+        return None if row is None else (str(row.generation), str(row.storage))
 
     async def finish_purge(self, scope: str, sha256: str, generation: str) -> None:
         from dendrux.db.models import Blob
@@ -548,19 +611,37 @@ class SQLBlobCatalog:
             {"state": "purged", "state_changed_at": _db_now(self._dialect)},
         )
 
-    async def stuck_rows(self, older_than: datetime, limit: int) -> list[BlobInfo]:
-        from sqlalchemy import and_, or_, select
+    async def stuck_rows(
+        self, older_than: datetime, limit: int, *, include_external: bool = True
+    ) -> list[BlobInfo]:
+        """Rows a crash left mid-transition that recovery can act on.
 
-        from dendrux.db.models import Blob
+        ``purging`` rows, ``deleting`` rows without edges (with edges they wait
+        for a revive, so listing them would starve the page) and stale
+        ``pending`` rows; ``include_external=False`` drops externally stored
+        rows (no blob store to delete their objects).
+        """
+        from sqlalchemy import and_, exists, or_, select
 
+        from dendrux.db.models import Blob, BlobRef
+
+        no_edge = ~exists(
+            select(BlobRef.id).where(
+                BlobRef.tenant_scope == Blob.tenant_scope, BlobRef.sha256 == Blob.sha256
+            )
+        )
+        where = [
+            or_(
+                Blob.state == "purging",
+                and_(Blob.state == "deleting", no_edge),
+                and_(Blob.state == "pending", Blob.state_changed_at < older_than),
+            )
+        ]
+        if not include_external:
+            where.append(Blob.storage != "external")
         stmt = (
             select(Blob.tenant_scope, *_blob_info_columns())
-            .where(
-                or_(
-                    Blob.state.in_(("deleting", "purging")),
-                    and_(Blob.state == "pending", Blob.state_changed_at < older_than),
-                )
-            )
+            .where(*where)
             .order_by(Blob.state_changed_at, Blob.tenant_scope, Blob.sha256)
             .limit(limit)
         )
@@ -568,7 +649,9 @@ class SQLBlobCatalog:
             rows = (await session.execute(stmt)).all()
         return [_ScopedInfo.of(row.tenant_scope, _row_to_info(row)) for row in rows]
 
-    async def gc_candidates(self, cutoff: datetime, limit: int) -> list[BlobInfo]:
+    async def gc_candidates(
+        self, cutoff: datetime, limit: int, *, include_external: bool = True
+    ) -> list[BlobInfo]:
         """Live rows unused since ``cutoff`` and stale pending rows, all without edges."""
         from sqlalchemy import and_, exists, or_, select
 
@@ -587,6 +670,7 @@ class SQLBlobCatalog:
                     and_(Blob.state == "pending", Blob.state_changed_at < cutoff),
                 ),
                 no_edge,
+                *([] if include_external else [Blob.storage != "external"]),
             )
             .order_by(Blob.last_used_at, Blob.tenant_scope, Blob.sha256)
             .limit(limit)
@@ -635,11 +719,15 @@ class SQLBlobCatalog:
     async def add_blob_refs(self, run_id: str, run_scope: str, edges: Sequence[BlobEdge]) -> None:
         if not edges:
             return
-        async with self._session_factory() as session:
-            await write_blob_refs(
-                session, run_id=run_id, blob_refs=edges, blob_refs_scope=run_scope
-            )
-            await session.commit()
+
+        async def _attempt() -> None:
+            async with self._session_factory() as session:
+                await write_blob_refs(
+                    session, run_id=run_id, blob_refs=edges, blob_refs_scope=run_scope
+                )
+                await session.commit()
+
+        await retry_transient_db(_attempt, label="add_blob_refs", run_id=run_id)
 
     async def run_references(self, run_scope: str, run_id: str, sha256: str) -> bool:
         from sqlalchemy import select
@@ -796,12 +884,15 @@ async def write_blob_refs(
             _log_mismatch(run_id, edge.owner_kind)
             raise BlobNotFoundError(image_id(edge.sha256))
 
-    # 2. Claim the blob rows with a write.
+    _check_batch_owner_keys(blob_refs)
+
+    # 2. Claim the blob rows with a write (rows locked in sha order first on PG).
     dialect = session.bind.dialect
-    shas = list(dict.fromkeys(e.sha256 for e in blob_refs))
+    shas = sorted({e.sha256 for e in blob_refs})
     now = _db_now(dialect.name)
     claimed: set[str] = set()
     for chunk in _chunks(shas):
+        await _lock_in_sha_order(session, dialect.name, run_scope, chunk)
         stmt = (
             update(Blob)
             .where(Blob.tenant_scope == run_scope, Blob.sha256.in_(chunk), Blob.state == "live")
@@ -823,6 +914,21 @@ async def write_blob_refs(
                 )
             )
     missing = [s for s in shas if s not in claimed]
+    # Trace edges skip a blob that is no longer live (a purged image in a
+    # retried/replayed trace): its input/submission/seed edge already holds
+    # reachability and history shows the purge placeholder. Every other
+    # owner kind needs the blob live.
+    required = [
+        s for s in missing if any(e.sha256 == s and e.owner_kind != "trace" for e in blob_refs)
+    ]
+    if missing and not required:
+        logger.info(
+            "Blob edges skipped for %d non-live image(s) in a trace (run=%s)", len(missing), run_id
+        )
+        blob_refs = [e for e in blob_refs if e.sha256 in claimed]
+        if not blob_refs:
+            return
+    missing = required
     if missing:
         states = {
             r.sha256: r.state
@@ -859,6 +965,48 @@ async def write_blob_refs(
     )
     await session.execute(stmt_ins)
 
+    # An owner key that already names a different blob is a collision, never a
+    # silent no-op (the new record's image would otherwise have no edge).
+    from sqlalchemy import tuple_
+
+    wanted = {(e.owner_kind, e.owner_id, e.ordinal): (e.tenant_scope, e.sha256) for e in blob_refs}
+    keys = list(wanted)
+    for i in range(0, len(keys), _IN_CHUNK):
+        part = keys[i : i + _IN_CHUNK]
+        stored = await session.execute(
+            select(
+                BlobRef.owner_kind,
+                BlobRef.owner_id,
+                BlobRef.ordinal,
+                BlobRef.tenant_scope,
+                BlobRef.sha256,
+            ).where(
+                BlobRef.run_id == run_id,
+                tuple_(BlobRef.owner_kind, BlobRef.owner_id, BlobRef.ordinal).in_(part),
+            )
+        )
+        for r in stored:
+            if wanted[(r.owner_kind, r.owner_id, int(r.ordinal))] != (r.tenant_scope, r.sha256):
+                logger.error(
+                    "Blob edge write rejected: owner key already references another image "
+                    "(run=%s owner_kind=%s owner_id=%s ordinal=%s)",
+                    run_id,
+                    r.owner_kind,
+                    r.owner_id,
+                    r.ordinal,
+                )
+                raise BlobNotFoundError(
+                    image_id(wanted[(r.owner_kind, r.owner_id, int(r.ordinal))][1])
+                )
+
+
+def _check_batch_owner_keys(edges: Sequence[BlobEdge]) -> None:
+    seen: dict[tuple[str, str, int], str] = {}
+    for edge in edges:
+        prior = seen.setdefault((edge.owner_kind, edge.owner_id, edge.ordinal), edge.sha256)
+        if prior != edge.sha256:
+            raise ValueError("blob_refs repeats an owner key with different images")
+
 
 def _log_mismatch(run_id: str, owner_kind: str) -> None:
     logger.error(
@@ -893,14 +1041,38 @@ class InMemoryBlobCatalog:
     tracked per run in memory: the runtime registers them with
     :meth:`add_blob_refs` and drops them with :meth:`release_run` when the
     run reaches a terminal state (runs without a database cannot pause).
-    Every method is atomic (a lock, no awaits inside).
+    Every method is atomic (a lock, no awaits inside). Edges are indexed by
+    blob and by run, so GC and release cost O(rows) and O(edges of the run).
     """
 
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str], _MemRow] = {}
         self._edges: dict[tuple[str, str, str, int], _MemEdge] = {}
+        self._by_blob: dict[tuple[str, str], set[tuple[str, str, str, int]]] = {}
+        self._by_run: dict[str, set[tuple[str, str, str, int]]] = {}
         self._run_scopes: dict[str, str] = {}
         self._lock = threading.Lock()
+
+    def _add_edge(self, key: tuple[str, str, str, int], edge: _MemEdge) -> None:
+        self._edges[key] = edge
+        self._by_blob.setdefault((edge.edge.tenant_scope, edge.edge.sha256), set()).add(key)
+        self._by_run.setdefault(edge.run_id, set()).add(key)
+
+    def _drop_edge(self, key: tuple[str, str, str, int]) -> None:
+        edge = self._edges.pop(key, None)
+        if edge is None:
+            return
+        blob_key = (edge.edge.tenant_scope, edge.edge.sha256)
+        by_blob = self._by_blob.get(blob_key)
+        if by_blob is not None:
+            by_blob.discard(key)
+            if not by_blob:
+                del self._by_blob[blob_key]
+        by_run = self._by_run.get(edge.run_id)
+        if by_run is not None:
+            by_run.discard(key)
+            if not by_run:
+                del self._by_run[edge.run_id]
 
     async def current_time(self) -> datetime:
         return _py_now()
@@ -912,9 +1084,7 @@ class InMemoryBlobCatalog:
         row.data = data
 
     def _edged(self, scope: str, sha256: str) -> bool:
-        return any(
-            e.edge.tenant_scope == scope and e.edge.sha256 == sha256 for e in self._edges.values()
-        )
+        return bool(self._by_blob.get((scope, sha256)))
 
     async def get_current(self, scope: str, sha256s: Sequence[str]) -> dict[str, BlobInfo]:
         with self._lock:
@@ -1053,6 +1223,14 @@ class InMemoryBlobCatalog:
     async def mark_deleting(
         self, scope: str, sha256: str, cutoff: datetime, *, stale_pending_cutoff: datetime
     ) -> str | None:
+        marked = await self.mark_deleting_row(
+            scope, sha256, cutoff, stale_pending_cutoff=stale_pending_cutoff
+        )
+        return None if marked is None else marked[0]
+
+    async def mark_deleting_row(
+        self, scope: str, sha256: str, cutoff: datetime, *, stale_pending_cutoff: datetime
+    ) -> tuple[str, str] | None:
         with self._lock:
             row = self._rows.get((scope, sha256))
             if row is None or self._edged(scope, sha256):
@@ -1065,7 +1243,7 @@ class InMemoryBlobCatalog:
             if not eligible:
                 return None
             self._set((scope, sha256), state="deleting", state_changed_at=_py_now())
-            return info.generation
+            return info.generation, info.storage
 
     async def revert_deleting(self, scope: str, sha256: str, generation: str) -> bool:
         with self._lock:
@@ -1097,6 +1275,12 @@ class InMemoryBlobCatalog:
             return True
 
     async def mark_purging(self, scope: str, sha256: str, reason: str | None) -> str | None:
+        marked = await self.mark_purging_row(scope, sha256, reason)
+        return None if marked is None else marked[0]
+
+    async def mark_purging_row(
+        self, scope: str, sha256: str, reason: str | None
+    ) -> tuple[str, str] | None:
         with self._lock:
             now = _py_now()
             before = self._cas(
@@ -1110,7 +1294,7 @@ class InMemoryBlobCatalog:
                 purge_reason=reason,
                 state_changed_at=now,
             )
-            return None if before is None else before.generation
+            return None if before is None else (before.generation, before.storage)
 
     async def finish_purge(self, scope: str, sha256: str, generation: str) -> None:
         with self._lock:
@@ -1123,23 +1307,33 @@ class InMemoryBlobCatalog:
                 state_changed_at=_py_now(),
             )
 
-    async def stuck_rows(self, older_than: datetime, limit: int) -> list[BlobInfo]:
-        with self._lock:
-            out: list[BlobInfo] = []
-            for (scope, _sha), row in self._rows.items():
-                info = row.info
-                changed = info.state_changed_at or info.last_used_at
-                if info.state in ("deleting", "purging") or (
-                    info.state == "pending" and changed < older_than
-                ):
-                    out.append(_ScopedInfo.of(scope, info))
-            return out[:limit]
-
-    async def gc_candidates(self, cutoff: datetime, limit: int) -> list[BlobInfo]:
+    async def stuck_rows(
+        self, older_than: datetime, limit: int, *, include_external: bool = True
+    ) -> list[BlobInfo]:
         with self._lock:
             out: list[BlobInfo] = []
             for (scope, sha), row in self._rows.items():
                 info = row.info
+                if not include_external and info.storage == "external":
+                    continue
+                changed = info.state_changed_at or info.last_used_at
+                if (
+                    info.state == "purging"
+                    or (info.state == "deleting" and not self._edged(scope, sha))
+                    or (info.state == "pending" and changed < older_than)
+                ):
+                    out.append(_ScopedInfo.of(scope, info))
+            return out[:limit]
+
+    async def gc_candidates(
+        self, cutoff: datetime, limit: int, *, include_external: bool = True
+    ) -> list[BlobInfo]:
+        with self._lock:
+            out: list[BlobInfo] = []
+            for (scope, sha), row in self._rows.items():
+                info = row.info
+                if not include_external and info.storage == "external":
+                    continue
                 changed = info.state_changed_at or info.last_used_at
                 old = (info.state == "live" and info.last_used_at < cutoff) or (
                     info.state == "pending" and changed < cutoff
@@ -1175,33 +1369,54 @@ class InMemoryBlobCatalog:
             ):
                 _log_mismatch(run_id, edges[0].owner_kind)
                 raise BlobNotFoundError(image_id(edges[0].sha256))
+            _check_batch_owner_keys(edges)
+            for e in edges:
+                key = (run_id, e.owner_kind, e.owner_id, e.ordinal)
+                existing = self._edges.get(key)
+                if existing is not None and (
+                    existing.edge.tenant_scope,
+                    existing.edge.sha256,
+                ) != (e.tenant_scope, e.sha256):
+                    logger.error(
+                        "Blob edge write rejected: owner key already references another image "
+                        "(run=%s owner_kind=%s)",
+                        run_id,
+                        e.owner_kind,
+                    )
+                    raise BlobNotFoundError(image_id(e.sha256))
+            live: list[BlobEdge] = []
             for e in edges:
                 row = self._rows.get((run_scope, e.sha256))
                 if row is None or row.info.state != "live":
+                    if e.owner_kind == "trace":
+                        continue  # same skip-non-live rule as the SQL edge write
                     if row is not None and row.info.state in ("purging", "purged"):
                         raise InvalidImageError("purged")
                     raise BlobNotFoundError(image_id(e.sha256))
+                live.append(e)
             now = _py_now()
             self._run_scopes[run_id] = run_scope
-            for e in edges:
+            for e in live:
                 self._set((run_scope, e.sha256), last_used_at=now)
                 key = (run_id, e.owner_kind, e.owner_id, e.ordinal)
-                self._edges.setdefault(key, _MemEdge(edge=e, run_id=run_id, created_at=now))
+                if key not in self._edges:
+                    self._add_edge(key, _MemEdge(edge=e, run_id=run_id, created_at=now))
 
     def release_run(self, run_id: str) -> None:
         """Drop every in-memory edge of ``run_id`` (call when the run is terminal)."""
         with self._lock:
             self._run_scopes.pop(run_id, None)
-            for key in [k for k in self._edges if k[0] == run_id]:
-                del self._edges[key]
+            for key in list(self._by_run.get(run_id, ())):
+                self._drop_edge(key)
 
     async def run_references(self, run_scope: str, run_id: str, sha256: str) -> bool:
         with self._lock:
             if self._run_scopes.get(run_id) != run_scope:
                 return False
             return any(
-                e.run_id == run_id and e.edge.tenant_scope == run_scope and e.edge.sha256 == sha256
-                for e in self._edges.values()
+                self._edges[k].edge.tenant_scope == run_scope
+                and self._edges[k].edge.sha256 == sha256
+                for k in self._by_run.get(run_id, ())
             )
 
     async def blob_references(self, scope: str, sha256: str) -> list[BlobReference]:
@@ -1214,16 +1429,20 @@ class InMemoryBlobCatalog:
                     ordinal=e.edge.ordinal,
                     created_at=e.created_at,
                 )
-                for e in self._edges.values()
-                if e.edge.tenant_scope == scope and e.edge.sha256 == sha256
+                for e in (self._edges[k] for k in self._by_blob.get((scope, sha256), ()))
             ]
 
     async def delete_orphan_edges(self, limit: int) -> int:
         with self._lock:
-            orphans = [k for k, e in self._edges.items() if e.run_id not in self._run_scopes]
-            for key in orphans[:limit]:
-                del self._edges[key]
-            return len(orphans[:limit])
+            orphans = [
+                k
+                for run_id, keys in self._by_run.items()
+                if run_id not in self._run_scopes
+                for k in keys
+            ][:limit]
+            for key in orphans:
+                self._drop_edge(key)
+            return len(orphans)
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1496,12 @@ class CachingBlobResolver:
             while self._size > self._max_bytes:
                 _, old = self._cache.popitem(last=False)
                 self._size -= len(old)
+
+    def evict(self, scope: str, sha256: str) -> None:
+        """Drop every cached generation of ``(scope, sha256)`` (called on purge)."""
+        with self._lock:
+            for key in [k for k in self._cache if k[0] == scope and k[1] == sha256]:
+                self._size -= len(self._cache.pop(key))
 
     async def read(self, scope: str, info: BlobInfo) -> bytes:
         if info.state != "live":
@@ -1343,6 +1568,10 @@ class CatalogBlobAccessor:
     ) -> bytes:
         """Verified bytes of a live blob in ``tenant_id``'s scope.
 
+        ``tenant_id=None`` (the default) is the untenanted scope only, not
+        "any tenant": blobs are tenant-scoped and a blob read has no run to
+        take a scope from. ``RunStore.read_image`` is the run-scoped read.
+
         Raises:
             BlobNotFoundError: absent, other tenant, pending, deleting or purged.
             InvalidImageError: ``"descriptor_mismatch"`` when an ``ImageRef``
@@ -1385,30 +1614,40 @@ class CatalogBlobAccessor:
         Purge wins over every ingest: the row moves to ``purging`` (bytes
         dropped), the external object is deleted, then the row is ``purged``.
         Re-ingesting the same bytes then fails with ``InvalidImageError("purged")``.
-        Edges are kept (audit).
+        Edges are kept (audit). This process's verified-bytes cache is evicted;
+        other processes drop theirs by LRU (their reads already fail, since
+        every read checks the row first). For an externally stored blob with
+        no ``blob_store`` configured, the intent is recorded and then
+        ``ImagePersistenceUnsupportedError("blob_store_not_configured")`` is
+        raised; a later ``collect_garbage`` with the store deletes the object.
         """
         sha = _check_sha(sha256)
         if reason is not None and len(reason) > _PURGE_REASON_MAX:
             raise ValueError(f"purge reason must be at most {_PURGE_REASON_MAX} characters")
         catalog = self._require_catalog()
         scope = tenant_scope_for(tenant_id)
-        row = await catalog.get_row(scope, sha)
-        if row is None:
-            return False
-        if row.state == "purged":
-            return True
-        if row.storage == "external" and self._store is None:
-            raise ImagePersistenceUnsupportedError("blob_store_not_configured")
-        generation = await catalog.mark_purging(scope, sha, reason)
-        if generation is None:
+        # Record intent first (bytes unreadable, re-ingest blocked); the external
+        # delete is decided from the row this statement updated.
+        marked = await _mark_purging_row(catalog, scope, sha, reason)
+        self._evict(scope, sha)
+        if marked is None:
             row = await catalog.get_row(scope, sha)
             if row is None:
                 return False
             if row.state != "purging":
-                return True
-            generation = row.generation
-        await self._finish_purge(catalog, scope, sha, generation, row.storage)
+                return True  # already purged
+            marked = (row.generation, row.storage)
+        generation, storage = marked
+        if storage == "external" and self._store is None:
+            # Intent is durable; the next collect_garbage with a blob_store finishes it.
+            raise ImagePersistenceUnsupportedError("blob_store_not_configured")
+        await self._finish_purge(catalog, scope, sha, generation, storage)
         return True
+
+    def _evict(self, scope: str, sha: str) -> None:
+        evict = getattr(self._resolver, "evict", None)
+        if evict is not None:
+            evict(scope, sha)
 
     async def _finish_purge(
         self, catalog: BlobCatalog, scope: str, sha: str, generation: str, storage: str
@@ -1437,7 +1676,8 @@ class CatalogBlobAccessor:
         stats = _GcStats()
 
         # 1. Recovery of rows a crash left mid-transition.
-        for info in await _call(catalog, "stuck_rows", cutoff, limit):
+        has_store = self._store is not None
+        for info in await _call(catalog, "stuck_rows", cutoff, limit, include_external=has_store):
             await self._guarded(self._recover, catalog, info, cutoff, stats)
         # 2. Edges whose run is gone (SQLite has no FK cascade).
         try:
@@ -1445,7 +1685,9 @@ class CatalogBlobAccessor:
         except Exception:
             logger.error("Blob GC: deleting orphan edges failed", exc_info=True)
         # 3. Unreferenced blobs past the grace period.
-        for info in await _call(catalog, "gc_candidates", cutoff, limit):
+        for info in await _call(
+            catalog, "gc_candidates", cutoff, limit, include_external=has_store
+        ):
             await self._guarded(self._collect, catalog, info, cutoff, stats)
         return stats.result()
 
@@ -1501,12 +1743,20 @@ class CatalogBlobAccessor:
         scope, sha = _scope_of(info), info.sha256
         if not self._can_touch_object(info):
             return
-        generation = await catalog.mark_deleting(scope, sha, cutoff, stale_pending_cutoff=cutoff)
-        if generation is None:
+        marked = await _call(
+            catalog, "mark_deleting_row", scope, sha, cutoff, stale_pending_cutoff=cutoff
+        )
+        if marked is None:
             return
-        # Defence in depth: an edge that slipped in reverts the mark (object untouched).
+        generation, storage = marked
+        # Defence in depth: an edge that slipped in keeps the blob.
         if await _call(catalog, "has_edges", scope, sha):
-            await _call(catalog, "revert_deleting", scope, sha, generation)
+            if storage == "db":
+                # Bytes are in the row (kept while deleting): safe to go back to live.
+                await _call(catalog, "revert_deleting", scope, sha, generation)
+            # External: never revert. A concurrent ingest may already have deleted
+            # key(generation) to revive the row; reverting would leave a live row
+            # without its object. The row stays ``deleting`` for that revive.
             logger.error(
                 "Blob GC: image %s gained a reference while being collected; kept (scope=%s)",
                 image_id(sha),
@@ -1514,7 +1764,7 @@ class CatalogBlobAccessor:
             )
             stats.skipped_referenced += 1
             return
-        await self._delete_object(scope, replace(info, generation=generation))
+        await self._delete_object(scope, replace(info, generation=generation, storage=storage))
         if await catalog.delete_row(scope, sha, generation):
             stats.deleted_blobs += 1
             stats.bytes_freed += info.byte_length
@@ -1561,11 +1811,25 @@ async def _catalog_now(catalog: Any) -> datetime:
     return _require_aware(await getter())
 
 
-async def _call(catalog: Any, name: str, *args: Any) -> Any:
+async def _call(catalog: Any, name: str, *args: Any, **kwargs: Any) -> Any:
     method = getattr(catalog, name, None)
     if method is None:
         raise ImagePersistenceUnsupportedError("state_store", store_type=type(catalog).__name__)
-    return await method(*args)
+    return await method(*args, **kwargs)
+
+
+async def _mark_purging_row(
+    catalog: Any, scope: str, sha: str, reason: str | None
+) -> tuple[str, str] | None:
+    marker = getattr(catalog, "mark_purging_row", None)
+    if marker is not None:
+        result: tuple[str, str] | None = await marker(scope, sha, reason)
+        return result
+    generation = await catalog.mark_purging(scope, sha, reason)
+    if generation is None:
+        return None
+    row = await catalog.get_row(scope, sha)
+    return (generation, row.storage if row is not None else "external")
 
 
 # ---------------------------------------------------------------------------
@@ -1667,35 +1931,53 @@ class BlobServices:
 # provider_request scrub (defence in depth; adapters sanitise first)
 # ---------------------------------------------------------------------------
 
-_DATA_URL_RE = re.compile(r"^data:image/[A-Za-z0-9.+-]+;base64,", re.IGNORECASE)
+# Any data URL with a base64 payload (any media type, any parameters).
+_DATA_URL_RE = re.compile(r"data:[^,\s\"'<>]*?;base64,([A-Za-z0-9+/_=-]*)", re.IGNORECASE)
+# A base64 run long enough to be payload, not prose (the §5.5 >= 200 rule).
+_B64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{200,}={0,2}")
 IMAGE_MARKER_PREFIX = "dendrux-image:sha256:"
+REDACTED_MARKER = "dendrux-image:redacted"
 
 
 def _marker_for_b64(b64: str) -> str:
     try:
         raw = base64.b64decode(b64, validate=True)
     except (binascii.Error, ValueError):
-        return "dendrux-image:redacted"
+        return REDACTED_MARKER
     return IMAGE_MARKER_PREFIX + hashlib.sha256(raw).hexdigest()
 
 
-def scrub_inline_images(value: Any) -> Any:
-    """Replace any inline base64 image left in a captured request by its marker.
+def _scrub_str(text: str) -> str:
+    if len(text) < 200 and ";base64," not in text.lower():
+        return text
+    out = _DATA_URL_RE.sub(lambda m: _marker_for_b64(m.group(1)), text)
+    out = _B64_RUN_RE.sub(lambda m: _marker_for_b64(m.group(0)), out)
+    return text if out == text else out
 
-    Data URLs (``data:image/...;base64,...``) and Anthropic base64 sources
-    (``{"type": "base64", "data": ...}``) become
-    ``"dendrux-image:sha256:<hex>"`` (the hash of the decoded bytes). Returns
+
+def scrub_inline_images(value: Any) -> Any:
+    """Replace any inline base64 payload left in a captured request by a marker.
+
+    Covers data URLs of any media type and parameters
+    (``data:image/png;charset=x;base64,...``), Anthropic base64 sources
+    (``{"type": "base64", "data": ...}``, any length), and any base64 run of
+    200+ characters anywhere in a string (bare values or embedded in text).
+    Each payload becomes ``"dendrux-image:sha256:<hex>"`` (hash of the decoded
+    bytes) or ``"dendrux-image:redacted"`` when it does not decode. Returns
     the input object itself when nothing changed.
     """
     if isinstance(value, str):
-        match = _DATA_URL_RE.match(value)
-        return _marker_for_b64(value[match.end() :]) if match else value
+        return _scrub_str(value)
     if isinstance(value, dict):
         changed = False
         out: dict[Any, Any] = {}
         is_b64_source = value.get("type") == "base64" and isinstance(value.get("data"), str)
         for k, v in value.items():
-            if is_b64_source and k == "data" and not v.startswith(IMAGE_MARKER_PREFIX):
+            if (
+                is_b64_source
+                and k == "data"
+                and not v.startswith((IMAGE_MARKER_PREFIX, REDACTED_MARKER))
+            ):
                 new: Any = _marker_for_b64(v)
             else:
                 new = scrub_inline_images(v)

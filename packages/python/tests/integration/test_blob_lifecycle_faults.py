@@ -159,7 +159,7 @@ async def test_crash_after_mark_purging_from_pending(engine) -> None:
     assert (await row_of(engine, s))[3] == "pending"  # type: ignore[index]
     assert len(blob_store.object_names()) == 1
     purger = services_for(engine, blob_store)
-    crash_after(catalog(purger), "mark_purging")
+    crash_after(catalog(purger), "mark_purging_row")
     with pytest.raises(Crash):
         await purger.accessor.purge(s)
     result = await services_for(engine, blob_store).accessor.collect_garbage(older_than=HOUR)
@@ -176,12 +176,12 @@ async def test_crash_after_mark_purging_from_deleting(engine) -> None:
     blob_store, services, s, data = await live_external(engine, 3)
     await age(engine, "-", s, 7200)
     gc = services_for(engine, blob_store)
-    crash_after(catalog(gc), "mark_deleting")
+    crash_after(catalog(gc), "mark_deleting_row")
     with pytest.raises(Crash):
         await gc.accessor.collect_garbage(older_than=HOUR)
     assert (await row_of(engine, s))[3] == "deleting"  # type: ignore[index]
     purger = services_for(engine, blob_store)
-    crash_after(catalog(purger), "mark_purging")
+    crash_after(catalog(purger), "mark_purging_row")
     with pytest.raises(Crash):
         await purger.accessor.purge(s)
     await services_for(engine, blob_store).accessor.collect_garbage(older_than=HOUR)
@@ -213,7 +213,7 @@ async def test_crash_after_purge_object_delete(engine) -> None:
 async def test_crash_after_mark_deleting(engine) -> None:
     blob_store, services, s, _ = await live_external(engine, 5)
     await age(engine, "-", s, 7200)
-    crash_after(catalog(services), "mark_deleting")
+    crash_after(catalog(services), "mark_deleting_row")
     with pytest.raises(Crash):
         await services.accessor.collect_garbage(older_than=HOUR)
     assert len(blob_store.object_names()) == 1
@@ -240,6 +240,8 @@ async def test_crash_during_external_create_collected_after_grace(engine, when) 
     services = services_for(engine, blob_store)
     if when == "before_put":
         crash_before(blob_store, "put")
+        # A real crash also skips ingest's in-process compensation.
+        crash_before(catalog(services), "mark_deleting")
     else:
         crash_before(catalog(services), "promote")
     with pytest.raises(Crash):
@@ -376,7 +378,7 @@ async def test_gc_crash_after_mark_then_ingest_revives(engine) -> None:
     blob_store, services, s, data = await live_external(engine, 14)
     ((_, _, g1, _),) = await blob_rows(engine)
     await age(engine, "-", s, 7200)
-    crash_after(catalog(services), "mark_deleting")
+    crash_after(catalog(services), "mark_deleting_row")
     with pytest.raises(Crash):
         await services.accessor.collect_garbage(older_than=HOUR)
     part = await store_png(services_for(engine, blob_store), "-", data)
@@ -393,7 +395,7 @@ async def test_db_storage_revive_and_gc(engine, store) -> None:
     data = make_png(15)
     part = await store_png(services, "-", data)
     await age(engine, "-", part.ref.sha256, 7200)
-    crash_after(catalog(services), "mark_deleting")
+    crash_after(catalog(services), "mark_deleting_row")
     with pytest.raises(Crash):
         await services.accessor.collect_garbage(older_than=HOUR)
     fresh = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
@@ -442,23 +444,15 @@ async def test_gc_marked_first_edge_write_fails_typed(engine, store) -> None:
     now = await cat.current_time()
     assert await cat.mark_deleting("-", s, now - HOUR, stale_pending_cutoff=now - HOUR)
     with pytest.raises(BlobNotFoundError) as info:
-        await store.save_trace(
-            "R1",
-            "user",
-            "x",
-            order_index=0,
-            blob_refs=[BlobEdge("-", s, "trace", "0", 0)],
-            blob_refs_scope="-",
+        await store.create_run(
+            "R2", "a", blob_refs=[BlobEdge("-", s, "input", "input", 0)], blob_refs_scope="-"
         )
     assert info.value.__cause__ is None and info.value.__context__ is None
     async with engine.connect() as conn:
-        assert (await conn.execute(text("SELECT count(*) FROM react_traces"))).scalar_one() == 0
+        assert (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one() == 1
 
 
-async def test_lost_race_at_recheck_reverts_to_live(engine) -> None:
-    blob_store, services, s, data = await live_external(engine, 18)
-    await age(engine, "-", s, 7200)
-    cat = catalog(services)
+def _first_has_edges_true(cat: Any) -> None:
     real = cat.has_edges
     calls: list[int] = []
 
@@ -467,11 +461,35 @@ async def test_lost_race_at_recheck_reverts_to_live(engine) -> None:
         return True if len(calls) == 1 else await real(scope, sha256)
 
     cat.has_edges = first_true
+
+
+async def test_lost_race_at_recheck_external_left_for_revive(engine) -> None:
+    """P2-1: an external row is never reverted (its object may already be gone)."""
+    blob_store, services, s, data = await live_external(engine, 18)
+    await age(engine, "-", s, 7200)
+    _first_has_edges_true(catalog(services))
+    result = await services.accessor.collect_garbage(older_than=HOUR)
+    assert result.skipped_referenced == 1 and result.deleted_blobs == 0
+    ((_, _, g1, state),) = await blob_rows(engine)
+    assert state == "deleting" and len(blob_store.object_names()) == 1
+    # The next ingest of the bytes revives it under a new generation; no orphan.
+    await store_png(services_for(engine, blob_store), "-", data)
+    ((_, _, g2, state),) = await blob_rows(engine)
+    assert state == "live" and g2 != g1
+    assert blob_store.object_names() == [BlobKey("-", s, g2).object_name]
+
+
+async def test_lost_race_at_recheck_db_storage_reverts_to_live(engine, store) -> None:
+    services = BlobServices.for_state_store(store)
+    data = make_png(118)
+    part = await store_png(services, "-", data)
+    await age(engine, "-", part.ref.sha256, 7200)
+    _first_has_edges_true(catalog(services))
     result = await services.accessor.collect_garbage(older_than=HOUR)
     assert result.skipped_referenced == 1 and result.deleted_blobs == 0
     ((_, _, _, state),) = await blob_rows(engine)
-    assert state == "live" and len(blob_store.object_names()) == 1
-    assert await services_for(engine, blob_store).accessor.read(s) == data
+    assert state == "live"
+    assert await BlobServices.for_state_store(store).accessor.read(part.ref) == data
 
 
 async def test_lost_race_at_delete_row_leaves_row_for_revive(engine, caplog) -> None:
@@ -501,10 +519,196 @@ async def test_lost_race_at_delete_row_leaves_row_for_revive(engine, caplog) -> 
     second = await services_for(engine, InMemoryBlobStore()).accessor.collect_garbage(
         older_than=HOUR
     )
-    assert second.skipped_referenced == 1 and second.deleted_blobs == 0
+    # Referenced deleting rows are not listed for recovery (no starvation, no error).
+    assert second.skipped_referenced == 0 and second.deleted_blobs == 0
     # The referencing run sees a typed not-found until the bytes are ingested again.
     with pytest.raises(BlobNotFoundError):
         await services.accessor.read(s)
     fresh_store = InMemoryBlobStore()
     await store_png(services_for(engine, fresh_store), "-", data)
     assert await services_for(engine, fresh_store).accessor.read(s) == data
+
+
+async def test_recovery_not_starved_by_referenced_deleting_rows(engine) -> None:
+    """P2-7: rows recovery always skips never fill the recovery page."""
+    blob_store = InMemoryBlobStore()
+    services = services_for(engine, blob_store)
+    store = SQLAlchemyStateStore(engine)
+    await store.create_run("R1", "a")
+    stuck = []
+    for i in range(3):
+        s = (await store_png(services, "-", make_png(200 + i))).ref.sha256
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE dendrux_blobs SET state='deleting' WHERE sha256 = :sha"),
+                {"sha": s},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO dendrux_blob_refs (id, tenant_scope, sha256, run_id, owner_kind,"
+                    " owner_id, ordinal, created_at)"
+                    " VALUES (:id, '-', :sha, 'R1', 'seed', 'seed', :o, CURRENT_TIMESTAMP)"
+                ),
+                {"id": f"E{i}", "sha": s, "o": i},
+            )
+        stuck.append(s)
+    target = (await store_png(services, "-", make_png(210))).ref.sha256
+    purger = services_for(engine, blob_store)
+    crash_before(catalog(purger), "finish_purge")
+    with pytest.raises(Crash):
+        await purger.accessor.purge(target)
+    result = await services_for(engine, blob_store).accessor.collect_garbage(
+        older_than=HOUR, limit=1
+    )
+    assert result.completed_purges == 1
+    assert (await row_of(engine, target))[3] == "purged"  # type: ignore[index]
+
+
+async def test_external_rows_skipped_by_gc_without_store(engine) -> None:
+    blob_store, services, s, _ = await live_external(engine, 211)
+    await age(engine, "-", s, 7200)
+    bare = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
+    result = await bare.accessor.collect_garbage(older_than=HOUR)
+    assert result.deleted_blobs == 0
+    assert (await row_of(engine, s))[3] == "live"  # type: ignore[index]
+    assert (await services.accessor.collect_garbage(older_than=HOUR)).deleted_blobs == 1
+
+
+async def test_owner_key_collision_raises_and_rolls_back(engine, store) -> None:
+    """P2-3: a reused owner key naming another image is an error, never a silent no-op."""
+    services = BlobServices.for_state_store(store)
+    a = (await store_png(services, "-", make_png(212))).ref.sha256
+    b = (await store_png(services, "-", make_png(213))).ref.sha256
+    await store.create_run("R1", "a")
+    kwargs: dict[str, Any] = {"order_index": 0, "blob_refs_scope": "-"}
+    await store.save_trace(
+        "R1", "user", "x", blob_refs=[BlobEdge("-", a, "trace", "0", 0)], **kwargs
+    )
+    with pytest.raises(BlobNotFoundError) as info:
+        await store.save_trace(
+            "R1", "user", "y", blob_refs=[BlobEdge("-", b, "trace", "0", 0)], **kwargs
+        )
+    assert info.value.__cause__ is None and info.value.__context__ is None
+    async with engine.connect() as conn:
+        traces = (await conn.execute(text("SELECT content FROM react_traces"))).scalars().all()
+        edges = (await conn.execute(text("SELECT sha256 FROM dendrux_blob_refs"))).scalars().all()
+    assert list(traces) == ["x"] and [e.strip() for e in edges] == [a]
+
+
+async def test_injected_deadlock_retries_whole_transaction(engine, store, monkeypatch) -> None:
+    """A retried attempt re-runs the record and its edges; nothing is duplicated."""
+    from sqlalchemy.exc import DBAPIError
+
+    import dendrux.runtime.durability as durability
+    import dendrux.runtime.state as state_mod
+
+    monkeypatch.setattr(durability, "_BASE_BACKOFF_S", 0.0)
+
+    class _DeadlockError(Exception):
+        sqlstate = "40P01"
+
+    real = state_mod.write_blob_refs
+    calls: list[int] = []
+
+    async def deadlock_once(*args: Any, **kwargs: Any) -> None:
+        await real(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 1:
+            raise DBAPIError("UPDATE dendrux_blobs", None, _DeadlockError())
+
+    monkeypatch.setattr(state_mod, "write_blob_refs", deadlock_once)
+    services = BlobServices.for_state_store(store)
+    s = (await store_png(services, "-", make_png(214))).ref.sha256
+    edge = [BlobEdge("-", s, "input", "input", 0)]
+    result = await store.create_run("R1", "a", blob_refs=edge, blob_refs_scope="-")
+    assert result.outcome == "created" and len(calls) == 2
+    await store.pause_run("R1", status="waiting_client_tool", pause_data={"iteration": 1})
+    sub = [BlobEdge("-", s, "submission", "1:C1", 0)]
+    assert (
+        await store.submit_and_claim(
+            "R1",
+            expected_status="waiting_client_tool",
+            submitted_data={"x": 1},
+            blob_refs=sub,
+            blob_refs_scope="-",
+        )
+        is True
+    )
+    async with engine.connect() as conn:
+        runs = (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one()
+        edges = (await conn.execute(text("SELECT count(*) FROM dendrux_blob_refs"))).scalar_one()
+    assert runs == 1 and edges == 2
+
+
+@CONCURRENT
+async def test_concurrent_shared_image_edge_writes_never_deadlock(engine) -> None:
+    """P1-1: 16 workers x 20 shared blobs, multi-image create_run + save_trace edges."""
+    import random
+
+    import dendrux.runtime.durability as durability
+
+    store = SQLAlchemyStateStore(engine)
+    services = BlobServices.for_state_store(store)
+    shas = [(await store_png(services, "t:acme", make_png(300 + i))).ref.sha256 for i in range(20)]
+    retries: list[str] = []
+    real_backoff = durability._backoff
+
+    async def counting_backoff(*args: Any, **kwargs: Any) -> None:
+        retries.append(str(args[3]))
+        await real_backoff(*args, **kwargs)
+
+    durability._backoff = counting_backoff  # type: ignore[assignment]
+    failures: list[BaseException] = []
+    iterations = 25 if engine.dialect.name == "postgresql" else 6
+
+    async def worker(w: int) -> None:
+        rng = random.Random(w)
+        for i in range(iterations):
+            run_id = f"W{w:02d}I{i:03d}".ljust(26, "0")
+            picked = rng.sample(shas, 6)
+            try:
+                await store.create_run(
+                    run_id,
+                    "a",
+                    tenant_id="acme",
+                    blob_refs=[
+                        BlobEdge("t:acme", x, "input", "input", k) for k, x in enumerate(picked)
+                    ],
+                    blob_refs_scope="t:acme",
+                )
+                await store.save_trace(
+                    run_id,
+                    "user",
+                    "x",
+                    order_index=0,
+                    blob_refs=[
+                        BlobEdge("t:acme", x, "trace", "0", k) for k, x in enumerate(picked)
+                    ],
+                    blob_refs_scope="t:acme",
+                )
+            except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+                failures.append(exc)
+
+    try:
+        await asyncio.gather(*(worker(w) for w in range(16)))
+    finally:
+        durability._backoff = real_backoff  # type: ignore[assignment]
+    assert failures == []
+    assert not any("40P01" in r or "deadlock" in r.lower() for r in retries)
+    async with engine.connect() as conn:
+        edges = (await conn.execute(text("SELECT count(*) FROM dendrux_blob_refs"))).scalar_one()
+    assert edges == 16 * iterations * 12
+
+
+async def test_raised_put_error_leaves_no_row(engine) -> None:
+    """Track A compensation: a put that raises (no process death) removes the pending row."""
+    blob_store = InMemoryBlobStore()
+    services = services_for(engine, blob_store)
+
+    async def store_down(*_: Any, **__: Any) -> None:
+        raise ConnectionError("object store unavailable")
+
+    wrap(blob_store, "put", before=store_down)
+    with pytest.raises(ConnectionError):
+        await store_png(services, "-", make_png(220))
+    assert await blob_rows(engine) == [] and blob_store.object_names() == []

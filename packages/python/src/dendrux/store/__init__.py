@@ -413,6 +413,14 @@ class RunStore:
         The run must exist (and belong to ``tenant_id`` when given) and have
         a recorded reference to ``sha256`` in its own tenant scope.
 
+        Tenant defaults differ on purpose, and match the rest of ``RunStore``:
+        ``read_image`` is run-scoped, so omitting ``tenant_id`` (``UNSCOPED``)
+        trusts the caller and reads in *the run's own* tenant scope (like
+        ``get_run``); pass ``tenant_id`` to enforce a tenant. The blob-scoped
+        ``blobs.read(sha256)`` has no run to take a scope from, so its default
+        ``tenant_id=None`` means the untenanted scope only (``"-"``), never
+        "any tenant"; pass the tenant explicitly for tenanted blobs.
+
         Raises:
             BlobNotFoundError: unknown run, other tenant, no reference, or the
                 image is not live (absence and mismatch are indistinguishable).

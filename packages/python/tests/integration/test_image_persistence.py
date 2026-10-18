@@ -36,7 +36,7 @@ from dendrux.types import (
     ToolResult,
     UsageStats,
 )
-from tests.unit.test_blob_catalog import make_png, runtime_for, store_png
+from tests.unit.test_blob_catalog import _SurfaceProvider, make_png, runtime_for, store_png
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -284,15 +284,32 @@ async def test_cross_tenant_edge_writes_rejected_and_rolled_back(engine, store) 
     errors.append(e5.value)
     # The tenant-b sha under tenant a's scope: the blob does not exist there.
     with pytest.raises(BlobNotFoundError) as e6:
-        await store.save_trace(
+        await store.save_tool_call(
             "RA",
-            "user",
-            "x",
-            order_index=0,
-            blob_refs=[BlobEdge("t:a", sha_b, "trace", "0", 0)],
+            tool_call_id="C9",
+            provider_tool_call_id=None,
+            tool_name="t",
+            target="server",
+            params=None,
+            result_payload="1",
+            success=True,
+            duration_ms=0,
+            iteration_index=1,
+            blob_refs=[BlobEdge("t:a", sha_b, "tool_call", "C9", 0)],
             blob_refs_scope="t:a",
         )
     errors.append(e6.value)
+    # A trace edge to it is skipped (no edge, no error, no oracle): same as absent.
+    await store.save_trace(
+        "RA",
+        "user",
+        "skipped",
+        order_index=9,
+        blob_refs=[BlobEdge("t:a", sha_b, "trace", "9", 0)],
+        blob_refs_scope="t:a",
+    )
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM react_traces"))
     for exc in errors:
         assert_clean(exc)
     assert await _count(engine, "react_traces") == 0
@@ -319,28 +336,103 @@ async def test_edge_to_purged_or_missing_blob_rolls_back(engine, store) -> None:
     await store.create_run("R1", "a")
     assert await services.accessor.purge(s, reason="erase")
     with pytest.raises(InvalidImageError) as purged:
-        await store.save_trace(
+        await store.save_tool_call(
             "R1",
-            "user",
-            "x",
-            order_index=0,
-            blob_refs=[BlobEdge("-", s, "trace", "0", 0)],
+            tool_call_id="C9",
+            provider_tool_call_id=None,
+            tool_name="t",
+            target="server",
+            params=None,
+            result_payload="1",
+            success=True,
+            duration_ms=0,
+            iteration_index=1,
+            blob_refs=[BlobEdge("-", s, "tool_call", "C9", 0)],
             blob_refs_scope="-",
         )
     assert purged.value.reason == "purged"
     assert_clean(purged.value)
     with pytest.raises(BlobNotFoundError):
-        await store.save_trace(
+        await store.save_tool_call(
             "R1",
-            "user",
-            "x",
-            order_index=0,
-            blob_refs=[BlobEdge("-", "c" * 64, "trace", "0", 0)],
+            tool_call_id="C9",
+            provider_tool_call_id=None,
+            tool_name="t",
+            target="server",
+            params=None,
+            result_payload="1",
+            success=True,
+            duration_ms=0,
+            iteration_index=1,
+            blob_refs=[BlobEdge("-", "c" * 64, "tool_call", "C9", 0)],
             blob_refs_scope="-",
         )
     with pytest.raises(BlobNotFoundError):  # unknown run
         await services.catalog.add_blob_refs("nope", "-", [BlobEdge("-", s, "seed", "seed", 0)])  # type: ignore[union-attr]
-    assert await _count(engine, "react_traces") == 0
+    with pytest.raises(InvalidImageError):  # seed edges need a live blob too
+        await services.catalog.add_blob_refs("R1", "-", [BlobEdge("-", s, "seed", "seed", 0)])  # type: ignore[union-attr]
+    assert await _count(engine, "tool_calls") == 0
+
+
+async def test_trace_edges_skip_non_live_blobs(engine, store) -> None:
+    """A trace of a purged/absent image is written without that edge; live ones keep theirs."""
+    services = BlobServices.for_state_store(store)
+    purged = (await store_png(services, "-", make_png(70))).ref.sha256
+    live = (await store_png(services, "-", make_png(71))).ref.sha256
+    await store.create_run("R1", "a")
+    assert await services.accessor.purge(purged)
+    await store.save_trace(
+        "R1",
+        "user",
+        "retried",
+        order_index=0,
+        blob_refs=[
+            BlobEdge("-", purged, "trace", "0", 1),
+            BlobEdge("-", live, "trace", "0", 2),
+            BlobEdge("-", "d" * 64, "trace", "0", 3),
+        ],
+        blob_refs_scope="-",
+    )
+    await store.save_trace(
+        "R1",
+        "user",
+        "only purged",
+        order_index=1,
+        blob_refs=[BlobEdge("-", purged, "trace", "1", 0)],
+        blob_refs_scope="-",
+    )
+    assert await _count(engine, "react_traces") == 2
+    assert await edge_rows(engine) == [("-", live, "R1", "trace", "0", 2)]
+    # Mixed with a non-trace edge to the purged blob: still a typed error, rolled back.
+    with pytest.raises(InvalidImageError):
+        await store.save_tool_call(
+            "R1",
+            tool_call_id="C1",
+            provider_tool_call_id=None,
+            tool_name="t",
+            target="server",
+            params=None,
+            result_payload="1",
+            success=True,
+            duration_ms=0,
+            iteration_index=1,
+            blob_refs=[
+                BlobEdge("-", live, "tool_call", "C1", 0),
+                BlobEdge("-", purged, "tool_call", "C1", 1),
+            ],
+            blob_refs_scope="-",
+        )
+    assert await _count(engine, "tool_calls") == 0
+    # Tenant mismatch is never skipped, even for trace edges.
+    with pytest.raises(BlobNotFoundError):
+        await store.save_trace(
+            "R1",
+            "user",
+            "x",
+            order_index=2,
+            blob_refs=[BlobEdge("t:x", live, "trace", "2", 0)],
+            blob_refs_scope="t:x",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +532,7 @@ async def test_canonical_sample_rows(engine, store) -> None:
         run,
         model="claude-sonnet-4-6",
         provider_name="AnthropicProvider",
+        provider=_SurfaceProvider("anthropic"),
         initial_order_index=2,
         target_lookup={"take_screenshot": "client"},
         tenant_scope="t:acme",
