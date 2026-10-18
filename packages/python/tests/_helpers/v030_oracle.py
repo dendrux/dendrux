@@ -54,6 +54,13 @@ byte for byte)
    ``tool.completed`` run-event rows (same run + iteration) and of consecutive
    ``tool_result`` stream events are put in call order (scripted provider ids sort
    in call order); the block keeps its original ``sequence_index`` values.
+7. Anthropic strict tools (Dendrux 0.4.1, T2 — a deliberate wire change). A tool
+   entry the Anthropic adapter sends with ``"strict": true`` is mapped back to
+   its v0.3.0 shape (``name``/``description``/``input_schema`` = the stored
+   ``ToolDef.parameters``) before it reaches the payload, ``captured_request``
+   and rows. Non-strict entries pass through untouched and are still compared
+   byte for byte; the strict wire itself is covered by
+   ``tests/unit/test_anthropic.py``.
 Provider-assigned ids (tool_use ids, message ids) are supplied by this module's
 scripts and are therefore deterministic; they are NOT normalised.
 
@@ -874,6 +881,24 @@ def instrument_provider(provider: Any, leg: dict[str, Any]) -> None:
     provider.complete_stream = complete_stream
 
 
+def _v030_anthropic_tool_shape(provider: Any) -> None:
+    """Normalisation 7: map strict Anthropic tool entries back to the v0.3.0 shape."""
+    real_convert = getattr(provider, "_convert_tools", None)
+    if real_convert is None:
+        return
+
+    def convert(tools: list[Any]) -> list[dict[str, Any]]:
+        out = real_convert(tools)
+        return [
+            {"name": e["name"], "description": e["description"], "input_schema": td.parameters}
+            if td.strict and e.get("strict") is True
+            else e
+            for td, e in zip(tools, out, strict=True)
+        ]
+
+    provider._convert_tools = convert
+
+
 def install_fake_sdk(provider: Any, rig: Rig, turns: list[Turn], leg: dict[str, Any]) -> None:
     """Replace the vendor SDK entry points with scripted fakes that record the payload."""
     counter = {"n": 0}
@@ -910,6 +935,7 @@ def install_fake_sdk(provider: Any, rig: Rig, turns: list[Turn], leg: dict[str, 
 
         provider._client.messages.create = create
         provider._client.messages.stream = stream
+        _v030_anthropic_tool_shape(provider)
     elif rig.vendor == "chat":
 
         async def chat_create(**kw: Any) -> Any:

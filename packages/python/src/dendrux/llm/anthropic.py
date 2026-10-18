@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -42,6 +43,13 @@ from dendrux.llm._retry_telemetry import (
     end_call_attempt_tracking,
     make_telemetry_http_client,
 )
+from dendrux.llm._schema import (
+    ANTHROPIC_STRICT_MAX_OPTIONAL,
+    ANTHROPIC_STRICT_MAX_TOOLS,
+    ANTHROPIC_STRICT_MAX_UNIONS,
+    anthropic_strict_budget,
+    prepare_anthropic_strict,
+)
 from dendrux.llm._stop_reason import anthropic_stop_reason
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
@@ -60,6 +68,11 @@ if TYPE_CHECKING:
 
     from dendrux.llm.base import ImageSupport
     from dendrux.types import Message, ToolDef
+
+logger = logging.getLogger(__name__)
+
+_STRUCTURED_TOOL_NAME = "structured_output"
+_STRUCTURED_TOOL_DESCRIPTION = "Return your response in this exact format."
 
 # Anthropic-specific kwargs that complete() will forward to the API.
 # Anything not in this set is silently ignored to prevent leaking
@@ -420,8 +433,10 @@ class AnthropicProvider(LLMProvider):
         by an explicit cache key.
 
         When output_schema is provided, injects a synthetic tool with the
-        schema and forces tool_choice. The tool_use response is extracted
-        and normalized into LLMResponse.text as a JSON string, with
+        schema and forces tool_choice. The tool is sent with ``strict: true``
+        (schema normalized for Anthropic strict mode) when the schema allows
+        it, otherwise exactly as before, non-strict. The tool_use response is
+        extracted and normalized into LLMResponse.text as a JSON string, with
         tool_calls set to None (preserving the SingleCall invariant).
         """
         registry = WireImageRegistry()
@@ -431,15 +446,9 @@ class AnthropicProvider(LLMProvider):
 
         # Structured output: inject synthetic tool + forced tool_choice
         is_structured = output_schema is not None
-        if is_structured:
-            api_kwargs["tools"] = [
-                {
-                    "name": "structured_output",
-                    "description": "Return your response in this exact format.",
-                    "input_schema": output_schema,
-                }
-            ]
-            api_kwargs["tool_choice"] = {"type": "tool", "name": "structured_output"}
+        if output_schema is not None:
+            api_kwargs["tools"] = [self._structured_output_tool(output_schema)]
+            api_kwargs["tool_choice"] = {"type": "tool", "name": _STRUCTURED_TOOL_NAME}
             # Update captured_request so evidence reflects the actual API call
             captured_request["tools"] = api_kwargs["tools"]
             captured_request["tool_choice"] = api_kwargs["tool_choice"]
@@ -851,15 +860,63 @@ class AnthropicProvider(LLMProvider):
             api_messages.append({"role": "user", "content": [tool_result_block]})
 
     def _convert_tools(self, tools: list[ToolDef]) -> list[dict[str, Any]]:
-        """Convert Dendrux ToolDefs to Anthropic tool format."""
-        return [
-            {
+        """Convert Dendrux ToolDefs to Anthropic tool format.
+
+        Non-strict tools are sent exactly as stored (byte-stable for prompt
+        caching). A ``strict`` tool is sent with ``"strict": true`` and a
+        copy of its schema normalized for Anthropic strict mode, unless the
+        schema cannot be strict or the request-wide limits (strict tools,
+        optional and union-typed parameters, counted in tool order) are
+        spent; then it is sent non-strict and the reason logged at DEBUG.
+        """
+        converted: list[dict[str, Any]] = []
+        strict_tools = optional_total = union_total = 0
+        for td in tools:
+            payload: dict[str, Any] = {
                 "name": td.name,
                 "description": td.description,
                 "input_schema": td.parameters,
             }
-            for td in tools
-        ]
+            if td.strict:
+                schema, problem = prepare_anthropic_strict(td.parameters)
+                optional = unions = 0
+                if problem is None:
+                    optional, unions = anthropic_strict_budget(schema)
+                    if strict_tools + 1 > ANTHROPIC_STRICT_MAX_TOOLS:
+                        problem = f"over {ANTHROPIC_STRICT_MAX_TOOLS} strict tools in one request"
+                    elif optional_total + optional > ANTHROPIC_STRICT_MAX_OPTIONAL:
+                        problem = (
+                            f"over {ANTHROPIC_STRICT_MAX_OPTIONAL} optional parameters "
+                            f"across strict tools in one request"
+                        )
+                    elif union_total + unions > ANTHROPIC_STRICT_MAX_UNIONS:
+                        problem = (
+                            f"over {ANTHROPIC_STRICT_MAX_UNIONS} union-typed parameters "
+                            f"across strict tools in one request"
+                        )
+                if problem is None:
+                    strict_tools += 1
+                    optional_total += optional
+                    union_total += unions
+                    payload = {**payload, "input_schema": schema, "strict": True}
+                else:
+                    logger.debug("Anthropic tool %r sent without strict: %s", td.name, problem)
+            converted.append(payload)
+        return converted
+
+    @staticmethod
+    def _structured_output_tool(output_schema: dict[str, Any]) -> dict[str, Any]:
+        """The synthetic structured-output tool, strict when the schema allows it."""
+        payload: dict[str, Any] = {
+            "name": _STRUCTURED_TOOL_NAME,
+            "description": _STRUCTURED_TOOL_DESCRIPTION,
+            "input_schema": output_schema,
+        }
+        schema, problem = prepare_anthropic_strict(output_schema)
+        if problem is not None:
+            logger.debug("Anthropic structured output sent without strict: %s", problem)
+            return payload
+        return {**payload, "input_schema": schema, "strict": True}
 
     # ------------------------------------------------------------------
     # Inbound conversions: Anthropic → Dendrux
