@@ -96,7 +96,8 @@ def find_open_object(node: Any, path: str) -> str | None:
     children: list[tuple[str, Any]] = [("[]", node.get("items"))]
     for key in ("anyOf", "oneOf", "allOf"):
         children.extend((f".{key}[{i}]", v) for i, v in enumerate(node.get(key) or []))
-    children.extend((f".$defs.{k}", v) for k, v in (node.get("$defs") or {}).items())
+    for key in ("$defs", "definitions"):
+        children.extend((f".{key}.{k}", v) for k, v in (node.get(key) or {}).items())
     for suffix, child in children:
         found = find_open_object(child, f"{path}{suffix}")
         if found:

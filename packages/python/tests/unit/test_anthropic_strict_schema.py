@@ -546,3 +546,24 @@ class TestFindOpenObject:
 
     def test_none_when_closed(self) -> None:
         assert find_open_object(_obj({"a": {"type": "string"}}), "p") is None
+
+
+class TestDraft7Definitions:
+    SCHEMA: dict[str, Any] = _obj(  # noqa: RUF012
+        {"x": {"$ref": "#/definitions/D"}}, definitions={"D": {"type": "object"}}
+    )
+
+    def test_find_open_object_walks_definitions(self) -> None:
+        assert find_open_object(self.SCHEMA, "parameters") == "parameters.definitions.D"
+
+    def test_open_object_in_definitions_incompatible(self) -> None:
+        problem = anthropic_strict_problem(self.SCHEMA)
+        assert problem is not None and "definitions.D" in problem
+
+    def test_strict_tool_decoration_rejects_it(self) -> None:
+        from dendrux.tool import tool
+
+        with pytest.raises(TypeError, match="definitions.D"):
+
+            @tool(strict=True, parameters=copy.deepcopy(self.SCHEMA))
+            async def f(x: Any) -> None: ...
