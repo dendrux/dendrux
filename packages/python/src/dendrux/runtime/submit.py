@@ -24,19 +24,43 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
-from dendrux.types import ApprovalDecision, PauseState, RunStatus, ToolCall, ToolResult, ToolTarget
+from dendrux.types import (
+    ApprovalDecision,
+    ImagePart,
+    ImageRef,
+    PauseState,
+    RunStatus,
+    TextPart,
+    ToolCall,
+    ToolResult,
+    ToolTarget,
+    content_part_from_dict,
+    content_part_to_dict,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
 
+    from dendrux.llm.base import LLMProvider
+    from dendrux.media._catalog import BlobEdge
+    from dendrux.media._policy import ImagePolicy, Origin
+    from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
+    from dendrux.types import ContentPart
 
 __all__ = [
     "DEFAULT_DENIAL_REASON",
     "approval_gates_of",
     "build_rejection_results",
+    "check_new_image_capability",
     "claim_or_raise",
     "deserialize_decisions",
+    "deserialize_tool_results",
+    "effective_image_capability",
+    "ingest_tool_result_images",
+    "ingest_user_items",
+    "parts_edges",
+    "tool_result_edges",
     "is_client_call",
     "normalize_decisions",
     "preflight_status",
@@ -80,12 +104,14 @@ async def raise_for_non_paused_status(store: StateStore, run_id: str) -> NoRetur
     raise RunNotPausedError(run_id, current)
 
 
-async def validate_tool_results(store: StateStore, run_id: str, results: list[ToolResult]) -> None:
+async def validate_tool_results(
+    store: StateStore, run_id: str, results: list[ToolResult]
+) -> PauseState:
     """Verify ``results`` align with the pending tool calls on ``run_id``.
 
     Raises on any mismatch — no partial acceptance. Rejects duplicate
     ``call_id`` values (one result per pending call) as well as
-    missing/unexpected ids.
+    missing/unexpected ids. Returns the validated pause.
     """
     raw_pause = await store.get_pause_state(run_id)
     if raw_pause is None:
@@ -109,6 +135,7 @@ async def validate_tool_results(store: StateStore, run_id: str, results: list[To
 
     if parts:
         raise InvalidToolResultError(run_id, "; ".join(parts))
+    return pause_state
 
 
 async def preflight_status(store: StateStore, run_id: str, expected_status: RunStatus) -> None:
@@ -140,6 +167,8 @@ async def claim_or_raise(
     expected_status: RunStatus,
     submitted_data: dict[str, Any] | None = None,
     validate: Callable[[dict[str, Any]], None] | None = None,
+    blob_refs: Sequence[BlobEdge] | None = None,
+    blob_refs_scope: str | None = None,
 ) -> None:
     """Perform a status preflight, then persist-first handoff + CAS claim.
 
@@ -154,6 +183,8 @@ async def claim_or_raise(
     just claims (used for approval-approve). ``validate`` (with
     ``submitted_data``) runs on the pause_data being claimed inside the
     claim transaction; if it raises, nothing is claimed and it propagates.
+    ``blob_refs`` (submission edges of submitted images) are written in the
+    claim transaction; they are passed to the store only when non-empty.
 
     Raises:
         RunNotFoundError: ``run_id`` does not exist.
@@ -169,6 +200,9 @@ async def claim_or_raise(
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
     if submitted_data is not None:
         claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
+        if blob_refs:
+            claim_kwargs["blob_refs"] = list(blob_refs)
+            claim_kwargs["blob_refs_scope"] = blob_refs_scope
         won = await store.submit_and_claim(
             run_id,
             expected_status=expected_status.value,
@@ -232,9 +266,14 @@ def build_rejection_results(
 
 
 def serialize_tool_results(results: list[ToolResult]) -> list[dict[str, Any]]:
-    """Match the wire shape expected by ``submitted_tool_results`` in pause_data."""
-    return [
-        {
+    """Match the wire shape expected by ``submitted_tool_results`` in pause_data.
+
+    ``images`` (descriptor dicts) is added only for results with images, which
+    must already be ingested.
+    """
+    out: list[dict[str, Any]] = []
+    for r in results:
+        entry: dict[str, Any] = {
             "name": r.name,
             "call_id": r.call_id,
             "payload": r.payload,
@@ -242,7 +281,192 @@ def serialize_tool_results(results: list[ToolResult]) -> list[dict[str, Any]]:
             "error": r.error,
             "duration_ms": r.duration_ms,
         }
+        if r.images:
+            entry["images"] = [content_part_to_dict(_as_part(img)) for img in r.images]
+        out.append(entry)
+    return out
+
+
+def deserialize_tool_results(raw: list[dict[str, Any]]) -> list[ToolResult]:
+    """Rebuild ``submitted_tool_results`` entries (images as stored refs)."""
+    results: list[ToolResult] = []
+    for r in raw:
+        images = tuple(
+            part
+            for part in (content_part_from_dict(d) for d in r.get("images") or [])
+            if isinstance(part, ImagePart)
+        )
+        results.append(
+            ToolResult(
+                name=r["name"],
+                call_id=r["call_id"],
+                payload=r["payload"],
+                success=r.get("success", True),
+                error=r.get("error"),
+                duration_ms=r.get("duration_ms", 0),
+                images=images,
+            )
+        )
+    return results
+
+
+def _as_part(img: object) -> ImagePart:
+    if isinstance(img, ImagePart):
+        return img
+    if isinstance(img, ImageRef):
+        return ImagePart(ref=img)
+    raise TypeError("tool result images must be ingested before they are persisted")
+
+
+# ---------------------------------------------------------------------------
+# Images at the entry points (ingest before the first durable write)
+# ---------------------------------------------------------------------------
+
+
+async def effective_image_capability(provider: LLMProvider, model: str, policy: ImagePolicy) -> str:
+    """``"yes" | "no" | "unknown"`` for new images on ``model`` (§5.6).
+
+    Policy overrides win, then a ``"no"`` the provider instance learned from
+    an image-unsupported response, then ``provider.image_input_support``.
+    ``"unknown"`` with ``unknown_capability="error"`` counts as ``"no"``. A
+    provider without ``image_input_support`` reports from
+    ``capabilities.supports_multimodal``.
+    """
+    override = policy.capability_overrides.get(model)
+    if override in ("yes", "no"):
+        return override
+    learned = getattr(provider, "learned_image_support", None)
+    if learned is not None and learned(model) == "no":
+        return "no"
+    support = getattr(provider, "image_input_support", None)
+    if support is not None:
+        value = await support(model)
+    else:
+        caps = getattr(provider, "capabilities", None)
+        value = "unknown" if getattr(caps, "supports_multimodal", False) else "no"
+    if value == "unknown" and policy.unknown_capability == "error":
+        return "no"
+    return str(value)
+
+
+async def check_new_image_capability(
+    provider: LLMProvider,
+    model: str,
+    policy: ImagePolicy,
+    *,
+    image_count: int,
+    origin: str,
+) -> None:
+    """Raise ``UnsupportedModalityError`` before any write when new images cannot be sent.
+
+    Only ``on_unsupported="error"`` raises; a placeholder or describe policy
+    lets the request view degrade the images instead.
+    """
+    if image_count <= 0 or policy.on_unsupported != "error":
+        return
+    if await effective_image_capability(provider, model, policy) != "no":
+        return
+    from dendrux.errors import UnsupportedModalityError
+
+    source = "capability"
+    if policy.capability_overrides.get(model) != "no":
+        source_of = getattr(provider, "image_capability_source", None)
+        if source_of is not None:
+            source = str(source_of())
+        elif type(provider).__name__.startswith("OpenRouter"):
+            source = "catalog"
+    raise UnsupportedModalityError(
+        provider=type(provider).__name__,
+        model=model,
+        image_count=image_count,
+        origin=origin,
+        source=source,
+    )
+
+
+async def ingest_user_items(
+    items: Sequence[Any],
+    *,
+    runtime: ImageRuntime,
+    origin: Origin = "user",
+    before_store: Callable[[], Awaitable[None]] | None = None,
+) -> tuple[ContentPart, ...]:
+    """Ingest the images of a ``UserContent`` sequence; return canonical parts in order."""
+    from dendrux.media._ingest import ingest
+
+    images = [item for item in items if not isinstance(item, str)]
+    ingested = iter(
+        await ingest(
+            images,
+            policy=runtime.policy,
+            runtime=runtime,
+            origin=origin,
+            before_store=before_store,
+        )
+    )
+    return tuple(TextPart(item) if isinstance(item, str) else next(ingested) for item in items)
+
+
+async def ingest_tool_result_images(
+    results: Sequence[ToolResult],
+    *,
+    runtime: ImageRuntime,
+    before_store: Callable[[], Awaitable[None]] | None = None,
+) -> list[ToolResult]:
+    """Ingest client-tool result images (``origin="client_tool"``), in order.
+
+    ``before_store`` runs once, after the first image-bearing result passed
+    validation and before any blob is written. Results without images are
+    returned unchanged.
+    """
+    from dataclasses import replace
+
+    from dendrux.media._ingest import ingest
+
+    out: list[ToolResult] = []
+    pending = before_store
+    for r in results:
+        if not r.images:
+            out.append(r)
+            continue
+        parts = await ingest(
+            list(r.images),
+            policy=runtime.policy,
+            runtime=runtime,
+            origin="client_tool",
+            tool_name=r.name,
+            before_store=pending,
+        )
+        pending = None
+        out.append(replace(r, images=parts))
+    return out
+
+
+def parts_edges(
+    parts: Sequence[ContentPart], *, tenant_scope: str, owner_kind: str, owner_id: str
+) -> list[BlobEdge]:
+    """Edges for the image parts of one persisted parts list (ordinal = index in it)."""
+    from dendrux.media._catalog import BlobEdge
+
+    return [
+        BlobEdge(tenant_scope, part.ref.sha256, owner_kind, owner_id, i)
+        for i, part in enumerate(parts)
+        if isinstance(part, ImagePart)
+    ]
+
+
+def tool_result_edges(
+    results: Sequence[ToolResult], *, tenant_scope: str, iteration: int
+) -> list[BlobEdge]:
+    """Submission edges of client-tool results: ``f"{iteration}:{call_id}"`` / image index."""
+    from dendrux.media._catalog import BlobEdge
+
+    return [
+        BlobEdge(
+            tenant_scope, _as_part(img).ref.sha256, "submission", f"{iteration}:{r.call_id}", i
+        )
         for r in results
+        for i, img in enumerate(r.images)
     ]
 
 

@@ -237,6 +237,9 @@ class OpenTelemetryNotifier(BaseNotifier):
             if guardrail_findings:
                 span.set_attribute("dendrux.guardrails.hit_count", len(guardrail_findings))
 
+            if semantic_messages:
+                self._set_image_attributes(span, run_id, semantic_messages)
+
             if self._include_messages and response.text:
                 span.set_attribute("gen_ai.completion", response.text)
 
@@ -244,6 +247,28 @@ class OpenTelemetryNotifier(BaseNotifier):
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
             _LOG.warning("OpenTelemetryNotifier.on_llm_call_completed failed: %s", exc)
+
+    def _set_image_attributes(self, span: Any, run_id: str, messages: list[Message]) -> None:
+        """``dendrux.images.count`` / ``.estimated_tokens`` for visible images (ids only)."""
+        images = [p for m in messages if m.parts for p in m.images]
+        if not images:
+            return
+        span.set_attribute("dendrux.images.count", len(images))
+        model = self._run_models.get(run_id)
+        family = _image_family(model)
+        if model is None or family is None:
+            return
+        from dendrux.media._tokens import estimate_image_tokens
+
+        total = 0
+        for part in images:
+            tokens = estimate_image_tokens(
+                part.ref, provider_family=family, model=model, detail=part.detail
+            )
+            if tokens is None:
+                return
+            total += tokens
+        span.set_attribute("dendrux.images.estimated_tokens", total)
 
     async def on_llm_call_failed(
         self,
@@ -432,3 +457,16 @@ def _to_attr_value(v: Any) -> Any:
         return json.dumps(v, default=str)
     except (TypeError, ValueError):
         return repr(v)
+
+
+def _image_family(model: str | None) -> str | None:
+    """Provider family for image token estimates, from the model id."""
+    if not model:
+        return None
+    if "/" in model:
+        return "openrouter"
+    if model.startswith("claude-"):
+        return "anthropic"
+    if model.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
+        return "openai"
+    return None
