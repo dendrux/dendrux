@@ -876,14 +876,19 @@ def _image_runtime(
     )
 
 
-def _recorder_scope_kwargs(tenant_id: str | None) -> dict[str, Any]:
-    """``tenant_scope=`` for ``PersistenceRecorder`` when it takes one (§8)."""
+def _recorder_image_kwargs(tenant_id: str | None, provider: LLMProvider) -> dict[str, Any]:
+    """``tenant_scope=`` (edge scope) and ``provider=`` (image token estimates) for
+    ``PersistenceRecorder`` when it takes them (§8)."""
     from dendrux.media._runtime import tenant_scope_for
     from dendrux.runtime.persistence import PersistenceRecorder
 
-    if not _accepts_kwarg(PersistenceRecorder.__init__, "tenant_scope"):
-        return {}
-    return {"tenant_scope": tenant_scope_for(tenant_id)}
+    init = PersistenceRecorder.__init__
+    out: dict[str, Any] = {}
+    if _accepts_kwarg(init, "tenant_scope"):
+        out["tenant_scope"] = tenant_scope_for(tenant_id)
+    if _accepts_kwarg(init, "provider"):
+        out["provider"] = provider
+    return out
 
 
 def _image_loop_kwargs(
@@ -1478,7 +1483,7 @@ async def run(
                         provider_name=type(provider).__name__,
                         target_lookup=target_lookup,
                         event_sequencer=sequencer,
-                        **_recorder_scope_kwargs(tenant_id),
+                        **_recorder_image_kwargs(tenant_id, provider),
                     )
 
                 await _emit_event(
@@ -2231,7 +2236,7 @@ async def retry(
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
             event_sequencer=sequencer,
-            **_recorder_scope_kwargs(tenant_id),
+            **_recorder_image_kwargs(tenant_id, provider),
         )
 
         await _emit_event(
@@ -2741,7 +2746,7 @@ def run_stream(
                     provider_name=type(provider).__name__,
                     target_lookup=target_lookup,
                     event_sequencer=sequencer,
-                    **_recorder_scope_kwargs(eff_tenant),
+                    **_recorder_image_kwargs(eff_tenant, provider),
                 )
 
             # 2. Set delegation context for the generator lifetime
@@ -3243,7 +3248,7 @@ async def _prepare_resume(
         target_lookup=target_lookup,
         initial_order_index=trace_order_offset,
         event_sequencer=sequencer,
-        **_recorder_scope_kwargs(tenant_id),
+        **_recorder_image_kwargs(tenant_id, provider),
     )
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and

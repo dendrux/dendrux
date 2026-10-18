@@ -6,7 +6,7 @@ Public names: :class:`Image`, :class:`ToolOutput`, :class:`ImagePolicy`,
 ``agent.blobs``. ``dendrux.media`` imports ``dendrux.types``, never the reverse.
 """
 
-from dendrux.media._catalog import BlobCatalog, BlobEdge, BlobResolver
+from dendrux.media._catalog import BlobCatalog, BlobEdge, BlobGcCatalog, BlobResolver
 from dendrux.media._ids import (
     IMAGE_ID_RE,
     PLACEHOLDER_PRECEDENCE,
@@ -60,6 +60,7 @@ __all__ = [
     "BlobAccessor",
     "BlobCatalog",
     "BlobEdge",
+    "BlobGcCatalog",
     "BlobInfo",
     "BlobKey",
     "BlobReference",

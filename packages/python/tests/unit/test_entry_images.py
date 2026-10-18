@@ -1132,7 +1132,6 @@ class TestPauseStateSites:
         missing = [(f, line) for f, line, kws in calls if "image_view" not in kws]
         assert missing == []
 
-    @pytest.mark.xfail(strict=False, reason="needs D1 merged (loops/ pause builders)")
     def test_loop_sites_pass_image_view(self) -> None:
         calls = _pause_state_calls(SRC / "loops")
         missing = [(f, line) for f, line, kws in calls if "image_view" not in kws]
@@ -1667,7 +1666,6 @@ class TestSeededSourceCarry:
         await follow.run("more", runs=[source.run_id], replay_last=1)
         return _llm_messages(src_agent, -1), _llm_messages(follow, 0)
 
-    @pytest.mark.xfail(strict=False, reason="needs B merged (recorder persists tool trace parts)")
     async def test_control_and_seeded_source_show_the_same_images(self, store: ImageStore) -> None:
         src_c, fol_c = await self._scenario(
             store, [ChatMessage.user("old"), ChatMessage.assistant("ok")]
@@ -1961,3 +1959,66 @@ class TestSubmitEdgeKeyRace:
         monkeypatch.undo()
         assert (await store.get_run(run_id)).status == RunStatus.WAITING_HUMAN_INPUT.value
         assert store.edges_of(run_id) == []
+
+
+class TestStoreFullSinglePass:
+    """A full blob store runs exactly one 1h GC pass before failing (§5.12)."""
+
+    @staticmethod
+    def _real_services(monkeypatch: pytest.MonkeyPatch) -> None:
+        from dendrux.runtime._blob_catalog import BlobServices
+
+        monkeypatch.setattr("dendrux.agent._blob_services_factory", lambda: BlobServices)
+
+    @staticmethod
+    def _spy(services: Any) -> list[Any]:
+        calls: list[Any] = []
+        real = services.accessor.collect_garbage
+
+        async def spy(**kwargs: Any) -> Any:
+            calls.append(kwargs.get("older_than"))
+            return await real(**kwargs)
+
+        services.accessor.collect_garbage = spy
+        return calls
+
+    async def test_no_database(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from datetime import timedelta
+
+        from dendrux.media import InMemoryBlobStore
+
+        self._real_services(monkeypatch)
+        agent = Agent(
+            prompt="p",
+            provider=MockLLM([LLMResponse(text="a"), LLMResponse(text="b")]),
+            loop=ImageLoop(),
+            images=ImagePolicy(capability_overrides={"mock": "yes"}),
+            blob_store=InMemoryBlobStore(max_bytes=len(PNG) + 16),
+        )
+        await agent.run([Image.from_bytes(PNG)])
+        assert agent.loop.seen[-1]["runtime"].collect_garbage is None  # type: ignore[union-attr]
+        calls = self._spy(agent._blob_services(None))
+        with pytest.raises(ImageLimitError, match="store_bytes"):
+            await agent.run([Image.from_bytes(PNG2)])
+        assert calls == [timedelta(hours=1)]  # the store wrapper's single pass
+
+    async def test_database_backed(self, engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        from datetime import timedelta
+
+        from dendrux.media import InMemoryBlobStore
+
+        self._real_services(monkeypatch)
+        store = SQLAlchemyStateStore(engine)
+        agent = _agent(
+            store,
+            [LLMResponse(text="a"), LLMResponse(text="b")],
+            blob_store=InMemoryBlobStore(max_bytes=len(PNG) + 16),
+        )
+        await agent.run([Image.from_bytes(PNG)])
+        assert agent.loop.seen[-1]["runtime"].collect_garbage is not None  # type: ignore[union-attr]
+        calls = self._spy(agent._blob_services(store))
+        before = await store.count_runs()
+        with pytest.raises(ImageLimitError, match="store_bytes"):
+            await agent.run([Image.from_bytes(PNG2)])
+        assert calls == [timedelta(hours=1)]  # ingest's single pass
+        assert await store.count_runs() == before

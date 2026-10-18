@@ -3,8 +3,7 @@
 State initialisation for seeded runs (history images count as sent, carried
 rejections / descriptions / guardrail verdicts, single-source drop view) and
 the approval -> client pause -> resume carry of ``image_view`` (N-2). These need
-the persistence (B), provider (C) and loop (D1) tracks; the coordinator removes
-the xfail marks at integration.
+the persistence (B), provider (C) and loop (D1) tracks.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "images"
 PNG = (FIXTURES / "zebra42.png").read_bytes()
 PNG2 = (FIXTURES / "kiwi77.png").read_bytes()
 SHA = hashlib.sha256(PNG).hexdigest()
-
-pytestmark = pytest.mark.xfail(strict=False, reason="needs B/C/D1 merged")
 
 
 @tool()

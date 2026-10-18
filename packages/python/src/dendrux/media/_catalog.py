@@ -93,6 +93,35 @@ class BlobCatalog(Protocol):
 
 
 @runtime_checkable
+class BlobGcCatalog(BlobCatalog, Protocol):
+    """A :class:`BlobCatalog` that also supports garbage collection and purge (§5.12).
+
+    The extra reads/transitions GC needs: the catalog clock (the database's
+    ``now()`` on Postgres), candidate selection, the edge re-check, the revert
+    of a lost race, and the marking variants that also return the row's
+    storage. Implemented by both built-in catalogs (SQL and in-memory).
+    """
+
+    async def current_time(self) -> datetime: ...
+
+    async def gc_candidates(
+        self, cutoff: datetime, limit: int, *, include_external: bool = True
+    ) -> list[BlobInfo]: ...
+
+    async def has_edges(self, scope: str, sha256: str) -> bool: ...
+
+    async def revert_deleting(self, scope: str, sha256: str, generation: str) -> bool: ...
+
+    async def mark_deleting_row(
+        self, scope: str, sha256: str, cutoff: datetime, *, stale_pending_cutoff: datetime
+    ) -> tuple[str, str] | None: ...
+
+    async def mark_purging_row(
+        self, scope: str, sha256: str, reason: str | None
+    ) -> tuple[str, str] | None: ...
+
+
+@runtime_checkable
 class BlobResolver(Protocol):
     """Reads verified bytes of a live blob row (DB or external store, cached).
 

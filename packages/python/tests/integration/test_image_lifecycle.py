@@ -2,9 +2,7 @@
 
 The §6 canonical sample end to end (client-tool screenshot, pause, resume on a
 fresh store + Agent), early typed errors, the external-``BlobStore`` second
-process, and a v0.3.0 text pause resuming unchanged. Tests marked xfail need
-the persistence (B), provider (C) and loop (D1) tracks merged; the coordinator
-removes the marks at integration.
+process, and a v0.3.0 text pause resuming unchanged.
 """
 
 from __future__ import annotations
@@ -37,7 +35,6 @@ IMG = {
     "width": 400,
     "height": 200,
 }
-NEEDS_BCD1 = pytest.mark.xfail(strict=False, reason="needs B/C/D1 merged")
 
 
 @tool(target="client")
@@ -71,7 +68,6 @@ def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
-@NEEDS_BCD1
 async def test_canonical_sample_end_to_end(engine: Any) -> None:
     store = SQLAlchemyStateStore(engine)
     agent = _agent(
@@ -178,7 +174,6 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
         await engine.dispose()
 
 
-@NEEDS_BCD1
 async def test_stream_errors_create_no_run_and_no_blob(engine: Any) -> None:
     store = SQLAlchemyStateStore(engine)
     agent = _agent(
@@ -195,7 +190,6 @@ async def test_stream_errors_create_no_run_and_no_blob(engine: Any) -> None:
     assert await _rows(engine, "SELECT sha256 FROM dendrux_blobs") == []
 
 
-@NEEDS_BCD1
 async def test_external_blob_store_second_process(engine: Any) -> None:
     from dendrux.store import RunStore
 
@@ -257,3 +251,26 @@ async def test_v030_text_pause_resumes_unchanged(engine: Any) -> None:
     ]
     record = await store.get_run(paused.run_id)
     assert record.input_data == {"input": "shot"}
+
+
+async def test_recorder_gets_provider_for_token_estimates(engine: Any) -> None:
+    """``PersistenceRecorder(provider=)``: image_stats.estimated_tokens is filled."""
+
+    class ClaudeLikeMock(MockLLM):
+        def image_capability_key(self, model: str) -> tuple[str, str, str]:
+            return ("anthropic", "", model)
+
+    store = SQLAlchemyStateStore(engine)
+    provider = ClaudeLikeMock(
+        [LLMResponse(text="ZEBRA42")],
+        model="claude-sonnet-4-6",
+        image_support="yes",  # type: ignore[call-arg]
+    )
+    agent = Agent(name="a", prompt="p", provider=provider, state_store=store)
+    result = await agent.run(["What does this say?", Image.from_bytes(PNG)])
+    llm = await store.get_llm_interactions(result.run_id)  # type: ignore[attr-defined]
+    assert llm[0].semantic_request["image_stats"] == {
+        "count": 1,
+        "bytes": len(PNG),
+        "estimated_tokens": 120,
+    }

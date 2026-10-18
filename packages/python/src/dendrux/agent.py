@@ -221,17 +221,14 @@ def _build_provider_from_spec(spec: str) -> LLMProvider:
 
 
 def _blob_services_factory() -> Any:
-    """``BlobServices`` from the persistence layer, or None when it is unavailable.
+    """``BlobServices`` from the persistence layer (the single wiring point).
 
-    The single wiring point with ``runtime/_blob_catalog.py``:
     ``BlobServices.for_state_store(store, blob_store=)`` and
-    ``BlobServices.in_memory(blob_store=)``.
+    ``BlobServices.in_memory(blob_store=)``; tests substitute fakes here.
     """
-    try:
-        from dendrux.runtime import _blob_catalog  # type: ignore[attr-defined,unused-ignore]
-    except ImportError:
-        return None
-    return getattr(_blob_catalog, "BlobServices", None)
+    from dendrux.runtime._blob_catalog import BlobServices
+
+    return BlobServices
 
 
 class _AgentBlobs:
@@ -708,7 +705,13 @@ class Agent:
         return services.catalog, services.blob_store, services.resolver
 
     def _image_gc(self, state_store: StateStore | None) -> Callable[[], Awaitable[object]] | None:
-        """One GC pass (``older_than=1h``) that ingest runs when the blob store is full (§5.12)."""
+        """One GC pass (``older_than=1h``) that ingest runs when the blob store is full (§5.12).
+
+        Database-backed agents only: the in-memory services (no database)
+        wrap their store so a full ``put`` already runs that single pass.
+        """
+        if state_store is None:
+            return None
         services = self._blob_services(state_store)
         accessor = getattr(services, "accessor", None)
         if accessor is None:
