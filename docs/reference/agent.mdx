@@ -140,6 +140,20 @@ for runs with no narration, and for idempotent cached results. Persisted traces
 carry the same split as `TraceEntry.phase`. A paused run may instead carry a
 clarification question.
 
+### Truncated answers
+
+A successful `RunResult` has `stop_reason`, why the call that produced the final answer stopped (`end_turn`, `max_tokens`, `stop_sequence`, `content_filter`, `refusal`, `pause_turn`, `tool_use`, `other`, or `None` when the provider reported none). If the model hit its output-token limit while writing the answer, the run still ends `success`, but `result.truncated` is `True` and Dendrux logs a warning. Check it before you trust the answer:
+
+```python
+result = await agent.run("Summarise this report")
+if result.truncated:
+    ...  # raise max_tokens, or ask the model to continue
+```
+
+When streaming, the `RUN_COMPLETED` event has the same `event.stop_reason` and `event.truncated`. The `run.completed` event in the store (and over `make_read_router` SSE) carries `stop_reason` and `truncated`. Dendrux does not continue a truncated answer automatically. Anthropic's `model_context_window_exceeded` counts as `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers).
+
+With `output_type`, a final answer that fails validation raises `StructuredOutputValidationError` instead. It carries `usage`, `model` and `stop_reason` for the rejected call, which is still recorded and priced; the run row's own totals stay at 0, so read the cost from `RunStore.get_subtree(run_id).usage`. See [Structured output](/docs/architecture/loops#when-validation-fails).
+
 Two ways to stop a `run()` in flight behave differently. Cancelling the task
 awaiting it yourself (including via `asyncio.wait_for`) atomically finalizes a
 still-running persisted run as `cancelled`, emits `run.cancelled` (reason
@@ -246,8 +260,14 @@ not reconstruct the original steps.
 The submit family resumes a paused run. Each one matches a pause status (see [Pause and resume](/docs/architecture/pause-resume)). All require persistence and the run to exist.
 
 ```python
-async def submit_tool_results(run_id: str, results: list[ToolResult], *, notifier=None) -> RunResult
-async def submit_input(run_id: str, text: UserContent, *, notifier=None) -> RunResult
+async def submit_tool_results(
+    run_id: str, results: list[ToolResult], *, notifier=None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> RunResult
+async def submit_input(
+    run_id: str, text: UserContent, *, notifier=None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> RunResult
 async def submit_approval(
     run_id: str,
     *,
@@ -255,9 +275,22 @@ async def submit_approval(
     decisions: Mapping[str, ApprovalDecision] | None = None,
     rejection_reason: str | None = None,
     notifier=None,
+    tenant_id: str | None = ...,    # omitted = unscoped
 ) -> RunResult
-async def submit_resume(run_id: str, *, notifier=None) -> RunResult
-async def resume(run_id: str, *, tool_results=None, user_input=None, notifier=None) -> RunResult
+async def submit_resume(
+    run_id: str, *, notifier=None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> RunResult
+async def resume(
+    run_id: str, *, tool_results=None, user_input=None, notifier=None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> RunResult
+```
+
+Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so existence never leaks across tenants. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it to skip the check.
+
+```python
+await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 ```
 
 | Method | Resumes | Raises |
@@ -279,10 +312,15 @@ Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMisma
 ## `resume_stream`
 
 ```python
-def resume_stream(run_id: str, *, tool_results=None, user_input=None, notifier=None) -> RunStream
+def resume_stream(
+    run_id: str, *, tool_results=None, user_input=None, notifier=None,
+    tenant_id: str | None = ...,    # omitted = unscoped
+) -> RunStream
 ```
 
 Streaming variant of resume: returns a `RunStream` for the resumed run. Image errors in the submitted `tool_results[i].images` or `user_input` are raised from the first iteration, leaving the run paused.
+
+`tenant_id=` works as for the other methods, with one difference in how it fails. Without it, setup failures such as a missing run come back as a `RUN_ERROR` event. With it, a run outside the tenant raises `RunNotFoundError` from the first iteration, before any event, and a store error from the tenant check (a database outage, say) is raised the same way instead of becoming `RUN_ERROR`. The run is left untouched. Catch the exception around the `async for`. If the agent has no persistence, the check is skipped and the usual "requires persistence" `RUN_ERROR` follows.
 
 ## `cancel_run`
 
