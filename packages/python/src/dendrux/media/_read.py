@@ -21,8 +21,21 @@ def check_bytes_source(data: bytes, max_source_bytes: int, *, index: int | None 
     return data
 
 
+_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
 def _read_path_sync(path: str, max_source_bytes: int) -> tuple[bytes | None, str | None, int]:
-    """Return (data, error, size). error is "path" or "too_large"."""
+    """Return (data, error, size). error is "path" or "too_large".
+
+    ``stat`` rejects early without opening; the file is then opened
+    non-blocking and re-checked with ``fstat`` on the open descriptor, so a
+    path swapped for a FIFO or device after the ``stat`` can never block.
+    """
     try:
         st = os.stat(path)
     except OSError:
@@ -32,10 +45,28 @@ def _read_path_sync(path: str, max_source_bytes: int) -> tuple[bytes | None, str
     if st.st_size > max_source_bytes:
         return None, "too_large", st.st_size
     try:
-        with open(path, "rb") as f:
-            data = f.read(max_source_bytes + 1)
+        fd = os.open(path, _OPEN_FLAGS)
     except OSError:
         return None, "path", 0
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return None, "path", 0
+        if fst.st_size > max_source_bytes:
+            return None, "too_large", fst.st_size
+        chunks: list[bytes] = []
+        remaining = max_source_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    except OSError:
+        return None, "path", 0
+    finally:
+        os.close(fd)
     if len(data) > max_source_bytes:
         return None, "too_large", len(data)
     return data, None, len(data)

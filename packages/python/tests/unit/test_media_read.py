@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import tracemalloc
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -76,17 +78,51 @@ class TestPath:
     ) -> None:
         p = tmp_path / "grows.bin"
         p.write_bytes(b"x" * 200)
-        real_stat = os.stat
 
         class SmallStat:
             def __init__(self, st: os.stat_result) -> None:
                 self.st_mode = st.st_mode
                 self.st_size = 10
 
-        monkeypatch.setattr(_read.os, "stat", lambda path: SmallStat(real_stat(path)))
+        class OsProxy:
+            """The module's ``os`` with stat/fstat reporting a size that is too small."""
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            def stat(self, path: Any) -> SmallStat:
+                return SmallStat(os.stat(path))
+
+            def fstat(self, fd: int) -> SmallStat:
+                return SmallStat(os.fstat(fd))
+
+        monkeypatch.setattr(_read, "os", OsProxy())
         with pytest.raises(ImageLimitError) as ei:
             await read_path_bounded(str(p), 100)
         assert ei.value.actual == 101  # read stopped at cap + 1
+
+    async def test_swapped_for_fifo_after_stat_does_not_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("needs mkfifo")
+        regular = tmp_path / "regular.png"
+        regular.write_bytes(PNG)
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+
+        class OsProxy:
+            """``stat`` sees a regular file; the path actually opened is a FIFO."""
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            def stat(self, path: Any) -> os.stat_result:
+                return os.stat(regular)
+
+        monkeypatch.setattr(_read, "os", OsProxy())
+        with pytest.raises(InvalidImageError, match="path"):
+            await asyncio.wait_for(read_path_bounded(str(fifo), 10_000), timeout=5)
 
 
 class TestBase64Strict:

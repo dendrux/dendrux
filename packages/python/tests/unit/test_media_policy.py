@@ -69,8 +69,9 @@ class TestImage:
     def test_value_errors(self) -> None:
         with pytest.raises(ValueError):
             Image.from_bytes(b"x", detail="max")  # type: ignore[arg-type]
-        with pytest.raises(ValueError):
-            Image.from_bytes(b"x", media_type=" ")
+        # Blank / parameters-only declared types are "undeclared" (the sniff decides).
+        assert Image.from_bytes(b"x", media_type=" ").media_type is None
+        assert Image.from_base64("aGk=", media_type=";").media_type is None
         with pytest.raises(ValueError):
             Image(source="bytes")
         with pytest.raises(ValueError):

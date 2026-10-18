@@ -22,7 +22,7 @@ def _norm_media_type(media_type: str | None) -> str | None:
         raise TypeError("media_type must be a string or None")
     mt = media_type.split(";", 1)[0].strip().lower()
     if not mt:
-        raise ValueError("media_type must not be empty")
+        return None  # blank / parameters-only: treated as undeclared (the sniff decides)
     return "image/jpeg" if mt == "image/jpg" else mt
 
 
@@ -84,10 +84,10 @@ class Image:
     ) -> Image:
         """Base64 text, or a ``data:<media type>;base64,<data>`` URL. Decoded strictly at ingest."""
         if isinstance(data, (bytes, bytearray)):
-            try:
-                data = bytes(data).decode("ascii")
-            except UnicodeDecodeError:
-                raise TypeError("Image.from_base64() needs ASCII text") from None
+            raw = bytes(data)
+            if not raw.isascii():
+                raise TypeError("Image.from_base64() needs ASCII text")
+            data = raw.decode("ascii")
         if not isinstance(data, str):
             raise TypeError(f"Image.from_base64() needs a str, got {type(data).__name__}")
         _check_detail(detail)
