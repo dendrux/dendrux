@@ -453,7 +453,10 @@ class AnthropicProvider(LLMProvider):
             if not registry.has_images:
                 raise timeout_error("AnthropicProvider", self._timeout) from None
             failure = transport_image_error(
-                "timeout", provider_name="anthropic", model=api_kwargs["model"]
+                "timeout",
+                provider_name="anthropic",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("AnthropicProvider", self._timeout)),
             )
         except anthropic.APIConnectionError as exc:
             if not registry.has_images:
@@ -466,6 +469,9 @@ class AnthropicProvider(LLMProvider):
                 raise
             failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
         if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
             raise failure
 
         if is_structured:
@@ -592,7 +598,10 @@ class AnthropicProvider(LLMProvider):
             if not registry.has_images:
                 raise timeout_error("AnthropicProvider", self._timeout) from None
             failure = transport_image_error(
-                "timeout", provider_name="anthropic", model=api_kwargs["model"]
+                "timeout",
+                provider_name="anthropic",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("AnthropicProvider", self._timeout)),
             )
         except anthropic.APIConnectionError as exc:
             if not registry.has_images:
@@ -608,6 +617,9 @@ class AnthropicProvider(LLMProvider):
         finally:
             end_call_attempt_tracking(attempt_token)
         if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
             raise failure
 
         usage = self._usage_from_response(final_message.usage)

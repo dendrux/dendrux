@@ -238,7 +238,24 @@ IMAGE_UNSUPPORTED_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 # A specific image the provider refused (size, dimensions, undecodable bytes).
 IMAGE_REJECTED_STATUSES: frozenset[int] = frozenset({400})
 IMAGE_REJECTED_CODE_PREFIX = "invalid_image"
-IMAGE_REJECTED_CODES: frozenset[str] = frozenset({"image_parse_error"})
+# Image error codes of the OpenAI Responses ``ResponseError.code`` enum (openai
+# SDK 2.30) that name a problem with one image's bytes. URL-fetch codes are left
+# out: Dendrux only sends inline data URLs. ``image_content_policy_violation``
+# is included: the image is refused as content, so it is tombstoned like any
+# other rejected image (owner may revisit).
+IMAGE_REJECTED_CODES: frozenset[str] = frozenset(
+    {
+        "image_parse_error",
+        "invalid_base64_image",
+        "image_too_large",
+        "image_too_small",
+        "image_file_too_large",
+        "invalid_image_mode",
+        "unsupported_image_media_type",
+        "empty_image_file",
+        "image_content_policy_violation",
+    }
+)
 IMAGE_REJECTED_TEXT = re.compile(r"\binvalid image\b|\bimage_parse_error\b", re.IGNORECASE)
 IMAGE_WORD = re.compile(r"\bimages?\b", re.IGNORECASE)
 IMAGE_REJECTED_KEYWORDS = re.compile(

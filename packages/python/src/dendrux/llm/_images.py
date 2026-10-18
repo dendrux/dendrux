@@ -14,6 +14,7 @@ Text-only requests never touch anything in this module.
 from __future__ import annotations
 
 import base64
+import contextlib
 import re
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -77,14 +78,15 @@ def portable_tool_text(msg: Message) -> str:
     return msg.content + "\n\n" + note if msg.content else note
 
 
-def has_image_parts(messages: Sequence[Message]) -> bool:
-    """True when any message carries image parts (an image-bearing request)."""
-    return any(m.parts is not None for m in messages)
-
-
 # ------------------------------------------------------------------
 # Registry: encode, register wire paths, sanitise, locate
 # ------------------------------------------------------------------
+
+
+# Keys that can follow an image block's own path in a vendor error path.
+IMAGE_BLOCK_SUBKEYS: frozenset[str | int] = frozenset(
+    {"image", "source", "base64", "data", "media_type", "image_url", "url", "detail", "type"}
+)
 
 
 class WireImageRegistry:
@@ -97,10 +99,11 @@ class WireImageRegistry:
     back to an ``image_id``. One registry per provider call; never shared.
     """
 
-    __slots__ = ("_b64", "_by_value", "_paths")
+    __slots__ = ("_b64", "_by_value", "_paths", "_urls")
 
     def __init__(self) -> None:
         self._b64: dict[str, str] = {}
+        self._urls: dict[str, str] = {}
         self._by_value: dict[str, str] = {}
         self._paths: dict[WirePath, ImagePart] = {}
 
@@ -119,27 +122,35 @@ class WireImageRegistry:
         """Registered wire paths -> ``image_id`` (a copy)."""
         return {path: part.image_id for path, part in self._paths.items()}
 
-    def base64(self, part: ImagePart) -> str:
-        """Canonical base64 of the part's verified bytes (RFC 4648, padded, one line)."""
-        sha = part.ref.sha256
-        cached = self._b64.get(sha)
-        if cached is not None:
-            return cached
+    @staticmethod
+    def _encode(part: ImagePart) -> str:
         if part.data is None:
             raise ValueError(
                 f"Image {part.image_id} reached the provider adapter without bytes; "
                 "adapters only accept request-view messages from prepare_request()."
             )
-        encoded = base64.b64encode(part.data).decode("ascii")
-        self._b64[sha] = encoded
-        self._by_value[encoded] = sha
-        return encoded
+        return base64.b64encode(part.data).decode("ascii")
+
+    def base64(self, part: ImagePart) -> str:
+        """Canonical base64 of the part's verified bytes (RFC 4648, padded, one line)."""
+        sha = part.ref.sha256
+        cached = self._b64.get(sha)
+        if cached is None:
+            cached = self._encode(part)
+            self._b64[sha] = cached
+            self._by_value[cached] = sha
+        return cached
 
     def data_url(self, part: ImagePart) -> str:
-        """``data:<media_type>;base64,<b64>`` for the part."""
-        url = f"data:{part.ref.media_type};base64,{self.base64(part)}"
-        self._by_value[url] = part.ref.sha256
-        return url
+        """``data:<media_type>;base64,<b64>`` for the part (one string kept per image)."""
+        sha = part.ref.sha256
+        cached = self._urls.get(sha)
+        if cached is None:
+            b64 = self._b64.get(sha) or self._encode(part)
+            cached = f"data:{part.ref.media_type};base64,{b64}"
+            self._urls[sha] = cached
+            self._by_value[cached] = sha
+        return cached
 
     def register(self, path: WirePath, part: ImagePart) -> None:
         """Record that ``part`` was emitted at ``path`` in the request body."""
@@ -148,9 +159,11 @@ class WireImageRegistry:
     def locate(self, path: WirePath | None) -> str | None:
         """``image_id`` of the registered image a vendor error path points at.
 
-        A registered path that prefixes ``path`` wins (longest first). Else, when
-        ``path`` names an ancestor that holds exactly one registered image, that
-        image. Otherwise None (unlocated).
+        A registered path equal to ``path``, or one that ``path`` extends with an
+        image sub-key (``image``, ``source``, ``data``, ``image_url``, ...), wins.
+        A path that descends any other way (e.g. ``content``) never names that
+        image block. Else, when ``path`` names an ancestor that holds exactly one
+        registered image, that image. Otherwise None (unlocated).
         """
         if not path:
             return None
@@ -158,7 +171,11 @@ class WireImageRegistry:
         best_len = -1
         for registered, part in self._paths.items():
             n = len(registered)
-            if n > best_len and path[:n] == registered:
+            if (
+                n > best_len
+                and path[:n] == registered
+                and (len(path) == n or path[n] in IMAGE_BLOCK_SUBKEYS)
+            ):
                 best, best_len = part, n
         if best is not None:
             return best.image_id
@@ -319,6 +336,14 @@ OPENAI_IMAGE_NO_PREFIXES: tuple[str, ...] = (
     "o3-mini",
 )
 OPENAI_IMAGE_NO_EXACT: frozenset[str] = frozenset({"gpt-4", "gpt-4-0314", "gpt-4-0613"})
+# Audio / realtime variants of the gpt-4o family do not take images on Chat;
+# not asserted "no" (unverified), so they are sent and a vendor refusal is learned.
+OPENAI_IMAGE_UNKNOWN_PREFIXES: tuple[str, ...] = (
+    "gpt-4o-audio",
+    "gpt-4o-realtime",
+    "gpt-4o-mini-audio",
+    "gpt-4o-mini-realtime",
+)
 
 
 def openai_image_support(model: str) -> ImageSupport:
@@ -334,6 +359,9 @@ def openai_image_support(model: str) -> ImageSupport:
     for prefix in OPENAI_IMAGE_NO_PREFIXES:
         if name.startswith(prefix) and len(prefix) > best:
             verdict, best = "no", len(prefix)
+    for prefix in OPENAI_IMAGE_UNKNOWN_PREFIXES:
+        if name.startswith(prefix) and len(prefix) > best:
+            verdict, best = "unknown", len(prefix)
     return verdict
 
 
@@ -365,7 +393,7 @@ def normalize_base_url(url: object) -> str:
 # Typed errors on image-bearing requests (§5.5 exception hygiene)
 # ------------------------------------------------------------------
 
-_DATA_URL_RE = re.compile(r"data:[^\s'\"<>]*")
+_DATA_URL_RE = re.compile(r"(?<![A-Za-z0-9_])data:[^\s'\"<>]*")
 _BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
 _MESSAGE_LIMIT = 500
 
@@ -535,10 +563,29 @@ def sdk_image_request_error(
 
 
 def transport_image_error(
-    kind: Literal["timeout", "connection"], *, provider_name: str, model: str
+    kind: Literal["timeout", "connection"],
+    *,
+    provider_name: str,
+    model: str,
+    hint: str | None = None,
 ) -> ProviderError:
-    """Timeout / connection failure on an image-bearing request (no request attached)."""
-    message = (
+    """Timeout / connection failure on an image-bearing request (no request attached).
+
+    ``hint`` is the v0.3.0 adapter message (e.g. the "Increase timeout: ..."
+    advice); it never contains request data.
+    """
+    default = (
         "LLM request timed out." if kind == "timeout" else "Connection to the provider failed."
     )
-    return ProviderError(provider=provider_name, model=model, error_type=kind, message=message)
+    return ProviderError(
+        provider=provider_name, model=model, error_type=kind, message=hint or default
+    )
+
+
+async def close_stream_quietly(stream: Any) -> None:
+    """Release an SDK stream's connection after an in-stream error; never raises."""
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    with contextlib.suppress(Exception):
+        await close()

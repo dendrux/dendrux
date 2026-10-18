@@ -35,6 +35,7 @@ from dendrux.llm._images import (
     WireImageRegistry,
     chat_image,
     chat_text,
+    close_stream_quietly,
     convert_parts,
     normalize_base_url,
     openai_image_support,
@@ -355,7 +356,10 @@ class OpenAIProvider(LLMProvider):
     def _transport_image_error(
         self, kind: Literal["timeout", "connection"], model: str
     ) -> Exception:
-        return transport_image_error(kind, provider_name=self._image_provider_name, model=model)
+        hint = str(timeout_error(type(self).__name__, self._timeout)) if kind == "timeout" else None
+        return transport_image_error(
+            kind, provider_name=self._image_provider_name, model=model, hint=hint
+        )
 
     async def __aenter__(self) -> OpenAIProvider:
         return self
@@ -551,6 +555,9 @@ class OpenAIProvider(LLMProvider):
                 raise
             failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
         if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
             raise failure
 
         llm_response = self._normalize_response(response)
@@ -635,6 +642,9 @@ class OpenAIProvider(LLMProvider):
             # does not need the counter.
             end_call_attempt_tracking(attempt_token)
         if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
             raise failure
 
         # Accumulators for building the final LLMResponse
@@ -732,6 +742,10 @@ class OpenAIProvider(LLMProvider):
                     yield flush_event
 
         if failure is not None:
+            await close_stream_quietly(stream)
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry, stream, chunk_iter
             raise failure
 
         # Some compatible backends end the stream without ever sending a

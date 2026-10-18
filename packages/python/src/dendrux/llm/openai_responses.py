@@ -30,6 +30,7 @@ from dendrux.llm._helpers import (
 )
 from dendrux.llm._images import (
     WireImageRegistry,
+    close_stream_quietly,
     convert_parts,
     image_request_error,
     normalize_base_url,
@@ -334,6 +335,10 @@ class OpenAIResponsesProvider(LLMProvider):
             value = error.get(name) if isinstance(error, dict) else getattr(error, name, None)
             return value if isinstance(value, str) and value else None
 
+        # An ``error`` stream event's ``type`` is the event name, not an error type.
+        error_type = field("type")
+        if error_type == "error":
+            error_type = None
         return image_request_error(
             provider=self,
             provider_name="openai_responses",
@@ -341,7 +346,7 @@ class OpenAIResponsesProvider(LLMProvider):
             registry=registry,
             status_code=None,
             code=field("code"),
-            error_type=field("type"),
+            error_type=error_type,
             param=field("param"),
             message=field("message") or "",
             streaming=True,
@@ -523,7 +528,10 @@ class OpenAIResponsesProvider(LLMProvider):
             if not registry.has_images:
                 raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
             failure = transport_image_error(
-                "timeout", provider_name="openai_responses", model=api_kwargs["model"]
+                "timeout",
+                provider_name="openai_responses",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("OpenAIResponsesProvider", self._timeout)),
             )
         except openai.APIConnectionError as exc:
             if not registry.has_images:
@@ -536,6 +544,9 @@ class OpenAIResponsesProvider(LLMProvider):
                 raise
             failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
         if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
             raise failure
 
         llm_response = self._normalize_response(response)
@@ -601,7 +612,10 @@ class OpenAIResponsesProvider(LLMProvider):
             if not registry.has_images:
                 raise timeout_error("OpenAIResponsesProvider", self._timeout) from None
             failure = transport_image_error(
-                "timeout", provider_name="openai_responses", model=api_kwargs["model"]
+                "timeout",
+                provider_name="openai_responses",
+                model=api_kwargs["model"],
+                hint=str(timeout_error("OpenAIResponsesProvider", self._timeout)),
             )
         except openai.APIConnectionError as exc:
             if not registry.has_images:
@@ -623,6 +637,9 @@ class OpenAIResponsesProvider(LLMProvider):
             # stream is open the SDK no longer retries.
             end_call_attempt_tracking(attempt_token)
         if failure is not None:
+            # Frame locals reach tracebacks (and error trackers): drop the
+            # request kwargs and registry, which hold the base64 payloads.
+            del api_kwargs, registry
             raise failure
 
         # Accumulators for building the final LLMResponse
@@ -641,6 +658,9 @@ class OpenAIResponsesProvider(LLMProvider):
             # Image-bearing: SDK errors raised mid-iteration and in-stream error
             # events become typed, sanitised errors (they may follow deltas).
             stream = self._guard_image_stream(stream, registry, api_kwargs["model"])
+            # This frame stays on the traceback of an in-stream failure; the
+            # request kwargs (base64 payloads) are not needed past this point.
+            del api_kwargs, registry
 
         async for event in stream:
             event_type = getattr(event, "type", None)
@@ -777,6 +797,8 @@ class OpenAIResponsesProvider(LLMProvider):
                 break
             yield event
         if failure is not None:
+            await close_stream_quietly(stream)
+            del stream, iterator, registry
             raise failure
 
     # ------------------------------------------------------------------
