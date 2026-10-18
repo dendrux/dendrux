@@ -107,6 +107,7 @@ The guide is [Images](/docs/recipes/images).
 | --- | --- | --- |
 | `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`. |
 | `RunStatus` | `from dendrux.types import RunStatus` | `pending`, `running`, `waiting_*`, `paused`, `success`, `error`, `cancelled`, `max_iterations`. |
+| `StopReason` | `from dendrux import StopReason` | Why the final LLM call stopped: `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `content_filter`, `refusal`, `pause_turn`, `other`. On `RunResult.stop_reason`; `RunResult.truncated` is true for `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers). |
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
 | `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |

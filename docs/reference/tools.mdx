@@ -35,7 +35,7 @@ The tool's `description` is the full docstring. The arguments schema is generate
 | `max_calls_per_run` | `None` | Limit on calls per run. `None` = unlimited. |
 | `timeout_seconds` | `120.0` | Execution timeout for server tools. |
 | `parameters` | `None` | Explicit JSON Schema for the arguments. Skips generation from type hints. |
-| `strict` | `False` | Opt into OpenAI strict function calling. See [Strict mode](#strict-mode). |
+| `strict` | `False` | Opt into strict tool calling on OpenAI and Anthropic. See [Strict mode](#strict-mode). |
 
 ## Supported parameter types
 
@@ -110,7 +110,7 @@ async def record(value) -> str:
 
 ## Strict mode
 
-`@tool(strict=True)` opts the tool into [OpenAI strict function calling](https://platform.openai.com/docs/guides/function-calling#strict-mode). With strict mode on, OpenAI guarantees that the arguments match the schema.
+`@tool(strict=True)` opts the tool into strict tool calling: [OpenAI strict function calling](https://platform.openai.com/docs/guides/function-calling#strict-mode) and [Anthropic strict tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use). With strict mode on, the provider constrains the model's arguments to the schema.
 
 The schema is normalized once, at decoration time, and stored on `ToolDef.parameters`, so every provider sees the same schema:
 
@@ -124,11 +124,54 @@ On the wire:
 | --- | --- |
 | `OpenAIProvider`, `OpenRouterProvider` (Chat Completions) | Sends `"strict": true` on the function. |
 | `OpenAIResponsesProvider` | Sends `"strict": true` on the function tool. |
-| `AnthropicProvider` | Ignores the flag and sends the normalized schema. |
+| `AnthropicProvider` | Sends `"strict": true` with a copy of the schema adapted to Anthropic's strict subset (see [Strict mode on Anthropic](#strict-mode-on-anthropic)). |
 
 OpenAI strict mode requires every object to declare its properties. If a strict tool has a free-form `dict` or `dict[str, T]` parameter, the decorator raises `TypeError`. Use a `BaseModel`, dataclass, or `TypedDict` instead.
 
-`strict=True` combines with `parameters=`: your explicit schema is normalized the same way.
+`strict=True` combines with `parameters=`: your explicit schema is normalized the same way. The decorator also rejects a free-form object under draft-7 `definitions`, the same as under `$defs`.
+
+### Strict mode on Anthropic
+
+On Anthropic, Dendrux sends `"strict": true` and a per-request copy of the schema adapted to Anthropic's strict subset. `ToolDef.parameters` is not changed. Non-strict tools are sent exactly as before, byte for byte, so prompt caching is not affected.
+
+The adapted copy:
+
+- Gets `additionalProperties: false` on every object.
+- Keeps what the grammar can enforce: `enum`, `const`, `$ref`, optional fields, `minLength`, `maxLength`, simple `pattern`s, `minItems` of 0 or 1, and the standard `format`s (`date-time`, `date`, `time`, `duration`, `email`, `hostname`, `uri`, `ipv4`, `ipv6`, `uuid`).
+- Moves what Anthropic rejects into the field's `description`, so the model still sees it: numeric bounds (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`), `multipleOf`, `maxItems`, `minItems` above 1, `uniqueItems`, uncommon `format`s, and advanced regex features such as lookaround. A bound like `Field(ge=1)` becomes the text "Must be >= 1." in the description.
+
+A constraint that was moved into the description is a hint to the model, not a grammar rule. If it matters, check it in your function.
+
+Anthropic limits one request to 20 strict tools, 24 optional parameters and 16 union-typed parameters (`X | None`, `anyOf`) across all strict tools. Dendrux counts these in tool order. A tool is sent non-strict, with the reason logged on `dendrux.llm.anthropic`, when it:
+
+- would go over a limit;
+- has a free-form `dict`, a tuple, an `Any` field or a recursive model.
+
+A strict tool that is sent non-strict logs a WARNING once per tool name, then DEBUG.
+
+If Anthropic still rejects a strict schema (its grammar compiler has size and regex limits that cannot be checked in advance), Dendrux retries that request once with every strict tool sent as before. It logs a WARNING and keeps sending that tool non-strict for the rest of the process. The retry applies to any HTTP 400 on a request that carried a strict tool; other errors are raised unchanged.
+
+To turn strict mode off for a provider, pass `strict=False`:
+
+```python
+provider = AnthropicProvider(model="claude-sonnet-4-6", strict=False)
+```
+
+Then tools and structured output are sent exactly as in 0.4.0. Use it when you point `ANTHROPIC_BASE_URL` at a gateway that rejects the `strict` field.
+
+**Data retention.** Strict mode sends your tool schemas to Anthropic's grammar compiler, which caches them for up to 24 hours since last use. That cache is separate from prompts and responses, which keep their usual zero-data-retention and HIPAA handling. Do not put sensitive data such as PHI in property names, `enum` or `const` values, or `pattern`s. If your schemas may contain it, use `AnthropicProvider(..., strict=False)`. See Anthropic's [strict tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use) and [structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs) pages, under "Data retention".
+
+Apps that already used `@tool(strict=True)` with Anthropic see one prompt-cache miss after upgrading to 0.4.1, because the tool payload now carries `strict` and the adapted schema.
+
+## When the model calls a tool that does not exist
+
+The call does not run. The model gets a failed tool result that lists what it can call:
+
+```text
+Unknown tool: bash. Available tools: read_file, write_file
+```
+
+Names are sorted and capped at 50, then `, … and N more`. If no tools were offered, the text is `Unknown tool: bash. No tools are available.` The `Unknown tool: <name>` prefix is stable.
 
 ## MCP tools
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -302,16 +304,251 @@ class TestConvertTools:
         assert result[0]["name"] == "a"
         assert result[1]["name"] == "b"
 
-    def test_strict_flag_not_sent(self, provider: AnthropicProvider) -> None:
+    def test_strict_flag_sent_with_normalized_schema(self, provider: AnthropicProvider) -> None:
         params = {
             "type": "object",
-            "properties": {"q": {"type": ["string", "null"]}},
-            "required": ["q"],
+            "properties": {
+                "q": {"type": ["string", "null"]},
+                "n": {"type": "integer", "minimum": 1},
+            },
+            "required": ["q", "n"],
             "additionalProperties": False,
         }
         tools = [ToolDef(name="s", description="S", parameters=params, strict=True)]
         result = provider._convert_tools(tools)
-        assert result[0] == {"name": "s", "description": "S", "input_schema": params}
+        assert result[0] == {
+            "name": "s",
+            "description": "S",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": ["string", "null"]},
+                    "n": {"type": "integer", "description": "Must be >= 1."},
+                },
+                "required": ["q", "n"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+        # The stored ToolDef schema is untouched (OpenAI providers still use it).
+        assert params["properties"]["n"]["minimum"] == 1
+
+
+# ------------------------------------------------------------------
+# Strict mode (request side)
+# ------------------------------------------------------------------
+
+
+def _closed(props: dict, required: list | None = None) -> dict:
+    return {
+        "type": "object",
+        "properties": props,
+        "required": list(props) if required is None else required,
+        "additionalProperties": False,
+    }
+
+
+_NULLABLE_INT = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+
+
+class TestStrictTools:
+    def test_non_strict_payload_byte_identical(self, provider: AnthropicProvider) -> None:
+        params = {
+            "type": "object",
+            "properties": {"n": {"type": "integer", "minimum": 1}, "d": {"type": "object"}},
+            "required": ["n"],
+        }
+        td = ToolDef(name="t", description="T", parameters=params)
+        result = provider._convert_tools([td])
+        expected = [{"name": "t", "description": "T", "input_schema": params}]
+        assert json.dumps(result) == json.dumps(expected)
+        assert result[0]["input_schema"] is td.parameters
+
+    def test_incompatible_strict_tool_sent_as_today(
+        self, provider: AnthropicProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        params = {
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/N"}},
+            "required": ["node"],
+            "additionalProperties": False,
+            "$defs": {"N": _closed({"kids": {"type": "array", "items": {"$ref": "#/$defs/N"}}})},
+        }
+        td = ToolDef(name="tree", description="T", parameters=params, strict=True)
+        with caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"):
+            result = provider._convert_tools([td])
+        assert result == [{"name": "tree", "description": "T", "input_schema": params}]
+        assert any(
+            "tree" in r.getMessage() and "recursive" in r.getMessage() for r in caplog.records
+        )
+
+    def test_strict_tool_count_limit(self, provider: AnthropicProvider) -> None:
+        tools = [
+            ToolDef(
+                name=f"t{i}",
+                description="T",
+                parameters=_closed({"x": {"type": "integer"}}),
+                strict=True,
+            )
+            for i in range(21)
+        ]
+        result = provider._convert_tools(tools)
+        assert [r.get("strict") for r in result] == [True] * 20 + [None]
+
+    def test_union_budget_shared_across_tools(self, provider: AnthropicProvider) -> None:
+        nine = _closed({f"p{i}": dict(_NULLABLE_INT) for i in range(9)})
+        tools = [
+            ToolDef(name="a", description="A", parameters=nine, strict=True),
+            ToolDef(name="b", description="B", parameters=nine, strict=True),
+            ToolDef(
+                name="c",
+                description="C",
+                parameters=_closed({"x": {"type": "integer"}}),
+                strict=True,
+            ),
+        ]
+        result = provider._convert_tools(tools)
+        assert [r.get("strict") for r in result] == [True, None, True]
+        assert result[1] == {"name": "b", "description": "B", "input_schema": nine}
+
+    def test_non_strict_tools_do_not_use_budget(self, provider: AnthropicProvider) -> None:
+        nine = _closed({f"p{i}": dict(_NULLABLE_INT) for i in range(9)})
+        tools = [
+            ToolDef(name="a", description="A", parameters=nine),
+            ToolDef(name="b", description="B", parameters=nine, strict=True),
+        ]
+        result = provider._convert_tools(tools)
+        assert [r.get("strict") for r in result] == [None, True]
+
+    async def test_complete_evidence_records_strict(self, provider: AnthropicProvider) -> None:
+        mock_response = _make_anthropic_response(
+            content=[TextBlock(type="text", text="ok", citations=None)]
+        )
+        td = ToolDef(
+            name="s",
+            description="S",
+            parameters=_closed({"n": {"type": "integer", "maximum": 3}}),
+            strict=True,
+        )
+        with patch.object(
+            provider._client.messages, "create", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = mock_response
+            result = await provider.complete([Message(role=Role.USER, content="hi")], tools=[td])
+        sent = mock_create.call_args.kwargs["tools"]
+        assert sent[0]["strict"] is True
+        assert sent[0]["input_schema"]["properties"]["n"] == {
+            "type": "integer",
+            "description": "Must be <= 3.",
+        }
+        assert result.provider_request is not None
+        assert result.provider_request["tools"] == sent
+
+    async def test_complete_stream_sends_strict(self, provider: AnthropicProvider) -> None:
+        final_msg = _make_anthropic_response([TextBlock(type="text", text="ok", citations=None)])
+        stream = MagicMock(return_value=_FakeStream([], final_msg))
+        provider._client.messages.stream = stream
+        td = ToolDef(
+            name="s", description="S", parameters=_closed({"x": {"type": "integer"}}), strict=True
+        )
+        events = [
+            e
+            async for e in provider.complete_stream(
+                [Message(role=Role.USER, content="hi")], tools=[td]
+            )
+        ]
+        assert stream.call_args.kwargs["tools"][0]["strict"] is True
+        done = events[-1]
+        assert done.raw.provider_request["tools"][0]["strict"] is True
+
+
+class TestStrictStructuredOutput:
+    @staticmethod
+    def _structured_response(data: dict) -> AnthropicMessage:
+        return _make_anthropic_response(
+            content=[
+                ToolUseBlock(type="tool_use", id="toolu_s", name="structured_output", input=data)
+            ],
+            stop_reason="tool_use",
+        )
+
+    async def test_compatible_schema_sent_strict(self, provider: AnthropicProvider) -> None:
+        schema = {
+            "type": "object",
+            "title": "Out",
+            "properties": {
+                "count": {"type": "integer", "minimum": 0, "title": "Count"},
+                "note": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+            },
+            "required": ["count"],
+        }
+        with patch.object(
+            provider._client.messages, "create", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = self._structured_response({"count": 2})
+            result = await provider.complete(
+                [Message(role=Role.USER, content="count")], output_schema=schema
+            )
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["tools"] == [
+            {
+                "name": "structured_output",
+                "description": "Return your response in this exact format.",
+                "input_schema": {
+                    "type": "object",
+                    "title": "Out",
+                    "properties": {
+                        "count": {
+                            "type": "integer",
+                            "title": "Count",
+                            "description": "Must be >= 0.",
+                        },
+                        "note": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+                    },
+                    "required": ["count"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        ]
+        assert kwargs["tool_choice"] == {"type": "tool", "name": "structured_output"}
+        assert result.provider_request["tools"] == kwargs["tools"]
+        assert result.provider_request["tool_choice"] == kwargs["tool_choice"]
+        assert "minimum" in schema["properties"]["count"]
+
+    async def test_incompatible_schema_sent_as_today(
+        self, provider: AnthropicProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+                "count": {"type": "integer", "minimum": 0},
+            },
+            "required": ["labels", "count"],
+        }
+        with (
+            patch.object(
+                provider._client.messages, "create", new_callable=AsyncMock
+            ) as mock_create,
+            caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"),
+        ):
+            mock_create.return_value = self._structured_response({"labels": {}, "count": 1})
+            await provider.complete([Message(role=Role.USER, content="x")], output_schema=schema)
+        sent = mock_create.call_args.kwargs["tools"]
+        expected = [
+            {
+                "name": "structured_output",
+                "description": "Return your response in this exact format.",
+                "input_schema": schema,
+            }
+        ]
+        assert json.dumps(sent) == json.dumps(expected)
+        assert sent[0]["input_schema"] is schema
+        assert any(
+            "structured output" in r.getMessage() and "labels" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 # ------------------------------------------------------------------

@@ -48,6 +48,7 @@ from dendrux.llm._retry_telemetry import (
     end_call_attempt_tracking,
     make_telemetry_http_client,
 )
+from dendrux.llm._stop_reason import responses_stop_reason
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -731,8 +732,9 @@ class OpenAIResponsesProvider(LLMProvider):
                     tool_call_id=call_id,
                 )
 
-            # --- Response completed — extract usage ---
-            elif event_type == "response.completed":
+            # --- Response finished — extract usage. A truncated response
+            # ends with ``response.incomplete`` instead of ``completed``.
+            elif event_type in ("response.completed", "response.incomplete"):
                 _completed_response = event.response
                 if hasattr(_completed_response, "usage") and _completed_response.usage:
                     usage = _build_usage_with_cache(_completed_response.usage)
@@ -752,6 +754,12 @@ class OpenAIResponsesProvider(LLMProvider):
             ]
             reasoning_blocks = blocks or None
 
+        stop_reason, raw_stop_reason = (
+            responses_stop_reason(_completed_response)
+            if _completed_response is not None
+            else (None, None)
+        )
+
         # Assemble the final LLMResponse
         llm_response = LLMResponse(
             text="".join(text_parts) if text_parts else None,
@@ -760,6 +768,8 @@ class OpenAIResponsesProvider(LLMProvider):
             usage=usage,
             reasoning="".join(reasoning_parts) if reasoning_parts else None,
             reasoning_blocks=reasoning_blocks,
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )
         llm_response.provider_request = captured_request
         llm_response.model = captured_request["model"]
@@ -1010,6 +1020,7 @@ class OpenAIResponsesProvider(LLMProvider):
         usage = UsageStats(usage_reported=False)
         if hasattr(response, "usage") and response.usage:
             usage = _build_usage_with_cache(response.usage)
+        stop_reason, raw_stop_reason = responses_stop_reason(response)
 
         return LLMResponse(
             text=text if text else None,
@@ -1018,4 +1029,6 @@ class OpenAIResponsesProvider(LLMProvider):
             usage=usage,
             reasoning="".join(reasoning_parts) if reasoning_parts else None,
             reasoning_blocks=reasoning_blocks if reasoning_blocks else None,
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )

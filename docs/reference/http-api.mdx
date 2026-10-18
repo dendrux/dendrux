@@ -234,7 +234,7 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | `run.started` | First event on any run | `{"agent_name": str, "system_prompt": str}` |
 | `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval" \| "paused", "pending_tool_calls": [{"id", "name", "target", "params"}]}`. A `paused` status adds `"reason": "requested" \| "budget"` and, if `request_pause(reason=...)` gave one, `"message"` (up to 500 chars); a budget pause adds `"exceeded": [{"metric", "used", "max"}]`. `pending_tool_calls` is empty for a pause with nothing outstanding |
 | `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}`; a result that carried images adds `"image_count"` to its entry, and an input with images adds `"image_count"` to the payload; `resumed_from` is `"paused"` after `submit_resume` |
-| `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str}` |
+| `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str, "stop_reason": str \| null, "truncated": bool}`. `stop_reason` is the normalized reason the final LLM call stopped (`end_turn`, `max_tokens`, ...) and is `null` on `max_iterations` or when the provider reported none; `truncated` is true when it is `max_tokens`. Events written before 0.4.1 have `status` only |
 | `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, run or stream interrupted, or a budget cancel | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when `cancel_run` abandoned a model call (`partial_output` is always `false` for batch `run()`); `{"reason": "task_cancelled"}` when the task awaiting `run()` was cancelled; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream; `{"reason": "budget_exceeded", "exceeded": [{"metric", "used", "max"}]}` for `Budget(on_exceed="cancel")` |
 | `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars) |
 | `run.interrupted` | `sweep(stale_running=...)` finalized a stale `running` run | `{"failure_reason": "stale_running" \| "never_started"}` |
@@ -285,7 +285,7 @@ Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and 
 
 Dendrux does not ship HTTP write routes. You wrap these methods in your own endpoints so auth, validation, and transport stay yours.
 
-### `agent.submit_tool_results(run_id, results, *, notifier=None) -> RunResult`
+### `agent.submit_tool_results(run_id, results, *, notifier=None, tenant_id=...) -> RunResult`
 
 Submit results for a run paused in `WAITING_CLIENT_TOOL`. Race-safe: persist-first handoff + CAS claim in one atomic step. Blocks until the next pause or terminal state.
 
@@ -304,13 +304,13 @@ class ToolResult:
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`.
 
-### `agent.submit_input(run_id, text, *, notifier=None) -> RunResult`
+### `agent.submit_input(run_id, text, *, notifier=None, tenant_id=...) -> RunResult`
 
 Submit a clarification for a run paused in `WAITING_HUMAN_INPUT`. Same race-safety as `submit_tool_results`. Blocks until next pause or terminal.
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`.
 
-### `agent.submit_approval(run_id, *, approved=None, decisions=None, rejection_reason=None, notifier=None) -> RunResult`
+### `agent.submit_approval(run_id, *, approved=None, decisions=None, rejection_reason=None, notifier=None, tenant_id=...) -> RunResult`
 
 Submit an approval decision for a run paused in `WAITING_APPROVAL`. Pass exactly one of `approved=` and `decisions=`.
 
@@ -322,7 +322,7 @@ Client-target calls in the batch never execute on the server in any form; the ru
 
 Raises: the same set as the other submit methods, plus `ValueError` for an invalid argument combination or decision ids.
 
-### `agent.submit_resume(run_id, *, notifier=None) -> RunResult`
+### `agent.submit_resume(run_id, *, notifier=None, tenant_id=...) -> RunResult`
 
 Continue a run in status `PAUSED` (a requested or budget pause) with its full history. Same race-safety as the other submit methods. Blocks until the next pause or terminal state.
 
@@ -360,7 +360,7 @@ Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 
 ### Minimal write-route wrappers
 
-A single-tenant example follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to `request_pause`, `submit_note`, and `cancel_run`; omitting `tenant_id` is unscoped, while explicit `tenant_id=None` means untenanted runs only. The `submit_*` methods have no tenant parameter, so verify run ownership before calling them. The sample below does both: `owned_run` is a dependency that checks the run belongs to the caller's tenant before any route touches it.
+A single-tenant example follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to every write method: `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream`, `request_pause`, `submit_note` and `cancel_run`. Omitting `tenant_id` is unscoped, while explicit `tenant_id=None` means untenanted runs only. A run outside the tenant raises `RunNotFoundError` before anything is written. The sample below also uses `owned_run`, a dependency that checks the run belongs to the caller's tenant before any route touches it, which is a cheap way to guard every route in one place. Passing `tenant_id=` to the submit calls themselves (for example `agent.submit_tool_results(run_id, results, tenant_id=tenant_id)`) gives the same guarantee at the call.
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -383,7 +383,7 @@ def tenant_of(request: Request) -> str:
     return request.state.tenant_id
 
 async def owned_run(run_id: str, tenant_id: str = Depends(tenant_of)) -> str:
-    """Ownership check for every route. The submit_* methods take no tenant_id."""
+    """Ownership check for every route."""
     try:
         await store.get_subtree(run_id, tenant_id=tenant_id)   # root must be in this tenant
     except StoreRunNotFoundError:
@@ -488,7 +488,7 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 
 | Exception | Base | Typical HTTP | Meaning |
 | --- | --- | --- | --- |
-| `RunNotFoundError` | `LookupError` | 404 | `run_id` does not exist. |
+| `RunNotFoundError` | `LookupError` | 404 | `run_id` does not exist, or is outside the `tenant_id` you passed. |
 | `RunNotPausedError` | `RuntimeError` | 409 | Run is not in any paused state. |
 | `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused, but for a different reason than this method expects. |
 | `RunAlreadyClaimedError` | `RuntimeError` | 409 | Concurrent submit won the CAS. Poll for completion; do not retry the submit. |

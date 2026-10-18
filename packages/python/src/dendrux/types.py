@@ -508,8 +508,9 @@ class ToolDef:
     happens once, at decoration time: when ``strict`` is True, ``parameters``
     already holds the strict-mode schema (every property required, objects
     closed with ``additionalProperties: false``), so every provider sees the
-    same stored schema. OpenAI Chat and Responses providers additionally send
-    ``"strict": true``; Anthropic ignores the flag and sends the schema as-is.
+    same stored schema. Strict tools are sent strict on OpenAI and Anthropic
+    (Anthropic: schema normalized; falls back to non-strict when the schema or
+    request limits don't allow it).
     """
 
     name: str
@@ -710,6 +711,32 @@ class ApprovalDecision:
         return cls(approved=False, reason=reason)
 
 
+StopReason: TypeAlias = Literal[
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "content_filter",
+    "refusal",
+    "pause_turn",
+    "other",
+]
+"""Why an LLM call stopped, normalized across providers.
+
+- ``"end_turn"``: natural finish.
+- ``"tool_use"``: stopped to call tools.
+- ``"max_tokens"``: hit the output-token limit (the output is cut off).
+- ``"stop_sequence"``: hit a stop sequence.
+- ``"content_filter"``: the provider filtered the output.
+- ``"refusal"``: the model refused (Anthropic ``"refusal"``).
+- ``"pause_turn"``: Anthropic server-tool pause.
+- ``"other"``: any other value the provider reported.
+
+``None`` (on :class:`LLMResponse` / :class:`RunResult`) means the provider
+did not report a stop reason; Dendrux never guesses one.
+"""
+
+
 @dataclass
 class UsageStats:
     """Token usage from an LLM call.
@@ -847,6 +874,10 @@ class LLMResponse:
 
     Anthropic, OpenAI, or any other provider all normalize to this.
     Strategies consume this — they never touch provider-specific APIs.
+
+    ``stop_reason`` is the normalized reason the call stopped
+    (:data:`StopReason`), ``None`` when the provider did not report one;
+    ``raw_stop_reason`` keeps the vendor's own string.
     """
 
     text: str | None = None
@@ -868,6 +899,11 @@ class LLMResponse:
     # tool use (Anthropic thinking blocks + signature, OpenAI reasoning items).
     # Stored and round-tripped as-is; never interpreted by Dendrux.
     reasoning_blocks: list[Any] | None = None
+    # Why the call stopped, normalized (see ``StopReason``); None when the
+    # provider did not report one. ``raw_stop_reason`` is the vendor string
+    # as received (e.g. Anthropic ``"max_tokens"``, OpenAI ``"length"``).
+    stop_reason: StopReason | None = None
+    raw_stop_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -992,6 +1028,14 @@ class RunResult:
     ``meta["partial_output"]=False``. Paused runs may carry a clarification
     question in ``answer``. ``meta["undelivered_notes"]`` lists inbox note ids
     a finished run never delivered (only present when there are any).
+
+    ``stop_reason`` is the normalized stop reason (:data:`StopReason`) of the
+    LLM call that produced the final answer. It is set on SUCCESS only, and
+    ``None`` for other statuses, when the provider did not report one, and
+    for idempotent cached results of runs finished before 0.4.1.
+    ``truncated`` is True when that call hit the output-token limit
+    (``stop_reason == "max_tokens"``): the run still ends SUCCESS, but the
+    answer is cut off.
     """
 
     run_id: str
@@ -1005,6 +1049,12 @@ class RunResult:
     meta: dict[str, Any] = field(default_factory=dict)
     commentary: list[str] = field(default_factory=list)
     replay: ReplaySummary | None = None
+    stop_reason: StopReason | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """True when the final answer was cut off at the output-token limit."""
+        return self.stop_reason == "max_tokens"
 
 
 PauseRequestOutcome: TypeAlias = Literal[
@@ -1614,7 +1664,8 @@ class RunEvent:
         TOOL_USE_START:  tool_name, tool_call_id, iteration, phase="commentary"
         TOOL_USE_END:    tool_call, tool_name, tool_call_id, iteration, phase="commentary"
         TOOL_RESULT:     tool_call, tool_result, iteration, phase="commentary"
-        RUN_COMPLETED:   run_result, phase="final_answer" on success
+        RUN_COMPLETED:   run_result, phase="final_answer" on success;
+                         ``stop_reason`` / ``truncated`` mirror run_result
         RUN_PAUSED:      run_result (pause state in run_result.meta)
         RUN_ERROR:       run_result, error
 
@@ -1640,6 +1691,18 @@ class RunEvent:
     error: str | None = None
     iteration: int | None = None
     phase: str | None = None
+
+    @property
+    def stop_reason(self) -> StopReason | None:
+        """The run's final stop reason on RUN_COMPLETED (``run_result.stop_reason``)."""
+        if self.type != RunEventType.RUN_COMPLETED or self.run_result is None:
+            return None
+        return self.run_result.stop_reason
+
+    @property
+    def truncated(self) -> bool:
+        """True on a RUN_COMPLETED whose final answer hit the output-token limit."""
+        return self.stop_reason == "max_tokens"
 
 
 class RunStream:
@@ -1794,12 +1857,32 @@ class StructuredOutputValidationError(RuntimeError):
     """Raised when the LLM response fails validation against the requested output_type.
 
     Carries the raw response text and the validation error for debugging.
+    ``usage``, ``model`` and ``stop_reason`` describe the LLM call that
+    produced the invalid response (``None`` when unknown), so its tokens and
+    cost are not lost: the call was made and billed even though its output was
+    rejected. ``stop_reason == "max_tokens"`` means the JSON was cut off at
+    the output-token limit.
     """
 
-    def __init__(self, raw_response: str, output_type_name: str, validation_error: str) -> None:
+    def __init__(
+        self,
+        raw_response: str,
+        output_type_name: str,
+        validation_error: str,
+        *,
+        usage: UsageStats | None = None,
+        model: str | None = None,
+        stop_reason: StopReason | None = None,
+    ) -> None:
         self.raw_response = raw_response
         self.output_type_name = output_type_name
         self.validation_error = validation_error
+        self.usage = usage
+        self.model = model
+        self.stop_reason = stop_reason
+        # The full rejected response, set by ``structured_complete`` so the
+        # loop can record the call with its evidence. Internal.
+        self._response: LLMResponse | None = None
         super().__init__(
             f"Structured output validation failed for {output_type_name}. "
             f"Validation error: {validation_error}\n"

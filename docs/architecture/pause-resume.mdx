@@ -108,6 +108,8 @@ updated_at: 2026-04-18 10:12:31
 
 `iteration_count` ticked from 1 to 2 (the LLM ran one more turn after the tool result was available), `pause_data` was cleared as part of the terminal transition, and `updated_at` moved forward by two seconds.
 
+A multi-tenant service passes `tenant_id=` to every `submit_*` call, to `resume` and to `resume_stream`. A run outside the tenant raises `RunNotFoundError` before any input, claim or event is written. See [Access control](/docs/architecture/access-control#tenants-and-delegated-runs).
+
 ## The atomic claim
 
 Two things can race at resume time: two human operators hitting Approve at once, or a retry firing twice. Dendrux settles the race with a compare-and-swap on the status column. `claim_paused_run` issues exactly this SQL:

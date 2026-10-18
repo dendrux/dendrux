@@ -83,6 +83,14 @@ What counts as a context overflow:
 
 Two other gateway fixes ride along. A streaming request that fails with an ordinary 400 (a bad parameter, say) used to be reported as "this endpoint does not support streaming"; now only a 400 that says streaming is unsupported (or whose `param` is `stream`) is mapped that way, and every other error surfaces as itself. And a backend that ends a stream without ever sending a `finish_reason` no longer loses its buffered tool calls: they are flushed when the stream ends.
 
+## Stop reasons and custom providers
+
+Every built-in provider sets `LLMResponse.stop_reason` (a normalized `StopReason`) and `raw_stop_reason` (the vendor string) on batch and streaming calls. The final answer's value lands on `RunResult.stop_reason`; `"max_tokens"` marks a run as truncated. See [Truncated answers](/docs/architecture/runs#truncated-answers). A custom provider should set both fields when its backend reports why generation stopped, and leave both `None` otherwise.
+
+## Anthropic strict mode
+
+`AnthropicProvider` sends `@tool(strict=True)` tools, and structured output whose schema fits, with `"strict": true`. Pass `AnthropicProvider(..., strict=False)` to send tools and structured output exactly as before 0.4.1. Details and limits are in [Strict mode on Anthropic](/docs/reference/tools#strict-mode-on-anthropic).
+
 ## The output-token cap is per-API
 
 Every provider takes a constructor default for the maximum output tokens per call and lets you override it per call via kwargs. The wire parameter name differs by API, and dendrux picks the right one for you:

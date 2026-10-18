@@ -36,6 +36,7 @@ from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, brea
 from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
+    final_stop_reason,
     guardrail_meta,
     interruptible,
     notify_governance,
@@ -1654,6 +1655,8 @@ class ReActLoop(Loop):
                         usage=response.usage,
                         provider_request=response.provider_request,
                         provider_response=None,
+                        stop_reason=response.stop_reason,
+                        raw_stop_reason=response.raw_stop_reason,
                     )
                     await _record_llm(
                         recorder,
@@ -1757,6 +1760,9 @@ class ReActLoop(Loop):
                     iteration_count=iteration,
                     usage=total_usage,
                     meta=guardrail_meta(g_engine, notifier_warnings),
+                    stop_reason=final_stop_reason(
+                        response, run_id=resolved_run_id, default_model=provider.model
+                    ),
                 )
 
             if isinstance(step.action, Clarification):
@@ -2336,6 +2342,9 @@ class ReActLoop(Loop):
                         iteration_count=iteration,
                         usage=total_usage,
                         meta=meta,
+                        stop_reason=final_stop_reason(
+                            llm_response, run_id=resolved_run_id, default_model=provider.model
+                        ),
                     ),
                 )
                 return
@@ -2568,6 +2577,25 @@ async def _execute_record_notify(
     return tool_call, result
 
 
+_UNKNOWN_TOOL_LIST_LIMIT = 50
+
+
+def _unknown_tool_message(name: str, lookups: ToolLookups) -> str:
+    """``Unknown tool: <name>`` plus the tools the model was offered.
+
+    ``lookups.defs`` holds the same tools the request's tool defs carry
+    (local, MCP and skill tools). Sorted, at most 50 names.
+    """
+    offered = sorted(lookups.defs)
+    if not offered:
+        return f"Unknown tool: {name}. No tools are available."
+    listed = ", ".join(offered[:_UNKNOWN_TOOL_LIST_LIMIT])
+    extra = len(offered) - _UNKNOWN_TOOL_LIST_LIMIT
+    if extra > 0:
+        listed += f", … and {extra} more"
+    return f"Unknown tool: {name}. Available tools: {listed}"
+
+
 async def _execute_tool(
     tool_call: ToolCall,
     lookups: ToolLookups,
@@ -2594,12 +2622,13 @@ async def _execute_tool(
 
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
+        message = _unknown_tool_message(tool_call.name, lookups)
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,
-            payload=json.dumps({"error": f"Unknown tool: {tool_call.name}"}),
+            payload=json.dumps({"error": message}, ensure_ascii=False),
             success=False,
-            error=f"Unknown tool: {tool_call.name}",
+            error=message,
         )
 
     if isinstance(fn, SkillTool):

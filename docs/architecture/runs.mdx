@@ -110,6 +110,42 @@ Two things to notice.
 
 **Cancellation is cooperative, with one controlled exception.** When you call `cancel_run`, dendrux sets a flag in the database. The runner observes that flag at two safe checkpoints: the top of every iteration, and right before pausing. For a run executing in the same process on the same `Agent` instance, `cancel_run` also interrupts the in-flight call: a streamed run abandons its model stream between tokens and keeps the partial text as the run's `answer` (so a one-turn chat reply can be stopped mid-sentence), and a batch `run()` returns a `cancelled` result at once, tools included. Everywhere else, in-flight tool calls finish first. Either way the run ends with a `run.cancelled` event. A related control, `request_pause`, works the same cooperative way but parks the run as `paused` instead of ending it; see [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause). See [Cancellation](/docs/architecture/cancellation) for the full story.
 
+## Truncated answers
+
+A model can stop in the middle of an answer because it hit its output-token limit. The run still ends `success`, because the loop finished normally. Check `truncated` before you trust the text:
+
+```python
+result = await agent.run("Summarise this report")
+if result.truncated:
+    ...  # raise max_tokens, or ask the model to continue
+```
+
+Every `RunResult` from a successful run has `stop_reason`, the normalized reason the final LLM call stopped. The type is `StopReason`, importable from `dendrux` and `dendrux.types`:
+
+| Value | Meaning |
+| --- | --- |
+| `end_turn` | The model finished naturally. |
+| `tool_use` | The model stopped to call tools. |
+| `max_tokens` | The model hit the output-token limit. The answer is cut off. |
+| `stop_sequence` | The model hit a stop sequence. |
+| `content_filter` | The provider filtered the output. |
+| `refusal` | The model refused (Anthropic). |
+| `pause_turn` | Anthropic paused a server-tool turn. |
+| `other` | The provider reported something else. |
+
+`stop_reason` is `None` when the provider did not report one, for runs that did not succeed, and for idempotent cached results of runs that finished before 0.4.1. Dendrux never guesses a value. `result.truncated` is `True` exactly when `stop_reason == "max_tokens"`.
+
+The mapping is the same on Anthropic, OpenAI Chat, OpenAI Responses and OpenRouter. Anthropic's `model_context_window_exceeded`, which newer models return when the output fills the context window, is counted as `max_tokens`. The vendor's own string is kept on `LLMResponse.raw_stop_reason` for custom providers and traces.
+
+When an answer is truncated, Dendrux also logs a warning with the run id and model. It does not continue the answer for you.
+
+Where else to read it:
+
+- **Streams.** The `RUN_COMPLETED` event has `event.stop_reason` and `event.truncated`, and the stream's final `RunResult` has the same values.
+- **Events.** The `run.completed` event data is `{"status", "stop_reason", "truncated"}`. Both new keys are always present; `stop_reason` is `null` on `max_iterations` or when the provider reported none. It reaches `RunStore.get_events` and `make_read_router` SSE.
+- **Traces.** Each `llm_interactions.semantic_response` includes the `stop_reason` of that call.
+- **`cancel_run`.** On a run that already succeeded, `cancel_run` returns the stored `stop_reason`.
+
 ## Verified end-to-end
 
 Here's the complete vetted example. Two scripts share an agent definition; the first runs to a pause, the second resumes it.

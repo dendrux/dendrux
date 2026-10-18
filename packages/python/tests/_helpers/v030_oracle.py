@@ -54,6 +54,13 @@ byte for byte)
    ``tool.completed`` run-event rows (same run + iteration) and of consecutive
    ``tool_result`` stream events are put in call order (scripted provider ids sort
    in call order); the block keeps its original ``sequence_index`` values.
+7. Anthropic strict tools (Dendrux 0.4.1, T2 — a deliberate wire change). A tool
+   entry the Anthropic adapter sends with ``"strict": true`` is mapped back to
+   its v0.3.0 shape (``name``/``description``/``input_schema`` = the stored
+   ``ToolDef.parameters``) before it reaches the payload, ``captured_request``
+   and rows. Non-strict entries pass through untouched and are still compared
+   byte for byte; the strict wire itself is covered by
+   ``tests/unit/test_anthropic.py``.
 Provider-assigned ids (tool_use ids, message ids) are supplied by this module's
 scripts and are therefore deterministic; they are NOT normalised.
 
@@ -874,6 +881,24 @@ def instrument_provider(provider: Any, leg: dict[str, Any]) -> None:
     provider.complete_stream = complete_stream
 
 
+def _v030_anthropic_tool_shape(provider: Any) -> None:
+    """Normalisation 7: map strict Anthropic tool entries back to the v0.3.0 shape."""
+    real_convert = getattr(provider, "_convert_tools", None)
+    if real_convert is None:
+        return
+
+    def convert(tools: list[Any], **kw: Any) -> list[dict[str, Any]]:
+        out = real_convert(tools, **kw)
+        return [
+            {"name": e["name"], "description": e["description"], "input_schema": td.parameters}
+            if td.strict and e.get("strict") is True
+            else e
+            for td, e in zip(tools, out, strict=True)
+        ]
+
+    provider._convert_tools = convert
+
+
 def install_fake_sdk(provider: Any, rig: Rig, turns: list[Turn], leg: dict[str, Any]) -> None:
     """Replace the vendor SDK entry points with scripted fakes that record the payload."""
     counter = {"n": 0}
@@ -910,6 +935,7 @@ def install_fake_sdk(provider: Any, rig: Rig, turns: list[Turn], leg: dict[str, 
 
         provider._client.messages.create = create
         provider._client.messages.stream = stream
+        _v030_anthropic_tool_shape(provider)
     elif rig.vendor == "chat":
 
         async def chat_create(**kw: Any) -> Any:
@@ -1607,13 +1633,66 @@ def normalise_rows(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return json.loads(dumps_canonical(out))
 
 
+_STOP_REASONS = (
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "content_filter",
+    "refusal",
+    "pause_turn",
+    "other",
+    None,
+)
+
+
+def _strip_041_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Remove the 0.4.1 stop-reason keys (#42) after checking their shape.
+
+    0.4.1 adds, additively: ``agent_runs.meta["dendrux.stop_reason"]``,
+    ``llm_interactions.semantic_response["stop_reason"]`` and
+    ``"stop_reason"``/``"truncated"`` on ``run.completed`` event data.
+    Everything else must still match v0.3.0 byte for byte.
+    """
+    row = dict(row)
+    if table == "agent_runs" and isinstance(row.get("meta"), dict):
+        meta = dict(row["meta"])
+        if meta.pop("dendrux.stop_reason", None) not in _STOP_REASONS:
+            return row, "agent_runs.meta: invalid dendrux.stop_reason"
+        row["meta"] = meta
+    elif table == "llm_interactions" and isinstance(row.get("semantic_response"), dict):
+        sr = dict(row["semantic_response"])
+        if sr.pop("stop_reason", None) not in _STOP_REASONS:
+            return row, "llm_interactions.semantic_response: invalid stop_reason"
+        row["semantic_response"] = sr
+    elif (
+        table == "run_events"
+        and row.get("event_type") == "run.completed"
+        and isinstance(row.get("data"), dict)
+    ):
+        data = dict(row["data"])
+        reason = data.pop("stop_reason", None)
+        truncated = data.pop("truncated", False)
+        if reason not in _STOP_REASONS or truncated != (reason == "max_tokens"):
+            return row, "run.completed: inconsistent stop_reason/truncated"
+        row["data"] = data
+    return row, None
+
+
 def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None:
-    """None when identical. New nullable columns in ``actual`` must be NULL (R-02/P-06)."""
+    """None when identical. New nullable columns in ``actual`` must be NULL (R-02/P-06).
+
+    The 0.4.1 stop-reason keys are validated and then ignored (see
+    :func:`_strip_041_additions`).
+    """
     for table in ROW_TABLES:
         exp_rows, act_rows = expected[table], actual[table]
         if len(exp_rows) != len(act_rows):
             return f"{table}: {len(exp_rows)} rows expected, {len(act_rows)} found"
-        for i, (e, a) in enumerate(zip(exp_rows, act_rows, strict=True)):
+        for i, (e, raw) in enumerate(zip(exp_rows, act_rows, strict=True)):
+            a, problem = _strip_041_additions(table, raw)
+            if problem:
+                return f"{table}[{i}]: {problem}"
             for col in e:
                 if col not in a:
                     return f"{table}[{i}].{col}: column missing"

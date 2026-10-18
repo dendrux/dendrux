@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.4.1 - 2026-10-18
+
+Truncation is now visible, Anthropic gets strict mode, and run-control writes
+take a tenant scope. No migration. No breaking API changes; see Changed for the
+behaviour differences.
+
+### Added
+
+- **Truncated answers are flagged.** `RunResult.stop_reason` is the
+  normalized reason the call that produced the final answer stopped
+  (`StopReason`: `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`,
+  `content_filter`, `refusal`, `pause_turn`, `other`; `None` when the
+  provider did not report one). `RunResult.truncated` is `True` when that is
+  `max_tokens`. A final answer cut off at the output-token limit (or, on
+  Anthropic, at the context window: `model_context_window_exceeded`) still
+  ends `SUCCESS`, now with `truncated=True` and a logged warning.
+  - `LLMResponse.stop_reason` / `raw_stop_reason` on Anthropic, OpenAI Chat,
+    OpenAI Responses and OpenRouter, batch and streaming.
+  - The `run.completed` event carries `stop_reason` and `truncated`; so does
+    the `RUN_COMPLETED` stream event. Each recorded LLM call's
+    `semantic_response` has its `stop_reason`. Idempotent cached results and
+    `cancel_run()` on a finished run restore it (`None` for runs finished
+    before 0.4.1).
+- **Anthropic strict mode.** `@tool(strict=True)` tools are sent to Anthropic
+  with `"strict": true`, and structured output (`output_type=`) uses strict
+  mode on Anthropic whenever the schema allows it.
+  - Dendrux sends a per-request copy of the schema adapted to Anthropic's
+    strict subset: objects are closed, and constraints Anthropic rejects
+    (`minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`,
+    `multipleOf`, `maxItems`, `minItems` above 1, `uniqueItems`, unsupported
+    `format`s and regex features, ...) move into the field description.
+    Pydantic still validates the full constraints.
+  - Schemas Anthropic can't take strictly (free-form dicts, recursive
+    models, tuples, `Any` fields, or more than 24 optional / 16 union-typed
+    parameters / 20 strict tools in one request) are sent non-strict exactly
+    as in 0.4.0. An explicit `@tool(strict=True)` downgraded this way logs a
+    WARNING once per tool.
+  - If Anthropic rejects a strict request with a 400, Dendrux retries it
+    once with every strict entry sent as in 0.4.0. Rejections it recognises
+    as strict-schema limits are remembered per model for the rest of the
+    process, with a WARNING once.
+  - `AnthropicProvider(strict=False)` turns all of this off and sends 0.4.0
+    payloads. Anthropic caches strict schemas for up to 24 hours; keep PHI
+    and secrets out of schemas (see the tools docs).
+- **`tenant_id=` on run-control writes.** `submit_tool_results`,
+  `submit_input`, `submit_approval`, `submit_resume`, `resume` and
+  `resume_stream` take `tenant_id=` like `cancel_run` and `submit_note`. A
+  run outside the given tenant raises `RunNotFoundError` before anything is
+  written. A scoped `resume_stream` raises on first iteration, before any
+  event.
+- **Cost of a failed structured call.** `StructuredOutputValidationError`
+  has `usage`, `model` and `stop_reason`.
+- **Unknown tools.** The result of a call to a tool that doesn't exist lists
+  the tools the model was offered: `Unknown tool: bash. Available tools:
+  read_file, write_file` (sorted, at most 50).
+
+### Changed
+
+- A SingleCall structured call whose output fails validation is now recorded
+  as a completed, priced LLM call (an `llm_interactions` row, budget check)
+  before the run fails. **It emits `llm.completed` instead of `llm.failed`.**
+  Detect validation failures with the `run.error` event or the raised
+  `StructuredOutputValidationError`. As for every errored run, the run row's
+  `total_*` columns stay 0; `RunStore` subtree usage includes the call.
+- **One prompt-cache miss on upgrade for Anthropic structured output and
+  strict tools.** Their tool payload now carries `strict` and the adapted
+  schema. Non-strict Anthropic tool payloads are byte-identical to 0.4.0.
+- `@tool(strict=True, parameters=...)` now also checks draft-7
+  `definitions` for free-form objects and raises `TypeError` for one, as it
+  already did for `$defs` (OpenAI strict rejected such schemas anyway).
+
+### Fixed
+
+- OpenAI Responses streaming: a truncated response (`response.incomplete`)
+  lost its usage, provider payload and reasoning items, so it couldn't be
+  priced.
+- `cancel_run(cascade=True)` on a parent and child sharing one task (same
+  Agent, in-process delegation) could record the parent as cancelled without
+  `meta["interrupted"]` when store writes were slow: the child was signalled
+  before the parent's interrupt was registered. All in-process signals are
+  now sent together after the durable cancel requests.
+
 ## 0.4.0 - 2026-10-18
 
 Image input across the run lifecycle. This release includes a database

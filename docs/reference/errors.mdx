@@ -61,7 +61,7 @@ A few related exceptions live on the package root rather than `dendrux.errors`:
 | --- | --- |
 | `RunAlreadyActiveError` | An idempotent create finds an already-active run. |
 | `IdempotencyConflictError` | An `idempotency_key` collides with a different request fingerprint. |
-| `StructuredOutputValidationError` | A SingleCall `output_type` fails validation. |
+| `StructuredOutputValidationError(raw_response, output_type_name, validation_error, *, usage=None, model=None, stop_reason=None)` | A SingleCall `output_type` fails validation. Carries `err.raw_response`, `err.output_type_name`, `err.validation_error` and, for the call that produced the invalid output, `err.usage` (`UsageStats`, priced when you set a `PriceTable`), `err.model` and `err.stop_reason`; each is `None` when unknown. `stop_reason == "max_tokens"` means the JSON was cut off. That call is recorded and priced even though the run fails. See [Structured output](/docs/architecture/loops#when-validation-fails). |
 | `DelegationDepthExceededError` | A sub-agent exceeds `max_delegation_depth`. |
 
 ## Errors raised by the new run-control methods
@@ -75,6 +75,7 @@ The 0.3.0 methods reuse the hierarchy above. These are the cases worth knowing:
 | `request_pause(run_id)` | `RunNotFoundError`, `ValueError` for a bad `reason`. A `waiting_*`, `paused` or terminal run is a no-op, not an error. |
 | `submit_note(run_id, text)` | `ValueError` for empty or oversized text or bad metadata, `RunNotFoundError`, `RunAlreadyTerminalError`. |
 | `cancel_run(..., cascade=True)`, `request_pause`, `submit_note`, `RunStore.get_notes` or `RunStore.get_subtree` on a custom pre-0.3 `StateStore` | `NotImplementedError` naming the missing store method. Existing flows on such a store keep working. |
+| `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume` or `resume_stream` with `tenant_id=` | `RunNotFoundError` when the run is missing or belongs to another tenant, raised before anything is written. `resume_stream` raises it, and any store error from the tenant check, from the first iteration instead of yielding `RUN_ERROR`. |
 | `RunStore.get_subtree` / `get_notes(tenant_id=...)` | `dendrux.store.RunNotFoundError`, a separate class from `dendrux.errors.RunNotFoundError`. |
 | `MCPConnection.call_tool` | `MCPToolNotFoundError` for an unlisted tool name, `MCPToolCallError` for a server error result, `TimeoutError` when `timeout=` expires. See [MCP](/docs/architecture/mcp#calling-a-tool-directly). |
 | `Agent(before_tool=...)` with `SingleCall` | `ValueError` at construction. |

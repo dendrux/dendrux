@@ -314,6 +314,7 @@ class PersistenceRecorder(BaseRecorder):
             response.text is not None
             or response.tool_calls is not None
             or response.reasoning is not None
+            or response.stop_reason is not None
         ):
             semantic_response = {}
             if response.reasoning is not None:
@@ -335,6 +336,7 @@ class PersistenceRecorder(BaseRecorder):
                 "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
                 "reasoning_tokens": response.usage.reasoning_tokens,
             }
+            semantic_response["stop_reason"] = response.stop_reason
 
         # Client-minted before either write so the llm_interactions row and
         # the llm.completed event share one id — a stable 1:1 join key even
