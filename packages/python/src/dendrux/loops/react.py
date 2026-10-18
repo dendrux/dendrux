@@ -58,6 +58,7 @@ from dendrux.loops._images import (
     control_stop,
     no_control,
     pause_image_view,
+    release_wire,
     tool_result_images_dropped,
 )
 from dendrux.loops.base import Loop
@@ -1542,6 +1543,7 @@ class ReActLoop(Loop):
                     if not prepared.slots:
                         raise
                     failure = _llm_exc
+                    prepared = release_wire(prepared)
                 if failure is None:
                     break
                 decision = await images.on_failure(
@@ -1590,7 +1592,7 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         meta=guardrail_meta(g_engine, notifier_warnings),
                     )
-            images.mark_sent(prepared)
+            prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
             response = price_response(response, pricing=agent.pricing, default_model=provider.model)
 
@@ -2161,6 +2163,7 @@ class ReActLoop(Loop):
                             raise
                         else:
                             failure = _stream_exc
+                            prepared = release_wire(prepared)
                     if failure is None:
                         break
                     decision = await images.on_failure(
@@ -2258,7 +2261,7 @@ class ReActLoop(Loop):
             # The try-block raised if no DONE arrived; only the interrupted path
             # (handled above) leaves this None.
             assert llm_response is not None
-            images.mark_sent(prepared)
+            prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
             llm_response = price_response(
                 llm_response, pricing=agent.pricing, default_model=provider.model

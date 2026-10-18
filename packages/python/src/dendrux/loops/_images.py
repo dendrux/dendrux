@@ -810,6 +810,17 @@ def apply_delta(state: ImageViewState, delta: ImageViewDelta) -> None:
             state.warned.append(warning)
 
 
+def release_wire(prepared: PreparedRequest) -> PreparedRequest:
+    """Drop the byte-carrying wire messages once the provider call is over.
+
+    Only ``semantic`` (refs, no bytes) is ever recorded; nothing keeps verified
+    bytes alive after the call (not the loop frame, not a traceback).
+    """
+    if prepared.wire is prepared.semantic:
+        return prepared
+    return replace(prepared, wire=prepared.semantic)
+
+
 def pause_image_view(state: ImageViewState, history: Sequence[Message]) -> ImageViewState | None:
     """``PauseState.image_view``: a copy once the run has seen an image, else None."""
     if state == ImageViewState() and not has_images(history):
@@ -887,10 +898,14 @@ class ImageCallSite:
             self.notifier, self.run_id, event_type, iteration, data, warnings=self.warnings
         )
 
-    def mark_sent(self, prepared: PreparedRequest) -> None:
-        """Commit step 6: the request's slots now count as history."""
+    def mark_sent(self, prepared: PreparedRequest) -> PreparedRequest:
+        """Commit step 6: the request's slots now count as history.
+
+        Returns ``prepared`` with the wire copy released (see :func:`release_wire`).
+        """
         if prepared.slots:
             self.state.sent_through = max(self.state.sent_through, len(prepared.slots))
+        return release_wire(prepared)
 
     def findings(self, prepared: PreparedRequest, base: dict[str, Any]) -> dict[str, Any] | None:
         """``guardrail_findings`` for the LLM record, with the image section merged."""

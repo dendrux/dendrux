@@ -36,7 +36,7 @@ from dendrux.loops._helpers import (
     record_llm_started,
     record_message,
 )
-from dendrux.loops._images import ImageCallSite, control_stop
+from dendrux.loops._images import ImageCallSite, control_stop, release_wire
 from dendrux.loops.base import Loop
 from dendrux.loops.react import _image_policy, _interrupted_result, _read_control
 from dendrux.types import (
@@ -369,6 +369,7 @@ class SingleCall(Loop):
                 if not prepared.slots:
                     raise
                 failure = _llm_exc
+                prepared = release_wire(prepared)
             if failure is None:
                 break
             decision = await images.on_failure(
@@ -403,7 +404,7 @@ class SingleCall(Loop):
                 force_tombstones=decision.tombstones,
             )
 
-        images.mark_sent(prepared)
+        prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
         response = price_response(response, pricing=agent.pricing, default_model=provider.model)
 
@@ -769,6 +770,7 @@ class SingleCall(Loop):
                         raise
                     else:
                         failure = _stream_exc
+                        prepared = release_wire(prepared)
                 if failure is None:
                     break
                 decision = await images.on_failure(
@@ -851,7 +853,7 @@ class SingleCall(Loop):
         # The try-block raised if no DONE arrived; only the interrupted path
         # (handled above) leaves this None.
         assert llm_response is not None
-        images.mark_sent(prepared)
+        prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
         llm_response = price_response(
             llm_response, pricing=agent.pricing, default_model=provider.model

@@ -1261,3 +1261,29 @@ async def test_commit_order_events_before_llm_started_then_sent() -> None:
     )
     assert log == ["image.degraded", "image.state", "llm.started", "llm.completed"]
     assert state.placeholders == {0: "unsupported"} and state.sent_through == 1
+
+
+async def test_release_wire_drops_bytes() -> None:
+    from dendrux.loops._images import ImageCallSite, release_wire
+
+    rt = make_runtime()
+    part = await store_image(rt, make_png(seed=810))
+    msgs = [user_msg("q", part)]
+    site = ImageCallSite(
+        state=ImageViewState(),
+        policy=rt.policy,
+        runtime=rt,
+        provider=ImageLLM([]),
+        model="claude-test",
+        recorder=None,
+        notifier=None,
+        run_id="r",
+        warnings=[],
+    )
+    prepared = await site.prepare(msgs, iteration=1)
+    assert prepared.wire[0].images[0].data is not None
+    released = site.mark_sent(prepared)
+    assert released.wire is released.semantic and site.state.sent_through == 1
+    assert all(p.data is None for m in released.wire for p in m.images)
+    plain = await site.prepare([Message(role=Role.USER, content="x")], iteration=2)
+    assert release_wire(plain) is plain
