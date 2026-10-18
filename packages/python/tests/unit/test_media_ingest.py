@@ -180,12 +180,31 @@ class FakeCatalog:
         self.data[(scope, sha256)] = None
         return row.generation
 
-    # Unused by ingest; present so the fake satisfies the protocol shape.
-    async def mark_deleting(self, *a: Any, **k: Any) -> str | None:
-        raise NotImplementedError
+    async def mark_deleting(
+        self, scope: str, sha256: str, cutoff: datetime, *, stale_pending_cutoff: datetime
+    ) -> str | None:
+        await self._hook("mark_deleting")
+        row = self.rows.get((scope, sha256))
+        if row is None:
+            return None
+        changed = row.state_changed_at or row.last_used_at
+        if (row.state == "live" and row.last_used_at < cutoff) or (
+            row.state == "pending" and changed < stale_pending_cutoff
+        ):
+            self._set(scope, sha256, state="deleting")
+            return row.generation
+        return None
 
-    async def delete_row(self, *a: Any, **k: Any) -> bool:
-        raise NotImplementedError
+    async def delete_row(self, scope: str, sha256: str, generation: str) -> bool:
+        await self._hook("delete_row")
+        row = self.rows.get((scope, sha256))
+        if row is None or row.state != "deleting" or row.generation != generation:
+            return False
+        del self.rows[(scope, sha256)]
+        self.data.pop((scope, sha256), None)
+        return True
+
+    # Unused by ingest; present so the fake satisfies the protocol shape.
 
     async def finish_purge(self, *a: Any, **k: Any) -> None:
         raise NotImplementedError
@@ -843,3 +862,210 @@ async def test_repr_and_error_leak_scan(tmp_path: Path) -> None:
             assert f not in text, (f, text)
     for e in errors:
         assert e.__cause__ is None and e.__context__ is None
+
+
+# ---------------------------------------------------------------------------
+# Fix round (review-A): P2-1 .. P2-8
+# ---------------------------------------------------------------------------
+
+
+async def test_byte_cap_checked_before_parse_and_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dendrux.media import _ingest
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise AssertionError("parsed an over-cap input")
+
+    monkeypatch.setattr(_ingest, "_parse_and_hash", boom)
+    monkeypatch.setattr(_ingest, "sniff_media_type", boom)
+    with pytest.raises(ImageLimitError) as ei:
+        await run_ingest(
+            [Image.from_bytes(b"\xff\xd8\xff" + b"\xff\x00" * 600)],
+            runtime(policy=ImagePolicy(max_image_bytes=1000)),
+        )
+    assert ei.value.scope == "image_bytes"
+
+
+async def test_large_inputs_parsed_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    from dendrux.media import _ingest
+
+    threads: list[int] = []
+    real = _ingest._parse_and_hash
+
+    def spy(data: bytes, index: int) -> Any:
+        threads.append(threading.get_ident())
+        return real(data, index)
+
+    monkeypatch.setattr(_ingest, "_parse_and_hash", spy)
+    monkeypatch.setattr(_ingest, "_THREAD_THRESHOLD", 2000)
+    assert len(PNG) < 2000 < len(JPG)
+    await run_ingest([Image.from_bytes(PNG), Image.from_bytes(JPG)], runtime())
+    main = threading.get_ident()
+    assert threads[0] == main and threads[1] != main
+
+
+async def test_deleting_revive_lost_to_gc_revert_restores_object() -> None:
+    cat, store = FakeCatalog(), InMemoryBlobStore()
+    old = BlobKey("t:acme", SHA, "01GDEL")
+    await store.put(old, PNG, media_type="image/png")
+    cat.seed("t:acme", PNG, state="deleting", storage="external", generation="01GDEL")
+
+    def gc_reverts() -> None:  # GC's edge re-check: deleting -> live, same generation
+        cat._set("t:acme", SHA, state="live")
+
+    cat.hooks["revive"] = gc_reverts
+    (part,) = await run_ingest([Image.from_bytes(PNG)], runtime(cat, store=store))
+    row = cat.rows[("t:acme", SHA)]
+    assert part.ref.sha256 == SHA and row.state == "live" and row.generation == "01GDEL"
+    assert await store.get(old) == PNG  # the object we deleted was put back
+
+
+async def test_stale_pending_adopt_lost_to_promote_restores_object() -> None:
+    cat, store = FakeCatalog(), InMemoryBlobStore()
+    old = BlobKey("t:acme", SHA, "01GOLD")
+    await store.put(old, PNG, media_type="image/png")
+    cat.seed(
+        "t:acme",
+        PNG,
+        state="pending",
+        storage="external",
+        generation="01GOLD",
+        state_changed_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+    def slow_ingest_promotes() -> None:
+        cat._set("t:acme", SHA, state="live")
+
+    cat.hooks["adopt_pending"] = slow_ingest_promotes
+    await run_ingest([Image.from_bytes(PNG)], runtime(cat, store=store))
+    assert cat.rows[("t:acme", SHA)].generation == "01GOLD"
+    assert await store.get(old) == PNG
+
+
+async def test_lenient_collect_count_cap_per_input() -> None:
+    cat = FakeCatalog()
+    policy = ImagePolicy(max_images_per_message=2)
+    images = [Image.from_bytes(PNG), Image.from_bytes(KIWI), Image.from_bytes(TINY)]
+    results = await run_ingest(
+        images, runtime(cat, policy=policy), lenient=True, collect_errors=True
+    )
+    assert isinstance(results[0], ImagePart) and isinstance(results[1], ImagePart)
+    err = results[2]
+    assert isinstance(err, ImageLimitError)
+    assert (err.scope, err.limit, err.actual, err.index) == ("message_count", 2, 3, 2)
+    assert len(cat.rows) == 2
+    with pytest.raises(ImageLimitError):
+        await run_ingest(images, runtime(policy=policy), collect_errors=True)
+    with pytest.raises(ImageLimitError):
+        await run_ingest(images, runtime(policy=policy), lenient=True)
+
+
+@pytest.mark.parametrize("declared", ["", ";", "application/octet-stream", "image/jpeg", "png"])
+async def test_lenient_trusts_sniff_over_odd_declared_type(declared: str) -> None:
+    b64 = base64.b64encode(PNG).decode()
+    (part,) = await run_ingest(
+        [Image.from_base64(b64, media_type=declared)], runtime(), lenient=True, collect_errors=True
+    )
+    assert isinstance(part, ImagePart) and part.ref.media_type == "image/png"
+
+
+class _FailingStore(InMemoryBlobStore):
+    def __init__(self, fail_times: int, exc: Exception) -> None:
+        super().__init__()
+        self.fail_times = fail_times
+        self.exc = exc
+
+    async def put(self, key: BlobKey, data: bytes, *, media_type: str) -> None:
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            self.calls.append(("put-failed", key.object_name))
+            raise self.exc
+        await super().put(key, data, media_type=media_type)
+
+
+async def test_put_failure_removes_own_pending_row() -> None:
+    cat = FakeCatalog()
+    store = _FailingStore(1, ConnectionError("s3 down"))
+    with pytest.raises(ConnectionError):
+        await run_ingest([Image.from_bytes(PNG)], runtime(cat, store=store))
+    assert cat.rows == {} and store.object_names() == []
+    assert "mark_deleting" in cat.calls and "delete_row" in cat.calls
+
+
+async def test_store_full_runs_one_gc_pass_then_retries() -> None:
+    cat = FakeCatalog()
+    full = ImageLimitError("store_bytes", limit=10, actual=20)
+    store = _FailingStore(1, full)
+    gc_calls: list[int] = []
+
+    async def collect() -> None:
+        gc_calls.append(1)
+
+    rt = replace(runtime(cat, store=store), collect_garbage=collect)
+    (part,) = await run_ingest([Image.from_bytes(PNG)], rt)
+    assert gc_calls == [1] and part.ref.sha256 == SHA
+    assert cat.rows[("t:acme", SHA)].state == "live"
+
+    still_full = _FailingStore(2, ImageLimitError("store_bytes", limit=10, actual=20))
+    cat2 = FakeCatalog()
+    rt2 = replace(runtime(cat2, store=still_full), collect_garbage=collect)
+    with pytest.raises(ImageLimitError) as ei:
+        await run_ingest([Image.from_bytes(PNG)], rt2)
+    assert ei.value.scope == "store_bytes" and cat2.rows == {}
+
+    cat3 = FakeCatalog()
+    with pytest.raises(ImageLimitError):  # no GC wired: raise immediately
+        await run_ingest(
+            [Image.from_bytes(PNG)],
+            runtime(
+                cat3, store=_FailingStore(1, ImageLimitError("store_bytes", limit=1, actual=2))
+            ),
+        )
+    assert cat3.rows == {}
+
+
+async def test_stale_pending_uses_catalog_clock() -> None:
+    class SkewedCatalog(FakeCatalog):
+        """DB clock 5 minutes behind the host: the pending row is fresh by the DB clock."""
+
+        async def current_time(self) -> datetime:
+            return datetime.now(UTC) - timedelta(minutes=5)
+
+    cat, store = SkewedCatalog(), InMemoryBlobStore()
+    db_now = datetime.now(UTC) - timedelta(minutes=5)
+    cat.seed(
+        "t:acme",
+        PNG,
+        state="pending",
+        storage="external",
+        generation="01GP",
+        state_changed_at=db_now,
+    )
+    await run_ingest([Image.from_bytes(PNG)], runtime(cat, store=store))
+    assert "adopt_pending" not in cat.calls
+    assert cat.rows[("t:acme", SHA)].generation == "01GP"
+
+
+async def test_validated_repr_has_no_bytes() -> None:
+    from dendrux.media._ingest import _validate_bytes
+
+    v = await _validate_bytes(
+        Image.from_bytes(PNG),
+        policy=ImagePolicy(),
+        origin="user",
+        tool_name=None,
+        index=0,
+        lenient=False,
+    )
+    assert "data=" not in repr(v) and "\\x89" not in repr(v)
+
+
+async def test_identity_hook_is_not_a_transform() -> None:
+    policy = ImagePolicy(ingest_hook=lambda req: bytes(req.data), ingest_hook_version="v1")
+    cat = FakeCatalog()
+    await run_ingest([Image.from_bytes(PNG)], runtime(cat, policy=policy))
+    assert cat.rows[("t:acme", SHA)].ingest_transform is None
+    with pytest.raises(InvalidImageError) as ei:
+        await run_ingest([Image.from_bytes(PNG, media_type="image/jpeg")], runtime(policy=policy))
+    assert ei.value.reason == "type_mismatch"

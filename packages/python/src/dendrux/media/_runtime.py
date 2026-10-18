@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from dendrux.media._catalog import BlobCatalog, BlobResolver
     from dendrux.media._policy import ImagePolicy
     from dendrux.media._store import BlobStore
@@ -33,6 +35,9 @@ class ImageRuntime:
     resolver: BlobResolver | None
     tenant_scope: str
     run_id: str | None = None
+    # Optional "one garbage-collection pass" (e.g. ``agent.blobs.collect_garbage``
+    # with ``older_than=1h``); ingest calls it once when the blob store is full.
+    collect_garbage: Callable[[], Awaitable[object]] | None = None
 
     @property
     def storage(self) -> Literal["db", "external"]:

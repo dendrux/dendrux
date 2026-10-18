@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
-from dataclasses import dataclass, replace
+import logging
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal, overload
 
@@ -34,7 +36,11 @@ if TYPE_CHECKING:
     from dendrux.media._runtime import ImageRuntime
     from dendrux.media._store import BlobStore
 
+logger = logging.getLogger(__name__)
+
 _MAX_PASSES = 3
+# Inputs above this size are parsed and hashed in a worker thread.
+_THREAD_THRESHOLD = 256 * 1024
 # A pending row older than this belongs to a crashed ingest and is adopted.
 PENDING_STALE_AFTER = timedelta(seconds=60)
 
@@ -44,7 +50,7 @@ class _Validated:
     """Phase-1 output for one byte-backed input."""
 
     index: int
-    data: bytes
+    data: bytes = field(repr=False)
     header: ImageHeader
     sha256: str
     transform: str | None
@@ -154,6 +160,8 @@ async def _run_hook(
             f"ImagePolicy.ingest_hook must return bytes or None, got {type(out).__name__}"
         )
     new = bytes(out)
+    if new == data:
+        return data, None  # byte-identical output is "unchanged": no transform recorded
     if len(new) > policy.max_image_bytes:
         raise ImageLimitError(
             "image_bytes", limit=policy.max_image_bytes, actual=len(new), index=index
@@ -174,6 +182,11 @@ async def _validate_bytes(
 ) -> _Validated:
     data, declared = await _obtain(image, policy, index, lenient=lenient)
     data, transform = await _run_hook(policy, data, declared, origin, tool_name, index)
+    # Cheap byte cap before any parse/hash work (the parsers are linear but not free).
+    if len(data) > policy.max_image_bytes:
+        raise ImageLimitError(
+            "image_bytes", limit=policy.max_image_bytes, actual=len(data), index=index
+        )
     sniffed = sniff_media_type(data)
     if sniffed is None or sniffed not in policy.allowed_media_types:
         raise InvalidImageError(
@@ -185,7 +198,10 @@ async def _validate_bytes(
         raise InvalidImageError(
             "type_mismatch", index=index, media_type=sniffed, byte_length=len(data)
         )
-    header = inspect_image(data, index=index)
+    if len(data) > _THREAD_THRESHOLD:
+        header, sha = await asyncio.to_thread(_parse_and_hash, data, index)
+    else:
+        header, sha = _parse_and_hash(data, index)
     check_image_policy(
         policy,
         media_type=header.media_type,
@@ -199,10 +215,14 @@ async def _validate_bytes(
         index=index,
         data=data,
         header=header,
-        sha256=hashlib.sha256(data).hexdigest(),
+        sha256=sha,
         transform=transform,
         detail=image.detail,
     )
+
+
+def _parse_and_hash(data: bytes, index: int) -> tuple[ImageHeader, str]:
+    return inspect_image(data, index=index), hashlib.sha256(data).hexdigest()
 
 
 async def _lookup_refs(
@@ -281,11 +301,23 @@ def _new_info(
     )
 
 
-def _is_stale_pending(row: BlobInfo) -> bool:
+async def _catalog_now(catalog: BlobCatalog) -> datetime:
+    """The catalog's clock when it has one (DB clock on Postgres), else host UTC."""
+    getter = getattr(catalog, "current_time", None)
+    if getter is not None:
+        now = getter()
+        if inspect.isawaitable(now):
+            now = await now
+        if isinstance(now, datetime):
+            return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    return _now()
+
+
+async def _is_stale_pending(catalog: BlobCatalog, row: BlobInfo) -> bool:
     changed = row.state_changed_at or row.last_used_at
     if changed.tzinfo is None:
         changed = changed.replace(tzinfo=UTC)
-    return _now() - changed > PENDING_STALE_AFTER
+    return await _catalog_now(catalog) - changed > PENDING_STALE_AFTER
 
 
 def _require_store(runtime: ImageRuntime) -> BlobStore:
@@ -294,25 +326,92 @@ def _require_store(runtime: ImageRuntime) -> BlobStore:
     return runtime.blob_store
 
 
-async def _put_and_promote(
+async def _put(runtime: ImageRuntime, key: BlobKey, item: _Validated) -> None:
+    """``BlobStore.put``; when the store is full, run one GC pass (if wired) and retry once."""
+    store = _require_store(runtime)
+    full: ImageLimitError | None = None
+    try:
+        await store.put(key, item.data, media_type=item.header.media_type)
+        return
+    except ImageLimitError as exc:
+        if exc.scope != "store_bytes" or runtime.collect_garbage is None:
+            raise
+        full = exc
+    assert full is not None
+    await runtime.collect_garbage()
+    await store.put(key, item.data, media_type=item.header.media_type)
+
+
+async def _abandon_own_pending(
     runtime: ImageRuntime, catalog: BlobCatalog, item: _Validated, generation: str
+) -> None:
+    """Best-effort removal of the pending row this ingest created/adopted/revived.
+
+    Used when its ``put`` failed: mark it ``deleting`` (only a ``pending`` row
+    with no edges can match), delete the object if any, then drop the row.
+    A crash here leaves a stale ``pending`` row that GC recovers.
+    """
+    scope, sha = runtime.tenant_scope, item.sha256
+    try:
+        marked = await catalog.mark_deleting(
+            scope,
+            sha,
+            datetime(1970, 1, 1, tzinfo=UTC),  # never matches a live row
+            stale_pending_cutoff=datetime(9999, 1, 1, tzinfo=UTC),
+        )
+        if marked is None:
+            return
+        if runtime.blob_store is not None:
+            await runtime.blob_store.delete(BlobKey(scope, sha, marked))
+        await catalog.delete_row(scope, sha, marked)
+    except Exception:  # compensation must never mask the put failure
+        logger.warning("image ingest: could not remove abandoned pending blob row", exc_info=False)
+
+
+async def _put_and_promote(
+    runtime: ImageRuntime,
+    catalog: BlobCatalog,
+    item: _Validated,
+    generation: str,
+    *,
+    owned: bool,
 ) -> bool:
     """Put ``key(generation)`` then promote it; on a lost promote, compensate.
 
-    Compensation: if the row no longer names ``generation`` in state
-    ``pending|live`` (purged, adopted, revived or deleted meanwhile), the
-    object this call wrote is deleted so it never outlives the row naming it.
+    ``owned``: this ingest created, adopted or revived the pending row; if the
+    put fails, that row is removed again. Compensation on a lost promote: if
+    the row no longer names ``generation`` in state ``pending|live`` (purged,
+    adopted, revived or deleted meanwhile), the object this call wrote is
+    deleted so it never outlives the row naming it.
     """
     scope, sha = runtime.tenant_scope, item.sha256
-    store = _require_store(runtime)
     key = BlobKey(scope, sha, generation)
-    await store.put(key, item.data, media_type=item.header.media_type)
+    if owned:
+        try:
+            await _put(runtime, key, item)
+        except BaseException:
+            await _abandon_own_pending(runtime, catalog, item, generation)
+            raise
+    else:
+        await _put(runtime, key, item)
     if await catalog.promote(scope, sha, generation):
         return True
     row = await catalog.get_row(scope, sha)
     if row is None or row.generation != generation or row.state not in ("pending", "live"):
-        await store.delete(key)
+        await _require_store(runtime).delete(key)
     return False
+
+
+async def _restore_if_still_named(
+    runtime: ImageRuntime, catalog: BlobCatalog, item: _Validated, generation: str
+) -> None:
+    """After deleting ``key(generation)`` and losing the follow-up transition:
+    if the row is ``live`` with that same generation again (GC reverted, or a
+    concurrent ingest promoted it), put the object back (same bytes, same key)."""
+    scope, sha = runtime.tenant_scope, item.sha256
+    row = await catalog.get_row(scope, sha)
+    if row is not None and row.state == "live" and row.generation == generation:
+        await _put(runtime, BlobKey(scope, sha, generation), item)
 
 
 async def _store_blob(runtime: ImageRuntime, catalog: BlobCatalog, item: _Validated) -> BlobInfo:
@@ -336,7 +435,7 @@ async def _store_blob(runtime: ImageRuntime, catalog: BlobCatalog, item: _Valida
             info = _new_info(item, storage="external", state="pending", generation=gen)
             if await catalog.insert_row(
                 scope, sha, info, state="pending", generation=gen, data=None
-            ) and await _put_and_promote(runtime, catalog, item, gen):
+            ) and await _put_and_promote(runtime, catalog, item, gen, owned=True):
                 return replace(info, state="live")
             continue
         if row.state == "live":
@@ -347,34 +446,40 @@ async def _store_blob(runtime: ImageRuntime, catalog: BlobCatalog, item: _Valida
         if row.state in ("purging", "purged"):
             raise InvalidImageError("purged", index=item.index, media_type=row.media_type)
         if row.state == "pending":
-            if not _is_stale_pending(row):
+            if not await _is_stale_pending(catalog, row):
                 # Another ingest is in flight: same bytes, same key (idempotent).
-                if await _put_and_promote(runtime, catalog, item, row.generation):
+                if await _put_and_promote(runtime, catalog, item, row.generation, owned=False):
                     return replace(row, state="live")
                 continue
             # A crashed ingest: delete its object before the row stops naming it.
             store = _require_store(runtime)
             await store.delete(BlobKey(scope, sha, row.generation))
             gen = generate_ulid()
-            if await catalog.adopt_pending(
-                scope, sha, row.generation, gen
-            ) and await _put_and_promote(runtime, catalog, item, gen):
+            if not await catalog.adopt_pending(scope, sha, row.generation, gen):
+                await _restore_if_still_named(runtime, catalog, item, row.generation)
+                continue
+            if await _put_and_promote(runtime, catalog, item, gen, owned=True):
                 return _new_info(item, storage="external", state="live", generation=gen)
             continue
         if row.state == "deleting":
+            deleted_old = False
             if row.storage == "external":
                 await _require_store(runtime).delete(BlobKey(scope, sha, row.generation))
+                deleted_old = True
             gen = generate_ulid()
             if not external:
                 if await catalog.revive(
                     scope, sha, row.generation, gen, to_state="live", data=item.data
                 ):
                     return _new_info(item, storage="db", state="live", generation=gen)
-                continue
-            if await catalog.revive(
+            elif await catalog.revive(
                 scope, sha, row.generation, gen, to_state="pending", data=None
-            ) and await _put_and_promote(runtime, catalog, item, gen):
-                return _new_info(item, storage="external", state="live", generation=gen)
+            ):
+                if await _put_and_promote(runtime, catalog, item, gen, owned=True):
+                    return _new_info(item, storage="external", state="live", generation=gen)
+                continue
+            if deleted_old:
+                await _restore_if_still_named(runtime, catalog, item, row.generation)
             continue
     raise BlobContentionError(image_id(sha))
 
@@ -438,7 +543,10 @@ async def ingest(
     claims: they are checked against the tenant catalog and rebuilt from it.
 
     ``lenient`` (MCP results) strips ASCII whitespace from base64 and trusts the
-    sniffed type over a declared one. ``collect_errors`` returns each failing
+    sniffed type over a declared one. With ``lenient`` and ``collect_errors``,
+    inputs beyond ``max_images_per_message`` are returned as per-input
+    ``ImageLimitError("message_count")`` entries instead of failing the call.
+    ``collect_errors`` returns each failing
     input's :class:`~dendrux.errors.ImageError` in its position instead of
     raising; only successful inputs are stored. ``before_store`` runs after
     phase 1 succeeded and before any blob row or object is written (the entry
@@ -458,20 +566,27 @@ async def ingest(
             )
     if not items:
         return ()
-    if len(items) > policy.max_images_per_message:
-        raise ImageLimitError(
-            "message_count", limit=policy.max_images_per_message, actual=len(items)
-        )
+    results: dict[int, ImagePart | ImageError] = {}
+    cap = policy.max_images_per_message
+    if len(items) > cap:
+        if not (lenient and collect_errors):
+            raise ImageLimitError("message_count", limit=cap, actual=len(items))
+        # Lenient collection (MCP): keep the first `cap` images; each extra one
+        # becomes its own error in position, so the call still succeeds.
+        for index in range(cap, len(items)):
+            results[index] = _detach(
+                ImageLimitError("message_count", limit=cap, actual=len(items), index=index)
+            )
     catalog = runtime.catalog
     if catalog is None:
         raise ImagePersistenceUnsupportedError("state_store")
-
-    results: dict[int, ImagePart | ImageError] = {}
 
     # Phase 1: validate every input; no blob rows written.
     refs: list[tuple[int, ImageRef, ImageDetail | None]] = []
     byte_items: list[tuple[int, Image]] = []
     for index, item in enumerate(items):
+        if index in results:
+            continue
         if isinstance(item, ImagePart):
             refs.append((index, item.ref, item.detail))
         elif isinstance(item, ImageRef):
