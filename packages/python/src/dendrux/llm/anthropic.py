@@ -10,10 +10,13 @@ No business logic, no agent loop awareness. Just shape translation.
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import hashlib
 import json
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any, Literal
 
 import anthropic
@@ -64,7 +67,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
     from dendrux.llm.base import ImageSupport
     from dendrux.types import Message, ToolDef
@@ -73,6 +76,61 @@ logger = logging.getLogger(__name__)
 
 _STRUCTURED_TOOL_NAME = "structured_output"
 _STRUCTURED_TOOL_DESCRIPTION = "Return your response in this exact format."
+
+# Strict-mode fallback. A 400 that points at a strict schema (a ``tools.N.``
+# path on a strict entry, or a request-level grammar/limit message; wording
+# recorded in live probes 2026-10-18) is retried once with every strict entry
+# reverted to its non-strict payload. Rejected strict entries are remembered
+# for the process so later requests skip the failing round trip.
+_STRICT_ERROR_PATH = re.compile(r"^tools\.(\d+)\.")
+_STRICT_ERROR_MARKERS = (
+    "grammar",
+    "too complex",
+    "schemas contains too many",
+    "strict tools",
+)
+_STRICT_REJECTED: set[str] = set()
+_STRICT_WARNED: set[str] = set()
+
+
+def _warn_strict_once(key: str, message: str, *args: Any) -> None:
+    """WARNING the first time ``key`` is seen in this process, DEBUG after."""
+    if key in _STRICT_WARNED:
+        logger.debug(message, *args)
+        return
+    _STRICT_WARNED.add(key)
+    logger.warning(message, *args)
+
+
+def _strict_entry_key(entry: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
+
+
+def _schema_digest(schema: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def _strict_rejection(exc: anthropic.APIError, sent_tools: Any) -> str | None:
+    """The error message when ``exc`` is a 400 caused by a strict entry, else None."""
+    if not isinstance(exc, anthropic.BadRequestError) or not isinstance(sent_tools, list):
+        return None
+    strict_indices = {
+        i for i, t in enumerate(sent_tools) if isinstance(t, dict) and t.get("strict") is True
+    }
+    if not strict_indices:
+        return None
+    error = exc.body.get("error") if isinstance(exc.body, dict) else None
+    if not isinstance(error, dict) or error.get("type") != "invalid_request_error":
+        return None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return None
+    path = _STRICT_ERROR_PATH.match(message)
+    if path is not None:
+        return message if int(path.group(1)) in strict_indices else None
+    lowered = message.lower()
+    return message if any(m in lowered for m in _STRICT_ERROR_MARKERS) else None
+
 
 # Anthropic-specific kwargs that complete() will forward to the API.
 # Anything not in this set is silently ignored to prevent leaking
@@ -438,6 +496,11 @@ class AnthropicProvider(LLMProvider):
         it, otherwise exactly as before, non-strict. The tool_use response is
         extracted and normalized into LLMResponse.text as a JSON string, with
         tool_calls set to None (preserving the SingleCall invariant).
+
+        If Anthropic rejects a strict schema (400 pointing at a strict entry,
+        or a grammar-size/limit error), the request is retried once with every
+        strict entry sent exactly as in 0.4.0; ``provider_request`` records the
+        request that succeeded. Any other error is raised unchanged.
         """
         registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
@@ -453,12 +516,17 @@ class AnthropicProvider(LLMProvider):
             captured_request["tools"] = api_kwargs["tools"]
             captured_request["tool_choice"] = api_kwargs["tool_choice"]
 
+        legacy = (
+            [self._structured_output_payload(output_schema)]
+            if output_schema is not None
+            else [self._legacy_tool(td) for td in tools or []]
+        )
+
         # Image-bearing requests never chain SDK errors (they carry the request
         # body): the typed error is built in the handler, raised after it.
         failure: Exception | None = None
         try:
-            with call_attempt_tracking():
-                response = await self._client.messages.create(**api_kwargs)
+            response = await self._create_with_strict_fallback(api_kwargs, captured_request, legacy)
         except anthropic.APITimeoutError:
             if not registry.has_images:
                 raise timeout_error("AnthropicProvider", self._timeout) from None
@@ -517,11 +585,16 @@ class AnthropicProvider(LLMProvider):
 
         At stream end, yields a DONE event carrying the full LLMResponse
         (with usage stats and provider payloads) for the loop to consume.
+
+        A strict-schema rejection when the stream opens (before any event)
+        is retried once without strict, as in ``complete``.
         """
         registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
             messages, tools, kwargs, registry=registry
         )
+
+        legacy = [self._legacy_tool(td) for td in tools or []]
 
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
@@ -540,7 +613,7 @@ class AnthropicProvider(LLMProvider):
         failure: Exception | None = None
         attempt_token = begin_call_attempt_tracking()
         try:
-            async with self._client.messages.stream(**api_kwargs) as stream:
+            async with self._open_stream(api_kwargs, captured_request, legacy) as stream:
                 async for event in stream:
                     if event.type == "content_block_start":
                         block = event.content_block
@@ -865,21 +938,27 @@ class AnthropicProvider(LLMProvider):
         Non-strict tools are sent exactly as stored (byte-stable for prompt
         caching). A ``strict`` tool is sent with ``"strict": true`` and a
         copy of its schema normalized for Anthropic strict mode, unless the
-        schema cannot be strict or the request-wide limits (strict tools,
+        schema cannot be strict, the request-wide limits (strict tools,
         optional and union-typed parameters, counted in tool order) are
-        spent; then it is sent non-strict and the reason logged at DEBUG.
+        spent, or Anthropic already rejected it in this process; then it is
+        sent non-strict (WARNING once per tool name, DEBUG after).
         """
         converted: list[dict[str, Any]] = []
         strict_tools = optional_total = union_total = 0
         for td in tools:
-            payload: dict[str, Any] = {
-                "name": td.name,
-                "description": td.description,
-                "input_schema": td.parameters,
-            }
+            payload = self._legacy_tool(td)
             if td.strict:
                 schema, problem = prepare_anthropic_strict(td.parameters)
+                candidate = {**payload, "input_schema": schema, "strict": True}
                 optional = unions = 0
+                if problem is None and _strict_entry_key(candidate) in _STRICT_REJECTED:
+                    logger.debug(
+                        "Anthropic tool %r sent without strict: rejected by Anthropic "
+                        "earlier in this process",
+                        td.name,
+                    )
+                    converted.append(payload)
+                    continue
                 if problem is None:
                     optional, unions = anthropic_strict_budget(schema)
                     if strict_tools + 1 > ANTHROPIC_STRICT_MAX_TOOLS:
@@ -898,25 +977,112 @@ class AnthropicProvider(LLMProvider):
                     strict_tools += 1
                     optional_total += optional
                     union_total += unions
-                    payload = {**payload, "input_schema": schema, "strict": True}
+                    payload = candidate
                 else:
-                    logger.debug("Anthropic tool %r sent without strict: %s", td.name, problem)
+                    _warn_strict_once(
+                        f"downgrade:{td.name}",
+                        "Anthropic tool %r sent without strict: %s",
+                        td.name,
+                        problem,
+                    )
             converted.append(payload)
         return converted
 
     @staticmethod
-    def _structured_output_tool(output_schema: dict[str, Any]) -> dict[str, Any]:
-        """The synthetic structured-output tool, strict when the schema allows it."""
-        payload: dict[str, Any] = {
+    def _legacy_tool(td: ToolDef) -> dict[str, Any]:
+        """The non-strict tool payload (unchanged since 0.4.0)."""
+        return {"name": td.name, "description": td.description, "input_schema": td.parameters}
+
+    @staticmethod
+    def _structured_output_payload(output_schema: dict[str, Any]) -> dict[str, Any]:
+        """The non-strict structured-output tool payload (unchanged since 0.4.0)."""
+        return {
             "name": _STRUCTURED_TOOL_NAME,
             "description": _STRUCTURED_TOOL_DESCRIPTION,
             "input_schema": output_schema,
         }
+
+    @classmethod
+    def _structured_output_tool(cls, output_schema: dict[str, Any]) -> dict[str, Any]:
+        """The synthetic structured-output tool, strict when the schema allows it."""
+        payload = cls._structured_output_payload(output_schema)
         schema, problem = prepare_anthropic_strict(output_schema)
+        candidate = {**payload, "input_schema": schema, "strict": True}
+        if problem is None and _strict_entry_key(candidate) in _STRICT_REJECTED:
+            problem = "rejected by Anthropic earlier in this process"
         if problem is not None:
             logger.debug("Anthropic structured output sent without strict: %s", problem)
             return payload
-        return {**payload, "input_schema": schema, "strict": True}
+        return candidate
+
+    @staticmethod
+    def _revert_strict(
+        api_kwargs: dict[str, Any],
+        captured_request: dict[str, Any],
+        legacy: list[dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """Swap every strict entry for its non-strict payload, remember and warn."""
+        reverted: list[dict[str, Any]] = []
+        for entry, original in zip(api_kwargs["tools"], legacy, strict=True):
+            if entry.get("strict") is not True:
+                reverted.append(entry)
+                continue
+            _STRICT_REJECTED.add(_strict_entry_key(entry))
+            label = entry["name"]
+            if label == _STRUCTURED_TOOL_NAME:
+                label = f"{label} (schema {_schema_digest(original['input_schema'])})"
+            _warn_strict_once(
+                f"rejected:{label}",
+                "Anthropic rejected strict mode for %s; retrying without strict "
+                "(and sending it non-strict for the rest of this process): %s",
+                label,
+                reason[:300],
+            )
+            reverted.append(original)
+        api_kwargs["tools"] = reverted
+        captured_request["tools"] = reverted
+
+    async def _create_with_strict_fallback(
+        self,
+        api_kwargs: dict[str, Any],
+        captured_request: dict[str, Any],
+        legacy: list[dict[str, Any]],
+    ) -> Any:
+        """``messages.create``, retried once without strict on a strict rejection."""
+        try:
+            with call_attempt_tracking():
+                return await self._client.messages.create(**api_kwargs)
+        except anthropic.APIError as exc:
+            reason = _strict_rejection(exc, api_kwargs.get("tools"))
+            if reason is None:
+                raise
+        # Retried outside the handler so a second failure never chains the first.
+        self._revert_strict(api_kwargs, captured_request, legacy, reason)
+        with call_attempt_tracking():
+            return await self._client.messages.create(**api_kwargs)
+
+    @contextlib.asynccontextmanager
+    async def _open_stream(
+        self,
+        api_kwargs: dict[str, Any],
+        captured_request: dict[str, Any],
+        legacy: list[dict[str, Any]],
+    ) -> AsyncIterator[Any]:
+        """``messages.stream`` entered, retried once without strict on a strict
+        rejection. The request is made on enter, before any event exists."""
+        async with contextlib.AsyncExitStack() as stack:
+            reason: str | None = None
+            try:
+                stream = await stack.enter_async_context(self._client.messages.stream(**api_kwargs))
+            except anthropic.APIError as exc:
+                reason = _strict_rejection(exc, api_kwargs.get("tools"))
+                if reason is None:
+                    raise
+            if reason is not None:
+                self._revert_strict(api_kwargs, captured_request, legacy, reason)
+                stream = await stack.enter_async_context(self._client.messages.stream(**api_kwargs))
+            yield stream
 
     # ------------------------------------------------------------------
     # Inbound conversions: Anthropic → Dendrux
