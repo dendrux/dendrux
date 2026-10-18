@@ -22,9 +22,16 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.4.0` - core API stabilizing, actively developed.
+> `v0.4.1` - core API stabilizing, actively developed.
 
 ---
+
+## What's new in 0.4.1
+
+- **Truncated answers are flagged**: `result.truncated` and `result.stop_reason` say when the final answer was cut off at the token limit, on all four providers. The run still succeeds, so check the flag.
+- **Anthropic strict mode**: `@tool(strict=True)` and structured output are sent strict on Anthropic when the schema allows it, with an automatic non-strict fallback and an `AnthropicProvider(strict=False)` opt-out.
+- **`tenant_id=` on run-control writes**: `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume` and `resume_stream` reject runs outside the tenant before writing anything.
+- No migration. See the [CHANGELOG](packages/python/CHANGELOG.md).
 
 ## What's new in 0.4.0
 
