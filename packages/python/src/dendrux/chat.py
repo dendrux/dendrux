@@ -58,6 +58,14 @@ def split_user_content(content: Any, *, owner: str = "user_input") -> tuple[str,
     )
 
 
+def _carries_images(value: Any) -> bool:
+    if isinstance(value, _IMAGE_TYPES):
+        return True
+    if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(value, Sequence):
+        return False
+    return any(isinstance(item, _IMAGE_TYPES) for item in value)
+
+
 class ChatRole(StrEnum):
     """Roles allowed in chat history passed via ``agent.run(history=...)``.
 
@@ -88,9 +96,23 @@ class ChatMessage:
     parts: tuple[str | ImageInput, ...] | None = None
 
     def __post_init__(self) -> None:
+        try:
+            role = ChatRole(self.role)
+        except ValueError:
+            raise ValueError(
+                f"ChatMessage.role must be 'user' or 'assistant', got {self.role!r}"
+            ) from None
+        object.__setattr__(self, "role", role)
+        if not isinstance(self.content, str):
+            if role == ChatRole.ASSISTANT and _carries_images(self.content):
+                raise ValueError("assistant chat messages cannot carry images")
+            hint = "; use ChatMessage.user([...]) for text and images" if role == "user" else ""
+            raise TypeError(
+                f"ChatMessage.content must be a str, got {type(self.content).__name__}{hint}"
+            )
         if self.parts is None:
             return
-        if self.role != ChatRole.USER:
+        if role != ChatRole.USER:
             raise ValueError("assistant chat messages cannot carry images")
         text, items = split_user_content(self.parts, owner="ChatMessage.parts")
         if not items:
@@ -114,7 +136,7 @@ class ChatMessage:
 
     @classmethod
     def assistant(cls, content: str) -> ChatMessage:
-        """Construct an assistant-role chat message."""
+        """Construct an assistant-role chat message (text only; images raise ``ValueError``)."""
         return cls(role=ChatRole.ASSISTANT, content=content)
 
 
