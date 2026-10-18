@@ -16,6 +16,7 @@ import datetime as _dt
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, overload
 
@@ -31,7 +32,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
     from datetime import datetime, timedelta
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -856,6 +857,21 @@ class StateStore(Protocol):
         ...
 
 
+class _SerializedSessionFactory:
+    """Session factory that holds the engine's session lock for each session's life."""
+
+    def __init__(self, engine: AsyncEngine, factory: Callable[[], AsyncSession]) -> None:
+        self._engine = engine
+        self._factory = factory
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[AsyncSession]:
+        from dendrux.db._pool_guard import serialized
+
+        async with serialized(self._engine), self._factory() as session:
+            yield session
+
+
 class SQLAlchemyStateStore(SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
@@ -872,10 +888,17 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy.orm import sessionmaker
 
+        from dendrux.db._pool_guard import shares_one_connection, warn_if_shared_connection
+
         self._engine = engine
         self._session_factory = sessionmaker(  # type: ignore[call-overload]
             engine, class_=AsyncSession, expire_on_commit=False
         )
+        if shares_one_connection(engine):
+            # One shared connection = one shared transaction: overlapping sessions
+            # would roll back each other's pending writes (see db/_pool_guard.py).
+            warn_if_shared_connection(engine)
+            self._session_factory = _SerializedSessionFactory(engine, self._session_factory)
 
     @property
     def store_identity(self) -> str:

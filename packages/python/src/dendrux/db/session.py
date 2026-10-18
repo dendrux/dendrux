@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+from dendrux.db._pool_guard import serialized
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
 
@@ -149,7 +150,7 @@ async def get_session(engine: AsyncEngine | None = None) -> AsyncGenerator[Async
         factory = sessionmaker(  # type: ignore[call-overload]
             resolved_engine, class_=AsyncSession, expire_on_commit=False
         )
-    async with factory() as session:
+    async with serialized(resolved_engine), factory() as session:
         try:
             yield session
             await session.commit()
