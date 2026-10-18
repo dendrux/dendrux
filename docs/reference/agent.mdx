@@ -50,6 +50,8 @@ Agent(
     skill_executor: SkillExecutor | None = None,
     tool_result_transform: ToolResultTransform | None = None,
     before_tool: BeforeToolHook | None = None,
+    images: ImagePolicy | None = None,
+    blob_store: BlobStore | None = None,
 )
 ```
 
@@ -76,6 +78,8 @@ Agent(
 | `skill_executor` | A `SkillExecutor` subclass instance that runs skill scripts. Without it, `run_skill_script` is not offered to the model. See [Running scripts](/docs/architecture/skills#running-scripts). |
 | `tool_result_transform` | Callable that rewrites a server tool's result before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
 | `before_tool` | Sync or async policy hook, run once for each parsed tool call that passes static `deny=` and skill preflight, before approval; called with a `ToolCallContext`, returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
+| `images` | An `ImagePolicy`: size and count caps, non-vision handling, the drop-old-images window, URL fetching and the ingest hook. `None` uses the defaults (vendor limits). Readable as `agent.image_policy`. See [Images](/docs/recipes/images). |
+| `blob_store` | A `BlobStore` that holds image bytes outside the Dendrux database (for example S3). `None` keeps bytes in the database. Pass the same store to every `Agent` and `RunStore` of the deployment. `agent.blobs` exposes `read`, `info`, `references`, `purge` and `collect_garbage`. See [S3 recipe](/docs/recipes/images-s3). |
 
 Construction validates its inputs: unknown names in `deny`/`require_approval`, `deny`/`require_approval` overlap, `output_type` without `SingleCall`, and tools with `SingleCall` all raise `ValueError`.
 
@@ -112,7 +116,7 @@ agent = Agent(provider=provider, prompt="...", tools=[query_sales],
 
 ```python
 async def run(
-    user_input: str,
+    user_input: UserContent,
     *,
     history: list[ChatMessage] | None = None,
     activate_skills: Sequence[str] | None = None,
@@ -123,6 +127,8 @@ async def run(
     output_type: type[BaseModel] | None = None,
 ) -> RunResult
 ```
+
+`UserContent` is `str | Sequence[str | Image | ImageRef | ImagePart]`: a plain string as before, or a list of text and images in the order the model should see them. Image problems raise `InvalidImageError`, `ImageLimitError`, `ImageFetchError` or `UnsupportedModalityError` before a run exists. See [Images](/docs/recipes/images).
 
 Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries; `idempotency_key` requires persistence. `activate_skills` names skills to deliver in the run's first message instead of waiting for the model to call `use_skill`; unknown or denied names raise `ValueError` before any run is created ([Skills](/docs/architecture/skills#explicit-activate_skills)).
 
@@ -154,7 +160,7 @@ never delivered (present only when there are any); see
 
 ```python
 def stream(
-    user_input: str,
+    user_input: UserContent,
     *,
     history: list[ChatMessage] | None = None,
     activate_skills: Sequence[str] | None = None,
@@ -241,7 +247,7 @@ The submit family resumes a paused run. Each one matches a pause status (see [Pa
 
 ```python
 async def submit_tool_results(run_id: str, results: list[ToolResult], *, notifier=None) -> RunResult
-async def submit_input(run_id: str, text: str, *, notifier=None) -> RunResult
+async def submit_input(run_id: str, text: UserContent, *, notifier=None) -> RunResult
 async def submit_approval(
     run_id: str,
     *,
@@ -262,6 +268,8 @@ async def resume(run_id: str, *, tool_results=None, user_input=None, notifier=No
 | `submit_resume` | `paused` (requested or budget pause) | the shared resume errors below. |
 | `resume` | generic resume entry point; with no payload it continues a `paused` run or approves a `waiting_approval` batch | same. |
 
+`submit_tool_results` honours `ToolResult.images`, and `submit_input` / `resume(user_input=)` accept images in the text; they are checked and stored before the run is claimed, so a rejected image leaves the run paused. See [Images](/docs/recipes/images#a-client-tool-that-returns-an-image).
+
 `submit_approval` takes exactly one of `approved=` (whole batch) or `decisions=` (per call, `ApprovalDecision.approve()` / `ApprovalDecision.deny(reason)` keyed by call id). Client-target calls in the batch are never executed on the server; the run pauses again as `waiting_client_tool` for them. See [Approval](/docs/architecture/approval).
 
 If the run was created with skills, these methods first compare them with the skills on this agent and raise `SkillMissingError` or `SkillMismatchError` (leaving the run paused) when they differ; `resume_stream` ends with a `RUN_ERROR` instead. See [Resume contract](/docs/architecture/skills#resume-contract).
@@ -274,7 +282,7 @@ Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMisma
 def resume_stream(run_id: str, *, tool_results=None, user_input=None, notifier=None) -> RunStream
 ```
 
-Streaming variant of resume: returns a `RunStream` for the resumed run.
+Streaming variant of resume: returns a `RunStream` for the resumed run. Image errors in the submitted `tool_results[i].images` or `user_input` are raised from the first iteration, leaving the run paused.
 
 ## `cancel_run`
 

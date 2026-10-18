@@ -26,6 +26,15 @@ def from_engine(engine: AsyncEngine) -> RunStore         # caller owns the engin
 async def close() -> None
 ```
 
+Both constructors also take `blob_store=` (a `BlobStore`) when the deployment keeps image bytes outside the database; use the same store as the `Agent`. Two members relate to images:
+
+```python
+store.blobs                                                       # BlobAccessor: read, info, references, purge, collect_garbage
+async def read_image(run_id: str, sha256: str, *, tenant_id=...) -> bytes
+```
+
+`read_image` returns verified image bytes only if the run exists (and matches `tenant_id` when given) and references that blob; otherwise `BlobNotFoundError`, the same error for a missing blob, another tenant's blob and an unreferenced one. It is the call to put behind your own authorization when you serve images from a route. `store.blobs.purge(...)` and `store.blobs.collect_garbage(...)` are the only writes `RunStore` has. See [Images](/docs/recipes/images#storage).
+
 `from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` reuses an engine you already have; `close()` is then a no-op and you dispose the engine yourself. `RunStore` is an async context manager.
 
 ## Read methods

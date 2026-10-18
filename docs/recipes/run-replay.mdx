@@ -7,7 +7,7 @@ description: Pass the run ids of a conversation and Dendrux replays its own trac
 
 ## The problem
 
-`history=` carries text only: the question and the answer of each earlier turn. For a tool-using chat that is not enough. On turn 2 the model has forgotten the schema it explored, the rows it read and the reasoning that connected them, so it explores again — the same `list_tables`, the same `describe_table`, the same queries — sometimes until it hits `max_iterations`. Every major vendor now recommends replaying earlier turns verbatim, tool calls and reasoning included.
+`history=` carries only the question and the answer of each earlier turn (plus any images the user attached). For a tool-using chat that is not enough. On turn 2 the model has forgotten the schema it explored, the rows it read and the reasoning that connected them, so it explores again — the same `list_tables`, the same `describe_table`, the same queries — sometimes until it hits `max_iterations`. Every major vendor now recommends replaying earlier turns verbatim, tool calls and reasoning included.
 
 Your app already stores something Dendrux does not: the order of runs in a conversation. Dendrux already stores something your app does not: what each run actually did. `runs=` joins the two.
 

@@ -1,0 +1,113 @@
+---
+title: Storing image bytes in S3
+description: Implement the three-method BlobStore protocol over S3 so image bytes live in object storage and only metadata stays in the Dendrux database. Wiring, garbage collection, erasure and what not to configure.
+---
+
+# Storing image bytes in S3
+
+By default Dendrux keeps image bytes in the database next to the run (`dendrux_blobs.data`). That is the right default: one system, transactional, nothing to operate. For heavy image workloads (screenshot-per-step agents, large uploads) it makes the database big and slows backups, and you may want the bytes in object storage instead.
+
+You do that by passing a `BlobStore`: three async methods. Dendrux still keeps all metadata in its database (type, size, dimensions, state, which run uses which blob); the store only holds bytes. Dendrux ships no S3 adapter, so this page is the recipe.
+
+```python
+from typing import Protocol
+from dendrux.media import BlobKey
+
+class BlobStore(Protocol):
+    async def put(self, key: BlobKey, data: bytes, *, media_type: str) -> None: ...   # idempotent per key
+    async def get(self, key: BlobKey) -> bytes | None: ...                            # None = absent
+    async def delete(self, key: BlobKey) -> None: ...                                 # absent counts as success
+```
+
+`key.object_name` is the object key to use: `<url-quoted tenant scope>/<sha256>/<generation>`. The generation changes if a blob is recreated, so a delete in flight can never remove a newer upload of the same bytes.
+
+## An S3 implementation
+
+This uses `boto3` (`pip install boto3`) and moves its blocking calls to a thread:
+
+```python
+import asyncio
+
+import boto3
+from botocore.exceptions import ClientError
+
+from dendrux.media import BlobKey
+
+
+class S3BlobStore:
+    def __init__(self, bucket: str, *, prefix: str = "dendrux-images/", client=None) -> None:
+        self._bucket = bucket
+        self._prefix = prefix
+        self._s3 = client or boto3.client("s3")
+
+    def _name(self, key: BlobKey) -> str:
+        return self._prefix + key.object_name
+
+    async def put(self, key: BlobKey, data: bytes, *, media_type: str) -> None:
+        await asyncio.to_thread(
+            self._s3.put_object,
+            Bucket=self._bucket,
+            Key=self._name(key),
+            Body=data,
+            ContentType=media_type,
+            ServerSideEncryption="AES256",
+        )
+
+    async def get(self, key: BlobKey) -> bytes | None:
+        def read() -> bytes | None:
+            try:
+                return self._s3.get_object(Bucket=self._bucket, Key=self._name(key))["Body"].read()
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                    return None
+                raise
+
+        return await asyncio.to_thread(read)
+
+    async def delete(self, key: BlobKey) -> None:
+        await asyncio.to_thread(
+            self._s3.delete_object, Bucket=self._bucket, Key=self._name(key)
+        )
+```
+
+The IAM policy needs `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on the prefix. S3 reports a delete of a missing object as success, which is what the protocol asks for. `put` of the same key with the same bytes is safe to repeat.
+
+## Wiring it in
+
+Use the same store everywhere bytes are read, stored or purged: every `Agent`, every `RunStore`, every worker. Rows record that their bytes are external, not which store holds them, so a process configured without it cannot read them (`ImagePersistenceUnsupportedError`, `reason="blob_store_not_configured"`).
+
+```python
+from dendrux import Agent
+from dendrux.store import RunStore
+
+store = S3BlobStore("my-agent-images")
+
+agent = Agent(..., database_url=DATABASE_URL, blob_store=store)
+runs = RunStore.from_database_url(DATABASE_URL, blob_store=store)   # for read_image and purge
+```
+
+A paused run started by one process resumes in another as long as both use the same bucket and database. Dendrux never opens or closes your client; its lifetime is yours.
+
+## Garbage collection and erasure work the same
+
+`await agent.blobs.collect_garbage()` and `await agent.blobs.purge(sha256, tenant_id=...)` call your `delete`. Run garbage collection on a schedule (hourly or daily, at least one hour of grace) from any process:
+
+```python
+from datetime import timedelta
+
+result = await agent.blobs.collect_garbage(older_than=timedelta(hours=24))
+```
+
+Every delete is written to the database as intent before the object is touched, so a crash between the two leaves a row the next collection finishes. You do not need an outbox or a bucket lifecycle rule.
+
+## What not to do
+
+- **No expiry lifecycle rule on the prefix.** An object that expires while a run still references it breaks the run (`BlobNotFoundError` on the next request). Let garbage collection decide what is unreferenced.
+- **Versioned buckets keep deleted objects.** A delete only adds a marker. If you rely on `purge` for erasure, add a lifecycle rule that expires non-current versions of this prefix.
+- **Do not trust the bucket.** Dendrux verifies the length, SHA-256, media type and dimensions of every object it reads and raises `BlobIntegrityError` on a mismatch, but it cannot protect objects from being overwritten; use a bucket policy that only your services can write.
+- **One store per deployment.** Switching buckets requires moving the objects first; the database does not know where they were.
+
+## Where this fits
+
+- [Images guide](/docs/recipes/images): storage, purge and the rest of the image API.
+- [RunStore](/docs/reference/run-store): `blobs` and `read_image`.

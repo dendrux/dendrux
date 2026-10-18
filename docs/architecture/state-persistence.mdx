@@ -34,6 +34,8 @@ A **library**, not a service. Dendrux doesn't run a server, doesn't manage worke
 
 The `agent_runs` table is the anchor. Everything else cascades from it: delete a run row and all its traces, tool calls, and events go with it.
 
+> **New in 0.4.0:** two image tables, `dendrux_blobs` (content-addressed image bytes and metadata, keyed by tenant scope and SHA-256) and `dendrux_blob_refs` (which run uses which blob). They hold images only; a deployment that never uses images has them empty. See [Images](/docs/recipes/images#storage). Postgres needs `dendrux db migrate` (revision `c6d7e8f9a0b1`) even if you never use images; see [Upgrading](#upgrading).
+
 > **New in 0.3.0:** a seventh table, `run_inbox`, holds notes submitted to a running agent with `submit_note`. It cascades with the run like the others. See [`run_inbox`](#run_inbox-notes-for-a-running-agent) below. The "six tables" wording elsewhere in these docs counts the original set.
 
 All IDs are **26-character ULIDs** (time-sortable, see [Runs and the lifecycle](/docs/architecture/runs)).
@@ -301,6 +303,8 @@ dendrux db status                        # show the current migration revision
 If the tables are missing when a run starts, dendrux raises `SchemaNotInitializedError` carrying these exact commands, rather than letting a raw "relation does not exist" error surface mid-run.
 
 ### Upgrading
+
+Upgrading to 0.4.0 adds the two image tables; a Postgres database that has not been migrated raises `SchemaOutOfDateError` naming `dendrux_blobs` and `dendrux_blob_refs` on first use. SQLite files create them on startup.
 
 After you upgrade the `dendrux` package, run `dendrux db migrate` against your database again, then restart your app. If you forget, dendrux does not let the first run fail with a raw `UndefinedColumnError`. On first use of a non-SQLite database (an `Agent` run, `sweep`, or the dashboard) it verifies that every table and column this version needs is present, and raises `SchemaOutOfDateError` naming what is missing, for example `agent_runs.pause_requested` and `table run_inbox` when you move from 0.2.0a23 to 0.3.0.
 

@@ -53,6 +53,20 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | `Pattern` | `from dendrux.guardrails import Pattern` | A named regex `Pattern(name, regex)`. |
 | `Guardrail` | `from dendrux.guardrails import Guardrail` | Protocol for custom guardrails (`async scan(text)`). |
 | `Finding` | `from dendrux.guardrails import Finding` | One detection: entity type, span, score, text. |
+| `ImageGuardrail` / `ImageScanInput` | `from dendrux.guardrails import ImageGuardrail, ImageScanInput` | Opt-in protocol for guardrails that scan images (`async scan_image(image)`). See [Images](/docs/recipes/images#guardrails). |
+
+## Images
+
+| Symbol | Import | What it is |
+| --- | --- | --- |
+| `Image` | `from dendrux import Image` | An image input: `from_bytes`, `from_path`, `from_base64`, `from_url`. Accepted in `user_input`, `ChatMessage.user`, `ToolOutput` and `ToolResult.images`. |
+| `ToolOutput` | `from dendrux import ToolOutput` | What a server `@tool` returns to attach images: `ToolOutput(result, images=[...])`. |
+| `ImageRef` / `ImagePart` / `TextPart` | `from dendrux import ImageRef, ImagePart, TextPart` | A stored image's descriptor, and the ordered parts of a multimodal `Message.parts`. |
+| `ImagePolicy` / `ImageDropPolicy` / `UrlPolicy` | `from dendrux.media import ImagePolicy, ImageDropPolicy, UrlPolicy` | `Agent(images=...)`: caps, non-vision behaviour, the drop-old-images window, URL fetching and the ingest hook. |
+| `BlobStore` / `BlobKey` / `InMemoryBlobStore` | `from dendrux.media import BlobStore, BlobKey, InMemoryBlobStore` | The byte-storage protocol for `Agent(blob_store=...)`. See [S3 recipe](/docs/recipes/images-s3). |
+| `agent.blobs` | `Agent.blobs` | `read`, `info`, `references`, `purge` and `collect_garbage` for stored images. |
+
+The guide is [Images](/docs/recipes/images).
 
 ## Notifiers
 
@@ -97,7 +111,7 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
 | `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |
 | `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
-| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 25 governance event types. See [Governance](/docs/architecture/governance). |
+| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 31 governance event types. See [Governance](/docs/architecture/governance). |
 | `ApprovalDecision` | `from dendrux import ApprovalDecision` | One human decision for `submit_approval(decisions=...)`: `approve()` or `deny(reason)`. See [Approval](/docs/architecture/approval#per-call-decisions). |
 | `ToolCallContext` / `ToolDecision` / `BeforeToolHook` | `from dendrux import ToolCallContext, ToolDecision, BeforeToolHook` | Input, verdict and type of `Agent(before_tool=...)`. See [Tool policy hook](/docs/architecture/tool-policy). |
 | `PauseOutcome` | `from dendrux import PauseOutcome` | Returned by `agent.request_pause`: root status before/after and each affected run. See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause). |

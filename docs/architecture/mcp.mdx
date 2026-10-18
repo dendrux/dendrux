@@ -694,6 +694,7 @@ async def call_tool(
 - **It takes the same path as an Agent-run call.** The connection lease, the runtime-wide in-flight cap (`max_in_flight_calls`), the stale-definition check, one recoverable 401 re-authentication, telemetry, result normalization, credential redaction and the error mapping are all shared. You get back the payload an Agent tool would receive, and a result the server flags as an error raises `MCPToolCallError`.
 - **`timeout` is an outer deadline in seconds**, covering queueing, connecting and the call. On expiry you get a `TimeoutError`, and if the call had already started its outcome is unknown: the server may still apply it, so do not retry automatically. `timeout=None` adds no deadline of its own but does **not** disable the source's transport `call_timeout`, which always applies.
 - Like `discover()`, await it on the event loop the runtime is bound to.
+- **Image results keep the legacy shape.** `call_tool` returns the same value it did before 0.4.0: image blocks stay inside the content envelope with their base64 `data`. Only Agent runs turn them into [image parts](#images-from-mcp-tools).
 
 > **`call_tool` bypasses all Agent governance.** There is no `deny=`, no `require_approval=`, no `before_tool` hook, no guardrails, no tenant authorization beyond the connection's own identity, no run row, no `tool_calls` record and no budget. It is your application's call and your application's audit. Authorize each call in your own code, and never expose `call_tool` (or a route wrapping it with caller-chosen names and arguments) directly to a model or an untrusted client.
 
@@ -794,7 +795,7 @@ The integration preserves:
 
 - `structuredContent` as a JSON-compatible Python value;
 - text-only content as a string;
-- image, audio, resource-link, and embedded-resource blocks in a JSON content envelope;
+- audio, resource-link, and embedded-resource blocks in a JSON content envelope, and image blocks as [image parts](#images-from-mcp-tools) the model can see;
 - negotiated protocol version and server identity in `ToolDef.meta`.
 
 `max_result_bytes` is enforced before a result enters the model conversation. Errors an application should be ready to handle:
@@ -812,6 +813,23 @@ The integration preserves:
 | `MCPResultTooLargeError` | The result exceeded `max_result_bytes`. | Yes — the result was discarded. |
 
 All are subclasses of `MCPError`, importable from `dendrux.mcp`.
+
+## Images from MCP tools
+
+In agent runs, image content from an MCP tool is passed to the model as an image, not as base64 text. Text and structured content are unchanged; the JSON payload keeps a stub for each image in place of its data:
+
+```json
+{"content": [{"type": "text", "text": "chart ready"},
+             {"type": "image", "image_index": 0, "mime_type": "image/png"}]}
+```
+
+Before 0.4.0 the same block was `{"type": "image", "data": "<base64>", "mimeType": "image/png"}` inside the payload. Consequences:
+
+- `tool_result_transform` receives a `ToolOutput` as `ctx.result` for image-bearing results (`.result` is the envelope or structured value, `.images` the images). Return it, or a new `ToolOutput`, to keep the images; any other return drops them.
+- Reads of `data` from MCP image blocks in `tool_calls.result` or traces no longer find it; the bytes are stored as blobs ([Images](/docs/recipes/images#storage)).
+- An image the runtime cannot use (unsupported type such as SVG, corrupt, over a cap) does not fail the call: the model sees `[image from MCP could not be used: <reason>]` and receives the other images. Base64 wrapped over several lines is accepted, and a wrong `mimeType` is ignored in favour of the detected type.
+- `MCPConnection.call_tool(...)` is unchanged: it returns the same envelope as before, base64 included, and an `is_error` result with image blocks keeps its previous text. Treat that text as sensitive.
+- `max_result_bytes` applies to the text envelope; images use the `ImagePolicy` caps on the Agent.
 
 ## Simple ownership without the runtime
 

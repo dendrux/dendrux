@@ -1,0 +1,77 @@
+---
+title: Resizing and validating images with an ingest hook
+description: Shrink large screenshots and photos before they are stored, and fully decode every image to catch corrupt pixel data, using ImagePolicy.ingest_hook and Pillow.
+---
+
+# Resizing and validating images with an ingest hook
+
+Dendrux accepts images up to the vendor limits (8000 px on the long side, 5 MiB per image) and never resizes or re-encodes them itself, so what a model sees is exactly the bytes you stored. Two things you may want to do before storing:
+
+- **Shrink.** A 12-megapixel photo or a 5K screenshot is more pixels than a model uses. Vendors downscale server-side, so you pay to upload and cache bytes the model throws away, and a very large PNG can exceed the 5 MiB cap.
+- **Decode fully.** Dendrux validates structure from the header and never decodes pixels, so a file that is truncated in the middle of its pixel data passes ingest and is only caught by the provider. A hook that decodes catches it at the door.
+
+`ImagePolicy.ingest_hook` is the one place for both. It runs once per image, before the image is checked and stored; its output is stored as a new blob. It never runs at send time.
+
+## The recipe
+
+Pillow is your dependency, not Dendrux's (`pip install pillow`).
+
+```python
+import asyncio
+import io
+
+from PIL import Image as PILImage, ImageOps
+
+from dendrux import Agent
+from dendrux.media import ImageIngestRequest, ImagePolicy
+
+PILImage.MAX_IMAGE_PIXELS = 8000 * 8000          # decompression-bomb guard for decode
+MAX_SIDE = 1568                                   # Claude's standard tier; 2000 also satisfies
+                                                  # Anthropic's more-than-20-images rule
+
+
+def shrink(req: ImageIngestRequest) -> bytes | None:
+    try:
+        im = PILImage.open(io.BytesIO(req.data))
+        im.load()                                 # full decode: raises on truncated or corrupt data
+    except Exception:
+        raise ValueError("image could not be decoded") from None
+    if max(im.size) <= MAX_SIDE:
+        return None                               # None = keep the original bytes
+    im = ImageOps.exif_transpose(im)
+    im.thumbnail((MAX_SIDE, MAX_SIDE), PILImage.LANCZOS)
+    out = io.BytesIO()
+    if im.mode in ("RGBA", "LA", "P"):
+        im.save(out, format="PNG", optimize=False)
+    else:
+        im.convert("RGB").save(out, format="JPEG", quality=85, subsampling=0)
+    return out.getvalue()
+
+
+async def shrink_async(req: ImageIngestRequest) -> bytes | None:
+    return await asyncio.to_thread(shrink, req)   # keep decoding off the event loop
+
+
+agent = Agent(
+    ...,
+    images=ImagePolicy(ingest_hook=shrink_async, ingest_hook_version="shrink-1568-v1"),
+)
+```
+
+How it behaves:
+
+- **Return `None`, or the same bytes, for "unchanged".** Nothing is recorded as transformed. Return new bytes to replace the image; they must fit `max_image_bytes`, and may be a different format (PNG in, JPEG out is fine).
+- **`ingest_hook_version` is required** whenever a hook is set. It is stored on the blob (`dendrux_blobs.ingest_transform`) only for images the hook actually changed. Bump it whenever the size, quality or library changes so you can tell which blobs came from which logic. The same input and the same pinned Pillow version should always give the same output; if the output varies, the same image will be stored more than once.
+- **A sync hook runs on the event loop.** Decoding a large image takes tens to hundreds of milliseconds and blocks every other request in the process. Use the async wrapper above, or a process pool.
+- **Errors are yours.** An exception from the hook propagates unchanged: an entry point such as `agent.run(...)` raises it before any run exists, and a tool that returned the image fails that call. Raise your own short message, as above; a library error can echo parts of the data.
+- **The request tells you where the image came from.** `req.origin` is `"user"`, `"tool"`, `"client_tool"` or `"mcp"`, `req.tool_name` names the tool, and `req.max_output_bytes` is the cap your output must fit. Return `None` for origins you do not want touched.
+- **The hook sees the bytes after the source-size check** (`max_source_bytes`, 25 MiB by default) and before the per-image caps, so it can bring an oversized file under `max_image_bytes`.
+
+## When to skip it
+
+If your images are already screenshots at screen size or thumbnails you generated, the defaults are enough. The hook is for user uploads and tool output you do not control. Resizing also changes what the model can read: shrinking a dense screenshot below its text size loses the text, so choose `MAX_SIDE` for the smallest text you need legible, not for the cheapest request.
+
+## Where this fits
+
+- [Images guide](/docs/recipes/images): limits, storage, providers and errors.
+- [S3 blob store recipe](/docs/recipes/images-s3): keep the stored bytes in object storage.
