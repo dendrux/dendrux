@@ -73,9 +73,17 @@ def tool(
         timeout_seconds: Execution timeout in seconds. Default 120s.
         parameters: Explicit JSON Schema (``{"type": "object", ...}``) for the
             tool's arguments. Bypasses schema generation from type hints.
-        strict: Opt into OpenAI strict function calling. The schema is
-            normalized at decoration time (every property required, closed
-            objects) and OpenAI providers send ``"strict": true``.
+        strict: Opt into strict (schema-constrained) tool calling on OpenAI
+            and Anthropic. The schema is normalized for OpenAI at decoration
+            time (every property required, closed objects; free-form dicts
+            are rejected) and OpenAI providers send ``"strict": true``.
+            ``AnthropicProvider`` sends ``"strict": true`` with a per-request
+            copy of that schema in which keywords Anthropic strict mode
+            rejects (``minimum``/``maximum``, ``maxItems``, unsupported
+            ``format`` or ``pattern``, ...) are moved into the description;
+            a schema Anthropic cannot take strictly (recursion, tuples,
+            untyped values, or over the request's 20 strict tools / 24
+            optional / 16 union-typed parameter limits) is sent non-strict.
 
     Usage:
         @tool(target="server")
@@ -171,9 +179,9 @@ def _validate_explicit_parameters(parameters: Any, tool_name: str) -> dict[str, 
 
 
 def _strict_schema(schema: dict[str, Any], tool_name: str) -> dict[str, Any]:
-    from dendrux.llm._schema import normalize_for_openai_strict
+    from dendrux.llm._schema import find_open_object, normalize_for_openai_strict
 
-    open_path = _find_open_object(schema, "parameters")
+    open_path = find_open_object(schema, "parameters")
     if open_path is not None:
         raise TypeError(
             f"Tool '{tool_name}' uses strict=True but {open_path} is a free-form object "
@@ -182,28 +190,6 @@ def _strict_schema(schema: dict[str, Any], tool_name: str) -> dict[str, Any]:
             f"or TypedDict instead, or drop strict=True."
         )
     return normalize_for_openai_strict(schema)
-
-
-def _find_open_object(node: Any, path: str) -> str | None:
-    if not isinstance(node, dict):
-        return None
-    node_type = node.get("type")
-    is_object = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
-    if is_object and "properties" not in node and "$ref" not in node:
-        return path
-    for key, sub in node.get("properties", {}).items():
-        found = _find_open_object(sub, f"{path}.{key}")
-        if found:
-            return found
-    children: list[tuple[str, Any]] = [("[]", node.get("items"))]
-    for key in ("anyOf", "oneOf", "allOf"):
-        children.extend((f".{key}[{i}]", v) for i, v in enumerate(node.get(key) or []))
-    children.extend((f".$defs.{k}", v) for k, v in (node.get("$defs") or {}).items())
-    for suffix, child in children:
-        found = _find_open_object(child, f"{path}{suffix}")
-        if found:
-            return found
-    return None
 
 
 # ---------------------------------------------------------------------------
