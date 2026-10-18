@@ -39,7 +39,9 @@ async def structured_complete(
     Raises:
         ValueError: If the provider does not support structured output.
         StructuredOutputValidationError: If the response fails Pydantic
-            validation (malformed JSON, wrong types, missing fields).
+            validation (malformed JSON, wrong types, missing fields). It
+            carries the call's ``usage`` and ``model`` (unpriced here; the
+            SingleCall loop prices and records the call before re-raising).
 
     Args:
         provider: The LLM provider to call.
@@ -70,10 +72,14 @@ async def structured_complete(
     try:
         output = output_type.model_validate_json(raw_text)
     except ValidationError as exc:
-        raise StructuredOutputValidationError(
+        error = StructuredOutputValidationError(
             raw_response=raw_text,
             output_type_name=output_type.__name__,
             validation_error=str(exc),
-        ) from exc
+            usage=response.usage,
+            model=response.model,
+        )
+        error._response = response
+        raise error from exc
 
     return response, output

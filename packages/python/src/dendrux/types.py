@@ -1875,6 +1875,9 @@ class StructuredOutputValidationError(RuntimeError):
         self.validation_error = validation_error
         self.usage = usage
         self.model = model
+        # The full rejected response, set by ``structured_complete`` so the
+        # loop can record the call with its evidence. Internal.
+        self._response: LLMResponse | None = None
         super().__init__(
             f"Structured output validation failed for {output_type_name}. "
             f"Validation error: {validation_error}\n"

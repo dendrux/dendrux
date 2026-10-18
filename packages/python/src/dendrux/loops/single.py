@@ -56,6 +56,7 @@ from dendrux.types import (
     RunResult,
     RunStatus,
     StreamEventType,
+    StructuredOutputValidationError,
     UsageStats,
     generate_ulid,
 )
@@ -106,6 +107,57 @@ async def _single_call_budget(
 def _call_usage(usage: UsageStats) -> UsageStats:
     """Run usage for the one call; an unpriced call marks the total unknown."""
     return replace(usage, cost_unknown=usage.cost_usd is None)
+
+
+async def _record_rejected_call(
+    exc: StructuredOutputValidationError,
+    *,
+    agent: Agent,
+    provider: LLMProvider,
+    run_id: str,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    warnings: list[str],
+    semantic_messages: list[Message] | None,
+    duration_ms: int,
+) -> None:
+    """Record a structured call whose output failed validation as a completed call.
+
+    The call was made and billed: it is priced, recorded (``llm.completed``
+    and its ``llm_interactions`` row) and checked against the budget like any
+    other call. ``exc.usage`` / ``exc.model`` are updated to the priced usage.
+    The caller re-raises, so the run still fails.
+    """
+    response = exc._response or LLMResponse(
+        text=exc.raw_response,
+        usage=exc.usage or UsageStats(usage_reported=False),
+        model=exc.model,
+    )
+    response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+    exc.usage = response.usage
+    exc.model = response.model or provider.model
+    await record_llm(
+        recorder,
+        run_id,
+        response,
+        1,
+        semantic_messages=semantic_messages,
+        semantic_tools=None,
+        duration_ms=duration_ms,
+    )
+    await notify_llm(
+        notifier,
+        run_id,
+        response,
+        1,
+        warnings,
+        semantic_messages=semantic_messages,
+        semantic_tools=None,
+        duration_ms=duration_ms,
+    )
+    await _single_call_budget(
+        agent.budget, _call_usage(response.usage), run_id, recorder, notifier, warnings
+    )
 
 
 class SingleCall(Loop):
@@ -362,6 +414,19 @@ class SingleCall(Loop):
                             f"({len(response.tool_calls)} calls). SingleCall agents must "
                             f"have zero tools — the provider should not produce tool calls."
                         )
+            except StructuredOutputValidationError as _invalid:
+                await _record_rejected_call(
+                    _invalid,
+                    agent=agent,
+                    provider=provider,
+                    run_id=resolved_run_id,
+                    recorder=recorder,
+                    notifier=notifier,
+                    warnings=notifier_warnings,
+                    semantic_messages=prepared.semantic,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
+                raise
             except Exception as _llm_exc:
                 _llm_fail_ms = int((time.monotonic() - t0) * 1000)
                 await record_llm_failed(
