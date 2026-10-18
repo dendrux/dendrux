@@ -1229,3 +1229,35 @@ async def test_eight_concurrent_runs_two_tenants_parallel_tools() -> None:
 async def test_inspect_fixture_png_valid() -> None:
     header = inspect_image(make_png(width=7, height=3))
     assert (header.width, header.height, header.media_type) == (7, 3, "image/png")
+
+
+async def test_commit_order_events_before_llm_started_then_sent() -> None:
+    """Commit protocol: delta applied, events recorded, then llm started; sent after success."""
+    log: list[str] = []
+
+    class OrderRecorder(RecordingRecorder):
+        async def on_governance_event(
+            self, run_id: str, event_type: str, *a: Any, **kw: Any
+        ) -> None:
+            log.append(event_type)
+
+        async def on_llm_call_started(self, run_id: str, iteration: int, **kw: Any) -> None:
+            log.append("llm.started")
+
+        async def on_llm_call_completed(self, *a: Any, **kw: Any) -> None:
+            log.append("llm.completed")
+
+    rt = make_runtime()
+    part = await store_image(rt, make_png(seed=800))
+    state = ImageViewState(sent_through=1)
+    llm = ImageLLM([LLMResponse(text="ok")], support="no")
+    await _run(
+        llm,
+        tools=[],
+        history=[user_msg("q", part)],
+        rt=rt,
+        state=state,
+        rec=OrderRecorder(),
+    )
+    assert log == ["image.degraded", "image.state", "llm.started", "llm.completed"]
+    assert state.placeholders == {0: "unsupported"} and state.sent_through == 1
