@@ -184,6 +184,20 @@ image results reach the model (see Changed).
 - `GuardrailEngine` text scans skip an image-only guardrail (`scan_image`
   without `scan`); other guardrails behave as in 0.3.0.
 
+### Fixed
+
+- In-memory SQLite (and any engine on `StaticPool` / `SingletonThreadPool`)
+  could silently lose `tool_calls`, `run_events` and trace rows when parallel
+  tool calls, heartbeats or readers used the database at the same time: the
+  sessions shared one connection and one transaction, so one session's
+  end-of-session rollback discarded another's pending write, with no error.
+  The bug predates 0.4.0 and became much more frequent on SQLAlchemy 2.1.
+  Sessions on such engines are now serialised, and creating a store on one
+  logs a single warning that writes are serialised and the data is not
+  durable. File SQLite and Postgres were never affected and are unchanged.
+- SQLAlchemy 2.1 is supported (the existing `>=2.0,<3.0` range). CI tests
+  both 2.0 and 2.1.
+
 ### Migration
 
 - New Alembic revision `c6d7e8f9a0b1` (down revision `b5c6d7e8f9a0`): creates
