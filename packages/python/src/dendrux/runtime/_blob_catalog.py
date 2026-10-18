@@ -887,7 +887,7 @@ async def write_blob_refs(
     _check_batch_owner_keys(blob_refs)
 
     # 2. Claim the blob rows with a write (rows locked in sha order first on PG).
-    dialect = session.bind.dialect
+    dialect = session.get_bind().dialect
     shas = sorted({e.sha256 for e in blob_refs})
     now = _db_now(dialect.name)
     claimed: set[str] = set()
