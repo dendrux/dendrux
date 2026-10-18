@@ -12,8 +12,9 @@ image results reach the model (see Changed).
 - **Images in user input.** `run()`, `stream()`, `submit_input()`,
   `resume(user_input=)` and `history=` accept `UserContent`: a string, or a
   list of strings and images in the order the model should see them.
-  `ChatMessage.user(...)` takes the same list (`ChatMessage.parts`); assistant
-  messages cannot carry images. `Image` (`from_bytes`, `from_path`,
+  `ChatMessage.user(...)` takes the same list (`ChatMessage.parts`); images are
+  supported in user turns only (`ChatMessage.assistant()` takes a string and an
+  assistant `ChatMessage` with `parts` raises `ValueError`). `Image` (`from_bytes`, `from_path`,
   `from_base64`, `from_url`) and `ToolOutput` are exported from `dendrux`, with
   `ImageRef`, `ImagePart` and `TextPart`. Supported formats are PNG, JPEG, GIF
   and WebP, detected from the bytes (never from a declared type, file name or
@@ -31,8 +32,10 @@ image results reach the model (see Changed).
   be used does not fail the call: the model sees
   `[image from MCP could not be used: <reason>]` and the other images.
 - **Provider support.** Anthropic (tool images native), OpenAI Responses (tool
-  images native by default; `OpenAIResponsesProvider(tool_result_images="portable")`
-  selects the portable form), OpenAI Chat and OpenRouter (portable: a text tool
+  images native by default, confirmed by the live matrix on gpt-5-mini and
+  gpt-4o-mini in batch, stream and resume;
+  `OpenAIResponsesProvider(tool_result_images="portable")` selects the portable
+  form), OpenAI Chat and OpenRouter (portable: a text tool
   message plus one framed user message that says the images are tool output).
   Image bytes are encoded once and never change between calls, so prompt
   caching is unaffected; cache markers, cache keys and text-only request bodies
@@ -62,7 +65,8 @@ image results reach the model (see Changed).
   interval=25, scope="tool_results")` keeps the model's view of tool images
   bounded in steps, which keeps most of the prompt cache. It is sticky, stored
   with the run, and survives pause, resume, retry and replay. Logs a warning and
-  emits `image.warning` once per run when combined with Anthropic thinking.
+  emits `image.warning` once per run when combined with provider thinking
+  (Anthropic, or OpenAI Responses with `thinking=True`).
 - **Blob storage.** Images are stored once as tenant-scoped, content-addressed
   blobs in two new tables, `dendrux_blobs` and `dendrux_blob_refs`; runs, pauses,
   traces and events hold references only, and `llm_interactions.provider_request`
@@ -133,7 +137,9 @@ image results reach the model (see Changed).
 - **`ProviderError` replaces raw SDK exceptions on image-bearing requests.** An
   application that caught a vendor exception from a request with images now sees
   `ProviderError` (sanitised message, at most 500 characters), or one of the more
-  specific image errors. Requests without images keep the exact errors they had.
+  specific image errors. Timeouts and connection failures on such requests are
+  `ProviderError` with `error_type="timeout"` or `"connection"`. Requests
+  without images keep the exact errors they had.
 - **Built-in providers report `supports_multimodal=True`.** A custom
   `LLMProvider` is treated as unable to read images until it sets
   `supports_multimodal=True` and converts `Message.parts`, so an adapter that
@@ -143,6 +149,26 @@ image results reach the model (see Changed).
 - **Custom `Strategy.format_tool_result` must keep image parts.** If a result had
   images and the returned message has none, the loop raises `TypeError`. Build
   the message with `tool_result_message(result)`.
+- **`ChatMessage` gains a third field, `parts`** (default `None`, user turns
+  only). Text-only messages now show `parts=None` in `repr` and
+  `dataclasses.asdict`, and `parts` is last in `__match_args__`; apps that
+  serialise history with `asdict` see the new key.
+- **Custom loops.** A `Loop` whose `run()` (or `run_stream()`) does not accept
+  `image_runtime` raises `TypeError` for image input, image replay (`runs=`) and
+  `retry()`. Text-only runs are unaffected.
+- **Idempotency covers images.** The same `idempotency_key` with different images
+  raises `IdempotencyConflictError`. A keyed retry whose image has since been
+  purged returns the existing run (the fingerprint is rebuilt from the stored
+  input), so two requests that differ only in which since-purged image they send
+  count as the same request. This does not apply when `history=` carries images:
+  that retry raises `InvalidImageError("purged")`.
+- **Image submissions re-check the pause at claim time.** `submit_tool_results` /
+  `submit_input` with images verify that the run is still at the pause they
+  validated against; otherwise `RunAlreadyClaimedError` and the run stays
+  paused. Text-only submissions are unchanged.
+- **`provider_request` scrubbing is structural.** The stored request is
+  sanitised by replacing the image data fields themselves
+  (`dendrux-image:sha256:<hex>`), not by pattern-matching text.
 - **`Message` gains `parts`.** Text-only messages are unchanged in meaning but
   `parts=None` now appears in `repr`, `dataclasses.asdict` and as the last entry
   of `__match_args__`; `Message.content` is always a `str` (the text projection
@@ -152,8 +178,8 @@ image results reach the model (see Changed).
   only for runs that have images; v0.3.0 pause data resumes unchanged. A persisted
   `agent_runs.input_data`, trace, tool-call or interaction row for a text-only run
   is byte-identical to 0.3.0.
-- `GuardrailEngine` text scans use only guardrails that implement `scan`;
-  an image-only guardrail is skipped by the text path.
+- `GuardrailEngine` text scans skip an image-only guardrail (`scan_image`
+  without `scan`); other guardrails behave as in 0.3.0.
 
 ### Migration
 
@@ -176,11 +202,11 @@ image results reach the model (see Changed).
 - Pass-through URLs and provider-hosted file ids are not supported in this
   release: `Image.from_url` always fetches and stores. Dendrux does not resize,
   re-encode or decode pixels; use `ImagePolicy.ingest_hook` (a Pillow recipe is
-  in the docs). A synchronous `ingest_hook` runs on the event loop, so do heavy
+  in the docs; it checks the pixel count before decoding). A synchronous `ingest_hook` runs on the event loop, so do heavy
   work in an async hook that uses a thread.
 - The URL fetcher verifies certificates with httpx's default bundle (certifi),
   not the operating system's trust store. A corporate CA needs
-  `UrlPolicy(fetcher=...)`.
+  `UrlPolicy(fetcher=...)` (an async callable).
 - Image guardrails run on batch paths only; `stream()` still rejects guardrails.
 - A gateway that words "this model has no image support" differently from the
   OpenAI, OpenAI Responses and OpenRouter messages does not map to
