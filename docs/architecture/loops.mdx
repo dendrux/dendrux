@@ -288,6 +288,21 @@ One user row, one assistant row, and we are done. No tool iterations, no pause s
 
 `SingleCall` is the only loop that supports `output_type`. Pass a `pydantic.BaseModel` subclass and the run returns a validated instance on `result.output`. If you set `output_type` without `loop=SingleCall()`, the constructor raises with the error shown earlier. That pairing is strict: structured output is parsed before guardrail scanning runs, so it is only allowed where guardrails and tools are absent.
 
+#### Strict mode on Anthropic
+
+On Anthropic, structured output uses strict tool use automatically when the output model fits Anthropic's strict subset. It follows the same adaptation and limits as [strict tools](/docs/reference/tools#strict-mode-on-anthropic): objects are closed, and constraints the grammar cannot enforce (for example `Field(ge=1)`) move into the field description. Pydantic still validates the full model when the response arrives, so those constraints are enforced there.
+
+If the model does not fit (a `dict[str, str]` field, a recursive model, a tuple, an `Any` field, or too many optional or union fields), the request is sent exactly as in earlier versions, without strict. The reason is logged at DEBUG on `dendrux.llm.anthropic`. If Anthropic rejects a strict schema anyway, the request is retried once without strict. `AnthropicProvider(..., strict=False)` turns strict mode off. Anthropic caches schemas for up to 24 hours; see [Data retention](/docs/reference/tools#strict-mode-on-anthropic) before putting sensitive values in field names or enums.
+
+#### When validation fails
+
+If the output fails validation, the run ends with `status=ERROR` and `agent.run()` raises `StructuredOutputValidationError`. The call that produced the invalid output was still made and billed, so Dendrux keeps its cost:
+
+- The error carries `usage`, `model` and `stop_reason` for that call. A `stop_reason` of `"max_tokens"` means the JSON was cut off; raise `max_tokens`.
+- The call is recorded as a completed LLM call: one `llm_interactions` row with usage, cost (priced with your `PriceTable`) and the raw invalid text, and an `llm.completed` event. It counts toward `Budget` checks.
+- The run's event sequence is `run.started`, `llm.completed`, `run.error`. Earlier versions emitted `llm.failed` here. To detect a validation failure, catch the exception or watch for `run.error`.
+- `RunStore.get_subtree(run_id).usage` includes the call. The run row's own totals (`agent_runs.total_*`, and `total_*` on `RunSummary` and `RunDetail`) stay at 0 for an errored run, as for every errored run. Read usage from `get_subtree` when you need the cost of a failed run.
+
 ## Why pluggable, not hard-coded
 
 Dendrux could have baked ReAct into the runner. It does not, for three reasons:
