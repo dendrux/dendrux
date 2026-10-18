@@ -240,6 +240,7 @@ class StreamScript:
 class _ScriptedStream:
     def __init__(self, owner: ImageLLM, item: Any) -> None:
         self.owner = owner
+        self.closed = False
         self.events: list[StreamEvent] = []
         self.error: BaseException | None = None
         if isinstance(item, BaseException):
@@ -264,8 +265,8 @@ class _ScriptedStream:
         return self
 
     async def __anext__(self) -> StreamEvent:
-        await asyncio.sleep(0)
         if self.events:
+            await asyncio.sleep(0)
             return self.events.pop(0)
         if self.error is not None:
             err, self.error = self.error, None
@@ -273,6 +274,9 @@ class _ScriptedStream:
         raise StopAsyncIteration
 
     async def aclose(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.owner.log.append("aclose")
         self.owner.aclosed += 1
 
 
@@ -302,6 +306,9 @@ class ImageLLM(LLMProvider):
         self.calls: list[list[Message]] = []
         self.support_calls = 0
         self.aclosed = 0
+        self.log: list[str] = []
+        self.on_open: Any = None
+        self.keep_calls = True
 
     @property
     def model(self) -> str:
@@ -322,7 +329,8 @@ class ImageLLM(LLMProvider):
         return ("anthropic", self.base_url, model)
 
     def _next(self, messages: list[Message]) -> Any:
-        self.calls.append(list(messages))
+        if self.keep_calls:
+            self.calls.append(list(messages))
         return self.script.pop(0)
 
     async def complete(self, messages: list[Message], tools: Any = None, **kw: Any) -> LLMResponse:
@@ -333,6 +341,9 @@ class ImageLLM(LLMProvider):
         return item
 
     def complete_stream(self, messages: list[Message], tools: Any = None, **kw: Any) -> Any:  # type: ignore[override]
+        self.log.append("open")
+        if self.on_open is not None:
+            self.on_open()
         return _ScriptedStream(self, self._next(messages))
 
 
@@ -1287,3 +1298,289 @@ async def test_release_wire_drops_bytes() -> None:
     assert all(p.data is None for m in released.wire for p in m.images)
     plain = await site.prepare([Message(role=Role.USER, content="x")], iteration=2)
     assert release_wire(plain) is plain
+
+
+# ---------------------------------------------------------------------------
+# Review fix round (review-D1.md)
+# ---------------------------------------------------------------------------
+
+
+async def test_no_wire_bytes_retained_after_multi_iteration_run() -> None:
+    """P1-1 regression (reviewer probe): no ImagePart with bytes survives the call."""
+    import gc
+
+    import dendrux.types as core_types
+
+    seeds = (5001, 5002, 5003)
+    marks = {make_png(seed=s) for s in seeds}
+
+    def live() -> int:
+        gc.collect()
+        return sum(
+            1
+            for o in gc.get_objects()
+            if isinstance(o, ImagePart) and o.data is not None and o.data in marks
+        )
+
+    during: list[int] = []
+
+    @tool()
+    async def snap(n: int) -> Any:
+        """Snap."""
+        during.append(live())
+        return ToolOutput(n, images=[Image.from_bytes(make_png(seed=5000 + n))])
+
+    llm = ImageLLM(
+        [
+            *(
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(name="snap", params={"n": n}, provider_tool_call_id=f"p{n}")
+                    ]
+                )
+                for n in (1, 2, 3)
+            ),
+            LLMResponse(text="done"),
+        ]
+    )
+    llm.keep_calls = False
+    agent = Agent(provider=llm, tools=[snap], prompt="p")
+    result = await ReActLoop().run(
+        agent=agent,
+        provider=llm,
+        strategy=NativeToolCalling(),
+        user_input="go",
+        image_runtime=make_runtime(),
+    )
+    assert result.status == RunStatus.SUCCESS
+    assert during == [0, 0, 0]
+    assert live() == 0
+    pinned = sum(
+        1
+        for parts, _ in core_types._PROJECTION_MEMO.values()
+        for p in parts
+        if isinstance(p, ImagePart) and p.data is not None
+    )
+    assert pinned == 0
+
+
+async def test_identical_bytes_user_history_never_tombstoned() -> None:
+    """P2-1: a tool image with the same bytes as a user history image."""
+    rt = make_runtime()
+    part = await store_image(rt, make_png(seed=5100))
+    history = [user_msg("see", part), assistant(call_ids=["c"]), tool_msg("shot", "c", part)]
+    llm = ImageLLM([rejected()])
+    state = ImageViewState(sent_through=2)
+    with pytest.raises(ImageRejectedError) as err:
+        await _run(llm, history=history, rt=rt, state=state)
+    assert err.value.located is False and state.rejected == [] and len(llm.calls) == 1
+    # New tool image with those bytes: still never tombstoned through the user copy.
+    llm2 = ImageLLM([rejected()])
+    state2 = ImageViewState(sent_through=1)
+    with pytest.raises(ImageRejectedError):
+        await _run(llm2, history=history, rt=rt, state=state2)
+    assert state2.rejected == []
+
+
+async def test_stream_in_process_cancel_before_retry() -> None:
+    """P2-3: interrupt set while the rejected stream is in flight → no second call."""
+    rt = make_runtime()
+    history = await _history(rt, tools=1, users=0)
+    llm = ImageLLM([StreamScript(error=rejected()), LLMResponse(text="never")])
+    interrupt = asyncio.Event()
+    llm.on_open = interrupt.set
+    agent = Agent(provider=llm, tools=[shot], prompt="p")
+    events = [
+        ev
+        async for ev in ReActLoop().run_stream(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            initial_history=history,
+            image_runtime=rt,
+            interrupt=interrupt,
+        )
+    ]
+    assert events[-1].type == RunEventType.RUN_CANCELLED
+    assert llm.log == ["open", "aclose"]
+
+
+async def test_single_stream_in_process_cancel_before_retry() -> None:
+    rt = make_runtime()
+    part = await store_image(rt, make_png(seed=5200))
+    err = UnsupportedModalityError(provider="x", model="claude-test", source="provider_response")
+    llm = ImageLLM([StreamScript(error=err), LLMResponse(text="never")], support="unknown")
+    interrupt = asyncio.Event()
+    llm.on_open = interrupt.set
+    agent = Agent(provider=llm, prompt="p", loop=SingleCall())
+    events = [
+        ev
+        async for ev in SingleCall().run_stream(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="x",
+            initial_history=[user_msg("q", part)],
+            image_runtime=rt,
+            image_view_state=ImageViewState(sent_through=1),
+            interrupt=interrupt,
+        )
+    ]
+    assert events[-1].type == RunEventType.RUN_CANCELLED and llm.log == ["open", "aclose"]
+
+
+async def _stream_run(
+    llm: ImageLLM, history: list[Message], rt: ImageRuntime, **kw: Any
+) -> list[Any]:
+    agent = Agent(provider=llm, tools=[shot], prompt="p")
+    return [
+        ev
+        async for ev in ReActLoop().run_stream(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            initial_history=history,
+            image_runtime=rt,
+            **kw,
+        )
+    ]
+
+
+async def test_stream_store_cancel_and_pause_before_retry() -> None:
+    rt = make_runtime()
+    history = await _history(rt, tools=1, users=0)
+    store = ControlStore()
+    store.cancel_after = 1
+    llm = ImageLLM([StreamScript(error=rejected()), LLMResponse(text="never")])
+    events = await _stream_run(llm, history, rt, state_store=store)
+    assert events[-1].type == RunEventType.RUN_CANCELLED and len(llm.calls) == 1
+    store2 = ControlStore()
+    store2.pause_after = 1
+    llm2 = ImageLLM([StreamScript(error=rejected())])
+    events2 = await _stream_run(llm2, history, rt, state_store=store2)
+    assert events2[-1].type == RunEventType.RUN_PAUSED
+    assert len(events2[-1].run_result.meta["pause_state"].image_view.rejected) == 1
+
+
+async def test_stream_close_before_reopen_order() -> None:
+    rt = make_runtime()
+    history = await _history(rt, tools=1, users=0)
+    llm = ImageLLM([StreamScript(error=rejected()), LLMResponse(text="ok")])
+    events = await _stream_run(llm, history, rt)
+    assert events[-1].type == RunEventType.RUN_COMPLETED
+    assert llm.log == ["open", "aclose", "open", "aclose"]
+
+
+async def test_stream_unsupported_history_retry() -> None:
+    rt = make_runtime()
+    history = await _history(rt, tools=1, users=1)
+    err = UnsupportedModalityError(provider="x", model="claude-test", source="provider_response")
+    llm = ImageLLM([StreamScript(error=err), LLMResponse(text="ok")], support="unknown")
+    events = await _stream_run(llm, history, rt, image_view_state=ImageViewState(sent_through=2))
+    assert events[-1].type == RunEventType.RUN_COMPLETED
+    assert llm.log == ["open", "aclose", "open", "aclose"]
+    assert not any(m.images for m in llm.calls[1])
+
+
+async def test_single_stream_unsupported_history_retry() -> None:
+    rt = make_runtime()
+    part = await store_image(rt, make_png(seed=5300))
+    err = UnsupportedModalityError(provider="x", model="claude-test", source="provider_response")
+    llm = ImageLLM([StreamScript(error=err), LLMResponse(text="ok")], support="unknown")
+    agent = Agent(provider=llm, prompt="p", loop=SingleCall())
+    events = [
+        ev
+        async for ev in SingleCall().run_stream(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="x",
+            initial_history=[user_msg("q", part)],
+            image_runtime=rt,
+            image_view_state=ImageViewState(sent_through=1),
+        )
+    ]
+    assert events[-1].type == RunEventType.RUN_COMPLETED
+    assert llm.log == ["open", "aclose", "open", "aclose"]
+    assert "not shown: this model does not accept images" in llm.calls[1][1].content
+
+
+async def test_learned_no_for_unhashable_provider() -> None:
+    """P2-4: an eq-dataclass provider (unhashable) still learns "no"."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class EqLLM(LLMProvider):
+        name: str = "eq"
+        capabilities = ProviderCapabilities(supports_multimodal=True)
+
+        @property
+        def model(self) -> str:
+            return "m"
+
+        async def complete(self, messages: Any, tools: Any = None, **kw: Any) -> LLMResponse:
+            raise AssertionError
+
+    provider = EqLLM()
+    with pytest.raises(TypeError):
+        hash(provider)
+    rt = make_runtime()
+    part = await store_image(rt, make_png(seed=5400))
+    before = await prep([user_msg(part)], rt, provider, state=ImageViewState(sent_through=1))
+    assert before.slots[0].visible
+    learn_image_unsupported(provider, "claude-test")
+    after = await prep([user_msg(part)], rt, provider, state=ImageViewState(sent_through=1))
+    assert after.delta.placeholders == {0: "unsupported"}
+
+
+async def test_ingest_timeout_not_reported_as_tool_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    import dendrux.loops.react as react_mod
+
+    async def slow(*a: Any, **k: Any) -> Any:
+        raise TimeoutError
+
+    monkeypatch.setattr(react_mod, "_ingest_tool_images", slow)
+    result = await _execute_tool(
+        ToolCall(name="shot", params={}, id="c"), _lookups(shot), image_runtime=make_runtime()
+    )
+    assert not result.success
+    assert result.error == "Image ingest for tool 'shot' timed out"
+
+
+async def test_identical_bytes_two_tenants_concurrently() -> None:
+    catalog = FakeCatalog()
+    same = make_png(seed=5500)
+
+    @tool()
+    async def snap() -> Any:
+        """Snap."""
+        await asyncio.sleep(0)
+        return ToolOutput("x", images=[Image.from_bytes(same)])
+
+    async def one(scope: str) -> ImageRuntime:
+        rt = make_runtime(scope=scope, catalog=catalog)
+        llm = ImageLLM(
+            [
+                LLMResponse(
+                    tool_calls=[ToolCall(name="snap", params={}, provider_tool_call_id="p")]
+                ),
+                LLMResponse(text="ok"),
+            ]
+        )
+        agent = Agent(provider=llm, tools=[snap], prompt="p")
+        await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            image_runtime=rt,
+        )
+        return rt
+
+    rts = await asyncio.gather(*(one(f"t:{i % 2}") for i in range(8)))
+    sha = hashlib.sha256(same).hexdigest()
+    assert {k for k in catalog.rows if k[1] == sha} == {("t:0", sha), ("t:1", sha)}
+    for rt in rts:
+        assert {s for s, _ in rt.resolver.reads} == {rt.tenant_scope}  # type: ignore[union-attr]

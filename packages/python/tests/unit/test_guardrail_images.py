@@ -195,3 +195,18 @@ async def test_loop_parts_aware_redaction_reaches_wire() -> None:
     )
     wire_user = llm.calls[0][1]
     assert "bob@example.com" not in wire_user.content and wire_user.images[0].data == RAW
+
+
+async def test_object_without_scan_methods_keeps_v030_failure() -> None:
+    """P2-2: a misnamed guardrail still fails loudly; only image-only guardrails are skipped."""
+    import pytest
+
+    class Misnamed:
+        action = "redact"
+
+        async def scna(self, text: str) -> list[Finding]:
+            return []
+
+    engine = GuardrailEngine([Misnamed()])  # type: ignore[list-item]
+    with pytest.raises(AttributeError):
+        await engine.scan_incoming("secret")
