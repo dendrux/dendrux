@@ -1,5 +1,203 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+Image input across the run lifecycle. This release includes a database
+migration (see Migration): run `dendrux db migrate` before upgrading a
+Postgres deployment, even if you never use images. It also changes how MCP
+image results reach the model (see Changed).
+
+### Added
+
+- **Images in user input.** `run()`, `stream()`, `submit_input()`,
+  `resume(user_input=)` and `history=` accept `UserContent`: a string, or a
+  list of strings and images in the order the model should see them.
+  `ChatMessage.user(...)` takes the same list (`ChatMessage.parts`); assistant
+  messages cannot carry images. `Image` (`from_bytes`, `from_path`,
+  `from_base64`, `from_url`) and `ToolOutput` are exported from `dendrux`, with
+  `ImageRef`, `ImagePart` and `TextPart`. Supported formats are PNG, JPEG, GIF
+  and WebP, detected from the bytes (never from a declared type, file name or
+  `Content-Type`); animated GIF and WebP are rejected unless allowed.
+- **Images in tool results.** A server `@tool` returns
+  `ToolOutput(result, images=[...])` (`result` is serialised exactly like a plain
+  return value, and the images follow the text). A client tool attaches
+  `ToolResult.images` in `submit_tool_results(...)`. `tool_result_message(result)`
+  is the one TOOL-message builder. `tool_result_transform` and
+  `ToolDecision.substitute(...)` accept a `ToolOutput`, and `ToolCallContext.images`
+  lists the images a `before_tool` hook's arguments refer to by id.
+  `ToolResult.notes` carries per-image ingest notes.
+- **Images from MCP tools.** Image content blocks become image parts for the
+  model in agent runs (see Changed for the payload change). An image that cannot
+  be used does not fail the call: the model sees
+  `[image from MCP could not be used: <reason>]` and the other images.
+- **Provider support.** Anthropic (tool images native), OpenAI Responses (tool
+  images native by default; `OpenAIResponsesProvider(tool_result_images="portable")`
+  selects the portable form), OpenAI Chat and OpenRouter (portable: a text tool
+  message plus one framed user message that says the images are tool output).
+  Image bytes are encoded once and never change between calls, so prompt
+  caching is unaffected; cache markers, cache keys and text-only request bodies
+  are unchanged. Anthropic's "more than 20 images means every image at most
+  2000 px" rule is enforced per request (also for `anthropic/*` OpenRouter
+  slugs).
+- **Non-vision models.** Capability is resolved per model: an
+  `ImagePolicy.capability_overrides` entry, then what the provider instance has
+  learned, then the adapter (static table for OpenAI models, model catalogue for
+  OpenRouter, `claude-*` for Anthropic). A new image for a model that cannot
+  read images raises `UnsupportedModalityError` before any provider request; a
+  history image becomes a placeholder and never an error. `on_unsupported` can
+  be `"placeholder"` or a describe function; `unknown_capability` chooses
+  between sending and failing for unknown models.
+- **Rejection handling.** When a provider refuses one image, `ImageRejectedError`
+  is raised; a rejected tool-result image is instead replaced by a placeholder
+  and the call is retried once (only if nothing was streamed yet). Rejected
+  images are remembered for the run and are not resent by `retry()` or `runs=`
+  replays. An OpenAI content-policy image code counts as a rejection.
+- **`ImagePolicy` and `Agent(images=, blob_store=)`.** Defaults are the vendor
+  limits: 8000 px long side, 5 MiB per image, 20 images per message, 100 and
+  20 MiB per request. Also: `max_estimated_image_tokens_per_request`,
+  `allowed_media_types`, `allow_animated`, `urls: UrlPolicy`, `drop:
+  ImageDropPolicy` and `ingest_hook` with the required `ingest_hook_version`.
+  `agent.image_policy` and `agent.blobs` expose the policy and the blob accessor.
+- **Opt-in dropping of old images.** `ImageDropPolicy(keep_recent=3,
+  interval=25, scope="tool_results")` keeps the model's view of tool images
+  bounded in steps, which keeps most of the prompt cache. It is sticky, stored
+  with the run, and survives pause, resume, retry and replay. Logs a warning and
+  emits `image.warning` once per run when combined with Anthropic thinking.
+- **Blob storage.** Images are stored once as tenant-scoped, content-addressed
+  blobs in two new tables, `dendrux_blobs` and `dendrux_blob_refs`; runs, pauses,
+  traces and events hold references only, and `llm_interactions.provider_request`
+  holds `dendrux-image:sha256:<hex>` instead of base64. Bytes live in the
+  database by default; pass `Agent(blob_store=...)` and
+  `RunStore.from_database_url(url, blob_store=...)` with any object implementing
+  the `BlobStore` protocol (`put`, `get`, `delete`) to keep them in object
+  storage. `InMemoryBlobStore` backs runs without a database (not durable).
+  `agent.blobs` and `RunStore.blobs` provide `read`, `info`, `references`,
+  `purge` and `collect_garbage`; `RunStore.read_image(run_id, sha256,
+  tenant_id=)` is a run-scoped read.
+- **Erasure.** `blobs.purge(sha256, tenant_id=, reason=)` deletes the bytes (and
+  the external object), keeps the row as a tombstone, renders
+  `[image ... was deleted]` in every run that used the image, and makes
+  re-ingesting the same bytes raise `InvalidImageError("purged")`.
+- **Fetch-once URLs.** `Image.from_url(url)` fetches once at ingest and stores
+  the bytes; the URL is never stored, logged or sent to a provider. The fetcher
+  allows HTTPS on 443 to public addresses only, validates every resolved address
+  and connects to the validated one (TLS is checked against the original host),
+  re-checks each of at most 3 redirects, ignores proxy environment variables and
+  `.netrc`, and caps size and time. `UrlPolicy` tunes it.
+- **Image guardrails.** The `ImageGuardrail` protocol
+  (`async scan_image(ImageScanInput) -> list[Finding]`) screens images once per
+  image, guardrail id and version; verdicts are stored and reused on resume,
+  retry and replay. If guardrails are configured but none scans images,
+  `guardrail.image_unscanned` is written once per run.
+- **Events.** Six governance event types (31 in total): `image.rejected`,
+  `image.state`, `image.view_changed`, `image.degraded`, `image.warning`,
+  `guardrail.image_unscanned`. `run.resumed` and `tool.completed` gain
+  `image_count` when images are present. The dashboard maps all six.
+- **Errors** in `dendrux.errors`: `InvalidImageError`, `ImageLimitError`,
+  `ImageFetchError` (all `ImageError`, a `ValueError`), `UnsupportedModalityError`,
+  `ImageRejectedError`, `ProviderError`, `BlobNotFoundError`,
+  `BlobIntegrityError`, `ImagePersistenceUnsupportedError`,
+  `BlobContentionError`. None of them carries image bytes, base64 or a URL's
+  query, and they are raised without a chained exception.
+- **Provider surface.** `LLMProvider.image_input_support(model)`,
+  `tool_result_images`, `thinking_enabled`, `many_image_rule(model)` and
+  `image_capability_key(model)`; `OpenRouterModel.supports_image_input`;
+  `MockLLM(responses, image_support="yes" | "no" | "unknown")` and
+  `MockLLM.wire_messages` for tests.
+- **Token estimates.** `estimate_image_tokens(...)` and
+  `llm_interactions.semantic_request.image_stats` (`count`, `bytes`,
+  `estimated_tokens`, `None` when the model is unknown). Chat spans in the
+  OpenTelemetry notifier gain `dendrux.images.count` and
+  `dendrux.images.estimated_tokens`.
+- Docs: new Images guide, resize recipe (Pillow `ingest_hook`) and S3 `BlobStore`
+  recipe; MCP, Agent, RunStore, Errors, Governance, HTTP API, Guardrails, Cost
+  and pricing, State persistence and API glossary updated. New examples
+  `examples/37_images.py` and `examples/38_images_client_tool.py` (mock provider,
+  no API key by default).
+
+### Changed
+
+- **MCP image results are image parts in agent runs.** Image content blocks no
+  longer appear as base64 inside the tool payload. The payload's content
+  envelope keeps a stub, `{"type": "image", "image_index": 0, "mime_type":
+  "image/png"}`, and the bytes reach the model as an image. Affected: a
+  `tool_result_transform` that read `data` from an MCP image block now receives
+  a `ToolOutput` as `ctx.result` (`ctx.result.result` is the envelope or
+  structured value, `ctx.result.images` the images) and must return it, or a new
+  `ToolOutput`, to keep the images; anything reading base64 out of
+  `tool_calls.result` or traces for MCP image tools finds the stub instead.
+  `MCPConnection.call_tool(...)` is unchanged: it returns the previous envelope,
+  base64 included, and its `is_error` text for image-bearing results is
+  unchanged (it can contain base64). Structured-content results now also carry
+  their images, which were previously discarded.
+- **`ProviderError` replaces raw SDK exceptions on image-bearing requests.** An
+  application that caught a vendor exception from a request with images now sees
+  `ProviderError` (sanitised message, at most 500 characters), or one of the more
+  specific image errors. Requests without images keep the exact errors they had.
+- **Built-in providers report `supports_multimodal=True`.** A custom
+  `LLMProvider` is treated as unable to read images until it sets
+  `supports_multimodal=True` and converts `Message.parts`, so an adapter that
+  reads only `Message.content` can never silently drop an image.
+  `MockLLM` defaults to `supports_multimodal=True`; `MockLLM(image_support="no")`
+  restores the old behaviour.
+- **Custom `Strategy.format_tool_result` must keep image parts.** If a result had
+  images and the returned message has none, the loop raises `TypeError`. Build
+  the message with `tool_result_message(result)`.
+- **`Message` gains `parts`.** Text-only messages are unchanged in meaning but
+  `parts=None` now appears in `repr`, `dataclasses.asdict` and as the last entry
+  of `__match_args__`; `Message.content` is always a `str` (the text projection
+  for multimodal messages). Text-only construction is slightly faster than in
+  0.3.0.
+- `PauseState` gains `image_view` and history messages gain `parts` in pause JSON,
+  only for runs that have images; v0.3.0 pause data resumes unchanged. A persisted
+  `agent_runs.input_data`, trace, tool-call or interaction row for a text-only run
+  is byte-identical to 0.3.0.
+- `GuardrailEngine` text scans use only guardrails that implement `scan`;
+  an image-only guardrail is skipped by the text path.
+
+### Migration
+
+- New Alembic revision `c6d7e8f9a0b1` (down revision `b5c6d7e8f9a0`): creates
+  `dendrux_blobs` and `dendrux_blob_refs` (with indexes; refs cascade with the run
+  and reference blobs with `ON DELETE RESTRICT`). Purely additive. **Every
+  Postgres (and other migration-managed) deployment must run `dendrux db migrate`
+  after upgrading, even if it never uses images.** Until then the first use of the
+  database raises `SchemaOutOfDateError` naming both tables. Downgrade drops
+  both.
+- SQLite files created by an earlier release gain the two tables on startup.
+- No existing table or column changes. Reading a database that has no images
+  behaves exactly as in 0.3.0.
+- Run `await agent.blobs.collect_garbage()` on a schedule (hourly or daily,
+  `older_than` at least one hour) to remove blobs no run references. Deleting a
+  run does not delete its blobs by itself.
+
+### Notes
+
+- Pass-through URLs and provider-hosted file ids are not supported in this
+  release: `Image.from_url` always fetches and stores. Dendrux does not resize,
+  re-encode or decode pixels; use `ImagePolicy.ingest_hook` (a Pillow recipe is
+  in the docs). A synchronous `ingest_hook` runs on the event loop, so do heavy
+  work in an async hook that uses a thread.
+- The URL fetcher verifies certificates with httpx's default bundle (certifi),
+  not the operating system's trust store. A corporate CA needs
+  `UrlPolicy(fetcher=...)`.
+- Image guardrails run on batch paths only; `stream()` still rejects guardrails.
+- A gateway that words "this model has no image support" differently from the
+  OpenAI, OpenAI Responses and OpenRouter messages does not map to
+  `UnsupportedModalityError`; set `ImagePolicy(capability_overrides={model:
+  "no"})`.
+- Do not enable DEBUG logging for the `openai`, `anthropic` or `httpx`
+  libraries when images are in use: their "Request options" lines contain the
+  base64 body. Dendrux's own logs never contain image bytes.
+- Images are stored in the database by default. For image-heavy workloads use a
+  `BlobStore` (S3 recipe in the docs). One external store per deployment:
+  every Agent and `RunStore` must use the same one.
+- Image tokens are billed inside the provider's input tokens; Dendrux does not
+  add anything to usage or cost, and its per-image estimate is for planning only.
+- Learned "this model cannot read images" knowledge lives on the provider
+  instance and is not shared between processes; a new process re-learns it with
+  one extra rejected call.
+
 ## 0.3.0 - 2026-10-17
 
 Run control, per-call governance and subtree reads. This release includes a

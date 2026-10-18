@@ -26,6 +26,11 @@
 
 ---
 
+## What's new in 0.4.0 (unreleased)
+
+- **Images**: `agent.run(["What is on this receipt?", Image.from_path("receipt.png")])`, tools that return `ToolOutput(result, images=[...])`, client tools that attach `ToolResult.images`, and MCP image results all reach the model as images. Images are stored once as tenant-scoped blobs (database by default, or your own `BlobStore` such as S3); runs, pauses and events hold references only. Anthropic, OpenAI Chat and Responses, and OpenRouter are supported; non-vision models get a typed error or a placeholder. See the [Images guide](docs/recipes/images.mdx).
+- **Migration**: run `dendrux db migrate` (new revision `c6d7e8f9a0b1`), even if you do not use images. See the [CHANGELOG](packages/python/CHANGELOG.md).
+
 ## What's new in 0.3.0
 
 - **Per-call approvals**: `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve() | .deny(reason)})` decides each gated call on its own. Client-target calls are never executed server-side on approval (a security fix).
@@ -472,6 +477,8 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |
 | [`30_mcp_agent.py`](packages/python/examples/30_mcp_agent.py) | Local tools + an SDK v2 MCP source with shared `MCPHost` lifecycle |
 | [`36_run_control.py`](packages/python/examples/36_run_control.py) | Per-call approvals, a `before_tool` policy hook and `request_pause` / `submit_resume`, with a mock provider (no API key) |
+| [`37_images.py`](packages/python/examples/37_images.py) | A user image plus a tool that returns an image, stored and read back (mock provider by default, no API key) |
+| [`38_images_client_tool.py`](packages/python/examples/38_images_client_tool.py) | Client-tool screenshot: pause, submit the image from a second Agent, resume (mock provider by default) |
 | **Governance** | |
 | [`governance/01_tool_deny.py`](packages/python/examples/governance/01_tool_deny.py) | Block tools deterministically (batch + streaming) |
 | [`governance/02_approval.py`](packages/python/examples/governance/02_approval.py) | Human-in-the-loop approval with approve/reject CLI |
