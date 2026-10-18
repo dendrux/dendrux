@@ -508,8 +508,9 @@ class ToolDef:
     happens once, at decoration time: when ``strict`` is True, ``parameters``
     already holds the strict-mode schema (every property required, objects
     closed with ``additionalProperties: false``), so every provider sees the
-    same stored schema. OpenAI Chat and Responses providers additionally send
-    ``"strict": true``; Anthropic ignores the flag and sends the schema as-is.
+    same stored schema. Strict tools are sent strict on OpenAI and Anthropic
+    (Anthropic: schema normalized; falls back to non-strict when the schema or
+    request limits don't allow it).
     """
 
     name: str
