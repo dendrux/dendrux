@@ -36,6 +36,7 @@ from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, brea
 from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
+    final_stop_reason,
     guardrail_meta,
     interruptible,
     notify_governance,
@@ -1654,6 +1655,8 @@ class ReActLoop(Loop):
                         usage=response.usage,
                         provider_request=response.provider_request,
                         provider_response=None,
+                        stop_reason=response.stop_reason,
+                        raw_stop_reason=response.raw_stop_reason,
                     )
                     await _record_llm(
                         recorder,
@@ -1757,6 +1760,9 @@ class ReActLoop(Loop):
                     iteration_count=iteration,
                     usage=total_usage,
                     meta=guardrail_meta(g_engine, notifier_warnings),
+                    stop_reason=final_stop_reason(
+                        response, run_id=resolved_run_id, default_model=provider.model
+                    ),
                 )
 
             if isinstance(step.action, Clarification):
@@ -2336,6 +2342,9 @@ class ReActLoop(Loop):
                         iteration_count=iteration,
                         usage=total_usage,
                         meta=meta,
+                        stop_reason=final_stop_reason(
+                            llm_response, run_id=resolved_run_id, default_model=provider.model
+                        ),
                     ),
                 )
                 return

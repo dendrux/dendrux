@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         LLMResponse,
         Message,
         RunResult,
+        StopReason,
         StreamEvent,
         ToolCall,
         ToolDef,
@@ -239,6 +240,26 @@ async def record_llm_started(
         semantic_messages=semantic_messages,
         semantic_tools=semantic_tools,
     )
+
+
+def final_stop_reason(
+    response: LLMResponse, *, run_id: str, default_model: str | None
+) -> StopReason | None:
+    """Stop reason of the call that produced a run's final answer.
+
+    Logs a warning when the answer was cut off at the output-token limit:
+    the run still succeeds, so this is the only signal outside
+    ``RunResult.truncated``.
+    """
+    if response.stop_reason == "max_tokens":
+        logger.warning(
+            "Run %s: final answer was cut off at the output-token limit "
+            "(model=%s, stop_reason=max_tokens). The run succeeded with a "
+            "truncated answer; raise max_tokens to get the full answer.",
+            run_id,
+            response.model or default_model,
+        )
+    return response.stop_reason
 
 
 def price_response(

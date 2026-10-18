@@ -23,7 +23,7 @@ import logging
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import (
@@ -100,6 +100,7 @@ from dendrux.types import (
     RunAlreadyActiveError,
     RunEventType,
     RunStatus,
+    StopReason,
     TextPart,
     UsageStats,
     _usage_from_dict,
@@ -124,6 +125,11 @@ if TYPE_CHECKING:
     from dendrux.types import ContentPart, RunEvent, RunResult, RunStream, ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
+
+STOP_REASON_META_KEY = "dendrux.stop_reason"
+"""``agent_runs.meta`` key holding a SUCCESS run's final normalized stop reason."""
+
+_STOP_REASONS = frozenset(get_args(StopReason))
 
 
 def _validate_loop_skill_compat(agent: Agent, resolved_loop: Loop) -> None:
@@ -541,6 +547,7 @@ async def _persist_loop_outcome(
             meta={**result.meta, "_finalize_won": won},
             commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
             replay=result.replay,
+            stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
         )
 
     async def _persisted(status_if_missing: RunStatus) -> RunResult:
@@ -677,16 +684,38 @@ async def _persist_loop_outcome(
             sequencer,
             {"placeholders": unmapped_placeholders},
         )
+    stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
+    if stop_reason is not None:
+        await _record_stop_reason(state_store, run_id, stop_reason)
     await _emit_event(
         state_store,
         run_id,
         "run.completed",
         sequencer,
-        {"status": result.status.value},
+        {
+            "status": result.status.value,
+            "stop_reason": stop_reason,
+            "truncated": stop_reason == "max_tokens",
+        },
     )
     finished = _wrap(status=result.status, won=True)
     await _attach_undelivered_notes(state_store, run_id, finished)
     return finished
+
+
+async def _record_stop_reason(state_store: StateStore, run_id: str, stop_reason: str) -> None:
+    """Best-effort ``meta[STOP_REASON_META_KEY]`` write after a won finalize.
+
+    A store without ``update_run_meta`` or a failed write only means an
+    idempotent replay of this run reports ``stop_reason=None``.
+    """
+    update = getattr(state_store, "update_run_meta", None)
+    if update is None:
+        return
+    try:
+        await update(run_id, {STOP_REASON_META_KEY: stop_reason})
+    except Exception:
+        logger.warning("Failed to record stop_reason for run %s", run_id, exc_info=True)
 
 
 async def _transition_with_event(
@@ -1971,6 +2000,8 @@ async def _build_cached_result(
     This is a *summary*, not a faithful replay of the original RunResult:
     - steps is always [] (AgentStep history is not persisted in recoverable form)
     - meta is empty (developer meta is on the run row, not in RunResult.meta)
+    - stop_reason is restored from ``meta[STOP_REASON_META_KEY]`` on SUCCESS
+      (None for runs finished before 0.4.1)
     - usage is reconstructed from aggregate columns (total_input_tokens, etc.),
       which may be zero for errored runs where finalize_run got total_usage=None
 
@@ -2024,7 +2055,15 @@ async def _build_cached_result(
         ),
         error=run.error,
         replay=_replay_from_meta(run.meta),
+        stop_reason=(
+            _stop_reason_from_meta(run.meta) if run.status == RunStatus.SUCCESS.value else None
+        ),
     )
+
+
+def _stop_reason_from_meta(meta: dict[str, Any] | None) -> StopReason | None:
+    value = (meta or {}).get(STOP_REASON_META_KEY)
+    return value if value in _STOP_REASONS else None
 
 
 def _replay_from_meta(meta: dict[str, Any] | None) -> ReplaySummary | None:

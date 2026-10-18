@@ -14,6 +14,7 @@ Constraints:
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
@@ -22,6 +23,7 @@ from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
     StreamInterruptedError,
     build_cache_key_prefix,
+    final_stop_reason,
     guardrail_meta,
     interruptible,
     notify_governance,
@@ -46,6 +48,7 @@ from dendrux.loops.react import (
 )
 from dendrux.types import (
     ImageViewState,
+    LLMResponse,
     Message,
     Role,
     RunEvent,
@@ -69,7 +72,7 @@ if TYPE_CHECKING:
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
-    from dendrux.types import AgentStep, Budget, LLMResponse
+    from dendrux.types import AgentStep, Budget
 
 
 async def _single_call_budget(
@@ -98,6 +101,11 @@ async def _single_call_budget(
         enforce=False,
     )
     await tracker.evaluate(1)
+
+
+def _call_usage(usage: UsageStats) -> UsageStats:
+    """Run usage for the one call; an unpriced call marks the total unknown."""
+    return replace(usage, cost_unknown=usage.cost_usd is None)
 
 
 class SingleCall(Loop):
@@ -452,15 +460,15 @@ class SingleCall(Loop):
             if out_block is not None:
                 # Scrub response before recording — block means the
                 # original text/params contain the PII that triggered it.
-                from dendrux.types import LLMResponse as _LLMResp2
-
-                _blocked_resp = _LLMResp2(
+                _blocked_resp = LLMResponse(
                     text="[blocked by guardrail]",
                     tool_calls=None,
                     raw=response.raw,
                     usage=response.usage,
                     provider_request=response.provider_request,
                     provider_response=None,
+                    stop_reason=response.stop_reason,
+                    raw_stop_reason=response.raw_stop_reason,
                 )
                 await record_llm(
                     recorder,
@@ -546,18 +554,7 @@ class SingleCall(Loop):
         await record_message(recorder, resolved_run_id, assistant_msg, 1)
         await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
 
-        usage = UsageStats(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            total_tokens=response.usage.total_tokens,
-            cost_usd=response.usage.cost_usd,
-            cache_read_input_tokens=response.usage.cache_read_input_tokens,
-            cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
-            reasoning_tokens=response.usage.reasoning_tokens,
-            cost_source=response.usage.cost_source,
-            usage_reported=response.usage.usage_reported,
-            cost_unknown=response.usage.cost_usd is None,
-        )
+        usage = _call_usage(response.usage)
 
         await _single_call_budget(
             agent.budget, usage, resolved_run_id, recorder, notifier, notifier_warnings
@@ -575,6 +572,9 @@ class SingleCall(Loop):
             iteration_count=1,
             usage=usage,
             meta=sc_meta,
+            stop_reason=final_stop_reason(
+                response, run_id=resolved_run_id, default_model=provider.model
+            ),
         )
 
     async def run_stream(
@@ -895,18 +895,7 @@ class SingleCall(Loop):
         await record_message(recorder, resolved_run_id, assistant_msg, 1)
         await notify_message(notifier, resolved_run_id, assistant_msg, 1, notifier_warnings)
 
-        usage = UsageStats(
-            input_tokens=llm_response.usage.input_tokens,
-            output_tokens=llm_response.usage.output_tokens,
-            total_tokens=llm_response.usage.total_tokens,
-            cost_usd=llm_response.usage.cost_usd,
-            cache_read_input_tokens=llm_response.usage.cache_read_input_tokens,
-            cache_creation_input_tokens=llm_response.usage.cache_creation_input_tokens,
-            reasoning_tokens=llm_response.usage.reasoning_tokens,
-            cost_source=llm_response.usage.cost_source,
-            usage_reported=llm_response.usage.usage_reported,
-            cost_unknown=llm_response.usage.cost_usd is None,
-        )
+        usage = _call_usage(llm_response.usage)
 
         await _single_call_budget(
             agent.budget, usage, resolved_run_id, recorder, notifier, notifier_warnings
@@ -926,6 +915,9 @@ class SingleCall(Loop):
                 iteration_count=1,
                 usage=usage,
                 meta=sc_stream_meta,
+                stop_reason=final_stop_reason(
+                    llm_response, run_id=resolved_run_id, default_model=provider.model
+                ),
             ),
         )
 
