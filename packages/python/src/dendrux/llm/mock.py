@@ -6,10 +6,10 @@ no API key needed. Every test in Dendrux uses this.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Any
 
 from dendrux.llm.base import LLMProvider
-from dendrux.types import ProviderCapabilities
 
 if TYPE_CHECKING:
     from dendrux.llm.base import ImageSupport
@@ -46,7 +46,11 @@ class MockLLM(LLMProvider):
         self._model = model
         self._call_count = 0
         self._image_support: ImageSupport = image_support
-        self.capabilities = ProviderCapabilities(supports_multimodal=image_support != "no")
+        # Derived from the class attribute, so a subclass's declared
+        # capabilities are kept; only supports_multimodal follows image_support.
+        self.capabilities = dataclasses.replace(
+            type(self).capabilities, supports_multimodal=image_support != "no"
+        )
         self.call_history: list[dict[str, Any]] = []
         self.wire_messages: list[list[Message]] = []
 
