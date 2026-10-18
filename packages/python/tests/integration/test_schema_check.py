@@ -37,7 +37,10 @@ pytestmark = pytest.mark.asyncio
 
 PRIOR = "a4b5c6d7e8f9"
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
-_MISSING = {"agent_runs.pause_requested", "run_inbox"}
+# 0.2.0a23 shape: no run control (0.3.0) and no image blob tables (0.4.0).
+_MISSING = {"agent_runs.pause_requested", "run_inbox", "dendrux_blobs", "dendrux_blob_refs"}
+_MISSING_TABLES = {"run_inbox", "dendrux_blobs", "dendrux_blob_refs"}
+RUN_CONTROL = "b5c6d7e8f9a0"  # 0.3.0 head: everything but the 0.4.0 image blob tables
 
 
 def _alembic(url: str, rev: str) -> None:
@@ -99,6 +102,8 @@ async def _build_previous_schema(url: str) -> None:
     engine = _admin(url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("DROP TABLE dendrux_blob_refs"))
+        await conn.execute(text("DROP TABLE dendrux_blobs"))
         await conn.execute(text("DROP TABLE run_inbox"))
         await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
     await engine.dispose()
@@ -141,7 +146,7 @@ async def test_agent_run_on_previous_schema_raises_clear_error(pg_url: str) -> N
     err = info.value
     assert set(err.missing) == _MISSING
     assert err.missing_columns == ("agent_runs.pause_requested",)
-    assert err.missing_tables == ("run_inbox",)
+    assert set(err.missing_tables) == _MISSING_TABLES
     assert "dendrux db migrate" in str(err)
     assert await _count_runs(pg_url) == 0
 
@@ -360,12 +365,33 @@ async def test_sqlite_is_unaffected(tmp_path: Path) -> None:
     engine = create_async_engine(url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("DROP TABLE dendrux_blob_refs"))
+        await conn.execute(text("DROP TABLE dendrux_blobs"))
         await conn.execute(text("DROP TABLE run_inbox"))
         await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
     await engine.dispose()
 
     agent = _agent(url)
     try:
+        assert (await agent.run("hi")).answer == "ok"
+    finally:
+        await agent.close()
+
+
+async def test_v030_schema_names_both_blob_tables(pg_url: str) -> None:
+    """A Postgres DB at 0.3.0 (b5c6d7e8f9a0) must be migrated even for apps without images."""
+    await asyncio.to_thread(_alembic, pg_url, RUN_CONTROL)
+    agent = _agent(pg_url)
+    try:
+        with pytest.raises(SchemaOutOfDateError) as info:
+            await agent.run("hi")
+        err = info.value
+        assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs"}
+        assert err.missing_columns == ()
+        assert "dendrux_blobs" in str(err) and "dendrux_blob_refs" in str(err)
+        assert "dendrux db migrate" in str(err)
+
+        await asyncio.to_thread(_alembic, pg_url, "head")
         assert (await agent.run("hi")).answer == "ok"
     finally:
         await agent.close()
