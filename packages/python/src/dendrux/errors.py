@@ -347,6 +347,26 @@ class SchemaOutOfDateError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _rebuild_error(cls: type[BaseException], kwargs: dict[str, object]) -> BaseException:
+    return cls(**kwargs)
+
+
+class _KwargsReduceMixin:
+    """Pickle/copy support for errors whose ``__init__`` takes named fields.
+
+    ``_init_fields`` lists the constructor parameters, each stored as an
+    attribute of the same name; the rebuilt error has no traceback or chain.
+    """
+
+    _init_fields: tuple[str, ...] = ()
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (
+            _rebuild_error,
+            (type(self), {name: getattr(self, name) for name in self._init_fields}),
+        )
+
+
 class ImageError(ValueError):
     """Base class of image input errors (bad input -> HTTP 400 family).
 
@@ -354,7 +374,7 @@ class ImageError(ValueError):
     """
 
 
-class InvalidImageError(ImageError):
+class InvalidImageError(_KwargsReduceMixin, ImageError):
     """An image input failed validation at ingest.
 
     ``reason`` is one of ``"unsupported_type"``, ``"type_mismatch"``,
@@ -362,6 +382,8 @@ class InvalidImageError(ImageError):
     ``"descriptor_version"``, ``"descriptor_mismatch"``, ``"bad_base64"``,
     ``"path"``. ``index`` is the position of the offending input when known.
     """
+
+    _init_fields = ("reason", "index", "media_type", "byte_length", "detail")
 
     def __init__(
         self,
@@ -373,6 +395,7 @@ class InvalidImageError(ImageError):
         detail: str | None = None,
     ) -> None:
         self.reason = reason
+        self.detail = detail
         self.index = index
         self.media_type = media_type
         self.byte_length = byte_length
@@ -391,13 +414,17 @@ class InvalidImageError(ImageError):
         super().__init__(msg + ".")
 
 
-class ImageLimitError(ImageError):
+class ImageLimitError(_KwargsReduceMixin, ImageError):
     """An image or request exceeded an :class:`~dendrux.media.ImagePolicy` cap.
 
     ``scope`` is one of ``"image_bytes"``, ``"source_bytes"``, ``"image_side"``,
     ``"image_pixels"``, ``"message_count"``, ``"request_count"``,
-    ``"request_bytes"``, ``"estimated_tokens"``, ``"many_image_dimension"``.
+    ``"request_bytes"``, ``"estimated_tokens"``, ``"many_image_dimension"``,
+    or ``"store_bytes"`` (an :class:`~dendrux.media.InMemoryBlobStore` is full
+    even after one garbage-collection pass).
     """
+
+    _init_fields = ("scope", "limit", "actual", "index")
 
     def __init__(
         self,
@@ -415,7 +442,7 @@ class ImageLimitError(ImageError):
         super().__init__(f"Image limit exceeded ({scope}){where}: {actual} > {limit}.")
 
 
-class ImageFetchError(ImageError):
+class ImageFetchError(_KwargsReduceMixin, ImageError):
     """Fetching an ``Image.from_url`` source failed or was refused.
 
     ``reason`` is one of ``"scheme"``, ``"port"``, ``"credentials"``,
@@ -424,6 +451,8 @@ class ImageFetchError(ImageError):
     ``"disabled"``, ``"connect"``. Only the host is ever reported, never the
     URL path, query or credentials.
     """
+
+    _init_fields = ("reason", "host", "status_code")
 
     def __init__(
         self,
@@ -443,7 +472,7 @@ class ImageFetchError(ImageError):
         super().__init__(msg + ".")
 
 
-class UnsupportedModalityError(RuntimeError):
+class UnsupportedModalityError(_KwargsReduceMixin, RuntimeError):
     """The target model does not accept image input.
 
     ``source`` says how that was decided: ``"capability"`` (static table or
@@ -451,6 +480,17 @@ class UnsupportedModalityError(RuntimeError):
     provider adapter cannot convert images) or ``"provider_response"`` (the
     vendor refused the request).
     """
+
+    _init_fields = (
+        "provider",
+        "model",
+        "image_count",
+        "origin",
+        "source",
+        "status_code",
+        "provider_code",
+        "modality",
+    )
 
     def __init__(
         self,
@@ -478,13 +518,23 @@ class UnsupportedModalityError(RuntimeError):
         )
 
 
-class ImageRejectedError(RuntimeError):
+class ImageRejectedError(_KwargsReduceMixin, RuntimeError):
     """The provider rejected a specific image in a request.
 
     ``image_ids`` lists the rejected images when the provider error could be
     located (``located=True``); ``retried`` is True when the call had already
     been retried once with the image replaced by a placeholder.
     """
+
+    _init_fields = (
+        "provider",
+        "model",
+        "image_ids",
+        "located",
+        "retried",
+        "status_code",
+        "provider_code",
+    )
 
     def __init__(
         self,
@@ -511,13 +561,15 @@ class ImageRejectedError(RuntimeError):
         )
 
 
-class ProviderError(RuntimeError):
+class ProviderError(_KwargsReduceMixin, RuntimeError):
     """A provider failure on an image-bearing request, with a sanitised message.
 
     Text-only requests keep their v0.3.0 exception types. ``message`` is the
     vendor message truncated to 500 characters with base64 runs and data
     URLs replaced by ``[redacted]``.
     """
+
+    _init_fields = ("provider", "model", "status_code", "provider_code", "error_type", "message")
 
     def __init__(
         self,
@@ -539,12 +591,14 @@ class ProviderError(RuntimeError):
         super().__init__(f"Provider {provider!r} error{status}: {self.message}")
 
 
-class BlobNotFoundError(LookupError):
+class BlobNotFoundError(_KwargsReduceMixin, LookupError):
     """The image does not exist for this tenant (or this run has no reference to it).
 
     Absence and a tenant mismatch are reported identically, so the error is
     never an existence oracle.
     """
+
+    _init_fields = ("image_id",)
 
     def __init__(self, image_id: str | None = None) -> None:
         self.image_id = image_id
@@ -552,12 +606,14 @@ class BlobNotFoundError(LookupError):
         super().__init__(f"{what} not found.")
 
 
-class BlobIntegrityError(RuntimeError):
+class BlobIntegrityError(_KwargsReduceMixin, RuntimeError):
     """Stored image bytes or a persisted descriptor failed verification.
 
     ``check`` is one of ``"length"``, ``"sha256"``, ``"media_type"``,
     ``"dimensions"``, ``"descriptor"``.
     """
+
+    _init_fields = ("image_id", "check")
 
     def __init__(self, image_id: str | None, check: str) -> None:
         self.image_id = image_id
@@ -565,7 +621,7 @@ class BlobIntegrityError(RuntimeError):
         super().__init__(f"Image {image_id!r} failed integrity check ({check}).")
 
 
-class ImagePersistenceUnsupportedError(RuntimeError):
+class ImagePersistenceUnsupportedError(_KwargsReduceMixin, RuntimeError):
     """The configured store, blob store or loop cannot handle images.
 
     ``reason`` is one of ``"state_store"`` (custom ``StateStore`` without the
@@ -573,6 +629,8 @@ class ImagePersistenceUnsupportedError(RuntimeError):
     no ``blob_store``) or ``"loop"`` (a loop that does not accept
     ``image_runtime``).
     """
+
+    _init_fields = ("reason", "store_type")
 
     def __init__(self, reason: str, *, store_type: str | None = None) -> None:
         self.reason = reason
@@ -588,11 +646,13 @@ class ImagePersistenceUnsupportedError(RuntimeError):
         super().__init__(f"Images are not supported here{store}: {hint}.")
 
 
-class BlobContentionError(RuntimeError):
+class BlobContentionError(_KwargsReduceMixin, RuntimeError):
     """Storing an image lost too many races with concurrent purge, GC or ingest.
 
     Transient: retrying the same call is safe.
     """
+
+    _init_fields = ("image_id",)
 
     def __init__(self, image_id: str | None = None) -> None:
         self.image_id = image_id
