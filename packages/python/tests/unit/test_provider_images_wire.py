@@ -591,3 +591,61 @@ class TestRegistry:
         out = reg.sanitize(payload)
         assert payload == before
         assert out == {"a": [sentinel(ZSHA), {"b": (sentinel(ZSHA), "keep")}]}
+
+
+# ---------------------------------------------------------------------------
+# Fix round (review-C)
+# ---------------------------------------------------------------------------
+class TestFixRoundWire:
+    def test_responses_native_all_placeholders_is_string(
+        self, responses_provider: OpenAIResponsesProvider
+    ) -> None:
+        c = call("call_P1")
+        text = '"p"\n\n' + placeholder("drop", ZID)
+        tool = Message(role=Role.TOOL, content=text, name=c.name, call_id=c.id)
+        _, items = responses_provider._convert_messages([*screenshot_turn(c), tool])
+        assert items[-1] == {"type": "function_call_output", "call_id": "call_P1", "output": text}
+
+    def test_responses_native_only_second_visible(
+        self, responses_provider: OpenAIResponsesProvider
+    ) -> None:
+        c1, c2 = call("call_A"), call("call_B")
+        t1 = Message(role=Role.TOOL, content='"a"', name=c1.name, call_id=c1.id)
+        reg = WireImageRegistry()
+        _, items = responses_provider._convert_messages(
+            [*screenshot_turn(c1, c2), t1, tool_parts(c2, '"b"', Z)], registry=reg
+        )
+        assert items[3] == {"type": "function_call_output", "call_id": "call_A", "output": '"a"'}
+        assert items[4]["output"] == [
+            {"type": "input_text", "text": '"b"'},
+            {"type": "input_image", "image_url": ZEBRA_URL, "detail": "auto"},
+        ]
+        assert reg.paths == {("input", 4, "output", 1): ZID}
+
+    def test_locate_never_descends_into_another_block(
+        self, anthropic_provider: AnthropicProvider
+    ) -> None:
+        # Reviewer probe: consecutive user turns; an index that would name B after
+        # a vendor-side merge must not resolve to the user image A.
+        c = call("toolu_B")
+        msgs = [
+            Message(role=Role.USER, content="stable head", placement="stable"),
+            Message(role=Role.USER, content="dynamic context"),
+            user_parts(Z, "what is this?"),
+            Message(role=Role.ASSISTANT, content="", tool_calls=[c]),
+            tool_parts(c, '"shot"', K),
+        ]
+        reg = WireImageRegistry()
+        anthropic_provider._convert_messages(msgs, registry=reg)
+        assert reg.paths[("messages", 2, "content", 0)] == ZID
+        probe = ("messages", 2, "content", 0, "content", 1, "image", "source", "base64")
+        assert reg.locate(probe) is None
+        assert reg.locate(("messages", 2, "content", 0, "source", "base64", "data")) == ZID
+        assert reg.locate(("messages", 4, "content", 0, "content", 1, "image")) == KID
+
+    def test_data_url_registry_keeps_one_string_per_image(self) -> None:
+        reg = WireImageRegistry()
+        url = reg.data_url(Z)
+        assert reg.data_url(Z) is url
+        assert reg._b64 == {}
+        assert list(reg._by_value) == [url]

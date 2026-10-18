@@ -250,3 +250,35 @@ class TestMockLLM:
     def test_invalid_support(self) -> None:
         with pytest.raises(ValueError, match="image_support"):
             MockLLM([], image_support="maybe")  # type: ignore[arg-type]
+
+
+class TestFixRoundCapability:
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-4o-audio-preview",
+            "gpt-4o-realtime-preview-2024-12-17",
+            "gpt-4o-mini-audio-preview",
+            "gpt-4o-mini-realtime-preview",
+        ],
+    )
+    def test_gpt4o_audio_realtime_not_yes(self, model: str) -> None:
+        assert openai_image_support(model) == "unknown"
+
+    async def test_mock_subclass_capabilities_kept(self) -> None:
+        from dendrux.types import ProviderCapabilities
+
+        class ToolMock(MockLLM):
+            capabilities = ProviderCapabilities(
+                supports_native_tools=True, supports_streaming=True, max_context_tokens=1234
+            )
+
+        llm = ToolMock([])
+        assert llm.capabilities.supports_native_tools is True
+        assert llm.capabilities.supports_streaming is True
+        assert llm.capabilities.max_context_tokens == 1234
+        assert llm.capabilities.supports_multimodal is True
+        assert ToolMock.capabilities.supports_multimodal is False  # class attr untouched
+        off = ToolMock([], image_support="no")
+        assert off.capabilities.supports_native_tools is True
+        assert off.capabilities.supports_multimodal is False

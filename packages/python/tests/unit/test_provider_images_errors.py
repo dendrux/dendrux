@@ -660,3 +660,156 @@ class TestResponsesErrors:
         with pytest.raises(ProviderError) as info:
             await drain(responses.complete_stream(USER_IMAGE))
         assert_clean(info.value)
+
+
+# ---------------------------------------------------------------------------
+# Fix round (review-C)
+# ---------------------------------------------------------------------------
+SDK_IMAGE_CODES = (
+    "invalid_image",
+    "invalid_image_format",
+    "invalid_base64_image",
+    "invalid_image_url",
+    "image_too_large",
+    "image_too_small",
+    "image_parse_error",
+    "image_content_policy_violation",
+    "invalid_image_mode",
+    "image_file_too_large",
+    "unsupported_image_media_type",
+    "empty_image_file",
+)
+
+
+def assert_frames_clean(exc: BaseException) -> None:
+    """No traceback frame local (as an error tracker would capture it) holds image bytes."""
+    tb = exc.__traceback__
+    assert tb is not None
+    while tb is not None:
+        frame = tb.tb_frame
+        for name, value in frame.f_locals.items():
+            text = repr(value)
+            for marker in LEAK_MARKERS:
+                assert marker not in text, (frame.f_code.co_name, name)
+        tb = tb.tb_next
+
+
+class RecordingStream(httpx.AsyncByteStream):
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.closed = False
+
+    async def __aiter__(self) -> Any:
+        yield self.data
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class TestFixRoundErrors:
+    @pytest.mark.parametrize("code", SDK_IMAGE_CODES)
+    @pytest.mark.parametrize("status", [400, None])
+    def test_sdk_image_codes_are_rejections(self, code: str, status: int | None) -> None:
+        inner = {"message": "Something about the upload.", "code": code}
+        assert _classify(status, inner) is GatewayErrorKind.IMAGE_REJECTED
+
+    def test_non_image_sdk_codes_are_not(self) -> None:
+        for code in ("server_error", "rate_limit_exceeded", "failed_to_download_image"):
+            assert _classify(400, {"message": "x", "code": code}) is GatewayErrorKind.OTHER
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            {"code": "image_too_small", "message": "Image too small."},
+            {"code": "empty_image_file", "message": "The file is empty."},
+            {"code": None, "message": "Image too large for this model; exceeds limit"},
+        ],
+    )
+    async def test_responses_error_event_rejections(
+        self, responses: OpenAIResponsesProvider, error: dict[str, Any]
+    ) -> None:
+        last = {"type": "error", "param": None, **error}
+        wire_openai(responses, sse_response((None, last)))
+        with pytest.raises(ImageRejectedError) as info:
+            await drain(responses.complete_stream(USER_IMAGE))
+        assert_clean(info.value)
+        failed = {"type": "response.failed", "response": {"id": "r", "error": error}}
+        wire_openai(responses, sse_response((None, failed)))
+        with pytest.raises(ImageRejectedError):
+            await drain(responses.complete_stream(USER_IMAGE))
+
+    async def test_frame_locals_clean_anthropic(self, claude: AnthropicProvider) -> None:
+        wire_anthropic(claude, json_response(400, ANTHROPIC_REJECTED_LOCATED))
+        with pytest.raises(ImageRejectedError) as info:
+            await claude.complete(tool_image_history("toolu_P1"))
+        assert_frames_clean(info.value)
+        with pytest.raises(ImageRejectedError) as info:
+            await drain(claude.complete_stream(tool_image_history("toolu_P1")))
+        assert_frames_clean(info.value)
+        wire_anthropic(claude, sse_response(*_anthropic_head(), ("error", ANTHROPIC_OVERLOADED)))
+        with pytest.raises(ProviderError) as perr:
+            await drain(claude.complete_stream(USER_IMAGE))
+        assert_frames_clean(perr.value)
+
+    async def test_frame_locals_clean_chat(self, chat: OpenAIProvider) -> None:
+        wire_openai(chat, json_response(400, CHAT_REJECTED_UNLOCATED))
+        with pytest.raises(ImageRejectedError) as info:
+            await chat.complete(USER_IMAGE)
+        assert_frames_clean(info.value)
+        with pytest.raises(ImageRejectedError) as info:
+            await drain(chat.complete_stream(USER_IMAGE))
+        assert_frames_clean(info.value)
+        wire_openai(
+            chat,
+            sse_response(
+                (None, _chat_chunk("x")), (None, {"error": CHAT_REJECTED_UNLOCATED["error"]})
+            ),
+        )
+        with pytest.raises(ImageRejectedError) as info:
+            await drain(chat.complete_stream(USER_IMAGE))
+        assert_frames_clean(info.value)
+
+    async def test_frame_locals_clean_responses(self, responses: OpenAIResponsesProvider) -> None:
+        wire_openai(responses, json_response(400, RESPONSES_REJECTED_LOCATED))
+        with pytest.raises(ImageRejectedError) as info:
+            await responses.complete(tool_image_history("call_P1"))
+        assert_frames_clean(info.value)
+        with pytest.raises(ImageRejectedError) as info:
+            await drain(responses.complete_stream(tool_image_history("call_P1")))
+        assert_frames_clean(info.value)
+        delta = {"type": "response.output_text.delta", "item_id": "m1", "delta": "x"}
+        failed = {
+            "type": "response.failed",
+            "response": {"id": "r", "error": {"code": "invalid_image", "message": "bad"}},
+        }
+        wire_openai(responses, sse_response((None, delta), (None, failed)))
+        with pytest.raises(ImageRejectedError) as info:
+            await drain(responses.complete_stream(USER_IMAGE))
+        assert_frames_clean(info.value)
+
+    async def test_timeout_keeps_hint(self, chat: OpenAIProvider) -> None:
+        def boom(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("slow", request=request)
+
+        wire_openai(chat, boom)
+        with pytest.raises(ProviderError) as info:
+            await chat.complete(USER_IMAGE)
+        assert "Increase timeout" in info.value.message
+        assert_clean(info.value)
+
+    async def test_in_stream_error_closes_stream(self, chat: OpenAIProvider) -> None:
+        body = sse((None, _chat_chunk("x")), (None, {"error": CHAT_REJECTED_UNLOCATED["error"]}))
+        recorder = RecordingStream(body)
+        wire_openai(
+            chat,
+            lambda request: httpx.Response(
+                200, stream=recorder, headers={"content-type": "text/event-stream"}
+            ),
+        )
+        with pytest.raises(ImageRejectedError):
+            await drain(chat.complete_stream(USER_IMAGE))
+        assert recorder.closed is True
+
+    def test_data_url_redaction_is_word_bounded(self) -> None:
+        assert sanitize_vendor_message("metadata: x") == "metadata: x"
+        assert sanitize_vendor_message("see data:image/png;base64,AAAA end") == "see [redacted] end"
