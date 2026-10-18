@@ -858,7 +858,11 @@ class StateStore(Protocol):
 
 
 class _SerializedSessionFactory:
-    """Session factory that holds the engine's session lock for each session's life."""
+    """Session factory that holds the pool's session lock for each session's life.
+
+    The session is closed (ROLLBACK and pool reset included) before the lock
+    is released, even when the caller is cancelled during the close.
+    """
 
     def __init__(self, engine: AsyncEngine, factory: Callable[[], AsyncSession]) -> None:
         self._engine = engine
@@ -866,10 +870,14 @@ class _SerializedSessionFactory:
 
     @asynccontextmanager
     async def __call__(self) -> AsyncIterator[AsyncSession]:
-        from dendrux.db._pool_guard import serialized
+        from dendrux.db._pool_guard import close_fully, serialized
 
-        async with serialized(self._engine), self._factory() as session:
-            yield session
+        async with serialized(self._engine):
+            session = self._factory()
+            try:
+                yield session
+            finally:
+                await close_fully(session.close)
 
 
 class SQLAlchemyStateStore(SQLBlobCatalog):
