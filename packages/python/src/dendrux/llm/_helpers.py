@@ -223,10 +223,39 @@ STREAM_REJECTED_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 _ERROR_TEXT_LIMIT = 2000
 
 
+# Image-bearing requests only (0.4.0). A model or route that does not accept
+# images at all: Responses 400, Chat 400, OpenRouter 404 (live-probe fixtures).
+IMAGE_UNSUPPORTED_STATUSES: frozenset[int] = frozenset({400, 404})
+IMAGE_UNSUPPORTED_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"does not support image inputs?",
+        r"image_url is only supported by certain models",
+        r"no endpoints found that support image input",
+    )
+)
+
+# A specific image the provider refused (size, dimensions, undecodable bytes).
+IMAGE_REJECTED_STATUSES: frozenset[int] = frozenset({400})
+IMAGE_REJECTED_CODE_PREFIX = "invalid_image"
+IMAGE_REJECTED_CODES: frozenset[str] = frozenset({"image_parse_error"})
+IMAGE_REJECTED_TEXT = re.compile(r"\binvalid image\b|\bimage_parse_error\b", re.IGNORECASE)
+IMAGE_WORD = re.compile(r"\bimages?\b", re.IGNORECASE)
+IMAGE_REJECTED_KEYWORDS = re.compile(
+    r"exceed|dimension|too large|could not process|invalid base64|many-image|media type",
+    re.IGNORECASE,
+)
+# Vendor error types under which the keyword rule may apply (Anthropic's
+# invalid_request_error; None when the body carries no type).
+IMAGE_REJECTED_ERROR_TYPES: frozenset[str | None] = frozenset({None, "invalid_request_error"})
+
+
 class GatewayErrorKind(Enum):
     """Outcome of classifying an OpenAI-compatible endpoint error."""
 
     CONTEXT_LENGTH = "context_length"
+    IMAGE_UNSUPPORTED = "image_unsupported"
+    IMAGE_REJECTED = "image_rejected"
     STREAMING_UNSUPPORTED = "streaming_unsupported"
     OTHER = "other"
 
@@ -296,6 +325,30 @@ def _is_context_length(
     return True
 
 
+def _is_image_unsupported(status_code: int | None, text: str) -> bool:
+    if status_code is not None and status_code not in IMAGE_UNSUPPORTED_STATUSES:
+        return False
+    return any(p.search(text) for p in IMAGE_UNSUPPORTED_PATTERNS)
+
+
+def _is_image_rejected(
+    status_code: int | None, code: str | None, error_type: str | None, text: str
+) -> bool:
+    if status_code is not None and status_code not in IMAGE_REJECTED_STATUSES:
+        return False
+    if code is not None and (
+        code.startswith(IMAGE_REJECTED_CODE_PREFIX) or code in IMAGE_REJECTED_CODES
+    ):
+        return True
+    if IMAGE_REJECTED_TEXT.search(text):
+        return True
+    return (
+        error_type in IMAGE_REJECTED_ERROR_TYPES
+        and IMAGE_WORD.search(text) is not None
+        and IMAGE_REJECTED_KEYWORDS.search(text) is not None
+    )
+
+
 def classify_gateway_error(
     *,
     status_code: int | None,
@@ -303,20 +356,33 @@ def classify_gateway_error(
     param: str | None,
     message: str,
     body: object = None,
+    image_request: bool = False,
+    error_type: str | None = None,
+    extra_text: str | None = None,
 ) -> GatewayErrorClass:
     """Classify an endpoint error. Pure; the single decision point for all call sites.
 
-    Precedence is fixed: context-length overflow first, streaming-unsupported
-    second, otherwise ``OTHER`` (the caller re-raises the original exception
-    untouched). Context length matches an accepted provider code or message
-    pattern on an accepted status (see the constants above), unless a
-    non-context provider code or an output-cap ``param`` vetoes the text path
-    (403 accepts only Together's formula); streaming
-    rejection requires a 400 whose ``param`` is ``stream`` or whose text says
-    streaming is unsupported.
+    Precedence is fixed: context-length overflow first, then (image-bearing
+    requests only) image-unsupported and image-rejected, then
+    streaming-unsupported, otherwise ``OTHER`` (the caller re-raises the
+    original exception untouched, or on an image-bearing request raises a
+    sanitised ``ProviderError``). Context length matches an accepted provider
+    code or message pattern on an accepted status (see the constants above),
+    unless a non-context provider code or an output-cap ``param`` vetoes the
+    text path (403 accepts only Together's formula); streaming rejection
+    requires a 400 whose ``param`` is ``stream`` or whose text says streaming
+    is unsupported.
+
+    ``image_request``, ``error_type`` (vendor error type, e.g. Anthropic's
+    ``invalid_request_error``) and ``extra_text`` (e.g. OpenRouter's
+    ``metadata.raw`` upstream body) are only consulted for image-bearing
+    requests, so text-only classification is exactly the v0.3.0 behaviour.
+    A ``status_code`` of ``None`` means an in-stream error event.
     """
     provider_code = code or _body_provider_code(body, status_code)
     text = _error_text(message, body)
+    if image_request and extra_text:
+        text = (text + "\n" + extra_text)[: 2 * _ERROR_TEXT_LIMIT]
 
     lowered_code = provider_code.lower() if provider_code is not None else None
     if (status_code is None or status_code in CONTEXT_LENGTH_STATUSES) and _is_context_length(
@@ -324,12 +390,54 @@ def classify_gateway_error(
     ):
         return GatewayErrorClass(GatewayErrorKind.CONTEXT_LENGTH, status_code, provider_code)
 
+    if image_request:
+        if _is_image_unsupported(status_code, text):
+            return GatewayErrorClass(GatewayErrorKind.IMAGE_UNSUPPORTED, status_code, provider_code)
+        lowered_type = error_type.lower() if error_type is not None else None
+        if _is_image_rejected(status_code, lowered_code, lowered_type, text):
+            return GatewayErrorClass(GatewayErrorKind.IMAGE_REJECTED, status_code, provider_code)
+
     if status_code in STREAM_REJECTED_STATUSES and (
         param in STREAM_REJECTED_PARAMS or any(p.search(text) for p in STREAM_REJECTED_PATTERNS)
     ):
         return GatewayErrorClass(GatewayErrorKind.STREAMING_UNSUPPORTED, status_code, provider_code)
 
     return GatewayErrorClass(GatewayErrorKind.OTHER, status_code, provider_code)
+
+
+# ------------------------------------------------------------------
+# Wire-path extraction (locating a rejected image, image requests only)
+# ------------------------------------------------------------------
+
+WirePath = tuple[str | int, ...]
+
+# ``messages.2.content.0.content.1`` (Anthropic), ``messages[3].content[1]``
+# (Chat), ``messages.[0].content.[1]`` (older OpenAI params), ``input[4].output[1]``
+# (Responses). At least one segment must follow the root name.
+_WIRE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:messages|input)"
+    r"(?:\s*\.?\s*\[\s*\d+\s*\]|\.\d+|\.[A-Za-z_][A-Za-z0-9_]*)+"
+)
+_WIRE_PATH_TOKEN_RE = re.compile(r"\d+|[A-Za-z_][A-Za-z0-9_]*")
+
+
+def extract_error_path(param: str | None, text: str | None) -> WirePath | None:
+    """Return the request path a vendor error points at, as tokens, or None.
+
+    The ``param`` field wins; otherwise the first path-shaped match in the
+    error text is used. Indices become ints:
+    ``"messages[3].content[1].image_url"`` -> ``("messages", 3, "content", 1, "image_url")``.
+    """
+    for candidate in (param, text):
+        if not candidate:
+            continue
+        match = _WIRE_PATH_RE.search(candidate)
+        if match is not None:
+            return tuple(
+                int(tok) if tok.isdigit() else tok
+                for tok in _WIRE_PATH_TOKEN_RE.findall(match.group(0))
+            )
+    return None
 
 
 # ------------------------------------------------------------------
