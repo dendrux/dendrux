@@ -36,11 +36,13 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from dendrux.llm._images import normalize_base_url
 from dendrux.llm.openai import OpenAIProvider, _normalize_effort
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from dendrux.llm.base import ImageCapabilitySource, ImageSupport
     from dendrux.types import LLMResponse, Message, StreamEvent, ToolDef, UsageStats
 
 logger = logging.getLogger(__name__)
@@ -145,6 +147,11 @@ class OpenRouterModel:
     def is_multimodal(self) -> bool:
         """True when the model accepts any non-text input (image, audio, ...)."""
         return any(m != "text" for m in self.input_modalities)
+
+    @property
+    def supports_image_input(self) -> bool:
+        """True when ``"image"`` is among the model's input modalities."""
+        return "image" in self.input_modalities
 
 
 def _parse_price(value: Any) -> float | None:
@@ -415,8 +422,39 @@ class OpenRouterProvider(OpenAIProvider):
         self._tools_verified: set[str] = set()
         self._tool_warnings_emitted: set[tuple[str, str]] = set()
 
+    # Images in tool results use the portable mapping (inherited). Rejected
+    # images are never located: an upstream's error path indexes the
+    # upstream's wire format, not this request.
+    _image_provider_name = "openrouter"
+    _locate_rejected_images = False
+
     def __repr__(self) -> str:
         return f"OpenRouterProvider(model={self._model!r})"
+
+    # ------------------------------------------------------------------
+    # Image input (0.4.0)
+    # ------------------------------------------------------------------
+
+    async def image_input_support(self, model: str) -> ImageSupport:
+        """From the model catalogue: ``"image"`` in ``input_modalities`` -> yes,
+        listed without it -> no, not listed / catalogue unavailable -> unknown."""
+        catalog = await _get_catalog(self._models_url)
+        if catalog is None:
+            return "unknown"
+        entry = catalog.get(model)
+        if entry is None:
+            return "unknown"
+        return "yes" if entry.supports_image_input else "no"
+
+    def image_capability_source(self) -> ImageCapabilitySource:
+        return "catalog"
+
+    def many_image_rule(self, model: str) -> tuple[int, int] | None:
+        """Anthropic's many-image rule for ``anthropic/*`` (and ``~anthropic/*``) slugs."""
+        return (20, 2000) if _is_anthropic_model(model) else None
+
+    def image_capability_key(self, model: str) -> tuple[str, str, str]:
+        return ("openrouter", normalize_base_url(self._client.base_url), model)
 
     async def list_models(self, *, refresh: bool = False) -> list[OpenRouterModel]:
         """List the OpenRouter model catalog as typed snapshots.

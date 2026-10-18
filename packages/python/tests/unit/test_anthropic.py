@@ -71,8 +71,8 @@ class TestCapabilities:
     def test_thinking_implemented(self, provider: AnthropicProvider) -> None:
         assert provider.capabilities.supports_thinking is True
 
-    def test_multimodal_not_implemented(self, provider: AnthropicProvider) -> None:
-        assert provider.capabilities.supports_multimodal is False
+    def test_multimodal_implemented(self, provider: AnthropicProvider) -> None:
+        assert provider.capabilities.supports_multimodal is True
 
     def test_declares_system_prompt(self, provider: AnthropicProvider) -> None:
         assert provider.capabilities.supports_system_prompt is True
