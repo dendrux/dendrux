@@ -38,11 +38,15 @@ class TestAnthropicMapping:
     def test_sdk_values_are_identity(self, raw: str) -> None:
         assert anthropic_stop_reason(raw) == (raw, raw)
 
-    def test_unknown_value_is_other_with_raw_kept(self) -> None:
+    def test_context_window_exceeded_is_max_tokens(self) -> None:
+        """Output cut off at the context window is a truncation (raw kept)."""
         assert anthropic_stop_reason("model_context_window_exceeded") == (
-            "other",
+            "max_tokens",
             "model_context_window_exceeded",
         )
+
+    def test_unknown_value_is_other_with_raw_kept(self) -> None:
+        assert anthropic_stop_reason("some_future_reason") == ("other", "some_future_reason")
 
     @pytest.mark.parametrize("raw", [None, ""])
     def test_missing_is_none(self, raw: Any) -> None:
@@ -189,6 +193,15 @@ class TestAnthropicProvider:
         done = await _done(anthropic_provider)
         assert done.stop_reason == "max_tokens"
         assert done.raw_stop_reason == "max_tokens"
+
+    def test_context_window_exceeded_truncates_response(
+        self, anthropic_provider: AnthropicProvider
+    ) -> None:
+        msg = _anthropic_message([TextBlock(type="text", text="cut")], None)
+        msg = msg.model_copy(update={"stop_reason": "model_context_window_exceeded"})
+        resp = anthropic_provider._normalize_response(msg)
+        assert resp.stop_reason == "max_tokens"
+        assert resp.raw_stop_reason == "model_context_window_exceeded"
 
     async def test_stream_falls_back_to_message_delta(
         self, anthropic_provider: AnthropicProvider

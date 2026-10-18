@@ -125,3 +125,18 @@ class TestSingleCallStopReason:
         assert events[-1].type == RunEventType.RUN_COMPLETED
         assert events[-1].stop_reason == "max_tokens"
         assert events[-1].truncated is True
+
+
+async def test_context_window_cut_answer_is_truncated(caplog: pytest.LogCaptureFixture) -> None:
+    """Anthropic ``model_context_window_exceeded`` flags the run truncated and warns."""
+    import logging
+
+    from dendrux.llm._stop_reason import anthropic_stop_reason
+
+    reason, raw = anthropic_stop_reason("model_context_window_exceeded")
+    resp = LLMResponse(text="cut", usage=_usage(), stop_reason=reason, raw_stop_reason=raw)
+    with caplog.at_level(logging.WARNING):
+        result = await Agent(provider=MockLLM([resp]), prompt="t").run("hi")
+    assert result.status == RunStatus.SUCCESS
+    assert result.truncated is True
+    assert [r for r in caplog.records if "cut off" in r.getMessage()]

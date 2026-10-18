@@ -15,6 +15,14 @@ _ANTHROPIC_VALUES: frozenset[str] = frozenset(
     {"end_turn", "tool_use", "max_tokens", "stop_sequence", "refusal", "pause_turn"}
 )
 
+# Anthropic values that mean something other than their own name. Sonnet 4.5
+# and newer stop with ``model_context_window_exceeded`` when the output fills
+# the context window before ``max_tokens``: the output is cut off, so it is a
+# truncation like ``max_tokens``.
+_ANTHROPIC_MAP: dict[str, StopReason] = {
+    "model_context_window_exceeded": "max_tokens",
+}
+
 _CHAT_MAP: dict[str, StopReason] = {
     "stop": "end_turn",
     "tool_calls": "tool_use",
@@ -30,12 +38,16 @@ _RESPONSES_INCOMPLETE_MAP: dict[str, StopReason] = {
 
 
 def anthropic_stop_reason(raw: Any) -> tuple[StopReason | None, str | None]:
-    """Anthropic ``stop_reason``: identity for the SDK values, else ``"other"``."""
+    """Anthropic ``stop_reason``: identity for the SDK values, else ``"other"``.
+
+    ``model_context_window_exceeded`` maps to ``"max_tokens"`` (output cut off
+    at the context window); ``raw_stop_reason`` keeps the vendor string.
+    """
     if not isinstance(raw, str) or not raw:
         return None, None
     if raw in _ANTHROPIC_VALUES:
         return raw, raw  # type: ignore[return-value]
-    return "other", raw
+    return _ANTHROPIC_MAP.get(raw, "other"), raw
 
 
 def chat_stop_reason(raw: Any) -> tuple[StopReason | None, str | None]:
