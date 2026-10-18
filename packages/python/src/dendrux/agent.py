@@ -39,7 +39,7 @@ from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -706,6 +706,18 @@ class Agent:
         if services is None:
             return None, self._blob_store, None
         return services.catalog, services.blob_store, services.resolver
+
+    def _image_gc(self, state_store: StateStore | None) -> Callable[[], Awaitable[object]] | None:
+        """One GC pass (``older_than=1h``) that ingest runs when the blob store is full (§5.12)."""
+        services = self._blob_services(state_store)
+        accessor = getattr(services, "accessor", None)
+        if accessor is None:
+            return None
+
+        async def _collect() -> object:
+            return await accessor.collect_garbage(older_than=timedelta(hours=1))
+
+        return _collect
 
     @property
     def before_tool(self) -> BeforeToolHook | None:

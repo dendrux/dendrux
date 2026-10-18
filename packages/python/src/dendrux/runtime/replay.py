@@ -70,6 +70,10 @@ STABLE_CONTEXT_KEY = "stable_context"
 PLACEMENT_KEY = "placement"
 # Multimodal parts on traces / input_data (absent for text-only data).
 PARTS_KEY = "dendrux.parts"
+# agent_runs.meta: image slots of a run's seeded prefix that its own traces do not
+# reproduce (history=, its runs= prefix, a retry rebuild). Written only when
+# non-zero; ``None`` = unknown (no slot mapping for a later single-source carry).
+IMAGE_SEEDED_KEY = "dendrux.images.seeded_slots"
 
 _TERMINAL_STATUSES = frozenset({"success", "error", "cancelled", "max_iterations"})
 
@@ -643,11 +647,14 @@ async def record_run_prefix(
     current: CurrentPrefix,
     seed: dict[str, Any],
     plan: ReplayPlan | None,
+    seeded_image_slots: int | None = 0,
 ) -> None:
     """Merge the prefix descriptor (and replay summary) into ``agent_runs.meta``.
 
     Best-effort: a store without ``update_run_meta`` or a failed write only
     means later replays treat this run as predating replay metadata.
+    ``seeded_image_slots`` (non-zero, or ``None`` = unknown) is recorded in the
+    same patch, so a later single-source replay can align its slots (§5.14).
     """
     if store is None:
         return
@@ -657,6 +664,8 @@ async def record_run_prefix(
     patch: dict[str, Any] = {PREFIX_META_KEY: prefix_descriptor(current, seed)}
     if plan is not None:
         patch[REPLAY_META_KEY] = plan.meta
+    if seeded_image_slots != 0:
+        patch[IMAGE_SEEDED_KEY] = seeded_image_slots
     try:
         await update(run_id, patch)
     except Exception:
@@ -686,21 +695,34 @@ class ImageSource:
 
     tenant_scope: str
     events: list[RunEventRecord]
+    # Source slot s is new-run slot ``s - slot_offset`` (the source's untraced
+    # seeded slots come first); None = unknown, so no slot-keyed state carries.
+    slot_offset: int | None = 0
+
+
+def source_slot_offset(meta: dict[str, Any] | None) -> int | None:
+    """A source run's seeded-slot offset from its ``agent_runs.meta`` (None = unknown)."""
+    meta = meta or {}
+    if PREFIX_META_KEY not in meta:
+        return None  # predates replay metadata, or its prefix write failed
+    value = meta.get(IMAGE_SEEDED_KEY, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 async def load_image_sources(
-    store: StateStore, runs: Sequence[tuple[str, str | None]]
+    store: StateStore, runs: Sequence[tuple[str, str | None, dict[str, Any] | None]]
 ) -> list[ImageSource]:
-    """Image governance events of each ``(run_id, tenant_id)`` source, in order."""
+    """Image governance events of each ``(run_id, tenant_id, meta)`` source, in order."""
     from dendrux.media._runtime import tenant_scope_for
 
     out: list[ImageSource] = []
-    for run_id, tenant_id in runs:
+    for run_id, tenant_id, meta in runs:
         events = await store.get_run_events(run_id, event_types=list(IMAGE_EVENT_TYPES))
         out.append(
             ImageSource(
                 tenant_scope=tenant_scope_for(tenant_id),
                 events=sorted(events, key=lambda e: e.sequence_index),
+                slot_offset=source_slot_offset(meta),
             )
         )
     return out
@@ -718,11 +740,15 @@ def initial_image_view(
     ``rejected`` = union and ``described`` / ``guardrail_verdicts`` = first
     wins, folded over the sources' ``image.rejected`` / ``image.state``
     events in source order, keeping only this tenant's entries. With exactly
-    one source seeded in full (``single_full``) its slots map 1:1 onto the
-    new run's leading slots, so the drop view (``epoch``,
-    ``dropped_through``) and sticky ``placeholders`` carry over too.
+    one source seeded in full (``single_full``) its traced slots map onto the
+    new run's leading slots, shifted by the source's own seeded slots
+    (``slot_offset``), so the drop view (``epoch``, ``dropped_through``) and
+    sticky ``placeholders`` carry over too. With an unknown offset the view
+    starts fresh (the first request may miss the provider cache once).
     """
     state = ImageViewState(sent_through=sent_through)
+    offset = sources[0].slot_offset if single_full and len(sources) == 1 else None
+    carry_view = offset is not None
     seen_rejected: set[ImageKey] = set()
     for source in sources:
         if source.tenant_scope != tenant_scope:
@@ -738,14 +764,14 @@ def initial_image_view(
                 event_scope = data.get("tenant_scope")
                 scope = event_scope if isinstance(event_scope, str) else source.tenant_scope
                 if scope == tenant_scope:
-                    _fold_state_event(state, data, scope, tenant_scope, single_full)
-            elif event.event_type == "image.view_changed" and single_full:
+                    _fold_state_event(state, data, scope, tenant_scope, offset)
+            elif event.event_type == "image.view_changed" and carry_view:
                 epoch = data.get("epoch")
                 dropped = data.get("dropped_through")
                 if isinstance(epoch, int):
                     state.epoch = max(state.epoch, epoch)
                 if isinstance(dropped, int):
-                    state.dropped_through = max(state.dropped_through, dropped)
+                    state.dropped_through = max(state.dropped_through, dropped - (offset or 0))
     return state
 
 
@@ -762,7 +788,7 @@ def _fold_state_event(
     data: dict[str, Any],
     source_scope: str,
     tenant_scope: str,
-    single_full: bool,
+    slot_offset: int | None,
 ) -> None:
     for item in data.get("described") or []:
         if not isinstance(item, dict) or not isinstance(item.get("text"), str):
@@ -788,13 +814,16 @@ def _fold_state_event(
             vkey,
             GuardrailVerdict(action=item["action"], entities=tuple(item.get("entities") or ())),
         )
-    if not single_full:
+    if slot_offset is None:
         return
     for item in data.get("placeholders") or []:
         if not isinstance(item, dict):
             continue
         slot, reason = item.get("slot"), item.get("reason")
         if not isinstance(slot, int) or not isinstance(reason, str):
+            continue
+        slot -= slot_offset  # the source's untraced seeded slots are not replayed
+        if slot < 0:
             continue
         # Sticky: the first reason wins, except that "purged" replaces any other.
         if slot not in state.placeholders or reason == "purged":

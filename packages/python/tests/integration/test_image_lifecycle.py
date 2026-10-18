@@ -88,7 +88,14 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
     call_id = pause["pending_tool_calls"][0]["id"]
     iteration = pause["iteration"]
 
-    # "Process exit": a fresh store object and Agent on the same database.
+    # "Process exit": a fresh store and Agent; on Postgres also a new engine
+    # (an in-memory SQLite database does not survive its engine).
+    if engine.dialect.name == "postgresql":
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        url = engine.url.render_as_string(hide_password=False)
+        await engine.dispose()
+        engine = create_async_engine(url)
     store2 = SQLAlchemyStateStore(engine)
     agent2 = _agent(store2, [LLMResponse(text="The code word is ZEBRA42.")])
     result = await agent2.submit_tool_results(
@@ -167,6 +174,8 @@ async def test_canonical_sample_end_to_end(engine: Any) -> None:
         [t.meta for t in traces], default=str
     )
     assert "iVBORw0K" not in dumped and "data:image" not in dumped
+    if engine.dialect.name == "postgresql":
+        await engine.dispose()
 
 
 @NEEDS_BCD1

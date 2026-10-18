@@ -10,13 +10,13 @@ the xfail marks at integration.
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from dendrux.agent import Agent
+from dendrux.chat import ChatMessage
 from dendrux.errors import UnsupportedModalityError
 from dendrux.llm.mock import MockLLM
 from dendrux.media import Image, ImageDropPolicy, ImagePolicy, ToolOutput
@@ -103,29 +103,46 @@ async def test_retry_never_resends_rejected_tool_image(engine: Any) -> None:
     assert "was rejected by the model provider" in tool_msg.content
 
 
-async def test_single_source_full_replay_keeps_drop_view(engine: Any) -> None:
+def _visible_tools(msgs: list[Any]) -> list[str]:
+    return [m.content.split("\n")[0] for m in msgs if m.role == Role.TOOL and m.images]
+
+
+def _view(msgs: list[Any]) -> list[tuple[str, str, list[str]]]:
+    return [(m.role.value, m.content, [p.ref.sha256 for p in m.images]) for m in msgs]
+
+
+async def _drop_source_then_follow(engine: Any, history: list[ChatMessage]) -> tuple[Any, Any]:
     store = SQLAlchemyStateStore(engine)
+    policy = ImagePolicy(drop=ImageDropPolicy(keep_recent=2, interval=2))
     calls = [
         LLMResponse(text=None, tool_calls=[ToolCall(name="screenshot", params={"n": i})])
-        for i in range(5)
+        for i in (1, 2, 3, 4, 5)
     ]
-    policy = ImagePolicy(drop=ImageDropPolicy(keep_recent=1, interval=2))
     provider = _mock([*calls, LLMResponse(text="done")])
-    source = await _agent(store, provider, images=policy).run("shoot five")
-    last_request = _sent(provider, -1)
+    source = await _agent(store, provider, images=policy).run("go", history=history)
     follow = _mock([LLMResponse(text="next")])
     await _agent(store, follow, images=policy).run("more", runs=[source.run_id], replay_last=1)
-    replayed = _sent(follow)
-    # N-8: the source's sticky drop placeholders carry over slot for slot (the
-    # follow-up may drop more: the source's last tool batch is no longer the
-    # current turn).
-    dropped = [i for i, m in enumerate(last_request) if "omitted from context" in m.content]
-    assert dropped
-    for i in dropped:
-        assert replayed[i].content == last_request[i].content
+    return _sent(provider, -1), _sent(follow)
 
 
-async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:
+async def test_single_source_full_replay_keeps_drop_view(engine: Any) -> None:
+    # N-8: the follow-up's first request shows exactly the images the source's
+    # last request showed, with the same sticky placeholders...
+    src, fol = await _drop_source_then_follow(
+        engine, [ChatMessage.user("old"), ChatMessage.assistant("ok")]
+    )
+    assert _visible_tools(fol) == _visible_tools(src)
+    dropped = [m.content for m in src if "omitted from context" in m.content]
+    assert dropped and [m.content for m in fol if "omitted from context" in m.content] == dropped
+    # ...also when the source had its own seeded image (P1-1: slots are shifted).
+    src_h, fol_h = await _drop_source_then_follow(
+        engine, [ChatMessage.user(["old", Image.from_bytes(PNG)]), ChatMessage.assistant("ok")]
+    )
+    assert _visible_tools(src_h) == _visible_tools(src)
+    assert _visible_tools(fol_h) == _visible_tools(src_h)
+
+
+async def _approval_scenario(engine: Any, approval: bool) -> tuple[list[Any], dict[str, Any]]:
     store = SQLAlchemyStateStore(engine)
     policy = ImagePolicy(drop=ImageDropPolicy(keep_recent=1, interval=1))
     provider = _mock(
@@ -141,16 +158,15 @@ async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:
             ),
         ]
     )
-    agent = _agent(store, provider, images=policy, require_approval=["screenshot"])
+    extra = {"require_approval": ["screenshot"]} if approval else {}
+    agent = _agent(store, provider, images=policy, **extra)
     paused = await agent.run("go")
     while paused.status == RunStatus.WAITING_APPROVAL:
-        before = await store.get_pause_state(paused.run_id)
         paused = await agent.submit_approval(paused.run_id, approved=True)
     assert paused.status == RunStatus.WAITING_CLIENT_TOOL
     client_pause = await store.get_pause_state(paused.run_id)
-    assert client_pause["image_view"] == before["image_view"]
     call_id = client_pause["pending_tool_calls"][0]["id"]
-
+    # Resume from a fresh store object and Agent ("new process").
     fresh_provider = _mock([LLMResponse(text="done")])
     fresh = _agent(SQLAlchemyStateStore(engine), fresh_provider, images=policy)
     result = await fresh.submit_tool_results(
@@ -165,4 +181,31 @@ async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:
         ],
     )
     assert result.status == RunStatus.SUCCESS
-    assert json.dumps(client_pause["image_view"], sort_keys=True)
+    return _sent(fresh_provider), client_pause["image_view"]
+
+
+async def test_approval_client_pause_resume_carries_view(engine: Any) -> None:
+    """N-2: approval -> client pause -> fresh-process resume == the run without approvals."""
+    with_approval, view_a = await _approval_scenario(engine, approval=True)
+    without, view_b = await _approval_scenario(engine, approval=False)
+    assert view_a == view_b
+    assert _view(with_approval) == _view(without)
+
+
+async def test_explicit_skill_retry_after_purge_shows_placeholder(engine: Any) -> None:
+    """P2-1: the purged input image of an explicit-skills run degrades on retry."""
+    from dendrux import Skill
+
+    skill = Skill(name="demo", description="Demo", body="skill body")
+    store = SQLAlchemyStateStore(engine)
+    source = await _agent(store, _mock([LLMResponse(text="one")]), skills=[skill]).run(
+        ["see", Image.from_bytes(PNG)], activate_skills=["demo"], tenant_id="acme"
+    )
+    assert await _agent(store, _mock([]), skills=[skill]).blobs.purge(SHA, tenant_id="acme")
+    retry_provider = _mock([LLMResponse(text="again")])
+    result = await _agent(store, retry_provider, skills=[skill]).retry(
+        source.run_id, tenant_id="acme"
+    )
+    assert result.status == RunStatus.SUCCESS
+    first_user = next(m for m in _sent(retry_provider) if m.role == Role.USER)
+    assert "was deleted" in first_user.content and not first_user.images

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from dendrux.errors import (
@@ -57,8 +58,12 @@ __all__ = [
     "deserialize_decisions",
     "deserialize_tool_results",
     "effective_image_capability",
+    "IngestGroup",
+    "ingest_groups",
     "ingest_tool_result_images",
     "ingest_user_items",
+    "merge_user_items",
+    "user_items_group",
     "parts_edges",
     "tool_result_edges",
     "is_client_call",
@@ -384,6 +389,68 @@ async def check_new_image_capability(
     )
 
 
+@dataclass(frozen=True)
+class IngestGroup:
+    """One message's (or tool result's) image inputs for :func:`ingest_groups`."""
+
+    images: tuple[Any, ...]
+    origin: Origin
+    tool_name: str | None = None
+
+
+async def ingest_groups(
+    groups: Sequence[IngestGroup],
+    *,
+    runtime: ImageRuntime,
+    before_store: Callable[[], Awaitable[None]] | None = None,
+) -> list[tuple[ImagePart, ...]]:
+    """Ingest several groups with ONE phase 1 for all of them before any phase 2 (§5.2).
+
+    Each group is its own ``ingest()`` call (its own per-message cap, origin
+    and tool name); the calls nest through ``before_store``, so every group
+    is validated before any blob is written. ``before_store`` (the entry
+    point's capability check) runs last, between the phases. Returns the
+    canonical parts per group, in order.
+    """
+    from dendrux.media._ingest import ingest
+
+    results: list[tuple[ImagePart, ...]] = [() for _ in groups]
+    todo = [i for i, g in enumerate(groups) if g.images]
+
+    async def _step(k: int) -> None:
+        if k == len(todo):
+            if before_store is not None:
+                await before_store()
+            return
+        group = groups[todo[k]]
+
+        async def _next() -> None:
+            await _step(k + 1)
+
+        results[todo[k]] = await ingest(
+            list(group.images),
+            policy=runtime.policy,
+            runtime=runtime,
+            origin=group.origin,
+            tool_name=group.tool_name,
+            before_store=_next,
+        )
+
+    await _step(0)
+    return results
+
+
+def user_items_group(items: Sequence[Any], origin: Origin = "user") -> IngestGroup:
+    """The image inputs of a ``UserContent`` sequence."""
+    return IngestGroup(tuple(item for item in items if not isinstance(item, str)), origin)
+
+
+def merge_user_items(items: Sequence[Any], images: Sequence[ImagePart]) -> tuple[ContentPart, ...]:
+    """Re-interleave ingested images with the text items, in caller order."""
+    ingested = iter(images)
+    return tuple(TextPart(item) if isinstance(item, str) else next(ingested) for item in items)
+
+
 async def ingest_user_items(
     items: Sequence[Any],
     *,
@@ -392,19 +459,10 @@ async def ingest_user_items(
     before_store: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[ContentPart, ...]:
     """Ingest the images of a ``UserContent`` sequence; return canonical parts in order."""
-    from dendrux.media._ingest import ingest
-
-    images = [item for item in items if not isinstance(item, str)]
-    ingested = iter(
-        await ingest(
-            images,
-            policy=runtime.policy,
-            runtime=runtime,
-            origin=origin,
-            before_store=before_store,
-        )
+    (images,) = await ingest_groups(
+        [user_items_group(items, origin)], runtime=runtime, before_store=before_store
     )
-    return tuple(TextPart(item) if isinstance(item, str) else next(ingested) for item in items)
+    return merge_user_items(items, images)
 
 
 async def ingest_tool_result_images(
@@ -415,31 +473,14 @@ async def ingest_tool_result_images(
 ) -> list[ToolResult]:
     """Ingest client-tool result images (``origin="client_tool"``), in order.
 
-    ``before_store`` runs once, after the first image-bearing result passed
-    validation and before any blob is written. Results without images are
-    returned unchanged.
+    All results are validated before any blob is written; ``before_store``
+    runs once, between the phases. Results without images are unchanged.
     """
     from dataclasses import replace
 
-    from dendrux.media._ingest import ingest
-
-    out: list[ToolResult] = []
-    pending = before_store
-    for r in results:
-        if not r.images:
-            out.append(r)
-            continue
-        parts = await ingest(
-            list(r.images),
-            policy=runtime.policy,
-            runtime=runtime,
-            origin="client_tool",
-            tool_name=r.name,
-            before_store=pending,
-        )
-        pending = None
-        out.append(replace(r, images=parts))
-    return out
+    groups = [IngestGroup(tuple(r.images), "client_tool", r.name) for r in results]
+    parts = await ingest_groups(groups, runtime=runtime, before_store=before_store)
+    return [replace(r, images=p) if r.images else r for r, p in zip(results, parts, strict=True)]
 
 
 def parts_edges(

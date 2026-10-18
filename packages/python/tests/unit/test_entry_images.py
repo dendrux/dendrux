@@ -31,7 +31,7 @@ from dendrux.errors import (
 )
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.react import ReActLoop
-from dendrux.media import Image, ImagePolicy, UrlPolicy
+from dendrux.media import Image, ImageDropPolicy, ImagePolicy, UrlPolicy
 from dendrux.runtime.replay import (
     ImageSource,
     history_seed,
@@ -270,6 +270,88 @@ class ImageLoop(ReActLoop):
         return super().run_stream(*args, **kwargs)
 
 
+class LegacyLoop(ReActLoop):
+    """A custom loop written against the pre-0.4 signature (no image kwargs)."""
+
+    async def run(  # type: ignore[override]
+        self,
+        *,
+        agent: Any,
+        provider: Any,
+        strategy: Any,
+        user_input: Any,
+        run_id: Any = None,
+        recorder: Any = None,
+        notifier: Any = None,
+        initial_history: Any = None,
+        initial_steps: Any = None,
+        iteration_offset: int = 0,
+        initial_usage: Any = None,
+        provider_kwargs: Any = None,
+        output_type: Any = None,
+        initial_pii_mapping: Any = None,
+        state_store: Any = None,
+        budget_carry: Any = None,
+    ) -> Any:
+        return await super().run(
+            agent=agent,
+            provider=provider,
+            strategy=strategy,
+            user_input=user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=notifier,
+            initial_history=initial_history,
+            initial_steps=initial_steps,
+            iteration_offset=iteration_offset,
+            initial_usage=initial_usage,
+            provider_kwargs=provider_kwargs,
+            output_type=output_type,
+            initial_pii_mapping=initial_pii_mapping,
+            state_store=state_store,
+            budget_carry=budget_carry,
+        )
+
+    def run_stream(  # type: ignore[override]
+        self,
+        *,
+        agent: Any,
+        provider: Any,
+        strategy: Any,
+        user_input: Any,
+        run_id: Any = None,
+        recorder: Any = None,
+        notifier: Any = None,
+        initial_history: Any = None,
+        initial_steps: Any = None,
+        iteration_offset: int = 0,
+        initial_usage: Any = None,
+        provider_kwargs: Any = None,
+        output_type: Any = None,
+        state_store: Any = None,
+        interrupt: Any = None,
+        budget_carry: Any = None,
+    ) -> Any:
+        return super().run_stream(
+            agent=agent,
+            provider=provider,
+            strategy=strategy,
+            user_input=user_input,
+            run_id=run_id,
+            recorder=recorder,
+            notifier=notifier,
+            initial_history=initial_history,
+            initial_steps=initial_steps,
+            iteration_offset=iteration_offset,
+            initial_usage=initial_usage,
+            provider_kwargs=provider_kwargs,
+            output_type=output_type,
+            state_store=state_store,
+            interrupt=interrupt,
+            budget_carry=budget_carry,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _services(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("dendrux.agent._blob_services_factory", lambda: FakeServices)
@@ -448,12 +530,13 @@ class TestRunWithImages:
         parts = record.input_data["dendrux.parts"]
         assert parts[0] == {"type": "text", "text": "What does this say?"}
         assert parts[1]["sha256"] == sha and parts[1]["width"] == 400
-        # input edge in the create_run transaction; trace edge for the user trace
+        # input edge in the create_run transaction; trace edges come only from the
+        # recorder's save_trace (B), never from a separate runner write
         assert ("create_run", result.run_id) in store.edge_calls
-        assert [(e.owner_kind, e.owner_id, e.ordinal) for e in store.edges_of(result.run_id)] == [
-            ("input", "input", 1),
-            ("trace", "0", 1),
-        ]
+        edges = [(e.owner_kind, e.owner_id, e.ordinal) for e in store.edges_of(result.run_id)]
+        assert edges[0] == ("input", "input", 1)
+        assert set(edges[1:]) <= {("trace", "0", 1)}
+        assert ("add_blob_refs", result.run_id) not in store.edge_calls
         assert all(e.tenant_scope == "t:acme" for e in store.edges_of(result.run_id))
         # the user trace keeps the projection and the wire parts in meta
         traces = await store.get_traces(result.run_id)
@@ -552,12 +635,13 @@ class TestRunWithImages:
             await agent.run([wrong])
 
     async def test_loop_without_image_runtime_raises_type_error(self, store: ImageStore) -> None:
-        agent = _agent(store, [LLMResponse(text="x")], loop=ReActLoop())
-        if "image_runtime" in __import__("inspect").signature(ReActLoop.run).parameters:
-            pytest.skip("built-in loop accepts image_runtime (D1 merged)")
+        agent = _agent(store, [LLMResponse(text="x")], loop=LegacyLoop())
         with pytest.raises(TypeError, match="image_runtime"):
             await agent.run([Image.from_bytes(PNG)])
+        with pytest.raises(TypeError, match="image_runtime"):
+            agent.stream([Image.from_bytes(PNG)])
         assert await _count_runs(store) == 0
+        assert store.rows == {}
 
     async def test_no_database_uses_in_memory_backend(self) -> None:
         agent = Agent(
@@ -683,7 +767,8 @@ class TestStreamWithImages:
         run_id = events[-1].run_result.run_id
         record = await store.get_run(run_id)
         assert record.input_data["dendrux.parts"][1]["sha256"] == _sha(PNG)
-        assert [e.owner_kind for e in store.edges_of(run_id)] == ["input", "trace"]
+        assert [e.owner_kind for e in store.edges_of(run_id)][0] == "input"
+        assert ("add_blob_refs", run_id) not in store.edge_calls
         assert agent.loop.seen[-1]["runtime"].tenant_scope == "t:t1"  # type: ignore[union-attr]
 
     async def test_interleaved_streams_keep_tenant_scopes(self, store: ImageStore) -> None:
@@ -1541,3 +1626,338 @@ class TestD1Seams:
             sent_through=0, sources=[src], tenant_scope="t:a", single_full=True
         )
         assert state.described == {("t:a", "x"): "a"}
+
+
+# ---------------------------------------------------------------------------
+# Review fix round (review-D2.md)
+# ---------------------------------------------------------------------------
+
+JPG = (FIXTURES / "zebra42.jpg").read_bytes()
+GIF = (FIXTURES / "zebra42.gif").read_bytes()
+SHOTS = [PNG, PNG2, JPG, GIF]
+CORRUPT = PNG[:120]
+
+
+@tool()
+async def shot(n: int) -> Any:
+    """Server screenshot."""
+    from dendrux.media import ToolOutput
+
+    return ToolOutput(f"shot {n}", images=[Image.from_bytes(SHOTS[n])])
+
+
+def _visible_tools(msgs: list[Message]) -> list[str]:
+    return [m.content.split("\n")[0] for m in msgs if m.role == Role.TOOL and m.images]
+
+
+class TestSeededSourceCarry:
+    """P1-1: a single-source carry is shifted by the source's own seeded slots."""
+
+    async def _scenario(self, store: ImageStore, history: list[ChatMessage]) -> tuple[Any, Any]:
+        policy = ImagePolicy(
+            drop=ImageDropPolicy(keep_recent=2, interval=2), capability_overrides={"mock": "yes"}
+        )
+        calls = [
+            LLMResponse(text=None, tool_calls=[ToolCall(name="shot", params={"n": i})])
+            for i in (1, 2, 3, 0, 1)
+        ]
+        src_agent = _agent(store, [*calls, LLMResponse(text="done")], tools=[shot], images=policy)
+        source = await src_agent.run("go", history=history)
+        follow = _agent(store, [LLMResponse(text="next")], tools=[shot], images=policy)
+        await follow.run("more", runs=[source.run_id], replay_last=1)
+        return _llm_messages(src_agent, -1), _llm_messages(follow, 0)
+
+    @pytest.mark.xfail(strict=False, reason="needs B merged (recorder persists tool trace parts)")
+    async def test_control_and_seeded_source_show_the_same_images(self, store: ImageStore) -> None:
+        src_c, fol_c = await self._scenario(
+            store, [ChatMessage.user("old"), ChatMessage.assistant("ok")]
+        )
+        assert _visible_tools(fol_c) == _visible_tools(src_c)
+        src_h, fol_h = await self._scenario(
+            store, [ChatMessage.user(["old", Image.from_bytes(PNG)]), ChatMessage.assistant("ok")]
+        )
+        assert _visible_tools(src_h) == _visible_tools(src_c)
+        assert _visible_tools(fol_h) == _visible_tools(src_h)
+        dropped_src = [m.content for m in src_h if "omitted from context" in m.content]
+        dropped_fol = [m.content for m in fol_h if "omitted from context" in m.content]
+        assert dropped_src and dropped_fol == dropped_src
+
+    def test_shift_applies_to_view_and_every_placeholder(self) -> None:
+        src = ImageSource(
+            "-",
+            [
+                _event("image.view_changed", {"epoch": 3, "dropped_through": 6}, 1),
+                _event(
+                    "image.state",
+                    {
+                        "placeholders": [
+                            {"slot": 0, "reason": "policy"},  # the source's seeded slot
+                            {"slot": 2, "reason": "rejected"},
+                            {"slot": 3, "reason": "purged"},
+                            {"slot": 4, "reason": "drop"},
+                        ]
+                    },
+                    2,
+                ),
+            ],
+            slot_offset=2,
+        )
+        state = initial_image_view(
+            sent_through=9, sources=[src], tenant_scope="-", single_full=True
+        )
+        assert (state.epoch, state.dropped_through) == (3, 4)
+        assert state.placeholders == {0: "rejected", 1: "purged", 2: "drop"}
+
+    def test_unknown_offset_starts_a_fresh_view(self) -> None:
+        src = ImageSource(
+            "-",
+            [
+                _event("image.view_changed", {"epoch": 3, "dropped_through": 6}, 1),
+                _event("image.rejected", {"sha256": "r"}, 2),
+                _event("image.state", {"placeholders": [{"slot": 0, "reason": "drop"}]}, 3),
+            ],
+            slot_offset=None,
+        )
+        state = initial_image_view(
+            sent_through=1, sources=[src], tenant_scope="-", single_full=True
+        )
+        assert (state.epoch, state.dropped_through, state.placeholders) == (0, 0, {})
+        assert state.rejected == [("-", "r")]  # key-based state still carries
+
+    def test_source_offset_from_meta(self) -> None:
+        from dendrux.runtime.replay import IMAGE_SEEDED_KEY, PREFIX_META_KEY, source_slot_offset
+
+        assert source_slot_offset(None) is None
+        assert source_slot_offset({PREFIX_META_KEY: {}}) == 0
+        assert source_slot_offset({PREFIX_META_KEY: {}, IMAGE_SEEDED_KEY: 3}) == 3
+        assert source_slot_offset({PREFIX_META_KEY: {}, IMAGE_SEEDED_KEY: None}) is None
+
+    async def test_seeded_slots_recorded_in_run_meta(self, store: ImageStore) -> None:
+        from dendrux.runtime.replay import IMAGE_SEEDED_KEY
+
+        agent = _agent(store, [LLMResponse(text="a"), LLMResponse(text="b")])
+        history = [ChatMessage.user(["old", Image.from_bytes(PNG)]), ChatMessage.assistant("ok")]
+        seeded = await agent.run("q", history=history)
+        plain = await agent.run(["q", Image.from_bytes(PNG2)])
+        assert (await store.get_run(seeded.run_id)).meta[IMAGE_SEEDED_KEY] == 1
+        assert IMAGE_SEEDED_KEY not in (await store.get_run(plain.run_id)).meta
+
+
+class TestOnePhaseOne:
+    """P2-2: every image is validated before any blob is written."""
+
+    async def test_second_tool_result_invalid_writes_nothing(self, store: ImageStore) -> None:
+        responses = [
+            LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(name="take_screenshot", params={}),
+                    ToolCall(name="take_screenshot", params={}),
+                ],
+            )
+        ]
+        agent = _agent(store, responses)
+        paused = await agent.run("two shots", tenant_id="acme")
+        ids = [
+            tc["id"] for tc in (await store.get_pause_state(paused.run_id))["pending_tool_calls"]
+        ]
+        with pytest.raises(InvalidImageError):
+            await _agent(store, []).submit_tool_results(
+                paused.run_id,
+                [
+                    ToolResult("take_screenshot", ids[0], '"a"', images=(Image.from_bytes(PNG),)),
+                    ToolResult(
+                        "take_screenshot", ids[1], '"b"', images=(Image.from_bytes(CORRUPT),)
+                    ),
+                ],
+            )
+        assert store.rows == {}
+        assert (await store.get_run(paused.run_id)).status == RunStatus.WAITING_CLIENT_TOOL.value
+
+    async def test_valid_input_with_invalid_history_writes_nothing(self, store: ImageStore) -> None:
+        agent = _agent(store, [LLMResponse(text="x")])
+        history = [ChatMessage.user([Image.from_bytes(CORRUPT)]), ChatMessage.assistant("ok")]
+        with pytest.raises(InvalidImageError):
+            await agent.run([Image.from_bytes(PNG)], history=history)
+        assert store.rows == {} and await _count_runs(store) == 0
+
+    async def test_capability_runs_once_after_all_validation(
+        self, store: ImageStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dendrux.runtime.submit as submit
+
+        order: list[str] = []
+        real = submit.check_new_image_capability
+
+        async def spy(*args: Any, **kwargs: Any) -> None:
+            order.append(f"capability:{kwargs['image_count']}:{len(store.rows)}")
+            await real(*args, **kwargs)
+
+        monkeypatch.setattr(submit, "check_new_image_capability", spy)
+        agent = _agent(store, [LLMResponse(text="x")])
+        history = [ChatMessage.user([Image.from_bytes(PNG2)]), ChatMessage.assistant("ok")]
+        await agent.run([Image.from_bytes(PNG)], history=history)
+        assert order == ["capability:1:0"]  # input images only, before any row
+        assert len(store.rows) == 2
+
+
+class TestResumeStreamValidatesFirst:
+    """P2-3: resume_stream checks the run before it ingests anything."""
+
+    async def test_wrong_status_and_call_id_write_no_blob(self, store: ImageStore) -> None:
+        agent = _agent(store, [LLMResponse(text="x")])
+        run_id = await _human_pause(store, agent)
+        stream = agent.resume_stream(
+            run_id,
+            tool_results=[
+                ToolResult("take_screenshot", "nope", '"x"', images=(Image.from_bytes(PNG),))
+            ],
+        )
+        with pytest.raises(ValueError):
+            async for _ in stream:
+                pass
+        assert store.rows == {}
+        assert (await store.get_run(run_id)).status == RunStatus.WAITING_HUMAN_INPUT.value
+
+        paused = await _agent(store, _screenshot_responses()).run("shot")
+        stream = _agent(store, []).resume_stream(
+            paused.run_id,
+            tool_results=[
+                ToolResult("take_screenshot", "wrong", '"x"', images=(Image.from_bytes(PNG),))
+            ],
+        )
+        with pytest.raises(ValueError, match="call_ids"):
+            async for _ in stream:
+                pass
+        assert store.rows == {}
+
+    async def test_missing_run_raises_not_found(self, store: ImageStore) -> None:
+        from dendrux.errors import RunNotFoundError
+
+        stream = _agent(store, []).resume_stream(
+            "01NOSUCHRUN000000000000000", user_input=[Image.from_bytes(PNG)]
+        )
+        with pytest.raises(RunNotFoundError):
+            async for _ in stream:
+                pass
+        assert store.rows == {}
+
+    async def test_resume_stream_checks_run_stream_signature(self, store: ImageStore) -> None:
+        class RunOnlyLoop(LegacyLoop):
+            async def run(self, **kwargs: Any) -> Any:  # accepts **kwargs (image_runtime too)
+                return await ReActLoop.run(self, **kwargs)
+
+        paused = await _agent(store, _screenshot_responses()).run("shot")
+        call_id = (await store.get_pause_state(paused.run_id))["pending_tool_calls"][0]["id"]
+        agent = _agent(store, [], loop=RunOnlyLoop())
+        stream = agent.resume_stream(
+            paused.run_id,
+            tool_results=[
+                ToolResult("take_screenshot", call_id, '"x"', images=(Image.from_bytes(PNG),))
+            ],
+        )
+        with pytest.raises(TypeError, match="run_stream"):
+            async for _ in stream:
+                pass
+
+
+class TestCustomLoopReplay:
+    """P2-4: a loop that cannot take image_runtime refuses an image prefix before create_run."""
+
+    async def test_runs_replay_of_image_run(self, store: ImageStore) -> None:
+        source = await _agent(store, [LLMResponse(text="x")]).run(["look", Image.from_bytes(PNG)])
+        before = await _count_runs(store)
+        agent = _agent(store, [LLMResponse(text="y")], loop=LegacyLoop())
+        with pytest.raises(TypeError, match="image_runtime"):
+            await agent.run("next", runs=[source.run_id], replay_last="all")
+        with pytest.raises(TypeError, match="image_runtime"):
+            await agent.retry(source.run_id)
+        assert await _count_runs(store) == before
+        events = [e async for e in agent.stream("next", runs=[source.run_id], replay_last=1)]
+        assert events[-1].run_result.meta["error_type"] == "TypeError"
+        assert await _count_runs(store) == before
+
+    async def test_text_replay_with_legacy_loop_still_works(self, store: ImageStore) -> None:
+        source = await _agent(store, [LLMResponse(text="x")]).run("text only")
+        agent = _agent(store, [LLMResponse(text="y")], loop=LegacyLoop())
+        result = await agent.run("next", runs=[source.run_id], replay_last="all")
+        assert result.status == RunStatus.SUCCESS
+
+
+class TestGarbageCollectionWiring:
+    """P2-5: a full blob store triggers one collect_garbage(older_than=1h) pass."""
+
+    async def test_runtime_gets_one_hour_gc_pass(self, store: ImageStore) -> None:
+        from datetime import timedelta
+
+        from dendrux.media import InMemoryBlobStore
+
+        calls: list[timedelta] = []
+        blob_store = InMemoryBlobStore(max_bytes=len(PNG) + 16)
+
+        class _Accessor:
+            async def collect_garbage(self, *, older_than: timedelta, limit: int = 1000) -> Any:
+                calls.append(older_than)
+                for name in blob_store.object_names():  # simulate GC freeing old objects
+                    scope, sha, gen = name.split("/")
+                    from urllib.parse import unquote
+
+                    from dendrux.media import BlobKey
+
+                    await blob_store.delete(BlobKey(unquote(scope), sha, gen))
+                return None
+
+        agent = _agent(store, [LLMResponse(text="a"), LLMResponse(text="b")], blob_store=blob_store)
+        agent._blob_services(store).accessor = _Accessor()
+        await agent.run([Image.from_bytes(PNG)])
+        assert calls == []
+        result = await agent.run([Image.from_bytes(PNG2)])  # store full -> one GC pass
+        assert result.status == RunStatus.SUCCESS
+        assert calls == [timedelta(hours=1)]
+        assert agent.loop.seen[-1]["runtime"].collect_garbage is not None  # type: ignore[union-attr]
+
+
+class TestIdempotencyAfterPurge:
+    """P2-7: a keyed retry whose image was purged returns the existing run."""
+
+    async def test_keyed_retry_after_purge_returns_existing(self, store: ImageStore) -> None:
+        agent = _agent(store, [LLMResponse(text="a")])
+        first = await agent.run(["q", Image.from_bytes(PNG)], idempotency_key="kp", tenant_id="t")
+        await store.mark_purging("t:t", _sha(PNG), "gdpr")
+        again = await agent.run(["q", Image.from_bytes(PNG)], idempotency_key="kp", tenant_id="t")
+        assert again.run_id == first.run_id and again.answer == "a"
+        with pytest.raises(IdempotencyConflictError):
+            await agent.run(["other", Image.from_bytes(PNG)], idempotency_key="kp", tenant_id="t")
+        with pytest.raises(InvalidImageError, match="purged"):
+            await agent.run(["q", Image.from_bytes(PNG)], tenant_id="t")
+
+    async def test_keyed_stream_after_purge_yields_cached(self, store: ImageStore) -> None:
+        agent = _agent(store, [LLMResponse(text="a")])
+        first = await agent.run([Image.from_bytes(PNG)], idempotency_key="ks")
+        await store.mark_purging("-", _sha(PNG), None)
+        events = [e async for e in agent.stream([Image.from_bytes(PNG)], idempotency_key="ks")]
+        assert len(events) == 1 and events[0].run_result.run_id == first.run_id
+
+
+class TestSubmitEdgeKeyRace:
+    """P2-7: the claim re-checks the pause iteration that keyed the submission edges."""
+
+    async def test_repaused_run_rejects_stale_submission(
+        self, store: ImageStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dendrux.errors import RunAlreadyClaimedError
+
+        agent = _agent(store, [LLMResponse(text="thanks")])
+        run_id = await _human_pause(store, agent)
+        real = store.get_pause_state
+
+        async def stale(rid: str) -> Any:
+            data = await real(rid)
+            return {**data, "iteration": data["iteration"] - 1} if data else data
+
+        monkeypatch.setattr(store, "get_pause_state", stale)
+        with pytest.raises(RunAlreadyClaimedError):
+            await agent.submit_input(run_id, ["here", Image.from_bytes(PNG)])
+        monkeypatch.undo()
+        assert (await store.get_run(run_id)).status == RunStatus.WAITING_HUMAN_INPUT.value
+        assert store.edges_of(run_id) == []
