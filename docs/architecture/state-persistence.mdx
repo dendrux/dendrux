@@ -287,6 +287,13 @@ Dendrux uses **SQLAlchemy 2.x async**. Anything async-SQLAlchemy supports works:
 
 The schema doesn't use any SQLite-specific or Postgres-specific features. Switching backends is a connection string change.
 
+**In-memory SQLite** (`sqlite+aiosqlite:///:memory:`) is for tests and demos only. SQLAlchemy gives it one shared connection, so Dendrux serialises its own database sessions on it (parallel tool calls and readers wait their turn) and logs a warning when a store is created on it. The data is gone when the engine is disposed. Two rules apply:
+
+- Use one event loop per in-memory engine.
+- Never hold a Dendrux session (`dendrux.db.session.get_session`) open across a call that runs an agent, for example for a whole web request that calls `agent.run()`. The agent's database writes wait for that session, so the call never finishes. A warning names the holding task after 10 seconds.
+
+A SQLite file or Postgres has none of these limits.
+
 ## Setting up the schema
 
 SQLite creates its tables automatically on first use, so there is nothing to run for a new file. A SQLite file created by an older release is upgraded in place on startup. The upgrade is add-only: it adds missing nullable or defaulted columns and indexes (0.3.0 adds `agent_runs.pause_requested` and the `run_inbox` table). If a column cannot be added safely, Dendrux raises an error naming the table and column and telling you to run `dendrux db migrate` or recreate the file. Every other backend needs the tables created once before the first run. Dendrux ships an Alembic migration set and a small CLI for exactly this. Upgrading an existing Postgres database to 0.3.0 is the same command; it applies revision `b5c6d7e8f9a0` (the `pause_requested` column and the `run_inbox` table):
