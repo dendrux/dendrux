@@ -9,6 +9,13 @@ Scenarios, each on claude-sonnet-4-6 and claude-haiku-4-5:
          strict, validates (direct call and an Agent with output_type).
     ST3  structured output with a dict[str, str] field: sent non-strict
          (unchanged payload) and still validates.
+    ST4  structured output whose strict grammar is too large (60 fields with
+         max_length=5000): Anthropic 400s the strict request, Dendrux retries
+         once non-strict, the output validates and provider_request shows
+         the non-strict request.
+    ST5  a strict tool whose pattern the normaliser keeps but Anthropic's
+         regex budget rejects, streamed: retried non-strict before any
+         event, the stream completes.
 
 An HTTP 200 alone never passes: the request evidence must show the strict
 flag (or its absence) and the output must validate against the model.
@@ -20,20 +27,22 @@ Run (keys come from the environment only):
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from dendrux import Agent, tool
+from dendrux.llm import anthropic as anthropic_mod
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.llm.structured import structured_complete
 from dendrux.loops.single import SingleCall
 from dendrux.tool import get_tool_def
-from dendrux.types import Message, Role, RunStatus
+from dendrux.types import Message, Role, RunStatus, StreamEventType, ToolDef
 
 MODELS = ("claude-sonnet-4-6", "claude-haiku-4-5")
 
@@ -182,3 +191,72 @@ async def test_dict_schema_falls_back_non_strict(case: Case, rec: dict[str, Any]
     assert sent["input_schema"] == schema
     assert out.labels.get("team") == "finance"
     rec["output"] = out.model_dump(mode="json")
+
+
+Wide = create_model(  # type: ignore[call-overload]
+    "Wide", **{f"field_{i}": (str, Field(min_length=1, max_length=5000)) for i in range(60)}
+)
+
+
+def _strict_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "dendrux.llm.anthropic"
+    ]
+
+
+@pytest.mark.parametrize("case", _cases("ST4"), ids=lambda c: f"{c.model}-ST4")
+async def test_grammar_too_large_falls_back(
+    case: Case, rec: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    anthropic_mod._STRICT_REJECTED.clear()
+    anthropic_mod._STRICT_WARNED.clear()
+    _provider(case.model)  # skips without a key
+    provider = AnthropicProvider(model=case.model, max_tokens=4096)
+    with caplog.at_level(logging.WARNING, logger="dendrux.llm.anthropic"):
+        response, out = await structured_complete(
+            provider,
+            [Message(role=Role.USER, content="Fill every field with one short lowercase word.")],
+            Wide,
+        )
+    sent = response.provider_request["tools"][0]
+    assert "strict" not in sent
+    assert sent["input_schema"] == Wide.model_json_schema()
+    assert out.field_0
+    warned = _strict_warnings(caplog)
+    assert len(warned) == 1 and "structured_output" in warned[0]
+    rec["warning"] = warned[0][:400]
+
+
+@pytest.mark.parametrize("case", _cases("ST5"), ids=lambda c: f"{c.model}-ST5")
+async def test_regex_budget_falls_back_in_stream(
+    case: Case, rec: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    anthropic_mod._STRICT_REJECTED.clear()
+    anthropic_mod._STRICT_WARNED.clear()
+    params = {
+        "type": "object",
+        "properties": {"code": {"type": "string", "pattern": "^[a-z]{1,100000}$"}},
+        "required": ["code"],
+        "additionalProperties": False,
+    }
+    td = ToolDef(name="save_code", description="Save a code.", parameters=params, strict=True)
+    provider = _provider(case.model)
+    with caplog.at_level(logging.WARNING, logger="dendrux.llm.anthropic"):
+        events = [
+            e
+            async for e in provider.complete_stream(
+                [Message(role=Role.USER, content="Save the code 'abc' with the save_code tool.")],
+                tools=[td],
+            )
+        ]
+    done = events[-1]
+    assert done.type is StreamEventType.DONE
+    assert done.raw.provider_request["tools"] == [
+        {"name": "save_code", "description": "Save a code.", "input_schema": params}
+    ]
+    assert done.raw.tool_calls and done.raw.tool_calls[0].params["code"] == "abc"
+    warned = _strict_warnings(caplog)
+    assert len(warned) == 1 and "save_code" in warned[0]
+    rec["warning"] = warned[0][:400]
