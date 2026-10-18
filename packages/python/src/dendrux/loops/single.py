@@ -14,7 +14,6 @@ Constraints:
 from __future__ import annotations
 
 import time
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
@@ -37,9 +36,11 @@ from dendrux.loops._helpers import (
     record_llm_started,
     record_message,
 )
+from dendrux.loops._images import ImageCallSite, control_stop
 from dendrux.loops.base import Loop
-from dendrux.loops.react import _interrupted_result
+from dendrux.loops.react import _image_policy, _interrupted_result, _read_control
 from dendrux.types import (
+    ImageViewState,
     Message,
     Role,
     RunEvent,
@@ -53,13 +54,14 @@ from dendrux.types import (
 
 if TYPE_CHECKING:
     import asyncio
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from pydantic import BaseModel
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
     from dendrux.types import AgentStep, Budget, LLMResponse
@@ -134,7 +136,9 @@ class SingleCall(Loop):
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
         initial_pii_mapping: dict[str, str] | None = None,
-        state_store: StateStore | None = None,  # noqa: ARG002 — SingleCall has no checkpoints
+        state_store: StateStore | None = None,
+        image_runtime: ImageRuntime | None = None,
+        image_view_state: ImageViewState | None = None,
     ) -> RunResult:
         """Execute a single LLM call and return the result."""
         if output_type is not None and agent.guardrails:
@@ -176,6 +180,18 @@ class SingleCall(Loop):
             history=history,
             tool_defs=[],
         )
+        images = _image_site(
+            agent,
+            provider,
+            image_runtime,
+            image_view_state,
+            _pkw,
+            recorder,
+            notifier,
+            resolved_run_id,
+            notifier_warnings,
+        )
+        control_reader = _cancel_reader(state_store, resolved_run_id)
 
         # Incoming guardrail — scan all messages
         g_engine = GuardrailEngine(agent.guardrails) if agent.guardrails else None
@@ -185,7 +201,7 @@ class SingleCall(Loop):
             for msg_idx, msg in enumerate(messages):
                 if not msg.content:
                     continue
-                cleaned, findings, block_err = await g_engine.scan_incoming(msg.content)
+                cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg)
                 if findings:
                     all_in_findings.extend(findings)
                 if block_err is not None:
@@ -213,11 +229,11 @@ class SingleCall(Loop):
                         usage=UsageStats(),
                         meta=guardrail_meta(g_engine, notifier_warnings),
                     )
-                if cleaned != msg.content:
+                if cleaned_msg is not msg:
                     _in_was_redacted = True
-                    # replace() preserves the origin envelope
+                    # The engine's replace() preserves the origin envelope
                     # (kind/placement/source) through redaction.
-                    messages[msg_idx] = replace(msg, content=cleaned)
+                    messages[msg_idx] = cleaned_msg
             if all_in_findings:
                 _in_entities = list({f.entity_type for f in all_in_findings})
                 await record_governance(
@@ -261,78 +277,133 @@ class SingleCall(Loop):
                     warnings=notifier_warnings,
                 )
 
-        # LLM call (lifecycle: started → completed/failed)
-        await record_llm_started(
-            recorder,
-            resolved_run_id,
-            1,
-            semantic_messages=messages,
-            semantic_tools=None,
-        )
-        await notify_llm_started(
-            notifier,
-            resolved_run_id,
-            1,
-            notifier_warnings,
-            semantic_messages=messages,
-            semantic_tools=None,
-        )
-        t0 = time.monotonic()
+        prepared = await images.prepare(messages, iteration=1, guardrails=agent.guardrails or ())
+        if prepared.block_error is not None:
+            await images.emit(
+                "guardrail.blocked",
+                {"direction": "incoming_image", "error": prepared.block_error},
+                1,
+            )
+            return RunResult(
+                run_id=resolved_run_id,
+                status=RunStatus.ERROR,
+                error=prepared.block_error,
+                steps=[],
+                iteration_count=1,
+                usage=UsageStats(),
+                meta=guardrail_meta(g_engine, notifier_warnings),
+            )
 
         # Structured output path: use the structured helper
         validated_output: Any = None
-        try:
-            with telemetry_context(
-                run_id=resolved_run_id,
-                iteration=1,
-                recorder=recorder,
-                notifier=notifier,
-            ):
-                if output_type is not None:
-                    from dendrux.llm.structured import structured_complete
-
-                    response, validated_output = await structured_complete(
-                        provider,
-                        messages,
-                        output_type,
-                        run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
-                    )
-                else:
-                    response = await provider.complete(
-                        messages,
-                        tools=None,
-                        run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
-                    )
-
-                if response.tool_calls:
-                    raise RuntimeError(
-                        f"SingleCall received unexpected tool_calls from provider "
-                        f"({len(response.tool_calls)} calls). SingleCall agents must "
-                        f"have zero tools — the provider should not produce tool calls."
-                    )
-        except Exception as _llm_exc:
-            _llm_fail_ms = int((time.monotonic() - t0) * 1000)
-            await record_llm_failed(
+        retried = False
+        while True:
+            # LLM call (lifecycle: started → completed/failed)
+            await record_llm_started(
                 recorder,
                 resolved_run_id,
                 1,
-                _llm_exc,
-                duration_ms=_llm_fail_ms,
+                semantic_messages=prepared.semantic,
+                semantic_tools=None,
             )
-            await notify_llm_failed(
+            await notify_llm_started(
                 notifier,
                 resolved_run_id,
                 1,
-                _llm_exc,
                 notifier_warnings,
-                duration_ms=_llm_fail_ms,
+                semantic_messages=prepared.semantic,
+                semantic_tools=None,
             )
-            raise
+            t0 = time.monotonic()
+            failure: Exception | None = None
+            try:
+                with telemetry_context(
+                    run_id=resolved_run_id,
+                    iteration=1,
+                    recorder=recorder,
+                    notifier=notifier,
+                ):
+                    if output_type is not None:
+                        from dendrux.llm.structured import structured_complete
 
+                        response, validated_output = await structured_complete(
+                            provider,
+                            prepared.wire,
+                            output_type,
+                            run_id=resolved_run_id,
+                            cache_key_prefix=cache_key_prefix,
+                            **_pkw,
+                        )
+                    else:
+                        response = await provider.complete(
+                            prepared.wire,
+                            tools=None,
+                            run_id=resolved_run_id,
+                            cache_key_prefix=cache_key_prefix,
+                            **_pkw,
+                        )
+
+                    if response.tool_calls:
+                        raise RuntimeError(
+                            f"SingleCall received unexpected tool_calls from provider "
+                            f"({len(response.tool_calls)} calls). SingleCall agents must "
+                            f"have zero tools — the provider should not produce tool calls."
+                        )
+            except Exception as _llm_exc:
+                _llm_fail_ms = int((time.monotonic() - t0) * 1000)
+                await record_llm_failed(
+                    recorder,
+                    resolved_run_id,
+                    1,
+                    _llm_exc,
+                    duration_ms=_llm_fail_ms,
+                )
+                await notify_llm_failed(
+                    notifier,
+                    resolved_run_id,
+                    1,
+                    _llm_exc,
+                    notifier_warnings,
+                    duration_ms=_llm_fail_ms,
+                )
+                if not prepared.slots:
+                    raise
+                failure = _llm_exc
+            if failure is None:
+                break
+            decision = await images.on_failure(
+                failure,
+                prepared,
+                iteration=1,
+                retried=retried,
+                visible_deltas=0,
+                control_reader=control_reader,
+            )
+            if control_stop(decision) is not None:
+                return RunResult(
+                    run_id=resolved_run_id,
+                    status=RunStatus.CANCELLED,
+                    steps=[],
+                    iteration_count=0,
+                    usage=UsageStats(),
+                    meta=guardrail_meta(g_engine, notifier_warnings),
+                )
+            if decision.action == "propagate":
+                raise failure
+            if decision.action == "raise":
+                assert decision.error is not None
+                del failure
+                raise decision.error
+            del failure
+            retried = True
+            prepared = await images.prepare(
+                messages,
+                iteration=1,
+                guardrails=agent.guardrails or (),
+                force_tombstones=decision.tombstones,
+            )
+
+        images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
         response = price_response(response, pricing=agent.pricing, default_model=provider.model)
 
@@ -389,10 +460,10 @@ class SingleCall(Loop):
                     resolved_run_id,
                     _blocked_resp,
                     1,
-                    semantic_messages=messages,
+                    semantic_messages=prepared.semantic,
                     semantic_tools=None,
                     duration_ms=llm_duration_ms,
-                    guardrail_findings=_sc_findings or None,
+                    guardrail_findings=images.findings(prepared, _sc_findings),
                 )
                 await notify_llm(
                     notifier,
@@ -400,10 +471,10 @@ class SingleCall(Loop):
                     _blocked_resp,
                     1,
                     notifier_warnings,
-                    semantic_messages=messages,
+                    semantic_messages=prepared.semantic,
                     semantic_tools=None,
                     duration_ms=llm_duration_ms,
-                    guardrail_findings=_sc_findings or None,
+                    guardrail_findings=images.findings(prepared, _sc_findings),
                 )
                 await _single_call_budget(
                     agent.budget,
@@ -444,10 +515,10 @@ class SingleCall(Loop):
             resolved_run_id,
             response,
             1,
-            semantic_messages=messages,
+            semantic_messages=prepared.semantic,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
-            guardrail_findings=_sc_findings or None,
+            guardrail_findings=images.findings(prepared, _sc_findings),
         )
         await notify_llm(
             notifier,
@@ -455,10 +526,10 @@ class SingleCall(Loop):
             response,
             1,
             notifier_warnings,
-            semantic_messages=messages,
+            semantic_messages=prepared.semantic,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
-            guardrail_findings=_sc_findings or None,
+            guardrail_findings=images.findings(prepared, _sc_findings),
         )
 
         assistant_msg = Message(
@@ -515,8 +586,10 @@ class SingleCall(Loop):
         initial_usage: UsageStats | None = None,
         provider_kwargs: dict[str, Any] | None = None,
         output_type: type[BaseModel] | None = None,
-        state_store: StateStore | None = None,  # noqa: ARG002 — SingleCall has no checkpoints
+        state_store: StateStore | None = None,
         interrupt: asyncio.Event | None = None,
+        image_runtime: ImageRuntime | None = None,
+        image_view_state: ImageViewState | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream a single LLM call as RunEvents.
 
@@ -564,6 +637,18 @@ class SingleCall(Loop):
             history=history,
             tool_defs=[],
         )
+        images = _image_site(
+            agent,
+            provider,
+            image_runtime,
+            image_view_state,
+            _pkw,
+            recorder,
+            notifier,
+            resolved_run_id,
+            notifier_warnings,
+        )
+        control_reader = _cancel_reader(state_store, resolved_run_id)
 
         if interrupt is not None and interrupt.is_set():
             # cancel_run landed before the provider call started — don't spend it.
@@ -579,12 +664,14 @@ class SingleCall(Loop):
             )
             return
 
+        prepared = await images.prepare(messages, iteration=1)
+
         # LLM call (lifecycle: started → completed/failed)
         await record_llm_started(
             recorder,
             resolved_run_id,
             1,
-            semantic_messages=messages,
+            semantic_messages=prepared.semantic,
             semantic_tools=None,
         )
         await notify_llm_started(
@@ -592,7 +679,7 @@ class SingleCall(Loop):
             resolved_run_id,
             1,
             notifier_warnings,
-            semantic_messages=messages,
+            semantic_messages=prepared.semantic,
             semantic_tools=None,
         )
         t0 = time.monotonic()
@@ -605,7 +692,7 @@ class SingleCall(Loop):
         )
         _stream_telemetry.__enter__()
         provider_stream = provider.complete_stream(
-            messages,
+            prepared.wire,
             tools=None,
             run_id=resolved_run_id,
             cache_key_prefix=cache_key_prefix,
@@ -613,69 +700,139 @@ class SingleCall(Loop):
         )
         partial_text: list[str] = []
         interrupted = False
+        retried = False
+        cancelled = False
         try:
-            try:
-                async for event in interruptible(provider_stream, interrupt):
-                    if event.type == StreamEventType.TEXT_DELTA:
-                        partial_text.append(event.text or "")
-                        yield RunEvent(
-                            type=RunEventType.TEXT_DELTA,
-                            text=event.text,
-                            iteration=1,
-                            phase="final_answer",
-                        )
-                    elif event.type == StreamEventType.REASONING_DELTA:
-                        yield RunEvent(
-                            type=RunEventType.REASONING_DELTA, text=event.text, iteration=1
-                        )
-                    elif event.type in (
-                        StreamEventType.TOOL_USE_START,
-                        StreamEventType.TOOL_USE_END,
-                    ):
+            while True:
+                failure: Exception | None = None
+                visible_deltas = 0
+                try:
+                    async for event in interruptible(provider_stream, interrupt):
+                        if event.type == StreamEventType.TEXT_DELTA:
+                            partial_text.append(event.text or "")
+                            visible_deltas += 1
+                            yield RunEvent(
+                                type=RunEventType.TEXT_DELTA,
+                                text=event.text,
+                                iteration=1,
+                                phase="final_answer",
+                            )
+                        elif event.type == StreamEventType.REASONING_DELTA:
+                            visible_deltas += 1
+                            yield RunEvent(
+                                type=RunEventType.REASONING_DELTA, text=event.text, iteration=1
+                            )
+                        elif event.type in (
+                            StreamEventType.TOOL_USE_START,
+                            StreamEventType.TOOL_USE_END,
+                        ):
+                            raise RuntimeError(
+                                f"SingleCall received unexpected {event.type.value} event "
+                                f"from provider stream. SingleCall agents must have zero "
+                                f"tools — the provider should not produce tool events."
+                            )
+                        elif event.type == StreamEventType.DONE:
+                            llm_response = event.raw
+                    # Validate inside the same try so contract violations still
+                    # pair with on_llm_call_failed (started already fired).
+                    if llm_response is None:
                         raise RuntimeError(
-                            f"SingleCall received unexpected {event.type.value} event "
-                            f"from provider stream. SingleCall agents must have zero "
-                            f"tools — the provider should not produce tool events."
+                            "Provider stream ended without DONE event. "
+                            "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
                         )
-                    elif event.type == StreamEventType.DONE:
-                        llm_response = event.raw
-                # Validate inside the same try so contract violations still
-                # pair with on_llm_call_failed (started already fired).
-                if llm_response is None:
-                    raise RuntimeError(
-                        "Provider stream ended without DONE event. "
-                        "complete_stream() must yield StreamEvent(type=DONE, raw=LLMResponse)."
+                    if llm_response.tool_calls:
+                        raise RuntimeError(
+                            f"SingleCall received unexpected tool_calls from provider "
+                            f"({len(llm_response.tool_calls)} calls). SingleCall agents must "
+                            f"have zero tools — the provider should not produce tool calls."
+                        )
+                except Exception as _stream_exc:
+                    _stream_fail_ms = int((time.monotonic() - t0) * 1000)
+                    await record_llm_failed(
+                        recorder,
+                        resolved_run_id,
+                        1,
+                        _stream_exc,
+                        duration_ms=_stream_fail_ms,
                     )
-                if llm_response.tool_calls:
-                    raise RuntimeError(
-                        f"SingleCall received unexpected tool_calls from provider "
-                        f"({len(llm_response.tool_calls)} calls). SingleCall agents must "
-                        f"have zero tools — the provider should not produce tool calls."
+                    await notify_llm_failed(
+                        notifier,
+                        resolved_run_id,
+                        1,
+                        _stream_exc,
+                        notifier_warnings,
+                        duration_ms=_stream_fail_ms,
                     )
-            except Exception as _stream_exc:
-                _stream_fail_ms = int((time.monotonic() - t0) * 1000)
-                await record_llm_failed(
+                    if isinstance(_stream_exc, StreamInterruptedError):
+                        interrupted = True
+                    elif not prepared.slots:
+                        raise
+                    else:
+                        failure = _stream_exc
+                if failure is None:
+                    break
+                decision = await images.on_failure(
+                    failure,
+                    prepared,
+                    iteration=1,
+                    retried=retried,
+                    visible_deltas=visible_deltas,
+                    control_reader=control_reader,
+                )
+                if control_stop(decision) is not None:
+                    cancelled = True
+                    break
+                if decision.action == "propagate":
+                    raise failure
+                if decision.action == "raise":
+                    assert decision.error is not None
+                    del failure
+                    raise decision.error
+                del failure
+                retried = True
+                await provider_stream.aclose()
+                prepared = await images.prepare(
+                    messages, iteration=1, force_tombstones=decision.tombstones
+                )
+                await record_llm_started(
                     recorder,
                     resolved_run_id,
                     1,
-                    _stream_exc,
-                    duration_ms=_stream_fail_ms,
+                    semantic_messages=prepared.semantic,
+                    semantic_tools=None,
                 )
-                await notify_llm_failed(
+                await notify_llm_started(
                     notifier,
                     resolved_run_id,
                     1,
-                    _stream_exc,
                     notifier_warnings,
-                    duration_ms=_stream_fail_ms,
+                    semantic_messages=prepared.semantic,
+                    semantic_tools=None,
                 )
-                if isinstance(_stream_exc, StreamInterruptedError):
-                    interrupted = True
-                else:
-                    raise
+                t0 = time.monotonic()
+                provider_stream = provider.complete_stream(
+                    prepared.wire,
+                    tools=None,
+                    run_id=resolved_run_id,
+                    cache_key_prefix=cache_key_prefix,
+                    **_pkw,
+                )
         finally:
             await provider_stream.aclose()
             _stream_telemetry.__exit__(None, None, None)
+
+        if cancelled:
+            yield RunEvent(
+                type=RunEventType.RUN_CANCELLED,
+                run_result=RunResult(
+                    run_id=resolved_run_id,
+                    status=RunStatus.CANCELLED,
+                    iteration_count=0,
+                    usage=UsageStats(),
+                    meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                ),
+            )
+            return
 
         if interrupted:
             yield RunEvent(
@@ -694,6 +851,7 @@ class SingleCall(Loop):
         # The try-block raised if no DONE arrived; only the interrupted path
         # (handled above) leaves this None.
         assert llm_response is not None
+        images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
         llm_response = price_response(
             llm_response, pricing=agent.pricing, default_model=provider.model
@@ -704,7 +862,7 @@ class SingleCall(Loop):
             resolved_run_id,
             llm_response,
             1,
-            semantic_messages=messages,
+            semantic_messages=prepared.semantic,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
         )
@@ -714,7 +872,7 @@ class SingleCall(Loop):
             llm_response,
             1,
             notifier_warnings,
-            semantic_messages=messages,
+            semantic_messages=prepared.semantic,
             semantic_tools=None,
             duration_ms=llm_duration_ms,
         )
@@ -761,3 +919,39 @@ class SingleCall(Loop):
                 meta=sc_stream_meta,
             ),
         )
+
+
+def _image_site(
+    agent: Agent,
+    provider: LLMProvider,
+    image_runtime: ImageRuntime | None,
+    image_view_state: ImageViewState | None,
+    provider_kwargs: dict[str, Any],
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    warnings: list[str],
+) -> ImageCallSite:
+    return ImageCallSite(
+        state=image_view_state if image_view_state is not None else ImageViewState(),
+        policy=_image_policy(agent, image_runtime),
+        runtime=image_runtime,
+        provider=provider,
+        model=str(provider_kwargs.get("model") or provider.model),
+        recorder=recorder,
+        notifier=notifier,
+        run_id=run_id,
+        warnings=warnings,
+    )
+
+
+def _cancel_reader(state_store: StateStore | None, run_id: str) -> Callable[[], Awaitable[Any]]:
+    """Control reader for an image retry: SingleCall honours cancel only (it never pauses)."""
+
+    async def read() -> Any:
+        if state_store is None:
+            return None
+        control = await _read_control(state_store, run_id)
+        return control if control.cancel_requested else None
+
+    return read

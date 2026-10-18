@@ -28,6 +28,7 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
+from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._retry_telemetry import telemetry_context
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
@@ -52,7 +53,18 @@ from dendrux.loops._helpers import (
     record_tool,
     record_tool_started,
 )
+from dendrux.loops._images import (
+    ImageCallSite,
+    control_stop,
+    no_control,
+    pause_image_view,
+    tool_result_images_dropped,
+)
 from dendrux.loops.base import Loop
+from dendrux.media._ids import IMAGE_ID_RE
+from dendrux.media._image import Image, ToolOutput
+from dendrux.media._ingest import ingest
+from dendrux.media._policy import ImagePolicy
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
 from dendrux.tools._validate import check_tool_call, check_tool_json
@@ -62,6 +74,9 @@ from dendrux.types import (
     Clarification,
     Finish,
     GovernanceEventType,
+    ImagePart,
+    ImageRef,
+    ImageViewState,
     LLMResponse,
     Message,
     PauseState,
@@ -82,13 +97,14 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Sequence
 
     from pydantic import BaseModel
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
     from dendrux.types import BeforeToolHook, ToolResultTransform
@@ -211,6 +227,13 @@ async def _append_assistant(
     return msg
 
 
+def _format_result(strategy: Strategy, result: ToolResult) -> Message:
+    """``strategy.format_tool_result`` plus the dropped-images guard."""
+    msg = strategy.format_tool_result(result)
+    tool_result_images_dropped(result.images, msg)
+    return msg
+
+
 def _commentary(steps: list[AgentStep]) -> list[str]:
     """Non-empty assistant text from steps that ended in tool calls, in order."""
     return [
@@ -247,6 +270,7 @@ def _build_pause(
     usage: UsageStats,
     approval_gates: dict[str, dict[str, str | None]] | None = None,
     budget: BudgetTracker | None = None,
+    image_view: ImageViewState | None = None,
 ) -> PauseState:
     """Build PauseState for client tool, approval or clarification pause."""
     pending_targets = (
@@ -265,6 +289,7 @@ def _build_pause(
         trace_order_offset=len(history),
         usage=_snapshot_usage(usage),
         approval_gates=approval_gates,
+        image_view=image_view,
         **(budget.pause_fields() if budget is not None else {}),
     )
 
@@ -299,6 +324,7 @@ def _checkpoint_pause_result(
     meta: dict[str, Any],
     budget: BudgetTracker | None = None,
     breaches: list[BudgetBreach] | None = None,
+    image_view: ImageViewState | None = None,
 ) -> RunResult:
     """PAUSED result for a pause observed at the top of ``iteration``.
 
@@ -318,6 +344,7 @@ def _checkpoint_pause_result(
         usage=_snapshot_usage(usage),
         pause_reason="budget" if exceeded else "requested",
         budget_exceeded=exceeded,
+        image_view=image_view,
         **(budget.pause_fields() if budget is not None else {}),
     )
     extra = {"budget_exceeded": exceeded} if exceeded else {}
@@ -329,6 +356,47 @@ def _checkpoint_pause_result(
         iteration_count=iteration - 1,
         usage=usage,
         meta={"pause_state": pause, **meta, **extra},
+    )
+
+
+def _control_stop_result(
+    control: Any,
+    *,
+    agent_name: str,
+    run_id: str,
+    history: list[Message],
+    steps: list[AgentStep],
+    iteration: int,
+    usage: UsageStats,
+    meta: dict[str, Any],
+    budget: BudgetTracker | None,
+    image_view: ImageViewState | None,
+) -> RunResult:
+    """CANCELLED / PAUSED result for a control read just before an image retry (N-15.1).
+
+    Nothing of ``iteration`` was committed (the assistant turn never
+    arrived), so it ends exactly like the top-of-iteration checkpoint.
+    """
+    if control.cancel_requested:
+        return RunResult(
+            run_id=run_id,
+            status=RunStatus.CANCELLED,
+            steps=steps,
+            commentary=_commentary(steps),
+            iteration_count=iteration - 1,
+            usage=usage,
+            meta=meta,
+        )
+    return _checkpoint_pause_result(
+        agent_name=agent_name,
+        run_id=run_id,
+        history=history,
+        steps=steps,
+        iteration=iteration,
+        usage=usage,
+        meta=meta,
+        budget=budget,
+        image_view=image_view,
     )
 
 
@@ -367,6 +435,7 @@ async def _budget_stop(
     iteration: int,
     usage: UsageStats,
     meta: dict[str, Any],
+    image_view: ImageViewState | None = None,
 ) -> RunResult | None:
     """Checkpoint budget enforcement: a PAUSED/CANCELLED result, or None to go on."""
     action, breaches = await budget.checkpoint(iteration)
@@ -391,6 +460,7 @@ async def _budget_stop(
         meta=meta,
         budget=budget,
         breaches=breaches,
+        image_view=image_view,
     )
 
 
@@ -454,6 +524,7 @@ class _LoopState(NamedTuple):
     steps: list[AgentStep]
     usage: UsageStats
     warnings: list[str]
+    image_view: ImageViewState
 
 
 async def _init_loop_state(
@@ -465,6 +536,7 @@ async def _init_loop_state(
     initial_history: list[Message] | None,
     initial_steps: list[AgentStep] | None,
     initial_usage: UsageStats | None,
+    image_view_state: ImageViewState | None = None,
 ) -> _LoopState:
     """Initialize mutable loop state — shared between run() and run_stream()."""
     if initial_history is not None:
@@ -506,6 +578,7 @@ async def _init_loop_state(
         steps=steps,
         usage=usage,
         warnings=[],
+        image_view=image_view_state if image_view_state is not None else ImageViewState(),
     )
 
 
@@ -528,6 +601,7 @@ async def _process_tool_calls(
     approved_skills: bool = False,
     before_tool: BeforeToolHook | None = None,
     tenant_id: str | None = None,
+    image_runtime: ImageRuntime | None = None,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -576,7 +650,7 @@ async def _process_tool_calls(
             continue
         await _record_tool(recorder, run_id, tc, json_result, iteration)
         await _notify_tool(notifier, run_id, tc, json_result, iteration, warnings)
-        result_msg = strategy.format_tool_result(json_result)
+        result_msg = _format_result(strategy, json_result)
         history.append(result_msg)
         await _record_message(recorder, run_id, result_msg, iteration)
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
@@ -613,7 +687,7 @@ async def _process_tool_calls(
                 correlation_id=tc.id,
                 warnings=warnings,
             )
-            result_msg = strategy.format_tool_result(deny_result)
+            result_msg = _format_result(strategy, deny_result)
             history.append(result_msg)
             await _record_message(recorder, run_id, result_msg, iteration)
             await _notify_message(notifier, run_id, result_msg, iteration, warnings)
@@ -655,7 +729,7 @@ async def _process_tool_calls(
                 if tc.name == "use_skill" and isinstance(lookups.fn.get(tc.name), SkillTool):
                     anticipated.add(tc.params["name"])
                 continue
-            result_msg = strategy.format_tool_result(failure)
+            result_msg = _format_result(strategy, failure)
             history.append(result_msg)
             await _record_tool(recorder, run_id, tc, failure, iteration)
             await _notify_tool(notifier, run_id, tc, failure, iteration, warnings)
@@ -686,6 +760,7 @@ async def _process_tool_calls(
             warnings=warnings,
             all_results=all_results,
             tenant_id=tenant_id,
+            image_runtime=image_runtime,
         )
 
     # --- Phase 1: Approval check (governance) ---
@@ -740,7 +815,7 @@ async def _process_tool_calls(
             continue
         await _record_tool(recorder, run_id, tc, invalid_result, iteration)
         await _notify_tool(notifier, run_id, tc, invalid_result, iteration, warnings)
-        result_msg = strategy.format_tool_result(invalid_result)
+        result_msg = _format_result(strategy, invalid_result)
         history.append(result_msg)
         await _record_message(recorder, run_id, result_msg, iteration)
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
@@ -765,7 +840,7 @@ async def _process_tool_calls(
             )
             await _record_tool(recorder, run_id, tc, limit_result, iteration)
             await _notify_tool(notifier, run_id, tc, limit_result, iteration, warnings)
-            result_msg = strategy.format_tool_result(limit_result)
+            result_msg = _format_result(strategy, limit_result)
             history.append(result_msg)
             await _record_message(recorder, run_id, result_msg, iteration)
             await _notify_message(notifier, run_id, result_msg, iteration, warnings)
@@ -800,6 +875,7 @@ async def _process_tool_calls(
                         iteration,
                         warnings,
                         tool_result_transform,
+                        image_runtime=image_runtime,
                     )
                     for tc in group
                 ]
@@ -809,7 +885,9 @@ async def _process_tool_calls(
             for tc in group:
                 await _record_tool_started(recorder, run_id, tc, iteration)
                 await _notify_tool_started(notifier, run_id, tc, iteration, warnings)
-                tool_result = await _execute_tool(tc, lookups, tool_result_transform)
+                tool_result = await _execute_tool(
+                    tc, lookups, tool_result_transform, image_runtime=image_runtime
+                )
                 await _record_tool(recorder, run_id, tc, tool_result, iteration)
                 await _notify_tool(notifier, run_id, tc, tool_result, iteration, warnings)
                 executed.append((tc, tool_result))
@@ -817,7 +895,7 @@ async def _process_tool_calls(
     # --- Phase 4: Append history in original order (deterministic for LLM) ---
     for tc, tool_result in executed:
         call_counts[tc.name] = call_counts.get(tc.name, 0) + 1
-        result_msg = strategy.format_tool_result(tool_result)
+        result_msg = _format_result(strategy, tool_result)
         history.append(result_msg)
         await _record_message(recorder, run_id, result_msg, iteration)
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
@@ -858,6 +936,7 @@ async def _call_before_tool(
     run_id: str,
     iteration: int,
     tenant_id: str | None,
+    images: tuple[ImageRef, ...] = (),
 ) -> tuple[ToolDecision | None, str | None]:
     """Run the hook on deep-copied inputs. Returns (decision, error_type).
 
@@ -875,6 +954,7 @@ async def _call_before_tool(
             meta=copy.deepcopy(lookups.meta.get(tc.name, {})),
             iteration=iteration,
             tenant_id=tenant_id,
+            images=images,
         )
         decision = hook(ctx)
         if inspect.isawaitable(decision):
@@ -912,6 +992,7 @@ async def _apply_before_tool(
     warnings: list[str],
     all_results: list[tuple[ToolCall, ToolResult]],
     tenant_id: str | None,
+    image_runtime: ImageRuntime | None = None,
 ) -> list[ToolCall]:
     """Evaluate ``before_tool`` per call; returns the calls that continue.
 
@@ -930,7 +1011,7 @@ async def _apply_before_tool(
         if record:
             await _record_tool(recorder, run_id, tc, result, iteration)
             await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
-        result_msg = strategy.format_tool_result(result)
+        result_msg = _format_result(strategy, result)
         history.append(result_msg)
         await _record_message(recorder, run_id, result_msg, iteration)
         await _notify_message(notifier, run_id, result_msg, iteration, warnings)
@@ -962,9 +1043,16 @@ async def _apply_before_tool(
         await deny(tc, _HOOK_ERROR_REASON)
 
     kept: list[ToolCall] = []
+    run_images = _run_image_index(history)
     for tc in calls:
         decision, error_type = await _call_before_tool(
-            hook, tc, lookups, run_id=run_id, iteration=iteration, tenant_id=tenant_id
+            hook,
+            tc,
+            lookups,
+            run_id=run_id,
+            iteration=iteration,
+            tenant_id=tenant_id,
+            images=_referenced_images(tc.params, run_images),
         )
         if error_type is not None:
             await hook_error(tc, error_type)
@@ -998,21 +1086,137 @@ async def _apply_before_tool(
             # Static approval gate stays in place; the call goes to a human.
             kept.append(tc)
             continue
+        sub_images: tuple[ImagePart, ...] = ()
         try:
-            payload = json.dumps(decision.result)
+            if isinstance(decision.result, ToolOutput):
+                payload = json.dumps(decision.result.result)
+            else:
+                payload = json.dumps(decision.result)
         except (TypeError, ValueError) as exc:
             await hook_error(tc, type(exc).__name__)
             continue
+        if isinstance(decision.result, ToolOutput) and decision.result.images:
+            try:
+                sub_images = await _ingest_tool_images(
+                    decision.result.images, tc.name, image_runtime
+                )
+            except Exception as exc:
+                # Fails closed like a serialisation error: the call is denied.
+                await hook_error(tc, type(exc).__name__)
+                continue
         substituted = ToolResult(
             name=tc.name,
             call_id=tc.id,
             payload=payload,
             success=True,
             meta={"substituted": True},
+            images=sub_images,
         )
         await governance("policy.substituted", {"tool_name": tc.name, "call_id": tc.id}, tc.id)
         await append(tc, substituted, record=True)
     return kept
+
+
+def _run_image_index(history: list[Message]) -> dict[str, list[ImageRef]]:
+    """``image_id`` -> distinct refs of this run's image slots, in slot order."""
+    index: dict[str, list[ImageRef]] = {}
+    for msg in history:
+        for part in msg.images:
+            refs = index.setdefault(part.ref.image_id, [])
+            if part.ref not in refs:
+                refs.append(part.ref)
+    return index
+
+
+def _referenced_images(params: Any, run_images: dict[str, list[ImageRef]]) -> tuple[ImageRef, ...]:
+    """Refs whose ``img_...`` id is a whole string value anywhere in ``params`` (OQ-9)."""
+    if not run_images:
+        return ()
+    found: set[str] = set()
+
+    def walk(value: Any, depth: int) -> None:
+        if depth > 50:
+            return
+        if isinstance(value, str):
+            if value in run_images and IMAGE_ID_RE.fullmatch(value):
+                found.add(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(params, 0)
+    out: list[ImageRef] = []
+    for image_id, refs in run_images.items():
+        if image_id in found:
+            out.extend(ref for ref in refs if ref not in out)
+    return tuple(out)
+
+
+async def _ingest_tool_images(
+    images: Sequence[Any],
+    tool_name: str,
+    image_runtime: ImageRuntime | None,
+) -> tuple[ImagePart, ...]:
+    """Strict ingest of a local tool's / substitute's ``ToolOutput`` images."""
+    if image_runtime is None:
+        raise ImagePersistenceUnsupportedError("loop")
+    return await ingest(
+        tuple(images),
+        policy=image_runtime.policy,
+        runtime=image_runtime,
+        origin="tool",
+        tool_name=tool_name,
+    )
+
+
+async def _ingest_mcp_images(
+    images: Sequence[Any],
+    tool_name: str,
+    image_runtime: ImageRuntime | None,
+) -> tuple[tuple[ImagePart, ...], tuple[str, ...]]:
+    """Lenient ingest of MCP images: failures become notes, the call still succeeds (N-11)."""
+    if image_runtime is None:
+        raise ImagePersistenceUnsupportedError("loop")
+    outcomes = await ingest(
+        tuple(images),
+        policy=image_runtime.policy,
+        runtime=image_runtime,
+        origin="mcp",
+        tool_name=tool_name,
+        lenient=True,
+        collect_errors=True,
+    )
+    parts: list[ImagePart] = []
+    notes: list[str] = []
+    for outcome in outcomes:
+        if isinstance(outcome, ImageError):
+            reason = getattr(outcome, "reason", None) or getattr(outcome, "scope", None)
+            notes.append(f"[image from MCP could not be used: {reason or 'invalid'}]")
+        else:
+            parts.append(outcome)
+    return tuple(parts), tuple(notes)
+
+
+def _contains_image(value: Any, depth: int = 0) -> bool:
+    if isinstance(value, (Image, ImageRef, ImagePart)):
+        return True
+    if depth > 20:
+        return False
+    if isinstance(value, dict):
+        return any(_contains_image(v, depth + 1) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_image(v, depth + 1) for v in value)
+    return False
+
+
+def _image_policy(agent: Any, image_runtime: ImageRuntime | None) -> ImagePolicy:
+    if image_runtime is not None:
+        return image_runtime.policy
+    policy = getattr(agent, "image_policy", None)
+    return policy if isinstance(policy, ImagePolicy) else ImagePolicy()
 
 
 class ReActLoop(Loop):
@@ -1050,11 +1254,15 @@ class ReActLoop(Loop):
         initial_pii_mapping: dict[str, str] | None = None,
         state_store: StateStore | None = None,
         budget_carry: BudgetCarry | None = None,
+        image_runtime: ImageRuntime | None = None,
+        image_view_state: ImageViewState | None = None,
     ) -> RunResult:
         """Execute the ReAct loop, optionally resuming from a pause.
 
         ``budget_carry`` restores budget bookkeeping (fired keys) from the
-        pause being resumed.
+        pause being resumed. ``image_runtime`` is the run's image runtime
+        (tenant scope, catalog, stores); ``image_view_state`` restores the
+        request-view state from a pause or seeds it for a new run.
         """
         resolved_run_id = run_id or generate_ulid()
         _pkw = provider_kwargs or {}
@@ -1069,9 +1277,28 @@ class ReActLoop(Loop):
             initial_history=initial_history,
             initial_steps=initial_steps,
             initial_usage=initial_usage,
+            image_view_state=image_view_state,
         )
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
+        image_state = state.image_view
+        images = ImageCallSite(
+            state=image_state,
+            policy=_image_policy(agent, image_runtime),
+            runtime=image_runtime,
+            provider=provider,
+            model=str(_pkw.get("model") or provider.model),
+            recorder=recorder,
+            notifier=notifier,
+            run_id=resolved_run_id,
+            warnings=notifier_warnings,
+        )
+
+        async def _control_reader() -> Any:
+            if state_store is None:
+                return await no_control()
+            return await _read_control(state_store, resolved_run_id)
+
         budget = BudgetTracker(
             agent.budget,
             run_id=resolved_run_id,
@@ -1124,6 +1351,7 @@ class ReActLoop(Loop):
                     usage=total_usage,
                     meta=guardrail_meta(g_engine, notifier_warnings),
                     budget=budget,
+                    image_view=pause_image_view(image_state, history),
                 )
             budget_result = await _budget_stop(
                 budget,
@@ -1134,6 +1362,7 @@ class ReActLoop(Loop):
                 iteration=iteration,
                 usage=total_usage,
                 meta=guardrail_meta(g_engine, notifier_warnings),
+                image_view=pause_image_view(image_state, history),
             )
             if budget_result is not None:
                 return budget_result
@@ -1163,7 +1392,7 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
-                    cleaned, findings, block_err = await g_engine.scan_incoming(msg.content)
+                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg)
                     if findings:
                         all_in_findings.extend(findings)
                     if block_err is not None:
@@ -1192,11 +1421,11 @@ class ReActLoop(Loop):
                             usage=total_usage,
                             meta=guardrail_meta(g_engine, notifier_warnings),
                         )
-                    if cleaned != msg.content:
+                    if cleaned_msg is not msg:
                         _in_was_redacted = True
-                        # replace() preserves the origin envelope
+                        # The engine's replace() preserves the origin envelope
                         # (kind/placement/source) through redaction.
-                        messages[msg_idx] = replace(msg, content=cleaned)
+                        messages[msg_idx] = cleaned_msg
                 if all_in_findings:
                     _in_entities = list({f.entity_type for f in all_in_findings})
                     await _record_governance(
@@ -1243,55 +1472,125 @@ class ReActLoop(Loop):
                         warnings=notifier_warnings,
                     )
 
-            # LLM call — batch (lifecycle: started → completed/failed)
-            await _record_llm_started(
-                recorder,
-                resolved_run_id,
-                iteration,
-                semantic_messages=messages,
-                semantic_tools=tools,
+            # Image request view (§5.1): placeholders, caps, verified bytes.
+            prepared = await images.prepare(
+                messages, iteration=iteration, guardrails=agent.guardrails or ()
             )
-            await _notify_llm_started(
-                notifier,
-                resolved_run_id,
-                iteration,
-                notifier_warnings,
-                semantic_messages=messages,
-                semantic_tools=tools,
-            )
-            t0 = time.monotonic()
-            try:
-                with telemetry_context(
+            if prepared.block_error is not None:
+                return await self._image_blocked(
+                    prepared.block_error,
+                    images=images,
                     run_id=resolved_run_id,
                     iteration=iteration,
-                    recorder=recorder,
-                    notifier=notifier,
-                ):
-                    response = await provider.complete(
-                        messages,
-                        tools=tools,
-                        run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
-                    )
-            except Exception as _llm_exc:
-                _llm_fail_ms = int((time.monotonic() - t0) * 1000)
-                await _record_llm_failed(
+                    steps=steps,
+                    usage=total_usage,
+                    meta=guardrail_meta(g_engine, notifier_warnings),
+                )
+
+            # LLM call — batch (lifecycle: started → completed/failed).
+            # An image rejection may retry the call once (§5.7).
+            retried = False
+            while True:
+                await _record_llm_started(
                     recorder,
                     resolved_run_id,
                     iteration,
-                    _llm_exc,
-                    duration_ms=_llm_fail_ms,
+                    semantic_messages=prepared.semantic,
+                    semantic_tools=tools,
                 )
-                await _notify_llm_failed(
+                await _notify_llm_started(
                     notifier,
                     resolved_run_id,
                     iteration,
-                    _llm_exc,
                     notifier_warnings,
-                    duration_ms=_llm_fail_ms,
+                    semantic_messages=prepared.semantic,
+                    semantic_tools=tools,
                 )
-                raise
+                t0 = time.monotonic()
+                failure: Exception | None = None
+                try:
+                    with telemetry_context(
+                        run_id=resolved_run_id,
+                        iteration=iteration,
+                        recorder=recorder,
+                        notifier=notifier,
+                    ):
+                        response = await provider.complete(
+                            prepared.wire,
+                            tools=tools,
+                            run_id=resolved_run_id,
+                            cache_key_prefix=cache_key_prefix,
+                            **_pkw,
+                        )
+                except Exception as _llm_exc:
+                    _llm_fail_ms = int((time.monotonic() - t0) * 1000)
+                    await _record_llm_failed(
+                        recorder,
+                        resolved_run_id,
+                        iteration,
+                        _llm_exc,
+                        duration_ms=_llm_fail_ms,
+                    )
+                    await _notify_llm_failed(
+                        notifier,
+                        resolved_run_id,
+                        iteration,
+                        _llm_exc,
+                        notifier_warnings,
+                        duration_ms=_llm_fail_ms,
+                    )
+                    if not prepared.slots:
+                        raise
+                    failure = _llm_exc
+                if failure is None:
+                    break
+                decision = await images.on_failure(
+                    failure,
+                    prepared,
+                    iteration=iteration,
+                    retried=retried,
+                    visible_deltas=0,
+                    control_reader=_control_reader,
+                )
+                stop = control_stop(decision)
+                if stop is not None:
+                    return _control_stop_result(
+                        stop,
+                        agent_name=agent.name,
+                        run_id=resolved_run_id,
+                        history=history,
+                        steps=steps,
+                        iteration=iteration,
+                        usage=total_usage,
+                        meta=guardrail_meta(g_engine, notifier_warnings),
+                        budget=budget,
+                        image_view=pause_image_view(image_state, history),
+                    )
+                if decision.action == "propagate":
+                    raise failure
+                if decision.action == "raise":
+                    assert decision.error is not None
+                    del failure
+                    raise decision.error
+                del failure
+                retried = True
+                prepared = await images.prepare(
+                    messages,
+                    iteration=iteration,
+                    guardrails=agent.guardrails or (),
+                    force_tombstones=decision.tombstones,
+                )
+                if prepared.block_error is not None:
+                    return await self._image_blocked(
+                        prepared.block_error,
+                        images=images,
+                        run_id=resolved_run_id,
+                        iteration=iteration,
+                        steps=steps,
+                        usage=total_usage,
+                        meta=guardrail_meta(g_engine, notifier_warnings),
+                    )
+            images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
             response = price_response(response, pricing=agent.pricing, default_model=provider.model)
 
@@ -1349,10 +1648,10 @@ class ReActLoop(Loop):
                         resolved_run_id,
                         _blocked_response,
                         iteration,
-                        semantic_messages=messages,
+                        semantic_messages=prepared.semantic,
                         semantic_tools=tools,
                         duration_ms=llm_duration_ms,
-                        guardrail_findings=_all_guardrail_findings or None,
+                        guardrail_findings=images.findings(prepared, _all_guardrail_findings),
                     )
                     await _notify_llm(
                         notifier,
@@ -1360,10 +1659,10 @@ class ReActLoop(Loop):
                         _blocked_response,
                         iteration,
                         notifier_warnings,
-                        semantic_messages=messages,
+                        semantic_messages=prepared.semantic,
                         semantic_tools=tools,
                         duration_ms=llm_duration_ms,
-                        guardrail_findings=_all_guardrail_findings or None,
+                        guardrail_findings=images.findings(prepared, _all_guardrail_findings),
                     )
                     _accumulate_usage(total_usage, response.usage)
                     budget.add_response(response.usage)
@@ -1401,10 +1700,10 @@ class ReActLoop(Loop):
                 resolved_run_id,
                 response,
                 iteration,
-                semantic_messages=messages,
+                semantic_messages=prepared.semantic,
                 semantic_tools=tools,
                 duration_ms=llm_duration_ms,
-                guardrail_findings=_all_guardrail_findings or None,
+                guardrail_findings=images.findings(prepared, _all_guardrail_findings),
             )
             await _notify_llm(
                 notifier,
@@ -1412,10 +1711,10 @@ class ReActLoop(Loop):
                 response,
                 iteration,
                 notifier_warnings,
-                semantic_messages=messages,
+                semantic_messages=prepared.semantic,
                 semantic_tools=tools,
                 duration_ms=llm_duration_ms,
-                guardrail_findings=_all_guardrail_findings or None,
+                guardrail_findings=images.findings(prepared, _all_guardrail_findings),
             )
             _accumulate_usage(total_usage, response.usage)
             budget.add_response(response.usage)
@@ -1468,6 +1767,7 @@ class ReActLoop(Loop):
                     iteration=iteration,
                     usage=total_usage,
                     budget=budget,
+                    image_view=pause_image_view(image_state, history),
                 )
                 meta: dict[str, Any] = {
                     "pause_state": pause,
@@ -1512,6 +1812,7 @@ class ReActLoop(Loop):
                     guardrail_engine=g_engine,
                     before_tool=before_tool,
                     tenant_id=hook_tenant_id,
+                    image_runtime=image_runtime,
                 )
                 if outcome.pending_calls:
                     pause_status = (
@@ -1529,6 +1830,7 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         approval_gates=outcome.approval_gates,
                         budget=budget,
+                        image_view=pause_image_view(image_state, history),
                     )
                     meta = {"pause_state": pause, **guardrail_meta(g_engine, notifier_warnings)}
                     return RunResult(
@@ -1551,6 +1853,32 @@ class ReActLoop(Loop):
             meta=guardrail_meta(g_engine, notifier_warnings),
         )
 
+    @staticmethod
+    async def _image_blocked(
+        error: str,
+        *,
+        images: ImageCallSite,
+        run_id: str,
+        iteration: int,
+        steps: list[AgentStep],
+        usage: UsageStats,
+        meta: dict[str, Any],
+    ) -> RunResult:
+        """ERROR result for an image guardrail ``block`` (commit step 4)."""
+        await images.emit(
+            "guardrail.blocked", {"direction": "incoming_image", "error": error}, iteration
+        )
+        return RunResult(
+            run_id=run_id,
+            status=RunStatus.ERROR,
+            error=error,
+            steps=steps,
+            commentary=_commentary(steps),
+            iteration_count=iteration,
+            usage=usage,
+            meta=meta,
+        )
+
     async def run_stream(
         self,
         *,
@@ -1570,6 +1898,8 @@ class ReActLoop(Loop):
         state_store: StateStore | None = None,
         interrupt: asyncio.Event | None = None,
         budget_carry: BudgetCarry | None = None,
+        image_runtime: ImageRuntime | None = None,
+        image_view_state: ImageViewState | None = None,
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 
@@ -1591,9 +1921,28 @@ class ReActLoop(Loop):
             initial_history=initial_history,
             initial_steps=initial_steps,
             initial_usage=initial_usage,
+            image_view_state=image_view_state,
         )
         history, call_counts, steps = state.history, state.call_counts, state.steps
         total_usage, notifier_warnings = state.usage, state.warnings
+        image_state = state.image_view
+        images = ImageCallSite(
+            state=image_state,
+            policy=_image_policy(agent, image_runtime),
+            runtime=image_runtime,
+            provider=provider,
+            model=str(_pkw.get("model") or provider.model),
+            recorder=recorder,
+            notifier=notifier,
+            run_id=resolved_run_id,
+            warnings=notifier_warnings,
+        )
+
+        async def _control_reader() -> Any:
+            if state_store is None:
+                return await no_control()
+            return await _read_control(state_store, resolved_run_id)
+
         budget = BudgetTracker(
             agent.budget,
             run_id=resolved_run_id,
@@ -1650,6 +1999,7 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
                         budget=budget,
+                        image_view=pause_image_view(image_state, history),
                     ),
                 )
                 return
@@ -1662,6 +2012,7 @@ class ReActLoop(Loop):
                 iteration=iteration,
                 usage=total_usage,
                 meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                image_view=pause_image_view(image_state, history),
             )
             if budget_result is not None:
                 yield RunEvent(
@@ -1691,12 +2042,16 @@ class ReActLoop(Loop):
                 tool_defs=tool_defs,
             )
 
+            # Image request view (§5.1). Image guardrails are batch-only:
+            # stream() rejects guardrails at the Agent level.
+            prepared = await images.prepare(messages, iteration=iteration)
+
             # LLM call — streaming (lifecycle: started → completed/failed)
             await _record_llm_started(
                 recorder,
                 resolved_run_id,
                 iteration,
-                semantic_messages=messages,
+                semantic_messages=prepared.semantic,
                 semantic_tools=tools,
             )
             await _notify_llm_started(
@@ -1704,7 +2059,7 @@ class ReActLoop(Loop):
                 resolved_run_id,
                 iteration,
                 notifier_warnings,
-                semantic_messages=messages,
+                semantic_messages=prepared.semantic,
                 semantic_tools=tools,
             )
             t0 = time.monotonic()
@@ -1717,7 +2072,7 @@ class ReActLoop(Loop):
             )
             _stream_telemetry.__enter__()
             provider_stream = provider.complete_stream(
-                messages,
+                prepared.wire,
                 tools=tools,
                 run_id=resolved_run_id,
                 cache_key_prefix=cache_key_prefix,
@@ -1727,76 +2082,161 @@ class ReActLoop(Loop):
             # Text after a tool block in the same call is known commentary.
             saw_tool_use = False
             interrupted = False
+            retried = False
+            stop_control: Any = None
             try:
-                try:
-                    async for event in interruptible(provider_stream, interrupt):
-                        if event.type == StreamEventType.TEXT_DELTA:
-                            partial_text.append(event.text or "")
-                            yield RunEvent(
-                                type=RunEventType.TEXT_DELTA,
-                                text=event.text,
-                                iteration=iteration,
-                                phase=event.phase or ("commentary" if saw_tool_use else None),
+                while True:
+                    failure: Exception | None = None
+                    # Externally visible deltas of this provider call (§5.7 guard).
+                    visible_deltas = 0
+                    try:
+                        async for event in interruptible(provider_stream, interrupt):
+                            if event.type == StreamEventType.TEXT_DELTA:
+                                partial_text.append(event.text or "")
+                                visible_deltas += 1
+                                yield RunEvent(
+                                    type=RunEventType.TEXT_DELTA,
+                                    text=event.text,
+                                    iteration=iteration,
+                                    phase=event.phase or ("commentary" if saw_tool_use else None),
+                                )
+                            elif event.type == StreamEventType.REASONING_DELTA:
+                                visible_deltas += 1
+                                yield RunEvent(
+                                    type=RunEventType.REASONING_DELTA,
+                                    text=event.text,
+                                    iteration=iteration,
+                                )
+                            elif event.type == StreamEventType.TOOL_USE_START:
+                                saw_tool_use = True
+                                visible_deltas += 1
+                                yield RunEvent(
+                                    type=RunEventType.TOOL_USE_START,
+                                    tool_name=event.tool_name,
+                                    tool_call_id=event.tool_call_id,
+                                    iteration=iteration,
+                                    phase="commentary",
+                                )
+                            elif event.type == StreamEventType.TOOL_USE_END:
+                                saw_tool_use = True
+                                visible_deltas += 1
+                                yield RunEvent(
+                                    type=RunEventType.TOOL_USE_END,
+                                    tool_call=event.tool_call,
+                                    tool_name=event.tool_name,
+                                    tool_call_id=event.tool_call_id,
+                                    iteration=iteration,
+                                    phase="commentary",
+                                )
+                            elif event.type == StreamEventType.DONE:
+                                llm_response = event.raw
+                        # Validate inside the same try so a contract-violating
+                        # provider stream still pairs with on_llm_call_failed.
+                        if llm_response is None:
+                            raise RuntimeError(
+                                f"Provider stream ended without DONE event at iteration "
+                                f"{iteration}. complete_stream() must yield "
+                                f"StreamEvent(type=DONE, raw=LLMResponse)."
                             )
-                        elif event.type == StreamEventType.REASONING_DELTA:
-                            yield RunEvent(
-                                type=RunEventType.REASONING_DELTA,
-                                text=event.text,
-                                iteration=iteration,
-                            )
-                        elif event.type == StreamEventType.TOOL_USE_START:
-                            saw_tool_use = True
-                            yield RunEvent(
-                                type=RunEventType.TOOL_USE_START,
-                                tool_name=event.tool_name,
-                                tool_call_id=event.tool_call_id,
-                                iteration=iteration,
-                                phase="commentary",
-                            )
-                        elif event.type == StreamEventType.TOOL_USE_END:
-                            saw_tool_use = True
-                            yield RunEvent(
-                                type=RunEventType.TOOL_USE_END,
-                                tool_call=event.tool_call,
-                                tool_name=event.tool_name,
-                                tool_call_id=event.tool_call_id,
-                                iteration=iteration,
-                                phase="commentary",
-                            )
-                        elif event.type == StreamEventType.DONE:
-                            llm_response = event.raw
-                    # Validate inside the same try so a contract-violating
-                    # provider stream still pairs with on_llm_call_failed.
-                    if llm_response is None:
-                        raise RuntimeError(
-                            f"Provider stream ended without DONE event at iteration "
-                            f"{iteration}. complete_stream() must yield "
-                            f"StreamEvent(type=DONE, raw=LLMResponse)."
+                    except Exception as _stream_exc:
+                        _stream_fail_ms = int((time.monotonic() - t0) * 1000)
+                        await _record_llm_failed(
+                            recorder,
+                            resolved_run_id,
+                            iteration,
+                            _stream_exc,
+                            duration_ms=_stream_fail_ms,
                         )
-                except Exception as _stream_exc:
-                    _stream_fail_ms = int((time.monotonic() - t0) * 1000)
-                    await _record_llm_failed(
+                        await _notify_llm_failed(
+                            notifier,
+                            resolved_run_id,
+                            iteration,
+                            _stream_exc,
+                            notifier_warnings,
+                            duration_ms=_stream_fail_ms,
+                        )
+                        if isinstance(_stream_exc, StreamInterruptedError):
+                            interrupted = True
+                        elif not prepared.slots:
+                            raise
+                        else:
+                            failure = _stream_exc
+                    if failure is None:
+                        break
+                    decision = await images.on_failure(
+                        failure,
+                        prepared,
+                        iteration=iteration,
+                        retried=retried,
+                        visible_deltas=visible_deltas,
+                        control_reader=_control_reader,
+                    )
+                    stop_control = control_stop(decision)
+                    if stop_control is not None:
+                        break
+                    if decision.action == "propagate":
+                        raise failure
+                    if decision.action == "raise":
+                        assert decision.error is not None
+                        del failure
+                        raise decision.error
+                    del failure
+                    # Retry in place (N-15.2): close the first stream, keep the
+                    # telemetry context, open a new stream for the new view.
+                    retried = True
+                    await provider_stream.aclose()
+                    prepared = await images.prepare(
+                        messages, iteration=iteration, force_tombstones=decision.tombstones
+                    )
+                    await _record_llm_started(
                         recorder,
                         resolved_run_id,
                         iteration,
-                        _stream_exc,
-                        duration_ms=_stream_fail_ms,
+                        semantic_messages=prepared.semantic,
+                        semantic_tools=tools,
                     )
-                    await _notify_llm_failed(
+                    await _notify_llm_started(
                         notifier,
                         resolved_run_id,
                         iteration,
-                        _stream_exc,
                         notifier_warnings,
-                        duration_ms=_stream_fail_ms,
+                        semantic_messages=prepared.semantic,
+                        semantic_tools=tools,
                     )
-                    if isinstance(_stream_exc, StreamInterruptedError):
-                        interrupted = True
-                    else:
-                        raise
+                    t0 = time.monotonic()
+                    provider_stream = provider.complete_stream(
+                        prepared.wire,
+                        tools=tools,
+                        run_id=resolved_run_id,
+                        cache_key_prefix=cache_key_prefix,
+                        **_pkw,
+                    )
             finally:
                 await provider_stream.aclose()
                 _stream_telemetry.__exit__(None, None, None)
+
+            if stop_control is not None:
+                stop_result = _control_stop_result(
+                    stop_control,
+                    agent_name=agent.name,
+                    run_id=resolved_run_id,
+                    history=history,
+                    steps=steps,
+                    iteration=iteration,
+                    usage=total_usage,
+                    meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+                    budget=budget,
+                    image_view=pause_image_view(image_state, history),
+                )
+                yield RunEvent(
+                    type=(
+                        RunEventType.RUN_CANCELLED
+                        if stop_result.status == RunStatus.CANCELLED
+                        else RunEventType.RUN_PAUSED
+                    ),
+                    run_result=stop_result,
+                )
+                return
 
             if interrupted:
                 # Mid-stream interrupt (cancel_run reached this process). The
@@ -1818,6 +2258,7 @@ class ReActLoop(Loop):
             # The try-block raised if no DONE arrived; only the interrupted path
             # (handled above) leaves this None.
             assert llm_response is not None
+            images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
             llm_response = price_response(
                 llm_response, pricing=agent.pricing, default_model=provider.model
@@ -1828,7 +2269,7 @@ class ReActLoop(Loop):
                 resolved_run_id,
                 llm_response,
                 iteration,
-                semantic_messages=messages,
+                semantic_messages=prepared.semantic,
                 semantic_tools=tools,
                 duration_ms=llm_duration_ms,
             )
@@ -1838,7 +2279,7 @@ class ReActLoop(Loop):
                 llm_response,
                 iteration,
                 notifier_warnings,
-                semantic_messages=messages,
+                semantic_messages=prepared.semantic,
                 semantic_tools=tools,
                 duration_ms=llm_duration_ms,
             )
@@ -1901,6 +2342,7 @@ class ReActLoop(Loop):
                     iteration=iteration,
                     usage=total_usage,
                     budget=budget,
+                    image_view=pause_image_view(image_state, history),
                 )
                 meta = {"pause_state": pause}
                 if notifier_warnings:
@@ -1948,6 +2390,7 @@ class ReActLoop(Loop):
                     guardrail_engine=None,  # streaming + guardrails banned at Agent level
                     before_tool=before_tool,
                     tenant_id=hook_tenant_id,
+                    image_runtime=image_runtime,
                 )
                 for tc, tool_result in outcome.all_results:
                     yield RunEvent(
@@ -1973,6 +2416,7 @@ class ReActLoop(Loop):
                         usage=total_usage,
                         approval_gates=outcome.approval_gates,
                         budget=budget,
+                        image_view=pause_image_view(image_state, history),
                     )
                     meta = {"pause_state": pause}
                     if notifier_warnings:
@@ -2090,6 +2534,8 @@ async def _execute_record_notify(
     iteration: int,
     notifier_warnings: list[str],
     transform: ToolResultTransform | None = None,
+    *,
+    image_runtime: ImageRuntime | None = None,
 ) -> tuple[ToolCall, ToolResult]:
     """Execute a tool, record, then notify — for parallel execution.
 
@@ -2098,7 +2544,7 @@ async def _execute_record_notify(
     """
     await _record_tool_started(recorder, run_id, tool_call, iteration)
     await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
-    result = await _execute_tool(tool_call, lookups, transform)
+    result = await _execute_tool(tool_call, lookups, transform, image_runtime=image_runtime)
     await _record_tool(recorder, run_id, tool_call, result, iteration)
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
     return tool_call, result
@@ -2108,6 +2554,8 @@ async def _execute_tool(
     tool_call: ToolCall,
     lookups: ToolLookups,
     transform: ToolResultTransform | None = None,
+    *,
+    image_runtime: ImageRuntime | None = None,
 ) -> ToolResult:
     """Execute a server tool function and return a ToolResult.
 
@@ -2118,6 +2566,11 @@ async def _execute_tool(
     return value of a successful call before serialization, so the
     store, notifiers and the model all see the transformed result.
     A transform that raises fails the call.
+
+    A ``ToolOutput`` result serialises its ``result`` like a plain return and
+    ingests its images through ``image_runtime`` (strict for local tools;
+    lenient with per-image notes for MCP tools). An image ingest failure
+    fails the call like any tool exception.
     """
     from dendrux.skills._session import SkillTool
 
@@ -2163,14 +2616,33 @@ async def _execute_tool(
                     error=error_msg,
                     duration_ms=duration_ms,
                 )
+        images: tuple[ImagePart, ...] = ()
+        notes: tuple[str, ...] = ()
+        if isinstance(result, ToolOutput):
+            output = result
+            result = output.result
+        else:
+            output = None
         try:
             payload = json.dumps(result)
         except (TypeError, ValueError) as ser_err:
+            hint = (
+                " To return images, return ToolOutput(result, images=[...])."
+                if _contains_image(result)
+                else ""
+            )
             raise TypeError(
                 f"Tool '{tool_call.name}' returned a non-JSON-serializable value: "
                 f"{type(result).__name__}. Tool return values must be JSON-serializable "
-                f"(str, int, float, bool, list, dict, or None)."
+                f"(str, int, float, bool, list, dict, or None).{hint}"
             ) from ser_err
+        if output is not None and output.images:
+            if _tool_source(tool_call.name, lookups) == "mcp":
+                images, notes = await _ingest_mcp_images(
+                    output.images, tool_call.name, image_runtime
+                )
+            else:
+                images = await _ingest_tool_images(output.images, tool_call.name, image_runtime)
 
         return ToolResult(
             name=tool_call.name,
@@ -2178,6 +2650,8 @@ async def _execute_tool(
             payload=payload,
             success=True,
             duration_ms=duration_ms,
+            images=images,
+            notes=notes,
         )
     except TimeoutError:
         duration_ms = int((time.monotonic() - start) * 1000)
