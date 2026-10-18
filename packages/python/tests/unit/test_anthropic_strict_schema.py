@@ -205,6 +205,21 @@ class TestNormalizeMovesConstraintsToDescription:
             "Must have at least 1 properties. Must have at most 2 properties."
         )
 
+    def test_draft7_dependencies_stripped(self) -> None:
+        inner = _obj({"a": {"type": "string"}}, dependencies={"a": ["a"]})
+        x = _x(normalize_for_anthropic_strict(_obj({"x": inner})))
+        assert "dependencies" not in x
+        assert x["description"] == 'Constraint dependencies: {"a": ["a"]}.'
+
+    def test_posix_class_pattern_does_not_warn(self) -> None:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            normalize_for_anthropic_strict(
+                _obj({"x": {"type": "string", "pattern": "^[[:alpha:]]+$"}})
+            )
+
     def test_not_stripped(self) -> None:
         schema = _obj({"x": {"type": "integer", "not": {"const": 3}}})
         x = _x(normalize_for_anthropic_strict(schema))
@@ -445,6 +460,10 @@ class TestCompatibility:
 
     def test_complex_enum_incompatible(self) -> None:
         assert not is_anthropic_strict_compatible(_obj({"x": {"enum": [{"a": 1}]}}))
+
+    def test_complex_const_incompatible(self) -> None:
+        problem = anthropic_strict_problem(_obj({"x": {"const": {"a": 1}}}))
+        assert problem is not None and "const" in problem
 
     def test_tuple_incompatible(self) -> None:
         class M(BaseModel):

@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import warnings
 from typing import Any
 
 
@@ -138,6 +139,7 @@ _ANTHROPIC_STRIPPED = (
     "patternProperties",
     "dependentRequired",
     "dependentSchemas",
+    "dependencies",
     "unevaluatedProperties",
     "not",
     "format",
@@ -190,7 +192,7 @@ def anthropic_strict_problem(schema: dict[str, Any]) -> str | None:
     Incompatible: an open object (no ``properties`` and no ``$ref``, or
     ``additionalProperties`` other than false), recursion, an unresolvable or
     external ``$ref``, a tuple (``prefixItems``), a value with no type, an
-    enum of objects or arrays, or more optional / union-typed parameters than
+    enum or const of objects or arrays, or more optional / union-typed parameters than
     one request allows.
     """
     return prepare_anthropic_strict(schema)[1]
@@ -325,7 +327,9 @@ def _anthropic_pattern_ok(pattern: str) -> bool:
     (``.``, ``[^...]``, ``\\D``, ``\\W``, ``\\S``) — all 400s in live probes.
     """
     try:
-        re.compile(pattern)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            re.compile(pattern)
     except re.error:
         return False
     negated = has_range = in_class = False
@@ -381,6 +385,8 @@ def _anthropic_structure_problem(schema: dict[str, Any]) -> str | None:
         enum = node.get("enum")
         if isinstance(enum, list) and any(isinstance(v, (dict, list)) for v in enum):
             return f"{path} is an enum of objects or arrays"
+        if isinstance(node.get("const"), (dict, list)):
+            return f"{path} is a const object or array"
         ref = node.get("$ref")
         if ref is None:
             continue
