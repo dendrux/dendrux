@@ -50,6 +50,7 @@ from dendrux.llm._retry_telemetry import (
     end_call_attempt_tracking,
     make_telemetry_http_client,
 )
+from dendrux.llm._stop_reason import chat_stop_reason
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -755,6 +756,7 @@ class OpenAIProvider(LLMProvider):
             yield flush_event
 
         # Assemble the final LLMResponse
+        stop_reason, raw_stop_reason = chat_stop_reason(finish_reason)
         llm_response = LLMResponse(
             text="".join(text_parts) if text_parts else None,
             tool_calls=tool_calls if tool_calls else None,
@@ -762,6 +764,8 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
             reasoning="".join(reasoning_parts) if reasoning_parts else None,
             reasoning_blocks=reasoning_block_acc if reasoning_block_acc else None,
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )
         llm_response.provider_request = captured_request
         llm_response.model = captured_request["model"]
@@ -1048,6 +1052,7 @@ class OpenAIProvider(LLMProvider):
         usage = UsageStats(usage_reported=False)
         if response.usage:
             usage = self._normalize_usage(response.usage)
+        stop_reason, raw_stop_reason = chat_stop_reason(getattr(choice, "finish_reason", None))
 
         return LLMResponse(
             text=text,
@@ -1056,4 +1061,6 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
             reasoning=_reasoning_text_from(message),
             reasoning_blocks=_reasoning_details_from(message),
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )

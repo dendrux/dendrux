@@ -42,6 +42,7 @@ from dendrux.llm._retry_telemetry import (
     end_call_attempt_tracking,
     make_telemetry_http_client,
 )
+from dendrux.llm._stop_reason import anthropic_stop_reason
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     REPLAYED_META_KEY,
@@ -519,6 +520,8 @@ class AnthropicProvider(LLMProvider):
         # Thinking-token count arrives on the message_delta event, not on the
         # streamed final message's usage — capture it here.
         stream_reasoning_tokens: int | None = None
+        # Fallback when the final message carries no stop_reason.
+        stream_stop_reason: str | None = None
 
         # Per-block state for tool call assembly
         _current_tool_name: str | None = None
@@ -584,6 +587,9 @@ class AnthropicProvider(LLMProvider):
                             _current_tool_json_parts = []
 
                     elif event.type == "message_delta":
+                        delta_stop = getattr(getattr(event, "delta", None), "stop_reason", None)
+                        if delta_stop:
+                            stream_stop_reason = delta_stop
                         details = getattr(
                             getattr(event, "usage", None), "output_tokens_details", None
                         )
@@ -626,6 +632,9 @@ class AnthropicProvider(LLMProvider):
         if usage.reasoning_tokens is None and stream_reasoning_tokens is not None:
             usage.reasoning_tokens = stream_reasoning_tokens
         reasoning, reasoning_blocks = self._extract_reasoning(final_message.content)
+        stop_reason, raw_stop_reason = anthropic_stop_reason(
+            getattr(final_message, "stop_reason", None) or stream_stop_reason
+        )
 
         llm_response = LLMResponse(
             text="".join(text_parts) if text_parts else None,
@@ -634,6 +643,8 @@ class AnthropicProvider(LLMProvider):
             usage=usage,
             reasoning=reasoning,
             reasoning_blocks=reasoning_blocks,
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )
         llm_response.provider_request = captured_request
         llm_response.model = captured_request["model"]
@@ -902,6 +913,10 @@ class AnthropicProvider(LLMProvider):
         The synthetic "structured_output" tool's input is the structured
         data. We serialize it to JSON and put it in LLMResponse.text,
         with tool_calls=None so SingleCall's invariant is preserved.
+
+        The forced call ends with ``stop_reason="tool_use"``; it is reported
+        as ``"end_turn"`` (the answer finished), with the vendor string kept
+        in ``raw_stop_reason``.
         """
         structured_data: dict[str, Any] | None = None
         for block in response.content:
@@ -916,12 +931,18 @@ class AnthropicProvider(LLMProvider):
             )
 
         usage = self._usage_from_response(response.usage)
+        stop_reason, raw_stop_reason = anthropic_stop_reason(getattr(response, "stop_reason", None))
+        if stop_reason == "tool_use":
+            # The forced structured_output call is the answer, not a tool request.
+            stop_reason = "end_turn"
 
         return LLMResponse(
             text=json.dumps(structured_data),
             tool_calls=None,
             raw=response,
             usage=usage,
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )
 
     def _normalize_response(self, response: anthropic.types.Message) -> LLMResponse:
@@ -948,6 +969,7 @@ class AnthropicProvider(LLMProvider):
 
         reasoning, reasoning_blocks = self._extract_reasoning(response.content)
         usage = self._usage_from_response(response.usage)
+        stop_reason, raw_stop_reason = anthropic_stop_reason(getattr(response, "stop_reason", None))
 
         return LLMResponse(
             text="".join(text_parts) if text_parts else None,
@@ -956,4 +978,6 @@ class AnthropicProvider(LLMProvider):
             usage=usage,
             reasoning=reasoning,
             reasoning_blocks=reasoning_blocks,
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
         )
