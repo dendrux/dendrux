@@ -513,3 +513,35 @@ class TestTypes:
 
         with pytest.raises(TypeError):
             StructuredOutputValidationError("{}", "Out", "bad", UsageStats())  # type: ignore[misc]
+
+
+class TestAnthropicStructuredTruncation:
+    """Structured end_turn mapping must not hide a truncated structured call."""
+
+    async def test_complete_with_schema_truncated_is_max_tokens(
+        self, anthropic_provider: AnthropicProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = ToolUseBlock(type="tool_use", id="t1", name="structured_output", input={"a": "x"})
+        msg = _anthropic_message([block], "max_tokens")
+        monkeypatch.setattr(
+            anthropic_provider._client.messages, "create", AsyncMock(return_value=msg)
+        )
+        resp = await anthropic_provider.complete(
+            _USER, output_schema={"type": "object", "properties": {"a": {"type": "string"}}}
+        )
+        assert resp.stop_reason == "max_tokens"
+        assert resp.raw_stop_reason == "max_tokens"
+
+    async def test_complete_with_schema_finished_is_end_turn(
+        self, anthropic_provider: AnthropicProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = ToolUseBlock(type="tool_use", id="t1", name="structured_output", input={"a": "x"})
+        msg = _anthropic_message([block], "tool_use")
+        monkeypatch.setattr(
+            anthropic_provider._client.messages, "create", AsyncMock(return_value=msg)
+        )
+        resp = await anthropic_provider.complete(
+            _USER, output_schema={"type": "object", "properties": {"a": {"type": "string"}}}
+        )
+        assert resp.stop_reason == "end_turn"
+        assert resp.raw_stop_reason == "tool_use"
