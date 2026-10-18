@@ -16,6 +16,8 @@ Scenarios, each on claude-sonnet-4-6 and claude-haiku-4-5:
     ST5  a strict tool whose pattern the normaliser keeps but Anthropic's
          regex budget rejects, streamed: retried non-strict before any
          event, the stream completes.
+    ST6  AnthropicProvider(strict=False): the strict tool and the structured
+         output go out exactly as in 0.4.0 (no "strict") and still work.
 
 An HTTP 200 alone never passes: the request evidence must show the strict
 flag (or its absence) and the output must validate against the model.
@@ -260,3 +262,26 @@ async def test_regex_budget_falls_back_in_stream(
     warned = _strict_warnings(caplog)
     assert len(warned) == 1 and "save_code" in warned[0]
     rec["warning"] = warned[0][:400]
+
+
+@pytest.mark.parametrize("case", _cases("ST6"), ids=lambda c: f"{c.model}-ST6")
+async def test_strict_opt_out(case: Case, rec: dict[str, Any]) -> None:
+    _provider(case.model)  # skips without a key
+    provider = AnthropicProvider(model=case.model, max_tokens=1024, strict=False)
+    td = get_tool_def(place_order)
+    response = await provider.complete(
+        [
+            Message(role=Role.SYSTEM, content="Use the place_order tool."),
+            Message(role=Role.USER, content=ORDER_PROMPT),
+        ],
+        tools=[td],
+    )
+    sent = response.provider_request["tools"][0]
+    assert sent == {"name": td.name, "description": td.description, "input_schema": td.parameters}
+    assert response.tool_calls
+    structured, order = await structured_complete(
+        provider, [Message(role=Role.USER, content=f"Extract the order. {ORDER_PROMPT}")], Order
+    )
+    assert "strict" not in structured.provider_request["tools"][0]
+    assert structured.provider_request["tools"][0]["input_schema"] == Order.model_json_schema()
+    assert order.quantity == 3
