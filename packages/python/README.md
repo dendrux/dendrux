@@ -2,7 +2,7 @@
 
 > Python SDK for Dendrux — the framework for building agents with tools, persistence, and observability.
 
-**Version:** 0.3.0
+**Version:** 0.4.0
 
 ## Install
 

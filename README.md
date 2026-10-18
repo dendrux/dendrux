@@ -22,11 +22,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.3.0` - core API stabilizing, actively developed.
+> `v0.4.0` - core API stabilizing, actively developed.
 
 ---
 
-## What's new in 0.4.0 (unreleased)
+## What's new in 0.4.0
 
 - **Images**: `agent.run(["What is on this receipt?", Image.from_path("receipt.png")])`, tools that return `ToolOutput(result, images=[...])`, client tools that attach `ToolResult.images`, and MCP image results all reach the model as images. Images are stored once as tenant-scoped blobs (database by default, or your own `BlobStore` such as S3); runs, pauses and events hold references only. Anthropic, OpenAI Chat and Responses, and OpenRouter are supported; non-vision models get a typed error or a placeholder. See the [Images guide](docs/recipes/images.mdx).
 - **Migration**: run `dendrux db migrate` (new revision `c6d7e8f9a0b1`), even if you do not use images. See the [CHANGELOG](packages/python/CHANGELOG.md).
