@@ -152,7 +152,10 @@ image results reach the model (see Changed).
 - **`ChatMessage` gains a third field, `parts`** (default `None`, user turns
   only). Text-only messages now show `parts=None` in `repr` and
   `dataclasses.asdict`, and `parts` is last in `__match_args__`; apps that
-  serialise history with `asdict` see the new key.
+  serialise history with `asdict` see the new key. `ChatMessage` now validates
+  at construction: non-`str` `content` raises `TypeError`, a role other than
+  `user`/`assistant` raises `ValueError`, and a string role (`"assistant"`) is
+  converted to `ChatRole`.
 - **Custom loops.** A `Loop` whose `run()` (or `run_stream()`) does not accept
   `image_runtime` raises `TypeError` for image input, image replay (`runs=`) and
   `retry()`. Text-only runs are unaffected.
