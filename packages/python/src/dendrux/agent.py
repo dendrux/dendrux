@@ -39,7 +39,7 @@ from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 
     from pydantic import BaseModel
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -67,6 +67,7 @@ if TYPE_CHECKING:
         Budget,
         ImageRef,
         PauseOutcome,
+        RunEvent,
         RunResult,
         RunStream,
         ToolDef,
@@ -96,6 +97,21 @@ _WAITING_STATUS_VALUES = frozenset(
 def _in_tenant_scope(record: Any, tenant_id: TenantScope) -> bool:
     """Omitted scope matches everything; otherwise the tenant must match exactly."""
     return tenant_id is UNSCOPED or record.tenant_id == tenant_id
+
+
+async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: TenantScope) -> None:
+    """Raise ``RunNotFoundError`` unless the run exists within ``tenant_id``.
+
+    Run before any write so a cross-tenant call changes nothing. A run's
+    tenant never changes, so this read cannot race. Omitted scope skips it.
+    """
+    if tenant_id is UNSCOPED:
+        return
+    from dendrux.errors import RunNotFoundError
+
+    record = await store.get_run(run_id)
+    if record is None or not _in_tenant_scope(record, tenant_id):
+        raise RunNotFoundError(run_id)
 
 
 def _cascade_order(subtree: Any) -> list[str]:
@@ -1386,6 +1402,7 @@ class Agent:
         tool_results: list[ToolResult] | None = None,
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> RunResult:
         """Resume a paused run.
 
@@ -1403,6 +1420,9 @@ class Agent:
                 string, or strings and images.
             notifier: Optional additional loop notifier. Composed with
                 PersistenceRecorder internally.
+            tenant_id: Omitted = no tenant check. Otherwise the run must belong
+                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
+                is raised before anything is written.
 
         Returns:
             RunResult with updated status.
@@ -1410,6 +1430,7 @@ class Agent:
         Raises:
             ValueError: If provider not set, persistence not configured,
                 both args provided, or neither provided.
+            RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
         # Validate args before any I/O
         provider = self._require_provider()
@@ -1425,6 +1446,8 @@ class Agent:
 
         from dendrux.runtime.runner import resume as runner_resume
         from dendrux.runtime.runner import resume_with_input
+
+        await _require_run_in_scope(store, run_id, tenant_id)
 
         if tool_results is not None:
             return await runner_resume(
@@ -1461,6 +1484,7 @@ class Agent:
         results: list[ToolResult],
         *,
         notifier: LoopNotifier | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> RunResult:
         """Submit client-side tool results and resume the paused run.
 
@@ -1477,13 +1501,17 @@ class Agent:
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
             notifier: Optional additional notifier composed during resume.
+            tenant_id: Omitted = no tenant check. Otherwise the run must belong
+                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
+                is raised before anything is written.
 
         Returns:
             :class:`RunResult` from the resumed loop.
 
         Raises:
             PersistenceNotConfiguredError: Agent has no DB.
-            RunNotFoundError: ``run_id`` does not exist.
+            RunNotFoundError: ``run_id`` does not exist (or is outside
+                ``tenant_id``).
             RunNotPausedError: run is not in a paused state.
             PauseStatusMismatchError: run is paused, but not for client tools.
             RunAlreadyClaimedError: a concurrent submit won the CAS.
@@ -1504,6 +1532,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             pause = await validate_tool_results(store, run_id, results)
@@ -1541,6 +1570,7 @@ class Agent:
         text: UserContent,
         *,
         notifier: LoopNotifier | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> RunResult:
         """Submit clarification input and resume the paused run.
 
@@ -1552,11 +1582,15 @@ class Agent:
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
             notifier: Optional additional notifier composed during resume.
+            tenant_id: Omitted = no tenant check. Otherwise the run must belong
+                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
+                is raised before anything is written.
 
         Raises:
-            PersistenceNotConfiguredError, RunNotFoundError,
-            RunNotPausedError, PauseStatusMismatchError,
-            RunAlreadyClaimedError, RunAlreadyTerminalError.
+            PersistenceNotConfiguredError, RunNotFoundError (also when
+            ``run_id`` is outside ``tenant_id``), RunNotPausedError,
+            PauseStatusMismatchError, RunAlreadyClaimedError,
+            RunAlreadyTerminalError.
         """
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
@@ -1571,6 +1605,7 @@ class Agent:
         from dendrux.chat import split_user_content
 
         projection, items = split_user_content(text, owner="text")
+        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             submitted: dict[str, Any] = {"submitted_user_input": projection}
@@ -1610,6 +1645,7 @@ class Agent:
         decisions: Mapping[str, ApprovalDecision] | None = None,
         rejection_reason: str | None = None,
         notifier: LoopNotifier | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> RunResult:
         """Submit an approval decision for a run awaiting human approval.
 
@@ -1646,12 +1682,16 @@ class Agent:
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
             notifier: Optional additional notifier composed during resume.
+            tenant_id: Omitted = no tenant check. Otherwise the run must belong
+                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
+                is raised before anything is written.
 
         Raises:
             ValueError: invalid argument combination or decision ids.
-            PersistenceNotConfiguredError, RunNotFoundError,
-            RunNotPausedError, PauseStatusMismatchError,
-            RunAlreadyClaimedError, RunAlreadyTerminalError.
+            PersistenceNotConfiguredError, RunNotFoundError (also when
+            ``run_id`` is outside ``tenant_id``), RunNotPausedError,
+            PauseStatusMismatchError, RunAlreadyClaimedError,
+            RunAlreadyTerminalError.
         """
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
@@ -1681,6 +1721,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             if pairs is not None:
@@ -2040,6 +2081,7 @@ class Agent:
         run_id: str,
         *,
         notifier: LoopNotifier | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> RunResult:
         """Resume a PAUSED run and block until its next pause or terminal state.
 
@@ -2050,10 +2092,18 @@ class Agent:
         that batch with the decisions already made. Pending inbox notes are
         delivered at the first iteration.
 
+        Args:
+            run_id: A run in status ``PAUSED``.
+            notifier: Optional additional notifier composed during resume.
+            tenant_id: Omitted = no tenant check. Otherwise the run must belong
+                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
+                is raised before anything is written.
+
         Raises:
-            PersistenceNotConfiguredError, RunNotFoundError,
-            RunNotPausedError, PauseStatusMismatchError (paused for another
-            reason, e.g. WAITING_APPROVAL), RunAlreadyClaimedError,
+            PersistenceNotConfiguredError, RunNotFoundError (also when
+            ``run_id`` is outside ``tenant_id``), RunNotPausedError,
+            PauseStatusMismatchError (paused for another reason, e.g.
+            WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
         from dendrux.errors import PersistenceNotConfiguredError
@@ -2066,6 +2116,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
+        await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             await claim_or_raise(store, run_id, expected_status=RunStatus.PAUSED)
@@ -2351,6 +2402,7 @@ class Agent:
         tool_results: list[ToolResult] | None = None,
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> RunStream:
         """Stream a resumed run as RunEvents.
 
@@ -2374,12 +2426,18 @@ class Agent:
             tool_results: Results for pending tool calls (client tool runs).
             user_input: Clarification answer (human-in-the-loop runs).
             notifier: Optional additional loop notifier.
+            tenant_id: Omitted = no tenant check. Otherwise the run must belong
+                to this tenant (``None`` = untenanted) or ``RunNotFoundError``
+                is raised before anything is written.
 
         Returns:
             RunStream — async iterable of RunEvent objects.
 
         Raises:
             ValueError: If provider not set, both args provided, or neither.
+            RunNotFoundError: Raised from the first iteration, before any
+                event, when ``run_id`` is outside ``tenant_id``. The run is
+                left untouched (the stream's close-time cleanup is a no-op).
         """
         if self._guardrails:
             raise ValueError(
@@ -2392,7 +2450,7 @@ class Agent:
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
 
-        return runner_resume_stream(
+        stream = runner_resume_stream(
             run_id,
             agent=self,
             provider=provider,
@@ -2401,6 +2459,36 @@ class Agent:
             user_input=user_input,
             extra_notifier=notifier,
         )
+        if tenant_id is UNSCOPED:
+            return stream
+        return self._tenant_checked_stream(stream, run_id, tenant_id)
+
+    def _tenant_checked_stream(
+        self, inner: RunStream, run_id: str, tenant_id: TenantScope
+    ) -> RunStream:
+        """Gate ``inner`` behind a tenant preflight that raises, not yields RUN_ERROR.
+
+        The check runs before ``inner`` starts, so its setup, claim and
+        close-time cancel never touch a run outside the tenant.
+        """
+        from dendrux.types import RunStream
+
+        async def _generate() -> AsyncGenerator[RunEvent, None]:
+            store = await self._resolve_state_store()
+            if store is not None:
+                await _require_run_in_scope(store, run_id, tenant_id)
+            events = inner.__aiter__()
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
+
+        async def _cleanup() -> RunResult | None:
+            await inner.aclose()
+            return inner.result
+
+        return RunStream(run_id=run_id, generator=_generate(), cleanup=_cleanup)
 
     # ------------------------------------------------------------------
     # MCP discovery
