@@ -916,8 +916,20 @@
     }
   }
 
-  function handlePaused(data) {
+  // The form is rebuilt from GET /runs/{id}/pending (RunStore.get_pending): the
+  // active pause's arguments, read from the database. A run.paused event in
+  // the history (e.g. replayed after a reconnect) has its arguments hidden.
+  async function handlePaused(eventData) {
     removeSkeleton();
+    let data = eventData;
+    try {
+      const resp = await fetch(`/runs/${runId}/pending`, { headers: authHeaders() });
+      if (resp.ok) {
+        const pendingNow = await resp.json();
+        if (!pendingNow) return;  // already resumed: this pause is history
+        data = pendingNow;
+      }
+    } catch (_) { /* fall back to the event's data */ }
     const status = data.status || "";
     if (status === "waiting_approval") {
       pendingApproval = data.pending_tool_calls || [];
@@ -925,7 +937,11 @@
         const tc = pendingApproval[0];
         $("af-name").textContent = tc.name;
         $("af-id").textContent = tc.id;
-        renderArgsInto(tc.params || {}, "af-args", "af-args-box");
+        if (!tc.params) {
+          addTimeline("Approval arguments unavailable; not approving blind", "err");
+          return;
+        }
+        renderArgsInto(tc.params, "af-args", "af-args-box");
         $("af-reject-row").classList.remove("active");
         $("af-reason").value = "";
         $("approval-form").classList.add("active");
