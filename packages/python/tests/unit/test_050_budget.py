@@ -10,7 +10,6 @@ import pytest
 from dendrux.agent import Agent
 from dendrux.errors import BudgetConfigurationError
 from dendrux.llm.mock import MockLLM
-from dendrux.loops import _budget
 from dendrux.loops._budget import BudgetCarry, BudgetTracker
 from dendrux.loops._helpers import price_response
 from dendrux.loops.base import BaseRecorder
@@ -184,6 +183,35 @@ class TestPricingFallsBackToTheRequestedModel:
         )
         assert priced.usage.cost_usd == 0.5
 
+    def test_exact_requested_entry_beats_a_catch_all_glob_on_the_vendor_id(self) -> None:
+        table = PriceTable({"claude-*": _RATE, "claude-opus-4": _OTHER_RATE})
+        priced = price_response(
+            _response("claude-opus-4-20250514"), pricing=table, default_model="claude-opus-4"
+        )
+        assert priced.usage.cost_usd == pytest.approx(10.0)
+
+    def test_lookup_order_exact_then_glob_response_before_requested(self) -> None:
+        wide = ModelPricing(input=2.0, output=2.0)
+        narrow = ModelPricing(input=3.0, output=3.0)
+        table = PriceTable({"a-*": wide, "b-*": narrow})
+        # Neither is exact: the glob on response.model wins over the glob on the request.
+        assert resolve_priced_model(table, "a-1", "b-1") == "a-1"
+        assert resolve_priced_model(table, "zzz", "b-1") == "b-1"
+        exact = PriceTable({"a-*": wide, "b-1": narrow})
+        # An exact entry for the request beats a glob on the response.
+        assert resolve_priced_model(exact, "a-1", "b-1") == "b-1"
+        both = PriceTable({"a-1": wide, "b-1": narrow})
+        assert resolve_priced_model(both, "a-1", "b-1") == "a-1"
+
+    def test_cost_unknown_call_stays_unpriced(self) -> None:
+        response = _response("mock")
+        response.usage = UsageStats(
+            input_tokens=1_000_000, output_tokens=0, total_tokens=1_000_000, cost_unknown=True
+        )
+        priced = price_response(response, pricing=PriceTable({"mock": _RATE}), default_model="mock")
+        assert priced.usage.cost_usd is None
+        assert priced.usage.cost_source is None
+
     def test_resolve_priced_model(self) -> None:
         table = PriceTable({"a": _RATE})
         assert resolve_priced_model(table, "b", "a") == "a"
@@ -278,6 +306,36 @@ class TestUnpricedCallUnderCostLimit:
         _, breaches = await tracker.checkpoint(2)
         assert [b.metric for b in breaches] == ["cost_usd"]
 
+    @pytest.mark.parametrize("action", ["pause", "cancel"])
+    async def test_resume_accepts_the_unpriced_calls_that_caused_the_pause(
+        self, action: str
+    ) -> None:
+        tracker = _tracker(
+            Budget(max_cost_usd=1.0, on_exceed=action),  # type: ignore[arg-type]
+            UsageRollup(known_cost_usd=0.1, unpriced_calls=1),
+            carry=BudgetCarry(gate=("cost_usd",), unpriced_calls=1),
+        )
+        _, breaches = await tracker.checkpoint(2)
+        assert breaches == []
+        assert await tracker.evaluate(2) == []
+
+    async def test_a_new_unpriced_call_after_resume_stops_the_run_again(self) -> None:
+        tracker = _tracker(
+            Budget(max_cost_usd=1.0, on_exceed="pause"),
+            UsageRollup(known_cost_usd=0.1, unpriced_calls=2),
+            carry=BudgetCarry(gate=("cost_usd",), unpriced_calls=1),
+        )
+        _, breaches = await tracker.checkpoint(2)
+        assert [b.metric for b in breaches] == ["cost_usd"]
+
+    async def test_pause_fields_record_the_measured_unpriced_count(self) -> None:
+        tracker = _tracker(
+            Budget(max_cost_usd=1.0, on_exceed="pause"),
+            UsageRollup(known_cost_usd=0.1, unpriced_calls=3),
+        )
+        await tracker.evaluate(1)
+        assert tracker.pause_fields()["budget_unpriced_calls"] == 3
+
     async def test_resume_gate_passes_when_priced_and_below_the_limit(self) -> None:
         tracker = _tracker(
             Budget(max_cost_usd=1.0, on_exceed="pause"),
@@ -325,6 +383,36 @@ class TestCountCacheTokens:
     async def test_in_memory_formula(self, choice: bool | None, expected: int) -> None:
         tracker = _memory_tracker(Budget(max_tokens=10_000, count_cache_tokens=choice))
         assert (await tracker._measure()).tokens == expected
+
+    async def test_in_memory_formula_does_not_need_total_tokens(self) -> None:
+        tracker = BudgetTracker(
+            Budget(max_tokens=500, on_exceed="cancel", count_cache_tokens=True),
+            run_id="r",
+            usage=UsageStats(input_tokens=900, output_tokens=100, cache_read_input_tokens=100),
+            recorder=None,
+            notifier=None,
+            warnings=[],
+        )
+        assert (await tracker._measure()).tokens == 1100
+        assert [b.metric for b in await tracker.evaluate(1)] == ["tokens"]
+
+    async def test_store_and_memory_paths_agree(self) -> None:
+        usage = UsageStats(
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_input_tokens=400,
+            cache_creation_input_tokens=100,
+        )
+        memory = BudgetTracker(
+            Budget(max_tokens=10_000, count_cache_tokens=True),
+            run_id="r",
+            usage=usage,
+            recorder=None,
+            notifier=None,
+            warnings=[],
+        )
+        stored = _tracker(Budget(max_tokens=10_000, count_cache_tokens=True), _ROLLUP)
+        assert (await memory._measure()).tokens == (await stored._measure()).tokens == 650
 
     async def test_missing_cache_fields_count_as_zero(self) -> None:
         tracker = BudgetTracker(
@@ -378,30 +466,70 @@ class TestCountCacheTokens:
             assert result.status == expected, choice
 
 
-class TestCountCacheTokensDeprecation:
-    @pytest.fixture(autouse=True)
-    def _fresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(_budget, "_cache_tokens_notice_emitted", False)
+class TestCountCacheTokensNotChosen:
+    """B17 warns with ``FutureWarning`` (visible by default) at ``Agent(...)``."""
 
     @staticmethod
-    def _build(budget: Budget) -> None:
-        _memory_tracker(budget)
+    def _construct(budget: Budget) -> None:
+        _agent(budget=budget)
 
-    def test_warns_once_when_a_token_budget_did_not_choose(self) -> None:
-        with pytest.warns(DeprecationWarning, match="count_cache_tokens"):
-            self._build(Budget(max_tokens=100))
+    def test_warns_at_the_agent_line_when_a_token_budget_did_not_choose(self) -> None:
+        with pytest.warns(FutureWarning, match="count_cache_tokens") as seen:
+            self._construct(Budget(max_tokens=100))
+        assert seen[0].filename == __file__
+
+    def test_dedup_is_left_to_the_warnings_module_per_call_site(self) -> None:
         with warnings.catch_warnings(record=True) as seen:
-            warnings.simplefilter("always")
-            self._build(Budget(max_tokens=100))
-        assert [w for w in seen if issubclass(w.category, DeprecationWarning)] == []
+            warnings.simplefilter("default")
+            for _ in range(3):
+                self._construct(Budget(max_tokens=100))
+        assert len([w for w in seen if issubclass(w.category, FutureWarning)]) == 1
+
+    def test_a_filtered_warning_does_not_use_up_the_notice(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self._construct(Budget(max_tokens=100))
+        with pytest.warns(FutureWarning):
+            self._construct(Budget(max_tokens=100))
 
     @pytest.mark.parametrize("choice", [True, False])
     def test_silent_when_chosen(self, choice: bool) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            self._build(Budget(max_tokens=100, count_cache_tokens=choice))
+            self._construct(Budget(max_tokens=100, count_cache_tokens=choice))
 
     def test_silent_for_cost_only_budget(self) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            self._build(Budget(max_cost_usd=1.0))
+            _agent(budget=Budget(max_cost_usd=1.0), pricing=PriceTable({"mock": _RATE}))
+
+    def test_runs_of_a_built_agent_do_not_warn_again(self) -> None:
+        agent = _agent(budget=Budget(max_tokens=100, count_cache_tokens=False))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            check_budget_config(agent)
+
+
+class TestCostUnknownCallEndsEnforcingRun:
+    async def test_cost_unknown_call_cancels_under_a_cost_budget(self) -> None:
+        @tool()
+        async def look() -> str:
+            """Look."""
+            return "ok"
+
+        unknown = LLMResponse(
+            text=None,
+            tool_calls=[ToolCall(name="look", params={}, id="c1")],
+            usage=UsageStats(input_tokens=10, output_tokens=10, total_tokens=20, cost_unknown=True),
+        )
+        llm = MockLLM([unknown, LLMResponse(text="never", usage=UsageStats())])
+        agent = Agent(
+            prompt="p",
+            tools=[look],
+            provider=llm,
+            pricing=PriceTable({"mock": _RATE}),
+            budget=Budget(max_cost_usd=100.0, on_exceed="cancel"),
+        )
+        result = await agent.run("go")
+        assert result.status == RunStatus.CANCELLED
+        assert llm.calls_made == 1

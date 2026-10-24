@@ -32,15 +32,17 @@ Unpriced calls (no provider cost, no ``PriceTable`` entry) under
 ``max_cost_usd``: with ``on_exceed`` ``"pause"`` or ``"cancel"`` they count as
 the limit being reached (``budget.exceeded`` with ``reason="unpriced_call"``),
 because the spend is unknown; with ``"warn"`` they only emit
-``budget.unpriced``. Misconfigured agents are normally caught earlier by
-``pricing.check_budget_config``.
+``budget.unpriced``. Resuming a pause that an unpriced call caused does not need
+a policy change: the unpriced calls counted at the pause are accepted, and only a
+new one stops the run again. With ``include_children`` the count covers delegated
+descendants too, so an unpriced child call stops the parent (child agents are not
+checked by the parent's ``check_budget_config``). Misconfigured agents are
+normally caught earlier by ``pricing.check_budget_config``.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -64,29 +66,6 @@ BUDGET_EXCEEDED = "budget_exceeded"
 _COST_DECIMALS = 6
 # ``budget.exceeded`` reason when an unpriced call stands in for the cost limit.
 UNPRICED_CALL = "unpriced_call"
-
-_notice_lock = threading.Lock()
-_cache_tokens_notice_emitted = False
-
-
-def _warn_cache_tokens_not_chosen(budget: Budget) -> None:
-    """One-time per process: a token budget that never chose ``count_cache_tokens``."""
-    global _cache_tokens_notice_emitted
-    if budget.max_tokens is None or budget.count_cache_tokens is not None:
-        return
-    if _cache_tokens_notice_emitted:
-        return
-    with _notice_lock:
-        if _cache_tokens_notice_emitted:
-            return
-        _cache_tokens_notice_emitted = True
-    warnings.warn(
-        "Budget(max_tokens=...) without count_cache_tokens: cache read and write tokens are "
-        "not counted today, but will be from 0.6. Choose explicitly with "
-        "Budget(count_cache_tokens=True) (and raise max_tokens) or count_cache_tokens=False.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
 
 
 @dataclass(frozen=True)
@@ -157,8 +136,6 @@ class BudgetTracker:
         fresh: bool = False,
     ) -> None:
         self.budget = budget
-        if budget is not None:
-            _warn_cache_tokens_not_chosen(budget)
         self._count_cache = budget is not None and budget.count_cache_tokens is True
         self._run_id = run_id
         self._usage = usage
@@ -169,6 +146,11 @@ class BudgetTracker:
         self.fired: list[tuple[str, float]] = list(carry.fired) if carry else []
         self.unpriced_reported = carry.unpriced_reported if carry else False
         self._gate = carry.gate if carry else ()
+        # Unpriced calls a budget pause already stopped for: resuming accepts
+        # them (the spend is unknown and stays so); a new unpriced call stops again.
+        self._ack_unpriced = carry.unpriced_calls if carry and COST_USD in carry.gate else 0
+        # Highest unpriced-call count measured (rollup includes children).
+        self._seen_unpriced = 0
         self._fresh = fresh
         self._first_checkpoint = True
         # Breaches from the latest post-response evaluation (None: none yet).
@@ -232,7 +214,9 @@ class BudgetTracker:
         }
         if self._unpriced:
             fields["budget_known_cost_usd"] = self._known_cost
-            fields["budget_unpriced_calls"] = self._unpriced
+        unpriced = max(self._unpriced, self._seen_unpriced)
+        if unpriced:
+            fields["budget_unpriced_calls"] = unpriced
         return fields
 
     async def _emit(self, event_type: str, iteration: int, data: dict[str, Any]) -> None:
@@ -255,16 +239,25 @@ class BudgetTracker:
                 tokens = rollup.input_tokens + rollup.output_tokens
                 if self._count_cache:
                     tokens += rollup.cache_read_tokens + rollup.cache_write_tokens
+                self._seen_unpriced = max(self._seen_unpriced, rollup.unpriced_calls)
                 return _Usage(
                     tokens=tokens,
                     known_cost_usd=rollup.known_cost_usd,
                     unpriced_calls=rollup.unpriced_calls,
                 )
-        tokens = self._usage.total_tokens
+        u = self._usage
         if self._count_cache:
-            tokens += (self._usage.cache_read_input_tokens or 0) + (
-                self._usage.cache_creation_input_tokens or 0
+            # Built from the components: ``total_tokens`` is supplied separately
+            # by providers and may be absent.
+            tokens = (
+                u.input_tokens
+                + u.output_tokens
+                + (u.cache_read_input_tokens or 0)
+                + (u.cache_creation_input_tokens or 0)
             )
+        else:
+            tokens = u.total_tokens
+        self._seen_unpriced = max(self._seen_unpriced, self._unpriced)
         return _Usage(
             tokens=tokens,
             known_cost_usd=self._known_cost,
@@ -316,7 +309,11 @@ class BudgetTracker:
             reached = used >= limit
             # An unpriced call hides spend: when the run is told to stop on
             # exceeding the cost limit it must stop here too (fail closed).
-            unpriced = metric == COST_USD and usage.unpriced_calls > 0 and self.action != "warn"
+            unpriced = (
+                metric == COST_USD
+                and usage.unpriced_calls > self._ack_unpriced
+                and self.action != "warn"
+            )
             if reached or unpriced:
                 breaches.append(BudgetBreach(metric=metric, used=used, max=limit))
                 if (metric, EXCEEDED) not in self.fired:
@@ -374,7 +371,11 @@ class BudgetTracker:
         for metric in gated:
             limit = limits[metric]
             assert limit is not None
-            unpriced = metric == COST_USD and usage.unpriced_calls > 0 and self.action != "warn"
+            unpriced = (
+                metric == COST_USD
+                and usage.unpriced_calls > self._ack_unpriced
+                and self.action != "warn"
+            )
             if unpriced or not limit > used[metric]:
                 breaches.append(BudgetBreach(metric=metric, used=used[metric], max=limit))
         return breaches

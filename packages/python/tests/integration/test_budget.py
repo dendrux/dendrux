@@ -491,6 +491,50 @@ class TestBudgetResume:
         record = await store.get_run(run_id)
         assert record.total_input_tokens + record.total_output_tokens == 700
 
+    async def test_unpriced_pause_resumes_without_changing_the_policy(self, store) -> None:
+        budget = Budget(max_cost_usd=5.0, on_exceed="pause", count_cache_tokens=False)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10, cost=None)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        paused = await agent.run("go")
+        assert paused.status == RunStatus.PAUSED
+        state = await _pause_state(store, paused.run_id)
+        assert state.budget_unpriced_calls == 1
+
+        same, llm = _agent(
+            store,
+            [_text("done", tokens=10, cost=0.01)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        result = await same.resume(paused.run_id)
+        assert result.status == RunStatus.SUCCESS
+        assert llm.calls == 1
+
+    async def test_a_new_unpriced_call_after_resume_pauses_again(self, store) -> None:
+        budget = Budget(max_cost_usd=5.0, on_exceed="pause", count_cache_tokens=False)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10, cost=None)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        paused = await agent.run("go")
+        again, llm = _agent(
+            store,
+            [_call("work", "t2", tokens=10, cost=None), _text("never", cost=0.0)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        result = await again.resume(paused.run_id)
+        assert result.status == RunStatus.PAUSED
+        assert llm.calls == 1
+        state = await _pause_state(store, paused.run_id)
+        assert state.budget_unpriced_calls == 2
+
     async def test_resume_stream_repauses(self, store) -> None:
         run_id = await self._paused(store)
         same, llm = _agent(
