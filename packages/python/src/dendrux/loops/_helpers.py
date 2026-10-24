@@ -272,7 +272,10 @@ def price_response(
     """Resolve ``response.usage.cost_usd`` from the agent's price table.
 
     ``model`` is the per-call requested model (``run(model=...)``), or None
-    when the call used the provider's configured ``default_model``.
+    when the call used the provider's configured ``default_model``. The table
+    is consulted for ``response.model`` first, then for the requested model, so
+    a dated snapshot id returned by the vendor still prices through the entry
+    written for the alias that was requested.
 
     Applied once per LLM call, before the response is recorded, so the
     persisted usage, the ``llm.completed`` event, the budget check and the
@@ -281,7 +284,8 @@ def price_response(
     """
     priced = price_usage(
         response.usage,
-        model=response.model or default_model,
+        model=response.model,
+        fallback_models=(model or default_model,),
         pricing=pricing,
     )
     if priced is response.usage:

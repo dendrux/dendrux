@@ -584,16 +584,16 @@ class TestBudgetActionsInLoop:
             assert events[-1].type == terminal
             assert len(llm.call_history) == 1
 
-    async def test_cost_limit_in_memory_with_unpriced_call(self):
+    async def test_cost_limit_in_memory_with_unpriced_call_warns(self):
         llm = MockLLM(
             [
                 _priced("a", 10, None, _search_call("t1")),
                 _priced("b", 10, 0.06, _search_call("t2")),
-                _priced("never", 1, 0.0),
+                _priced("done", 1, 0.0),
             ]
         )
         spy = _GovSpy()
-        agent = _make_agent(budget=Budget(max_cost_usd=0.05, on_exceed="pause"))
+        agent = _make_agent(budget=Budget(max_cost_usd=0.05, on_exceed="warn"))
         result = await ReActLoop().run(
             agent=agent,
             provider=llm,
@@ -601,8 +601,7 @@ class TestBudgetActionsInLoop:
             user_input="go",
             recorder=spy,
         )
-        assert result.status == RunStatus.PAUSED
-        assert result.meta["budget_exceeded"] == [{"metric": "cost_usd", "used": 0.06, "max": 0.05}]
+        assert result.status == RunStatus.SUCCESS
         assert spy.of("budget.unpriced") == [
             {
                 "metric": "cost_usd",
@@ -612,7 +611,25 @@ class TestBudgetActionsInLoop:
                 "known_cost_usd": 0.0,
             }
         ]
-        assert result.meta["pause_state"].budget_unpriced_reported is True
+        assert spy.of("budget.exceeded")[0]["reason"] == "budget_exceeded"
+
+    @pytest.mark.parametrize(("action", "status"), [("pause", "PAUSED"), ("cancel", "CANCELLED")])
+    async def test_unpriced_call_counts_as_exceeded_when_enforcing(self, action, status):
+        llm = MockLLM([_priced("a", 10, None, _search_call("t1")), _priced("never", 1, 0.0)])
+        spy = _GovSpy()
+        agent = _make_agent(budget=Budget(max_cost_usd=0.05, on_exceed=action))
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            recorder=spy,
+        )
+        assert result.status == RunStatus[status]
+        assert llm.calls_made == 1
+        assert result.meta["budget_exceeded"] == [{"metric": "cost_usd", "used": 0.0, "max": 0.05}]
+        assert [e["reason"] for e in spy.of("budget.exceeded")] == ["unpriced_call"]
+        assert len(spy.of("budget.unpriced")) == 1
 
     async def test_events_carry_metric(self):
         llm = MockLLM([_priced("Done.", 900, 0.9)])

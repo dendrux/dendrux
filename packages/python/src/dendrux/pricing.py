@@ -157,14 +157,17 @@ def price_usage(
     *,
     model: str | None,
     pricing: PriceTable | None,
+    fallback_models: tuple[str | None, ...] = (),
 ) -> UsageStats:
     """Return ``usage`` with ``cost_usd`` and ``cost_source`` resolved.
 
     Resolution order:
 
     1. A provider-reported cost is kept and tagged ``"provider"``.
-    2. Otherwise, if ``pricing`` covers ``model``, the cost is computed and
-       tagged ``"table"``.
+    2. Otherwise, if ``pricing`` covers ``model`` (or, failing that, the first
+       of ``fallback_models`` it covers, e.g. the requested model when the
+       vendor returned a dated snapshot id), the cost is computed and tagged
+       ``"table"``.
     3. Otherwise the usage is returned unpriced (``cost_usd=None``,
        ``cost_source=None``).
 
@@ -176,20 +179,56 @@ def price_usage(
         return replace(usage, cost_source="provider")
     if pricing is None or not usage.usage_reported:
         return usage
-    cost = pricing.cost_for(model, usage)
+    cost = pricing.cost_for(resolve_priced_model(pricing, model, *fallback_models), usage)
     if cost is None:
         return usage
     return replace(usage, cost_usd=cost, cost_source="table")
 
 
+def resolve_priced_model(pricing: PriceTable | None, *models: str | None) -> str | None:
+    """The first of ``models`` the table covers, else the first non-empty one.
+
+    Callers pass ``(response.model, requested_model)``: vendors return dated
+    snapshot ids (``gpt-5-2025-08-07``) for a requested alias (``gpt-5``), and
+    a table written for the alias must still price the call.
+    """
+    candidates = [m for m in models if m]
+    if pricing is not None:
+        for model in candidates:
+            if pricing.lookup(model) is not None:
+                return model
+    return candidates[0] if candidates else None
+
+
 def check_budget_config(agent: Agent, *, model: str | None = None) -> None:
-    """Check that a dollar budget can be priced (B4). Inert for now.
+    """Fail fast when a dollar budget cannot be priced (B4).
+
+    A ``Budget(max_cost_usd=...)`` needs a pricing source for the model the
+    run will request: a provider that reports cost (``reports_cost``) or a
+    :class:`PriceTable` entry (exact id or glob, same lookup as pricing the
+    calls). Otherwise the limit would silently never trip.
 
     Called from ``Agent.__init__`` (``model=None``: the provider's configured
-    model) and at every ``run`` / ``stream`` / ``retry`` entry with the per-call
-    requested ``model=`` override, when one was passed. Will raise
-    :class:`~dendrux.errors.BudgetConfigurationError`.
+    model) and at every ``run`` / ``stream`` / ``retry`` entry with the
+    per-call ``model=`` override when one was passed.
+
+    Raises:
+        BudgetConfigurationError: ``reason="unpriced_model"``.
     """
+    budget = agent.budget
+    if budget is None or budget.max_cost_usd is None:
+        return
+    provider = agent.provider
+    if provider is None:
+        return
+    if provider.reports_cost:
+        return
+    requested = model or provider.model
+    if agent.pricing is not None and agent.pricing.lookup(requested) is not None:
+        return
+    from dendrux.errors import BudgetConfigurationError
+
+    raise BudgetConfigurationError(model=requested or None, reason="unpriced_model")
 
 
 def _is_glob(key: str) -> bool:
