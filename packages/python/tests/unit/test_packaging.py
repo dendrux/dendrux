@@ -20,7 +20,7 @@ def test_httpx_is_a_base_dependency() -> None:
     """httpx is imported at module load (llm/_retry_telemetry.py) on the core
     import path, so it must be a base dependency — not only pulled transitively
     via a provider extra. Otherwise `import dendrux` fails for installs without
-    a provider SDK (e.g. a read-only RunStore + make_read_router consumer).
+    a provider SDK (e.g. a read-only RunStore consumer).
     """
     base_deps = _pyproject()["project"]["dependencies"]
     assert any(dep.replace(" ", "").lower().startswith("httpx") for dep in base_deps), (

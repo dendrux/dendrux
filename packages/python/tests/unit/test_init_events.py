@@ -6,14 +6,12 @@ Covers:
   mcp.connected after run.started inside the try block
 - MCP discovery failure → mcp.error + run error cleanup
 - Console notifier rendering of all 4 new event types
-- Normalizer mapping for all 4 new event types
 - SingleCall + tool_sources runtime validation
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,9 +20,6 @@ from dendrux.agent import Agent
 from dendrux.loops.base import BaseNotifier, BaseRecorder
 from dendrux.tool import tool
 from dendrux.types import GovernanceEventType
-
-if TYPE_CHECKING:
-    from datetime import datetime
 
 # ------------------------------------------------------------------
 # Shared fixtures
@@ -564,173 +559,6 @@ class TestConsoleNotifierInitEvents:
         )
         captured = capsys.readouterr()
         assert "Connection refused" in captured.out
-
-
-# ------------------------------------------------------------------
-# Normalizer mapping
-# ------------------------------------------------------------------
-
-
-class TestNormalizerInitEvents:
-    """GOVERNANCE_EVENT_META has entries for 5 new event types."""
-
-    def test_skill_catalog_resolved_in_meta(self) -> None:
-        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
-
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_CATALOG_RESOLVED]
-        assert severity == "info"
-        assert "skill" in title.lower() or "loaded" in title.lower()
-
-    def test_skill_activation_failed_in_meta(self) -> None:
-        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
-
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_ACTIVATION_FAILED]
-        assert severity == "warning"
-        assert "skill" in title.lower() or "denied" in title.lower()
-
-    def test_mcp_connected_in_meta(self) -> None:
-        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
-
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.MCP_CONNECTED]
-        assert severity == "info"
-        assert "mcp" in title.lower() or "connected" in title.lower()
-
-    def test_mcp_error_in_meta(self) -> None:
-        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
-
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.MCP_ERROR]
-        assert severity == "error"
-        assert "mcp" in title.lower() or "error" in title.lower()
-
-    def test_skill_activated_in_meta(self) -> None:
-        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
-
-        severity, title = GOVERNANCE_EVENT_META[GovernanceEventType.SKILL_ACTIVATED]
-        assert severity == "info"
-        assert "skill" in title.lower() or "invoked" in title.lower()
-
-    def test_governance_event_types_frozenset_updated(self) -> None:
-        """The frozenset used for node dispatch includes new types."""
-        from dendrux.dashboard.normalizer import _GOVERNANCE_EVENT_TYPES
-
-        assert GovernanceEventType.SKILL_CATALOG_RESOLVED in _GOVERNANCE_EVENT_TYPES
-        assert GovernanceEventType.SKILL_ACTIVATION_FAILED in _GOVERNANCE_EVENT_TYPES
-        assert GovernanceEventType.SKILL_ACTIVATED in _GOVERNANCE_EVENT_TYPES
-        assert GovernanceEventType.MCP_CONNECTED in _GOVERNANCE_EVENT_TYPES
-        assert GovernanceEventType.MCP_ERROR in _GOVERNANCE_EVENT_TYPES
-
-    async def test_normalizer_creates_governance_node_for_skill_loaded(self) -> None:
-        """Normalizer converts skill.catalog_resolved DB event into GovernanceEventNode."""
-        from dendrux.dashboard.normalizer import (
-            GovernanceEventNode,
-            normalize_timeline,
-        )
-
-        @dataclass
-        class _Event:
-            id: str = ""
-            event_type: str = ""
-            sequence_index: int = 0
-            iteration_index: int = 0
-            correlation_id: str | None = None
-            data: dict[str, Any] | None = None
-            created_at: datetime | None = None
-
-        @dataclass
-        class _Run:
-            id: str = ""
-            agent_name: str = ""
-            status: str = "success"
-            input_data: dict[str, Any] | None = None
-            output_data: dict[str, Any] | None = None
-            answer: str | None = None
-            error: str | None = None
-            iteration_count: int = 0
-            model: str | None = None
-            strategy: str | None = None
-            parent_run_id: str | None = None
-            delegation_level: int = 0
-            total_input_tokens: int = 0
-            total_output_tokens: int = 0
-            total_cost_usd: float | None = None
-            total_cache_read_tokens: int = 0
-            total_cache_creation_tokens: int = 0
-            total_reasoning_tokens: int = 0
-            meta: dict[str, Any] | None = None
-            created_at: datetime | None = None
-            updated_at: datetime | None = None
-
-        @dataclass
-        class MockStore:
-            _run: _Run | None = None
-            _events: list[_Event] = field(default_factory=list)
-            _traces: list[Any] = field(default_factory=list)
-            _tool_calls: list[Any] = field(default_factory=list)
-
-            async def get_run(self, run_id: str) -> _Run | None:
-                return self._run if self._run and self._run.id == run_id else None
-
-            async def get_run_events(
-                self,
-                run_id: str,
-                *,
-                after_sequence_index: int | None = None,
-                limit: int | None = None,
-            ) -> list[_Event]:
-                rows = self._events
-                if after_sequence_index is not None:
-                    rows = [e for e in rows if e.sequence_index > after_sequence_index]
-                return rows if limit is None else rows[:limit]
-
-            async def get_traces(
-                self, run_id: str, *, limit: int | None = None, offset: int = 0
-            ) -> list[Any]:
-                rows = self._traces[offset:]
-                return rows if limit is None else rows[:limit]
-
-            async def get_tool_calls(
-                self, run_id: str, *, limit: int | None = None, offset: int = 0
-            ) -> list[Any]:
-                rows = self._tool_calls[offset:]
-                return rows if limit is None else rows[:limit]
-
-        store = MockStore(
-            _run=_Run(id="r1", agent_name="A", status="success"),
-            _events=[
-                _Event(
-                    id="e0",
-                    event_type="run.started",
-                    sequence_index=0,
-                    data={"agent_name": "A"},
-                ),
-                _Event(
-                    id="e1",
-                    event_type="skill.catalog_resolved",
-                    sequence_index=1,
-                    iteration_index=0,
-                    data={
-                        "name": "pdf-processing",
-                        "description": "Extract text from PDFs",
-                    },
-                ),
-                _Event(
-                    id="e2",
-                    event_type="run.completed",
-                    sequence_index=2,
-                    data={"status": "success"},
-                ),
-            ],
-        )
-
-        result = await normalize_timeline("r1", store)
-        assert result is not None
-        # run.started + governance + finish = 3 nodes
-        assert len(result.nodes) == 3
-        gov_node = result.nodes[1]
-        assert isinstance(gov_node, GovernanceEventNode)
-        assert gov_node.event_type == "skill.catalog_resolved"
-        assert gov_node.severity == "info"
-        assert gov_node.data["name"] == "pdf-processing"
 
 
 # ------------------------------------------------------------------

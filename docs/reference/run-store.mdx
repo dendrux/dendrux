@@ -5,7 +5,7 @@ description: The read-only facade over Dendrux's six tables. Constructors, every
 
 # RunStore
 
-`RunStore` is the public, read-only way to query everything Dendrux persisted about a run. It is a plain Python object you can call from any code (routes, admin scripts, background jobs) and it is what [`make_read_router`](/docs/reference/read-router) is built on.
+`RunStore` is the public, read-only way to query everything Dendrux persisted about a run. It is a plain Python object you can call from any code (routes, admin scripts, background jobs) it supports routes and inspection tools owned by your app.
 
 ```python
 from dendrux.store import RunStore
@@ -53,7 +53,7 @@ A run outside the scope behaves exactly like a missing one: `get_run` returns `N
 from dendrux import UNSCOPED
 ```
 
-[//]: # "VERIFY-0.5.0: T1 adds tenant_id to these RunStore methods; the signatures below follow spec section 5.1"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Read methods
 
@@ -127,9 +127,24 @@ def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | N
 
 **`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. A shared poller serves every follower of a run in your process, at most 500 followers per store (`FollowCapacityError`, answer 503), 900 s per follow by default. Events pass through `redact_event`: with `include_payloads=False` the system prompt, provider bodies, the PII mapping and past pauses' arguments are removed, and the active pause's arguments stay.
 
-**`redact_event(event, *, include_payloads=False, active_pause=False)`** is the same filter as a function, for code that reads with `get_events`. All of these are importable from `dendrux.store` (`PendingPause`, `PendingToolCall`, `Follow`, `FollowEnd`, `FollowHeartbeat`, `FollowCapacityError`, `EventFeed`, `redact_event`).
+**`get_event_view(run_id, event, *, tenant_id, include_payloads=False)`** verifies that the run is in scope. Pass only events read from that same run;
+StoredEvent has no run ID for verifying event association. It resolves the active pause and uses recorded
+model-sent approval arguments. Prefer it when paging raw `get_events` rows for a UI.
+`follow` applies this contextual projection automatically. Neither makes raw traces,
+run details or provider records suitable for a browser without your field allowlist.
 
-[//]: # "VERIFY-0.5.0: signatures and defaults are from T1 section 10 (worktree 050-t1); the pause_id field is None until T7 fills it"
+**`redact_event(event, *, include_payloads=False, active_pause=False)`** is a conservative
+standalone filter with no database context. Unverified active approval/input params
+are hidden (`params=None`, `args_hidden=True`); never replace them with empty args.
+Use `get_event_view` for the verified model-sent values. All feed and pending types,
+`EventFeed`, `redact_event` and `RunStore` are importable from `dendrux.store`.
+
+Client-tool params may contain real personal data under the default PII restore
+policy. Authenticate and authorize user-level run ownership before exposing them.
+The feed bounds iteration; your HTTP transport must bound blocked sends and call
+`aclose()` in `finally`, including if no generator iteration begins.
+
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 ### `get_subtree`
 
@@ -199,10 +214,10 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`RunSubtree`**, **`SubtreeNode`**, **`RunUsage`** (from `get_subtree`) and **`RunNote`** (from `get_notes`) are described under [`get_subtree`](#get_subtree) and [`get_notes`](#get_notes).
 
-**`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`, and (0.5.0) `pause_id`, which you can pass back as `expected_pause_id=` to a `submit_*` call. `pending_tool_calls` carries the pending calls' ids, names and parameters, so `get_pauses` is the public way to read a client tool's call ids when you are not holding the original `RunResult` (see [Client-side tools](/docs/recipes/client-tools)). `pause_id` is `None` for pauses recorded before 0.5.0.
+**`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`, and (0.5.0) `pause_id`. `pending_tool_calls` carries the pending calls' ids, names and parameters, so `get_pauses` is the public way to read a client tool's call ids when you are not holding the original `RunResult` (see [Client-side tools](/docs/recipes/client-tools)). `pause_id` is `None` for pauses recorded before 0.5.0.
 
 ## Where this fits
 
 - [State persistence](/docs/architecture/state-persistence): the tables behind these records.
-- [make_read_router](/docs/reference/read-router): the same reads over HTTP.
+- [Build your own read routes](/docs/recipes/build-your-own-read-routes): the same reads over HTTP.
 - [HTTP API surface](/docs/reference/http-api): the endpoint shapes.

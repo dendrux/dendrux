@@ -200,7 +200,7 @@ Descendants are cancelled deepest first and `run_id` last, over a snapshot of th
 - **Cancellation is not retroactive.** Tokens spent before the runner observes the flag have been billed. Side effects from tools that already executed are not undone. The cancel is forward-looking: stop further iterations, do not roll back.
 - **Cancelling after the last checkpoint does not undo a finished run.** If the run's final answer is already being produced when the cancel lands, it completes as `success`.
 - **Interrupted model calls report no usage.** Providers send token counts at the end of a stream. A call abandoned mid-stream contributes nothing to `usage`; only completed iterations are counted.
-- **Cancellation does not require holding the agent instance that started the run.** Any process with a DB handle and the same agent class can cancel. A dashboard, a webhook, an admin script — they all work.
+- **Cancellation does not require holding the agent instance that started the run.** Any process with a DB handle and the same agent class can cancel. An inspection tool, a webhook, an admin script — they all work.
 - **`cancel_run` is the only sanctioned way to stop a run.** Do not delete the row, do not edit the status by hand, do not kill the asyncio task in isolation. The CAS / flag dance encodes the safety properties.
 
 ## Where this fits

@@ -1,7 +1,7 @@
 """Masking database URLs for logs, errors and CLI output (internal, shared).
 
 One implementation for every place that prints or logs a database URL (the
-engine/session layer, ``dendrux db``, the dashboard CLI), so the edge cases
+engine/session layer, ``dendrux db``, the CLI), so the edge cases
 are handled once: passwords in the userinfo or the query string, and
 unparseable input.
 """

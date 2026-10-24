@@ -32,16 +32,17 @@
 
 0.5.0 ("Trust") makes Dendrux safe by default for multi-tenant, production use. Read the [upgrade guide](docs/upgrading-to-0.5.0.mdx) before you deploy: run `dendrux db migrate`, then roll your workers (rolling deploys are supported).
 
-- **Tenant-scoped reads.** `make_read_router(..., tenant_resolver=...)` is now required: a dependency that returns the caller's tenant, or `UNSCOPED` for a single-tenant app. Every `RunStore` read takes `tenant_id=`, a run in another tenant looks exactly like a missing one, and idempotency keys are per tenant. Opt into `Agent(strict_tenancy=True)` to make forgetting `tenant_id=` an error. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
-- **Payloads hidden by default.** The read router leaves out provider requests and responses, raw tool data, the system prompt and the PII mapping unless you pass `include_payloads=True`; the active pause's arguments stay visible so client tools and approval screens keep working.
-- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. `make_read_router` stays, frozen. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx).
+- **Tenant-scoped reads.** Pass `tenant_id=` on every RunStore read and Agent write. A foreign run looks like a missing one. Your routes authenticate the actor and authorize user-level run ownership. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
+- **Payloads hidden by default.** `RunStore.follow` and `get_event_view` hide historical payloads by default. Active client calls remain actionable and may contain personal data; authorize the actor before returning them. Raw RunStore reads require your own response projection.
+- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx).
 - **No more silent provider failures.** Every failed request is a typed `ProviderError` (`.category`, `.retryable`, `.safe_message`); empty streams, refusals and failed Responses calls end the run `error` with `RunResult.error_info` instead of an empty `success`. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](docs/recipes/handling-provider-errors.mdx).
 - **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
 - **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
 - **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. The default is unchanged. See [PII restore](docs/architecture/pii-restore.mdx).
-- **Run integrity.** Pauses carry a `pause_id` so a stale submit is rejected (`expected_pause_id=`), claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
-- **Secure dashboard.** `dendrux dashboard` needs a token (`DENDRUX_DASHBOARD_TOKEN`) when it listens off loopback.
+- **Run integrity.** Claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
 - **Migration.** Run `dendrux db migrate` (revision `d7e8f9a0b1c2`). Several defaults flip in 0.6; 0.5 prints a `FutureWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
+
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support before documenting stale-submit protection."
 
 ## What's new in 0.4.1
 
@@ -295,7 +296,7 @@ result = await agent.run("do the thing", notifier=ConsoleNotifier())
 
 Every run persists: traces with full message content, tool calls with parameters and results, LLM interactions with request/response payloads, token usage, timing, delegation links, and lifecycle events.
 
-**PII policy**: the DB is the authoritative execution record and stores raw values. Guardrails redact at the LLM boundary only — what the provider API sees — and the placeholder→real bijection is persisted on `agent_runs.pii_mapping` as the audit key, so dashboards can replay either view from the same rows. See [PII redaction](docs/architecture/pii-redaction.mdx).
+**PII policy**: the DB is the authoritative execution record and stores raw values. Guardrails redact at the LLM boundary only — what the provider API sees — and the placeholder→real bijection is persisted on `agent_runs.pii_mapping` as the audit key, so inspection tools can replay either view from the same rows. See [PII redaction](docs/architecture/pii-redaction.mdx).
 
 ### 🌳 Coordinate Agents
 
@@ -314,7 +315,7 @@ async def research(query: str) -> str:
         return result.answer
 ```
 
-The state store links parent and child runs. The dashboard shows the full delegation tree. Depth guards prevent runaway recursion.
+The state store links parent and child runs. Read the delegation tree with `RunStore.get_subtree(..., tenant_id=...)` and render it in your app. Depth guards prevent runaway recursion.
 
 ### 📚 Skills
 
@@ -467,22 +468,17 @@ Omit `database_url` entirely for ephemeral runs. No persistence, no overhead.
 
 ---
 
-## CLI and Dashboard
+## CLI and inspection
 
 ```bash
-dendrux runs                    # list all runs
-dendrux runs --status error     # filter by status
-dendrux traces <run_id>         # full conversation trace
-dendrux traces <run_id> --tools # with tool call details
-dendrux db migrate              # run Alembic migrations (Postgres)
-dendrux dashboard               # launch web dashboard at :8001
+dendrux runs --tenant acme --limit 50
+dendrux traces RUN_ID --limit 100
+dendrux db check
 ```
 
-The dashboard opens without a token on loopback only; on any other address set `DENDRUX_DASHBOARD_TOKEN`.
-
-The dashboard shows runs, timelines, tool calls, token usage, delegation trees, and LLM payloads. All data is read-only. Traces and tool calls are rendered raw; when a PII guardrail is active, `agent_runs.pii_mapping` carries the bijection the LLM saw and can be applied at render time to produce an LLM-eye view.
-
----
+Use RunStore reads plus your own tracing and operator UI. See
+[Observability](docs/recipes/observability.mdx) for bounded inspection and
+[HTTP integration](docs/reference/http-api.mdx) for app-owned routes.
 
 ## Examples
 
@@ -504,7 +500,7 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`14_skills/`](packages/python/examples/14_skills/) | Skills with files and a script executor: model-driven and explicit activation, deny policy |
 | [`15_cache_efficiency.py`](packages/python/examples/15_cache_efficiency.py) | Anthropic prompt-cache hit measurement |
 | [`16_cache_efficiency_openai.py`](packages/python/examples/16_cache_efficiency_openai.py) | OpenAI prompt-cache hit measurement |
-| [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |
+| [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** developer-owned routes, header auth, RunStore pending reads and governance |
 | [`30_mcp_agent.py`](packages/python/examples/30_mcp_agent.py) | Local tools + an SDK v2 MCP source with shared `MCPHost` lifecycle |
 | [`36_run_control.py`](packages/python/examples/36_run_control.py) | Per-call approvals, a `before_tool` policy hook and `request_pause` / `submit_resume`, with a mock provider (no API key) |
 | [`37_images.py`](packages/python/examples/37_images.py) | A user image plus a tool that returns an image, stored and inspected (mock provider by default, no API key) |
@@ -514,7 +510,6 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`governance/02_approval.py`](packages/python/examples/governance/02_approval.py) | Human-in-the-loop approval with approve/reject CLI |
 | [`governance/03_budget.py`](packages/python/examples/governance/03_budget.py) | Token budget with threshold warnings |
 | [`governance/04_guardrails.py`](packages/python/examples/governance/04_guardrails.py) | PII redaction, secret detection, warn mode |
-| [`governance/05_dashboard.py`](packages/python/examples/governance/05_dashboard.py) | Dashboard pointed at a seeded run database |
 
 ```bash
 cd packages/python/examples
@@ -542,7 +537,7 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 ## Status
 
-Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore`, and `make_read_router` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
@@ -557,9 +552,9 @@ Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent
 | Delegation context (parent-child linking) | Stabilizing |
 | Governance (deny, approval, budget, guardrails) | Stabilizing |
 | Recorder/Notifier split | Stable |
-| CLI + Dashboard | Stabilizing |
+| CLI | Stabilizing |
 | Client-side tool pause/resume | Stabilizing |
-| Public HTTP surface (`make_read_router`, `RunStore`) | Stabilizing |
+| Public read API (`RunStore`) | Stabilizing |
 
 Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 6,100+ tests, strict types, Apache 2.0.
 

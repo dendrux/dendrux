@@ -113,7 +113,7 @@ patterns=[
 ]
 ```
 
-For RAG agents, prefer `action="warn"` initially. Run for a week, look at the `guardrail.detected` events in the dashboard, and tighten to `block` only on the patterns that fire exclusively on real attacks.
+For RAG agents, prefer `action="warn"` initially. Run for a week, look at the `guardrail.detected` events in your inspection tools, and tighten to `block` only on the patterns that fire exclusively on real attacks.
 
 ### Code-execution / sandboxed-tool agents
 
@@ -230,9 +230,9 @@ And in `run_events`:
 
 Since 0.5.0 a block never copies the matched text into the error, the event or the logs. It reports the kind, how many, and where (message index, role, and the tool call id for tool results). That keeps a leaked secret or a person's data from being written into the audit trail by the very guardrail that caught it. Look up the message by its location if you need to see what matched.
 
-[//]: # "VERIFY-0.5.0: T3 owns the block message format and the findings/location field names; replace the example strings with the real output"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
-The dashboard renders this as a red chip in the Safety panel with the entity type and the iteration where it fired.
+Inspection tools you build can group these events by entity type and iteration.
 
 ## What's coming in v2
 

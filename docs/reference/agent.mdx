@@ -110,7 +110,7 @@ agent = Agent(provider=provider, prompt="...", limits=Limits(max_input_bytes=4 *
 
 The note cap is enforced by one conditional insert in the store, so concurrent `submit_note` calls cannot exceed it. A custom `StateStore` whose `add_note` has no `max_notes` keyword keeps working without the cap.
 
-[//]: # "VERIFY-0.5.0: caps are enforced by T4 (inputs, tool results) and T1 (notes, metadata); T0 only stores them. Recheck the replacement JSON and the ValueError behaviour"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ### Transforming tool results
 
@@ -169,7 +169,7 @@ for runs with no narration, and for idempotent cached results. Persisted traces
 carry the same split as `TraceEntry.phase`. A paused run may instead carry a
 clarification question.
 
-[//]: # "VERIFY-0.5.0: AGT-209 item 5 (RunResult fields listed plainly, including stop_reason, truncated, error_info, pause_id) is deliberately written at release, once T7 has wired error_info and pause_id. Add a RunResult section here then, and fix the link above that points RunResult at run-store"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ### Truncated answers
 
@@ -181,7 +181,7 @@ if result.truncated:
     ...  # raise max_tokens, or ask the model to continue
 ```
 
-When streaming, the `RUN_COMPLETED` event has the same `event.stop_reason` and `event.truncated`. The `run.completed` event in the store (and over `make_read_router` SSE) carries `stop_reason` and `truncated`. Dendrux does not continue a truncated answer automatically. Anthropic's `model_context_window_exceeded` counts as `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers).
+When streaming, the `RUN_COMPLETED` event has the same `event.stop_reason` and `event.truncated`. The `run.completed` event in the store (and over `RunStore.follow`) carries `stop_reason` and `truncated`. Dendrux does not continue a truncated answer automatically. Anthropic's `model_context_window_exceeded` counts as `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers).
 
 With `output_type`, a final answer that fails validation raises `StructuredOutputValidationError` instead. It carries `usage`, `model` and `stop_reason` for the rejected call, which is still recorded and priced; the run row's own totals stay at 0, so read the cost from `RunStore.get_subtree(run_id).usage`. See [Structured output](/docs/architecture/loops#when-validation-fails).
 
@@ -320,7 +320,7 @@ async def resume(
 
 Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so existence never leaks across tenants. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it (or pass `UNSCOPED`) to skip the check; with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
-Each method also takes `expected_pause_id=`. If the run's current pause has a different `pause_id` (the one on `RunResult.pause_id` and the `run.paused` event), the call raises `PauseStatusMismatchError` and writes nothing, which stops a stale client from answering a newer pause. Optional in 0.5, required in 0.6. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 ```python
 await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)

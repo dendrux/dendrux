@@ -1,6 +1,6 @@
 """Public read facade over persisted agent-run state.
 
-``RunStore`` is the stable contract developers use to build dashboards,
+``RunStore`` is the stable contract developers use to build inspection tools,
 monitoring, billing, and any other observation layer on top of Dendrux.
 
 It is read-only for run data. Write paths remain on
@@ -843,7 +843,7 @@ class RunStore:
 
         The mapping is the audit key that links raw traces persisted in
         the DB to the placeholder view the LLM provider API actually saw.
-        Use it to render the LLM-eye view from raw traces in dashboards
+        Use it to render the LLM-eye view from raw traces in inspection tools
         or exports.
 
         Empty dict if the run has no mapping (no PII guardrail active,

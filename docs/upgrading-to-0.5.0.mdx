@@ -18,7 +18,7 @@ Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [W
 3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing (use `--allow-unstamped` if you build your schema with `create_all`). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query.
 4. **Read the warnings.** Run your tests with warnings visible (`python -W default`). Every default that changes in 0.6 prints a `FutureWarning` in 0.5 (visible by default), and a renamed or removed setting prints a `DeprecationWarning`. Python shows each warning once per call site.
 
-[//]: # "VERIFY-0.5.0: revision id d7e8f9a0b1c2 and the exact index list come from T1's R1 revision; re-check after integration"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ### Mixed fleets during a rolling deploy
 
@@ -30,72 +30,61 @@ Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [W
 
 The revision has a tested downgrade. Roll the workers back to 0.4.1 first, then downgrade the database to the previous revision (`c6d7e8f9a0b1`) with Alembic. After a downgrade, idempotency keys are unique across all tenants again, as in 0.4.1, so a downgrade fails if two tenants already share a key.
 
-[//]: # "VERIFY-0.5.0: there is no dendrux db downgrade command (cli/db.py has migrate and status only); confirm the supported downgrade invocation, the failure on shared keys, and that dendrux db check exists (T1, AGT-210)"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+
+## Removed in 0.5.0
+
+`make_read_router` (`dendrux.http`) and the embedded dashboard (`dendrux.dashboard`,
+`packages/dashboard`, and the `dendrux dashboard` command) are removed in 0.5.0.
+The `http` extra is removed; install your web framework and server explicitly.
+Delete old mounts/imports and CLI token/host configuration. Dendrux is a library:
+developers build their own routes on RunStore.
+
+| Old router endpoint | Replacement library call |
+| --- | --- |
+| `GET /health` | Your app's health check; no RunStore equivalent |
+| `GET /runs` | `list_runs(tenant_id=..., limit=..., offset=...)` and `count_runs(tenant_id=...)`; filters include `status`, `agent_name`, `started_after`, `started_before` |
+| `GET /runs/{id}` | `get_run(id, tenant_id=...)` |
+| `GET /runs/{id}/events` | `get_events(id, tenant_id=..., after_sequence_index=..., limit=...)` then `get_event_view(id, event, tenant_id=...)` |
+| `GET /runs/{id}/events/stream` | `follow(id, tenant_id=..., after_sequence_index=...)`; use `until_terminal=False` to keep following beyond terminal status |
+| `GET /runs/{id}/llm-calls` | `get_llm_calls(id, tenant_id=..., limit=..., offset=...)` (raw; project fields yourself) |
+| `GET /runs/{id}/tool-calls` | `get_tool_invocations(id, tenant_id=..., limit=..., offset=...)` (raw; project fields yourself) |
+| `GET /runs/{id}/traces` | `get_traces(id, tenant_id=..., limit=..., offset=...)` (raw; project fields yourself) |
+| `GET /runs/{id}/pauses` | `get_pause_page(id, tenant_id=..., limit=...)` for pairs plus truncation; `get_pending(id, tenant_id=...)` for current actionable state |
+
+Return one 404 for missing and foreign runs. Authenticate with headers and verify
+user-level run ownership as well as tenant scope. Enforce approval roles server-side.
+Clamp limits/offsets and expose incomplete pages; raw store records are not safe
+browser DTOs. Keep traces, provider bodies, arbitrary output, metadata and PII
+mappings server-side. Current client-tool params can contain real personal data.
+If `args_hidden=True`, stop and resolve on the server; never approve empty arguments.
+
+For SSE you now own Last-Event-ID parsing, reconnects, 204 drained-terminal responses,
+capacity handling, redaction, disconnect cleanup and network-send deadlines.
+Those HTTP status mappings belong to your application.
+The feed's maximum duration bounds iteration, not blocked sends. Always call
+`follow.aclose()` in `finally`. Never put bearer tokens in URLs or pipe
+`agent.stream()` directly to a browser. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+**Observability migration.** The embedded dashboard's normalized historical timeline
+and operator UI have no drop-in replacement. Use RunStore reads plus your own tracing:
+page events, inspect pending state and bounded pause pairs/tool/LLM reads, and build
+any timeline projection with explicit bounds and truncation. Connect
+`OpenTelemetryNotifier` to your app's tracing. See the working
+[operator inspection recipe](/docs/recipes/observability).
+
+### Tenant scope and redaction on your routes
+
+Pass `tenant_id=` on every Agent and RunStore call. `get_pending` and `follow`
+require an explicit scope; older reads default to all tenants. `None` means
+untenanted runs only and `UNSCOPED` is an explicit all-tenant operator view.
+`get_event_view` and `follow` hide historical payloads by default, while keeping
+active client calls actionable. Approval/input arguments use recorded model values
+or fail closed. This does not make every RunStore read a redacted wire response.
 
 ## What you must change
 
-### 1. `make_read_router` needs a tenant resolver
-
-`tenant_resolver=` is now required. It tells the router which tenant the caller may read.
-
-```python
-from dendrux import UNSCOPED
-from dendrux.http import make_read_router
-
-# Multi-tenant: a FastAPI dependency that returns the caller's tenant.
-async def tenant_resolver(user=Depends(current_user)) -> str:
-    return user.org_id
-
-app.include_router(
-    make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver),
-    prefix="/api",
-)
-
-# Single-tenant app: say so explicitly.
-app.include_router(
-    make_read_router(store=store, authorize=authorize, tenant_resolver=UNSCOPED),
-    prefix="/api",
-)
-```
-
-- The resolver returns a non-empty `str` (that tenant only), `None` (untenanted runs only) or `UNSCOPED` (every tenant). Anything else is a 500. The router fails closed.
-- A run outside the caller's scope returns the same 404 as a run that does not exist.
-- The `?tenant_id=` query parameter on `GET /runs` is honoured only when the resolver returned `UNSCOPED` (an admin narrowing the view). For everyone else it is ignored.
-- A resolver that returns `UNSCOPED` is an all-tenant reader. Give it only to your own operators.
-- The resolver must return a plain value. Do not use `yield` in it.
-
-See [make_read_router](/docs/reference/read-router) and [Multi-tenancy](/docs/architecture/multi-tenancy).
-
-### 2. Read responses hide payloads unless you opt in
-
-`make_read_router(include_payloads=False)` is the default. Responses from `/runs/*`, `/events`, SSE and `/pauses` no longer carry:
-
-- the provider request and response,
-- raw traces, tool results and server-tool parameters,
-- the system prompt in `run.started`,
-- the arguments of past pauses,
-- the PII mapping.
-
-**The active pause stays actionable.** While a run is paused, its pending arguments remain visible by default: the parameters of a pending client-tool call, and the arguments in an approval or input request. They are the instruction to the client, so hiding them would break client tools and approval screens. This covers `run.paused`, `/pauses` and `RunStore.get_pending`. Approval and input views show the arguments as the model sent them, which is placeholder form when PII redaction is on.
-
-Pass `include_payloads=True` for a trusted internal viewer. Counts, statuses, timings, token usage and event types are always returned.
-
-> **Recommended: build your own read routes.** `make_read_router` stays in 0.5 and is frozen: no new features, and no deprecation warning. Its hardening now lives in `RunStore` as `get_pending` (what a run is waiting on) and `follow` (a hardened live feed), which your own routes can call. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
-
-### 3. The dashboard needs a token off loopback
-
-`dendrux dashboard` still opens without a token when bound to `127.0.0.1`. Bound to anything else it requires one, sets no `Access-Control-Allow-Origin: *`, and checks the `Host` header.
-
-```bash
-export DENDRUX_DASHBOARD_TOKEN="$(openssl rand -hex 32)"
-dendrux dashboard --host 0.0.0.0 --allow-origin https://ops.example.com
-```
-
-Prefer the environment variable; `--token` works but warns because arguments are visible in process listings.
-
-[//]: # "VERIFY-0.5.0: T5 owns the dashboard; confirm flag names --host --token --allow-origin and the env var DENDRUX_DASHBOARD_TOKEN"
-
-### 4. Dollar budgets need a price
+### 1. Dollar budgets need a price
 
 `Budget(max_cost_usd=...)` on a model Dendrux cannot price now raises `BudgetConfigurationError`, at construction and again at run start for the model actually used. Before, the budget silently never fired.
 
@@ -116,9 +105,9 @@ agent = Agent(
 
 See [Budget](/docs/architecture/budget) and [Cost and pricing](/docs/architecture/pricing).
 
-[//]: # "VERIFY-0.5.0: T3 owns this; the snippet uses ModelPricing(input=, output=) as in 0.4.1; B4 may add nothing to the constructor"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
-### 5. Provider failures are typed errors
+### 2. Provider failures are typed errors
 
 Silent empty answers are gone. A stream that ends with no terminal event, a Responses `error` or `response.failed`, a refusal and a content filter each raise a `ProviderError` subclass, and the run ends `error` with `RunResult.error_info`.
 
@@ -129,7 +118,7 @@ Silent empty answers are gone. A stream that ends with no terminal event, a Resp
 
 See [Handling provider errors](/docs/recipes/handling-provider-errors) and [Models and providers](/docs/architecture/models).
 
-### 6. Create one state store per process
+### 3. Create one state store per process
 
 The implicit engine built from `DENDRUX_DATABASE_URL` is deprecated. An `Agent` with no `state_store=` or `database_url=` still resolves it, but warns once. The shared engine also guards against use from a second event loop and raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress".
 
@@ -148,7 +137,7 @@ async with Agent(provider=..., prompt=..., state_store=STORE) as agent:
 
 Do not pass `database_url=` on every request. Each `Agent` would build its own pool. A script that builds one `Agent` with `database_url=` is fine. See [Web endpoints](/docs/recipes/web-endpoint).
 
-### 7. Local `@tool` arguments are validated and coerced
+### 4. Local `@tool` arguments are validated and coerced
 
 For `@tool` functions Dendrux now checks the model's arguments against the schema, then coerces them to the annotated types. A parameter annotated with a Pydantic model receives the model instance, not a dict; an `Enum` parameter receives the member; `3.0` becomes `3` for an `int`; ISO strings become `datetime`; `Field(...)` constraints (`ge`, `le`, `max_length` and so on) are enforced and appear in the schema.
 
@@ -160,19 +149,19 @@ For `@tool` functions Dendrux now checks the model's arguments against the schem
 
 See [Tools](/docs/reference/tools).
 
-### 8. Metadata keys starting with `dendrux.` are reserved
+### 5. Metadata keys starting with `dendrux.` are reserved
 
 `agent.run(..., metadata={"dendrux.x": 1})` raises `ValueError`. Rename the key. Dendrux uses that prefix for its own run metadata.
 
-### 9. `RunNotFoundError` takes a run id
+### 6. `RunNotFoundError` takes a run id
 
-`dendrux.store.RunNotFoundError` is now the same class as `dendrux.errors.RunNotFoundError`, and its constructor takes a run id: `RunNotFoundError("01J...")`. One `except RunNotFoundError` catches it from `Agent`, `RunStore` and the read router. If you raised it yourself with a message, pass the id instead.
+`dendrux.store.RunNotFoundError` is now the same class as `dendrux.errors.RunNotFoundError`, and its constructor takes a run id: `RunNotFoundError("01J...")`. One `except RunNotFoundError` catches it from `Agent`, `RunStore`. If you raised it yourself with a message, pass the id instead.
 
-### 10. `retry()` and `submit_*` raise `RunNotFoundError` for foreign runs
+### 7. `retry()` and `submit_*` raise `RunNotFoundError` for foreign runs
 
 A missing run and a run that belongs to another tenant now raise the same `RunNotFoundError` (a `LookupError`) from `retry`, `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume` and `resume`. Before, `retry` raised `ValueError` or `ReplayRunError` and some paths leaked that a run existed. Catch `RunNotFoundError` and return 404.
 
-### 11. `list_runs` and `count_runs` treat `None` as "untenanted"
+### 8. `list_runs` and `count_runs` treat `None` as "untenanted"
 
 On `RunStore` and `StateStore`, `tenant_id` now defaults to `UNSCOPED`.
 
@@ -185,7 +174,7 @@ On `RunStore` and `StateStore`, `tenant_id` now defaults to `UNSCOPED`.
 
 If you called `list_runs(tenant_id=maybe_tenant)` with a value that can be `None`, decide which you mean. Authors of a custom `StateStore` must treat `UNSCOPED` as "no filter" and `None` as `tenant_id IS NULL`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
-### 12. Size caps
+### 9. Size caps
 
 Input text, metadata, notes and tool results now have limits. The defaults:
 
@@ -204,7 +193,7 @@ agent = Agent(provider=..., prompt="...", limits=Limits(max_tool_result_bytes=4 
 
 Images keep their own caps ([Images](/docs/recipes/images)). MCP results are cut off while they are read, so an oversized result is never held in memory in full.
 
-### 13. Custom `StateStore`: allocate the event index in the insert
+### 10. Custom `StateStore`: allocate the event index in the insert
 
 `save_run_event` must allocate the sequence index inside the insert and **return** it. `EventSequencer` is removed. A single statement does it on SQL stores:
 
@@ -216,9 +205,9 @@ FROM run_events WHERE agent_run_id = :run_id
 
 Custom stores must also accept `tenant_id` on the read methods and `max_notes=` on `add_note` (one conditional statement that raises `NoteLimitExceededError` when the run is full). A store whose `add_note` has no `max_notes` keyword keeps working, without the cap.
 
-[//]: # "VERIFY-0.5.0: T1 owns the store; confirm the save_run_event return type and the add_note max_notes signature"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
-### 14. Guardrail findings no longer carry matched text
+### 11. Guardrail findings no longer carry matched text
 
 `guardrail.blocked` events and guardrail errors report the kind, the count and the location (message index, role, tool call id), never the matched text. If you parsed text out of `guardrail.blocked`, use `kind` and `location`.
 
@@ -226,19 +215,23 @@ Detection got stricter in a good way: phone numbers need E.164 or separators plu
 
 See [Guardrails](/docs/architecture/guardrails).
 
-### 15. SSE closes when a run is finished
+### 12. Live reads and query bounds
 
-`GET /runs/{run_id}/events/stream` now sends an `event: end` frame and closes once the run is terminal and every event has been delivered. Reconnecting to a finished, drained run returns HTTP 204. Add `?follow=true` to keep the 0.4 behaviour of holding the stream open. Other changes:
+`RunStore.follow` ends with `FollowEnd("terminal", cursor)` once a terminal run's
+stored events are drained. `Follow.drained_terminal` signals that no events remain;
+your route can map that signal to HTTP 204. Set `until_terminal=False` if your app
+needs to keep following beyond terminal status.
 
-- At most 500 concurrent SSE connections per router (per process); the next one gets 503. Tune with `sse_max_connections=`.
-- A connection closes after 900 seconds with a cursor so the client reconnects, and authorisation is re-checked on reconnect. Tune with `sse_max_duration_s=`.
-- Clients watching the same run share one polling query, so database load grows with watched runs, not with open connections.
-- `GET /runs/{id}/llm-calls` pages 50 by default (200 at most).
-- `started_after` and `started_before` need a timezone (RFC 3339); a naive datetime is a 422. `offset` is capped at 10,000.
+- A store admits at most 500 followers by default, then raises `FollowCapacityError`.
+- `max_duration_s=900` bounds iteration by default and returns a resume cursor.
+  Your transport must also bound network sends, re-authorize reconnects and close
+  the follower in `finally`.
+- Followers of the same run share one poller, so polling load grows with watched runs.
+- `list_runs` rejects `offset > 10_000` with `ValueError`. Its `started_after` and
+  `started_before` values must be timezone-aware datetimes.
 
-See [HTTP API surface](/docs/reference/http-api) and [Mount the read router](/docs/recipes/mount-read-router).
-
-[//]: # "VERIFY-0.5.0: T1 owns SSE; confirm the end frame name, 204 on drained terminal runs, follow=true, 503 when full, and the llm-calls paging numbers"
+Your application chooses its HTTP statuses, framing and pagination schema. See
+[Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 ## Limits at a glance
 
@@ -253,20 +246,20 @@ Every new bound in 0.5.0, for capacity planning:
 | MCP response body read (4 times the text cap), no images | 4 MiB | the read is cut off and the result is rejected as too large |
 | Distinct PII values redacted per run | 20,000 | the scan is `unscannable`, so `block` and `redact` stop the run |
 | Concurrent Presidio scans | 16 | an extra scan is `unscannable` (fails closed) rather than queued |
-| `GET /runs` offset | 10,000 | HTTP 422 |
-| Concurrent SSE or `follow` connections | 500 per process | HTTP 503 or `FollowCapacityError` |
-| One SSE or `follow` connection | 900 s | closes with a resume cursor |
+| `list_runs` offset | 10,000 | `ValueError` |
+| Concurrent `follow` readers | 500 per store by default | `FollowCapacityError` |
+| One `follow` reader | 900 s by default (`max_duration_s`) | `FollowEnd("max_duration", cursor)` |
 | Provider call deadline | 600 s call, 600 s between stream events | `ProviderTimeoutError` |
 | Sync-tool threads | 32 per process, 8 per Agent | calls queue |
 
-[//]: # "VERIFY-0.5.0: coordinator section 8 caps (20,000 PII values, 16 Presidio scans, 4 MiB MCP read, offset 10,000 with 422) come from T3, T4 and T1 worktrees; the MCP behaviour on exceeding is T4's and the wording here is inferred. Recheck all rows at merge"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## What you may notice
 
 These need no change but are visible.
 
 - **`governance.changed` on resume.** Resuming a run with different governance (guardrails, `deny`, `require_approval`, `before_tool`, limits) now emits a `governance.changed` event and a log line. It does not stop the run unless you opt in with `Agent(on_governance_change="raise")`, which raises `GovernanceMismatchError`. Runs paused before 0.5 are skipped. Budget numbers are excluded from the comparison. See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume).
-- **Stale submits are caught.** Every pause now has a `pause_id` (on `RunResult.pause_id`, `PausePair.pause_id` and the `run.paused` event). Pass `expected_pause_id=` to a `submit_*` call and a mismatch raises `PauseStatusMismatchError`. It is optional in 0.5. See [Pause and resume](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 - **Idempotency keys are per tenant.** The same `idempotency_key` in two tenants now creates two runs. `tenant_id=""` is rejected with `ValueError` on every entry point. See [Multi-tenancy](/docs/architecture/multi-tenancy#idempotency-keys).
 - **Strict tenancy is available.** `Agent(strict_tenancy=True)` makes every entry point require an explicit `tenant_id`. It is off by default and becomes the default in 0.6.
 - **`stream_events` without a tenant warns.** `RunStore.stream_events(run_id)` still reads any tenant's run when `tenant_id` is omitted (so 0.4.1 callers keep working) but prints a `DeprecationWarning`. Pass an explicit tenant, or use `RunStore.follow`, which also ends when the run does and redacts payloads. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
@@ -284,19 +277,18 @@ These need no change but are visible.
 | Warning | 0.5 | 0.6 |
 | --- | --- | --- |
 | Strict tenancy | off unless `Agent(strict_tenancy=True)` | on by default |
-| `expected_pause_id` | optional (warns under strict tenancy when omitted on `approved=True`) | required |
 | `DENDRUX_DATABASE_URL` implicit engine | works, warns | removed |
 | `on_governance_change` | `"warn"` | `"raise"` |
 | Token budgets and cache tokens | `Budget(count_cache_tokens=...)` unset warns when a token budget is used | cache read and write tokens counted by default |
 
 To silence a warning, make the choice explicit. For example, `Budget(max_tokens=200_000, count_cache_tokens=False)` keeps 0.4 counting, and `count_cache_tokens=True` counts `input + output + cache read + cache write` tokens (raise `max_tokens` if you opt in).
 
-[//]: # "VERIFY-0.5.0: confirm each warning text and trigger once the tracks land; the expected_pause_id warning is T7 wave 2"
+[//]: # "VERIFY-0.5.0: Confirm warning texts and triggers against the release candidate."
 
 ## Checklist
 
 - [ ] `dendrux db migrate`, then `dendrux db check`
-- [ ] `tenant_resolver=` on every `make_read_router`
+- [ ] Replace removed mounts with app-owned routes and explicit tenant scope
 - [ ] `include_payloads=True` only where a trusted viewer needs raw payloads
 - [ ] A price for every model under a dollar budget
 - [ ] `except ProviderError` where you caught SDK exceptions
@@ -305,7 +297,7 @@ To silence a warning, make the choice explicit. For example, `Budget(max_tokens=
 - [ ] `Limits(...)` if your tool results or inputs are legitimately larger than 1 MiB
 - [ ] `tenant_id=` on `list_runs` calls that passed `None` meaning "all"
 - [ ] Custom `StateStore` updated
-- [ ] Dashboard token set if it listens off loopback
+- [ ] Operator inspection and tracing configured in your application
 - [ ] Tests run with `-W default` and every `FutureWarning` and `DeprecationWarning` answered
 
 ## Where this fits
@@ -313,4 +305,4 @@ To silence a warning, make the choice explicit. For example, `Budget(max_tokens=
 - [Multi-tenancy](/docs/architecture/multi-tenancy): scoping reads and writes by tenant.
 - [Handling provider errors](/docs/recipes/handling-provider-errors): the typed error taxonomy.
 - [Erasing a tenant's data](/docs/recipes/erasing-tenant-data): the manual recipe until 0.6.
-- [make_read_router](/docs/reference/read-router) and [HTTP API surface](/docs/reference/http-api): the read surface in full.
+- [HTTP integration](/docs/reference/http-api): the library and transport boundary.

@@ -72,7 +72,6 @@ With persistence enabled, inspect any run after it completes:
 ```bash
 dendrux runs
 dendrux traces <run_id> --tools
-dendrux dashboard
 ```
 
 ## Files

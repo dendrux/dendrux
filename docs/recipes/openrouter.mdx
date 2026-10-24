@@ -124,7 +124,7 @@ OpenRouter returns real spend on every response — automatically, no request fl
 - `usage.cost` → `cost_usd` — what OpenRouter charged your account for the call, in USD (the same unit as the per-token prices `list_models()` reports).
 - `prompt_tokens_details.cache_write_tokens` → `cache_creation_input_tokens`, alongside the `cached_tokens` → `cache_read_input_tokens` mapping every OpenAI-wire provider already gets.
 
-Both stream and non-stream paths are covered — cost rides the final SSE chunk — and per-call values roll up into run-level totals through the normal accumulator, so `RunStore` and the dashboard show cost per run with nothing extra to wire:
+Both stream and non-stream paths are covered — cost rides the final SSE chunk — and per-call values roll up into run-level totals through the normal accumulator, so `RunStore` and your app can display cost per run with nothing extra to wire:
 
 ```python
 resp = await agent.run("Summarize this thread.")

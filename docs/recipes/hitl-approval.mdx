@@ -45,11 +45,11 @@ print(first.run_id)
 
 Status comes back as `waiting_approval`. The run row in `agent_runs` is in that status, the pending tool call is recorded in `pause_data`, and a `approval.requested` event has landed in `run_events` with the tool name and `correlation_id` set to the call id.
 
-The refund function has not been invoked. You can verify this in your code or in the dashboard — `tool_calls` is empty for the run.
+The refund function has not been invoked. You can verify this in your code or in your inspection tools — `tool_calls` is empty for the run.
 
 ## Approving
 
-Pull the run by id (typically from the dashboard, an alert, or a queue), and ship the decision back:
+Pull the run by id (typically from your inspection tools, an alert, or a queue), and ship the decision back:
 
 ```python
 result = await agent.submit_approval(first.run_id, approved=True)
@@ -156,7 +156,7 @@ See [HTTP API surface](/docs/reference/http-api) for the full set of write route
 
 ## Notes
 
-- **Send the `pause_id` back with the decision.** Hand `result.pause_id` to your client with the pending approval and pass it as `expected_pause_id=` when you submit. A stale decision then fails with `PauseStatusMismatchError` (409) instead of approving a later pause. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 - **Approval requires persistence.** No `database_url` or `state_store` (or the deprecated `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
 - **The agent instance does not have to be the same one that started the run.** Any agent process with the same DB and same tool definitions can serve the approval. That is what makes pause/resume crash-resilient and worker-friendly.

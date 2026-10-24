@@ -155,7 +155,7 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
     connection, a table listing, one batched column listing and, on Postgres,
     index catalog reads. Named model indexes must match their definitions and
     be valid and ready; column types and defaults are not compared. Missing indexes are
-    listed in ``SchemaOutOfDateError.missing_columns`` as
+    listed in ``SchemaOutOfDateError.missing_indexes`` as
     ``"table.index (index)"``. If the
     catalog read fails with a database error (such as insufficient
     privileges) a warning is logged and the check is skipped; failures to
@@ -182,9 +182,7 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
     if not actual:
         raise SchemaNotInitializedError()
     missing_tables, missing_columns = compare_schema(actual)
-    if indexes is not None:
-        # Reported with the columns: SchemaOutOfDateError has no index field.
-        missing_columns.extend(compare_indexes(indexes, actual.keys()))
-    if missing_tables or missing_columns:
-        raise SchemaOutOfDateError(missing_tables, missing_columns)
+    missing_indexes = compare_indexes(indexes, actual.keys()) if indexes is not None else []
+    if missing_tables or missing_columns or missing_indexes:
+        raise SchemaOutOfDateError(missing_tables, missing_columns, missing_indexes)
     _VERIFIED.add(engine.sync_engine)

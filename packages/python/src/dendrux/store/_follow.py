@@ -2,8 +2,7 @@
 
 Framework-agnostic: an async iterator of :class:`~dendrux.store.StoredEvent`
 items plus :class:`FollowHeartbeat` and a final :class:`FollowEnd`. Serve it
-as SSE, websockets or long-poll from your own routes; ``make_read_router``
-is a thin wrapper over it.
+as SSE, websockets or long-poll from your own routes.
 
 Load model. One :class:`EventFeed` keeps **one poller per watched run** and
 fans events out in memory to every follower of that run, so database load

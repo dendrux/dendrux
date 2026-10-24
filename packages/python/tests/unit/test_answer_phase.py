@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -11,12 +9,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux import Agent, tool
 from dendrux.db.models import Base
-from dendrux.http import read_router as _rr
 from dendrux.llm.base import LLMProvider
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.single import SingleCall
 from dendrux.runtime.state import SQLAlchemyStateStore
-from dendrux.store import RunStore, TraceEntry
+from dendrux.store import RunStore, StoredEvent, TraceEntry
 from dendrux.types import (
     LLMResponse,
     ProviderCapabilities,
@@ -268,19 +265,17 @@ async def test_sse_event_log_carries_iteration_and_phase(engine, state_store):
     result = await agent.run("hi")
     store = RunStore.from_engine(engine)
 
-    frames: list[dict[str, Any]] = []
-    gen = _rr._sse_event_generator(store, result.run_id, cursor=None)
-    try:
-        async with asyncio.timeout(5):
-            async for raw in gen:
-                if raw.startswith(":"):
-                    continue
-                payload = json.loads(raw.split("data: ", 1)[1])
-                frames.append(payload)
-                if payload["event_type"] == "run.completed":
-                    break
-    finally:
-        await gen.aclose()
+    frames = []
+    async with store.follow(result.run_id, tenant_id=None) as feed:
+        async for item in feed:
+            if isinstance(item, StoredEvent):
+                frames.append(
+                    {
+                        "iteration_index": item.iteration_index,
+                        "data": item.data,
+                        "event_type": item.event_type,
+                    }
+                )
 
     llm = [
         (f["iteration_index"], f["data"]["phase"])

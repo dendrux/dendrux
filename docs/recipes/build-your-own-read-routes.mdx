@@ -1,203 +1,181 @@
 ---
 title: Build your own read routes
-description: Serve run state to your frontend from routes you own, using RunStore.get_pending for what a run is waiting on, RunStore.follow for a hardened live feed, and redact_event for what a reader may see.
+description: Wrap RunStore pending state, contextual event views and bounded live feeds in routes owned by your application.
 ---
 
 # Build your own read routes
 
-Your frontend usually needs two things from Dendrux: **what is the run waiting on right now** (a tool to run, a call to approve, a question to answer) and **a live feed of what the run is doing**. Dendrux gives you both as library calls on `RunStore`. You wrap them in routes you own, with your auth, your tenant and your response shapes.
+Dendrux is a library. Your application owns HTTP, auth, tenant resolution, user-level
+run ownership, approval authority and response schemas. Use `RunStore.get_pending`
+to rebuild a form and `RunStore.follow` for an optional live feed. Neither requires
+FastAPI; install your web framework separately if you use the example below.
 
-This is the recommended way to read runs over HTTP since 0.5.0. `make_read_router` is still there and works, but it is frozen: it gets no new features, and it is a thin wrapper over the same primitives. See [make_read_router](/docs/reference/read-router).
-
-## The primitives
-
-| Call | What it gives you |
+| Primitive | Purpose |
 | --- | --- |
-| `await store.get_pending(run_id, tenant_id=...)` | A `PendingPause` (or `None` if the run is not paused): `kind`, `pause_id`, the pending tool calls with their arguments, and the question or approval request. One bounded read. |
-| `store.follow(run_id, tenant_id=..., after_sequence_index=...)` | A live, hardened feed of the run's events: one shared poller per watched run, closes when the run finishes, capped in number and duration, with redaction. |
-| `redact_event(event, include_payloads=..., active_pause=...)` | The event as a reader without payload access may see it. `follow` applies it for you. Use it when you read events yourself with `get_events`. |
-| `await store.get_subtree(run_id, tenant_id=...)` | The run and its delegated children, to find pauses below the root. |
+| get_pending(run_id, tenant_id=...) | Current PendingPause, or None when not paused |
+| follow(run_id, tenant_id=..., after_sequence_index=...) | Redacted live StoredEvent values, FollowHeartbeat and FollowEnd |
+| get_event_view(run_id, event, tenant_id=...) | Contextual event view using the verified active pause and recorded model arguments |
+| redact_event(event) | Conservative standalone event projection; unverified active approval arguments fail closed |
+| get_subtree(run_id, tenant_id=...) | Delegated runs; inspect pending state on each waiting child |
 
-All of them require an explicit tenant scope and never fail open. `tenant_id` is keyword-only: a string (that tenant), `None` (untenanted runs only) or `UNSCOPED` (every tenant, an operator view). Leaving it out is a `TypeError`. A run outside the scope behaves exactly like a missing one (`RunNotFoundError`), so your routes can return one 404 for both. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+Pass an explicit `tenant_id` on every call: a nonempty string selects that tenant,
+`None` selects untenanted runs, and `UNSCOPED` is an explicit operator-only all-tenant
+view. Missing and foreign runs raise the same `RunNotFoundError`. Most older reads
+still default to all tenants; your routes must never rely on that default.
+
+## Pending state and sensitive arguments
+
+In these snippets `store` and `app` are application-owned objects. Your
+`current_tenant` dependency authenticates a header credential and resolves its
+tenant. Your `owned_run` dependency additionally verifies that the authenticated
+actor may access the requested run, returning its ID or the same 404 as a missing
+run. Both dependencies are application policy, not Dendrux helpers.
 
 ```python
-from dendrux import UNSCOPED
-from dendrux.store import (
-    RunStore, FollowEnd, FollowHeartbeat, FollowCapacityError, redact_event,
-)
-```
+from fastapi import Depends
 
-## What is the run waiting on?
-
-```python
 @app.get("/runs/{run_id}/pending")
-async def pending(run_id: str, tenant: str = Depends(current_tenant)):
-    try:
-        pause = await store.get_pending(run_id, tenant_id=tenant)
-    except RunNotFoundError:
-        raise HTTPException(404, "run not found")
+async def pending(
+    run_id: str = Depends(owned_run),
+    tenant: str = Depends(current_tenant),
+):
+    pause = await store.get_pending(run_id, tenant_id=tenant)
     return pause.to_dict() if pause is not None else None
 ```
 
-Call it after a page reload, a reconnect, a timed-out request or a retried idempotent call to rebuild the form or the tool call. `to_dict()` uses the same shape as the `run.paused` event (`pending_tool_calls`, `status`, `pause_id`) plus `kind`, `question`, `options`, `reason`, `message` and `exceeded`.
+The pause contains `kind`, `status`, `pause_id`, `pending_tool_calls`, the input
+question/options, and pause reason/message. Client-tool params use execution values
+and can contain real personal data. Approval and input calls use model-sent arguments
+(PII placeholders when applicable). If `args_hidden=True`, stop and request resolution
+on the server; never replace unavailable args with `{}` or approve blind.
 
-| `kind` | Status | The client should |
-| --- | --- | --- |
-| `client_tool` | `waiting_client_tool` | run each call and `submit_tool_results` |
-| `approval` | `waiting_approval` | show the calls and `submit_approval` |
-| `input` | `waiting_human_input` | show `question` (and `options`) and `submit_input` |
-| `paused` | `paused` | show `reason` and `message`, then `submit_resume` |
+Use the matching Agent submit method for each kind. Re-fetch pending after a
+conflict before asking the actor again. A read/check alone cannot guarantee that
+a delayed decision still targets the pause that actor saw.
 
-**Which arguments you see.** The active pause's arguments stay visible even when payloads are hidden elsewhere, because they are the instruction to the client. Client-tool arguments are in the form the client tool receives them (real values with the default `PII(restore="all")`). An approval or input request shows the arguments as the model sent them, in placeholder form when PII redaction is on, so a reviewer sees the same thing that is stored. Past pauses' arguments, tool results, server-tool parameters, prompts and the PII mapping stay out of reach unless you opt in.
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
-[//]: # "VERIFY-0.5.0: get_pending params are T1 (unchanged 0.4.1 form: after de-anonymisation). The coordinator amendment says approval and input views show placeholder form; T4/T7 own that. Recheck the exact form per kind once merged"
+## Optional live feed over SSE
 
-**Delegated runs.** `get_pending` reports the run you ask about. A run that delegated to children pauses in a child. List the tree with `get_subtree` and call `get_pending` for each node that is waiting:
+`follow` has a shared poller per watched run, terminal drain, redaction, heartbeats,
+capacity (500 followers per store by default) and a maximum iteration duration
+(default 900 seconds). `EventFeed(store, max_followers=...)` customizes capacity.
+A feed yields a `FollowEnd` with a cursor on terminal drain, lag or duration expiry.
+Reconnect using `Last-Event-ID`; rerun authentication and ownership on every request.
 
-```python
-tree = await store.get_subtree(run_id, tenant_id=tenant)
-waiting = [
-    pause
-    for node in tree.nodes
-    if (pause := await store.get_pending(node.run.run_id, tenant_id=tenant)) is not None
-]
-```
-
-## A live feed with `follow`
-
-`follow` yields stored events, then `FollowHeartbeat` markers when the run is quiet, then one final `FollowEnd` that carries the reason and a cursor to resume from. Serve it as SSE, websockets or long-polling; this is SSE:
+The feed cannot bound a blocked network send. This application response wraps the
+whole ASGI response in an absolute deadline, including headers and body sends. It
+closes the follower even if no generator iteration begins or the client disconnects.
+The transport deadline may end before an `end` frame is delivered; reconnect using
+the last successfully received event ID.
 
 ```python
+import asyncio
 import json
-from fastapi import HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
 
-def frame(event) -> str:
-    payload = {
-        "sequence_index": event.sequence_index,
-        "iteration_index": event.iteration_index,
-        "event_type": event.event_type,
-        "correlation_id": event.correlation_id,
-        "timestamp": event.created_at.isoformat() if event.created_at else None,
-        "data": event.data,
-    }
-    return f"id: {event.sequence_index}\nevent: message\ndata: {json.dumps(payload, default=str)}\n\n"
+from fastapi import Depends, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+from dendrux.errors import RunNotFoundError
+from dendrux.store import FollowCapacityError, FollowEnd, FollowHeartbeat
+
+class LiveResponse(StreamingResponse):
+    def __init__(self, content, *, follow, deadline):
+        super().__init__(content, media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+        })
+        self.follow = follow
+        self.deadline = deadline
+
+    async def __call__(self, scope, receive, send):
+        try:
+            async with asyncio.timeout_at(self.deadline):
+                await super().__call__(scope, receive, send)
+        except TimeoutError:
+            pass  # The transport deadline ends the response without an error traceback.
+        finally:
+            await self.follow.aclose()
 
 @app.get("/runs/{run_id}/live")
-async def live(run_id: str, request: Request, tenant: str = Depends(current_tenant)):
+async def live(
+    request: Request,
+    run_id: str = Depends(owned_run),
+    tenant: str = Depends(current_tenant),
+):
     last = request.headers.get("last-event-id")
-    cursor = int(last) if last and last.isdigit() else None
-    follow = store.follow(run_id, tenant_id=tenant, after_sequence_index=cursor)
+    if last is not None and (not last.isascii() or not last.isdigit() or len(last) > 18):
+        raise HTTPException(400, "invalid Last-Event-ID")
+    cursor = int(last) if last is not None else None
+    duration = 900
+    deadline = asyncio.get_running_loop().time() + duration
+    follow = store.follow(run_id, tenant_id=tenant,
+                          after_sequence_index=cursor, max_duration_s=duration)
     try:
-        await follow.start()                         # checks the scope and takes a slot
+        await follow.start()
+        if follow.drained_terminal:
+            await follow.aclose()
+            return Response(status_code=204)
     except RunNotFoundError:
+        await follow.aclose()
         raise HTTPException(404, "run not found")
     except FollowCapacityError:
-        raise HTTPException(503, "busy", headers={"Retry-After": "5"})
-    if follow.drained_terminal:                      # finished, and the client has everything
         await follow.aclose()
-        return Response(status_code=204)
+        raise HTTPException(503, "busy", headers={"Retry-After": "5"})
+    except BaseException:
+        await follow.aclose()
+        raise
 
     async def frames():
         try:
             async for item in follow:
-                if isinstance(item, FollowEnd):
-                    yield f"event: end\ndata: {json.dumps({'reason': item.reason, 'cursor': item.cursor})}\n\n"
-                    return
                 if isinstance(item, FollowHeartbeat):
                     yield ": keepalive\n\n"
+                elif isinstance(item, FollowEnd):
+                    data = {"reason": item.reason, "cursor": item.cursor}
+                    yield f"event: end\ndata: {json.dumps(data)}\n\n"
                 else:
-                    yield frame(item)
+                    data = {"sequence_index": item.sequence_index,
+                            "event_type": item.event_type, "data": item.data}
+                    yield f"id: {item.sequence_index}\ndata: {json.dumps(data)}\n\n"
         finally:
-            await follow.aclose()                    # always free the slot
+            await follow.aclose()
 
-    return StreamingResponse(
-        frames(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return LiveResponse(frames(), follow=follow, deadline=deadline)
 ```
 
-What `follow` does for you:
+Use streaming `fetch` with `Authorization` or your app's auth header; native
+`EventSource` cannot send custom headers. Never put credentials in URLs. Parse SSE
+incrementally, retain each event ID, handle 204 as finished, honor 503/Retry-After,
+and reconnect after a lag/duration end or a network failure with bounded backoff.
+Cancel the fetch reader on page teardown. Keep the same run ID across reconnects.
 
-- **Shared polling.** Every follower of one run in a process shares one polling query, so database load follows the number of watched runs, not open connections. An idle run is polled every 0.5 s, backing off to 2 s. Nothing runs when nobody follows. Budget about one query per second per watched run, and give a busy feed its own small engine (`RunStore.from_database_url(...)`) so viewers cannot starve your agents' pool.
-- **Closes on terminal.** When the run's status is terminal and every event has been sent, the last item is `FollowEnd("terminal", cursor)`. Pass `until_terminal=False` to keep following past that.
-- **Caps.** At most 500 followers per `RunStore` (an `EventFeed`; build `EventFeed(store, max_followers=...)` for another limit), after which `follow(...)` raises `FollowCapacityError` (answer 503). A follow ends after `max_duration_s` (default 900) with `FollowEnd("max_duration", cursor)`, and a follower that falls too far behind ends with `"lagging"`. In both cases reconnect with `after_sequence_index=cursor`; run your auth again on each reconnect.
-- **Redaction.** With `include_payloads=False` (the default) the system prompt, provider requests and responses, and the PII mapping are removed, and so are the arguments of past pauses. The active pause's arguments stay. Pass `include_payloads=True` only for trusted viewers.
-- **A bogus cursor is harmless.** A client cannot hide events from other followers by sending a wrong `Last-Event-ID`.
+Do not pipe `agent.stream()` into browser SSE. Closing that stream cancels the run.
+Start work with `agent.run` under your application's execution lifecycle and follow
+the durable database log. A synchronous start can time out before it returns a run
+ID; persist an app request ID and a recovery association before starting long work.
 
-[//]: # "VERIFY-0.5.0: follow, FollowEnd, FollowHeartbeat, FollowCapacityError, EventFeed and redact_event are exported from dendrux.store per T1 section 10; the defaults (500 followers, 900 s) and the lagging reason are from T1. Confirm the final import paths at merge"
-
-### Authenticating an SSE connection
-
-Do not put a token in the `EventSource` URL (`?token=...`). URLs end up in access logs, proxy logs, browser history and `Referer` headers. Two approaches that keep it out:
-
-1. **A cookie on the same origin.** `EventSource` sends cookies, so a short-lived, `HttpOnly`, `Secure`, `SameSite=Lax` session cookie set at login authenticates the connection with no token in the URL:
-
-   ```javascript
-   const es = new EventSource(`/runs/${run_id}/live`, {withCredentials: true});
-   ```
-
-2. **`fetch` with an `Authorization` header.** `EventSource` cannot set headers, but `fetch` can stream the same response and you parse the frames yourself:
-
-   ```javascript
-   async function follow(run_id, token, onEvent, cursor) {
-     const headers = {Authorization: `Bearer ${token}`};
-     if (cursor != null) headers["Last-Event-ID"] = String(cursor);
-     const res = await fetch(`/runs/${run_id}/live`, {headers});
-     if (res.status === 204) return;                 // finished and drained
-     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-     let buf = "";
-     for (;;) {
-       const {value, done} = await reader.read();
-       if (done) break;
-       buf += value;
-       let i;
-       while ((i = buf.indexOf("\n\n")) >= 0) {
-         const raw = buf.slice(0, i); buf = buf.slice(i + 2);
-         if (raw.startsWith(":")) continue;          // keepalive
-         const ev = raw.split("\n").find((l) => l.startsWith("event: "))?.slice(7);
-         const data = raw.split("\n").find((l) => l.startsWith("data: "))?.slice(6);
-         if (ev === "end") return JSON.parse(data);  // {reason, cursor}
-         onEvent(JSON.parse(data));
-       }
-     }
-   }
-   ```
-
-Either way, your route calls the same `current_tenant` dependency as every other route and passes the result to `follow`.
-
-## Never pipe `agent.stream()` into a browser
-
-> **Do not return `agent.stream()` as a browser SSE response.** The run then lasts only as long as that connection. Closing the tab, a mobile network change or a proxy timeout closes the stream, and closing the stream cancels the run. Start the run with `agent.run(...)` (in a background task of your own, or with the request that created it) and let the browser follow the database log with `follow`. The log survives disconnects; a run tied to a socket does not.
-
-If you do use `agent.stream()`, consume it on the server (to persist the answer, as in [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary)) and relay events to the browser through `follow`.
-
-## Reading events yourself
-
-If you page events with `get_events` or `stream_events` instead of `follow`, pass every event through `redact_event` before it leaves your server, and pass `tenant_id` every time:
+## Reading historical events
 
 ```python
-events = await store.get_events(run_id, tenant_id=tenant, after_sequence_index=cursor)
-safe = [redact_event(e, include_payloads=False) for e in events]
+events = await store.get_events(run_id, tenant_id=tenant,
+                                after_sequence_index=cursor, limit=100)
+views = [await store.get_event_view(run_id, event, tenant_id=tenant)
+         for event in events]
 ```
 
-`active_pause=True` keeps the pending-call arguments of a `run.paused` event; set it only for the latest pause of a run whose status is still a pause status. `follow` computes that for you.
+Each `get_event_view` call queries run status and can also read active-pause context.
+The loop above therefore performs at least one additional query per event; use a
+small page for inspection and `follow` for live delivery.
 
-`stream_events` is kept for existing callers. Calling it without a `tenant_id` still reads any tenant's run (as in 0.4.1) but now prints a `DeprecationWarning`; pass an explicit tenant, or use `follow`, which also ends when the run does and redacts.
+Page with the last sequence index. Use `get_event_view` for contextual approval
+arguments; it verifies the run is in scope. Pass only events read from that same
+run: StoredEvent has no run ID to validate their association. Standalone `redact_event`
+has no database context and hides unverified active approval/input args. `follow`
+already applies the contextual projection. Even the default view intentionally
+contains actionable client-tool params: authorize the actor before exposing it.
+Raw run details, traces and tool/provider records are sensitive; select the fields
+your audience needs instead of serializing dataclasses wholesale. Enabling payloads
+is reserved for trusted operators. Prompts, provider bodies and PII mappings must
+never be included in a general browser DTO.
 
-## Checklist
-
-- [ ] Every route resolves the caller's tenant and passes `tenant_id=` to `get_pending`, `follow`, `get_subtree` and `get_events`.
-- [ ] One 404 for missing and foreign runs.
-- [ ] `follow(...).aclose()` runs on every exit path, and you map `FollowCapacityError` to 503.
-- [ ] No token in an `EventSource` URL.
-- [ ] `include_payloads=True` only behind your strongest auth.
-- [ ] The feed's store has its own small connection pool if you serve many viewers.
-- [ ] Nothing returns `agent.stream()` to a browser.
-
-## Where this fits
-
-- [Client-side tools](/docs/recipes/client-tools): the `pending` and `tool-results` routes in use.
-- [RunStore](/docs/reference/run-store): signatures and record types.
-- [make_read_router](/docs/reference/read-router): the frozen router, built on these calls.
-- [Multi-tenancy](/docs/architecture/multi-tenancy): scopes and strict tenancy.
+For operator inspection and tracing, see [Observability](/docs/recipes/observability).
+For runnable request/response clients see [Client tools](/docs/recipes/client-tools).

@@ -21,18 +21,18 @@ A **library**, not a service. Dendrux doesn't run a server, doesn't manage worke
 
 ## The six tables
 
-<SchemaDiagram
-  parentName="agent_runs"
-  parentSubtitle="id = ULID PK"
-  parentDescription="One row per agent.run() call. Holds status, model, totals, pause state."
-  edgeLabel="agent_run_id FK · cascade delete"
->
-  <SchemaItem name="react_traces" description="Conversation messages, in order" />
-  <SchemaItem name="tool_calls" description="One row per tool invocation" />
-  <SchemaItem name="token_usage" description="Per-LLM-call totals (legacy)" />
-  <SchemaItem name="llm_interactions" description="Per-LLM-call, full payloads" />
-  <SchemaItem name="run_events" description="Audit log, ordered by sequence_index" />
-</SchemaDiagram>
+`agent_runs` is the parent table (ULID primary key). Each child uses
+`agent_run_id` as a foreign key with cascade deletion.
+
+| Table | Contents |
+| --- | --- |
+| agent_runs | One row per agent.run call: status, model, totals and pause state |
+| react_traces | Conversation messages, in order |
+| tool_calls | One row per tool invocation |
+| token_usage | Per-LLM-call totals (legacy) |
+| llm_interactions | Per-LLM-call, full payloads |
+| run_events | Audit log, ordered by sequence_index |
+
 
 The `agent_runs` table is the anchor. Everything else cascades from it: delete a run row and all its traces, tool calls, and events go with it.
 
@@ -169,7 +169,7 @@ The `semantic_*` columns let you ask "what did dendrux think it sent?" The `prov
 
 ## `token_usage`: legacy, kept for backwards compat
 
-Same shape as the token columns on `llm_interactions`, one row per LLM call. Older versions of dendrux only had this table; `llm_interactions` superseded it but `token_usage` is still written so existing dashboards keep working.
+Same shape as the token columns on `llm_interactions`, one row per LLM call. Older versions of dendrux only had this table; `llm_interactions` superseded it but `token_usage` is still written so existing inspection tools keep working.
 
 ```text
 id:               01KPFXPATDNPK7KX68QYKVMXDX
@@ -187,7 +187,7 @@ If you're starting fresh, query `llm_interactions` instead.
 
 ## `run_events`: the ordered audit log
 
-Append-only event log for everything observable about a run: lifecycle transitions, LLM completions, tool completions, governance decisions. The dashboard and SSE stream are both built on this table.
+Append-only event log for everything observable about a run: lifecycle transitions, LLM completions, tool completions, governance decisions. Your inspection UI and live routes can read this table through RunStore.
 
 ```text
 id:               01KPFXP9MXHCM94YH8EAV79YKK
@@ -218,7 +218,7 @@ The **`sequence_index`** column is the canonical ordering key inside a run. Two 
 
 `correlation_id` links related events together. A `tool.completed` event carries the `tool_call_id` it corresponds to. A `run.resumed` event carries the `correlation_id` of the original `run.paused` it picks up from. This avoids ambiguity in multi-tool, multi-pause runs.
 
-`data` is JSON: the event-specific payload. **Privacy**: only observable data goes here. The unredacted execution state lives in `agent_runs.pause_data`, which the dashboard never queries.
+`data` is JSON: the event-specific payload. **Privacy**: only observable data goes here. The unredacted execution state lives in `agent_runs.pause_data`, which your routes must not expose.
 
 ## `run_inbox`: notes for a running agent
 
@@ -230,7 +230,7 @@ Unlike the append-only tables, `run_inbox` rows are updated once: `delivered_at`
 
 The four child tables (`react_traces`, `tool_calls`, `llm_interactions`, `run_events`) are **insert-only**. (`run_inbox` is the one exception, above.) Once a row is written, dendrux never updates it. Only `agent_runs.status` and the roll-up totals change over time.
 
-This is on purpose. An audit trail you can rewrite isn't an audit trail. If something looks wrong in the dashboard, the raw rows are the source of truth. Migrations preserve old rows; bug fixes add new columns rather than rewriting existing data.
+This is on purpose. An audit trail you can rewrite isn't an audit trail. If something looks wrong in your inspection tools, the raw rows are the source of truth. Migrations preserve old rows; bug fixes add new columns rather than rewriting existing data.
 
 ## Indexes
 
@@ -323,13 +323,13 @@ If the tables are missing when a run starts, dendrux raises `SchemaNotInitialize
 
 Upgrading to 0.5.0 adds `agent_runs.claim_epoch`, the tenant-scoped idempotency index and the `(tenant_id, created_at)` index (revision `d7e8f9a0b1c2`). A Postgres database that has not been migrated raises `SchemaOutOfDateError` on first use, and the schema check now also verifies the named indexes. `dendrux db check` compares the database with this version's migration head (exit 0 current, 1 behind, 2 unknown; `--allow-unstamped` for schemas built with `create_all`). The full procedure, including mixed-fleet rules, is in [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).
 
-[//]: # "VERIFY-0.5.0: T1 builds dendrux db check and the index check in _schema_check; confirm names and exit codes, and that CLI error output masks database URL passwords"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 Upgrading to 0.4.0 adds the two image tables; a Postgres database that has not been migrated raises `SchemaOutOfDateError` naming `dendrux_blobs` and `dendrux_blob_refs` on first use. SQLite files create them on startup.
 
-After you upgrade the `dendrux` package, run `dendrux db migrate` against your database again, then restart your app. If you forget, dendrux does not let the first run fail with a raw `UndefinedColumnError`. On first use of a non-SQLite database (an `Agent` run, `sweep`, or the dashboard) it verifies that every table and column this version needs is present, and raises `SchemaOutOfDateError` naming what is missing, for example `agent_runs.pause_requested` and `table run_inbox` when you move from 0.2.0a23 to 0.3.0.
+After you upgrade the `dendrux` package, run `dendrux db migrate` against your database again, then restart your app. If you forget, dendrux does not let the first run fail with a raw `UndefinedColumnError`. On first use of a non-SQLite database (an `Agent` run or `sweep`) it verifies that every table, column and required Postgres index this version needs is present, and raises `SchemaOutOfDateError` naming what is missing, for example `agent_runs.pause_requested` and `table run_inbox` when you move from 0.2.0a23 to 0.3.0.
 
-The check is read-only (it only inspects table and column names, matched exactly), runs once per engine, and does not run on SQLite, which upgrades itself. It checks presence only: it does not compare column types, nullability or defaults. It does not read Alembic's version table, so it works if you create the schema some other way. Extra tables, extra columns and missing indexes are not errors. `RunStore` is read-only apart from `blobs.purge` and `blobs.collect_garbage`, and is not checked, so a reporting database that exposes the tables as views keeps working. If the database refuses the catalog read (for example for lack of privileges), dendrux logs a warning and carries on; connection failures still raise. If you manage the schema yourself and want to turn the check off, set `DENDRUX_SKIP_SCHEMA_CHECK=1`.
+The check is read-only (it inspects table/column names and required Postgres index definitions and readiness), runs once per engine, and does not run on SQLite, which upgrades itself. It checks presence only: it does not compare column types, nullability or defaults. It does not read Alembic's version table, so it works if you create the schema some other way. Extra tables, columns and indexes are ignored. Missing or invalid required Postgres indexes are reported separately as `SchemaOutOfDateError.missing_indexes`; `missing_columns` contains columns only. `RunStore` is read-only apart from `blobs.purge` and `blobs.collect_garbage`, and is not checked, so a reporting database that exposes the tables as views keeps working. If the database refuses the catalog read (for example for lack of privileges), dendrux logs a warning and carries on; connection failures still raise. If you manage the schema yourself and want to turn the check off, set `DENDRUX_SKIP_SCHEMA_CHECK=1`.
 
 ## Reading runs back through RunStore
 
@@ -372,7 +372,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`RunStore` also exposes `get_tool_invocations`, `get_traces`, `get_pauses`, `get_notes`, `get_subtree` and `list_runs(metadata_filter=...)`. See [Chatbot threads](/docs/recipes/chatbot-threads) for the metadata-filter query patterns and [Mount the read router](/docs/recipes/mount-read-router) to expose these reads over HTTP.
+`RunStore` also exposes `get_tool_invocations`, `get_traces`, `get_pauses`, `get_notes`, `get_subtree` and `list_runs(metadata_filter=...)`. See [Chatbot threads](/docs/recipes/chatbot-threads) for the metadata-filter query patterns and [Build your own read routes](/docs/recipes/build-your-own-read-routes) to expose these reads over HTTP.
 
 ## What's next
 

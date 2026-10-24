@@ -62,7 +62,6 @@ jobs:
       - name: Check
         run: |
           twine check --strict "$RUNNER_TEMP"/dist/*
-          python .github/scripts/check_wheel_dashboard.py "$RUNNER_TEMP"/dist/*.whl
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

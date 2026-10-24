@@ -1,4 +1,4 @@
-"""0.5.0 contracts: Agent and read-router kwargs, and the inert entry-check seams.
+"""0.5.0 contracts: Agent and read primitives, and the inert entry-check seams.
 
 Every public entry point calls ``runtime._entry_checks.entry_checks`` first,
 which dispatches to ``_tenant_checks`` and ``_limit_checks``; the runner calls
@@ -15,8 +15,6 @@ import pytest
 
 from dendrux import Agent
 from dendrux._sentinel import _OMITTED
-from dendrux.http import make_read_router
-from dendrux.http.read_router import _tenant_dependency
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime import _limit_checks, _tenant_checks
 from dendrux.runtime.state import UNSCOPED
@@ -456,50 +454,3 @@ class TestAgentKwargs:
         assert seen == [3]
         lookups = await agent.get_tool_lookups()
         assert lookups.call_limiter is sentinel
-
-
-class _FakeStore:
-    pass
-
-
-class TestReadRouterKwargs:
-    def test_tenant_resolver_is_required(self) -> None:
-        with pytest.raises(TypeError, match="tenant_resolver"):
-            make_read_router(store=_FakeStore(), authorize=lambda: None)  # type: ignore[call-arg, arg-type]
-
-    def test_accepts_unscoped_and_callables(self) -> None:
-        make_read_router(store=_FakeStore(), authorize=lambda: None, tenant_resolver=UNSCOPED)  # type: ignore[arg-type]
-        make_read_router(
-            store=_FakeStore(),  # type: ignore[arg-type]
-            authorize=lambda: None,
-            tenant_resolver=lambda: "t",
-            include_payloads=True,
-            sse_max_connections=10,
-            sse_max_duration_s=60,
-        )
-
-    def test_unscoped_sentinel_becomes_a_constant_dependency(self) -> None:
-        dep = _tenant_dependency(UNSCOPED)
-        assert callable(dep)
-        assert dep() is UNSCOPED
-
-        def resolver() -> str:
-            return "t"
-
-        assert _tenant_dependency(resolver) is resolver
-
-    @pytest.mark.parametrize(
-        ("kwargs", "exc"),
-        [
-            ({"tenant_resolver": "tenant-a"}, TypeError),
-            ({"tenant_resolver": None}, TypeError),
-            ({"tenant_resolver": UNSCOPED, "include_payloads": 1}, TypeError),
-            ({"tenant_resolver": UNSCOPED, "sse_max_connections": 0}, ValueError),
-            ({"tenant_resolver": UNSCOPED, "sse_max_connections": True}, ValueError),
-            ({"tenant_resolver": UNSCOPED, "sse_max_duration_s": 0}, ValueError),
-            ({"tenant_resolver": UNSCOPED, "sse_max_duration_s": float("inf")}, ValueError),
-        ],
-    )
-    def test_validation(self, kwargs: dict[str, Any], exc: type[Exception]) -> None:
-        with pytest.raises(exc):
-            make_read_router(store=_FakeStore(), authorize=lambda: None, **kwargs)  # type: ignore[arg-type]

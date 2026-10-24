@@ -79,7 +79,7 @@ Budget(max_tokens=200_000, count_cache_tokens=False)   # keep the 0.4 count, sil
 
 The dollar limit is where caching always shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes. A delegated child can still spend past a parent's limit within one of its own iterations; tightening that is planned for 0.6.
 
-[//]: # "VERIFY-0.5.0: T3 owns count_cache_tokens; confirm the formula, the warning trigger, and the child overshoot note"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Dollar limits
 
@@ -181,7 +181,7 @@ A child run is a run with its own `Agent`, and its own budget if it has one. Eac
 
 - **With persistence** (a database or `state_store`), the run's own usage is tracked in memory as calls complete, and the subtree rollup of children is read from successfully recorded `llm_interactions`. A failed usage write is retried and never switches enforcement off; if the live read itself raises, the tracker falls back to in-memory usage.
 
-[//]: # "VERIFY-0.5.0: the budget read is T7 wave 2; recheck this bullet against the final budget reads"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 - **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
 
 Paused runs write their running totals (tokens and `total_cost_usd`) to the row when they pause, so a paused run no longer reads as zero spend.
@@ -211,7 +211,7 @@ class StopOnBudget:
     async def on_tool_completed(self, *a, **k): pass
 ```
 
-**Out-of-process, via the read router or SSE.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
+**Out-of-process, via RunStore.follow.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
 
 ## Where this fits
 

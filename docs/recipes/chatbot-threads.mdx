@@ -105,7 +105,7 @@ traces = await store.get_traces(run.run_id)            # ReAct thoughts/actions
 pauses = await store.get_pauses(run.run_id)            # HITL approval cycles
 ```
 
-The full audit/tracing surface is the same one [the read router](/docs/recipes/mount-read-router) exposes — just call it from your own code if you want a custom thread inspector instead of the generic dashboard.
+The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
 
 ## Backend semantics
 
@@ -126,6 +126,6 @@ If you need any of those, file an issue with the use case. The current shape cov
 
 ## Where this fits
 
-- Recipes: [Mount the read router](/docs/recipes/mount-read-router) to expose all of this over HTTP for a frontend.
+- Recipes: [Build your own read routes](/docs/recipes/build-your-own-read-routes) to expose all of this over HTTP for a frontend.
 - Architecture: [Runs](/docs/architecture/runs) explains the `meta` column and other persisted run fields.
-- Reference: [HTTP API surface](/docs/reference/http-api) for the read endpoints (HTTP exposure of `metadata_filter` is not in the read router today — wrap `RunStore.list_runs` in your own thin endpoint if you need it).
+- Reference: [HTTP API surface](/docs/reference/http-api) for the read endpoints (wrap `RunStore.list_runs` in your own endpoint if you need `metadata_filter` over HTTP).

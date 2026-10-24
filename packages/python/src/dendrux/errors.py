@@ -340,7 +340,7 @@ class SqliteSchemaSyncError(RuntimeError):
 
 
 class SchemaOutOfDateError(RuntimeError):
-    """A non-SQLite database is missing tables or columns this Dendrux version needs.
+    """A non-SQLite database is missing tables, columns or indexes this Dendrux version needs.
 
     Raised once per engine, before the first query, when the database was
     migrated by an older Dendrux and ``dendrux db migrate`` has not been run
@@ -355,16 +355,23 @@ class SchemaOutOfDateError(RuntimeError):
         missing_tables: Names of model tables absent from the database.
         missing_columns: ``"table.column"`` entries for columns absent from
             tables that do exist.
+        missing_indexes: Missing or invalid ``"table.index (index)"`` entries.
     """
 
     def __init__(
         self,
         missing_tables: Iterable[str] = (),
         missing_columns: Iterable[str] = (),
+        missing_indexes: Iterable[str] = (),
     ) -> None:
         self.missing_tables: tuple[str, ...] = tuple(missing_tables)
         self.missing_columns: tuple[str, ...] = tuple(missing_columns)
-        missing = [*self.missing_columns, *(f"table {t}" for t in self.missing_tables)]
+        self.missing_indexes: tuple[str, ...] = tuple(missing_indexes)
+        missing = [
+            *self.missing_columns,
+            *self.missing_indexes,
+            *(f"table {t}" for t in self.missing_tables),
+        ]
         super().__init__(
             f"The database schema is behind this version of dendrux (missing: "
             f"{', '.join(missing)}). Run `dendrux db migrate` with DENDRUX_DATABASE_URL "
@@ -374,8 +381,8 @@ class SchemaOutOfDateError(RuntimeError):
 
     @property
     def missing(self) -> tuple[str, ...]:
-        """Every missing object: columns as ``table.column``, tables by name."""
-        return (*self.missing_columns, *self.missing_tables)
+        """Every missing object: columns, tables by name, then indexes."""
+        return (*self.missing_columns, *self.missing_tables, *self.missing_indexes)
 
 
 # ---------------------------------------------------------------------------

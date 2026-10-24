@@ -181,7 +181,7 @@ await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 
 Passing `tenant_id` is how your route handlers keep one customer from touching another's runs. Dendrux does not decide who the caller is; derive the tenant from the authenticated request and pass it in.
 
-Forgetting it once is the easy mistake. `Agent(strict_tenancy=True)` (0.5.0) makes every entry point require an explicit `tenant_id`, raising `TenantScopeRequiredError` otherwise; delegated children still inherit their parent's tenant. Strict tenancy becomes the default in 0.6. Scopes, the read router's tenant resolver and idempotency keys are covered on [Multi-tenancy](/docs/architecture/multi-tenancy).
+Forgetting it once is the easy mistake. `Agent(strict_tenancy=True)` (0.5.0) makes every entry point require an explicit `tenant_id`, raising `TenantScopeRequiredError` otherwise; delegated children still inherit their parent's tenant. Strict tenancy becomes the default in 0.6. Scopes, the application tenant resolution and idempotency keys are covered on [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ## Why a synthetic result instead of an exception
 
@@ -190,7 +190,7 @@ The most obvious alternative is to raise a Python exception when a denied tool i
 That design is wrong for two reasons.
 
 1. **The LLM has useful work left to do.** A model that gets a "denied" tool result can apologize, ask for a different approach, suggest an escalation path, or try a non-destructive alternative. All of that is lost if the runtime kills the run on the first denied attempt. The user's request still deserves a response.
-2. **Denial is not an error.** `status=error` is reserved for things that actually broke: a guardrail-blocked secret, an unrecoverable tool failure, a provider outage. A policy denial is a normal branch of the decision tree, and should look like one in the event log. `policy.denied` is its own event type so dashboards can aggregate access-control activity without mixing it with failure alerts.
+2. **Denial is not an error.** `status=error` is reserved for things that actually broke: a guardrail-blocked secret, an unrecoverable tool failure, a provider outage. A policy denial is a normal branch of the decision tree, and should look like one in the event log. `policy.denied` is its own event type so inspection tools can aggregate access-control activity without mixing it with failure alerts.
 
 The synthetic tool result is the cheapest way to give the model enough information to keep going. The `success=False, error="denied"` shape matches what it would see from a real tool failure, and most prompts already handle that case.
 

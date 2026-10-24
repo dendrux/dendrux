@@ -16,8 +16,7 @@ That's the whole library. The rest of these docs explain how it does that and ho
 - An `Agent` you can call with `await agent.run(input)`.
 - Pause and resume across processes. State lives in your database, not in memory.
 - Four governance layers (PII redaction, access control, guardrails, approval) that you turn on per agent, not per call.
-- A built-in dashboard for inspecting runs, steps, events, and pause data. It needs a token when it listens on anything but loopback.
-- Read primitives on `RunStore` (`get_pending` for what a run is waiting on, `follow` for a hardened live feed) that you wrap in routes you own, plus a ready-made FastAPI router (`make_read_router`, frozen in 0.5) scoped per tenant by a resolver you supply and hiding raw payloads by default. You write your own write endpoints; they're a few lines each.
+- Read primitives on `RunStore` (`get_pending` for what a run is waiting on, `follow` for a hardened live feed) that you wrap in routes you own, and contextual event views (`get_event_view`) for reads. You own every route, its auth, tenant and user-level ownership checks, and browser response schema.
 
 ## What dendrux does *not* do
 
@@ -41,7 +40,7 @@ Everything in dendrux serves one of these. Each has a front-door page:
 
 **[Governance](/docs/architecture/governance)**: four protective layers (tool deny and policy hooks, human approval, token and dollar budgets, content guardrails with PII redaction) you turn on per agent as kwargs, not per call.
 
-**[Evidence and observability](/docs/recipes/observability)**: one stack: a fail-closed recorder, a fail-open notifier, OpenTelemetry, a dashboard, and a read API. Every LLM call, tool execution, and pause is recorded.
+**[Evidence and observability](/docs/recipes/observability)**: one stack: a fail-closed recorder, a fail-open notifier, OpenTelemetry, and RunStore reads for inspection tools you build. Every LLM call, tool execution, and pause is recorded.
 
 </div>
 

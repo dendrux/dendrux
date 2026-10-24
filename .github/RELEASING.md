@@ -31,7 +31,7 @@ actions.
 1. Bump the version sites, merge the release PR to `main`.
 2. Tag the merge commit `vX.Y.Z` and push the tag. The build job checks the tag is on
    `main` and equals the `pyproject.toml` version, builds, and runs `twine check --strict`
-   and the dashboard wheel check.
+   before uploading the artifact.
 3. Read the build log, then approve the `pypi` deployment. The publish job re-checks that
    the distributions belong to the tag.
 4. Verify the digests and install in a clean virtualenv, then announce.
