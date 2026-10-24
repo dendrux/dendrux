@@ -11,7 +11,8 @@ grows with the number of watched runs, not with open connections. An idle
 run is polled every 0.5 s, backing off to 2 s, plus a status read every 4th
 idle poll. The poller is an ordinary asyncio task owned by the feed: it
 starts with the first follower of a run and is cancelled, and awaited, when
-the last one leaves. Nothing runs when nobody is following. Budget about one
+the last one leaves. Slow cancellation remains tracked until the task finishes.
+Budget about one
 query per second per watched run, and give a busy feed its own small engine
 (``RunStore.from_database_url(...)``) so viewers cannot starve the agents'
 pool. Push (Postgres LISTEN/NOTIFY) is planned for 0.6.
@@ -96,34 +97,29 @@ FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa
 _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
 
 
-def to_placeholders(value: Any, pii_mapping: Mapping[str, str] | None) -> Any:
-    """``value`` with every real value of ``pii_mapping`` put back as its placeholder.
-
-    ``pii_mapping`` is the run's ``{placeholder: real value}`` map. The
-    runtime de-anonymises tool arguments before an approval pause; this
-    restores the form the model sent (``<<EMAIL_ADDRESS_1>>``). Longer values
-    are replaced first. Dicts and lists are walked; other values are kept.
-    """
-    if not pii_mapping:
-        return value
-    pairs = sorted(
-        ((real, ph) for ph, real in pii_mapping.items() if isinstance(real, str) and real),
-        key=lambda p: len(p[0]),
-        reverse=True,
-    )
-
-    def walk(v: Any) -> Any:
-        if isinstance(v, str):
-            for real, ph in pairs:
-                v = v.replace(real, ph)
-            return v
-        if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
-        if isinstance(v, list):
-            return [walk(x) for x in v]
-        return v
-
-    return walk(value)
+def approval_calls(
+    calls: Any,
+    pii_mapping: Mapping[str, str] | None,
+    approval_params: Mapping[str, dict[str, Any]] | None,
+) -> Any:
+    """Use recorded model arguments; never infer them from execution values."""
+    if not isinstance(calls, list):
+        return calls
+    result = []
+    for call in calls:
+        if not isinstance(call, dict):
+            result.append(call)
+            continue
+        shown = dict(call)
+        params = (approval_params or {}).get(str(call.get("id")))
+        if params is not None:
+            shown.pop("arguments", None)
+            shown["params"] = params
+        elif pii_mapping:
+            shown.pop("arguments", None)
+            shown.update(params=None, args_hidden=True)
+        result.append(shown)
+    return result
 
 
 def redact_event(
@@ -132,12 +128,12 @@ def redact_event(
     include_payloads: bool = False,
     active_pause: bool = False,
     pii_mapping: Mapping[str, str] | None = None,
+    approval_params: Mapping[str, dict[str, Any]] | None = None,
 ) -> StoredEvent:
     """The event as a reader may see it (B2 and the approval-arguments rule).
 
     In every mode, the arguments of an **approval or input** ``run.paused``
-    are shown in placeholder form, as the model sent them, using the run's
-    ``pii_mapping`` (``RunStore.get_pii_mapping``): a human approving a call
+    use ``approval.requested.params``, exactly as the model sent them. Approvers
     never sees de-anonymised values. Client-tool pauses keep the 0.4.1 form.
 
     With ``include_payloads=True`` nothing else changes. Otherwise:
@@ -160,7 +156,9 @@ def redact_event(
         and data.get("status") in _PLACEHOLDER_PAUSES
         and isinstance(data.get("pending_tool_calls"), list)
     ):
-        data["pending_tool_calls"] = to_placeholders(data["pending_tool_calls"], pii_mapping)
+        data["pending_tool_calls"] = approval_calls(
+            data["pending_tool_calls"], pii_mapping, approval_params
+        )
     if include_payloads:
         return dataclasses.replace(event, data=data) if data != event.data else event
     data = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}
@@ -191,6 +189,8 @@ class _Follower:
     end_reason: FollowEndReason | None = None
 
     def push(self, event: StoredEvent) -> None:
+        if self.end_reason is not None:
+            return
         if len(self.buffer) >= self.limit:
             self.end("lagging")
             return
@@ -212,6 +212,7 @@ class _RunFeed:
         self.head = head
         self.followers: set[_Follower] = set()
         self.terminal = False
+        self.closing = False
         self.task: asyncio.Task[None] | None = None
 
     def add(self, follower: _Follower) -> int | None:
@@ -223,6 +224,7 @@ class _RunFeed:
             self.task = asyncio.get_running_loop().create_task(
                 self._poll(), name=f"dendrux-run-feed:{self.run_id}"
             )
+            self.task.add_done_callback(self._done)
         return self.head
 
     def remove(self, follower: _Follower) -> asyncio.Task[None] | None:
@@ -230,12 +232,20 @@ class _RunFeed:
         self.followers.discard(follower)
         if self.followers:
             return None
+        if self.closing:
+            return self.task
+        self.closing = True
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+            return self.task
         self.owner._drop(self)
-        task, self.task = self.task, None
-        if task is not None and not task.done():
-            task.cancel()
-            return task
         return None
+
+    def _done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()  # observe failures, including shutdown failures
+        if self.closing or not self.followers:
+            self.owner._drop(self)
 
     def _publish(self, events: list[StoredEvent]) -> None:
         for event in events:
@@ -271,8 +281,8 @@ class _RunFeed:
                     check_status = check_status or idle_polls % owner.status_every == 0
                 if not self.terminal and check_status:
                     check_status = False
-                    run = await owner.store.get_run(self.run_id)
-                    if run is None or run.status in TERMINAL_STATUSES:
+                    status = await owner.store._status(self.run_id)
+                    if status is None or status in TERMINAL_STATUSES:
                         # Events committed before the status flip: drain them first.
                         while True:
                             tail = await self._fetch()
@@ -345,6 +355,7 @@ class EventFeed:
         self.status_every = status_every
         self.batch = batch
         self.stop_timeout_s = stop_timeout_s
+        self._closed = False
         self._open = 0
         self._feeds: dict[str, _RunFeed] = {}
 
@@ -378,7 +389,8 @@ class EventFeed:
         Iterate the result (``async for item in feed.follow(...)``) or call
         ``await follow.start()`` first to surface ``RunNotFoundError`` and
         :class:`FollowCapacityError` before streaming. Always close it
-        (``async with``, or ``await follow.aclose()``) to free the slot.
+        (``async with``, or ``await follow.aclose()``) for deterministic cleanup.
+        Abandoned iteration also releases resources through generator finalization.
 
         Items are :class:`StoredEvent` (passed through :func:`redact_event`),
         :class:`FollowHeartbeat`, and one final :class:`FollowEnd`. With
@@ -400,7 +412,10 @@ class EventFeed:
         )
 
     def _acquire(self) -> None:
-        if self._open >= self.max_followers:
+        if self._closed:
+            raise RuntimeError("This event feed is closed.")
+        closing = sum(f.closing for f in self._feeds.values())
+        if self._open + closing >= self.max_followers:
             logger.warning(
                 "follower limit reached: code=follow_capacity limit=%d",
                 self.max_followers,
@@ -417,14 +432,41 @@ class EventFeed:
             del self._feeds[feed.run_id]
 
     async def _feed_for(self, run_id: str) -> _RunFeed:
+        if self._closed:
+            raise RuntimeError("This event feed is closed.")
         feed = self._feeds.get(run_id)
         if feed is not None:
+            if feed.closing:
+                raise FollowCapacityError(self.max_followers)
             return feed
         head = await _current_head(self.store, run_id)
+        if self._closed:
+            raise RuntimeError("This event feed is closed.")
         # Another follower may have created the feed while we read the head.
-        return self._feeds.get(run_id) or self._feeds.setdefault(
-            run_id, _RunFeed(self, run_id, head)
-        )
+        feed = self._feeds.setdefault(run_id, _RunFeed(self, run_id, head))
+        if feed.closing:
+            raise FollowCapacityError(self.max_followers)
+        return feed
+
+    async def aclose(self) -> None:
+        """Stop all pollers and await their actual completion before disposing the store.
+
+        Cancellation of the caller never removes unfinished tasks from accounting.
+        A later call can finish waiting for the same tasks.
+        """
+        self._closed = True
+        tasks = []
+        for feed in list(self._feeds.values()):
+            for follower in feed.followers:
+                follower.end("error")
+            if not feed.closing:
+                feed.closing = True
+                if feed.task is not None and not feed.task.done():
+                    feed.task.cancel()
+            if feed.task is not None:
+                tasks.append(feed.task)
+        if tasks:
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
 
 
 class Follow:
@@ -451,8 +493,9 @@ class Follow:
         self._started = False
         self._holds_slot = False
         self._closed = False
-        self._active_pause_seq: int | None = None
-        self._pii_mapping: dict[str, str] | None = None
+        self._feed: _RunFeed | None = None
+        self._follower: _Follower | None = None
+        self._deadline: float | None = None
         self._gen: AsyncIterator[FollowItem] | None = None
         self.drained_terminal = False
         """True after :meth:`start` when the run is terminal and nothing is left
@@ -470,22 +513,41 @@ class Follow:
         if self._closed:
             raise RuntimeError("This follow is closed.")
         store = self._owner.store
-        record = await store._scoped_run(self.run_id, self._tenant_id)
-        if record is None:
+        status = await store._status(self.run_id, self._tenant_id)
+        if status is None:
             raise RunNotFoundError(self.run_id)
-        if record.status in TERMINAL_STATUSES and self._until_terminal:
+        if status in TERMINAL_STATUSES and self._until_terminal:
             pending = await store.get_events(
                 self.run_id, after_sequence_index=self._cursor, limit=1
             )
             self.drained_terminal = not pending
-        if record.status in PAUSE_STATUSES:
-            self._active_pause_seq = await store._latest_pause_sequence(self.run_id)
         self._owner._acquire()
         self._holds_slot = True
         self._started = True
+        if self._max_duration_s is not None:
+            self._deadline = asyncio.get_running_loop().time() + self._max_duration_s
 
-    def __aiter__(self) -> Follow:
-        return self
+    async def __aiter__(self) -> AsyncIterator[FollowItem]:
+        # A separate generator gets finalized when an async-for is abandoned,
+        # even if the caller retains the Follow/context-manager object.
+        try:
+            while True:
+                try:
+                    yield await self.__anext__()
+                except StopAsyncIteration:
+                    return
+        finally:
+            await self.aclose()
+
+    def _release(self) -> None:
+        if self._holds_slot:
+            self._holds_slot = False
+            self._owner._release()
+
+    def __del__(self) -> None:
+        self._release()
+        if self._feed is not None and self._follower is not None:
+            self._feed.remove(self._follower)
 
     async def __anext__(self) -> FollowItem:
         await self.start()
@@ -493,7 +555,7 @@ class Follow:
             self._gen = self._run()
         try:
             return await self._gen.__anext__()
-        except StopAsyncIteration:
+        except BaseException:
             await self.aclose()
             raise
 
@@ -506,9 +568,7 @@ class Follow:
             if self._gen is not None:
                 await self._gen.aclose()  # type: ignore[attr-defined]
         finally:
-            if self._holds_slot:
-                self._holds_slot = False
-                self._owner._release()
+            self._release()
 
     async def __aenter__(self) -> Follow:
         await self.start()
@@ -517,81 +577,99 @@ class Follow:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
-    async def _view(self, event: StoredEvent, *, live: bool) -> StoredEvent:
-        active = event.event_type == "run.paused" and (
-            live or event.sequence_index == self._active_pause_seq
-        )
-        status = (event.data or {}).get("status")
-        if event.event_type == "run.paused" and status in _PLACEHOLDER_PAUSES:
-            # The mapping grows during a run: read it when an approval is shown.
-            self._pii_mapping = await self._owner.store.get_pii_mapping(self.run_id) or None
-        return redact_event(
+    async def _view(self, event: StoredEvent) -> StoredEvent:
+        return await self._owner.store._event_view(
+            self.run_id,
             event,
+            tenant_id=self._tenant_id,
             include_payloads=self._include_payloads,
-            active_pause=active,
-            pii_mapping=self._pii_mapping,
         )
+
+    def _expired(self) -> bool:
+        return self._deadline is not None and asyncio.get_running_loop().time() >= self._deadline
 
     async def _run(self) -> AsyncIterator[FollowItem]:
         owner = self._owner
         store = owner.store
-        if self.drained_terminal:
-            yield FollowEnd("terminal", self._cursor)
-            return
-        feed = await owner._feed_for(self.run_id)
-        follower = _Follower(until_terminal=self._until_terminal, limit=owner.buffer)
-        loop = asyncio.get_running_loop()
-        started = last_write = loop.time()
         cursor = self._cursor
-        limit = self._max_duration_s if self._max_duration_s is not None else float("inf")
+        loop = asyncio.get_running_loop()
+        last_write = loop.time()
         try:
+            if self.drained_terminal:
+                yield FollowEnd("terminal", cursor)
+                return
+            async with asyncio.timeout_at(self._deadline):
+                feed = await owner._feed_for(self.run_id)
+            follower = _Follower(until_terminal=self._until_terminal, limit=owner.buffer)
+            self._feed, self._follower = feed, follower
             head = feed.add(follower)
-            # Catch up from the database to the feed's head, in batches.
             if head is not None and (cursor is None or cursor < head):
-                passed_head = False
-                while not passed_head:
-                    batch = await store.get_events(
-                        self.run_id, after_sequence_index=cursor, limit=owner.batch
-                    )
+                while cursor is None or cursor < head:
+                    if self._expired():
+                        yield FollowEnd("max_duration", cursor)
+                        return
+                    async with asyncio.timeout_at(self._deadline):
+                        batch = await store.get_events(
+                            self.run_id, after_sequence_index=cursor, limit=owner.batch
+                        )
                     for ev in batch:
                         if ev.sequence_index > head:
-                            passed_head = True
                             break
-                        yield await self._view(ev, live=False)
-                        cursor = ev.sequence_index
-                    if len(batch) < owner.batch or cursor is None or cursor >= head:
+                        if self._expired():
+                            yield FollowEnd("max_duration", cursor)
+                            return
+                        async with asyncio.timeout_at(self._deadline):
+                            view = await self._view(ev)
+                        cursor = self._cursor = ev.sequence_index
+                        yield view
+                    if len(batch) < owner.batch or not batch or batch[-1].sequence_index >= head:
                         break
                 last_write = loop.time()
             while True:
-                while follower.buffer:
+                if self._expired():
+                    yield FollowEnd("max_duration", cursor)
+                    return
+                if follower.buffer:
                     ev = follower.buffer.popleft()
                     if cursor is None or ev.sequence_index > cursor:
-                        yield await self._view(ev, live=True)
-                        cursor = ev.sequence_index
+                        async with asyncio.timeout_at(self._deadline):
+                            view = await self._view(ev)
+                        cursor = self._cursor = ev.sequence_index
+                        yield view
                         last_write = loop.time()
+                    continue
                 if follower.end_reason is not None:
                     yield FollowEnd(follower.end_reason, cursor)
                     return
                 now = loop.time()
-                if now - started >= limit:
-                    yield FollowEnd("max_duration", cursor)
-                    return
                 if now - last_write >= owner.heartbeat_s:
                     yield FollowHeartbeat()
                     last_write = loop.time()
                     continue
-                timeout = min(owner.heartbeat_s - (now - last_write), limit - (now - started))
+                timeout = owner.heartbeat_s - (now - last_write)
+                if self._deadline is not None:
+                    timeout = min(timeout, self._deadline - now)
                 follower.wake.clear()
                 if follower.buffer or follower.end_reason is not None:
                     continue
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(follower.wake.wait(), timeout=max(timeout, 0.0))
+        except TimeoutError:
+            yield FollowEnd("max_duration", cursor)
         finally:
-            poller = feed.remove(follower)
-            if poller is not None:
-                # Let the cancelled poller finish (and return its connection):
-                # no task outlives its last follower.
-                await asyncio.wait({poller}, timeout=owner.stop_timeout_s)
+            self._release()
+            if self._feed is not None and self._follower is not None:
+                poller = self._feed.remove(self._follower)
+                self._feed = self._follower = None
+                if poller is not None:
+                    # Timeout/caller cancellation leaves the task tracked in EventFeed.
+                    _, pending = await asyncio.wait({poller}, timeout=owner.stop_timeout_s)
+                    if pending:
+                        logger.warning(
+                            "poller shutdown pending: run_id=%s code=follow_shutdown_pending",
+                            self.run_id,
+                            extra={"run_id": self.run_id, "code": "follow_shutdown_pending"},
+                        )
 
 
 async def _current_head(store: RunStore, run_id: str) -> int | None:

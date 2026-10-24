@@ -276,9 +276,10 @@ class SubtreeSummary:
 
 @dataclass
 class DelegationInfo:
-    """Complete delegation context for a single run.
+    """Bounded delegation context for a single run.
 
-    Returned by ``StateStore.get_delegation_info()``.
+    Returned by ``StateStore.get_delegation_info()``. When truncated, subtree
+    totals cover only visited rows and are lower bounds on the full tree.
     """
 
     parent: ParentRef | None
@@ -286,6 +287,7 @@ class DelegationInfo:
     ancestry: list[RunBrief]
     subtree_summary: SubtreeSummary
     ancestry_complete: bool
+    truncated: bool = False
 
 
 @dataclass
@@ -881,7 +883,9 @@ class StateStore(Protocol):
         """
         ...
 
-    async def get_delegation_info(self, run_id: str) -> DelegationInfo | None:
+    async def get_delegation_info(
+        self, run_id: str, *, max_rows: int = 1000, max_depth: int = 32
+    ) -> DelegationInfo | None:
         """Get full delegation context for a run.
 
         Returns parent ref, direct children, ancestry chain, and subtree
@@ -2021,6 +2025,112 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 return None
             return dict(row)  # type narrowing for mypy
 
+    async def get_run_status(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> str | None:
+        """Status-only projection for polling; never loads execution history."""
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            value = (
+                await session.execute(
+                    _apply_tenant_scope(
+                        select(AgentRun.status).where(AgentRun.id == run_id), tenant_id
+                    )
+                )
+            ).scalar_one_or_none()
+            return None if value is None else str(value)
+
+    async def get_active_pause_sequence(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> int | None:
+        from sqlalchemy import func, select
+
+        from dendrux.db.models import AgentRun, RunEvent
+
+        seq = (
+            select(func.max(RunEvent.sequence_index))
+            .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+            .scalar_subquery()
+        )
+        invalidated = (
+            select(func.coalesce(func.max(RunEvent.sequence_index), -1))
+            .where(
+                RunEvent.agent_run_id == run_id,
+                RunEvent.event_type.in_(
+                    ["run.resumed", "run.completed", "run.error", "run.cancelled"]
+                ),
+            )
+            .scalar_subquery()
+        )
+        async with self._session_factory() as session:
+            value = (
+                await session.execute(
+                    _apply_tenant_scope(
+                        select(seq).where(
+                            AgentRun.id == run_id,
+                            seq > invalidated,
+                            AgentRun.status.in_(
+                                [
+                                    "waiting_client_tool",
+                                    "waiting_human_input",
+                                    "waiting_approval",
+                                    "paused",
+                                ]
+                            ),
+                        ),
+                        tenant_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            return None if value is None else int(value)
+
+    async def get_approval_params(
+        self, run_id: str, pause_sequence: int, *, tenant_id: TenantScope = UNSCOPED
+    ) -> dict[str, dict[str, Any]]:
+        """Latest recorded model args per call in this pause's event interval.
+
+        Read at most 1000 approval requests. Missing/overflowed calls fail closed
+        in the display layer when PII mapping exists.
+        """
+        from sqlalchemy import func, select
+
+        from dendrux.db.models import RunEvent
+
+        boundary = (
+            select(func.coalesce(func.max(RunEvent.sequence_index), -1))
+            .where(
+                RunEvent.agent_run_id == run_id,
+                RunEvent.event_type.in_(["run.paused", "run.resumed"]),
+                RunEvent.sequence_index < pause_sequence,
+            )
+            .scalar_subquery()
+        )
+        stmt = (
+            select(RunEvent.data)
+            .where(
+                RunEvent.agent_run_id == run_id,
+                _run_in_scope(run_id, tenant_id),
+                RunEvent.event_type == "approval.requested",
+                RunEvent.sequence_index > boundary,
+                RunEvent.sequence_index < pause_sequence,
+            )
+            .order_by(RunEvent.sequence_index.desc())
+            .limit(1000)
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        result: dict[str, dict[str, Any]] = {}
+        seen: set[str] = set()
+        for data in rows:
+            data = data or {}
+            call_id = data.get("call_id")
+            if isinstance(call_id, str) and call_id not in seen:
+                seen.add(call_id)
+                if isinstance(data.get("params"), dict):
+                    result[call_id] = data["params"]
+        return result
+
     async def get_pause_summary(
         self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
     ) -> PauseSummary | None:
@@ -2357,6 +2467,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         event_types: list[str] | None = None,
         before: datetime | None = None,
         tenant_id: TenantScope = UNSCOPED,
+        _pause_page: bool = False,
     ) -> list[RunEventRecord]:
         """Events of a run by ``sequence_index``; empty when outside ``tenant_id``."""
         from sqlalchemy import false, select
@@ -2387,7 +2498,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
             if limit is not None:
                 # Clamp to 1..1000
-                clamped = max(1, min(limit, 1000))
+                clamped = max(1, min(limit, 2002 if _pause_page else 1000))
                 stmt = stmt.limit(clamped)
 
             result = await session.execute(stmt)
@@ -2619,53 +2730,143 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     # Delegation queries
     # ------------------------------------------------------------------
 
-    async def get_delegation_info(self, run_id: str) -> DelegationInfo | None:
-        """Get full delegation context for a run.
+    async def get_delegation_info(
+        self, run_id: str, *, max_rows: int = 1000, max_depth: int = 32
+    ) -> DelegationInfo | None:
+        """Bounded delegation context; summaries cover only the visited subtree.
 
-        Steps: load run → resolve parent → walk ancestry → BFS subtree → return.
-        Cycle-safe via visited sets. Cross-DB portable (no recursive CTE).
+        max_rows includes the root, ancestors and descendants (1..10000).
+        max_depth bounds each direction (0..100). One lookahead row detects
+        truncation; large JSON execution/payload columns are never selected.
         """
         from sqlalchemy import select
+        from sqlalchemy.orm import load_only
 
         from dendrux.db.models import AgentRun
 
+        if (
+            isinstance(max_rows, bool)
+            or not isinstance(max_rows, int)
+            or not 1 <= max_rows <= 10000
+        ):
+            raise ValueError("max_rows must be an int between 1 and 10000.")
+        if (
+            isinstance(max_depth, bool)
+            or not isinstance(max_depth, int)
+            or not 0 <= max_depth <= 100
+        ):
+            raise ValueError("max_depth must be an int between 0 and 100.")
+        projection = load_only(
+            AgentRun.id,
+            AgentRun.parent_run_id,
+            AgentRun.agent_name,
+            AgentRun.status,
+            AgentRun.delegation_level,
+            AgentRun.total_input_tokens,
+            AgentRun.total_output_tokens,
+            AgentRun.total_cost_usd,
+        )
+
+        def brief(row: AgentRun) -> RunBrief:
+            return RunBrief(
+                run_id=row.id,
+                agent_name=row.agent_name,
+                status=_extract_status(row),
+                delegation_level=row.delegation_level,
+            )
+
         async with self._session_factory() as session:
-            # 1. Load the run
-            stmt = select(AgentRun).where(AgentRun.id == run_id)
-            result = await session.execute(stmt)
-            run_row = result.scalar_one_or_none()
+            run_row = (
+                await session.execute(
+                    select(AgentRun).options(projection).where(AgentRun.id == run_id)
+                )
+            ).scalar_one_or_none()
             if run_row is None:
                 return None
-
-            # 2. Resolve parent ref (or broken-chain marker)
-            parent: ParentRef | None = None
-            if run_row.parent_run_id:
-                p_stmt = select(AgentRun).where(AgentRun.id == run_row.parent_run_id)
-                p_result = await session.execute(p_stmt)
-                p_row = p_result.scalar_one_or_none()
-                if p_row is not None:
-                    parent = ParentRef(
-                        run_id=p_row.id,
-                        resolved=True,
-                        agent_name=p_row.agent_name,
-                        status=_extract_status(p_row),
-                        delegation_level=p_row.delegation_level,
+            remaining = max_rows - 1
+            seen = {run_id}
+            ancestry: list[RunBrief] = []
+            parent = (
+                ParentRef(run_id=run_row.parent_run_id, resolved=False)
+                if run_row.parent_run_id
+                else None
+            )
+            current = run_row.parent_run_id
+            truncated = False
+            ancestry_complete = True
+            while current:
+                if current in seen:
+                    ancestry_complete = False
+                    break
+                if remaining == 0 or len(ancestry) >= max_depth:
+                    truncated = True
+                    ancestry_complete = False
+                    break
+                row = (
+                    await session.execute(
+                        select(AgentRun).options(projection).where(AgentRun.id == current)
                     )
-                else:
-                    parent = ParentRef(run_id=run_row.parent_run_id, resolved=False)
-
-            # 3. Walk ancestry upward (root-first)
-            ancestry, ancestry_complete = await self._walk_ancestry(session, run_row)
-
-            # 4. BFS subtree downward (collects direct children + rolled-up metrics)
-            children, subtree_summary = await self._traverse_subtree_bfs(session, run_row)
-
+                ).scalar_one_or_none()
+                if row is None:
+                    ancestry_complete = False
+                    break
+                seen.add(row.id)
+                remaining -= 1
+                ancestry.append(brief(row))
+                if len(ancestry) == 1:
+                    parent = ParentRef(
+                        run_id=row.id,
+                        resolved=True,
+                        agent_name=row.agent_name,
+                        status=_extract_status(row),
+                        delegation_level=row.delegation_level,
+                    )
+                current = row.parent_run_id
+            ancestry.reverse()
+            descendants: list[tuple[AgentRun, int]] = []
+            frontier = [run_id]
+            depth = 0
+            seen = {run_id}
+            while frontier:
+                depth += 1
+                next_level = []
+                stop = False
+                for i in range(0, len(frontier), _IN_CHUNK):
+                    allowance = remaining if depth <= max_depth else 0
+                    stmt = (
+                        select(AgentRun)
+                        .options(projection)
+                        .where(
+                            AgentRun.parent_run_id.in_(frontier[i : i + _IN_CHUNK]),
+                            AgentRun.id.not_in(seen),
+                        )
+                        .order_by(AgentRun.created_at, AgentRun.id)
+                        .limit(allowance + 1)
+                    )
+                    rows = list((await session.execute(stmt)).scalars())
+                    if len(rows) > allowance:
+                        truncated = True
+                        stop = True
+                    for row in rows[:allowance]:
+                        seen.add(row.id)
+                        remaining -= 1
+                        descendants.append((row, depth))
+                        next_level.append(row.id)
+                    if stop:
+                        break
+                if stop:
+                    break
+                frontier = next_level
+            children, summary = await self._traverse_subtree_bfs(
+                session, run_row, descendants=descendants
+            )
             return DelegationInfo(
                 parent=parent,
                 children=children,
                 ancestry=ancestry,
-                subtree_summary=subtree_summary,
+                subtree_summary=summary,
                 ancestry_complete=ancestry_complete,
+                truncated=truncated,
             )
 
     async def _walk_ancestry(
@@ -2763,12 +2964,15 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         self,
         session: AsyncSession,
         run_row: AgentRun,
+        *,
+        descendants: list[tuple[AgentRun, int]] | None = None,
     ) -> tuple[list[RunBrief], SubtreeSummary]:
         """BFS downward from run_row. Returns (direct_children, summary).
 
         Summary includes the root run itself in token/cost/status counts.
         """
-        descendants = await self._bfs_descendants(session, run_row.id)
+        if descendants is None:
+            descendants = await self._bfs_descendants(session, run_row.id)
 
         sum_input = run_row.total_input_tokens or 0
         sum_output = run_row.total_output_tokens or 0
@@ -3323,3 +3527,26 @@ async def _finalized_output_data(
     if usage is not None:
         output["usage"] = _usage_to_dict(usage)
     return output
+
+
+def validate_event_writer(store: Any) -> None:
+    """Reject the 0.4 event API before a legacy writer can silently persist index zero."""
+    import inspect
+
+    if "sequence_index" in inspect.signature(store.save_run_event).parameters:
+        raise TypeError(
+            "StateStore.save_run_event still accepts sequence_index (0.4 API). "
+            "Remove that parameter and allocate and return an integer index in the insert."
+        )
+
+
+def validate_event_index(index: Any) -> None:
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        import warnings
+
+        warnings.warn(
+            "StateStore.save_run_event must return its allocated non-negative integer index; "
+            "update this custom store before relying on event cursors.",
+            RuntimeWarning,
+            stacklevel=2,
+        )

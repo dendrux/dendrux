@@ -36,6 +36,7 @@ pool) so viewers cannot starve the agents' connection pool. Push
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -50,15 +51,11 @@ from fastapi.responses import StreamingResponse
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime.state import MAX_LIST_OFFSET, UNSCOPED, _Unscoped
 from dendrux.store._follow import (
-    PAUSE_STATUSES,
     EventFeed,
     Follow,
     FollowCapacityError,
     FollowEnd,
     FollowHeartbeat,
-    redact_event,
-    to_placeholders,
-    without_params,
 )
 
 if TYPE_CHECKING:
@@ -67,7 +64,7 @@ if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
     from dendrux.runtime.state import TenantScope
-    from dendrux.store import PausePair, RunStore, StoredEvent
+    from dendrux.store import RunStore, StoredEvent
 
 logger = logging.getLogger(__name__)
 
@@ -308,17 +305,18 @@ def make_read_router(
         # response means "nothing new yet," not "stream is over." A poller
         # that reset to null after an empty batch would miss future events.
         next_cursor = events[-1].sequence_index if events else after
-        active = None
-        mapping = None
-        if any(e.event_type == "run.paused" for e in events):
-            active = await _active_pause_sequence(store, run_id, scope)
-            mapping = await store.get_pii_mapping(run_id, tenant_id=scope)
+        active = (
+            await store._active_pause_sequence(run_id, scope)
+            if any(e.event_type == "run.paused" for e in events)
+            else None
+        )
         items = [
-            redact_event(
+            await store._event_view(
+                run_id,
                 e,
+                tenant_id=scope,
                 include_payloads=payloads,
                 active_pause=e.sequence_index == active,
-                pii_mapping=mapping,
             )
             for e in events
         ]
@@ -372,6 +370,7 @@ def make_read_router(
         return _SseResponse(
             _sse_frames(stream),
             close=stream.aclose,
+            deadline=stream._deadline,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -433,15 +432,17 @@ def make_read_router(
         return {"items": items, "limit": limit, "offset": offset}
 
     @auth_router.get("/runs/{run_id}/pauses")
-    async def get_pauses(run_id: str, scope: Any = Depends(resolve_scope)) -> dict[str, Any]:  # noqa: B008
-        if await store.get_run(run_id, tenant_id=scope) is None:
+    async def get_pauses(
+        run_id: str,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+        scope: Any = Depends(resolve_scope),  # noqa: B008
+    ) -> dict[str, Any]:
+        if await store._status(run_id, scope) is None:
             raise _not_found(run_id)
-        items = await store.get_pauses(run_id, tenant_id=scope)
-        if items:
-            active = await _active_pause_sequence(store, run_id, scope)
-            mapping = await store.get_pii_mapping(run_id, tenant_id=scope)
-            items = [_pause_view(p, active, mapping, payloads) for p in items]
-        return {"items": items}
+        items, truncated = await store.get_pause_page(
+            run_id, tenant_id=scope, limit=limit, include_payloads=payloads
+        )
+        return {"items": items, "limit": limit, "truncated": truncated}
 
     router.include_router(auth_router)
     return router
@@ -450,30 +451,6 @@ def make_read_router(
 # ---------------------------------------------------------------------------
 # Helpers over the store primitives
 # ---------------------------------------------------------------------------
-
-
-async def _active_pause_sequence(store: RunStore, run_id: str, scope: Any) -> int | None:
-    """Index of the ``run.paused`` event of the pause the run is in now, else None.
-
-    Only that pause's arguments stay visible without ``include_payloads``.
-    """
-    run = await store.get_run(run_id, tenant_id=scope)
-    if run is None or run.status not in PAUSE_STATUSES:
-        return None
-    return await store._latest_pause_sequence(run_id)
-
-
-def _pause_view(
-    pause: PausePair, active: int | None, mapping: dict[str, str], payloads: bool
-) -> PausePair:
-    """Approval/input pauses show placeholder-form args; past pauses hide them by default."""
-    calls = pause.pending_tool_calls
-    if pause.reason in ("waiting_approval", "waiting_human_input"):
-        calls = to_placeholders(calls, mapping)
-    is_active = pause.pause_sequence_index == active and pause.resume_sequence_index is None
-    if not payloads and not is_active:
-        calls = [without_params(c) for c in calls]
-    return dataclasses.replace(pause, pending_tool_calls=calls)
 
 
 def _make_feed(store: RunStore, max_followers: int) -> EventFeed:
@@ -513,14 +490,31 @@ class _SseResponse(StreamingResponse):
         content: AsyncIterator[str],
         *,
         close: Callable[[], Awaitable[None]],
+        deadline: float | None = None,
         **kw: Any,
     ) -> None:
         super().__init__(content, **kw)
         self._close = close
+        self._deadline = deadline
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def bounded_send(message: Any) -> None:
+            # A stalled transport cannot hold the connection beyond its deadline.
+            # Give the end frame a small, bounded flush interval.
+            timeout = None
+            if self._deadline is not None:
+                body = message.get("body", b"")
+                end_frame = message["type"] == "http.response.body" and (
+                    not body or body.startswith(b"event: end\n")
+                )
+                timeout = max(
+                    0.05 if end_frame else 0.0,
+                    self._deadline - asyncio.get_running_loop().time(),
+                )
+            await asyncio.wait_for(send(message), timeout)
+
         try:
-            await super().__call__(scope, receive, send)
+            await super().__call__(scope, receive, bounded_send)
         finally:
             await self._close()
 

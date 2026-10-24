@@ -352,12 +352,16 @@ async def _emit_event(
     from dendrux.runtime.durability import retry_critical
 
     async def _write() -> None:
-        await state_store.save_run_event(
+        from dendrux.runtime.state import validate_event_index, validate_event_writer
+
+        validate_event_writer(state_store)
+        index = await state_store.save_run_event(
             run_id,
             event_type=event_type,
             correlation_id=correlation_id,
             data=data,
         )
+        validate_event_index(index)
 
     await retry_critical(_write, label=f"emit_{event_type}", run_id=run_id)
 
@@ -379,12 +383,16 @@ async def _emit_event_safe(
     if state_store is None:
         return
     try:
-        await state_store.save_run_event(
+        from dendrux.runtime.state import validate_event_index, validate_event_writer
+
+        validate_event_writer(state_store)
+        index = await state_store.save_run_event(
             run_id,
             event_type=event_type,
             correlation_id=correlation_id,
             data=data,
         )
+        validate_event_index(index)
     except Exception:
         logger.warning(
             "Failed to record %s for run %s (in error handler)", event_type, run_id, exc_info=True

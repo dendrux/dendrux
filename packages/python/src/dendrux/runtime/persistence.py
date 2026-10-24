@@ -220,13 +220,17 @@ class PersistenceRecorder(BaseRecorder):
         """
 
         async def _write() -> None:
-            await self._store.save_run_event(
+            from dendrux.runtime.state import validate_event_index, validate_event_writer
+
+            validate_event_writer(self._store)
+            index = await self._store.save_run_event(
                 self._run_id,
                 event_type=event_type,
                 iteration_index=iteration,
                 correlation_id=correlation_id,
                 data=data,
             )
+            validate_event_index(index)
 
         await retry_critical(_write, label="save_run_event", run_id=self._run_id)
 

@@ -726,7 +726,7 @@ class TestPausesEndpoint:
         async with await _client(app) as http:
             resp = await http.get("/runs/r1/pauses")
             body = resp.json()
-            assert body == {"items": []}
+            assert body == {"items": [], "limit": 100, "truncated": False}
 
     async def test_unknown_run_404(self, store) -> None:
         app = _build_app(store)

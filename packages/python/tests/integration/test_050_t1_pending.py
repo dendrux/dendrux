@@ -311,6 +311,15 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
         guardrails=[PII()],
         state_store=store,
     )
+    # Emulate T4's producer contract; this branch's loop has no params yet.
+    original_save = store.save_run_event
+
+    async def save_with_model_args(run_id: str, **kw: Any) -> int:
+        if kw["event_type"] == "approval.requested":
+            kw["data"] = {**kw["data"], "params": {"to": "<<EMAIL_ADDRESS_1>>"}}
+        return await original_save(run_id, **kw)
+
+    store.save_run_event = save_with_model_args
     real = "bob@example.com"
     paused = await agent.run(f"mail {real} please", tenant_id="acme")
     run_id = paused.run_id
@@ -352,3 +361,138 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
     result = await agent.submit_approval(run_id, approved=True, tenant_id="acme")
     assert result.status.value == "success"
     assert received == [real]  # the approved tool still receives the real value
+
+
+@pytest.mark.parametrize(
+    "status", ["waiting_approval", "waiting_human_input", "waiting_client_tool"]
+)
+@pytest.mark.parametrize("recorded,mapped", [(True, True), (False, True), (False, False)])
+async def test_pause_display_uses_recorded_args_on_every_path(
+    store: Any,
+    run_store: RunStore,
+    status: str,
+    recorded: bool,
+    mapped: bool,
+) -> None:
+    from dendrux.http.read_router import _sse_frames
+
+    await store.create_run("display", "a", tenant_id="T")
+    # Reused call IDs from older pauses must never supply the new approval view.
+    await store.save_run_event(
+        "display",
+        event_type="approval.requested",
+        data={"call_id": "c", "params": {"old": "<<OLD>>"}},
+    )
+    await store.save_run_event("display", event_type="run.paused", data={})
+    await store.save_run_event("display", event_type="run.resumed", data={})
+    await store.save_run_event(
+        "display",
+        event_type="approval.requested",
+        data={"call_id": "c", "params": {"superseded": True}},
+    )
+    model = {"phone": "<<PHONE_1>>", "literal": "Bobcat", "email": "<<EMAIL_1>>"}
+    data = {"call_id": "c", **({"params": model} if recorded else {})}
+    await store.save_run_event("display", event_type="approval.requested", data=data)
+    execution = {"phone": 1234567890, "literal": "Bobcat", "email": "bob@example.com"}
+    pause = {"pending_tool_calls": [{"id": "c", "name": "send", "params": execution}]}
+    await store.pause_run(
+        "display",
+        status=status,
+        pause_data=pause,
+        pii_mapping={
+            "<<PHONE_1>>": "+1 234 567 890",
+            "<<EMAIL_1>>": "Bob@Example.com",
+            "<<PERSON_1>>": "Bob",
+        }
+        if mapped
+        else {},
+    )
+    await store.save_run_event("display", event_type="run.paused", data={"status": status, **pause})
+    pending = await run_store.get_pending("display", tenant_id="T")
+    expected = (
+        execution
+        if status == "waiting_client_tool" or not (mapped or recorded)
+        else model
+        if recorded
+        else None
+    )
+    assert pending.tool_calls[0].params == expected
+    assert pending.tool_calls[0].args_hidden == (expected is None)
+    for payloads in (False, True):
+        app = FastAPI()
+        app.include_router(
+            make_read_router(
+                store=run_store,
+                authorize=_allow,
+                tenant_resolver=lambda: "T",
+                include_payloads=payloads,
+            )
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as http:
+            events = (await http.get("/runs/display/events")).json()["items"]
+            pair = (await http.get("/runs/display/pauses")).json()["items"][-1]
+        call = events[-1]["data"]["pending_tool_calls"][0]
+        assert call["params"] == expected
+        assert pair["pending_tool_calls"][0]["params"] == expected
+        if expected is None:
+            assert call["args_hidden"] is True
+        async with run_store.follow(
+            "display", tenant_id="T", include_payloads=payloads, max_duration_s=0.1
+        ) as follow:
+            frames = [frame async for frame in _sse_frames(follow)]
+        shown = [json.loads(f.split("data: ")[1]) for f in frames if "event: message\n" in f]
+        assert shown[-1]["event_type"] == "run.paused"
+        assert shown[-1]["data"]["pending_tool_calls"][0]["params"] == expected
+
+
+async def test_pause_page_pairs_at_boundary_and_reports_truncation(
+    store: Any, run_store: RunStore
+) -> None:
+    await store.create_run("pages", "a")
+    for i in range(5):
+        await store.save_run_event("pages", event_type="run.paused", data={"pause_id": str(i)})
+        await store.save_run_event("pages", event_type="run.resumed")
+    items, truncated = await run_store.get_pause_page("pages", limit=2)
+    assert truncated and len(items) == 2
+    assert [p.resume_sequence_index for p in items] == [1, 3]
+    items, truncated = await run_store.get_pause_page("pages", limit=5)
+    assert len(items) == 5 and not truncated
+    async with _client(run_store) as http:
+        body = (await http.get("/runs/pages/pauses?limit=2")).json()
+        assert body["truncated"] and body["limit"] == 2 and len(body["items"]) == 2
+        assert (await http.get("/runs/pages/pauses?limit=1001")).status_code == 422
+
+
+async def test_delegation_traversal_bounds_and_projection(store: Any, engine: Any) -> None:
+    from sqlalchemy import event
+
+    await store.create_run("root", "a")
+    for i in range(6):
+        await store.create_run(f"c{i}", "a", parent_run_id="root")
+    await store.create_run("leaf", "a", parent_run_id="c0")
+    queries = []
+
+    def capture(_c: Any, _cur: Any, stmt: str, *a: Any) -> None:
+        queries.append(stmt)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        bounded = await store.get_delegation_info("root", max_rows=3)
+        assert bounded.truncated and len(bounded.children) == 2
+        assert bounded.subtree_summary.descendant_count == 2
+        depth = await store.get_delegation_info("root", max_depth=1)
+        assert depth.truncated and depth.subtree_summary.descendant_count == 6
+        whole = await store.get_delegation_info("root")
+        assert not whole.truncated and whole.subtree_summary.descendant_count == 7
+        ancestors = await store.get_delegation_info("leaf", max_depth=1)
+        assert ancestors.truncated and not ancestors.ancestry_complete
+        root_only = await store.get_delegation_info("root", max_rows=1)
+        assert root_only.truncated and not root_only.children
+        leaf = await store.get_delegation_info("leaf", max_rows=3)
+        assert not leaf.truncated and leaf.ancestry_complete
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert not any("pause_data" in q or "pii_mapping" in q or "input_data" in q for q in queries)
+    for kw in ({"max_rows": 0}, {"max_rows": 10001}, {"max_depth": -1}, {"max_depth": 101}):
+        with pytest.raises(ValueError):
+            await store.get_delegation_info("root", **kw)

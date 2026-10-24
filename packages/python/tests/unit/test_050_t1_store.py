@@ -550,3 +550,27 @@ class TestRetryNotFound:
         assert isinstance(foreign.value, LookupError)
         assert type(missing.value) is type(foreign.value)
         assert str(foreign.value) == f"Run '{done.run_id}' not found."
+
+
+class TestLegacyEventWriter:
+    async def test_legacy_index_zero_writer_is_rejected_before_write(self) -> None:
+        from dendrux.runtime.runner import _emit_event
+
+        class Legacy:
+            written = False
+
+            async def save_run_event(self, run_id: str, sequence_index: int = 0, **kw: Any) -> int:
+                self.written = True
+                return sequence_index
+
+        legacy = Legacy()
+        with pytest.raises(TypeError, match="sequence_index"):
+            await _emit_event(legacy, "r", "tick")
+        assert not legacy.written
+
+    @pytest.mark.parametrize("value", [None, True, "0", -1])
+    def test_non_integer_event_result_warns_loudly(self, value: Any) -> None:
+        from dendrux.runtime.state import validate_event_index
+
+        with pytest.warns(RuntimeWarning, match="allocated non-negative integer"):
+            validate_event_index(value)

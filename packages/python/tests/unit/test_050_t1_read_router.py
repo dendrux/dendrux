@@ -396,3 +396,45 @@ class TestSseConnectionCap:
             feed._release()
             assert (await http.get("/runs/r1/events/stream?after=-1")).status_code == 200
         assert feed.followers == 0
+
+
+@pytest.mark.parametrize("disconnect", [True, False])
+async def test_sse_disconnect_and_stalled_send_release_slot(
+    state: Any,
+    store: RunStore,
+    disconnect: bool,
+) -> None:
+    from dendrux.store import EventFeed
+
+    await state.create_run("disconnect", "a")
+    await state.save_run_event("disconnect", event_type="tick")
+    feed = EventFeed(store, poll_interval_s=0.01, poll_max_s=0.02)
+    stream = feed.follow("disconnect", tenant_id=None, max_duration_s=0.03)
+    await stream.start()
+    sent = asyncio.Event()
+
+    async def receive() -> Any:
+        await sent.wait()
+        if disconnect:
+            return {"type": "http.disconnect"}
+        await asyncio.Event().wait()
+
+    async def send(message: Any) -> None:
+        if message["type"] == "http.response.body":
+            sent.set()
+            await asyncio.Event().wait()
+
+    response = rr._SseResponse(
+        rr._sse_frames(stream), close=stream.aclose, deadline=stream._deadline
+    )
+    try:
+        async with asyncio.timeout(2):
+            if disconnect:
+                await response({"type": "http", "asgi": {"spec_version": "2.0"}}, receive, send)
+            else:
+                with pytest.raises((TimeoutError, ExceptionGroup)):
+                    await response({"type": "http", "asgi": {"spec_version": "2.0"}}, receive, send)
+        assert feed.followers == 0
+    finally:
+        await feed.aclose()
+    assert feed.watched_runs == 0

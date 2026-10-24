@@ -107,18 +107,6 @@ class TestRedactEvent:
 
 
 class TestApprovalPlaceholders:
-    def test_approval_args_are_put_back_in_placeholder_form(self) -> None:
-        from dendrux.store import to_placeholders
-
-        mapping = {"<<EMAIL_ADDRESS_1>>": "bob@example.com", "<<PERSON_1>>": "Bob"}
-        args = {"to": "bob@example.com", "cc": ["Bob <bob@example.com>"], "n": 3}
-        assert to_placeholders(args, mapping) == {
-            "to": "<<EMAIL_ADDRESS_1>>",
-            "cc": ["<<PERSON_1>> <<<EMAIL_ADDRESS_1>>>"],
-            "n": 3,
-        }
-        assert to_placeholders(args, None) is args
-
     def test_redact_event_shows_approval_args_as_placeholders_in_every_mode(self) -> None:
         mapping = {"<<EMAIL_ADDRESS_1>>": "bob@example.com"}
         ev = StoredEvent(
@@ -135,8 +123,17 @@ class TestApprovalPlaceholders:
             created_at=None,
         )
         for payloads in (False, True):
-            shown = redact_event(
+            hidden = redact_event(
                 ev, include_payloads=payloads, active_pause=True, pii_mapping=mapping
+            )
+            assert hidden.data["pending_tool_calls"][0]["params"] is None
+            assert hidden.data["pending_tool_calls"][0]["args_hidden"] is True
+            shown = redact_event(
+                ev,
+                include_payloads=payloads,
+                active_pause=True,
+                pii_mapping=mapping,
+                approval_params={"c": {"to": "<<EMAIL_ADDRESS_1>>"}},
             )
             assert shown.data["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
         client = dataclasses.replace(ev, data={**ev.data, "status": "waiting_client_tool"})
@@ -379,3 +376,194 @@ class TestStreamEvents:
             warnings.simplefilter("error")
             with pytest.raises(RunNotFoundError):
                 await anext(store.stream_events("ra", tenant_id="B"))
+
+
+class TestFixRound:
+    async def test_overflow_never_accepts_6_10_15_after_a_gap(
+        self, state: Any, store: RunStore
+    ) -> None:
+        await state.create_run("r1", "a")
+        await state.save_run_event("r1", event_type="tick")
+        feed = _feed(store, buffer=5)
+        async with feed.follow("r1", tenant_id=None) as follow:
+            assert (await anext(follow)).sequence_index == 0
+            follower = follow._follower
+            assert follower is not None
+            for index in range(1, 8):
+                follower.push(StoredEvent(index, 0, "tick", None, {}, None))
+            delivered = []
+            for index in (6, 10, 15):
+                delivered.append(await anext(follow))
+                follower.push(StoredEvent(index, 0, "tick", None, {}, None))
+            delivered.extend([item async for item in follow])
+        assert _seqs(delivered) == [1, 2, 3, 4, 5]
+        assert delivered[-1] == FollowEnd("lagging", 5)
+
+    @pytest.mark.parametrize("live", [False, True])
+    async def test_duration_bounds_slow_delivery(
+        self, state: Any, store: RunStore, live: bool
+    ) -> None:
+        await state.create_run("r1", "a")
+        for _ in range(3):
+            await state.save_run_event("r1", event_type="tick")
+        async with _feed(store).follow("r1", tenant_id=None, max_duration_s=0.04) as follow:
+            first = await anext(follow)
+            if live:
+                # Skip catch-up for this variant and replenish the live queue.
+                await anext(follow)
+                first = await anext(follow)
+                assert follow._follower is not None
+                follow._follower.push(StoredEvent(3, 0, "tick", None, {}, None))
+            await asyncio.sleep(0.06)
+            assert await anext(follow) == FollowEnd("max_duration", first.sequence_index)
+
+    async def test_blocked_read_obeys_duration(
+        self, state: Any, store: RunStore, monkeypatch: Any
+    ) -> None:
+        await state.create_run("r1", "a")
+        await state.save_run_event("r1", event_type="tick")
+
+        async def blocked(*a: Any, **kw: Any) -> Any:
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(store, "get_events", blocked)
+        async with _feed(store).follow("r1", tenant_id=None, max_duration_s=0.03) as follow:
+            assert await anext(follow) == FollowEnd("max_duration", None)
+
+    @pytest.mark.parametrize("mode", ["break", "exception", "gc", "cancel", "start_only"])
+    async def test_abandoned_followers_release_capacity(
+        self, state: Any, store: RunStore, mode: str
+    ) -> None:
+        import gc
+
+        await state.create_run("r1", "a")
+        await state.save_run_event("r1", event_type="tick")
+        feed = _feed(store)
+        for _ in range(600 if mode == "break" else 3):
+            follow = feed.follow("r1", tenant_id=None)
+            if mode == "start_only":
+                await follow.start()
+            elif mode == "cancel":
+                await anext(follow)
+                task = asyncio.create_task(anext(follow))
+                await asyncio.sleep(0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif mode == "gc":
+                await anext(follow)
+            else:
+                try:
+                    async for _item in follow:
+                        if mode == "exception":
+                            raise ValueError("consumer error")
+                        break
+                except ValueError:
+                    pass
+            del follow
+            if mode == "gc":
+                gc.collect()
+            async with asyncio.timeout(2):
+                while feed.followers or feed.watched_runs:
+                    await asyncio.sleep(0.001)
+        assert feed.followers == feed.watched_runs == 0
+        await feed.aclose()
+
+    async def test_slow_cancellation_stays_tracked(
+        self, state: Any, store: RunStore, monkeypatch: Any
+    ) -> None:
+        await state.create_run("r1", "a")
+        await state.save_run_event("r1", event_type="tick")
+        entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original = store.get_events
+
+        async def slow(*a: Any, **kw: Any) -> Any:
+            if asyncio.current_task().get_name().startswith("dendrux-run-feed:"):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+                    raise
+            return await original(*a, **kw)
+
+        monkeypatch.setattr(store, "get_events", slow)
+        feed = _feed(store, max_followers=1, stop_timeout_s=0.001)
+        follow = feed.follow("r1", tenant_id=None)
+        await anext(follow)
+        await entered.wait()
+        poller = feed._feeds["r1"].task
+        await follow.aclose()
+        assert cancelled.is_set() and not poller.done()
+        assert feed.followers == 0 and feed.watched_runs == 1
+        with pytest.raises(FollowCapacityError):
+            await feed.follow("r1", tenant_id=None).start()
+        shutdown = asyncio.create_task(feed.aclose())
+        await asyncio.sleep(0)
+        shutdown.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        assert feed.watched_runs == 1
+        release.set()
+        await feed.aclose()
+        assert poller.done() and feed.watched_runs == 0
+
+    @pytest.mark.parametrize(
+        "transition", ["resume", "resume_event_only", "terminal", "replacement"]
+    )
+    async def test_active_pause_is_refreshed_before_delivery(
+        self, state: Any, store: RunStore, transition: str
+    ) -> None:
+        await state.create_run("r1", "a")
+        await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)
+        await state.pause_run("r1", status="waiting_client_tool", pause_data={})
+        follow = _feed(store).follow("r1", tenant_id=None)
+        await follow.start()
+        if transition == "terminal":
+            await state.finalize_run("r1", status="success")
+        elif transition == "resume_event_only":
+            await state.save_run_event("r1", event_type="run.resumed")
+        elif transition == "resume":
+            await state.claim_paused_run("r1", expected_status="waiting_client_tool")
+            await state.save_run_event("r1", event_type="run.resumed")
+        else:
+            await state.save_run_event("r1", event_type="run.resumed")
+            await state.save_run_event("r1", event_type="run.paused", data=_PAUSED)
+        async with follow:
+            old = await anext(follow)
+        assert "params" not in old.data["pending_tool_calls"][0]
+
+    async def test_poller_status_projection_excludes_history(
+        self, state: Any, store: RunStore, engine: Any
+    ) -> None:
+        from sqlalchemy import event
+
+        await state.create_run("r1", "a")
+        await state.pause_run(
+            "r1", status="waiting_client_tool", pause_data={"history": ["x" * 10000]}
+        )
+        queries = []
+
+        def capture(_c: Any, _cur: Any, stmt: str, *a: Any) -> None:
+            queries.append(stmt)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture)
+        try:
+            async with _feed(store, heartbeat_s=0.04).follow("r1", tenant_id=None) as follow:
+                await anext(follow)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        assert any("agent_runs.status" in q for q in queries)
+        assert not any("pause_data" in q for q in queries)
+
+
+async def test_closed_feed_cannot_start_a_preacquired_follower(state: Any, store: RunStore) -> None:
+    await state.create_run("r1", "a")
+    feed = _feed(store)
+    follow = feed.follow("r1", tenant_id=None)
+    await follow.start()
+    await feed.aclose()
+    with pytest.raises(RuntimeError, match="closed"):
+        await anext(follow)
+    assert feed.followers == feed.watched_runs == 0

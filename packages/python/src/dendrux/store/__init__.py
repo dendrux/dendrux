@@ -38,11 +38,12 @@ Example
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import inspect
 import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from dendrux._sentinel import _OmittedType
 from dendrux.db._sqlite_sync import create_sqlite_schema
@@ -61,14 +62,15 @@ from dendrux.runtime.state import (
     _Unscoped,
 )
 from dendrux.store._follow import (
+    PAUSE_STATUSES,
     EventFeed,
     Follow,
     FollowCapacityError,
     FollowEnd,
     FollowHeartbeat,
     FollowItem,
+    approval_calls,
     redact_event,
-    to_placeholders,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
 
@@ -338,7 +340,9 @@ class PendingToolCall:
     de-anonymisation, so with ``PII(restore="all")`` (the default) they hold
     real values. For an **approval** pause, the placeholder form the model
     sent (``<<EMAIL_ADDRESS_1>>``), never de-anonymised values: that is what a
-    human approves. ``target`` is ``"client"`` or ``"server"``.
+    human approves. If a PII mapping exists but recorded model arguments
+    are unavailable, ``params`` is None and ``args_hidden`` is True.
+    ``target`` is ``"client"`` or ``"server"``.
     ``approval`` is ``{"source": "static" | "hook", "reason": ...}`` for a
     call waiting for approval, else None.
     """
@@ -346,8 +350,9 @@ class PendingToolCall:
     id: str
     name: str
     target: str | None
-    params: dict[str, Any]
+    params: dict[str, Any] | None
     approval: dict[str, Any] | None = None
+    args_hidden: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +392,7 @@ class PendingPause:
                     "target": c.target,
                     "params": c.params,
                     "approval": c.approval,
+                    **({"args_hidden": True} if c.args_hidden else {}),
                 }
                 for c in self.tool_calls
             ],
@@ -467,7 +473,7 @@ class RunStore:
 
     Engine lifecycle: ``from_database_url`` creates and owns the engine;
     ``close()`` (or ``async with``) disposes it. ``from_engine`` leaves
-    engine ownership with the caller; ``close()`` is then a no-op.
+    engine ownership with the caller; ``close()`` still stops the owned event feed.
 
     Tenancy: every read takes ``tenant_id``. Omitted (``UNSCOPED``) is a
     trusted all-tenant read. A string scopes the read to that tenant and
@@ -559,7 +565,9 @@ class RunStore:
         return await accessor.read(sha256, tenant_id=record.tenant_id)
 
     async def close(self) -> None:
-        """Dispose any engine this store owns. No-op for caller-owned engines."""
+        """Stop owned event feeds, then dispose only engines this store owns."""
+        if self._event_feed is not None:
+            await self._event_feed.aclose()
         if isinstance(self._state, _InitOnFirstUse):
             self._state.closed = True
         if self._owned_engine is not None:
@@ -884,33 +892,82 @@ class RunStore:
         ]
 
     async def get_pauses(
-        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        limit: int = 100,
     ) -> list[PausePair]:
-        """Derive pause/resume cycles from ``run_events``.
+        """First bounded pause/resume pairs; use get_pause_page for truncation metadata."""
+        items, _ = await self.get_pause_page(run_id, tenant_id=tenant_id, limit=limit)
+        return items
 
-        Pairing is nearest-neighbor: each ``run.paused`` pairs with the
-        next ``run.resumed`` in ``sequence_index`` order. An unpaired
-        ``run.paused`` at the end of the log represents an active pause
-        (``resume_sequence_index`` is ``None``).
+    async def get_pause_page(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        limit: int = 100,
+        include_payloads: bool = False,
+    ) -> tuple[list[PausePair], bool]:
+        """Bounded pairs (1..1000), plus an honest truncated flag.
 
-        Filters event_type at the SQL layer (only ``run.paused`` and
-        ``run.resumed`` rows are fetched). Never reads
-        ``AgentRun.pause_data``. Empty when the run is outside ``tenant_id``.
+        Read a lookahead beyond the maximum paired rows so the last returned
+        pause's resume is never lost at the page boundary. Orphan resume events
+        can shorten the page; truncated remains true when more rows may exist.
         """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an int between 1 and 1000.")
+        method = self._state.get_run_events
+        kwargs: dict[str, Any] = {}
+        builtin = "_pause_page" in inspect.signature(method).parameters
+        if builtin:
+            kwargs["_pause_page"] = True
+        row_limit = 2 * limit + 2 if builtin else min(2 * limit + 2, 1000)
         rows = await self._scoped_read(
-            self._state.get_run_events,
+            method,
             run_id,
             tenant_id,
             event_types=["run.paused", "run.resumed"],
+            limit=row_limit,
+            **kwargs,
         )
-        return _derive_pauses(rows or [])
+        rows = rows or []
+        pairs = _derive_pauses(rows)
+        truncated = len(rows) == row_limit or len(pairs) > limit
+        if len(rows) == row_limit and pairs and pairs[-1].resume_sequence_index is None:
+            pairs.pop()  # unresolved lookahead is not represented as an active pause
+        items = []
+        active = await self._active_pause_sequence(run_id, tenant_id) if pairs else None
+        for pair in pairs[:limit]:
+            event = StoredEvent(
+                sequence_index=pair.pause_sequence_index,
+                iteration_index=0,
+                event_type="run.paused",
+                correlation_id=None,
+                created_at=pair.pause_at,
+                data={"status": pair.reason, "pending_tool_calls": pair.pending_tool_calls},
+            )
+            view = await self._event_view(
+                run_id,
+                event,
+                tenant_id=tenant_id,
+                include_payloads=include_payloads,
+                active_pause=pair.pause_sequence_index == active,
+            )
+            items.append(
+                dataclasses.replace(
+                    pair, pending_tool_calls=(view.data or {})["pending_tool_calls"]
+                )
+            )
+        return items, truncated
 
     async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
         """What the run is waiting for now, or None when it is not paused.
 
         ``tenant_id`` is required (keyword-only): a string or ``None`` scopes
         the read, ``UNSCOPED`` reads any tenant and must be passed explicitly.
-        One bounded read on the built-in store: the pause history is never
+        Bounded reads on the built-in store: the pause history is never
         loaded. Use it after a reload, a reconnect, a timed-out request or a
         retried idempotent call to rebuild the client's form or tool call.
         Arguments are in the form described on :class:`PendingToolCall`.
@@ -940,9 +997,13 @@ class RunStore:
         if kind is None:
             return None
         if kind in ("approval", "input"):
+            seq = await self._active_pause_sequence(run_id, tenant_id)
+            params = await self._approval_params(run_id, seq, tenant_id)
             pause = {
                 **pause,
-                "pending_tool_calls": to_placeholders(pause.get("pending_tool_calls"), mapping),
+                "pending_tool_calls": approval_calls(
+                    pause.get("pending_tool_calls"), mapping, params
+                ),
             }
         return _pending_from(run_id, status, kind, pause, last_step)
 
@@ -987,14 +1048,70 @@ class RunStore:
             max_duration_s=max_duration_s,
         )
 
-    async def _latest_pause_sequence(self, run_id: str) -> int | None:
-        """Index of the run's latest ``run.paused`` event (unscoped; callers scope first)."""
-        getter = getattr(self._state, "get_pause_summary", None)
+    async def _status(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> str | None:
+        getter = getattr(self._state, "get_run_status", None)
         if getter is not None:
-            summary = await getter(run_id)
-            return summary.paused_event_sequence if summary is not None else None
-        rows = await self._state.get_run_events(run_id, event_types=["run.paused"])
-        return rows[-1].sequence_index if rows else None
+            return cast("str | None", await getter(run_id, tenant_id=tenant_id))
+        record = await self._scoped_run(run_id, tenant_id)
+        return str(record.status) if record is not None else None
+
+    async def _active_pause_sequence(
+        self, run_id: str, tenant_id: TenantScope = UNSCOPED
+    ) -> int | None:
+        getter = getattr(self._state, "get_active_pause_sequence", None)
+        if getter is not None:
+            return cast("int | None", await getter(run_id, tenant_id=tenant_id))
+        if await self._status(run_id, tenant_id) not in PAUSE_STATUSES:
+            return None
+        # Bounded custom-store fallback. Unknown tail means no active exception.
+        rows = await self._scoped_read(
+            self._state.get_run_events,
+            run_id,
+            tenant_id,
+            event_types=["run.paused", "run.resumed"],
+            limit=1000,
+        )
+        if not rows or len(rows) == 1000 or rows[-1].event_type != "run.paused":
+            return None
+        return int(rows[-1].sequence_index)
+
+    async def _approval_params(
+        self, run_id: str, seq: int | None, tenant_id: TenantScope = UNSCOPED
+    ) -> dict[str, dict[str, Any]]:
+        getter = getattr(self._state, "get_approval_params", None)
+        if getter is None or seq is None:
+            return {}  # legacy custom stores fail closed when PII is present
+        return cast("dict[str, dict[str, Any]]", await getter(run_id, seq, tenant_id=tenant_id))
+
+    async def _event_view(
+        self,
+        run_id: str,
+        event: StoredEvent,
+        *,
+        tenant_id: TenantScope = UNSCOPED,
+        include_payloads: bool = False,
+        active_pause: bool | None = None,
+    ) -> StoredEvent:
+        mapping = None
+        params = None
+        if event.event_type == "run.paused":
+            if active_pause is None:
+                active_pause = event.sequence_index == await self._active_pause_sequence(
+                    run_id, tenant_id
+                )
+            if (include_payloads or active_pause) and (event.data or {}).get("status") in (
+                "waiting_approval",
+                "waiting_human_input",
+            ):
+                mapping = await self.get_pii_mapping(run_id, tenant_id=tenant_id)
+                params = await self._approval_params(run_id, event.sequence_index, tenant_id)
+        return redact_event(
+            event,
+            include_payloads=include_payloads,
+            active_pause=bool(active_pause),
+            pii_mapping=mapping,
+            approval_params=params,
+        )
 
     # ------------------------------------------------------------------
     # Tenant scoping
@@ -1087,7 +1204,8 @@ def _pending_from(
                 id=str(tc["id"]),
                 name=str(tc.get("name", "")),
                 target=targets.get(tc["id"]) if isinstance(targets, dict) else None,
-                params=dict(tc.get("params") or {}),
+                params=None if tc.get("args_hidden") else dict(tc.get("params") or {}),
+                args_hidden=bool(tc.get("args_hidden")),
                 approval=dict(gate) if isinstance(gate, dict) else None,
             )
         )
@@ -1311,5 +1429,4 @@ __all__ = [
     "TraceEntry",
     "UNSCOPED",
     "redact_event",
-    "to_placeholders",
 ]
