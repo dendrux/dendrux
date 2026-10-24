@@ -60,3 +60,6 @@ examples/**/output/
 
 # Private notes (never commit)
 meeting-prep.md
+
+# JavaScript dependencies used by local tooling
+node_modules/

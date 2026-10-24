@@ -45,7 +45,7 @@ tool_calls (proof of side effect):
   send_email  params={"to": "jane.doe@example.com", "body": "..."}
 ```
 
-The DB stores ground truth. The `pii_mapping` column is the audit key that lets an app-owned operator UI reconstruct what the LLM saw at any point.
+The DB stores ground truth. The `pii_mapping` column is the audit key that lets inspection tools you build reconstruct what the LLM saw at any point.
 
 ## Where the redaction boundary actually sits
 
@@ -108,7 +108,7 @@ Three invariants this mapping enforces:
 
 1. **Stable tokens.** If the same email appears in two different messages, the same `<<EMAIL_ADDRESS_1>>` token is used both times. The guardrail engine checks the reverse index before minting a new placeholder.
 2. **Pause-safe.** On resume, the runner reads `pii_mapping` off the row and reinitializes the guardrail engine with it. A second-iteration scan picks up the same placeholder for the same email, so the LLM never sees a redaction jitter between pause and resume.
-3. **Audit-replayable.** With raw history in `react_traces` and the mapping on the run row, an app-owned operator UI can render every event in two views: LLM-eye (apply the mapping) and ground-truth (raw). The mapping is the key that links them.
+3. **Audit-replayable.** With raw history in `react_traces` and the mapping on the run row, inspection tools you build can render every event in two views: LLM-eye (apply the mapping) and ground-truth (raw). The mapping is the key that links them.
 
 From `dendrux/runtime/runner.py`:
 

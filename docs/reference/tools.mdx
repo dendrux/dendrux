@@ -133,7 +133,7 @@ Details:
 - MCP tools and client tools are not coerced: their arguments and results are unchanged from 0.4.
 - Tool schemas are part of the prompt, so adding constraint keywords can change a prompt-cache key once, on the first request after you upgrade.
 
-[//]: # "VERIFY-0.5.0: T4 owns validation and coercion; confirm the order of operations, the error wording rule, that the approval view is the model-sent form (exclude_unset) and that the approval fingerprint uses it"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Timeouts and the thread pool
 
@@ -150,7 +150,7 @@ A sync tool that has timed out cannot be killed; it keeps its thread until it re
 
 If a parallel batch ends the run (a failure that stops the run), the async siblings are cancelled and recorded as `cancelled`; sibling sync tools that had already started are recorded with an unknown outcome.
 
-[//]: # "VERIFY-0.5.0: T4 owns the pool; confirm the helper's public name and import path for the hung-thread gauge, the tool.completed field name for zombie counts, and the default tool_threads"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Result size limits
 

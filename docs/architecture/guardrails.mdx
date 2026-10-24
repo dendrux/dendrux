@@ -273,7 +273,7 @@ governance events:
 
 One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name, a count and a location (message index, role, tool call id), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the audit trail.
 
-[//]: # "VERIFY-0.5.0: T3 owns the exact message wording; replace the example strings with real output"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Prompt injection — domain-specific by design
 
@@ -321,7 +321,7 @@ governance events:
 
 Two `guardrail.detected` events, one for the incoming user message and one for the outgoing assistant reply (which echoed the ticket back). No `guardrail.redacted`, no `guardrail.blocked`, an empty `pii_mapping`. The text is unchanged; the log records that it was seen.
 
-This action is the right choice when you want a signal that something matched without changing the flow. A operator UI can count `guardrail.detected` events by entity type across runs to get a usage heat-map.
+This action is the right choice when you want a signal that something matched without changing the flow. An inspection tool can count `guardrail.detected` events by entity type across runs to get a usage heat-map.
 
 ## Incoming and outgoing are both scanned — with different jobs
 
@@ -347,7 +347,7 @@ If a guardrail cannot examine some content (it is nested too deeply, larger than
 
 Like every finding, it carries a kind, a count and a location, never the content itself.
 
-[//]: # "VERIFY-0.5.0: T3 owns this; confirm the kind name is unscannable and the depth and size limits worth documenting"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Multiple guardrails compose
 

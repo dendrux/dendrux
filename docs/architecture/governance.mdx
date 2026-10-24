@@ -145,7 +145,7 @@ The `pii_mapping` blob on `agent_runs` after the run:
 }
 ```
 
-That mapping is the audit key. Guardrails redact at the LLM boundary only — what the provider API sees. The DB stores raw values (ground truth), and the mapping lets an app-owned operator UI reconstruct the LLM-eye view from the raw traces on demand. The mapping lives on the `agent_runs` row for the lifetime of the run. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
+That mapping is the audit key. Guardrails redact at the LLM boundary only — what the provider API sees. The DB stores raw values (ground truth), and the mapping lets inspection tools you build reconstruct the LLM-eye view from the raw traces on demand. The mapping lives on the `agent_runs` row for the lifetime of the run. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
 
 ## How events reach the recorder and notifier
 
@@ -196,7 +196,7 @@ Agent(..., on_governance_change="raise")   # raise GovernanceMismatchError; the 
 
 `governance.changed` names the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `FutureWarning` if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
 
-[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the FutureWarning against the merged code"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Why one pipeline instead of four subsystems
 
@@ -205,7 +205,7 @@ A reasonable alternative design is to give each governance concern its own audit
 Dendrux does not do that, for three reasons.
 
 1. **Ordering is important and cross-cutting.** "Did the guardrail detect the PII before or after the approval was decided?" is a question that matters. The answer requires a single ordered log, not four tables that need to be merged on timestamps. `sequence_index` is that log.
-2. **Readers want one stream.** A operator UI that wants to render "what happened on this run" reads one table. An SSE client that wants to stream live events reads one endpoint. A developer who wants to debug a suspicious decision greps one log. Four tables means four queries, four joins, four schemas to learn.
+2. **Readers want one stream.** An inspection tool that wants to render "what happened on this run" reads one table. An SSE client that wants to stream live events reads one endpoint. A developer who wants to debug a suspicious decision greps one log. Four tables means four queries, four joins, four schemas to learn.
 3. **The set of concerns will grow.** MCP events and skill events (seven of them, covering activation, file reads and script runs) were added after the original PII + approval cut. Every addition would otherwise require a new table, a new migration, a new query pattern. A typed event on a shared table needs neither. Adding a new governance concern means adding a new `event_type` constant and calling `recorder.on_governance_event(...)`; everything downstream works.
 
 The cost is a JSON `data` column on `run_events` that is typed per `event_type`, not per column. For a log that readers mostly want in order, that is the right tradeoff. Queries that need a specific event type (`WHERE event_type = 'guardrail.blocked'`) still return the relevant rows in the right order, and the JSON column gives each event type the flexibility to carry whatever payload makes sense without forcing a schema migration.

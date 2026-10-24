@@ -151,15 +151,15 @@ The active pause's arguments stay visible by default, in `run.paused`, `/pauses`
 
 ## Approving the right pause
 
-A decision can arrive late, from a tab left open or a retried request. Pass `expected_pause_id=` (the `pause_id` from `RunResult`, the `run.paused` event or `RunStore.get_pauses`) and a decision aimed at an older pause raises `PauseStatusMismatchError` instead of approving the newer one. It is optional in 0.5 and required in 0.6. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+A decision can arrive late, from a tab left open or a retried request. Re-fetch
+pending state before asking the actor again. A read/check does not itself provide
+an atomic guarantee that the decision still targets the displayed pause.
 
-```python
-await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
-```
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 On resume the run re-checks `deny` and the per-tool call limits before executing approved calls, so a tool denied or capped after the pause is not run.
 
-[//]: # "VERIFY-0.5.0: resume-side deny and call-limit re-check and expected_pause_id are T7 wave 2; the approval-event argument form is T4"
+[//]: # "VERIFY-0.5.0: Confirm resume-side policy checks and approval argument form against the release candidate."
 
 ## Per-call decisions
 

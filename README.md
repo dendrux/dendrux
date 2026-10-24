@@ -39,8 +39,10 @@
 - **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
 - **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
 - **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. The default is unchanged. See [PII restore](docs/architecture/pii-restore.mdx).
-- **Run integrity.** Pauses carry a `pause_id` so a stale submit is rejected (`expected_pause_id=`), claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
+- **Run integrity.** Claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
 - **Migration.** Run `dendrux db migrate` (revision `d7e8f9a0b1c2`). Several defaults flip in 0.6; 0.5 prints a `FutureWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
+
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support before documenting stale-submit protection."
 
 ## What's new in 0.4.1
 

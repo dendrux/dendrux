@@ -149,6 +149,14 @@ async def test_client_tools_flow_with_defaults(store: Any, run_store: RunStore) 
     pending = await run_store.get_pending(paused.run_id, tenant_id=None)
     call = pending.tool_calls[0]
     assert call.params == {"sheet": "S1"}
+    events = await run_store.get_events(paused.run_id, tenant_id=None)
+    active = next(e for e in events if e.event_type == "run.paused")
+    view = await run_store.get_event_view(paused.run_id, active, tenant_id=None)
+    assert view.data["pending_tool_calls"][0]["params"] == {"sheet": "S1"}
+    pairs, truncated = await run_store.get_pause_page(paused.run_id, tenant_id=None)
+    assert not truncated and len(pairs) == 1
+    assert pairs[0].resume_sequence_index is None
+    assert pairs[0].pending_tool_calls[0]["params"] == {"sheet": "S1"}
     result = await paused.agent.submit_tool_results(
         paused.run_id,
         [ToolResult(name=call.name, call_id=call.id, payload='"rows"')],
@@ -159,6 +167,12 @@ async def test_client_tools_flow_with_defaults(store: Any, run_store: RunStore) 
     past = next(e for e in events if e.event_type == "run.paused")
     view = await run_store.get_event_view(paused.run_id, past, tenant_id=None)
     assert "params" not in view.data["pending_tool_calls"][0]
+    pairs, truncated = await run_store.get_pause_page(paused.run_id, tenant_id=None)
+    assert not truncated and len(pairs) == 1
+    assert pairs[0].resume_sequence_index is not None
+    assert "params" not in pairs[0].pending_tool_calls[0]
+    pairs, _ = await run_store.get_pause_page(paused.run_id, tenant_id=None, include_payloads=True)
+    assert pairs[0].pending_tool_calls[0]["params"] == {"sheet": "S1"}
 
 
 async def test_approval_flow_with_defaults(store: Any, run_store: RunStore) -> None:
@@ -295,6 +309,12 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
         )
         assert scoped.data["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
         assert real not in json.dumps(scoped.data)
+        pairs, truncated = await run_store.get_pause_page(
+            run_id, tenant_id="acme", include_payloads=include_payloads
+        )
+        assert not truncated and len(pairs) == 1
+        assert pairs[0].pending_tool_calls[0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert real not in json.dumps(pairs[0].pending_tool_calls)
         with pytest.raises(RunNotFoundError):
             await run_store.get_event_view(run_id, raw_pause, tenant_id="other")
 
@@ -387,6 +407,14 @@ async def test_pause_display_uses_recorded_args_on_every_path(
         )
         call = view.data["pending_tool_calls"][0]
         assert call["params"] == expected
+        pairs, truncated = await run_store.get_pause_page(
+            "display", tenant_id="T", include_payloads=payloads
+        )
+        assert not truncated and len(pairs) == 2
+        assert pairs[-1].resume_sequence_index is None
+        pair_call = pairs[-1].pending_tool_calls[0]
+        assert pair_call["params"] == expected
+        assert pair_call.get("args_hidden", False) == (expected is None)
         if expected is None:
             assert call["args_hidden"] is True
         async with run_store.follow(
@@ -409,6 +437,9 @@ async def test_pause_page_pairs_at_boundary_and_reports_truncation(
     assert [p.resume_sequence_index for p in items] == [1, 3]
     items, truncated = await run_store.get_pause_page("pages", limit=5)
     assert len(items) == 5 and not truncated
+    for invalid_limit in (0, 1001):
+        with pytest.raises(ValueError, match="limit"):
+            await run_store.get_pause_page("pages", tenant_id=None, limit=invalid_limit)
 
 
 async def test_delegation_traversal_bounds_and_projection(store: Any, engine: Any) -> None:

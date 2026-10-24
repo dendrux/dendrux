@@ -69,7 +69,7 @@ async def main() -> None:
 
     (work_dir / "project-ideas.txt").write_text(
         "Ideas for Q3:\n"
-        "1. Build a customer metrics UI with real-time metrics\n"
+        "1. Build a customer dashboard with real-time metrics\n"
         "2. Automate the onboarding flow with agent workflows\n"
         "3. Add multi-language support for the API docs\n"
         "4. Explore partnership with Acme Corp for distribution\n"

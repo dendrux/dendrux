@@ -185,7 +185,64 @@ async def test_live_recipe_bounds_network_send_and_releases_follower(stall_heade
         follow=SimpleNamespace(aclose=close),
         deadline=asyncio.get_running_loop().time() + 0.02,
     )
-    with pytest.raises(TimeoutError):
-        async with asyncio.timeout(1):
-            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, None, send)
+    async with asyncio.timeout(1):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, None, send)
     assert closed == [True]
+
+
+@pytest.mark.parametrize("outcome", ["drained", "missing", "capacity", "invalid_cursor"])
+async def test_live_recipe_validates_cursor_and_closes_on_startup_outcomes(outcome):
+    from fastapi import FastAPI
+
+    from dendrux.errors import RunNotFoundError
+    from dendrux.store import FollowCapacityError
+
+    app = FastAPI()
+    calls = []
+    closed = []
+
+    async def owned_run(run_id: str):
+        return run_id
+
+    async def current_tenant():
+        return "T"
+
+    async def start():
+        if outcome == "missing":
+            raise RunNotFoundError("r")
+        if outcome == "capacity":
+            raise FollowCapacityError(500)
+
+    async def close():
+        closed.append(True)
+
+    def follow(run_id, **kwargs):
+        calls.append((run_id, kwargs))
+        return SimpleNamespace(start=start, aclose=close, drained_terminal=True)
+
+    path = REPO / "docs/recipes/build-your-own-read-routes.mdx"
+    snippets = re.findall(r"```python\n(.*?)```", path.read_text(), re.S)
+    snippet = next(code for code in snippets if "class LiveResponse" in code)
+    namespace = {
+        "app": app,
+        "store": SimpleNamespace(follow=follow),
+        "owned_run": owned_run,
+        "current_tenant": current_tenant,
+    }
+    exec(compile(snippet, str(path), "exec"), namespace)
+    headers = {"Last-Event-ID": "invalid" if outcome == "invalid_cursor" else "7"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://demo") as client:
+        response = await client.get("/runs/r/live", headers=headers)
+    assert (
+        response.status_code
+        == {"drained": 204, "missing": 404, "capacity": 503, "invalid_cursor": 400}[outcome]
+    )
+    if outcome == "invalid_cursor":
+        assert calls == [] and closed == []
+    else:
+        assert closed == [True]
+        assert calls[0][0] == "r"
+        assert calls[0][1]["tenant_id"] == "T"
+        assert calls[0][1]["after_sequence_index"] == 7
+    if outcome == "capacity":
+        assert response.headers["Retry-After"] == "5"

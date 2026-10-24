@@ -13,11 +13,11 @@ A minimal application uses these routes (names are your choice):
 
 | App route | Python method |
 | --- | --- |
-| POST /chat | Agent.run(input, tenant_id=tenant) |
-| POST /runs/{id}/tool-results | Agent.submit_tool_results(id, results, tenant_id=tenant) |
-| POST /runs/{id}/approvals | Agent.submit_approval(id, approved=decision, tenant_id=tenant) |
-| GET /runs/{id}/pending | RunStore.get_pending(id, tenant_id=tenant) |
-| Optional GET /runs/{id}/live | RunStore.follow(id, tenant_id=tenant) |
+| `POST /chat` | `Agent.run(input, tenant_id=tenant)` |
+| `POST /runs/{id}/tool-results` | `Agent.submit_tool_results(id, results, tenant_id=tenant)` |
+| `POST /runs/{id}/approvals` | `Agent.submit_approval(id, approved=decision, tenant_id=tenant)` |
+| `GET /runs/{id}/pending` | `RunStore.get_pending(id, tenant_id=tenant)` |
+| Optional `GET /runs/{id}/live` | `RunStore.follow(id, tenant_id=tenant)` |
 
 See [Client tools](/docs/recipes/client-tools) and the runnable examples
 `03_client_tools` and `17_full_stack_app` for start, submit and pending routes.
@@ -96,7 +96,7 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 | `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
 
-[//]: # "VERIFY-0.5.0: payload shapes for guardrail.blocked findings, guardrail.restore_skipped, governance.changed and run.error error_info are inferred from the spec (counts and kinds only); T3 and T7 own the exact field names"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and `budget.exceeded` at most once per metric. Every pause persists the fired set, so resumed runs do not re-fire.
 
@@ -185,7 +185,7 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | --- | --- | --- | --- |
 | `RunNotFoundError` | `LookupError` | 404 | `run_id` does not exist, or is outside the `tenant_id` you passed. One class for `Agent`, `RunStore` and `retry`; the same error for a foreign run as for a missing one. |
 | `RunNotPausedError` | `RuntimeError` | 409 | Run is not in any paused state. |
-| `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused, but for a different reason than this method expects, or (with `expected_pause_id=`) it paused again since your client saw it: `err.reason` is `"status"` or `"pause_id"`. |
+| `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused for a different kind of signal than this method expects. |
 | `RunAlreadyClaimedError` | `RuntimeError` | 409 | Concurrent submit won the CAS. Poll for completion; do not retry the submit. |
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids). No partial claim. |

@@ -16,11 +16,11 @@ Every run emits a stream of events, and every event lands in the `run_events` ta
 
 The only guarantee readers need is the first one: **within a run, `sequence_index` is strictly monotonic**. Order events by it and you get the exact order the runtime observed them.
 
-**How the number is allocated.** Since 0.5.0 the database assigns it in the same statement that inserts the event (`INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1`), and the store returns it. There is no counter in your process, so several workers writing to one run (a resume in another process, for example) cannot interleave to reuse a number. A custom `StateStore` must do the same; see [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0#13-custom-statestore-allocate-the-event-index-in-the-insert).
+**How the number is allocated.** Since 0.5.0 the database assigns it in the same statement that inserts the event (`INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1`), and the store returns it. There is no counter in your process, so several workers writing to one run (a resume in another process, for example) cannot interleave to reuse a number. A custom `StateStore` must do the same; see [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0#10-custom-statestore-allocate-the-event-index-in-the-insert).
 
 A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every worker is on 0.5.0 or later. Until then, a fleet that mixes 0.4.1 and 0.5 workers can in rare races write one duplicate index, and an SSE cursor can miss that one event. That window closes with the 0.5.1 index.
 
-[//]: # "VERIFY-0.5.0: T1 implements the allocation; confirm the statement shape and that the return value reaches the recorder"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## A real event timeline
 

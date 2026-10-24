@@ -37,7 +37,9 @@ async def inspect_run(database_url, run_id, tenant):
         return detail.status
 ```
 
-Page events using `after_sequence_index` and an explicit row limit. Treat a full
+Page events using `after_sequence_index` and an explicit row limit. Each
+`get_event_view` call queries run status and may also read active-pause context;
+keep inspection pages small because this adds at least one query per event. Treat a full
 page as potentially incomplete; retain the cursor. `get_pause_page` returns an
 explicit truncation flag. Build any historical join of events, traces, tools and
 usage in your app, with row/byte/time bounds and visible truncation. A pending pause

@@ -177,7 +177,7 @@ A pure completion-only surface looks tidy but breaks down under three real condi
 
 1. **Provider exceptions never reach completion.** `provider.complete()` can raise — network blip, rate limit, malformed schema. With only `on_llm_call_completed`, the notifier never hears about that call. With `on_llm_call_started` and `on_llm_call_failed`, the notifier opens a span on start, marks it errored on failure, and the trace tells the truth.
 2. **Span timing is wrong without start.** OpenTelemetry and similar tracers want a real start time, not "completion minus duration." The lifecycle pair gives them one.
-3. **Some observers care about prefetch state.** A operator UI that highlights "LLM call in progress" needs to know the call started before it ends.
+3. **Some observers care about prefetch state.** An inspection tool that highlights "LLM call in progress" needs to know the call started before it ends.
 
 The same logic applies to runs (`on_run_started` / `on_run_finished` / `on_run_failed`) and to tools (`on_tool_started` / `on_tool_completed`). Tool failures take a slightly different shape — the loop catches them and emits `on_tool_completed` with `ToolResult(success=False)` — because the loop already wraps every dispatch in error handling and there is nothing the notifier could do that the loop has not already done. LLM failures, by contrast, propagate, so the notifier needs an explicit failed hook.
 

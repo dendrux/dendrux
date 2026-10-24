@@ -6,7 +6,6 @@ Covers:
   mcp.connected after run.started inside the try block
 - MCP discovery failure → mcp.error + run error cleanup
 - Console notifier rendering of all 4 new event types
-- Normalizer mapping for all 4 new event types
 - SingleCall + tool_sources runtime validation
 """
 
@@ -560,11 +559,6 @@ class TestConsoleNotifierInitEvents:
         )
         captured = capsys.readouterr()
         assert "Connection refused" in captured.out
-
-
-# ------------------------------------------------------------------
-# Normalizer mapping
-# ------------------------------------------------------------------
 
 
 # ------------------------------------------------------------------

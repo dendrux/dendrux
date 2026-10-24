@@ -49,11 +49,11 @@ and can contain real personal data. Approval and input calls use model-sent argu
 (PII placeholders when applicable). If `args_hidden=True`, stop and request resolution
 on the server; never replace unavailable args with `{}` or approve blind.
 
-Use the matching Agent submit method for each kind. A client should bind a submit to
-a non-null pause ID, and re-fetch pending after a conflict before asking the actor
-again. Integration gap: the current wave-1 Agent API lacks `expected_pause_id`; the
-run-integrity track must add the atomic check before multi-tab approval or automatic
-submit retries are safe. An application-side read/check alone cannot close that race.
+Use the matching Agent submit method for each kind. Re-fetch pending after a
+conflict before asking the actor again. A read/check alone cannot guarantee that
+a delayed decision still targets the pause that actor saw.
+
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 ## Optional live feed over SSE
 
@@ -90,6 +90,8 @@ class LiveResponse(StreamingResponse):
         try:
             async with asyncio.timeout_at(self.deadline):
                 await super().__call__(scope, receive, send)
+        except TimeoutError:
+            pass  # The transport deadline ends the response without an error traceback.
         finally:
             await self.follow.aclose()
 
@@ -160,8 +162,13 @@ views = [await store.get_event_view(run_id, event, tenant_id=tenant)
          for event in events]
 ```
 
+Each `get_event_view` call queries run status and can also read active-pause context.
+The loop above therefore performs at least one additional query per event; use a
+small page for inspection and `follow` for live delivery.
+
 Page with the last sequence index. Use `get_event_view` for contextual approval
-arguments; it verifies the event belongs to the scoped run. Standalone `redact_event`
+arguments; it verifies the run is in scope. Pass only events read from that same
+run: StoredEvent has no run ID to validate their association. Standalone `redact_event`
 has no database context and hides unverified active approval/input args. `follow`
 already applies the contextual projection. Even the default view intentionally
 contains actionable client-tool params: authorize the actor before exposing it.

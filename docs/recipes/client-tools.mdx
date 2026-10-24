@@ -177,10 +177,7 @@ async def tool_results(body: ResultsIn, run_id: str = Depends(owned_run),
 
 Add a `DELETE /runs/{run_id}` route over `agent.cancel_run(run_id, tenant_id=tenant)` the same way.
 
-Integration gap: this branch's Agent submit methods do not yet accept
-`expected_pause_id`, so the route above cannot guarantee atomic stale-pause rejection.
-Require a non-null pause ID and pass it to the atomic submit check when T7 lands;
-on 409 re-fetch pending and ask the actor again instead of retrying an old approval.
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 Keep result metadata, traces, provider bodies, arbitrary output and PII mappings
 out of browser responses. The answer in this allowlist is intended for the authenticated
@@ -268,7 +265,6 @@ If you want progress in the UI while the model works, add a route over `RunStore
 - **Persistence is required.** Client tools rely on the run being safely pausable across requests, processes, and crashes. No DB means no client tools.
 - **Whole batch pauses.** If the LLM emits four tool calls and any one is a client tool, the batch waits. Server tools that ran before the pause are still recorded and their results are kept; the rest of the batch sits in `pause_data` until the client returns.
 - **Submit must cover every pending call.** `submit_tool_results` raises `InvalidToolResultError` on missing or unknown ids. No partial claim. Decide what to do with a call you cannot fulfill before submitting.
-- **Send the `pause_id` back.** Pass it as `expected_pause_id=` so a stale tab cannot answer a newer pause (`PauseStatusMismatchError`, 409). Optional in 0.5, required in 0.6.
 - **Cancel works at any time.** `agent.cancel_run(run_id, tenant_id=tenant)` on a `waiting_client_tool` run finalizes it as `CANCELLED` atomically. A client following the log sees `run.cancelled` and the `end` frame.
 - **`get_pauses` is the history view.** `RunStore.get_pauses(run_id)` lists past and current pauses for an inspector; use `get_pending` to act on the current one.
 

@@ -82,7 +82,7 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 - Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `FutureWarning` when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
 - It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
 
-[//]: # "VERIFY-0.5.0: T1 fills in resolve_tenant; confirm the delegated-child inheritance and the FutureWarning text when strict_tenancy is not chosen"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ### Metadata
 
@@ -118,6 +118,6 @@ Dendrux 0.5 does not ship a tenant erasure API; it is the first priority for 0.6
 
 ## Where this fits
 
-- [Build your own read routes](/docs/recipes/build-your-own-read-routes): the resolver and `include_payloads`.
+- [Build your own read routes](/docs/recipes/build-your-own-read-routes): tenant scope, ownership checks and event projection.
 - [RunStore](/docs/reference/run-store): the read methods and their scope.
 - [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).

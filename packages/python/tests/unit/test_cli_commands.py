@@ -65,6 +65,51 @@ class TestVersionAndHelp:
         assert result.output.startswith("dendrux ")
 
 
+class TestNoSecretsInTracebacks:
+    def test_root_app_never_shows_locals(self) -> None:
+        from dendrux.cli.runs import app as runs_app
+
+        assert app.pretty_exceptions_show_locals is False
+        assert runs_app.pretty_exceptions_show_locals is False
+
+    @pytest.mark.parametrize("show_locals", [False, True], ids=["default", "control"])
+    def test_escaped_runs_exception_hides_database_url_locals(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+        show_locals: bool,
+    ) -> None:
+        import os
+        import sys
+
+        from dendrux.cli import runs
+
+        url = f"postgresql+asyncpg://user:{PASSWORD}@db.example/app"
+        monkeypatch.setenv("DENDRUX_DATABASE_URL", url)
+
+        async def boom(*_args: Any, **_kwargs: Any) -> None:
+            database_url = os.environ["DENDRUX_DATABASE_URL"]
+            assert database_url
+            raise ValueError("command failed")
+
+        monkeypatch.setattr(runs, "_list_runs", boom)
+        monkeypatch.setattr(sys, "argv", ["dendrux", "runs"])
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+        if show_locals:
+            monkeypatch.setattr(app, "pretty_exceptions_show_locals", True)
+            monkeypatch.setattr(runs.app, "pretty_exceptions_show_locals", True)
+        try:
+            app()
+        except ValueError:
+            sys.excepthook(*sys.exc_info())
+        else:
+            pytest.fail("expected an escaped command exception")
+        captured = capfd.readouterr()
+        output = captured.out + captured.err
+        assert "command failed" in output
+        assert (PASSWORD in output) is show_locals
+
+
 class TestRunsCommand:
     def test_lists_all_tenants_when_no_filter(self, seeded_db: str) -> None:
         out = _plain(runner.invoke(app, ["runs"], terminal_width=200).output)

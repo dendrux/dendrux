@@ -48,11 +48,6 @@ class ToolResultsIn(BaseModel):
     results: list[ToolResultItem] = Field(min_length=1, max_length=100)
 
 
-class ApprovalIn(BaseModel):
-    approved: bool
-    rejection_reason: str | None = Field(default=None, max_length=2000)
-
-
 def browser_result(result: Any) -> dict[str, Any]:
     """Allowlist the response; answer is intended for this authenticated actor."""
     return {"run_id": result.run_id, "status": result.status.value, "answer": result.answer}
@@ -186,8 +181,7 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        # TODO: pass expected_pause_id when the run-integrity contract lands.
-        # Current Agent has no such argument; this demo has no stale-submit guarantee.
+        # VERIFY-0.5.0: Confirm expected_pause_id support before adding pause-ID validation.
         result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
         return browser_result(result)
 

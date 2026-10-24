@@ -43,8 +43,4 @@ to your application DB to survive server restarts. Persist an app request ID bef
 starting work; a request timeout before the first response may lose the run ID and
 cancellation may cancel the run. Own any background execution and recovery lifecycle.
 
-TODO integration: this branch's Agent does not yet accept `expected_pause_id`.
-There is no atomic stale-pause guarantee in this demo. Gate multi-tab approval and
-automatic retries on the run-integrity track; once it lands, require a non-null
-pause ID, pass it to the atomic submit check, and on conflict re-fetch pending and
-ask the actor again. Do not infer a safe decision from an old form.
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."

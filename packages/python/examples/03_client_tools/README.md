@@ -20,12 +20,11 @@ The token represents one actor who owns the dedicated `demo-user` tenant.
 | --- | --- |
 | POST /chat | Agent.run(..., tenant_id=...) |
 | POST /runs/{id}/tool-results | Agent.submit_tool_results(..., tenant_id=...) |
-
 | GET /runs/{id}/pending | RunStore.get_pending(..., tenant_id=...) |
 
 The start and submit requests wait until a pause or terminal result. The client
 then fetches pending state to rebuild forms. It sends call IDs and names with
-tool results and stops if approval arguments have `args_hidden=True`. Only
+tool results. Only
 `run_id`, `status` and the answer intended for this actor leave the result DTO;
 metadata, traces, provider bodies, arbitrary output and PII mappings stay server-side.
 Client-tool params may contain real personal data. Tool outputs are client assertions.
@@ -37,14 +36,10 @@ transport needs its own send deadline and `finally: await follow.aclose()`.
 Do not stream `agent.stream()` directly to a browser: a disconnect cancels it.
 
 Before production, implement real identity, user-level run ownership within each
-tenant, approval-role authorization, app audit records, rate limits and request
+tenant, app audit records, rate limits and request
 budgets. UI callbacks are UX only. The in-memory run/provider association must move
 to your application DB to survive server restarts. Persist an app request ID before
 starting work; a request timeout before the first response may lose the run ID and
 cancellation may cancel the run. Own any background execution and recovery lifecycle.
 
-TODO integration: this branch's Agent does not yet accept `expected_pause_id`.
-There is no atomic stale-pause guarantee in this demo. Gate multi-tab approval and
-automatic retries on the run-integrity track; once it lands, require a non-null
-pause ID, pass it to the atomic submit check, and on conflict re-fetch pending and
-ask the actor again. Do not infer a safe decision from an old form.
+[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."

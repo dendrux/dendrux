@@ -40,9 +40,7 @@ async function pending() {
   el("calls").textContent = JSON.stringify(currentPause, null, 2);
   const hidden = (currentPause.pending_tool_calls || []).some(call => call.args_hidden);
   el("submit").hidden = currentPause.kind !== "client_tool";
-  for (const id of ["approve", "reject"]) {
-    if (el(id)) el(id).hidden = currentPause.kind !== "approval" || hidden;
-  }
+
   if (hidden) el("status").textContent = "Arguments unavailable. Request server-side resolution.";
 }
 async function showResult(data) {

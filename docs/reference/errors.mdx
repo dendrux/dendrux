@@ -32,7 +32,7 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 | --- | --- | --- | --- |
 | `RunNotFoundError(run_id)` | `LookupError` | `run_id` does not exist, or belongs to a tenant other than the one you passed. The same error for both, from `Agent`, `retry` and `RunStore` alike (`dendrux.store.RunNotFoundError` is an alias of this class). | 404 |
 | `RunNotPausedError(run_id, current_status)` | `RuntimeError` | A submit method is called on a run that is not paused. | 409 |
-| `PauseStatusMismatchError(run_id, current_status, expected_status, *, expected_pause_id=, current_pause_id=, reason=)` | `RuntimeError` | Submit called for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`), or with an `expected_pause_id=` that is no longer the run's current pause (`reason="pause_id"`, a stale submit). `reason` is `"status"` otherwise. | 409 |
+| `PauseStatusMismatchError(run_id, current_status, expected_status)` | `RuntimeError` | Submit called for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). | 409 |
 | `RunAlreadyClaimedError(run_id)` | `RuntimeError` | A concurrent submit already won the CAS claim on this pause. | 409 |
 | `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method, or `submit_note`, targets a run that is already terminal; also a submit on a run whose cancellation was requested but not yet observed. (`cancel_run` and `request_pause` do not raise this.) | 409 |
 | `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set (unknown or duplicate ids). | 400 |
@@ -109,7 +109,7 @@ Every failed LLM request raises a `ProviderError` subclass (inside a run it ends
 
 `safe_message` is a fixed template (`"{provider} {category} (HTTP {status}, code {provider_code})"`) that never contains vendor text, and is what `RunResult.error`, `agent_runs.error` and the `run.error` event carry. The vendor's own text lives only in debug traces and stored provider evidence, excluded from default contextual event views; raw store evidence remains operator-only. Image-path errors keep their sanitised `message`. The recipe is [Handling provider errors](/docs/recipes/handling-provider-errors).
 
-[//]: # "VERIFY-0.5.0: the provider taxonomy is T0's contract (errors.py) plus T2's behaviour; recheck the retryable defaults and the category for credits and rejected once T2 lands"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## MCP errors
 

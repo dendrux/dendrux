@@ -159,8 +159,7 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        # TODO: pass expected_pause_id when the run-integrity contract lands.
-        # Current Agent has no such argument; this demo has no stale-submit guarantee.
+        # VERIFY-0.5.0: Confirm expected_pause_id support before adding pause-ID validation.
         result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
         return browser_result(result)
 
@@ -178,7 +177,7 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             raise HTTPException(409, "not waiting for approval")
         if any(call.args_hidden for call in pause.tool_calls):
             raise HTTPException(409, "approval arguments unavailable; resolve on the server")
-        # TODO: atomic expected_pause_id validation belongs to the pending T7 contract.
+        # VERIFY-0.5.0: Confirm expected_pause_id support before adding pause-ID validation.
         result = await agents[provider].submit_approval(
             run_id,
             approved=body.approved,

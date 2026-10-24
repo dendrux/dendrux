@@ -11,25 +11,14 @@ The short answer: **Dendrux owns run state and the audit trail. You own everythi
 
 ## The two databases
 
-```mermaid
-flowchart LR
-    subgraph App["Your app database (you own this)"]
-        users["users"]
-        chats["chats"]
-        messages["messages"]
-        links["dendrux_run_id · column or link table"]
-    end
-    subgraph Dx["Dendrux database (Dendrux owns this)"]
-        runs[("agent_runs")]
-        traces["react_traces"]
-        tools["tool_calls"]
-        llm["llm_interactions"]
-        events["run_events"]
-    end
-    messages --- links
-    links -. "run_id + metadata.thread_id" .-> runs
+| Database | Owner | Records |
+| --- | --- | --- |
+| Product database | Your application | Users, chats, messages, and a run-ID column or link table |
+| Dendrux database | Dendrux | Runs, traces, tool invocations, LLM interactions and events |
 
-```
+Link each product message to its run with `dendrux_run_id`; use
+`metadata.thread_id` to associate related runs.
+
 
 Your tables hold product truth: who the user is, which conversations exist, what each message says, what the UI renders. Dendrux's [six tables](/docs/architecture/state-persistence) hold execution truth: every LLM call, every tool invocation, the ordered event log, and the pause state needed to resume. The two meet at a single point: the **run ID** that your turn records (a column on the message or a row in a link table), plus the `metadata.thread_id` you stamp on every run.
 

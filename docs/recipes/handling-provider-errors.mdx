@@ -71,7 +71,7 @@ except ProviderError as err:
 
 `ErrorInfo` has `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. It is also stored with the run (`RunDetail.error_info`), put on the `run.error` event, and `RunResult.error`, `agent_runs.error` and `RunDetail.error` now hold the `safe_message`.
 
-[//]: # "VERIFY-0.5.0: the run wiring of error_info (run.error payload, RunResult.error from safe_message, RunDetail.error_info) is T7 wave 2; AGT-209 item 5 is written at release. Recheck every sentence in this paragraph"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Should I retry?
 
@@ -107,7 +107,7 @@ When a deadline fires the call is abandoned and not retried again, and you get `
 
 The old `timeout=` argument still works as a shorthand that sets both `call_timeout` and `stream_idle_timeout`, and prints a `DeprecationWarning`.
 
-[//]: # "VERIFY-0.5.0: T2 owns providers; confirm the kwarg names, defaults, the DeprecationWarning for timeout=, and the 30 second margin wording"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Mapping to HTTP
 

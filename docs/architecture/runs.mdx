@@ -63,9 +63,9 @@ The runtime checks the pause type before accepting a submission. Submitting an a
 
 A run is more than its status. Three things about it are persisted.
 
-**Steps** are the chronological record of what happened: each LLM turn, each tool call, each pause and resume. When you load a run from the database, you get its full step history. This is what powers the operator UI's run-detail view, and it's what gets shipped to the LLM as conversation context on every iteration.
+**Steps** are the chronological record of what happened: each LLM turn, each tool call, each pause and resume. When you load a run from the database, you get its full step history. This can power app-owned run inspection tools, and it's what gets shipped to the LLM as conversation context on every iteration.
 
-**Events** are atomic moments emitted as the run progresses: `run.started`, `llm.completed`, `tool.completed`, `run.paused`, `run.resumed`, `run.completed`. Each event has a monotonic `sequence_index` so SSE clients can reconnect and ask "give me everything after sequence 47" without losing or duplicating events. Events drive the live operator UI and any custom UI you build.
+**Events** are atomic moments emitted as the run progresses: `run.started`, `llm.completed`, `tool.completed`, `run.paused`, `run.resumed`, `run.completed`. Each event has a monotonic `sequence_index` so SSE clients can reconnect and ask "give me everything after sequence 47" without losing or duplicating events. Events can drive inspection tools and custom interfaces you build.
 
 **Pause data** is the small payload attached to a run when it pauses. (A `paused` run has none outstanding: its pending call list is empty, and resume simply continues the loop.) For `waiting_client_tool` it's the list of pending tool calls the LLM made. For `waiting_human_input` it's the question being shown to the human. For `waiting_approval` it's the action the agent wants to take. Pause data is what your write endpoint reads to know what to render to the user.
 
@@ -152,7 +152,7 @@ Where else to read it:
 
 A failed LLM request ends the run `error`. Since 0.5.0 the cause is a typed `ProviderError` (rate limit, timeout, refusal, empty stream and so on) summarised as `RunResult.error_info` and `RunDetail.error_info`, and `RunResult.error` is a fixed safe message, never the vendor's text. A run no longer ends `success` with an empty answer when the provider returned nothing. See [Handling provider errors](/docs/recipes/handling-provider-errors).
 
-[//]: # "VERIFY-0.5.0: the run-level wiring of error_info and the safe error message is T7 wave 2; recheck this section after it merges"
+[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Verified end-to-end
 
