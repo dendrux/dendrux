@@ -141,6 +141,8 @@ Three things that make this robust in practice:
 2. **Tolerant of model corruption.** If the LLM hallucinates a placeholder that does not exist in the mapping (e.g. `<<EMAIL_ADDRESS_42>>` when only `<<EMAIL_ADDRESS_1>>` was ever minted), the string passes through unchanged. The loop emits a warning rather than crashing.
 3. **Non-mutating.** Returns a new dict. Nothing the tool does to its params dict back-contaminates the LLM's view of the conversation.
 
+**Which tools get real values.** By default (`PII(restore="all")`, the behaviour of every earlier release) any tool can receive a restored value. If your agent reads content you do not control, use `PII(restore="allowlisted")` and mark the tools that may handle real values with `@tool(receives_pii=...)`; every other tool receives the placeholder text. See [PII restore](/docs/architecture/pii-restore) for the trade-off, the recommendation and how validation errors avoid echoing values.
+
 The tool runs with the real values. The tool result goes into the DB raw, via `on_message_appended` and `on_tool_completed`. The next iteration's `scan_incoming` walks the full history and re-applies placeholders for the LLM — so the DB keeps ground truth while the provider API keeps seeing placeholders.
 
 ## Deanonymization: the user-facing answer

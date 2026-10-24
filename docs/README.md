@@ -9,36 +9,36 @@ The site (a separate Next.js app) pulls these files in at build time. Editing an
 ```
 docs/
 ├── overview.mdx            → /docs
+├── is-dendrux-for-you.mdx  → /docs/is-dendrux-for-you
 ├── quickstart.mdx          → /docs/quickstart
+├── upgrading-to-0.5.0.mdx  → /docs/upgrading-to-0.5.0
 ├── architecture/           → /docs/architecture/*
-│   ├── runs.mdx
-│   ├── state-persistence.mdx
-│   ├── event-ordering.mdx
-│   ├── pause-resume.mdx
-│   ├── cancellation.mdx
-│   ├── inbox.mdx
-│   ├── budget.mdx
-│   ├── tool-policy.mdx
-│   ├── governance.mdx
-│   ├── pii-redaction.mdx
-│   ├── access-control.mdx
-│   ├── guardrails.mdx
-│   ├── approval.mdx
-│   ├── notifier.mdx
-│   ├── recorder.mdx
-│   ├── loops.mdx
-│   └── pricing.mdx
+│   ├── runs.mdx, state-persistence.mdx, event-ordering.mdx
+│   ├── pause-resume.mdx, cancellation.mdx, inbox.mdx
+│   ├── multi-tenancy.mdx
+│   ├── governance.mdx, access-control.mdx, tool-policy.mdx, approval.mdx
+│   ├── guardrails.mdx, pii-redaction.mdx, pii-restore.mdx
+│   ├── budget.mdx, pricing.mdx
+│   ├── loops.mdx, models.mdx, reasoning.mdx, prompt-cache.mdx
+│   ├── mcp.mdx, skills.mdx
+│   └── notifier.mdx, recorder.mdx
 ├── recipes/                → /docs/recipes/*
 └── reference/              → /docs/reference/*
 ```
 
+Adding a page here does not add it to the site's sidebar. The navigation is hand-curated in the docs site repo (`lib/docs-nav.ts`); add the entry there in the same change.
+
 ## Editing rules
 
 - Each `.mdx` file starts with frontmatter (`title`, `description`).
-- Use plain Markdown wherever possible. JSX components are available for callouts, diagrams, and tabs — see existing pages for examples.
+- **Plain Markdown only.** The docs site provides no custom components: no `<Callout>`, no JSX tags, no `{...}` expressions in prose. A single unknown component fails the whole site deploy. For a note, use a blockquote with a bold lead: `> **Note.** text`. Anything with `<` or `{` that is not code goes in backticks or a fenced block.
+- No HTML comments (`<!-- -->`): MDX rejects them. To leave an invisible reviewer note, use a Markdown reference definition on its own line, with the text in double quotes: `[//]: # "note text"` (no double quotes or backslashes inside; parentheses in parentheses-delimited titles break the build). Notes that start `VERIFY-0.5.0:` mark text that depends on code not yet verified; remove them once it is.
 - Code blocks use triple backticks with a language tag (` ```python`, ` ```bash`). Shiki highlights them at build time.
 - One H1 per page (the title). Use H2/H3 for sections.
+- Do not name or compare with other agent frameworks.
+- Describe the secure behaviour a release ships, not the weakness it replaced.
+- Verify before you push: build the site against this directory (`DENDRUX_DOCS_PATH=<this dir> npm run build` in the docs site repo).
 
 ## When you change a public API
 
-If you rename, add, or remove anything in `dendrux/__init__.py`, update the corresponding page in `docs/reference/` in the same PR. Reviewers will check.
+If you rename, add, or remove anything in `dendrux/__init__.py`, update the corresponding page in `docs/reference/` (and the [API glossary](reference/api-glossary.mdx)) in the same PR. Reviewers will check.

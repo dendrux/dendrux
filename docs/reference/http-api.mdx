@@ -23,12 +23,25 @@ async def authorize(request: Request) -> None:
     if token != f"Bearer {EXPECTED_TOKEN}":
         raise HTTPException(status_code=401, detail="unauthorized")
 
+async def tenant_resolver(request: Request) -> str:
+    return request.state.tenant_id
+
 store = RunStore.from_database_url("postgresql+asyncpg://...")
-router = make_read_router(store=store, authorize=authorize)
+router = make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver)
 app.include_router(router, prefix="/dendrux")
 ```
 
 `authorize` runs on every route except `/health`. Raise `HTTPException` inside to deny; return any value (ignored) to allow. The factory does not interpret your return value or impose an auth shape.
+
+`tenant_resolver` is required and also runs on every route except `/health`. It returns the caller's scope: a non-empty `str` (that tenant), `None` (untenanted runs only) or `UNSCOPED` (every tenant). A single-tenant app passes `tenant_resolver=UNSCOPED` (`from dendrux import UNSCOPED`). A run outside the scope gets the same 404 as a missing run. See [make_read_router](/docs/reference/read-router) and [Multi-tenancy](/docs/architecture/multi-tenancy).
+
+> **This router is frozen in 0.5.** It gets no new features and no deprecation warning. The recommended way to serve reads is your own routes over `RunStore.get_pending` and `RunStore.follow`; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+Other options: `include_payloads=False` (default) hides raw payloads, `sse_max_connections=500` and `sse_max_duration_s=900` bound the SSE endpoint.
+
+### Payloads hidden by default
+
+With `include_payloads=False`, responses from `/runs/*`, `/events`, SSE and `/pauses` leave out: the provider request and response, raw trace content, raw tool parameters and results, the system prompt in `run.started`, the arguments of past pauses and the PII mapping. The **active pause's** arguments stay visible by default (pending client-tool calls, approval and input requests), in `run.paused`, `/pauses` and `RunStore.get_pending`. Everything below describes the shapes with `include_payloads=True`; with the default, those fields are absent.
 
 ## Read endpoints
 
@@ -51,13 +64,13 @@ Query parameters:
 | `status` | `list[str]` (repeatable) | all | Filter by `RunStatus` values. Repeat for OR: `?status=running&status=waiting_approval`. |
 | `agent_name` | `str` | all | Exact-match agent name. |
 | `parent_run_id` | `str` | all | Return only child runs of this parent. |
-| `tenant_id` | `str` | all | Multi-tenant isolation filter. |
-| `started_after` | ISO-8601 datetime | none | Inclusive lower bound on `created_at`. |
-| `started_before` | ISO-8601 datetime | none | Exclusive upper bound on `created_at`. |
+| `tenant_id` | `str` | caller's scope | Narrows the list. Honoured only when the tenant resolver returned `UNSCOPED`; ignored for a scoped caller. |
+| `started_after` | RFC 3339 datetime | none | Inclusive lower bound on `created_at`. Needs a timezone (a naive datetime is a 422); normalised to UTC. |
+| `started_before` | RFC 3339 datetime | none | Exclusive upper bound on `created_at`. Same rules. |
 | `limit` | `int` 1-1000 | 50 | Page size. |
-| `offset` | `int` >= 0 | 0 | Rows to skip. |
+| `offset` | `int` 0-10000 | 0 | Rows to skip. Over 10,000 is a 422. |
 
-Response:
+Response (each item also carries `tenant_id`):
 
 ```json
 {
@@ -87,9 +100,9 @@ Response:
 
 ### `GET /runs/{run_id}`
 
-Single run detail. Returns the same summary fields plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (true while a cancel has been requested but the run has not yet reached a terminal status).
+Single run detail. Returns the same summary fields plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (true while a cancel has been requested but the run has not yet reached a terminal status), `tenant_id` and `error_info` (the typed provider failure that ended the run, or `null`).
 
-Errors: `404` if not found.
+Errors: `404` if not found or outside the caller's scope (the same body for both).
 
 ### `GET /runs/{run_id}/events`
 
@@ -124,7 +137,7 @@ Empty-batch rule: `next_cursor` echoes your input `after` when the page is empty
 
 ### `GET /runs/{run_id}/events/stream`
 
-Server-Sent Events. Reads from `run_events` in a per-connection polling loop. No shared queue, no fan-out manager. Each connection is an independent async iterator.
+Server-Sent Events. Reads from `run_events` by polling. Connections watching the same run in one process share one polling query and fan out in process (at most one poller per run, torn down when its last client leaves), so database load follows the number of watched runs, not the number of open connections.
 
 Cursor resolution (first match wins):
 
@@ -155,9 +168,13 @@ Every frame uses `event: message`. The dendrux event type lives inside the JSON 
 
 Heartbeat: `: keepalive\n\n` every 15s of idleness. Prevents nginx (default 60s `proxy_read_timeout`) from closing the connection.
 
-Poll cadence: 0.5s per connection when idle. That is ~2 DB queries per second per open SSE connection. Size your connection pool accordingly until Postgres `LISTEN/NOTIFY` ships.
+Poll cadence: 0.5s when events are flowing, backing off to 2s when idle, one query per watched run. Budget about one query per second per watched run, and consider a separate small engine for the router when you serve many viewers. Postgres `LISTEN/NOTIFY` push is planned for 0.6.
 
-Termination: the stream stays open until the client disconnects. Terminal events (`run.completed`, `run.error`, `run.cancelled`) arrive as normal frames; the client decides when to close. If the client drops, the generator ends on the next `asyncio.sleep` and the connection releases.
+Limits: at most `sse_max_connections` (default 500) concurrent connections per router, which is per process; the next connection gets `503`. A connection lasts at most `sse_max_duration_s` (default 900) and then closes so the client reconnects with its cursor. The tenant resolver and `authorize` run again on every reconnect.
+
+Termination: when the run status is terminal and every event has been sent, the server writes an `event: end` frame (its data is `{"reason", "cursor"}`) and closes. Reconnecting to a finished, drained run returns `204` with no body. Add `?follow=true` to keep the stream open after the run finishes (the 0.4 behaviour). If the client drops, the generator ends on the next sleep and the connection releases.
+
+[//]: # "VERIFY-0.5.0: T1 owns SSE; confirm the end frame, 204, follow=true, 503 and the poll backoff numbers"
 
 Reconnect pattern from a browser:
 
@@ -181,10 +198,10 @@ Query parameters:
 | Name | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `iteration` | `int` | all | Filter to one iteration index. |
-| `limit` | `int` 1-1000 | 100 | Page size. |
+| `limit` | `int` 1-200 | 50 | Page size. |
 | `offset` | `int` >= 0 | 0 | Rows to skip. |
 
-Response items carry `iteration`, `provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_usd`, `duration_ms`, `provider_request`, `provider_response`, `created_at`. `provider_request` and `provider_response` are raw adapter-boundary JSON; treat as opaque.
+Response items carry `iteration`, `provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_usd`, `duration_ms`, `provider_request`, `provider_response`, `created_at`. `provider_request` and `provider_response` are raw adapter-boundary JSON; treat as opaque. Both are only returned with `include_payloads=True`.
 
 ### `GET /runs/{run_id}/tool-calls`
 
@@ -200,7 +217,7 @@ Full conversation trace (user, assistant, tool messages) in `order_index` order.
 
 Query parameters: `limit`, `offset`.
 
-Response items: `role`, `content`, `order_index`, `meta`, `created_at`. `content` is always the raw stored value — DB is ground truth. PII guardrails redact at the LLM-call boundary only; replay against `agent_runs.pii_mapping` to render the LLM-eye view.
+Response items: `role`, `content`, `order_index`, `meta`, `created_at`. With `include_payloads=False` `content` is not returned. Otherwise it is always the raw stored value — DB is ground truth. PII guardrails redact at the LLM-call boundary only; replay against `agent_runs.pii_mapping` to render the LLM-eye view.
 
 ### `GET /runs/{run_id}/pauses`
 
@@ -215,13 +232,14 @@ Response items:
   "resume_sequence_index": 8,
   "resume_at": "2026-04-18T12:00:30Z",
   "reason": "waiting_client_tool",
+  "pause_id": "01HXYZ...",
   "pending_tool_calls": [{"id": "...", "name": "read_file", "target": "client", "params": {...}}],
   "submitted_results": [{"name": "read_file", "call_id": "...", "payload": "...", "success": true}],
   "user_input": null
 }
 ```
 
-An unpaired `run.paused` at the end of the log represents an active pause (`resume_sequence_index` is `null`).
+An unpaired `run.paused` at the end of the log represents an active pause (`resume_sequence_index` is `null`). `pause_id` is `null` for pauses recorded before 0.5.0. Pass it as `expected_pause_id=` to a `submit_*` call to reject a stale submit. With `include_payloads=False` the parameters and submitted payloads are omitted.
 
 ## SSE event inventory
 
@@ -231,12 +249,12 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 
 | `event_type` | When | `data` payload |
 | --- | --- | --- |
-| `run.started` | First event on any run | `{"agent_name": str, "system_prompt": str}` |
-| `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval" \| "paused", "pending_tool_calls": [{"id", "name", "target", "params"}]}`. A `paused` status adds `"reason": "requested" \| "budget"` and, if `request_pause(reason=...)` gave one, `"message"` (up to 500 chars); a budget pause adds `"exceeded": [{"metric", "used", "max"}]`. `pending_tool_calls` is empty for a pause with nothing outstanding |
+| `run.started` | First event on any run | `{"agent_name": str, "system_prompt": str}` (`system_prompt` only with `include_payloads=True`) |
+| `run.paused` | Runner finalizes the current iteration into a pause | `{"status": "waiting_client_tool" \| "waiting_human_input" \| "waiting_approval" \| "paused", "pending_tool_calls": [{"id", "name", "target", "params"}]}`. Every pause carries `"pause_id"` (a ULID; absent on events written before 0.5.0). A `paused` status adds `"reason": "requested" \| "budget"` and, if `request_pause(reason=...)` gave one, `"message"` (up to 500 chars); a budget pause adds `"exceeded": [{"metric", "used", "max"}]`. `pending_tool_calls` is empty for a pause with nothing outstanding |
 | `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}`; a result that carried images adds `"image_count"` to its entry, and an input with images adds `"image_count"` to the payload; `resumed_from` is `"paused"` after `submit_resume` |
 | `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str, "stop_reason": str \| null, "truncated": bool}`. `stop_reason` is the normalized reason the final LLM call stopped (`end_turn`, `max_tokens`, ...) and is `null` on `max_iterations` or when the provider reported none; `truncated` is true when it is `max_tokens`. Events written before 0.4.1 have `status` only |
 | `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, run or stream interrupted, or a budget cancel | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when `cancel_run` abandoned a model call (`partial_output` is always `false` for batch `run()`); `{"reason": "task_cancelled"}` when the task awaiting `run()` was cancelled; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream; `{"reason": "budget_exceeded", "exceeded": [{"metric", "used", "max"}]}` for `Budget(on_exceed="cancel")` |
-| `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars) |
+| `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars). For a provider failure `error` is the fixed `safe_message`, never the vendor's text, and the payload adds `"error_info": {"category", "retryable", "safe_message", ...}` |
 | `run.interrupted` | `sweep(stale_running=...)` finalized a stale `running` run | `{"failure_reason": "stale_running" \| "never_started"}` |
 | `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens", "cost_usd", "cost_source", "usage_reported", "model", "has_tool_calls", "phase"}` |
 | `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}` (plus `"image_count"` when the result has images); malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
@@ -259,13 +277,15 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `budget.unpriced` | A `max_cost_usd` budget met its first unpriced LLM call in the run (once per run) | `{"metric": "cost_usd", "used": float, "max": float, "unpriced_calls": int, "known_cost_usd": float}` |
 | `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
-| `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "error": str}` |
+| `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "error": str, "findings": [{"kind", "count", "location"}]}`. Never contains the matched text; `location` is the message index, role and tool call id |
 | `guardrail.image_unscanned` | Guardrails are configured, a request carries images, and none scans images (once per run) | `{"count": int}` |
 | `image.rejected` | The provider refused an image; one event per candidate image | `{"image_id", "sha256", "tenant_scope", "provider", "model", "status_code", "located": bool, "retried": bool}` |
 | `image.state` | A request recorded new image descriptions, guardrail verdicts or placeholders | `{"tenant_scope", "described": [{"sha256", "text"}], "guardrail_verdicts": [{"sha256", "guardrail_id", "guardrail_version", "origin", "tool_name", "action", "entities"}], "placeholders": [{"slot", "reason"}]}` |
 | `image.view_changed` | The drop-old-images window advanced | `{"epoch": int, "dropped_through": int, "visible": int}` (`visible` = eligible images still shown) |
 | `image.degraded` | Images were replaced by placeholders | `{"reason": "purged" \| "policy" \| "rejected" \| "unsupported" \| "described" \| "guardrail" \| "drop", "count": int, "slots": [int]}`; once per image slot |
 | `image.warning` | Drop policy combined with provider thinking (Anthropic, or OpenAI Responses `thinking=True`; once per run) | `{"warning": "drop_with_thinking"}` |
+| `guardrail.restore_skipped` | `PII(restore="allowlisted")` kept a placeholder because the tool is not marked `receives_pii` | `{"tool_name", "entities": list[str], "count": int}`. Counts and entity types only |
+| `governance.changed` | A resume found different governance from the run's start (guardrails, `deny`, `require_approval`, `before_tool`, limits) | `{"changed": list[str], "action": "warn" \| "raise"}`. Names the parts that changed, never their contents |
 | `guardrail.unmapped_placeholder` | Final output contains placeholders that cannot be deanonymized | `{"placeholders": list[str]}` |
 | `skill.catalog_resolved` | Run start, when skills are configured | `{"delivery": "progressive" \| "inlined", "skills": [{"name", "revision", "digest"}], "denied": list[str]}` |
 | `skill.activated` | A skill's body was delivered to the model | `{"name": str, "digest": str, "origin": "model" \| "explicit" \| "inlined"}` |
@@ -278,6 +298,8 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `mcp.error` | MCP discovery failed | Strict failure: `{"error": str, "error_type": str \| null, "code": str}`. Best-effort source failure also includes `"source_name"`, `"namespace"`, and `"failure_mode"`. OAuth failures may add `"reason"`; `error` is truncated to 500 characters |
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 | `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
+
+[//]: # "VERIFY-0.5.0: payload shapes for guardrail.blocked findings, guardrail.restore_skipped, governance.changed and run.error error_info are inferred from the spec (counts and kinds only); T3 and T7 own the exact field names"
 
 Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and `budget.exceeded` at most once per metric. Every pause persists the fired set, so resumed runs do not re-fire.
 
@@ -360,7 +382,7 @@ Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 
 ### Minimal write-route wrappers
 
-A single-tenant example follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to every write method: `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream`, `request_pause`, `submit_note` and `cancel_run`. Omitting `tenant_id` is unscoped, while explicit `tenant_id=None` means untenanted runs only. A run outside the tenant raises `RunNotFoundError` before anything is written. The sample below also uses `owned_run`, a dependency that checks the run belongs to the caller's tenant before any route touches it, which is a cheap way to guard every route in one place. Passing `tenant_id=` to the submit calls themselves (for example `agent.submit_tool_results(run_id, results, tenant_id=tenant_id)`) gives the same guarantee at the call.
+A sample follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to every write method: `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream`, `request_pause`, `submit_note` and `cancel_run`. Omitting `tenant_id` is unscoped by default, while explicit `tenant_id=None` means untenanted runs only; with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`, and `UNSCOPED` is the explicit operator value. A run outside the tenant raises `RunNotFoundError` before anything is written. The sample below also uses `owned_run`, a dependency that checks the run belongs to the caller's tenant before any route touches it, which is a cheap way to guard every route in one place. Passing `tenant_id=` to the submit calls themselves (for example `agent.submit_tool_results(run_id, results, tenant_id=tenant_id)`) gives the same guarantee at the call.
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -375,7 +397,6 @@ from dendrux.errors import (
     RunNotPausedError,
 )
 from dendrux import ApprovalDecision
-from dendrux.store import RunNotFoundError as StoreRunNotFoundError
 from dendrux.types import ToolResult
 
 def tenant_of(request: Request) -> str:
@@ -384,9 +405,7 @@ def tenant_of(request: Request) -> str:
 
 async def owned_run(run_id: str, tenant_id: str = Depends(tenant_of)) -> str:
     """Ownership check for every route."""
-    try:
-        await store.get_subtree(run_id, tenant_id=tenant_id)   # root must be in this tenant
-    except StoreRunNotFoundError:
+    if await store.get_run(run_id, tenant_id=tenant_id) is None:   # out of scope = missing
         raise HTTPException(404, "run not found")
     return run_id
 
@@ -425,6 +444,7 @@ async def submit_input(body: dict, run_id: str = Depends(owned_run)):
 
 @writes.post("/runs/{run_id}/approval")
 async def submit_approval(body: dict, run_id: str = Depends(owned_run)):
+    # Pass expected_pause_id (from the run.paused event or PausePair) so a stale client cannot approve a newer pause.
     # Whole batch: {"approved": true}. Per call: {"decisions": {"<call_id>": {"approved": false, "reason": "..."}}}
     if "decisions" in body:
         decisions = {
@@ -488,13 +508,16 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 
 | Exception | Base | Typical HTTP | Meaning |
 | --- | --- | --- | --- |
-| `RunNotFoundError` | `LookupError` | 404 | `run_id` does not exist, or is outside the `tenant_id` you passed. |
+| `RunNotFoundError` | `LookupError` | 404 | `run_id` does not exist, or is outside the `tenant_id` you passed. One class for `Agent`, `RunStore` and `retry`; the same error for a foreign run as for a missing one. |
 | `RunNotPausedError` | `RuntimeError` | 409 | Run is not in any paused state. |
-| `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused, but for a different reason than this method expects. |
+| `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused, but for a different reason than this method expects, or (with `expected_pause_id=`) it paused again since your client saw it: `err.reason` is `"status"` or `"pause_id"`. |
 | `RunAlreadyClaimedError` | `RuntimeError` | 409 | Concurrent submit won the CAS. Poll for completion; do not retry the submit. |
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
 | `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids). No partial claim. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
+| `TenantScopeRequiredError` | `ValueError` | 500 | `strict_tenancy=True` and the call omitted `tenant_id`. A bug in your route, not a client error. |
+| `NoteLimitExceededError` | `ValueError` | 409 or 429 | `submit_note` on a run that already has `max_notes_per_run` notes. |
+| `ProviderError` and subclasses | `RuntimeError` | 502 | A provider failure. Normally reported on the run result as `error_info`; see [Handling provider errors](/docs/recipes/handling-provider-errors). |
 | `ContextLengthExceededError` | `RuntimeError` | 413 or 400 | An OpenAI-compatible endpoint rejected the request as larger than the model's context window. Raised by `run()` / `stream()`, not by a submit method. |
 | `SkillMissingError` | `SkillContinuityError` | 409 | The run was created with a skill this agent does not have. Run stays paused; attach the skill and retry. |
 | `SkillMismatchError` | `SkillContinuityError` | 409 | A skill the run was created with has different content now. Run stays paused; attach the original content and retry. |
@@ -541,7 +564,7 @@ async with RunStore.from_database_url("...") as store:
 
 ## Where this fits
 
-- Read endpoints and SSE: `dendrux/http/read_router.py`, mounted via `make_read_router(store=, authorize=)`.
+- Read endpoints and SSE: `dendrux/http/read_router.py`, mounted via `make_read_router(store=, authorize=, tenant_resolver=)`.
 - Read types: `dendrux/store/__init__.py` (`RunStore`, `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`).
 - Write-side agent methods: `dendrux/agent.py` (`submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `request_pause`, `submit_note`, `cancel_run`).
 - Exceptions: `dendrux/errors.py`.

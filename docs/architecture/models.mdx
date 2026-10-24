@@ -55,13 +55,33 @@ OpenAIProvider(model="llama-3.3-70b", base_url="https://api.groq.com/openai/v1",
 
 When `base_url` points away from the official endpoint, dendrux drops OpenAI-specific request fields (the prompt-cache key, the OpenAI-only output-token parameter) that some compatible backends reject. You get the universal request shape automatically.
 
+## Provider errors and deadlines
+
+Since 0.5.0 every failed request raises a `ProviderError` subclass (`ProviderAuthError`, `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderUnavailableError`, `ProviderStreamIncompleteError`, `ModelRefusalError`, `ContentFilteredError`, `ContextLengthExceededError`, or the base class for credits, rejected and unknown). All four providers map their SDK and HTTP errors the same way and chain the SDK exception on `__cause__`. A stream that ends without its terminal event, a Responses `error` or `response.failed` event, a refusal and a content filter all raise instead of producing an empty answer. See [Handling provider errors](/docs/recipes/handling-provider-errors) for the taxonomy and what to do with each.
+
+Every provider also accepts three deadlines, so a stalled call ends instead of hanging:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `call_timeout` | 600 s | Total wall-clock limit for one non-streaming call, including the SDK's own retries |
+| `stream_idle_timeout` | 600 s | Longest gap between meaningful stream events (keep-alive pings do not count) |
+| `stream_total_timeout` | `None` | Optional limit on a whole stream |
+
+`max_retries` keeps its meaning: the SDK still retries connection resets, 408, 409, 429 and 5xx responses. But when `call_timeout` fires the call is abandoned and not retried again, raising `ProviderTimeoutError`, so a long generation is paid for at most once. A stream retries once inside the provider only if nothing has been yielded yet. Pass `None` to turn a deadline off. With `call_timeout=None` nothing bounds the SDK's own retries either, so a slow or failing request can be retried after it already produced billed output, and a paid call can run more than once; the network read timeout is still set a little above the longest deadline so a dead connection cannot hang for hours. The old `timeout=` argument is a deprecated shorthand that sets both `call_timeout` and `stream_idle_timeout` and prints a `DeprecationWarning`.
+
+The duration and any timeout reason are recorded with each LLM call.
+
+[//]: # "VERIFY-0.5.0: T2 owns the providers; confirm the argument names and defaults, the retry rule, and where duration and timeout_reason are recorded"
+
+Provider clients are rebuilt per event loop, so using one provider from a second loop (a test client, a second `asyncio.run`) no longer fails on a connection from the first.
+
 ## Request errors on OpenAI-compatible endpoints
 
-Compatible servers report problems in slightly different ways. `OpenAIProvider` (and therefore `OpenRouterProvider`) classifies API status errors and in-stream error events for batch calls, stream creation, and stream iteration. SDK timeout and connection errors keep Dendrux's existing transport mappings. There are three outcomes for the classified errors, checked in this order:
+Compatible servers report problems in slightly different ways. `OpenAIProvider` (and therefore `OpenRouterProvider`) classifies API status errors and in-stream error events for batch calls, stream creation, and stream iteration. There are three outcomes for the classified errors, checked in this order:
 
 1. **Context window exceeded** raises `ContextLengthExceededError`.
 2. **Streaming not supported** (streaming calls only) raises `NotImplementedError`, the same as before.
-3. **Any other status error** is re-raised unchanged, exactly as the SDK raised it.
+3. **Any other status error** raises the matching `ProviderError` subclass (auth, rate limit, unavailable and so on), with the SDK error on `__cause__`.
 
 ```python
 from dendrux import ContextLengthExceededError
@@ -73,7 +93,7 @@ except ContextLengthExceededError as exc:
     history = history[-6:]          # trim and try again, or tell the user
 ```
 
-`ContextLengthExceededError` is a `RuntimeError`, importable from `dendrux` and `dendrux.errors`. It carries `status_code` (`None` for an error event inside a stream), `provider_code` (for example `"context_length_exceeded"`) and `model`. The message names the model and never contains prompt content. As with any provider exception, the run row ends in `error` before the exception reaches you.
+`ContextLengthExceededError` is a `ProviderError` (and so a `RuntimeError`), importable from `dendrux` and `dendrux.errors`. It carries `status_code` (`None` for an error event inside a stream), `provider_code` (for example `"context_length_exceeded"`) and `model`. The message names the model and never contains prompt content. As with any provider exception, the run row ends in `error` before the exception reaches you.
 
 What counts as a context overflow:
 

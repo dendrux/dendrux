@@ -16,6 +16,12 @@ Every run emits a stream of events, and every event lands in the `run_events` ta
 
 The only guarantee readers need is the first one: **within a run, `sequence_index` is strictly monotonic**. Order events by it and you get the exact order the runtime observed them.
 
+**How the number is allocated.** Since 0.5.0 the database assigns it in the same statement that inserts the event (`INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1`), and the store returns it. There is no counter in your process, so several workers writing to one run (a resume in another process, for example) cannot interleave to reuse a number. A custom `StateStore` must do the same; see [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0#13-custom-statestore-allocate-the-event-index-in-the-insert).
+
+A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every worker is on 0.5.0 or later. Until then, a fleet that mixes 0.4.1 and 0.5 workers can in rare races write one duplicate index, and an SSE cursor can miss that one event. That window closes with the 0.5.1 index.
+
+[//]: # "VERIFY-0.5.0: T1 implements the allocation; confirm the statement shape and that the return value reaches the recorder"
+
 ## A real event timeline
 
 The timeline below is the literal `run_events` log from the quickstart run, dumped from `quickstart.db`. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
@@ -113,10 +119,10 @@ asyncio.run(main())
 
 A typical event-bus design broadcasts new events through an in-process pub/sub queue. It is fast, but it does not survive process restarts, it does not work across multiple web instances, and it cannot replay events the client missed while offline.
 
-Dendrux keeps the log in the `run_events` table and polls it per connection. The tradeoff is a few extra SQL queries per second while a client is streaming, in exchange for three real properties:
+Dendrux keeps the log in the `run_events` table and polls it. The tradeoff is a few extra SQL queries per second per watched run while a client is streaming, in exchange for three real properties:
 
 1. **Replay is free.** A client that reconnects after any amount of downtime gets everything it missed from the exact same code path that served the first read.
-2. **No fan-out manager.** Every connection is an independent async generator, which means adding a second server instance needs no shared state and no message bus.
+2. **No message bus.** Clients watching the same run in one process share one polling query that fans out in memory, and nothing is shared between processes, so adding a second server instance needs no shared state.
 3. **Events are durable.** If the runner crashes mid-iteration, events written before the crash are still visible to readers. Nothing lives only in memory.
 
 The poll interval and a periodic `: keepalive` comment are tuned so idle connections do not get closed by reverse proxies, but the wire format is plain SSE with no dendrux-specific framing. Any client that can read `EventSource` can read this stream.

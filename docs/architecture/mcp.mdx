@@ -798,7 +798,13 @@ The integration preserves:
 - audio, resource-link, and embedded-resource blocks in a JSON content envelope, and image blocks as [image parts](#images-from-mcp-tools) the model can see;
 - negotiated protocol version and server identity in `ToolDef.meta`.
 
-`max_result_bytes` is enforced before a result enters the model conversation. Errors an application should be ready to handle:
+`max_result_bytes` is enforced before a result enters the model conversation. In 0.5.0 the transport also enforces the Agent's `Limits.max_tool_result_bytes` (1 MiB by default) while the response is being read, so an oversized result is cut off before it is fully in memory; the model then sees the `size_limit` error result described under [Tools](/docs/reference/tools#result-size-limits). The read of one `tools/call` response body is capped at four times the text cap (4 MiB with the default 1 MiB), because JSON escaping and SSE framing can inflate text on the wire; in a run that can ingest images, room for one image at the `ImagePolicy` source cap is added. The decoded result is still held to the text cap.
+
+**Session loss.** If a `tools/call` POST itself comes back as HTTP 404 "Session not found", the runtime re-initialises the session and retries that call once. After any other loss in the middle of a call (a dropped connection, a timeout) the server may have applied the call, so it is reported as `MCPOutcomeUnknownError` and never retried automatically. Servers on the stateless protocol revision have no session at all. After an error that closes a connection, the runtime rebinds its executors so the next call starts clean.
+
+[//]: # "VERIFY-0.5.0: T4 owns MCP; confirm the streaming cap lives in mcp/_http.py, the single 404 retry and the executor rebind after a classified loss"
+
+Errors an application should be ready to handle:
 
 | Error | Meaning | Was anything sent? |
 | --- | --- | --- |

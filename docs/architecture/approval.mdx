@@ -143,6 +143,24 @@ Pass exactly one of `approved=` or `decisions=`; passing both or neither raises 
 | `approved=False` | Every pending call receives a synthetic failed `ToolResult` whose payload is `rejection_reason` as a JSON string (default `"User declined to run this tool."`). Same bytes as before 0.3. |
 | `decisions={call_id: ApprovalDecision.approve() \| ApprovalDecision.deny(reason)}` | Each gated call is decided on its own. A denied call gets a failed result whose payload is `{"denied": reason}`. |
 
+## What the reviewer approves is what runs
+
+The approval view (`approval.requested`, and any approval view that is stored or shown) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when a PII guardrail redacted them, before any coercion, and without defaults Dendrux filled in. Execution uses the coerced real values (see [How arguments are checked](/docs/reference/tools#how-arguments-are-checked)). Coercion is deterministic, so the arguments a person approves still decide what runs. `before_tool` hooks receive real values in process, as before. The call is validated before the pause: an invalid call is returned to the model, never put in front of a person.
+
+The active pause's arguments stay visible by default, in `run.paused`, `/pauses` and `RunStore.get_pending`, because they are the thing being approved. In your own approval screen, load them with `get_pending` (see [Build your own read routes](/docs/recipes/build-your-own-read-routes)); everything else payload-like stays hidden unless you opt in.
+
+## Approving the right pause
+
+A decision can arrive late, from a tab left open or a retried request. Pass `expected_pause_id=` (the `pause_id` from `RunResult`, the `run.paused` event or `RunStore.get_pauses`) and a decision aimed at an older pause raises `PauseStatusMismatchError` instead of approving the newer one. It is optional in 0.5 and required in 0.6. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+```python
+await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
+```
+
+On resume the run re-checks `deny` and the per-tool call limits before executing approved calls, so a tool denied or capped after the pause is not run.
+
+[//]: # "VERIFY-0.5.0: resume-side deny and call-limit re-check and expected_pause_id are T7 wave 2; the approval-event argument form is T4"
+
 ## Per-call decisions
 
 ```python

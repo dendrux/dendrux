@@ -122,21 +122,27 @@ Here is the full path of a single chat message in a streaming app. The run ID is
 ```python
 @app.post("/chats/{chat_id}/messages")
 async def post_message(chat_id: str, body: NewMessage, user: User = Depends(auth)):
-    # 1. Persist the user's message in YOUR db.
-    await db.save_message(chat_id, role="user", content=body.text, status="complete")
-
-    # 2. Load prior turns from YOUR db and convert to Dendrux's input type.
+    # 1. Load the PREVIOUS turns from YOUR db, before saving the new message,
+    #    and convert them to Dendrux's input type. history is the earlier
+    #    transcript only; the current message goes in user_input, never in both.
     rows = await db.load_messages(chat_id)
     history = [
         ChatMessage.user(m.content) if m.role == "user" else ChatMessage.assistant(m.content)
         for m in rows
+        if m.status == "complete"
     ]
 
-    # 3. Start the run. run_id is available before iteration.
+    # 2. Persist the user's message in YOUR db.
+    turn_id = await db.save_message(chat_id, role="user", content=body.text, status="complete")
+
+    # 3. Start the run. run_id is available before iteration. The idempotency
+    #    key makes a retried HTTP request return the same run instead of a new one.
     stream = agent.stream(
         user_input=body.text,
         history=history,
-        metadata={"thread_id": chat_id, "user_id": user.id},
+        tenant_id=user.org_id,
+        idempotency_key=f"turn-{turn_id}",
+        metadata={"thread_id": chat_id, "user_id": user.id, "app_turn_id": turn_id},
     )
 
     # 4. Create the assistant placeholder linked to the run up front.
@@ -171,6 +177,68 @@ The non-streaming version is the same shape with `await agent.run(...)` in place
 
 The example above uses Pattern A (the run ID and status on the assistant message). With Pattern B, the steps are identical except the run ID and status live on a turn row instead: at step 4 insert an `agent_run_links` row (`user_message_id`, the freshly created `assistant_message_id`, `dendrux_run_id=stream.run_id`, `status='streaming'`), and at step 6 update that link row's status to `complete` while writing the answer to the plain `messages` row. Same choreography, one extra row write, and your `messages` table stays free of Dendrux columns.
 
+## The history rule
+
+`history=` is the transcript **before** this turn. `user_input=` is **this** turn. Never put the current message in both: the model would see it twice, and the cached prefix would change on every retry.
+
+The most common way to break the rule is to save the new user message and then reload "all messages in the chat" to build `history`. Load first, or exclude the row you just wrote, as the lifecycle above does. A small conversion helper keeps it in one place:
+
+```python
+def to_history(rows) -> list[ChatMessage]:
+    return [
+        ChatMessage.user(m.content) if m.role == "user" else ChatMessage.assistant(m.content)
+        for m in rows
+        if m.status == "complete" and m.content    # skip failed or still-streaming turns
+    ]
+```
+
+Skip assistant rows whose turn failed or is still streaming: a half-written or empty answer in the history teaches the model nothing useful. See [Chatbot threads](/docs/recipes/chatbot-threads#history-is-the-previous-transcript-only).
+
+## Mapping run status to your product status
+
+`RunResult.status` (and `RunDetail.status`) is the runtime's view. Your UI wants a smaller set. One adapter, in your code, keeps the two apart:
+
+| Dendrux status | Product status | Notes |
+| --- | --- | --- |
+| `pending` | `pending` | Created, not yet running |
+| `running` | `running` | |
+| `waiting_client_tool` | `running` (or "waiting for the app") | Your client must execute a tool and submit the result |
+| `waiting_human_input` | `needs_input` | Show the question; answer with `submit_input` |
+| `waiting_approval` | `needs_approval` | Show the pending calls; decide with `submit_approval` |
+| `paused` | `paused` | Requested or budget pause; continue with `submit_resume` |
+| `success` | `completed` | Check `result.truncated`: a cut-off answer is still `success` |
+| `max_iterations` | `failed` (reason: "too many steps") | The loop hit its cap without a final answer |
+| `error` | `failed` | Show a generic message; the cause is in `result.error_info` and `RunDetail.error_info` |
+| `cancelled` | `cancelled` | |
+
+```python
+PRODUCT_STATUS = {
+    "pending": "pending", "running": "running",
+    "waiting_client_tool": "running", "waiting_human_input": "needs_input",
+    "waiting_approval": "needs_approval", "paused": "paused",
+    "success": "completed", "max_iterations": "failed",
+    "error": "failed", "cancelled": "cancelled",
+}
+```
+
+## When a turn fails
+
+Create the assistant placeholder before the run starts (as in the lifecycle above) and give it a failed state, so the user never sees a spinner that never ends. On `error`, store your own short message ("Something went wrong, try again") and keep the Dendrux `run_id` on the turn so support can find the audit trail. For a retryable error (`result.error_info.retryable`), offer a retry button that calls `agent.retry(run_id)`; for a refusal or content filter, show the product message you choose rather than the provider's. Do not show `result.error` verbatim: since 0.5.0 it is a fixed, safe summary, but it is still not written for end users. Details: [Handling provider errors](/docs/recipes/handling-provider-errors).
+
+## Production smoke test
+
+Run this once after every deploy of the integration, in staging first:
+
+1. **App migrations.** Apply your own schema changes.
+2. **Dendrux migrations.** Run `dendrux db migrate`, then `dendrux db check` (exit code 0 means current). A Postgres database that was not migrated fails at startup with `SchemaOutOfDateError`.
+3. **Start the app.** Check the log for `FutureWarning`s about 0.6 defaults.
+4. **Create a chat** in your UI or API.
+5. **Send a message** and wait for the answer. Send a second message that depends on the first, to prove `history=` works.
+6. **Inspect your transcript.** Your `messages` rows should hold the user text and the assistant answer, and the turn row should hold the `dendrux_run_id`.
+7. **Inspect the Dendrux run.** `RunStore.get_run(run_id, tenant_id=...)` should show `success`, the right `tenant_id`, your `thread_id` and `app_turn_id` in `meta`, and token usage. `get_events` should show `run.started` through `run.completed`; `get_llm_calls` should show the model you expect.
+8. **Check isolation.** Ask for the same `run_id` with a different tenant; you should get `None` or a 404, never data.
+9. **Retry the request.** Re-send step 5's request with the same idempotency key; you should get the same `run_id`, not a second run.
+
 ## Recommended metadata keys
 
 `metadata` is opaque JSON that lands on the run row. Dendrux stores it and never reads it during execution; it exists purely for your dev-side queries and rollups. For a production app, stamp every run with:
@@ -179,12 +247,13 @@ The example above uses Pattern A (the run ID and status on the assistant message
 metadata={
     "thread_id": str(chat_id),     # the conversation; the canonical chatbot key
     "user_id": str(user_id),       # who asked
-    "tenant_id": str(tenant_id),   # org/workspace scoping for multi-tenant apps
+    "tenant_id": str(tenant_id),   # for your own metadata_filter queries (not the isolation field)
+    "app_turn_id": str(turn_id),   # the turn row in your agent_run_links table
     "request_id": request_id,      # ties a run to your HTTP/trace logs
 }
 ```
 
-Keys are restricted to `[A-Za-z0-9_-]+` for filter safety. With these in place you can answer "every run in this chat," "this user's cost this month," or "the run behind request X" without touching your own tables. The query mechanics are in [Chatbot threads](/docs/recipes/chatbot-threads#querying-every-run-in-a-thread).
+Isolation between tenants is the separate `tenant_id=` argument on `run()` and every other call, not a metadata key; pass both. Keys are restricted to `[A-Za-z0-9_-]+` for filter safety (so a key like `dendrux.x`, which is reserved for Dendrux's own metadata, is rejected). Metadata is capped at 64 KiB. With these in place you can answer "every run in this chat," "this user's cost this month," or "the run behind request X" without touching your own tables. The query mechanics are in [Chatbot threads](/docs/recipes/chatbot-threads#querying-every-run-in-a-thread).
 
 ## Read through the public APIs, not raw SQL
 

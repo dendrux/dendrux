@@ -148,7 +148,7 @@ Three writes land from one hook. The recorder is responsible for:
 
 1. **Durability policy.** Which writes retry, which swallow exceptions, which propagate.
 2. **Correlation.** `run_event.correlation_id` is set to the `tool_call.id` so `approval.requested`, `tool.completed`, and `approval.decided` can be joined later as one tool-lifecycle story.
-3. **Ordering.** An `order_index` counter is maintained for `react_traces`. A shared `EventSequencer` is used for `run_events.sequence_index` (see [Event ordering](/docs/architecture/event-ordering)).
+3. **Ordering.** An `order_index` counter is maintained for `react_traces`. The store allocates `run_events.sequence_index` inside the insert itself, so concurrent writers cannot take the same number (see [Event ordering](/docs/architecture/event-ordering)). There is no in-process sequencer since 0.5.0.
 
 The recorder writes raw values — it is the authoritative transcript, so it must match what actually happened. PII guardrails redact at the LLM-call boundary only; see [PII redaction](/docs/architecture/pii-redaction) for the boundary model.
 

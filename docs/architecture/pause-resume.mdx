@@ -139,6 +139,34 @@ UPDATE agent_runs
 
 This collapses "check the status is something I can finalize, then finalize it" into a single atomic statement. A cancel request arriving during that window either wins or loses based on whose UPDATE commits first. There is no in-between state.
 
+## Pause ids and stale submits
+
+The atomic claim guarantees one winner, but it cannot tell whether the winner was answering the pause they actually saw. A browser tab left open for an hour can approve a pause that has since been replaced by a newer one on the same run. Since 0.5.0 every pause has a `pause_id` (a ULID) to close that gap.
+
+- The id is stored in the run's pause state and exposed on `RunResult.pause_id`, on `PausePair.pause_id` (`RunStore.get_pauses`), on the `run.paused` event and in the `/pauses` endpoint. Pauses recorded before 0.5.0 have none.
+- Every `submit_*` method and `resume` accepts `expected_pause_id=`. If the run's current pause has a different id, nothing is claimed, nothing is written, and the call raises `PauseStatusMismatchError` with `reason="pause_id"` (HTTP 409).
+
+```python
+paused = await agent.run("Refund order 42")
+await agent.submit_approval(
+    paused.run_id, approved=True, expected_pause_id=paused.pause_id,
+)
+```
+
+Round-trip the id through your client: send it down with the approval request and send it back with the decision. It is optional in 0.5. In a strict-tenancy deployment, omitting it on `approved=True` prints a `FutureWarning`, because it becomes required in 0.6.
+
+Validation (agent name, `pause_id`, call ids) runs before the claim and again inside the claim transaction, and a failure after the claim releases it back to the paused status, so a rejected submit never leaves the run stuck as `running`.
+
+Pause state is versioned (`schema_version`). A reader ignores keys it does not know and defaults ones that are missing, which is what lets 0.4.1 and 0.5 workers share runs during a rolling deploy.
+
+[//]: # "VERIFY-0.5.0: pause_id, expected_pause_id, validate-then-claim and the release-on-failure rule are T7 (wave 2); the field names are T0's contract. Recheck everything in this section after T7 merges"
+
+## Fencing: which worker owns a run
+
+`agent_runs.claim_epoch` counts claims. Every claim raises it and every status change (finish, pause, release) is conditional on the worker's own value. If a sweep takes over a run, or a slow worker wakes up after another has claimed the run, the old worker finds its epoch stale at its next checkpoint (top of an iteration, before a tool, before a pause) and stops without writing. Fencing protects runs claimed by 0.5 workers; during a rolling deploy a run claimed by a 0.4.1 worker has no epoch to compare.
+
+[//]: # "VERIFY-0.5.0: fencing is T7 wave 2; the column is T0's"
+
 ## Requesting a pause
 
 A waiting pause happens because the run needs input. A **requested pause** is for the opposite case: the run is healthy and running, and your application wants it to stop where it is (a deploy window, an operator's "hold on", a tenant that hit a limit) and continue later, in this process or another.

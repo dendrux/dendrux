@@ -7,7 +7,9 @@ description: The six tables dendrux writes to, what each one stores, and why the
 
 Everything dendrux knows about a run lives in your database. Not in memory, not in a queue, not in a sidecar process. **Six SQLAlchemy tables, one ULID per row.** When a run pauses, it persists. When a different process resumes it, it reads those rows.
 
-This page walks through each table with real row contents from a vetted run (`dendrux==0.2.0a1` against SQLite). Every value below was copied from a real `quickstart.db` produced by the [Quickstart](/docs/quickstart) example.
+This page walks through each table with real row contents from a vetted run against SQLite. Every value below was copied from a real `quickstart.db` produced by the [Quickstart](/docs/quickstart) example. Newer releases add columns (for example `agent_runs.claim_epoch` in 0.5.0) that the captured rows predate.
+
+[//]: # "VERIFY-0.5.0: stale-version cleanup: Re-capture the sample rows on the release candidate"
 
 > **Building a product on top of this?** These six tables are Dendrux's run-state and audit surface, not your product database. If you are building a chat app, store your user-visible chats and messages in your own tables and link to Dendrux by run ID. See [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary) for the boundary, a minimal schema, and the request lifecycle.
 
@@ -72,6 +74,7 @@ idempotency_key:      None
 idempotency_fingerprint: None
 cancel_requested:     0
 pause_requested:      0
+claim_epoch:          0
 created_at:           2026-04-18 09:10:32
 updated_at:           2026-04-18 09:13:35
 ```
@@ -83,12 +86,13 @@ A few columns deserve a closer look:
 - **`pii_mapping`** is also JSON, but unlike `pause_data` it is **not** cleared on finalize. It's part of the audit trail. See [PII redaction](/docs/architecture/pii-redaction).
 - **`cancel_requested`** is the cooperative cancellation flag. The runner reads it at safe checkpoints. See [Cancellation](/docs/architecture/cancellation).
 - **`pause_requested`** is its twin for `request_pause` (added in 0.3.0, default false). It is cleared when the run pauses, is claimed for resume, or finishes. See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause).
+- **`claim_epoch`** (new in 0.5.0, `INTEGER NOT NULL`, default 0) is a fencing counter. Each time a worker claims a run, the counter goes up, and status changes (finish, pause, release) are conditional on the worker's own value. A worker whose claim was taken over, for example after a sweep, stops instead of overwriting the new owner. It protects only runs claimed by 0.5 workers.
 - **`status`** also takes the value `paused` for a requested or budget pause. It is a plain string column, so no enum migration was needed.
 - **`last_progress_at`** is the liveness timestamp the stale sweep reads; see [below](#long-running-tools-and-the-stale-sweep).
 - **`meta`** is opaque JSON for *your* application. Dendrux stores it and ships it back; it never reads it. Use it to link a run to your user IDs, request IDs, ticket numbers, anything.
 - **`parent_run_id`** + **`delegation_level`** form the sub-agent tree. When an agent spawns a sub-agent, the child gets its own `agent_runs` row with `parent_run_id` pointing back.
 
-Three indexes exist on this table: `parent_run_id` (for the delegation tree), `status` (for "find all running runs"), and `created_at` (for "most recent first").
+Four indexes exist on this table: `parent_run_id` (for the delegation tree), `status` (for "find all running runs"), `created_at` (for "most recent first") and, since 0.5.0, `(tenant_id, created_at DESC)` for tenant-scoped listings. The `idempotency_key` uniqueness is per tenant: a partial unique index on `(COALESCE(tenant_id, ''), idempotency_key)` where the key is set. See [Multi-tenancy](/docs/architecture/multi-tenancy#idempotency-keys).
 
 ## `react_traces`: the conversation
 
@@ -230,13 +234,15 @@ This is on purpose. An audit trail you can rewrite isn't an audit trail. If some
 
 ## Indexes
 
-The schema ships with four indexes that matter for typical query patterns:
+The schema ships with indexes that matter for typical query patterns:
 
 | Index | Purpose |
 |---|---|
 | `agent_runs(parent_run_id)` | Walk the sub-agent tree |
 | `agent_runs(status)` | Find all running / paused / failed runs |
 | `agent_runs(created_at)` | "Most recent runs" listings |
+| `agent_runs(tenant_id, created_at DESC)` | Tenant-scoped listings (0.5.0) |
+| `agent_runs(COALESCE(tenant_id, ''), idempotency_key)`, unique, where the key is set | One idempotency key per tenant (0.5.0) |
 | `react_traces(agent_run_id, order_index)` | Load a run's full conversation in order |
 | `tool_calls(agent_run_id)` | Per-run tool history |
 | `llm_interactions(agent_run_id)` | Per-run LLM call history |
@@ -305,11 +311,19 @@ dendrux db migrate                       # create / upgrade the schema
 dendrux db status                        # show the current migration revision
 ```
 
-`DENDRUX_DATABASE_URL` is the one knob the CLI reads. It never accepts the URL as a flag, so credentials stay out of your shell history and process list. The same variable is also the fallback your app uses when you build an `Agent` without an explicit `database_url=`, so setting it once covers both migration and runtime.
+`DENDRUX_DATABASE_URL` is the one knob the CLI reads. It never accepts the URL as a flag, so credentials stay out of your shell history and process list. Error output from the CLI masks the password in any URL it prints.
+
+> **Deprecated in 0.5.0.** An `Agent` built with neither `state_store=` nor `database_url=` still falls back to this variable, but it now warns once, and the fallback is removed in 0.6. Create one `SQLAlchemyStateStore` at startup and pass `state_store=` to every Agent (see [Web endpoints](/docs/recipes/web-endpoint)). The CLI keeps reading the variable.
+
+The shared engine behind that fallback is tied to one event loop. Using it from a second loop (a second `asyncio.run`, a test client on another loop) raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress".
 
 If the tables are missing when a run starts, dendrux raises `SchemaNotInitializedError` carrying these exact commands, rather than letting a raw "relation does not exist" error surface mid-run.
 
 ### Upgrading
+
+Upgrading to 0.5.0 adds `agent_runs.claim_epoch`, the tenant-scoped idempotency index and the `(tenant_id, created_at)` index (revision `d7e8f9a0b1c2`). A Postgres database that has not been migrated raises `SchemaOutOfDateError` on first use, and the schema check now also verifies the named indexes. `dendrux db check` compares the database with this version's migration head (exit 0 current, 1 behind, 2 unknown; `--allow-unstamped` for schemas built with `create_all`). The full procedure, including mixed-fleet rules, is in [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).
+
+[//]: # "VERIFY-0.5.0: T1 builds dendrux db check and the index check in _schema_check; confirm names and exit codes, and that CLI error output masks database URL passwords"
 
 Upgrading to 0.4.0 adds the two image tables; a Postgres database that has not been migrated raises `SchemaOutOfDateError` naming `dendrux_blobs` and `dendrux_blob_refs` on first use. SQLite files create them on startup.
 

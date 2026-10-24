@@ -56,7 +56,17 @@ agent = Agent(
 )
 ```
 
-The default `PII()` carries five patterns: `EMAIL_ADDRESS`, `PHONE_NUMBER`, `US_SSN`, `CREDIT_CARD`, `IP_ADDRESS`. All regex, applied incoming (for redaction before the LLM call) and outgoing (for block/warn policy detection). Entity names are canonical to Presidio's vocabulary so the same names appear regardless of which engine is active.
+The default `PII()` carries five patterns: `EMAIL_ADDRESS`, `PHONE_NUMBER`, `US_SSN`, `CREDIT_CARD`, `IP_ADDRESS`. All regex, applied incoming (for redaction before the LLM call) and outgoing (for block/warn policy detection). Since 0.5.0 they are stricter, which means fewer false positives:
+
+| Entity | Matches only when |
+| --- | --- |
+| `PHONE_NUMBER` | the number is in E.164 form or has separators, and a context word such as "phone" or "call" is nearby |
+| `CREDIT_CARD` | the digits pass the Luhn check |
+| `IP_ADDRESS` | every octet is 255 or less |
+
+All built-in patterns run in linear time, so a hostile megabyte of text cannot stall the event loop. Scans of more than 32 KB run in a worker thread so other runs keep moving.
+
+After redaction, `PII(restore=...)` decides which tools get real values back. See [PII restore](/docs/architecture/pii-restore). Entity names are canonical to Presidio's vocabulary so the same names appear regardless of which engine is active.
 
 A real run with the input `"Send the receipt to jane.doe@example.com please."` produced these governance rows, plus the PII mapping:
 
@@ -240,7 +250,7 @@ async def main() -> None:
         result = await agent.run("Here is my key: AKIAIOSFODNN7EXAMPLE, please store it.")
         print(result.status.value)        # error  (the secret never reaches the model)
         print(result.error)
-        # Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY matched 'AKIAIOSFODNN7EXAMPLE'
+        # Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY (1 finding in message 0, role user)
 
     store = RunStore.from_database_url(url)
     async with store:
@@ -251,17 +261,19 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. The default action is `block`, not `redact`, because a secret that leaked into a prompt should stop the conversation rather than be silently replaced.
+`SecretDetection` ships with four patterns: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `GENERIC_API_KEY`, `PRIVATE_KEY`. Since 0.5.0 an AWS secret key is reported only next to an `AKIA...` access key or a context word such as `aws_secret_access_key`, so random 40-character strings no longer trigger it. The default action is `block`, not `redact`, because a secret that leaked into a prompt should stop the conversation rather than be silently replaced.
 
 The captured governance rows from that run:
 
 ```text
 status: error
 governance events:
-  seq=1  guardrail.blocked  data={"direction": "incoming", "error": "Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY ...
+  seq=1  guardrail.blocked  data={"direction": "incoming", "error": "Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY (1 finding in message 0, role user)", ...
 ```
 
-One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name and the matched snippet (truncated to 80 chars, `repr()`-ed for log safety) so a reader can see which rule fired and on what.
+One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name, a count and a location (message index, role, tool call id), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the audit trail.
+
+[//]: # "VERIFY-0.5.0: T3 owns the exact message wording; replace the example strings with real output"
 
 ## Prompt injection — domain-specific by design
 
@@ -322,6 +334,20 @@ The **outgoing scan** happens after `provider.complete()` returns, on the assist
 This split is deliberate: the DB is ground truth. Dashboards, traces, and the developer's own systems see the raw value; only the provider API wire carries placeholders.
 
 A run that enters `waiting_approval` and later resumes will scan again on the next iteration (the history being replayed is the raw transcript). The `pii_mapping` is stable across scans so the same replacement token is reused, and there is no double-redaction.
+
+## Content that cannot be scanned fails closed
+
+If a guardrail cannot examine some content (it is nested too deeply, larger than the scanner's limit, has more than 20,000 distinct values to redact in one run, or arrives while 16 Presidio scans are already running), it reports an `unscannable` finding instead of silently letting the content through. What happens next follows the action:
+
+| Action | `unscannable` content |
+| --- | --- |
+| `block` | blocks the run |
+| `redact` | blocks the run (it cannot be redacted if it cannot be read) |
+| `warn` | recorded in `guardrail.detected`, run continues |
+
+Like every finding, it carries a kind, a count and a location, never the content itself.
+
+[//]: # "VERIFY-0.5.0: T3 owns this; confirm the kind name is unscannable and the depth and size limits worth documenting"
 
 ## Multiple guardrails compose
 

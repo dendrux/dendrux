@@ -42,7 +42,14 @@ print(result.usage.cost_source)   # "table"
 
 Keys are exact model ids or `fnmatch`-style globs. Lookup prefers an exact match, then the longest matching glob, so `"gpt-5-pro"` beats `"gpt-5*"` and `"gpt-5-mini*"` beats `"gpt-*"`. Matching is case-sensitive, like model ids.
 
-The table lives on the `Agent`, not the provider. That means it works the same with a provider instance, a `"vendor:model"` recipe string, a custom provider, and a per-turn `model=` override: each call is priced by the model that actually served it (`LLMResponse.model`), falling back to the provider's configured model.
+The table lives on the `Agent`, not the provider. That means it works the same with a provider instance, a `"vendor:model"` recipe string, a custom provider, and a per-turn `model=` override: each call is priced by looking up, in this order:
+
+1. an exact match for the model the vendor reports having served (`LLMResponse.model`);
+2. an exact match for the model you requested (the per-call `model=` if you passed one, else the provider's configured model);
+3. the longest glob matching the reported model;
+4. the longest glob matching the requested model.
+
+So a dated snapshot such as `claude-haiku-4-5-20251001` is priced by a table entry for the alias you requested, and an exact entry always beats a glob. A provider-set `cost_unknown` is always honoured: that call stays unpriced whatever the table says.
 
 ## The formula
 
@@ -105,7 +112,10 @@ their stored cost but may have no source information.
 - **Batch and long-context tiers.** If you use them, key separate table entries for the model ids involved; dendrux does not pick a tier for you.
 - **Audio and per-request surcharges.** The table prices tokens only.
 - **Images.** Image tokens are billed inside the provider's input tokens, so they are priced through the input rate with no separate entry, and `UsageStats` reports the provider's numbers unchanged. Dendrux's own per-image estimate (`image_stats.estimated_tokens`) is for planning and caps, and is never added to usage or cost. See [Images](/docs/recipes/images#cost-and-usage).
-- **Budget.** `cost_usd` is for reporting. `Budget` thresholds are still in tokens. See [Budget](/docs/architecture/budget).
+- **Budget.** A `Budget(max_cost_usd=...)` uses these prices, and since 0.5.0 it refuses to start when the model has none (`BudgetConfigurationError`). See [Dollar limits](/docs/architecture/budget#dollar-limits).
+- **Long cache lifetimes.** A call that wrote the long (12 hour) cache tier is marked cost-unknown, because its write rate differs from the default tier; the rate table for it arrives in 0.6.
+
+[//]: # "VERIFY-0.5.0: T2 owns the cache-write partition; confirm cache_write_tokens maps to cache_creation_input_tokens, fresh = input - read - write, and the ttl_12h cost_unknown rule"
 
 ## Where this fits
 

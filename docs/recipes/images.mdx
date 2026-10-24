@@ -10,6 +10,8 @@ Dendrux 0.4.0 accepts images (PNG, JPEG, GIF, WebP) anywhere text goes into a ru
 - in the user's message: `run()`, `stream()`, `submit_input()`, `resume(user_input=)`, and `history=`;
 - in tool results: a server `@tool` returns `ToolOutput`, a client tool attaches `ToolResult.images`, and an MCP tool's image content becomes image parts.
 
+Import image names from one place: `from dendrux.media import Image, ToolOutput, ImagePolicy, ImageDropPolicy, UrlPolicy`. (`Image` and `ToolOutput` are also exported from `dendrux`, but the examples here use `dendrux.media` throughout.)
+
 Every image is checked once, stored once as a content-addressed blob, and referenced everywhere else by a small descriptor. Your run rows, pause snapshots, traces and events hold references, never pixels or base64. Pause and resume, retry and `runs=` replay all work with images, including across processes.
 
 Runnable scripts: [`examples/37_images.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/37_images.py) (user image plus a tool that returns an image) and [`examples/38_images_client_tool.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/38_images_client_tool.py) (client-tool screenshot, pause, resume on a second Agent). Both run on a scripted mock model by default and on a real vision model with `--provider`.
@@ -19,8 +21,9 @@ Runnable scripts: [`examples/37_images.py`](https://github.com/dendrux/dendrux/b
 `user_input` may be a string or a list of strings and images. Order is kept.
 
 ```python
-from dendrux import Agent, Image
+from dendrux import Agent
 from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.media import Image
 
 async with Agent(
     name="Reader",
@@ -67,7 +70,8 @@ For tool-using chats, `runs=thread.run_ids` ([Memory across runs](/docs/recipes/
 Return `ToolOutput(result, images=[...])`. `result` is serialised exactly like a normal return value, so `ToolOutput("Captured.")` produces the same payload as `return "Captured."`. The images follow the text, in order.
 
 ```python
-from dendrux import Image, ToolOutput, tool
+from dendrux import tool
+from dendrux.media import Image, ToolOutput
 
 @tool()
 async def render_chart(metric: str) -> ToolOutput:
@@ -90,7 +94,7 @@ A `@tool(target="client")` pauses the run. Your app runs the tool and sends the 
 
 ```python
 import json
-from dendrux import Image
+from dendrux.media import Image
 from dendrux.types import ToolResult
 
 result = await agent.submit_tool_results(

@@ -22,7 +22,7 @@ Building the `Agent` object is essentially free. The cost is in the resources it
 
 | Resource | Cost if rebuilt per request | What to do |
 | --- | --- | --- |
-| DB engine | A new connection pool every request | Share one: set `DENDRUX_DATABASE_URL` or inject a `state_store`. |
+| DB engine | A new connection pool every request | Create one `state_store` per process at startup and pass it to every Agent. Do not pass `database_url=` per request, and do not rely on `DENDRUX_DATABASE_URL` (deprecated in 0.5.0, removed in 0.6). |
 | MCP source | Re-spawns a subprocess / reconnects + re-lists tools | Share one process-wide `MCPRuntime`; `bind()` per request with the requester's `tenant_key`. |
 | Provider client | Loses connection keep-alive | Use a request-owned provider unless your application has an explicit non-Agent owner for a shared provider. |
 
@@ -32,7 +32,7 @@ from dendrux.db.session import get_engine
 from dendrux.mcp import MCPRuntime, MCPSource
 from dendrux.runtime.state import SQLAlchemyStateStore
 
-engine = await get_engine(os.environ["DENDRUX_DATABASE_URL"])  # shared singleton
+engine = await get_engine(os.environ["DATABASE_URL"])  # shared singleton
 STORE  = SQLAlchemyStateStore(engine)
 MCP_RUNTIME = MCPRuntime()                                     # one per worker process
 MCP_SOURCES = {
@@ -77,6 +77,10 @@ async def chat(req):
         )
         return {"answer": result.answer}
 ```
+
+An `Agent` built with `database_url=` creates and owns its own engine, so doing that per request opens a new pool each time. An `Agent` with neither `state_store=` nor `database_url=` falls back to a process-global engine built from `DENDRUX_DATABASE_URL`; that fallback warns once in 0.5.0 and goes away in 0.6. The global engine is also bound to one event loop: using it from a second loop raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress". Pass `state_store=STORE` and none of this applies.
+
+In a multi-tenant service, pass the authenticated caller's `tenant_id=` on every call (`run`, `stream`, `submit_*`, `cancel_run`), or build the Agent with `strict_tenancy=True` so that forgetting it is an error. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ### Ownership at request shutdown
 

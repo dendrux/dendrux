@@ -59,21 +59,49 @@ All the arguments:
 | `max_cost_usd` | Dollar cap. Positive number, or `None`. | `None` |
 | `warn_at` | Fractions of each limit at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
 | `on_exceed` | `"warn"`, `"pause"` or `"cancel"`. | `"warn"` |
+| `count_cache_tokens` | `True` counts cache read and cache write tokens in the token total. `False` keeps the 0.4 count (fresh input plus output). `None` means "not chosen": the 0.4 count, plus a `FutureWarning` when `max_tokens` is set. | `None` |
 | `include_children` | Count delegated descendant runs' usage. | `True` |
 
 At least one of `max_tokens` and `max_cost_usd` is required; `Budget()` raises `ValueError`. So does a non-positive limit, a `warn_at` fraction outside `(0, 1)`, or an unknown `on_exceed`.
 
-Tokens are `input_tokens + output_tokens`, summed over the LLM calls. `input_tokens` counts fresh (non-cached) input, so cache reads and writes are not in the token total. The dollar limit is where caching shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes.
+### How tokens are counted
+
+By default tokens are `input_tokens + output_tokens`, summed over the LLM calls. `input_tokens` counts fresh (non-cached) input, so cache reads and writes are not in that total.
+
+With `Budget(count_cache_tokens=True)` the total is `input + output + cache_read + cache_write` tokens, which matches what the context window and most provider rate limits count. If you opt in, expect budgets to trip sooner on agents with large cached prompts, and raise `max_tokens` to match.
+
+In 0.5 the default stays the 0.4 count and a token budget without an explicit `count_cache_tokens` prints a `FutureWarning`. In 0.6 counting cache tokens becomes the default. Choose explicitly now:
+
+```python
+Budget(max_tokens=200_000, count_cache_tokens=True)    # the 0.6 behaviour
+Budget(max_tokens=200_000, count_cache_tokens=False)   # keep the 0.4 count, silence the warning
+```
+
+The dollar limit is where caching always shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes. A delegated child can still spend past a parent's limit within one of its own iterations; tightening that is planned for 0.6.
+
+[//]: # "VERIFY-0.5.0: T3 owns count_cache_tokens; confirm the formula, the warning trigger, and the child overshoot note"
 
 ## Dollar limits
 
-`max_cost_usd` needs a cost per call, from the provider (OpenRouter reports it) or from a `PriceTable` on the agent. A call with neither is **unpriced**. The dollar check counts the priced calls only, and the first time it sees an unpriced call in a run it writes one `budget.unpriced` event:
+`max_cost_usd` needs a cost per call, from the provider (OpenRouter reports it) or from a `PriceTable` on the agent.
 
+**It is checked up front.** If the agent's model has neither, `Budget(max_cost_usd=...)` raises `BudgetConfigurationError` when the `Agent` is built, and again when a run starts for the model actually used (a per-call `model=` override can change it). A dollar budget that could never fire is a configuration error, not a silent no-op. Fix it by adding a `PriceTable` entry for the model you request (globs such as `"gpt-5*"` work), or by using a provider that reports cost.
+
+Vendors often return a dated snapshot id (`claude-haiku-4-5-20251001`) rather than the alias you asked for. Pricing looks for an exact match on the returned model, then an exact match on the requested model, then a glob on the returned model, then a glob on the requested model, so a table entry for the alias still prices the call (see [Cost and pricing](/docs/architecture/pricing)). A cost the provider marks unknown is never filled in from the table.
+
+Within a run, a call can still be **unpriced** (a model that is not in the table, or a provider that stopped reporting cost). What happens depends on `on_exceed`:
+
+| `on_exceed` | An unpriced call under `max_cost_usd` |
+| --- | --- |
+| `"pause"` or `"cancel"` | counts as exceeding the limit (the budget cannot prove it is within it) |
+| `"warn"` | writes one `budget.unpriced` event per run and the call adds no amount to the comparison |
+
+Under `"warn"` the first unpriced call writes the event: 
 ```json
 {"metric": "cost_usd", "used": 0.0132, "max": 0.5, "unpriced_calls": 1, "known_cost_usd": 0.0132}
 ```
 
-An unpriced call contributes no amount to the dollar comparison. `budget.unpriced` exposes that gap; without complete provider pricing or a `PriceTable`, `max_cost_usd` can under-count. Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
+Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
 
 ## What the events look like
 
@@ -151,7 +179,9 @@ A child run is a run with its own `Agent`, and its own budget if it has one. Eac
 
 ## Usage source and persistence
 
-- **With persistence** (a database or `state_store`), usage is read live from successfully recorded `llm_interactions`. Those writes are best-effort, so a failed write can make the rollup under-count; if the live read itself raises, the tracker falls back to in-memory usage.
+- **With persistence** (a database or `state_store`), the run's own usage is tracked in memory as calls complete, and the subtree rollup of children is read from successfully recorded `llm_interactions`. A failed usage write is retried and never switches enforcement off; if the live read itself raises, the tracker falls back to in-memory usage.
+
+[//]: # "VERIFY-0.5.0: the budget read is T7 wave 2; recheck this bullet against the final budget reads"
 - **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
 
 Paused runs write their running totals (tokens and `total_cost_usd`) to the row when they pause, so a paused run no longer reads as zero spend.

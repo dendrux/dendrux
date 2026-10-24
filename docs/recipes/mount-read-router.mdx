@@ -5,7 +5,9 @@ description: Stand up dendrux's read-only HTTP surface — runs, events, drill-d
 
 # Mounting the read router
 
-Dendrux ships one factory, `make_read_router`, that returns a FastAPI `APIRouter` covering every read endpoint a dashboard or monitor needs: list runs, fetch a run, page through events, stream events as SSE, drill into LLM calls, tool calls, traces, and pause/resume cycles. You mount it into your app, supply an authorize dependency, and that is the entire setup.
+> **Prefer your own routes.** `make_read_router` is frozen in 0.5 (no new features, not deprecated). For production UIs, build your own read routes on `RunStore.get_pending` and `RunStore.follow`: [Build your own read routes](/docs/recipes/build-your-own-read-routes). This recipe is for when the ready-made router is enough.
+
+Dendrux ships one factory, `make_read_router`, that returns a FastAPI `APIRouter` covering every read endpoint a dashboard or monitor needs: list runs, fetch a run, page through events, stream events as SSE, drill into LLM calls, tool calls, traces, and pause/resume cycles. You mount it into your app, supply an authorize dependency and a tenant resolver, and that is the entire setup.
 
 This recipe shows the mount, the responses each endpoint returns (captured from a real run), and the patterns you will reach for when wiring this into your own app.
 
@@ -25,19 +27,28 @@ async def authorize(request: Request) -> None:
     if token != f"Bearer {EXPECTED_TOKEN}":
         raise HTTPException(401, "unauthorized")
 
+async def tenant_resolver(request: Request) -> str:
+    return request.state.tenant_id          # set by your auth layer
+
 app.include_router(
-    make_read_router(store=store, authorize=authorize),
+    make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver),
     prefix="/api",
 )
 ```
 
-Five things to know:
+Single-tenant app? Pass the sentinel instead of a function: `tenant_resolver=UNSCOPED` (`from dendrux import UNSCOPED`).
+
+[//]: # "VERIFY-0.5.0: this recipe describes T1's read router (tenant resolver, payload hiding, SSE close/204/follow, paging). Re-capture the example responses with include_payloads=True after T1 lands"
+
+Seven things to know:
 
 1. `RunStore` is the read-only facade over the dendrux database. Its lifecycle is yours to manage; use `RunStore.from_database_url(...)` for the store-owned engine path or `RunStore.from_engine(engine)` if you already have one.
 2. `authorize` is a FastAPI dependency. Raise `HTTPException` to deny; return any value (ignored) to allow. The dependency runs on every endpoint except `/health` (Kubernetes probes need an unauthenticated path).
 3. `prefix=` is yours. The factory does not impose a path.
 4. CORS, TLS, rate limiting, request logging — all yours. The router is a plain `APIRouter` with no middleware attached.
-5. The router is read-only. Write operations (submit tool results, submit input, submit approval, cancel) are wrapper routes you build on `Agent` methods. See [HTTP API surface](/docs/reference/http-api) for the full list and [Client-side tools](/docs/recipes/client-tools) for an end-to-end example.
+5. `tenant_resolver` is required. It returns the caller's tenant (`str`), `None` (untenanted runs only) or `UNSCOPED` (all tenants), and every read is scoped by it. A run outside the scope returns the same 404 as a missing run. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+6. Raw payloads are hidden by default (`include_payloads=False`): provider requests and responses, raw traces, tool parameters and results, the system prompt and the PII mapping. The captured responses below were taken with `include_payloads=True` so you can see the full shape; with the default, those fields are absent or replaced. See [make_read_router](/docs/reference/read-router#payloads).
+7. The router is read-only. Write operations (submit tool results, submit input, submit approval, cancel) are wrapper routes you build on `Agent` methods. See [HTTP API surface](/docs/reference/http-api) for the full list and [Client-side tools](/docs/recipes/client-tools) for an end-to-end example.
 
 ## Endpoints, captured
 
@@ -75,7 +86,7 @@ Unauthenticated. Returns `{"status": "ok"}`. Use it for Kubernetes liveness and 
 }
 ```
 
-Filters available as query params: `status` (repeatable for OR), `agent_name`, `parent_run_id`, `tenant_id`, `started_after`, `started_before`. Pagination via `limit` (1-1000, default 50) and `offset` (default 0). `total` is a separate count, so you can render pagination controls without a second request.
+Filters available as query params: `status` (repeatable for OR), `agent_name`, `parent_run_id`, `tenant_id`, `started_after`, `started_before`. `tenant_id` narrows the list only when your resolver returned `UNSCOPED`; for a scoped caller it is ignored. The two date filters need a timezone (`2026-04-19T00:00:00Z`); a naive datetime is a 422. Pagination via `limit` (1-1000, default 50) and `offset` (default 0, at most 10,000). Each item also carries `tenant_id`. `total` is a separate count, so you can render pagination controls without a second request.
 
 ### `GET /api/runs/{run_id}`
 
@@ -96,7 +107,7 @@ Filters available as query params: `status` (repeatable for OR), `agent_name`, `
 }
 ```
 
-Single run detail. Same fields as the list view plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`. 404 if the id is unknown.
+Single run detail. Same fields as the list view plus `strategy`, `input_data`, `answer`, `error`, `failure_reason` and, for a run a provider failure ended, `error_info`. 404 if the id is unknown or outside the caller's tenant (the same body in both cases).
 
 ### `GET /api/runs/{run_id}/events?after=N&limit=100`
 
@@ -120,7 +131,7 @@ Paginated event log. `after` is an exclusive cursor (pass the last batch's `sequ
 
 ### `GET /api/runs/{run_id}/events/stream`
 
-Server-Sent Events. One frame per event in `sequence_index` order. Connection stays open until the client disconnects.
+Server-Sent Events. One frame per event in `sequence_index` order. When the run is terminal and every event has been sent, the server writes an `event: end` frame and closes. Reconnecting to a finished, drained run returns HTTP 204; add `?follow=true` to keep the stream open as in 0.4. A single connection lasts at most `sse_max_duration_s` (900 seconds by default) and then closes so the client reconnects with its cursor.
 
 Frames look like:
 
@@ -133,7 +144,7 @@ data: {"sequence_index": 5, "iteration_index": 1, "event_type": "run.paused", "c
 
 Cursor resolution (first match wins): `Last-Event-ID` header, `?after=N` query param, `None` (start from the beginning). Reconnect via `EventSource` automatically populates `Last-Event-ID` from the last frame's `id`.
 
-Heartbeat: `: keepalive\n\n` every 15s of idleness. Polling cadence: 0.5s per connection. Plan for ~2 DB QPS per open SSE connection until Postgres `LISTEN/NOTIFY` ships.
+Heartbeat: `: keepalive\n\n` every 15s of idleness. Clients watching the same run share one polling query, backing off from 0.5s to 2s when idle, so database load follows the number of watched runs, not the number of connections (about one query per second per watched run). The router serves at most `sse_max_connections` (500) connections per process and answers 503 beyond that. Postgres `LISTEN/NOTIFY` is planned for 0.6.
 
 Browser usage:
 
@@ -141,8 +152,9 @@ Browser usage:
 const es = new EventSource(`/api/runs/${run_id}/events/stream?after=5`);
 es.addEventListener("message", (e) => {
   const frame = JSON.parse(e.data);
-  if (frame.event_type === "run.completed") es.close();
+  handle(frame);
 });
+es.addEventListener("end", () => es.close());   // the run is finished and drained
 ```
 
 ### `GET /api/runs/{run_id}/llm-calls`
@@ -168,7 +180,7 @@ es.addEventListener("message", (e) => {
 }
 ```
 
-`provider_request` and `provider_response` are the raw adapter-boundary JSON. Treat as opaque diagnostic blobs; do not depend on their shape across provider versions.
+`provider_request` and `provider_response` are the raw adapter-boundary JSON. They are only returned with `include_payloads=True`; by default the usage, cost and timing fields are returned and the two payload fields are omitted. Treat them as opaque diagnostic blobs; do not depend on their shape across provider versions. The list pages 50 calls by default (200 at most).
 
 ### `GET /api/runs/{run_id}/tool-calls`
 
@@ -191,7 +203,7 @@ es.addEventListener("message", (e) => {
 }
 ```
 
-Server tools, submitted client tools, and approved-server tools all land here. Denied tools (via `deny=`) do not write a row. Approval-rejected tools write a row with `success: false` and the rejection reason in `error`. See [Access control](/docs/architecture/access-control) for the contrast.
+With `include_payloads=False`, `params` and `result` are omitted. Server tools, submitted client tools, and approved-server tools all land here. Denied tools (via `deny=`) do not write a row. Approval-rejected tools write a row with `success: false` and the rejection reason in `error`. See [Access control](/docs/architecture/access-control) for the contrast.
 
 ### `GET /api/runs/{run_id}/traces`
 
@@ -208,7 +220,7 @@ Conversation messages in order. Roles: `user`, `assistant`, `tool`. Useful for r
 }
 ```
 
-`content` is always the raw stored value — the DB is ground truth. When a PII guardrail is active, the `agent_runs.pii_mapping` column carries the placeholder → real bijection the LLM saw, which a dashboard can apply to render the LLM-eye view. Execution state (`pause_data`) is never exposed by this endpoint. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
+With `include_payloads=False` message content is not returned. With payloads on, `content` is always the raw stored value — the DB is ground truth. When a PII guardrail is active, the `agent_runs.pii_mapping` column carries the placeholder → real bijection the LLM saw, which a dashboard can apply to render the LLM-eye view. Execution state (`pause_data`) is never exposed by this endpoint. See [PII redaction](/docs/architecture/pii-redaction) for the full boundary model.
 
 ### `GET /api/runs/{run_id}/pauses`
 
@@ -221,13 +233,14 @@ Pause/resume pairs derived from `run_events` (never from `pause_data`, which is 
   "resume_sequence_index": 8,
   "resume_at": "2026-04-19T04:21:45Z",
   "reason": "waiting_client_tool",
+  "pause_id": "01KPHZJ4Y8...",
   "pending_tool_calls": [{"id": "...", "name": "read_excel_range", "target": "client", "params": {...}}],
   "submitted_results": [{"name": "read_excel_range", "call_id": "...", "payload": "[[42]]", "success": true}],
   "user_input": null
 }
 ```
 
-An unpaired pause at the end of the log (no `run.resumed` after it) represents an active pause. `resume_sequence_index` is `null` and `submitted_results` is empty.
+`params` and `submitted_results` payloads follow `include_payloads` like the other drill-downs. `pause_id` identifies this pause; pass it as `expected_pause_id=` to a `submit_*` call to reject stale submits. An unpaired pause at the end of the log (no `run.resumed` after it) represents an active pause. `resume_sequence_index` is `null` and `submitted_results` is empty.
 
 ## Patterns
 
@@ -237,24 +250,32 @@ An unpaired pause at the end of the log (no `run.resumed` after it) represents a
 
 ```python
 store = RunStore.from_database_url(DB_URL)
-app.include_router(make_read_router(store=store, authorize=authorize), prefix="/api")
-# all your agents share this DB; the router sees every run
+app.include_router(
+    make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver),
+    prefix="/api",
+)
+# all your agents share this DB; the router shows each caller their tenant's runs
 ```
 
-### Tenant isolation in the dependency
+### Tenant isolation: the resolver
 
-The factory's `authorize` is a generic FastAPI dependency, so you can do whatever FastAPI does. Inject a tenant id from the request context and have your store treat the `tenant_id` query param as required:
+Tenant scoping is the `tenant_resolver`, not `authorize`. `authorize` decides whether the caller may use the API at all; the resolver decides which tenant's runs they see. Both are ordinary FastAPI dependencies, and the resolver can depend on the same user lookup:
 
 ```python
-async def authorize(request: Request) -> str:
+async def current_user(request: Request) -> User:
     user = await load_user(request)
     if not user:
         raise HTTPException(401, "unauthorized")
-    request.state.tenant_id = user.tenant_id
-    return user.tenant_id
+    return user
+
+async def authorize(user: User = Depends(current_user)) -> None:
+    ...                                    # raise to deny, e.g. disabled accounts
+
+async def tenant_resolver(user: User = Depends(current_user)):
+    return UNSCOPED if user.is_support_staff else user.tenant_id
 ```
 
-The handlers themselves only see whatever the dependency raises. Cross-tenant data leakage is prevented by always passing `tenant_id=` when you call `store.list_runs(...)` from your own routes, and by adding a check in your dependency or a middleware that rejects requests where the path's `run_id` does not belong to the caller's tenant.
+Because the resolver runs on every route and the scope is part of each SQL query, you do not need a per-route ownership check in front of the router. A run in another tenant returns the same 404 as a run that does not exist. When you call `RunStore` from your own routes, pass `tenant_id=` yourself. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ### Caller-owned engine
 
@@ -282,7 +303,7 @@ The full read surface:
 | --- | --- |
 | `list_runs(...)` | Filtered, paginated `RunSummary` list |
 | `count_runs(...)` | `int` matching the same filters |
-| `get_run(run_id)` | `RunDetail` for one run |
+| `get_run(run_id)` | `RunDetail` for one run (or `None`) |
 | `get_events(run_id, after_sequence_index=...)` | `StoredEvent` page |
 | `stream_events(run_id, ...)` | Async iterator of `StoredEvent` (the same source SSE polls) |
 | `get_llm_calls(run_id)` | `LLMCall` list (prompts, responses, usage, cache) |
@@ -290,6 +311,8 @@ The full read surface:
 | `get_traces(run_id)` | `TraceEntry` list (ReAct thoughts/actions/observations) |
 | `get_pauses(run_id)` | `PausePair` list (HITL approval cycles) |
 | `get_pii_mapping(run_id)` | Redaction lineage |
+
+Every one of these takes `tenant_id=` (default `UNSCOPED`, all tenants). Pass the caller's tenant from your own routes; `None` means untenanted runs only.
 
 `list_runs` and `count_runs` accept one filter that the HTTP router does **not** expose: `metadata_filter: dict[str, Any]`. It performs exact-match equality across every key inside the run's `meta` JSON (AND across keys), dispatched per backend — `jsonb @>` containment on Postgres, repeated `json_extract` on SQLite. The canonical use is `metadata_filter={"thread_id": "..."}` for per-conversation observability in chatbots; see [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
 
@@ -304,7 +327,7 @@ Filter keys are restricted to `^[A-Za-z0-9_-]+$`; nested paths and partial match
 
 - **The router never blocks.** All endpoints either return immediately or stream (SSE). No long-running synchronous work.
 - **404 fast.** Drill-down endpoints (`/llm-calls`, `/tool-calls`, `/traces`, `/pauses`, `/events*`) preflight `get_run` and 404 if the run does not exist, instead of silently returning empty pages.
-- **No magic transport.** SSE is a `StreamingResponse` over a polling loop, not a queue or fan-out manager. Sized to nginx defaults: heartbeat under `proxy_read_timeout`, polling tuned for ~2 QPS per connection.
+- **No magic transport.** SSE is a `StreamingResponse` over a polling loop, not a message broker. Clients watching one run share a single bounded poller per process. Sized to nginx defaults: heartbeat under `proxy_read_timeout`, polling backed off to 2 seconds when idle.
 - **No middleware.** Auth, CORS, observability, rate limiting all stay in your hands. `make_read_router` returns a plain `APIRouter`.
 
 ## Where this fits

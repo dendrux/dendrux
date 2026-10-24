@@ -26,7 +26,7 @@ Guardrails, approval, and access control are independent. You can use any one, a
 
 Governance events are distinct from lifecycle events (`run.started`, `run.paused`, `llm.completed`, `tool.completed`, `run.completed`). Lifecycle events describe what the runtime did. Governance events describe what a governance layer decided.
 
-All 31 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
+All 33 governance event types, pulled directly from `dendrux.types.GovernanceEventType`:
 
 ```text
 POLICY_DENIED           = 'policy.denied'
@@ -42,6 +42,8 @@ GUARDRAIL_DETECTED      = 'guardrail.detected'
 GUARDRAIL_REDACTED      = 'guardrail.redacted'
 GUARDRAIL_BLOCKED       = 'guardrail.blocked'
 GUARDRAIL_UNMAPPED_PLACEHOLDER = 'guardrail.unmapped_placeholder'
+GUARDRAIL_RESTORE_SKIPPED = 'guardrail.restore_skipped'
+GOVERNANCE_CHANGED      = 'governance.changed'
 SKILL_CATALOG_RESOLVED  = 'skill.catalog_resolved'
 SKILL_ACTIVATED         = 'skill.activated'
 SKILL_ACTIVATION_FAILED = 'skill.activation_failed'
@@ -64,7 +66,7 @@ GUARDRAIL_IMAGE_UNSCANNED = 'guardrail.image_unscanned'
 
 The six image events (`image.*` and `guardrail.image_unscanned`) record what happened to images the runtime sent, dropped, replaced or could not scan. Their payloads carry ids, counts and verdicts, never image bytes. See [Images](/docs/recipes/images#what-is-recorded).
 
-`guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction and an error string; that error includes the blocked finding's entity type and a bounded snippet. A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
+`guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction, an error string and the findings' kind, count and location; since 0.5.0 it never contains the matched text. `guardrail.restore_skipped` records, as counts only, that [PII restore](/docs/architecture/pii-restore) kept a placeholder out of a tool that is not allowlisted. `governance.changed` is described [below](#detecting-changed-governance-on-resume). A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
 
 Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
 
@@ -174,6 +176,27 @@ async def notify_governance(notifier, event_type, iteration, data, correlation_i
 Two wrappers, two failure policies. The recorder is fail-closed: if the DB write fails, the run stops. The notifier is fail-open: if a callback raises, the exception is logged as a warning and the run continues. See [Recorder](/docs/architecture/recorder) and [Notifier](/docs/architecture/notifier) for the full picture.
 
 The loop calls both wrappers in sequence at the point where a governance decision is made. A guardrail that redacts emits `guardrail.detected` and `guardrail.redacted` from inside the scan. An approval gate emits `approval.requested` when it decides to pause, and `approval.decided` when the submit endpoint resumes. The pattern is always the same: decide, emit, let the pipeline fan out.
+
+## Detecting changed governance on resume
+
+A paused run can wait for days. In that time someone may deploy a build with a different guardrail list, a looser `deny=`, or a different `before_tool` hook, and the resume then runs under rules the run never started with. Since 0.5.0 Dendrux notices.
+
+At run start it stores a short digest of the governance configuration. On resume it recomputes the digest and compares:
+
+- The digest covers: each guardrail (class name, action and entity set, plus `governance_fingerprint()` if your custom guardrail defines one), the `before_tool` hook's qualified name, the sorted `deny` and `require_approval` lists, and the limits. It never uses reprs or object ids, so it is the same in every process.
+- The digest does **not** cover budget numbers: raising a limit to resume a budget pause is a normal operation.
+- Runs paused before 0.5 have no digest and are skipped, with a log line.
+
+What happens on a mismatch is your choice:
+
+```python
+Agent(..., on_governance_change="warn")    # default in 0.5: emit governance.changed and log; resume proceeds
+Agent(..., on_governance_change="raise")   # raise GovernanceMismatchError; the run stays paused
+```
+
+`governance.changed` names the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `FutureWarning` if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
+
+[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the FutureWarning against the merged code"
 
 ## Why one pipeline instead of four subsystems
 

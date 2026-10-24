@@ -166,7 +166,8 @@ The run-control and read APIs take a `tenant_id=` argument that makes a call beh
 | `agent.submit_note(run_id, text)` | Run must be in the tenant, else `RunNotFoundError`. | Unscoped. |
 | `agent.submit_tool_results(...)`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream` | Run must be in the tenant, else `RunNotFoundError`, raised before any result, input, decision, claim, status change or event is written. | Unscoped. |
 | `RunStore.get_subtree(run_id)` | Root and every descendant must be in the tenant; others are excluded with everything below them. | Unscoped. |
-| `RunStore.get_notes(run_id)` | Run must be in the tenant, else `dendrux.store.RunNotFoundError`. | Unscoped. |
+| `RunStore.get_notes(run_id)` | Run must be in the tenant, else `RunNotFoundError`. | Unscoped. |
+| Every other `RunStore` read (`get_run`, `get_events`, `list_runs`, ...) | Scoped to the tenant (0.5.0). `get_run` returns `None` when out of scope. | `UNSCOPED`: all tenants. |
 
 `tenant_id=None` is a real value meaning "untenanted runs only", which is different from leaving the argument out. A `before_tool` hook sees the run's tenant as `ToolCallContext.tenant_id`.
 
@@ -179,6 +180,8 @@ await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 `resume_stream` differs in how it reports the failure. A scoped `resume_stream` raises `RunNotFoundError` from the first iteration, before any event, instead of yielding a `RUN_ERROR` event as the unscoped call does. A store error during the tenant check (for example a database outage) is raised from the first iteration too. Wrap the `async for` in a `try` when you pass `tenant_id=`.
 
 Passing `tenant_id` is how your route handlers keep one customer from touching another's runs. Dendrux does not decide who the caller is; derive the tenant from the authenticated request and pass it in.
+
+Forgetting it once is the easy mistake. `Agent(strict_tenancy=True)` (0.5.0) makes every entry point require an explicit `tenant_id`, raising `TenantScopeRequiredError` otherwise; delegated children still inherit their parent's tenant. Strict tenancy becomes the default in 0.6. Scopes, the read router's tenant resolver and idempotency keys are covered on [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ## Why a synthetic result instead of an exception
 
