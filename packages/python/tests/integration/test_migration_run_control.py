@@ -25,7 +25,6 @@ from sqlalchemy.pool import NullPool
 from dendrux.db.models import Base
 from dendrux.runtime.state import SQLAlchemyStateStore
 from tests.integration._migration_schema import migration_schema
-from tests.integration._migration_schema import test_database_url as _migrate_pg_url
 
 pytestmark = pytest.mark.asyncio
 
@@ -134,10 +133,8 @@ async def _check_prior(engine: Any) -> None:
         assert count == 2  # r-run was deleted at head; the rest survived the downgrade
 
 
-async def test_postgres_upgrade_downgrade_on_populated_db() -> None:
-    url = _migrate_pg_url()
-    if url is None:
-        pytest.skip("DENDRUX_TEST_PG_URL not set")
+async def test_postgres_upgrade_downgrade_on_populated_db(pg_test_url: str) -> None:
+    url = pg_test_url
     async with migration_schema(url, "control_migration") as engine:
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         async with engine.begin() as conn:

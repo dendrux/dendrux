@@ -34,9 +34,6 @@ if TYPE_CHECKING:
 from tests.integration._migration_schema import (
     migration_schema,
 )
-from tests.integration._migration_schema import (
-    test_database_url as _schema_pg_url,
-)
 
 pytestmark = pytest.mark.asyncio
 
@@ -76,10 +73,8 @@ def _alembic(url: str, rev: str) -> None:
 
 
 @pytest_asyncio.fixture
-async def pg_url(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
-    url = _schema_pg_url()
-    if url is None:
-        pytest.skip("DENDRUX_TEST_PG_URL not set")
+async def pg_url(monkeypatch: pytest.MonkeyPatch, pg_test_url: str) -> AsyncIterator[str]:
+    url = pg_test_url
     monkeypatch.delenv("DENDRUX_SKIP_SCHEMA_CHECK", raising=False)
     async with migration_schema(url, "schema_check"):
         try:

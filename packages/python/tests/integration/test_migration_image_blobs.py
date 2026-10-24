@@ -13,7 +13,6 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
-import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -25,9 +24,6 @@ from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.store import RunStore
 from tests.integration._migration_schema import (
     migration_schema,
-)
-from tests.integration._migration_schema import (
-    test_database_url as _private_pg_url,
 )
 from tests.unit.test_blob_catalog import make_png, store_png
 
@@ -147,10 +143,8 @@ async def _check_prior(engine: Any) -> None:
         assert "run_inbox" in tables
 
 
-async def test_postgres_up_down_up_on_populated_db() -> None:
-    url = _private_pg_url()
-    if url is None:
-        pytest.skip("DENDRUX_TEST_PG_URL not set")
+async def test_postgres_up_down_up_on_populated_db(pg_test_url: str) -> None:
+    url = pg_test_url
     async with migration_schema(url, "image_migration") as engine:
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         async with engine.begin() as conn:

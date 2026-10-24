@@ -12,7 +12,6 @@ import datetime as dt
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import pytest
 from sqlalchemy import text
@@ -21,8 +20,8 @@ from dendrux.db._schema_check import ensure_schema_current
 from dendrux.errors import SchemaOutOfDateError
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import IdempotencyConflictError
+from tests._helpers.pg_url import validate_test_pg_url
 from tests.integration._migration_schema import migration_schema
-from tests.integration._migration_schema import test_database_url as _db_url
 
 pytestmark = pytest.mark.asyncio
 
@@ -35,7 +34,7 @@ def _alembic(url: str, op: str, rev: str) -> None:
     from alembic import command
     from alembic.config import Config
 
-    assert urlparse(url).path.endswith("_test")
+    validate_test_pg_url(url, append_suffix=False)
     cfg = Config()
     cfg.set_main_option("script_location", str(_MIGRATIONS))
     cfg.set_main_option("sqlalchemy.url", url)
@@ -43,12 +42,9 @@ def _alembic(url: str, op: str, rev: str) -> None:
 
 
 @pytest.fixture
-async def pg() -> Any:
-    url = _db_url()
-    if url is None:
-        pytest.skip("DENDRUX_TEST_PG_URL not set")
-    async with migration_schema(url, "t1_r1_migration") as engine:
-        yield url, engine
+async def pg(pg_test_url: str) -> Any:
+    async with migration_schema(pg_test_url, "t1_r1_migration") as engine:
+        yield pg_test_url, engine
 
 
 async def _indexes(engine: Any) -> dict[str, str]:
