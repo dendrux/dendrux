@@ -17,6 +17,8 @@ Everywhere a tenant is accepted on a read or a run-control write, it means one o
 | `None` | Untenanted runs only (`tenant_id IS NULL`) |
 | `UNSCOPED` | Every tenant. A trusted, operator-level view |
 
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import UNSCOPED
 # also: from dendrux.store import UNSCOPED
@@ -38,6 +40,8 @@ Every `RunStore` read takes `tenant_id: TenantScope = UNSCOPED`: `get_run`, `get
 - `RunSummary` and `RunDetail` carry `tenant_id`.
 
 In your own routes, pass the caller's tenant on every read:
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 detail = await store.get_run(run_id, tenant_id=current_tenant)
@@ -67,6 +71,8 @@ An explicit `tenant_id` on a run-control write must match the run's tenant exact
 ### Strict tenancy
 
 In a multi-tenant service the dangerous mistake is forgetting `tenant_id=` once. `strict_tenancy=True` turns that into an error:
+
+[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
 
 ```python
 agent = Agent(provider=provider, prompt="...", strict_tenancy=True)

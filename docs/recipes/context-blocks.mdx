@@ -9,6 +9,8 @@ A run often needs material that is neither the agent's identity nor the conversa
 
 Dendrux gives you a third channel: `context=`. One new type, one new argument, nothing else changes.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, ContextBlock
 
@@ -35,6 +37,8 @@ A file attached in the middle of a conversation is **not** stable context — it
 
 Retrieved chunks change every turn, so they are `dynamic` — which is the default:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run(question, context=[
     ContextBlock(doc.text, kind="retrieved_doc", source=doc.url) for doc in docs
@@ -46,6 +50,8 @@ result = await agent.run(question, context=[
 ## Project context out of the prompt
 
 Project instructions are *runtime context*, not agent *identity*. Move them out of `prompt=` and into `context=` as a `stable` block. The prompt stays a small, frozen persona; the instructions cache:
+
+[//]: # "docs-test: skip - fragment: relies on `p`, defined by setup shown elsewhere"
 
 ```python
 agent = Agent(provider=p, prompt="You are Orbit's assistant.")   # identity only
@@ -61,6 +67,8 @@ result = await agent.run(user_message, history=chat_history, context=[
 ## In a multi-turn loop
 
 `context=` mirrors `history=`: per-run, read-only, re-supplied each call, never persisted as forward state. Store only the raw turns in your history — never bake dynamic context into them, or archived turns stop caching.
+
+[//]: # "docs-test: skip - fragment: relies on `project`, defined by setup shown elsewhere"
 
 ```python
 history = []

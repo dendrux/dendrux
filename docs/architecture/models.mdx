@@ -83,6 +83,8 @@ Compatible servers report problems in slightly different ways. `OpenAIProvider` 
 2. **Streaming not supported** (streaming calls only) raises `NotImplementedError`, the same as before.
 3. **Any other status error** raises the matching `ProviderError` subclass (auth, rate limit, unavailable and so on), with the SDK error on `__cause__`.
 
+[//]: # "docs-test: skip - fragment: relies on `user_input`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import ContextLengthExceededError
 

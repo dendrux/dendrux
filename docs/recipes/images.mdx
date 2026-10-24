@@ -20,6 +20,8 @@ Runnable scripts: [`examples/37_images.py`](https://github.com/dendrux/dendrux/b
 
 `user_input` may be a string or a list of strings and images. Order is kept.
 
+[//]: # "docs-test: skip - uses a placeholder image path"
+
 ```python
 from dendrux import Agent
 from dendrux.llm.anthropic import AnthropicProvider
@@ -54,6 +56,8 @@ A bad input raises before a run exists: `agent.run(...)` raises `InvalidImageErr
 ### History and follow-up turns
 
 `ChatMessage.user(...)` takes the same list form, so a chat history can carry images. Those images are stored when the run starts and count as already sent: they are never an error for a model that cannot read images (see [Models that cannot read images](#models-that-cannot-read-images)).
+
+[//]: # "docs-test: skip - uses a placeholder image path"
 
 ```python
 from dendrux.chat import ChatMessage
@@ -91,6 +95,8 @@ Where this plugs into the rest of the tool pipeline:
 ## A client tool that returns an image
 
 A `@tool(target="client")` pauses the run. Your app runs the tool and sends the result back; attach the images on the `ToolResult`:
+
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
 
 ```python
 import json
@@ -192,6 +198,8 @@ What happens when the answer is **no**:
 
 OpenRouter, OpenAI-compatible servers and other gateways word "this model has no image support" in their own ways. Dendrux recognises the OpenAI, OpenAI Responses and OpenRouter messages; a gateway that says it differently surfaces as `ProviderError` or `ImageRejectedError`, not `UnsupportedModalityError`. When you know a model cannot take images, say so up front and Dendrux never sends them:
 
+[//]: # "docs-test: skip - fragment: relies on `ImagePolicy`, defined by setup shown elsewhere"
+
 ```python
 ImagePolicy(capability_overrides={"my-gateway/text-model": "no"})
 ```
@@ -228,6 +236,8 @@ Caps apply when an image enters (`InvalidImageError`, `ImageLimitError`) and are
 ## Dropping old images
 
 A long tool loop that returns a screenshot every step grows the prompt by one image per step. The drop policy is opt-in and keeps the model's view bounded:
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 from dendrux.media import ImageDropPolicy, ImagePolicy
@@ -277,6 +287,8 @@ class BlobStore(Protocol):
 
 Run deletion is your SQL. Blobs are deleted by garbage collection, which removes blobs no run references and which have not been used for the grace period:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from datetime import timedelta
 
@@ -287,6 +299,8 @@ print(result.deleted_blobs, result.bytes_freed)
 Run it on a schedule (hourly or daily) from any process. It is idempotent and restartable, it finishes interrupted deletes and purges, and it never raises on a single bad row. `older_than` must be at least one hour; the grace period protects an image that was just stored and not yet referenced. On SQLite, which does not enforce foreign keys, collection also removes references of deleted runs.
 
 **Purge is erasure.** To remove an image's bytes for compliance:
+
+[//]: # "docs-test: skip - fragment: relies on `sha256`, defined by setup shown elsewhere"
 
 ```python
 await agent.blobs.purge(sha256, tenant_id="acme", reason="gdpr request 4411")

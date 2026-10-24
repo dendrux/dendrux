@@ -44,6 +44,8 @@ The pairing is deliberate: every "started" hook has either a matching "completed
 
 The Protocol lives in `dendrux/loops/base.py`:
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 @runtime_checkable
 class LoopNotifier(Protocol):
@@ -100,6 +102,8 @@ Five overrides, ten hooks supported. The other five (`on_run_failed`, `on_llm_ca
 ## Plugging one in
 
 Unlike the recorder, the notifier is a per-call argument, not a constructor keyword. You pass it each time you call `agent.run()` or a resume method:
+
+[//]: # "docs-test: skip - fragment: relies on `add`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent

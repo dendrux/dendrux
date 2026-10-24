@@ -11,6 +11,8 @@ description: Pass the run ids of a conversation and Dendrux replays its own trac
 
 Your app already stores something Dendrux does not: the order of runs in a conversation. Dendrux already stores something your app does not: what each run actually did. `runs=` joins the two.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run(
     user_text,
@@ -78,6 +80,8 @@ Dendrux adds one extra Anthropic cache breakpoint at the end of the replayed reg
 - Replaying a tool call whose tool is absent from the current `tools` was accepted by every vendor we tested.
 
 ## Observability
+
+[//]: # "docs-test: skip - fragment: relies on `result`, defined by setup shown elsewhere"
 
 ```python
 result.replay

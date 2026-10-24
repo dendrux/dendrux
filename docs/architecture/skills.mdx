@@ -36,6 +36,8 @@ The system prompt lists the skill's name and description. When the model decides
 
 ### 2. Add files
 
+[//]: # "docs-test: skip - needs a local file the reader provides"
+
 ```python
 triage = Skill(
     name="ticket-triage",
@@ -53,6 +55,8 @@ Text files become readable through `read_skill_resource`. Binary files are liste
 ### 3. Add an executor for scripts
 
 Files under `scripts/` can be run, but only by code you provide. Dendrux never executes a skill script itself.
+
+[//]: # "docs-test: skip - fragment: relies on `triage_with_scripts`, defined by setup shown elsewhere"
 
 ```python
 agent = Agent(
@@ -101,6 +105,8 @@ The script lines and the "run scripts" hint only appear when the agent has an ex
 A `Skill` is an immutable, validated value. Every construction path checks the same rules and raises `SkillValidationError` (a `ValueError`) naming the field that failed.
 
 ### Three ways to make one
+
+[//]: # "docs-test: skip - fragment: relies on `markdown_text`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Skill
@@ -154,6 +160,8 @@ Dendrux holds the package in memory. It builds one read-only bytes mapping per r
 Every skill has a content digest, `skill.digest`, formatted `sha256:<hex>`. It covers the name, description, body, license, compatibility, allowed tools, metadata, and every file with its text-or-binary kind. It does not cover `revision` or `path`. Two skills built different ways but with identical content have the same digest, and the digest is stable across processes.
 
 ## Attaching skills to an agent
+
+[//]: # "docs-test: skip - fragment: relies on `MyExecutor`, defined by setup shown elsewhere"
 
 ```python
 agent = Agent(
@@ -278,6 +286,8 @@ Files a script creates stay in the executor's environment. Dendrux returns only 
 
 The three skill tools can be named in `deny` and `require_approval` like any other tool, even on an agent with no other tools:
 
+[//]: # "docs-test: skip - fragment: relies on `triage_with_scripts`, defined by setup shown elsewhere"
+
 ```python
 agent = Agent(
     provider=...,
@@ -313,6 +323,8 @@ When a run is created, Dendrux stores a manifest in the run's metadata under `de
 - Runs created before this feature have no manifest and are not checked.
 
 Both errors extend `SkillContinuityError` and carry `run_id`, `missing` (sorted names) and `mismatched` (a tuple of `SkillDigestMismatch` with `name`, `expected_digest` and `actual_digest`). They live in `dendrux.errors`. The check covers `resume`, `resume_stream`, `submit_tool_results`, `submit_input` and `submit_approval`, approve or reject. A failed check does not claim the run: it stays in its paused status, so you can attach the right content and try again. `resume_stream` reports the failure as a terminal `RUN_ERROR` event with `error_type` set to `"SkillMissingError"` or `"SkillMismatchError"`, because that method never raises.
+
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
 
 ```python
 from dendrux.errors import SkillMismatchError, SkillMissingError
@@ -452,6 +464,8 @@ On POSIX, `start_new_session=True` plus `killpg` terminates the subprocess group
 ### E2B sandbox (sketch)
 
 A hosted sandbox keeps untrusted code off your machine. This sketch uses the E2B Python SDK (`pip install e2b`); check its documentation for the current method names and options, which may differ from what is shown.
+
+[//]: # "docs-test: skip - needs the optional package `e2b`"
 
 ```python
 import shlex

@@ -22,6 +22,8 @@ When you call `agent.run(input)`, the runner hands the request to the loop. The 
 
 The loop never touches provider-specific APIs or prompt formatting. That belongs to the strategy. The loop is pure orchestration: it owns the question "does the agent go around again?"
 
+[//]: # "docs-test: skip - fragment: relies on `ABC`, defined by setup shown elsewhere"
+
 ```python
 class Loop(ABC):
     """Base class for agent execution loops.
@@ -37,6 +39,8 @@ Those two lines from `dendrux/loops/base.py` are the shipping contract.
 ## Plugging a loop in
 
 The `Agent` constructor takes a `loop=` keyword. Default is `None`, which the runner resolves to `ReActLoop`.
+
+[//]: # "docs-test: skip - fragment: relies on `refund`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent
@@ -81,6 +85,8 @@ The `Loop` instance you pass is held on the agent for the whole lifetime of the 
 | Final `iteration_count` on success | 1, 2, 3, ..., up to `max_iterations` | Always `1` |
 
 These rules are enforced in the `Agent._validate()` path. The relevant failure messages, straight from `dendrux/agent.py`:
+
+[//]: # "docs-test: skip - fragment: relies on `self`, defined by setup shown elsewhere"
 
 ```python
 # Tools with SingleCall
@@ -230,6 +236,8 @@ Three constraints are enforced at construction or at run time:
 ### What `iteration_count` means here
 
 Always `1`. The loop writes exactly one LLM interaction, appends the assistant's response to history, and returns. From `dendrux/loops/single.py`:
+
+[//]: # "docs-test: skip - fragment: the body of a function defined elsewhere"
 
 ```python
 return RunResult(

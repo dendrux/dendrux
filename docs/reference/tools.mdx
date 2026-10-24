@@ -156,6 +156,8 @@ If a parallel batch ends the run (a failure that stops the run), the async sibli
 
 A tool result larger than `Limits.max_tool_result_bytes` (1 MiB by default) is replaced before it is stored or sent to the model. A JSON result becomes `{"error": "result too large", "code": "size_limit", "bytes": N}`; a plain string result is truncated with a marker. The same cap applies to local, MCP and client-submitted results.
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, Limits
 
@@ -224,6 +226,8 @@ A strict tool that is sent non-strict logs a WARNING once per tool name, then DE
 If Anthropic still rejects a strict schema (its grammar compiler has size and regex limits that cannot be checked in advance), Dendrux retries that request once with every strict tool sent as before. It logs a WARNING and keeps sending that tool non-strict for the rest of the process. The retry applies to any HTTP 400 on a request that carried a strict tool; other errors are raised unchanged.
 
 To turn strict mode off for a provider, pass `strict=False`:
+
+[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
 
 ```python
 provider = AnthropicProvider(model="claude-sonnet-4-6", strict=False)

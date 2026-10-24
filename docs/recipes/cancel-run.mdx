@@ -9,6 +9,8 @@ description: Stop a paused or in-flight run cleanly. The same call works for pau
 
 ## The call
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.cancel_run(run_id)
 print(result.status.value)   # "cancelled" if cancel won, original terminal otherwise
@@ -100,6 +102,8 @@ The returned `RunResult` is a receipt: `status` is still `running` and `meta["ca
 
 Since 0.3.0 a batch `run()` is interruptible too. If `agent.run(...)` is executing in this process and you call `cancel_run(run_id)` on the same `Agent` object, the in-flight model call or tool is cancelled and `run()` **returns** a result instead of raising:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 task = asyncio.create_task(agent.run("Do the long thing"))
 ...
@@ -113,6 +117,8 @@ assert result.meta["interrupted"] is True and result.meta["partial_output"] is F
 ### Streamed run on this `Agent` instance
 
 If the run was started with `stream()` or `resume_stream()` on the same `Agent` object, `cancel_run` also fires an in-process interrupt. The loop abandons the in-flight model stream immediately, even while waiting for the next token, closes the provider connection, and yields `RUN_CANCELLED` whose `answer` is the text streamed so far:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 async with agent.stream("Draft the announcement") as stream:
@@ -151,6 +157,8 @@ If you call a submit method *after* `cancel_run` has set the flag (but before th
 
 A minimal cancel endpoint:
 
+[//]: # "docs-test: skip - fragment: relies on `router`, defined by setup shown elsewhere"
+
 ```python
 from fastapi import APIRouter, Depends, HTTPException
 from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
@@ -187,6 +195,8 @@ es.addEventListener("message", (e) => {
 ## Stopping a run and its children
 
 Delegated child runs have their own rows and cancel flags. Cancelling the parent does not cancel them unless you ask:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.cancel_run(run_id, cascade=True)

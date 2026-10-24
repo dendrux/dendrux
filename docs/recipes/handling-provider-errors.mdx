@@ -47,6 +47,8 @@ The original SDK exception is on `__cause__`, and the vendor's own message text 
 
 A provider failure inside a run ends the run `error` and `run()` returns a `RunResult`; the typed error is summarised on the result:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run(text, tenant_id=tenant)
 if result.status == RunStatus.ERROR and result.error_info:
@@ -57,6 +59,8 @@ if result.status == RunStatus.ERROR and result.error_info:
 ```
 
 When you call a provider directly (`await provider.complete(...)`, or a custom loop), the `ProviderError` itself is raised:
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
 ```python
 from dendrux.errors import ProviderError, ProviderRateLimitError
@@ -95,6 +99,8 @@ Providers now give up instead of hanging. Three keyword arguments exist on `Anth
 | `call_timeout` | 600 seconds | Total wall-clock time for one non-streaming call, including the SDK's own retries |
 | `stream_idle_timeout` | 600 seconds | Longest gap between meaningful stream events. Keep-alive pings do not reset it |
 | `stream_total_timeout` | `None` | Optional cap on a whole stream |
+
+[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
 
 ```python
 AnthropicProvider(model="claude-sonnet-4-6", call_timeout=120, stream_idle_timeout=60)

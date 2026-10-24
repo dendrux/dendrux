@@ -157,10 +157,14 @@ decision again, and avoid automatically retrying a decision from an old form.
 
 A waiting pause happens because the run needs input. A **requested pause** is for the opposite case: the run is healthy and running, and your application wants it to stop where it is (a deploy window, an operator's "hold on", a tenant that hit a limit) and continue later, in this process or another.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 outcome = await agent.request_pause(run_id, reason="deploy window")
 print(outcome.status_before, "->", outcome.affected)   # running -> [('01M5...', 'requested')]
 ```
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def request_pause(
@@ -194,6 +198,8 @@ A request does not wait for the pause. It returns when the flag is recorded. `Pa
 If the run reaches a waiting pause first (it asks for approval, say), that pause satisfies the request and clears the flag. If the iteration in flight produces the final answer, the run completes and the flag is cleared.
 
 ### Resuming
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.submit_resume(run_id)      # blocks to the next pause or terminal state

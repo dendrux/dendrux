@@ -110,6 +110,8 @@ Each `agent.run()` is one turn. Dendrux reads the `history=` you give it as inpu
 
 Here is the full path of a single chat message in a streaming app. The run ID is available immediately from the stream (before the first token), so you can link the assistant message at creation time and fill its content as the stream completes.
 
+[//]: # "docs-test: skip - fragment: relies on `app`, defined by setup shown elsewhere"
+
 ```python
 @app.post("/chats/{chat_id}/messages")
 async def post_message(chat_id: str, body: NewMessage, user: User = Depends(auth)):
@@ -233,6 +235,8 @@ Run this once after every deploy of the integration, in staging first:
 ## Recommended metadata keys
 
 `metadata` is opaque JSON that lands on the run row. Dendrux stores it and never reads it during execution; it exists purely for your dev-side queries and rollups. For a production app, stamp every run with:
+
+[//]: # "docs-test: skip - fragment: relies on `chat_id`, defined by setup shown elsewhere"
 
 ```python
 metadata={

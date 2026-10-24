@@ -79,6 +79,8 @@ The `tool_calls` table now has one row for the refund: `tool_name=refund`, `succ
 
 Same pause, opposite decision:
 
+[//]: # "docs-test: skip - fragment: needs the paused run from the previous step"
+
 ```python
 result = await agent.submit_approval(
     first.run_id,
@@ -106,6 +108,8 @@ The third row is for contrast. `deny=` is a hard policy block (tool never reache
 
 When the model asks for several gated calls in one turn, decide each one:
 
+[//]: # "docs-test: skip - fragment: relies on `call_a`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import ApprovalDecision
 
@@ -125,6 +129,8 @@ To approve something *later*, after the run has moved on, deny it with a reason 
 ## Wiring it up over HTTP
 
 Approval decisions usually arrive over HTTP from a UI. The route is a thin wrapper:
+
+[//]: # "docs-test: skip - fragment: relies on `router`, defined by setup shown elsewhere"
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException

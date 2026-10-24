@@ -7,9 +7,13 @@ description: Leave a note for a run that is already in progress. How submit_note
 
 Sometimes a person has something to add while an agent is mid-run: "also skip anything older than 2023", "the customer just replied". `submit_note` leaves that message for the run. The model sees it at the next iteration, and the run keeps going. It does not pause the run and it does not need the run to be waiting for anything.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 note_id = await agent.submit_note(run_id, "Skip anything older than 2023.")
 ```
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def submit_note(
@@ -43,12 +47,16 @@ The runner appends and records the message first, then marks the note delivered.
 
 A note submitted while the run makes its last LLM call (or after its final iteration began) may never be delivered. When a run ends, the result lists the notes it did not deliver:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run("...")
 print(result.meta.get("undelivered_notes"))   # ['01M5...'] or missing
 ```
 
 `meta["undelivered_notes"]` appears only when there are any. The same list is available later, with the text and your metadata, from the store:
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 notes = await store.get_notes(run_id, undelivered_only=True)

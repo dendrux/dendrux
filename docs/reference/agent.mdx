@@ -7,6 +7,8 @@ description: The Agent constructor and every public runtime method (run, resume,
 
 `Agent` holds an agent's identity, capabilities, and limits, and exposes the runtime methods that execute it. Construct it once and reuse it across many runs.
 
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
 ```python
 from dendrux import Agent
 from dendrux.llm.anthropic import AnthropicProvider
@@ -23,6 +25,8 @@ agent = Agent(
 `Agent` is an async context manager. Use `async with Agent(...) as agent:` so MCP sources, the provider, and any agent-owned engine close cleanly. All runtime methods are `async`.
 
 ## Constructor
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 Agent(
@@ -102,6 +106,8 @@ Construction validates its inputs: unknown names in `deny`/`require_approval`, `
 | `max_metadata_bytes` | 64 KiB | Run `metadata` | `ValueError` |
 | `max_notes_per_run` | 1000 | `submit_note` per run | `NoteLimitExceededError` (a `ValueError`) |
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, Limits
 
@@ -115,6 +121,8 @@ The note cap is enforced by one conditional insert in the store, so concurrent `
 ### Transforming tool results
 
 `tool_result_transform` runs after every successful server-executed tool call — local `@tool` functions and MCP tools alike — and before the result is serialized. Whatever it returns becomes the result: the persisted `ToolInvocation.result`, the `TOOL` message the model sees, and the notifier/stream events all carry the transformed value.
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent, ToolResultContext
@@ -142,6 +150,8 @@ agent = Agent(provider=provider, prompt="...", tools=[query_sales],
 - Sync transforms run on the event loop, so keep them cheap.
 
 ## `run`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def run(
@@ -175,6 +185,8 @@ clarification question.
 
 A successful `RunResult` has `stop_reason`, why the call that produced the final answer stopped (`end_turn`, `max_tokens`, `stop_sequence`, `content_filter`, `refusal`, `pause_turn`, `tool_use`, `other`, or `None` when the provider reported none). If the model hit its output-token limit while writing the answer, the run still ends `success`, but `result.truncated` is `True` and Dendrux logs a warning. Check it before you trust the answer:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run("Summarise this report")
 if result.truncated:
@@ -202,6 +214,8 @@ never delivered (present only when there are any); see
 [Inbox notes](/docs/architecture/inbox).
 
 ## `stream`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 def stream(
@@ -247,6 +261,8 @@ carry `phase`:
 A text block streams before the tool call that makes it commentary, so the
 phase of a delta is usually unknown when it arrives. Clients buffer instead:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 buckets: dict[int, list[str]] = {}
 commentary: set[int] = set()
@@ -290,6 +306,8 @@ not reconstruct the original steps.
 
 The submit family resumes a paused run. Each one matches a pause status (see [Pause and resume](/docs/architecture/pause-resume)). All require persistence and the run to exist.
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 async def submit_tool_results(
     run_id: str, results: list[ToolResult], *, notifier=None,
@@ -322,6 +340,8 @@ Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_no
 
 [//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 ```
@@ -344,6 +364,8 @@ Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMisma
 
 ## `resume_stream`
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 def resume_stream(
     run_id: str, *, tool_results=None, user_input=None, notifier=None,
@@ -356,6 +378,8 @@ Streaming variant of resume: returns a `RunStream` for the resumed run. Image er
 `tenant_id=` works as for the other methods, with one difference in how it fails. Without it, setup failures such as a missing run come back as a `RUN_ERROR` event. With it, a run outside the tenant raises `RunNotFoundError` from the first iteration, before any event, and a store error from the tenant check (a database outage, say) is raised the same way instead of becoming `RUN_ERROR`. The run is left untouched. Catch the exception around the `async for`. If the agent has no persistence, the check is skipped and the usual "requires persistence" `RUN_ERROR` follows.
 
 ## `cancel_run`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def cancel_run(
@@ -371,6 +395,8 @@ Request cancellation. Works for paused runs (atomic CAS to `cancelled`, includin
 `cascade=True` also cancels every non-terminal descendant, deepest first and `run_id` last, over a point-in-time snapshot; per-run outcomes are in `meta["cascade"]`. `tenant_id=` requires the run to belong to exactly that tenant (`None` = untenanted) or `RunNotFoundError` is raised, and limits the cascade to the same tenant. A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
 
 ## `request_pause`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def request_pause(
@@ -388,6 +414,8 @@ Ask a running run to pause durably at its next checkpoint (the top of its next i
 
 ## `submit_note`
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 async def submit_note(
     run_id: str,
@@ -402,6 +430,8 @@ Leave a note for a non-terminal run; returns the note id. The runner delivers pe
 
 ## Heartbeat
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 from dendrux import heartbeat, aheartbeat
 
@@ -413,6 +443,8 @@ Call it from inside a tool that waits a long time (a human, a slow job) to refre
 
 ## `retry`
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 async def retry(run_id: str, *, tenant_id=..., metadata=None, notifier=None, **kwargs) -> RunResult
 ```
@@ -420,6 +452,8 @@ async def retry(run_id: str, *, tenant_id=..., metadata=None, notifier=None, **k
 Start a fresh run that reuses an existing terminal run's input and approximate prior context. Requires persistence. The source run must belong to `tenant_id`, otherwise `RunNotFoundError` is raised (the same error for a missing run and a foreign one; it was `ReplayRunError` or `ValueError` before 0.5.0). Skills the source run activated explicitly stay activated; if one is no longer attached, `retry` raises `ValueError` before creating a run.
 
 ## `close`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def close() -> None

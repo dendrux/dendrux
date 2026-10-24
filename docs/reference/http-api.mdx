@@ -110,6 +110,8 @@ Submit results for a run paused in `WAITING_CLIENT_TOOL`. Race-safe: persist-fir
 
 `results` is `list[ToolResult]`. Every pending call id must be covered; unknown or missing ids raise `InvalidToolResultError` and nothing is claimed. `ToolResult` fields:
 
+[//]: # "docs-test: skip - fragment: relies on `dataclass`, defined by setup shown elsewhere"
+
 ```python
 @dataclass(frozen=True)
 class ToolResult:
@@ -214,6 +216,8 @@ From `dendrux.store`:
 All frozen dataclasses. Top-level fields are immutable; nested `dict`/`list` values are plain JSON (mutating them only touches your in-memory copy, never the DB).
 
 `RunStore` construction:
+
+[//]: # "docs-test: skip - fragment: relies on `RunStore`, defined by setup shown elsewhere"
 
 ```python
 # Store-owned engine (typical)

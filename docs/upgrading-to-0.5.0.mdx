@@ -88,6 +88,8 @@ or fail closed. This does not make every RunStore read a redacted wire response.
 
 `Budget(max_cost_usd=...)` on a model Dendrux cannot price now raises `BudgetConfigurationError`, at construction and again at run start for the model actually used. Before, the budget silently never fired.
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, Budget, ModelPricing, PriceTable
 
@@ -121,6 +123,8 @@ See [Handling provider errors](/docs/recipes/handling-provider-errors) and [Mode
 ### 3. Create one state store per process
 
 The implicit engine built from `DENDRUX_DATABASE_URL` is deprecated. An `Agent` with no `state_store=` or `database_url=` still resolves it, but warns once. The shared engine also guards against use from a second event loop and raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress".
+
+[//]: # "docs-test: skip - fragment: relies on `DATABASE_URL`, defined by setup shown elsewhere"
 
 ```python
 # once, at app startup

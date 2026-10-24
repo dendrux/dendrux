@@ -28,6 +28,8 @@ On Postgres the foreign keys are `ON DELETE CASCADE`, so deleting the run rows r
 
 Block the tenant at your own edge first. Then cancel anything still active so no run writes while you delete:
 
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.store import RunStore
 
@@ -47,6 +49,8 @@ Wait until `list_runs(..., status=active)` returns nothing.
 ```sql
 SELECT sha256 FROM dendrux_blobs WHERE tenant_scope = 't:acme';
 ```
+
+[//]: # "docs-test: skip - fragment: relies on `hashes`, defined by setup shown elsewhere"
 
 ```python
 for sha in hashes:
@@ -93,6 +97,8 @@ DELETE FROM agent_runs       WHERE tenant_id = 'acme';
 ### 4. Remove leftover image rows
 
 After the runs are gone nothing references the tenant's blob rows, so collect them:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 await agent.blobs.collect_garbage(older_than=timedelta(hours=1), limit=1000)

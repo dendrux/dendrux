@@ -15,6 +15,8 @@ This page covers the four things you need to know about runs: their identity, th
 
 When you call `agent.run(...)`, dendrux assigns the run a **ULID**, a 26-character ID that's both unique and time-sortable. That ID is the only thing you need to interact with the run later: pause, resume, cancel, observe.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run("What is 15 + 27?")
 print(result.run_id)
@@ -116,6 +118,8 @@ Two things to notice.
 
 A model can stop in the middle of an answer because it hit its output-token limit. The run still ends `success`, because the loop finished normally. Check `truncated` before you trust the text:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run("Summarise this report")
 if result.truncated:
@@ -180,6 +184,8 @@ def build_agent() -> Agent:
     )
 ```
 
+[//]: # "docs-test: skip - imports the reader's own module `agent_def`, created in an earlier step"
+
 ```python
 # starter.py
 import asyncio
@@ -198,6 +204,8 @@ Real output:
 ```
 waiting_approval 01KPFXP9M96CXNR9JYT8KJ27J0
 ```
+
+[//]: # "docs-test: skip - imports the reader's own module `agent_def`, created in an earlier step"
 
 ```python
 # resumer.py
@@ -223,6 +231,8 @@ Two processes, one database, one logical run. That's the whole pause-resume mode
 ## What this means for your code
 
 You almost never write a state machine when working with dendrux. You just check `result.status` and decide what to do:
+
+[//]: # "docs-test: skip - fragment: the body of a function defined elsewhere"
 
 ```python
 result = await agent.run("...")

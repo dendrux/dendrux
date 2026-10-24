@@ -31,6 +31,8 @@ tenant. Your `owned_run` dependency additionally verifies that the authenticated
 actor may access the requested run, returning its ID or the same 404 as a missing
 run. Both dependencies are application policy, not Dendrux helpers.
 
+[//]: # "docs-test: skip - fragment: relies on `app`, defined by setup shown elsewhere"
+
 ```python
 from fastapi import Depends
 
@@ -68,6 +70,8 @@ whole ASGI response in an absolute deadline, including headers and body sends. I
 closes the follower even if no generator iteration begins or the client disconnects.
 The transport deadline may end before an `end` frame is delivered; reconnect using
 the last successfully received event ID.
+
+[//]: # "docs-test: skip - fragment: relies on `app`, defined by setup shown elsewhere"
 
 ```python
 import asyncio
@@ -154,6 +158,8 @@ the durable database log. A synchronous start can time out before it returns a r
 ID; persist an app request ID and a recovery association before starting long work.
 
 ## Reading historical events
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 events = await store.get_events(run_id, tenant_id=tenant,

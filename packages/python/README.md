@@ -43,6 +43,8 @@ asyncio.run(main())
 Bind cheaply for each request, hand an explicit tool view to an ephemeral
 `Agent`, and close the runtime once during application shutdown:
 
+[//]: # "docs-test: skip - fragment: relies on `current_user`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent
 from dendrux.mcp import MCPRuntime, MCPSource
@@ -96,9 +98,11 @@ and the [end-to-end example](https://github.com/dendrux/dendrux/blob/main/packag
 
 ## API Quick Reference
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from pathlib import Path
-from dendrux.observers.console import ConsoleObserver
+from dendrux.notifiers.console import ConsoleNotifier
 
 async with Agent(
     provider=provider,                  # Required: LLM provider
@@ -109,13 +113,15 @@ async with Agent(
 ) as agent:
     result = await agent.run(
         "What is 15 + 27?",
-        observer=ConsoleObserver(),      # Optional: terminal output
+        notifier=ConsoleNotifier(),      # Optional: terminal output
         tenant_id="org-123",             # Optional: multi-tenant isolation
         metadata={"thread": "t1"},       # Optional: your linking data
     )
 ```
 
 ### RunResult
+
+[//]: # "docs-test: skip - fragment: relies on `result`, defined by setup shown elsewhere"
 
 ```python
 result.answer          # str | None — the agent's final answer
@@ -129,6 +135,8 @@ result.error           # str | None — error message if status is ERROR
 
 ### Tool Options
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 @tool()                                  # Basic server tool
 @tool(target="client")                   # Client-side — agent pauses
@@ -139,4 +147,4 @@ result.error           # str | None — error message if status is ERROR
 
 ## Full Documentation
 
-See the [full documentation on GitHub](https://github.com/dendrux/dendrux) for provider setup, configuration, database guide, CLI, inspection tools you build, observer system, and examples.
+See the [full documentation on GitHub](https://github.com/dendrux/dendrux) for provider setup, configuration, database guide, CLI, inspection tools you build, the notifier system, and examples.

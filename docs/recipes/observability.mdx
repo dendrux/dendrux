@@ -59,6 +59,8 @@ apply your normal database-access controls. It is not an end-user API.
 
 ## Connect tracing
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.notifiers import CompositeNotifier, ConsoleNotifier
 from dendrux.notifiers.otel import OpenTelemetryNotifier

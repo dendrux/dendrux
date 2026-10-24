@@ -112,6 +112,8 @@ Three invariants this mapping enforces:
 
 From `dendrux/runtime/runner.py`:
 
+[//]: # "docs-test: skip - fragment: relies on `state_store`, defined by setup shown elsewhere"
+
 ```python
 # Load pii_mapping for guardrail continuity across pause/resume
 _saved_pii_mapping = await state_store.get_pii_mapping(run_id)
@@ -149,10 +151,14 @@ The tool runs with the real values. The tool result goes into the DB raw, via `o
 
 The LLM only ever sees placeholders, so its raw text response naturally contains them too — `"Nice to meet you, <<PERSON_1>>!"`. That string is what gets persisted to `agent_runs.answer` (the DB-stores-raw invariant is intact). On the way back to the developer, the runner reverses the mapping one more time so `RunResult.answer` reads `"Nice to meet you, anmol!"` — what the user actually wants to see in a chatbot reply.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run(user_input="my name is anmol")
 result.answer            # "Nice to meet you, anmol!" — for the user
 ```
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 run = await store.get_run(result.run_id)

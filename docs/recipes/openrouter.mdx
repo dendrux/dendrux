@@ -7,6 +7,8 @@ description: Run any OpenRouter catalog model through dendrux — native tool ca
 
 `OpenRouterProvider` gives your agents OpenRouter's aggregated catalog — DeepSeek, Llama, Qwen, Mistral, Gemini and hundreds more — through one API key. It is a thin preset over `OpenAIProvider` (OpenRouter speaks the Chat Completions wire format), so streaming, native tool calling, usage capture, pause/resume, and the evidence layer all work unchanged.
 
+[//]: # "docs-test: skip - placeholder: the ellipsis stands for your own tools"
+
 ```python
 from dendrux import Agent
 from dendrux.llm.openrouter import OpenRouterProvider
@@ -55,6 +57,8 @@ dendrux also sends OpenRouter's `provider.require_parameters` routing flag by de
 
 The catalog is queryable as typed, immutable snapshots — no model needed, since discovery isn't tied to a chosen one. There are no filter kwargs either; every field is a filter axis, composed with plain Python:
 
+[//]: # "docs-test: skip - fragment: relies on `OpenRouterProvider`, defined by setup shown elsewhere"
+
 ```python
 async with OpenRouterProvider() as provider:   # discovery-only: no model required
     models = await provider.list_models()
@@ -99,6 +103,8 @@ What this unlocks: model-picker UIs that only offer models that will actually wo
 
 `OpenRouterModel` is a frozen dataclass of JSON-native fields, so it serializes without ceremony:
 
+[//]: # "docs-test: skip - fragment: relies on `OpenRouterProvider`, defined by setup shown elsewhere"
+
 ```python
 from dataclasses import asdict
 
@@ -108,6 +114,8 @@ async with OpenRouterProvider(model="deepseek/deepseek-chat") as provider:
 ```
 
 Run that from anything that fires on a cadence — a weekly cron, a worker tick, a deploy hook. Between refreshes your "which model for this job?" logic reads stored rows and never touches the network:
+
+[//]: # "docs-test: skip - fragment: relies on `load_tool_capable_models`, defined by setup shown elsewhere"
 
 ```python
 rows  = await load_tool_capable_models(min_context=128_000)   # a SQL WHERE
@@ -125,6 +133,8 @@ OpenRouter returns real spend on every response — automatically, no request fl
 - `prompt_tokens_details.cache_write_tokens` → `cache_creation_input_tokens`, alongside the `cached_tokens` → `cache_read_input_tokens` mapping every OpenAI-wire provider already gets.
 
 Both stream and non-stream paths are covered — cost rides the final SSE chunk — and per-call values roll up into run-level totals through the normal accumulator, so `RunStore` and your app can display cost per run with nothing extra to wire:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 resp = await agent.run("Summarize this thread.")
@@ -164,6 +174,8 @@ OpenRouterProvider(model="qwen/qwen3-14b", thinking=True, effort="medium")
 
 `list_models()` carries the metadata to build the control — and to hide "Off" when it isn't allowed:
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 for m in await provider.list_models():
     caps = m.reasoning
@@ -180,6 +192,8 @@ For a token budget instead of an effort level (Anthropic/Gemini/some Qwen), pass
 ### Reasoning tokens vs. reasoning text
 
 These are **separate** response data: `reasoning_tokens` counts internal reasoning the model billed; `reasoning` is a human-readable summary the provider *chose* to expose (often absent). dendrux surfaces both on the public LLM call, so an app can say precisely "reasoning happened, but no readable summary was recorded":
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 call = (await store.get_llm_calls(run_id))[-1]

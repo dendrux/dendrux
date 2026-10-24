@@ -75,6 +75,8 @@ Five things to notice:
 
 `submit_approval(run_id, approved=False, rejection_reason="...")` is the other branch. It resumes the run, skips the tool, and feeds a synthetic failed tool result (carrying the reason) back to the model:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 paused = await agent.run("Refund order 42 using the refund tool.")
 print(paused.status.value)   # waiting_approval
@@ -163,6 +165,8 @@ On resume the run re-checks `deny` and the per-tool call limits before executing
 
 ## Per-call decisions
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import ApprovalDecision
 
@@ -227,6 +231,8 @@ Each entry's `decision` is one of `approved`, `denied`, `not_gated_executed` or 
 ## Approve later
 
 The decision belongs to the pause. Once a run has moved on, there is no way to approve a call after the fact. When "not now, but maybe later" is a real workflow (a review queue, a daily batch), deny the call with a reason that says so, and let your application run the action itself when someone signs it off:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 # 1. Hold the call now. The model is told the action is queued.

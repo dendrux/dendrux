@@ -11,6 +11,8 @@ description: Copy-paste regex patterns for the PromptInjection guardrail, organi
 - **LLM output + tool-call params** — covered by `scan_outgoing` (detection-only; the DB stores raw, the block fires before downstream consumers see the response).
 - **Streaming** — *not covered.* `Agent.stream()` and `Agent.resume_stream` reject `guardrails=` because the outgoing scan needs the full response. Use the non-streaming API when guardrails are required.
 
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
 ```python
 from dendrux import Agent
 from dendrux.guardrails import Pattern, PromptInjection
@@ -50,6 +52,8 @@ Universal defaults for a non-universal threat would create false positives that 
 
 A single `PromptInjection` instance applies the same action to every boundary it scans. To use different actions for different threat classes, instantiate **two** guardrails with **different pattern sets** — one strict `block` instance, one noisy `warn` instance:
 
+[//]: # "docs-test: skip - fragment: relies on `STRICT_PATTERNS`, defined by setup shown elsewhere"
+
 ```python
 guardrails=[
     PromptInjection(action="block", patterns=STRICT_PATTERNS),
@@ -70,6 +74,8 @@ guardrails=[
 ### Customer support / business agents
 
 The classic "override the policy" set. Strong anchors so they don't fire on legitimate phrasing.
+
+[//]: # "docs-test: skip - fragment: relies on `Pattern`, defined by setup shown elsewhere"
 
 ```python
 patterns=[
@@ -92,6 +98,8 @@ patterns=[
 ### RAG / web-fetching agents (indirect injection focus)
 
 The biggest real-world risk: pages, emails, files, and search results that contain hidden instructions. These patterns target the containers attackers hide instructions in.
+
+[//]: # "docs-test: skip - fragment: relies on `Pattern`, defined by setup shown elsewhere"
 
 ```python
 patterns=[
@@ -119,6 +127,8 @@ For RAG agents, prefer `action="warn"` initially. Run for a week, look at the `g
 
 Agents with shell access, code interpreters, or destructive APIs. Pair these patterns with `require_approval=[...]` on the tool itself for defense in depth.
 
+[//]: # "docs-test: skip - fragment: relies on `Pattern`, defined by setup shown elsewhere"
+
 ```python
 patterns=[
     # Model control tokens — no legitimate use in user or tool text
@@ -138,6 +148,8 @@ patterns=[
 ## Composing with other governance layers
 
 `PromptInjection` is one layer. Pair with the others for defense in depth:
+
+[//]: # "docs-test: skip - fragment: relies on `Budget`, defined by setup shown elsewhere"
 
 ```python
 agent = Agent(
@@ -237,6 +249,8 @@ Inspection tools you build can group these events by entity type and iteration.
 ## What's coming in v2
 
 A classifier engine using a fine-tuned model (e.g. `deepset/deberta-v3-base-injection`):
+
+[//]: # "docs-test: skip - planned v2 API, not implemented yet"
 
 ```python
 PromptInjection(

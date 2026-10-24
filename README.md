@@ -106,6 +106,8 @@ Three concepts: `Agent`, `@tool()`, provider. Everything else is opt-in.
 
 Production agent in 10 lines. Add PII redaction, tool deny, human approval, and budget tracking in 5 more:
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 agent = Agent(
     provider=provider,
@@ -180,11 +182,15 @@ results = await sweep(
 
 **Retry terminal runs**: a failed, cancelled, or timed-out run can be retried with prior context from persisted traces. The DB stores raw values (guardrails redact at the LLM boundary only), so retry replays the full original conversation. Same agent or a different one, different model, different tools.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.retry("01JR...")
 ```
 
 **Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`. Keys are unique per tenant.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.run(
@@ -219,6 +225,8 @@ async def write_to_db(data: str) -> str: ...
 ### 🔐 Govern Behavior
 
 Four layers of runtime governance, all opt-in via kwargs on `Agent`:
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent, Budget
@@ -288,6 +296,8 @@ Two event seams, separated by design:
 - **Recorder** (internal): authoritative persistence. Fail-closed with durability retry. If a trace can't be written, the run stops.
 - **Notifier** (external): best-effort UI notifications. Exceptions swallowed. Never kills a run.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.notifiers.console import ConsoleNotifier
 
@@ -321,6 +331,8 @@ The state store links parent and child runs. Read the delegation tree with `RunS
 
 Package instructions, reference files, and scripts as a skill. The model sees a catalogue, pulls a body only when it needs it, and reads files or runs scripts on demand.
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, Skill, SkillExecutionResult, SkillExecutor
 
@@ -340,6 +352,8 @@ Skills build from code, `SKILL.md` text, or a directory. Scripts under `scripts/
 ### ⏸️ Pause for the Real World
 
 **Client-side tools**: define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
+
+[//]: # "docs-test: skip - fragment: relies on `db_url`, defined by setup shown elsewhere"
 
 ```python
 @tool(target="client")
@@ -384,6 +398,8 @@ Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schem
 ### 🔀 Streaming
 
 Stream events as they happen: token-by-token text, tool calls, lifecycle events:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 # Full event stream
@@ -450,6 +466,8 @@ All providers accept `max_tokens`, `temperature`, `max_retries`, and the deadlin
 ## Database
 
 SQLite works with zero config. Tables auto-create on first use.
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 agent = Agent(

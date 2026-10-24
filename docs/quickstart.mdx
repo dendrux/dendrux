@@ -29,11 +29,15 @@ Pick one of three patterns:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
+
 ```python
 provider = AnthropicProvider(model="claude-sonnet-4-6")  # picks up env var
 ```
 
 **B. Explicit argument.** Make the source of the key visible in code. Useful when you load it from a secrets manager.
+
+[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
 
 ```python
 import os
@@ -49,6 +53,8 @@ provider = AnthropicProvider(
 pip install python-dotenv
 echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 ```
+
+[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
 
 ```python
 from dotenv import load_dotenv
@@ -103,6 +109,8 @@ Three things worth noticing:
 
 `starter.py`:
 
+[//]: # "docs-test: skip - imports the reader's own module `agent_def`, created in an earlier step"
+
 ```python
 import asyncio
 from agent_def import build_agent
@@ -139,6 +147,8 @@ The agent called the LLM, the LLM decided to call `refund`, dendrux saw the appr
 ## 5. Resume from a different process
 
 `resumer.py`:
+
+[//]: # "docs-test: skip - imports the reader's own module `agent_def`, created in an earlier step"
 
 ```python
 import asyncio

@@ -63,6 +63,8 @@ The resolved cursor is passed into `RunStore.get_events(run_id, after_sequence_i
 
 A client that last saw `seq=3` and reconnects gets the rest of the run, no duplicates and no gaps:
 
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
 ```python
 events = await store.get_events(RUN_ID, after_sequence_index=3)
 print([e.sequence_index for e in events])

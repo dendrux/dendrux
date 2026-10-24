@@ -28,6 +28,8 @@ That pulls `opentelemetry-api` only. Your application installs whatever SDK + ex
 
 If your app already has OTel wired up (most do, via the auto-instrumentors for FastAPI / SQLAlchemy / requests / etc.), the entire integration is one extra notifier:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.notifiers.otel import OpenTelemetryNotifier
 
@@ -38,6 +40,8 @@ result = await agent.run(
 ```
 
 If you're already passing a `ConsoleNotifier`, compose:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 from dendrux.notifiers import CompositeNotifier, ConsoleNotifier

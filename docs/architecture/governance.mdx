@@ -189,6 +189,8 @@ At run start it stores a short digest of the governance configuration. On resume
 
 What happens on a mismatch is your choice:
 
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
 ```python
 Agent(..., on_governance_change="warn")    # default in 0.5: emit governance.changed and log; resume proceeds
 Agent(..., on_governance_change="raise")   # raise GovernanceMismatchError; the run stays paused

@@ -7,6 +7,8 @@ description: The read-only facade over Dendrux's six tables. Constructors, every
 
 `RunStore` is the public, read-only way to query everything Dendrux persisted about a run. It is a plain Python object you can call from any code (routes, admin scripts, background jobs) it supports routes and inspection tools owned by your app.
 
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.store import RunStore
 
@@ -18,6 +20,8 @@ async with store:
 
 ## Constructors and lifecycle
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 @classmethod
 def from_database_url(database_url: str) -> RunStore     # store owns the engine
@@ -27,6 +31,8 @@ async def close() -> None
 ```
 
 Both constructors also take `blob_store=` (a `BlobStore`) when the deployment keeps image bytes outside the database; use the same store as the `Agent`. Two members relate to images:
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 store.blobs                                                       # BlobAccessor: read, info, references, purge, collect_garbage
@@ -56,6 +62,8 @@ from dendrux import UNSCOPED
 [//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
 
 ## Read methods
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def list_runs(
@@ -115,6 +123,8 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False,
 
 Two calls exist to serve a frontend from your own routes. Both require an explicit `tenant_id` (a string, `None`, or `UNSCOPED`; leaving it out is a `TypeError`) and never fail open. The recipe is [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
 ```python
 async def get_pending(run_id: str, *, tenant_id: TenantScope) -> PendingPause | None
 
@@ -150,6 +160,8 @@ The feed bounds iteration; your HTTP transport must bound blocked sends and call
 
 A delegated run has child runs, which may have children of their own. `get_subtree` returns the whole tree under a run, with usage rolled up:
 
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+
 ```python
 tree = await store.get_subtree(run_id)
 for node in tree.nodes:                       # breadth-first, root first
@@ -166,6 +178,8 @@ print(tree.usage.input_tokens, tree.usage.output_tokens, tree.usage.cost_usd)
 
 ### `get_notes`
 
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+
 ```python
 notes = await store.get_notes(run_id, undelivered_only=True)
 ```
@@ -178,6 +192,8 @@ The run's [inbox](/docs/architecture/inbox) notes as `RunNote` records (`note_id
 
 `get_events`, `get_llm_calls` and `get_tool_invocations` accept `before=`, an exclusive upper bound on `created_at`. It must be timezone-aware; a naive datetime raises `ValueError`. `get_events` also accepts `event_types=`, a list of event type strings to keep (an empty list matches nothing):
 
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+
 ```python
 from datetime import UTC, datetime
 
@@ -188,6 +204,8 @@ old = await store.get_llm_calls(run_id, before=datetime(2026, 10, 1, tzinfo=UTC)
 ### `metadata_filter`
 
 `list_runs` and `count_runs` accept `metadata_filter: dict[str, Any]` (the HTTP router does not expose this). It does exact-match equality across every key in the run's `meta` JSON, AND across keys (`jsonb @>` on Postgres, repeated `json_extract` on SQLite). Keys are restricted to `^[A-Za-z0-9_-]+$`; nested paths are out of scope. The canonical use is per-conversation observability:
+
+[//]: # "docs-test: skip - fragment: continues after a step that closed the store"
 
 ```python
 runs = await store.list_runs(metadata_filter={"thread_id": "thread_abc"})

@@ -117,6 +117,8 @@ MCP tool sources raise their own typed hierarchy under `MCPError`, importable fr
 
 ## Example: mapping errors in a write route
 
+[//]: # "docs-test: skip - fragment: relies on `router`, defined by setup shown elsewhere"
+
 ```python
 from fastapi import APIRouter, Depends, HTTPException
 from dendrux.errors import (

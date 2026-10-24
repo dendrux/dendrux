@@ -88,6 +88,8 @@ Four things to pull out of that trace:
 
 From `dendrux/loops/react.py`, the relevant branch of the tool-dispatch phase:
 
+[//]: # "docs-test: skip - fragment: relies on `tc`, defined by setup shown elsewhere"
+
 ```python
 if tc.name in deny_set:
     deny_msg = f"Tool '{tc.name}' is denied by policy."
@@ -120,6 +122,8 @@ Three observations about the exact code:
 ## Construction-time validation
 
 The deny list is not just enforced at runtime; `Agent` validates it at construction:
+
+[//]: # "docs-test: skip - fragment: relies on `self`, defined by setup shown elsewhere"
 
 ```python
 # From dendrux/agent.py
@@ -172,6 +176,8 @@ The run-control and read APIs take a `tenant_id=` argument that makes a call beh
 `tenant_id=None` is a real value meaning "untenanted runs only", which is different from leaving the argument out. A `before_tool` hook sees the run's tenant as `ToolCallContext.tenant_id`.
 
 Since 0.4.1 the submit and resume methods take the same keyword-only `tenant_id=`. A run outside the tenant raises `RunNotFoundError`, indistinguishable from a missing run, so a caller cannot learn that another tenant's run exists. The check is a read that happens first, and a run's tenant never changes, so it cannot race. Nothing is persisted on a mismatch.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
