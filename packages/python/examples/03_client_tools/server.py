@@ -88,7 +88,7 @@ def create_demo_app():  # type: ignore[no-untyped-def]
 
     from dendrux.http import make_read_router
     from dendrux.llm.anthropic import AnthropicProvider
-    from dendrux.store import RunStore
+    from dendrux.store import UNSCOPED, RunStore
     from dendrux.types import ToolResult
 
     load_dotenv(Path(__file__).resolve().parents[4] / ".env")
@@ -127,7 +127,7 @@ def create_demo_app():  # type: ignore[no-untyped-def]
     # Mount Dendrux's read router — it owns run listing, run detail, events,
     # drill-downs, and the SSE stream (the hard transport piece).
     app.include_router(
-        make_read_router(store=store, authorize=allow_all),
+        make_read_router(store=store, authorize=allow_all, tenant_resolver=UNSCOPED),
         prefix="/api",
     )
 

@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+
+from dendrux.runtime.state import UNSCOPED, _Unscoped
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -53,10 +56,43 @@ _SSE_HEARTBEAT_INTERVAL_S = 15.0
 _SSE_POLL_INTERVAL_S = 0.5
 
 
+@dataclass(frozen=True)
+class _ReadRouterConfig:
+    """Validated ``make_read_router`` options shared by the route handlers."""
+
+    tenant_dependency: Callable[..., Any]
+    include_payloads: bool
+    sse_max_connections: int
+    sse_max_duration_s: float
+
+
+def _unscoped_tenant() -> _Unscoped:
+    return UNSCOPED
+
+
+def _tenant_dependency(tenant_resolver: Callable[..., Any] | _Unscoped) -> Callable[..., Any]:
+    """The FastAPI dependency resolving the caller's tenant scope.
+
+    The ``UNSCOPED`` sentinel itself stands for a constant all-tenant resolver.
+    """
+    if isinstance(tenant_resolver, _Unscoped):
+        return _unscoped_tenant
+    if not callable(tenant_resolver):
+        raise TypeError(
+            "tenant_resolver must be a FastAPI dependency callable or UNSCOPED, "
+            f"got {type(tenant_resolver).__name__}."
+        )
+    return tenant_resolver
+
+
 def make_read_router(
     *,
     store: RunStore,
     authorize: Callable[..., Any],
+    tenant_resolver: Callable[..., Any] | _Unscoped,
+    include_payloads: bool = False,
+    sse_max_connections: int = 500,
+    sse_max_duration_s: float = 900,
 ) -> APIRouter:
     """Build a mountable read-only router backed by ``store``.
 
@@ -65,11 +101,41 @@ def make_read_router(
         authorize: A FastAPI dependency callable. Runs on every authenticated
             route. Raise ``HTTPException`` inside to deny; return any value
             (ignored) to allow. ``/health`` bypasses this dependency.
+        tenant_resolver: Required. A FastAPI dependency returning the
+            caller's tenant (``str``), ``None`` (untenanted runs only) or
+            ``UNSCOPED`` (every tenant), or the ``UNSCOPED`` sentinel itself
+            for single-tenant apps.
+        include_payloads: Include raw payloads (provider requests and
+            responses, tool arguments and results, the system prompt, the
+            PII mapping) in responses. Off by default.
+        sse_max_connections: Most concurrent SSE connections this router
+            (process) serves.
+        sse_max_duration_s: Longest one SSE connection stays open, in seconds.
 
     Returns:
         An ``APIRouter`` suitable for ``app.include_router(...)``. The
         caller owns routing prefixes, CORS, TLS, and deployment.
     """
+    if not isinstance(include_payloads, bool):
+        raise TypeError("include_payloads must be a bool.")
+    if (
+        isinstance(sse_max_connections, bool)
+        or not isinstance(sse_max_connections, int)
+        or sse_max_connections <= 0
+    ):
+        raise ValueError("sse_max_connections must be a positive int.")
+    if (
+        isinstance(sse_max_duration_s, bool)
+        or not isinstance(sse_max_duration_s, (int, float))
+        or not 0 < sse_max_duration_s < float("inf")
+    ):
+        raise ValueError("sse_max_duration_s must be a positive number of seconds.")
+    config = _ReadRouterConfig(
+        tenant_dependency=_tenant_dependency(tenant_resolver),
+        include_payloads=include_payloads,
+        sse_max_connections=sse_max_connections,
+        sse_max_duration_s=float(sse_max_duration_s),
+    )
     router = APIRouter()
 
     # /health bypasses auth so external probes (Kubernetes, load balancers)
@@ -174,7 +240,7 @@ def make_read_router(
         cursor = _resolve_sse_cursor(request.headers.get("last-event-id"), after)
 
         return StreamingResponse(
-            _sse_event_generator(store, run_id, cursor),
+            _sse_event_generator(store, run_id, cursor, config=config),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -255,6 +321,8 @@ async def _sse_event_generator(
     store: RunStore,
     run_id: str,
     cursor: int | None,
+    *,
+    config: _ReadRouterConfig | None = None,
 ) -> AsyncIterator[str]:
     """Yield SSE frames (events + heartbeat comments) until disconnect.
 

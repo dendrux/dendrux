@@ -49,7 +49,7 @@ from dendrux.errors import (
 )
 from dendrux.http import make_read_router
 from dendrux.runtime.state import SQLAlchemyStateStore
-from dendrux.store import RunStore
+from dendrux.store import UNSCOPED, RunStore
 from dendrux.types import ToolResult
 
 from agent_setup import build_anthropic_agent, build_openai_agent  # type: ignore[import-not-found]  # isort: skip
@@ -206,7 +206,7 @@ def create_demo_app() -> FastAPI:
     # --- Dendrux-provided surfaces --------------------------------------
     store = RunStore.from_engine(engine)
     app.include_router(
-        make_read_router(store=store, authorize=require_caller),
+        make_read_router(store=store, authorize=require_caller, tenant_resolver=UNSCOPED),
         prefix="/api/dendrux",
     )
     app.mount("/dashboard", create_dashboard_api(state_store))

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux.db.models import Base
 from dendrux.http import make_read_router
 from dendrux.runtime.state import SQLAlchemyStateStore
-from dendrux.store import RunStore
+from dendrux.store import UNSCOPED, RunStore
 from dendrux.types import UsageStats
 
 # ------------------------------------------------------------------
@@ -65,7 +65,7 @@ def _build_app(store: RunStore, authorize=None) -> FastAPI:
         authorize = _allow
 
     app = FastAPI()
-    app.include_router(make_read_router(store=store, authorize=authorize))
+    app.include_router(make_read_router(store=store, authorize=authorize, tenant_resolver=UNSCOPED))
     return app
 
 
