@@ -3,7 +3,6 @@
 Internal module — not part of the public API. Contains small, pure functions
 that all three providers (Anthropic, OpenAI, OpenAI Responses) share:
   - Tool call JSON parsing (one never-raising parser for batch and stream)
-  - Error factories for timeout and connection failures
   - Message history helpers (call index, tool message resolution)
   - Reasoning replay selection (which stored blocks go back on the wire)
 """
@@ -95,34 +94,6 @@ def build_tool_call(
         provider_tool_call_id=provider_tool_call_id,
         raw_arguments=raw,
         parse_error=parse_error,
-    )
-
-
-# ------------------------------------------------------------------
-# Error factories
-# ------------------------------------------------------------------
-
-
-def timeout_error(provider_class: str, timeout: float) -> TimeoutError:
-    """Build a TimeoutError with a helpful message pointing to the fix."""
-    return TimeoutError(
-        f"LLM request timed out after {timeout}s. "
-        f"The model may need more time for large outputs. "
-        f"Increase timeout: {provider_class}(model=..., timeout=300)"
-    )
-
-
-def connection_error(
-    api_name: str,
-    model: str,
-    exc: Exception,
-    *,
-    streaming: bool = False,
-) -> ConnectionError:
-    """Build a ConnectionError with model context."""
-    verb = "failed during streaming" if streaming else "failed"
-    return ConnectionError(
-        f"Connection to {api_name} {verb}. Model: {model}. Original error: {exc}"
     )
 
 

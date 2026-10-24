@@ -492,7 +492,7 @@ class TestComplete:
         )
 
         msgs = [Message(role=Role.USER, content="Hi")]
-        with pytest.raises(TimeoutError, match="timed out.*timeout=300"):
+        with pytest.raises(TimeoutError, match="timed out.*call_timeout"):
             await provider.complete(msgs)
 
     async def test_complete_forwards_kwargs(self, provider: OpenAIProvider) -> None:
@@ -1271,7 +1271,7 @@ class TestBoundaryHardening:
         provider._client.chat.completions.create = AsyncMock(
             side_effect=openai.APIConnectionError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(ConnectionError, match="Connection to OpenAI API failed"):
+        with pytest.raises(ConnectionError, match="Could not reach the provider"):
             await provider.complete([Message(role=Role.USER, content="Hi")])
 
     async def test_stream_connection_error_mapped(self, provider: OpenAIProvider) -> None:
@@ -1279,7 +1279,7 @@ class TestBoundaryHardening:
         provider._client.chat.completions.create = AsyncMock(
             side_effect=openai.APIConnectionError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(ConnectionError, match="Connection to OpenAI API failed"):
+        with pytest.raises(ConnectionError, match="Could not reach the provider"):
             async for _ in provider.complete_stream(
                 [Message(role=Role.USER, content="Hi")],
             ):

@@ -428,8 +428,12 @@ class TestAnthropicErrors:
 
     async def test_text_only_keeps_sdk_error(self, claude: AnthropicProvider) -> None:
         wire_anthropic(claude, json_response(400, ANTHROPIC_REJECTED_UNLOCATED))
-        with pytest.raises(anthropic.BadRequestError):
+        with pytest.raises(ProviderError) as info:
             await claude.complete(TEXT_ONLY)
+        # Text-only: a typed error with the SDK error chained (0.5.0, B10).
+        assert not isinstance(info.value, ImageRejectedError)
+        assert info.value.category == "rejected"
+        assert isinstance(info.value.__cause__, anthropic.BadRequestError)
 
     async def test_timeout_has_no_request_attached(self, claude: AnthropicProvider) -> None:
         def boom(request: httpx.Request) -> httpx.Response:
@@ -628,8 +632,11 @@ class TestResponsesErrors:
         self, responses: OpenAIResponsesProvider
     ) -> None:
         wire_openai(responses, json_response(400, RESPONSES_UNSUPPORTED))
-        with pytest.raises(NotImplementedError):
+        # Only a 400 that says streaming is unsupported is NotImplementedError.
+        with pytest.raises(ProviderError) as info:
             await drain(responses.complete_stream(TEXT_ONLY))
+        assert info.value.category == "rejected"
+        assert isinstance(info.value.__cause__, openai.BadRequestError)
 
     @pytest.mark.parametrize("terminal", ["response.failed", "error"])
     async def test_mid_stream_rejection_after_delta(
@@ -794,7 +801,8 @@ class TestFixRoundErrors:
         wire_openai(chat, boom)
         with pytest.raises(ProviderError) as info:
             await chat.complete(USER_IMAGE)
-        assert "Increase timeout" in info.value.message
+        assert "call_timeout" in info.value.message
+        assert info.value.category == "timeout"
         assert_clean(info.value)
 
     async def test_in_stream_error_closes_stream(self, chat: OpenAIProvider) -> None:

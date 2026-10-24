@@ -11,6 +11,7 @@ import pytest
 from anthropic.types import Message as AnthropicMessage
 from anthropic.types import TextBlock, ToolUseBlock, Usage
 
+from dendrux.errors import ProviderStreamIncompleteError
 from dendrux.llm._stop_reason import (
     anthropic_stop_reason,
     chat_stop_reason,
@@ -304,10 +305,15 @@ async def _astream(chunks: list[Any]) -> Any:
 
 
 def _chat_chunks(finish_reason: str | None) -> list[_Chunk]:
-    return [
+    chunks = [
         _Chunk(choices=[_StreamChoice(delta=_Delta(content="cu"))]),
         _Chunk(choices=[_StreamChoice(delta=_Delta(content="t"), finish_reason=finish_reason)]),
     ]
+    if finish_reason is None:
+        # A backend that never sends finish_reason still ends with a usage
+        # chunk; a stream with neither is incomplete (0.5.0).
+        chunks.append(_Chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1)))
+    return chunks
 
 
 def _chat_providers() -> list[Any]:
@@ -454,18 +460,18 @@ class TestResponsesProvider:
         done = await _done(responses_provider)
         assert done.stop_reason == "end_turn"
 
-    async def test_stream_without_terminal_event_is_none(
+    async def test_stream_without_terminal_event_raises(
         self, responses_provider: OpenAIResponsesProvider, monkeypatch: Any
     ) -> None:
+        """A stream cut before ``response.completed`` is an error, not a short answer."""
         events = [_REvent(type="response.output_text.delta", delta="ok")]
         monkeypatch.setattr(
             responses_provider._client.responses,
             "create",
             AsyncMock(return_value=_astream(events)),
         )
-        done = await _done(responses_provider)
-        assert done.stop_reason is None
-        assert done.raw_stop_reason is None
+        with pytest.raises(ProviderStreamIncompleteError):
+            await _done(responses_provider)
 
 
 # ---------------------------------------------------------------------------
