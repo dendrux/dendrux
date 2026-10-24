@@ -1350,7 +1350,6 @@ class TestRetryAndReplay:
         await store.save_run_event(
             source.run_id,
             event_type="image.rejected",
-            sequence_index=99,
             iteration_index=1,
             data={"image_id": "img_x", "sha256": sha, "tenant_scope": "t:acme"},
         )

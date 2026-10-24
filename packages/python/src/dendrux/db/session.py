@@ -4,10 +4,17 @@ Zero-config promise: first run() call auto-creates ~/.dendrux/dendrux.db
 with all tables. No 'dendrux db migrate' needed for SQLite.
 
 Postgres users set DENDRUX_DATABASE_URL and use Alembic migrations.
+
+The shared engine belongs to the event loop that created it. Using it from
+another loop on Postgres raises a clear ``RuntimeError`` (instead of
+asyncpg's "another operation is in progress"). Applications should create
+one state store per process at startup and pass ``state_store=`` to every
+Agent. URLs in messages are always masked.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -20,6 +27,7 @@ from sqlalchemy.orm import sessionmaker
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+from dendrux._redact import mask_database_url
 from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._sqlite_sync import create_sqlite_schema
@@ -50,11 +58,42 @@ def _published(resolved_url: str) -> AsyncEngine | None:
         return None
     if _engine_url != resolved_url:
         raise RuntimeError(
-            f"get_engine() already initialized with URL {_engine_url!r}, "
-            f"cannot reinitialize with {resolved_url!r}. "
+            f"get_engine() already initialized with URL {mask_database_url(_engine_url or '')}, "
+            f"cannot reinitialize with {mask_database_url(resolved_url)}. "
             f"Call reset_engine() first to change databases."
         )
     return _engine
+
+
+def _bind_to_current_loop(engine: AsyncEngine) -> None:
+    """Make every pool checkout on another event loop fail with a clear error.
+
+    asyncpg connections belong to the loop that opened them; sharing the
+    global engine across loops (a new loop per request, ``asyncio.run`` per
+    call, worker threads) otherwise fails deep inside the driver. SQLite
+    connections are not loop-bound, so SQLite engines are left alone.
+    """
+    if engine.dialect.name == "sqlite":
+        return
+    from sqlalchemy import event
+
+    owner = asyncio.get_running_loop()
+
+    def _check_loop(*_args: object) -> None:
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if current is not owner:
+            raise RuntimeError(
+                "The shared dendrux database engine (from DENDRUX_DATABASE_URL) was created "
+                "on a different event loop and cannot be used from this one. Create one "
+                "state store per process on the loop that serves requests and pass "
+                "state_store= to every Agent, or call dendrux.db.session.reset_engine() "
+                "before switching loops."
+            )
+
+    event.listen(engine.sync_engine, "checkout", _check_loop)
 
 
 async def get_engine(url: str | None = None) -> AsyncEngine:
@@ -102,6 +141,7 @@ async def get_engine(url: str | None = None) -> AsyncEngine:
             await candidate.dispose()
             raise
 
+        _bind_to_current_loop(candidate)
         with _engine_lock:
             if _generation == generation and _engine is None:
                 _engine = candidate

@@ -60,7 +60,6 @@ async def _create_run(
         await store.save_run_event(
             rid,
             event_type="run.started",
-            sequence_index=0,
             data={"agent_name": agent_name},
         )
 

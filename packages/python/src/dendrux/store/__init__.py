@@ -49,10 +49,13 @@ from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
 from dendrux.runtime.state import (
+    MAX_LIST_OFFSET,
     UNSCOPED,
     SQLAlchemyStateStore,
     StateStore,
     TenantScope,
+    _check_scope,
+    _to_aware_utc,
     _Unscoped,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
@@ -68,6 +71,9 @@ if TYPE_CHECKING:
 
 # ``RunNotFoundError`` is re-exported from :mod:`dendrux.errors`: one class
 # everywhere since 0.5.0 (its constructor takes the run id).
+
+ERROR_INFO_META_KEY = "dendrux.error_info"
+"""``agent_runs.meta`` key holding a provider failure's :class:`ErrorInfo` dict."""
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +375,14 @@ class RunStore:
     Engine lifecycle: ``from_database_url`` creates and owns the engine;
     ``close()`` (or ``async with``) disposes it. ``from_engine`` leaves
     engine ownership with the caller; ``close()`` is then a no-op.
+
+    Tenancy: every read takes ``tenant_id``. Omitted (``UNSCOPED``) is a
+    trusted all-tenant read. A string scopes the read to that tenant and
+    ``None`` to untenanted runs; a run outside the scope reads exactly like a
+    missing one (``None``, an empty list, or ``RunNotFoundError`` where a
+    missing run raises). Scoping is applied in the same SQL query on the
+    built-in store; a custom ``StateStore`` whose read methods do not take
+    ``tenant_id`` is scoped by reading the run first.
     """
 
     def __init__(self, state_store: StateStore, *, blob_store: BlobStore | None = None) -> None:
@@ -470,14 +484,20 @@ class RunStore:
         status: str | list[str] | None = None,
         agent_name: str | None = None,
         parent_run_id: str | None = None,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[RunSummary]:
-        """List runs with SQL-side filtering and pagination.
+        """List runs with SQL-side filtering and pagination, newest first.
+
+        ``tenant_id``: omit (``UNSCOPED``) for every tenant, a string for that
+        tenant, ``None`` for untenanted runs only (changed in 0.5.0). ``limit``
+        is clamped to 1..1000 and ``offset`` may be at most 10,000.
+        ``started_after`` / ``started_before`` must be timezone-aware; they are
+        compared in UTC.
 
         ``metadata_filter`` matches runs where every given key/value pair
         is present at the top level of the run's ``metadata`` (the dev
@@ -486,6 +506,9 @@ class RunStore:
         keys are restricted to ``[A-Za-z0-9_-]+``, nested paths are not
         supported.
         """
+        _check_scope(tenant_id)
+        if offset > MAX_LIST_OFFSET:
+            raise ValueError(f"offset must be at most {MAX_LIST_OFFSET}, got {offset}.")
         records = await self._state.list_runs(
             limit=limit,
             offset=offset,
@@ -493,8 +516,8 @@ class RunStore:
             status=status,
             agent_name=agent_name,
             parent_run_id=parent_run_id,
-            started_after=started_after,
-            started_before=started_before,
+            started_after=_utc(started_after),
+            started_before=_utc(started_before),
             metadata_filter=metadata_filter,
         )
         return [_run_to_summary(r) for r in records]
@@ -505,25 +528,26 @@ class RunStore:
         status: str | list[str] | None = None,
         agent_name: str | None = None,
         parent_run_id: str | None = None,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> int:
         """Count runs matching the same filters as ``list_runs``."""
+        _check_scope(tenant_id)
         return await self._state.count_runs(
             tenant_id=tenant_id,
             status=status,
             agent_name=agent_name,
             parent_run_id=parent_run_id,
-            started_after=started_after,
-            started_before=started_before,
+            started_after=_utc(started_after),
+            started_before=_utc(started_before),
             metadata_filter=metadata_filter,
         )
 
-    async def get_run(self, run_id: str) -> RunDetail | None:
-        """Fetch a single run's detail, or ``None`` if it does not exist."""
-        record = await self._state.get_run(run_id)
+    async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunDetail | None:
+        """Fetch a single run's detail, or ``None`` if it does not exist or is out of scope."""
+        record = await self._scoped_run(run_id, tenant_id)
         if record is None:
             return None
         return _run_to_detail(record)
@@ -536,22 +560,27 @@ class RunStore:
         limit: int | None = None,
         event_types: list[str] | None = None,
         before: datetime | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[StoredEvent]:
         """Read events for a run in ``sequence_index`` order.
 
         ``after_sequence_index`` is an exclusive cursor. Pass the previous
-        batch's last ``sequence_index`` to continue. ``event_types`` keeps
-        only those types (an empty list matches nothing). ``before`` is an
-        exclusive, timezone-aware upper bound on ``created_at``.
+        batch's last ``sequence_index`` to continue. ``limit`` is clamped to
+        1..1000 (``None`` reads every event). ``event_types`` keeps only those
+        types (an empty list matches nothing). ``before`` is an exclusive,
+        timezone-aware upper bound on ``created_at``. Empty when the run is
+        outside ``tenant_id``.
         """
-        rows = await self._state.get_run_events(
+        rows = await self._scoped_read(
+            self._state.get_run_events,
             run_id,
+            tenant_id,
             after_sequence_index=after_sequence_index,
             limit=limit,
             event_types=event_types,
             before=before,
         )
-        return [_event_to_stored(r) for r in rows]
+        return [_event_to_stored(r) for r in rows or []]
 
     async def get_subtree(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunSubtree:
         """Return a run, all its descendants, and live rolled-up usage.
@@ -595,15 +624,17 @@ class RunStore:
         *,
         after_sequence_index: int | None = None,
         poll_interval_s: float = 0.5,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> AsyncIterator[StoredEvent]:
         """Stream events as they land in the durable log.
 
         Raises :class:`RunNotFoundError` before the first yield if
-        ``run_id`` does not exist. The caller decides when to stop —
-        typically by breaking out of ``async for`` on a terminal
-        ``event_type`` or by calling ``aclose()`` on the returned generator.
+        ``run_id`` does not exist or is outside ``tenant_id``. The caller
+        decides when to stop — typically by breaking out of ``async for`` on
+        a terminal ``event_type`` or by calling ``aclose()`` on the returned
+        generator. A run's tenant never changes, so the scope is checked once.
         """
-        run = await self._state.get_run(run_id)
+        run = await self._scoped_run(run_id, tenant_id)
         if run is None:
             raise RunNotFoundError(run_id)
 
@@ -633,18 +664,22 @@ class RunStore:
         limit: int | None = None,
         offset: int = 0,
         before: datetime | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[LLMCall]:
         """Return LLM interactions for a run. ``limit``/``offset`` push
         pagination into SQL. ``before`` is an exclusive, timezone-aware
-        upper bound on ``created_at``."""
-        rows = await self._state.get_llm_interactions(
+        upper bound on ``created_at``. Empty when the run is outside
+        ``tenant_id``."""
+        rows = await self._scoped_read(
+            self._state.get_llm_interactions,
             run_id,
+            tenant_id,
             iteration_index=iteration,
             limit=limit,
             offset=offset,
             before=before,
         )
-        return [_llm_to_public(r) for r in rows]
+        return [_llm_to_public(r) for r in rows or []]
 
     async def get_tool_invocations(
         self,
@@ -654,18 +689,22 @@ class RunStore:
         limit: int | None = None,
         offset: int = 0,
         before: datetime | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[ToolInvocation]:
         """Return tool invocations for a run. ``limit``/``offset`` push
         pagination into SQL. ``before`` is an exclusive, timezone-aware
-        upper bound on ``created_at``."""
-        rows = await self._state.get_tool_calls(
+        upper bound on ``created_at``. Empty when the run is outside
+        ``tenant_id``."""
+        rows = await self._scoped_read(
+            self._state.get_tool_calls,
             run_id,
+            tenant_id,
             iteration_index=iteration,
             limit=limit,
             offset=offset,
             before=before,
         )
-        return [_tool_to_public(r) for r in rows]
+        return [_tool_to_public(r) for r in rows or []]
 
     async def get_traces(
         self,
@@ -673,14 +712,19 @@ class RunStore:
         *,
         limit: int | None = None,
         offset: int = 0,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[TraceEntry]:
         """Return the conversation trace (user / assistant / tool messages)
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
-        pagination into SQL."""
-        rows = await self._state.get_traces(run_id, limit=limit, offset=offset)
-        return [_trace_to_public(r) for r in rows]
+        pagination into SQL. Empty when the run is outside ``tenant_id``."""
+        rows = await self._scoped_read(
+            self._state.get_traces, run_id, tenant_id, limit=limit, offset=offset
+        )
+        return [_trace_to_public(r) for r in rows or []]
 
-    async def get_pii_mapping(self, run_id: str) -> dict[str, str]:
+    async def get_pii_mapping(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> dict[str, str]:
         """Return the PII placeholder → real-value mapping for a run.
 
         The mapping is the audit key that links raw traces persisted in
@@ -689,9 +733,10 @@ class RunStore:
         or exports.
 
         Empty dict if the run has no mapping (no PII guardrail active,
-        no entities detected, or the run does not exist).
+        no entities detected, the run does not exist, or it is outside
+        ``tenant_id``).
         """
-        mapping = await self._state.get_pii_mapping(run_id)
+        mapping = await self._scoped_read(self._state.get_pii_mapping, run_id, tenant_id)
         return mapping or {}
 
     async def get_notes(
@@ -732,7 +777,9 @@ class RunStore:
             for r in rows
         ]
 
-    async def get_pauses(self, run_id: str) -> list[PausePair]:
+    async def get_pauses(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> list[PausePair]:
         """Derive pause/resume cycles from ``run_events``.
 
         Pairing is nearest-neighbor: each ``run.paused`` pairs with the
@@ -742,10 +789,48 @@ class RunStore:
 
         Filters event_type at the SQL layer (only ``run.paused`` and
         ``run.resumed`` rows are fetched). Never reads
-        ``AgentRun.pause_data``.
+        ``AgentRun.pause_data``. Empty when the run is outside ``tenant_id``.
         """
-        rows = await self._state.get_run_events(run_id, event_types=["run.paused", "run.resumed"])
-        return _derive_pauses(rows)
+        rows = await self._scoped_read(
+            self._state.get_run_events,
+            run_id,
+            tenant_id,
+            event_types=["run.paused", "run.resumed"],
+        )
+        return _derive_pauses(rows or [])
+
+    # ------------------------------------------------------------------
+    # Tenant scoping
+    # ------------------------------------------------------------------
+
+    async def _scoped_run(self, run_id: str, tenant_id: TenantScope) -> Any:
+        """The run record within ``tenant_id``, or None (missing and foreign alike)."""
+        _check_scope(tenant_id)
+        if isinstance(tenant_id, _Unscoped):
+            return await self._state.get_run(run_id)
+        getter = self._state.get_run
+        if _accepts_tenant(getter):
+            return await getter(run_id, tenant_id=tenant_id)  # type: ignore[call-arg]
+        record = await getter(run_id)
+        return record if record is not None and record.tenant_id == tenant_id else None
+
+    async def _scoped_read(
+        self, method: Any, run_id: str, tenant_id: TenantScope, **kwargs: Any
+    ) -> Any:
+        """Call a per-run read within ``tenant_id``; None when the run is out of scope.
+
+        The built-in store applies the scope as a predicate of the same
+        query. A custom store's method without ``tenant_id`` gets a run
+        lookup first (a run's tenant never changes, so this cannot race).
+        """
+        _check_scope(tenant_id)
+        if isinstance(tenant_id, _Unscoped):
+            return await method(run_id, **kwargs)
+        if _accepts_tenant(method):
+            return await method(run_id, tenant_id=tenant_id, **kwargs)
+        if await self._scoped_run(run_id, tenant_id) is None:
+            return None
+        return await method(run_id, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +856,32 @@ def _run_to_summary(record: Any) -> RunSummary:
         delegation_level=record.delegation_level,
         total_reasoning_tokens=record.total_reasoning_tokens,
         replay=_replay_of(record),
+        tenant_id=getattr(record, "tenant_id", None),
     )
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    """Aware datetimes in UTC; naive ones are rejected by the store."""
+    if value is None or value.tzinfo is None:
+        return value
+    return _to_aware_utc(value)
+
+
+def _accepts_tenant(method: Any) -> bool:
+    """True only for an explicit ``tenant_id`` parameter.
+
+    A bare ``**kwargs`` might swallow the scope silently, so such methods get
+    the run-lookup fallback instead (fail closed).
+    """
+    try:
+        return "tenant_id" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _error_info_of(record: Any) -> ErrorInfo | None:
+    data = (getattr(record, "meta", None) or {}).get(ERROR_INFO_META_KEY)
+    return ErrorInfo.from_dict(data) if isinstance(data, dict) else None
 
 
 def _usage_to_public(rollup: Any) -> RunUsage:
@@ -820,6 +930,8 @@ def _run_to_detail(record: Any) -> RunDetail:
         cancel_requested=bool(getattr(record, "cancel_requested", False)),
         replay=_replay_of(record),
         pause_requested=bool(getattr(record, "pause_requested", False)),
+        tenant_id=getattr(record, "tenant_id", None),
+        error_info=_error_info_of(record),
     )
 
 
@@ -918,6 +1030,7 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
         pending_tool_calls=list(pdata.get("pending_tool_calls") or []),
         submitted_results=list(rdata.get("submitted_results") or []),
         user_input=rdata.get("user_input"),
+        pause_id=pdata.get("pause_id") if isinstance(pdata.get("pause_id"), str) else None,
     )
 
 

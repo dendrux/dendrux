@@ -55,7 +55,7 @@ def store(engine):
     return RunStore.from_engine(engine)
 
 
-def _build_app(store: RunStore, authorize=None) -> FastAPI:
+def _build_app(store: RunStore, authorize=None, *, include_payloads: bool = False) -> FastAPI:
     """Wrap make_read_router in a minimal FastAPI app for the test client."""
     if authorize is None:
 
@@ -65,7 +65,14 @@ def _build_app(store: RunStore, authorize=None) -> FastAPI:
         authorize = _allow
 
     app = FastAPI()
-    app.include_router(make_read_router(store=store, authorize=authorize, tenant_resolver=UNSCOPED))
+    app.include_router(
+        make_read_router(
+            store=store,
+            authorize=authorize,
+            tenant_resolver=UNSCOPED,
+            include_payloads=include_payloads,
+        )
+    )
     return app
 
 
@@ -239,8 +246,8 @@ class TestGetRunEndpoint:
 class TestGetEventsEndpoint:
     async def test_envelope_with_cursor(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
-        for i in range(3):
-            await internal_store.save_run_event("r1", event_type="tick", sequence_index=i)
+        for _i in range(3):
+            await internal_store.save_run_event("r1", event_type="tick")
 
         app = _build_app(store)
         async with await _client(app) as http:
@@ -252,8 +259,8 @@ class TestGetEventsEndpoint:
 
     async def test_cursor_param(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
-        for i in range(5):
-            await internal_store.save_run_event("r1", event_type="tick", sequence_index=i)
+        for _i in range(5):
+            await internal_store.save_run_event("r1", event_type="tick")
 
         app = _build_app(store)
         async with await _client(app) as http:
@@ -277,7 +284,7 @@ class TestGetEventsEndpoint:
         """Empty batch with a cursor echoes the cursor back — a poller
         must be able to resume without losing its place."""
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event("r1", event_type="tick", sequence_index=0)
+        await internal_store.save_run_event("r1", event_type="tick")
 
         app = _build_app(store)
         async with await _client(app) as http:
@@ -358,8 +365,8 @@ class TestSseGenerator:
         monkeypatch.setattr(_rr, "_SSE_POLL_INTERVAL_S", 0.01)
 
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
-        await internal_store.save_run_event("r1", event_type="llm.completed", sequence_index=1)
+        await internal_store.save_run_event("r1", event_type="run.started")
+        await internal_store.save_run_event("r1", event_type="llm.completed")
 
         gen = _rr._sse_event_generator(store, "r1", cursor=None)
         frame1 = await gen.__anext__()
@@ -380,8 +387,8 @@ class TestSseGenerator:
         monkeypatch.setattr(_rr, "_SSE_POLL_INTERVAL_S", 0.01)
 
         await internal_store.create_run("r1", "Agent")
-        for i in range(3):
-            await internal_store.save_run_event("r1", event_type="tick", sequence_index=i)
+        for _i in range(3):
+            await internal_store.save_run_event("r1", event_type="tick")
 
         gen = _rr._sse_event_generator(store, "r1", cursor=1)
         frame = await gen.__anext__()
@@ -401,7 +408,7 @@ class TestSseGenerator:
 
         async def _write_later() -> None:
             await asyncio.sleep(0.05)
-            await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=0)
+            await internal_store.save_run_event("r1", event_type="run.completed")
 
         async with contextlib.aclosing(gen):
             frame, _ = await asyncio.wait_for(
@@ -503,7 +510,7 @@ class TestResolveSseCursor:
     async def test_datetime_serialized_as_iso_string(self, store, internal_store) -> None:
         """Datetime fields round-trip through JSON as ISO strings."""
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
+        await internal_store.save_run_event("r1", event_type="run.started")
 
         app = _build_app(store)
         async with await _client(app) as http:
@@ -596,7 +603,7 @@ class TestToolCallsEndpoint:
             iteration_index=0,
         )
 
-        app = _build_app(store)
+        app = _build_app(store, include_payloads=True)
         async with await _client(app) as http:
             resp = await http.get("/runs/r1/tool-calls")
             body = resp.json()
@@ -648,7 +655,7 @@ class TestTracesEndpoint:
         await internal_store.save_trace("r1", "user", "hello", order_index=0)
         await internal_store.save_trace("r1", "assistant", "hi back", order_index=1)
 
-        app = _build_app(store)
+        app = _build_app(store, include_payloads=True)
         async with await _client(app) as http:
             resp = await http.get("/runs/r1/traces")
             body = resp.json()
@@ -691,7 +698,6 @@ class TestPausesEndpoint:
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=0,
             data={
                 "status": "waiting_client_tool",
                 "pending_tool_calls": [{"id": "tc_1", "name": "read_file"}],
@@ -700,7 +706,6 @@ class TestPausesEndpoint:
         await internal_store.save_run_event(
             "r1",
             event_type="run.resumed",
-            sequence_index=1,
             data={"resumed_from": "waiting_client_tool"},
         )
 

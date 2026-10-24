@@ -53,6 +53,10 @@ class _Unscoped:
 
 
 UNSCOPED = _Unscoped()
+
+# First key of the Postgres advisory lock that serializes note inserts of one
+# run under ``Limits.max_notes_per_run`` (second key: ``hashtext(run_id)``).
+_NOTE_LOCK_NAMESPACE = 0x44584E54
 """Omitted tenant scope: trusted, no tenant predicate. Distinct from ``None``,
 which scopes to untenanted runs only."""
 
@@ -645,9 +649,10 @@ class StateStore(Protocol):
         terminal status. Returns False when nothing was inserted.
 
         ``max_notes`` (``Limits.max_notes_per_run``): when set, the insert is
-        also conditional on the run having fewer notes, in the same statement,
-        and :class:`~dendrux.errors.NoteLimitExceededError` is raised when it
-        has that many already. Not enforced yet.
+        also conditional on the run having fewer notes, and
+        :class:`~dendrux.errors.NoteLimitExceededError` is raised when an
+        in-scope, non-terminal run has that many already. The count and the
+        insert must be atomic: concurrent submitters must never exceed the cap.
         """
         ...
 
@@ -761,11 +766,18 @@ class StateStore(Protocol):
         run_id: str,
         *,
         event_type: str,
-        sequence_index: int = 0,
         iteration_index: int = 0,
         correlation_id: str | None = None,
         data: dict[str, Any] | None = None,
-    ) -> None: ...
+    ) -> int:
+        """Append an event and return the ``sequence_index`` it was given.
+
+        The store allocates the index (``max + 1`` for the run, starting at 0)
+        in the same atomic step as the insert, so concurrent writers of one
+        run get distinct indexes in commit order. Changed in 0.5.0: callers
+        no longer pass ``sequence_index``.
+        """
+        ...
 
     async def get_run_events(
         self,
@@ -782,19 +794,23 @@ class StateStore(Protocol):
         *,
         limit: int = 50,
         offset: int = 0,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         status: str | list[str] | None = None,
         agent_name: str | None = None,
         parent_run_id: str | None = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
-    ) -> list[RunRecord]: ...
+    ) -> list[RunRecord]:
+        """Runs newest first. ``tenant_id``: ``UNSCOPED`` (default) for every
+        tenant, a string for that tenant, ``None`` for untenanted runs only
+        (changed in 0.5.0: ``None`` used to mean "no filter")."""
+        ...
 
     async def count_runs(
         self,
         *,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         status: str | list[str] | None = None,
         agent_name: str | None = None,
         parent_run_id: str | None = None,
@@ -950,9 +966,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from dendrux.db.enums import AgentRunStatus
         from dendrux.db.models import AgentRun
 
-        # Fast path: if an idempotency key is provided, check for existing run
+        if tenant_id == "":
+            raise ValueError("tenant_id must be a non-empty string or None, not ''.")
+        # Fast path: if an idempotency key is provided, check for an existing
+        # run of this tenant (keys are unique per tenant, not globally).
         if idempotency_key is not None:
-            existing = await self._check_idempotency(idempotency_key, idempotency_fingerprint or "")
+            existing = await self._check_idempotency(
+                idempotency_key, idempotency_fingerprint or "", tenant_id=tenant_id
+            )
             if existing is not None:
                 return existing
 
@@ -988,16 +1009,29 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     await session.commit()
                 except IntegrityError as exc:
                     await session.rollback()
-                    # Only resolve via idempotency if this is the idempotency
-                    # unique constraint, not an arbitrary integrity error.
-                    # IntegrityError is NOT transient — don't let retry_transient_db see it.
-                    if idempotency_key is not None and "idempotency_key" in str(exc):
-                        existing = await self._check_idempotency(
-                            idempotency_key, idempotency_fingerprint or ""
-                        )
-                        if existing is not None:
-                            return existing
-                    raise
+                    # Only resolve via idempotency when the violated constraint is
+                    # an idempotency-key unique index, not an arbitrary integrity
+                    # error. IntegrityError is NOT transient — don't let
+                    # retry_transient_db see it.
+                    if idempotency_key is None or not _is_idempotency_violation(exc):
+                        raise
+                    existing = await self._check_idempotency(
+                        idempotency_key, idempotency_fingerprint or "", tenant_id=tenant_id
+                    )
+                    if existing is not None:
+                        return existing
+                    # The key is held by another tenant's run under a pre-0.5
+                    # global unique index (legacy SQLite file). Fail closed
+                    # without disclosing that run.
+                    logger.warning(
+                        "idempotency key held by another tenant under a pre-0.5 global "
+                        "unique index: run_id=%s code=idempotency_conflict_legacy",
+                        run_id,
+                        extra={"run_id": run_id, "code": "idempotency_conflict_legacy"},
+                    )
+                    raise IdempotencyConflictError(
+                        run_id=None, idempotency_key=idempotency_key
+                    ) from None
 
             return CreateRunResult(
                 run_id=run_id,
@@ -1011,14 +1045,21 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         self,
         idempotency_key: str,
         fingerprint: str,
+        *,
+        tenant_id: str | None = None,
     ) -> CreateRunResult | None:
-        """Check for existing run with this idempotency key.
+        """Check for an existing run of ``tenant_id`` with this idempotency key.
+
+        Keys are scoped per tenant (``None`` is the untenanted scope, stored
+        as ``''`` in the index), so another tenant's run is never returned.
+        The predicate spells the index expression so it uses
+        ``uq_agent_runs_tenant_idempotency_key``.
 
         Returns None if no match (caller should create fresh).
         Returns CreateRunResult if match found.
         Raises IdempotencyConflictError if key reused with different input.
         """
-        from sqlalchemy import select
+        from sqlalchemy import func, literal_column, select
 
         from dendrux.db.enums import AgentRunStatus
         from dendrux.db.models import AgentRun
@@ -1031,7 +1072,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         }
 
         async with self._session_factory() as session:
-            stmt = select(AgentRun).where(AgentRun.idempotency_key == idempotency_key)
+            stmt = select(AgentRun).where(
+                func.coalesce(AgentRun.tenant_id, literal_column("''")) == (tenant_id or ""),
+                AgentRun.idempotency_key == idempotency_key,
+            )
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
 
@@ -1226,7 +1270,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         limit: int | None = None,
         offset: int = 0,
         before: datetime | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[LLMInteractionRecord]:
+        """LLM interactions of a run; empty when the run is outside ``tenant_id``."""
         from sqlalchemy import select
 
         _require_aware_utc("before", before)
@@ -1236,7 +1282,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async with self._session_factory() as session:
             stmt = (
                 select(LLMInteraction)
-                .where(LLMInteraction.agent_run_id == run_id)
+                .where(LLMInteraction.agent_run_id == run_id, _run_in_scope(run_id, tenant_id))
                 .order_by(LLMInteraction.iteration_index, LLMInteraction.id)
             )
             if iteration_index is not None:
@@ -1712,16 +1758,46 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     ) -> bool:
         """Conditional ``INSERT ... SELECT`` guarded by status and tenant, row share-locked.
 
-        ``max_notes`` is accepted but not enforced yet (see :meth:`StateStore.add_note`).
+        With ``max_notes`` the statement also requires ``COUNT(notes) < max_notes``.
+        On Postgres a transaction-scoped advisory lock per run is taken first,
+        so concurrent note submitters of one run count and insert one at a time
+        (each statement sees the previous commit) without blocking the runner's
+        own writes to the run row. SQLite serializes writers already.
         """
         import datetime as _dt
 
-        from sqlalchemy import JSON, DateTime, String, Text, insert, literal, null, select
+        from sqlalchemy import (
+            JSON,
+            DateTime,
+            Integer,
+            String,
+            Text,
+            func,
+            insert,
+            literal,
+            null,
+            select,
+        )
 
         from dendrux.db.models import AgentRun, RunInbox
+        from dendrux.errors import NoteLimitExceededError
+
+        if max_notes is not None and (isinstance(max_notes, bool) or max_notes < 1):
+            raise ValueError("max_notes must be a positive int or None.")
+
+        def _note_count() -> Any:
+            return select(func.count()).select_from(RunInbox).where(RunInbox.run_id == run_id)
 
         async def _attempt() -> bool:
             async with self._session_factory() as session:
+                if max_notes is not None and self._engine.dialect.name == "postgresql":
+                    await session.execute(
+                        select(
+                            func.pg_advisory_xact_lock(
+                                literal(_NOTE_LOCK_NAMESPACE, Integer()), func.hashtext(run_id)
+                            )
+                        )
+                    )
                 source = select(
                     literal(note_id, String(26)),
                     AgentRun.id,
@@ -1732,6 +1808,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     AgentRun.id == run_id,
                     AgentRun.status.notin_(_TERMINAL_STATUS_VALUES),
                 )
+                if max_notes is not None:
+                    source = source.where(_note_count().scalar_subquery() < max_notes)
                 # FOR SHARE (Postgres; a no-op on SQLite, whose writes are
                 # serialized): a concurrent finalize waits for this insert, or
                 # this insert re-checks the status the finalize committed.
@@ -1748,8 +1826,26 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         source,
                     )
                 )
+                inserted = bool(result.rowcount and result.rowcount > 0)
+                if not inserted and max_notes is not None:
+                    # Still under the lock: tell "full" from missing/terminal/foreign.
+                    status = await session.scalar(
+                        _apply_tenant_scope(
+                            select(AgentRun.status).where(AgentRun.id == run_id), tenant_id
+                        )
+                    )
+                    full = (await session.scalar(_note_count()) or 0) >= max_notes
+                    if status is not None and status not in _TERMINAL_STATUS_VALUES and full:
+                        await session.rollback()
+                        logger.warning(
+                            "note limit reached: run_id=%s code=note_limit limit=%d",
+                            run_id,
+                            max_notes,
+                            extra={"run_id": run_id, "code": "note_limit"},
+                        )
+                        raise NoteLimitExceededError(run_id, limit=max_notes)
                 await session.commit()
-                return bool(result.rowcount and result.rowcount > 0)
+                return inserted
 
         return await retry_transient_db(_attempt, label="add_note", run_id=run_id)
 
@@ -1892,14 +1988,18 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 return None
             return dict(row)  # type narrowing for mypy
 
-    async def get_pii_mapping(self, run_id: str) -> dict[str, str] | None:
-        """Retrieve pii_mapping for a run. Returns None if not set."""
+    async def get_pii_mapping(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> dict[str, str] | None:
+        """Retrieve pii_mapping for a run. None if not set or outside ``tenant_id``."""
         from sqlalchemy import select
 
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = select(AgentRun.pii_mapping).where(AgentRun.id == run_id)
+            stmt = _apply_tenant_scope(
+                select(AgentRun.pii_mapping).where(AgentRun.id == run_id), tenant_id
+            )
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
             if row is None:
@@ -2006,13 +2106,18 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         return await retry_transient_db(_attempt, label="submit_and_claim", run_id=run_id)
 
-    async def get_run(self, run_id: str) -> RunRecord | None:
+    async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunRecord | None:
+        """The run, or None when it does not exist or is outside ``tenant_id``.
+
+        The tenant predicate is part of the query, so a foreign run reads
+        exactly like a missing one.
+        """
         from sqlalchemy import select
 
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = select(AgentRun).where(AgentRun.id == run_id)
+            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
             if row is None:
@@ -2025,7 +2130,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         *,
         limit: int | None = None,
         offset: int = 0,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[TraceRecord]:
+        """Trace rows of a run; empty when the run is outside ``tenant_id``."""
         from sqlalchemy import select
 
         from dendrux.db.models import ReactTrace
@@ -2033,7 +2140,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async with self._session_factory() as session:
             stmt = (
                 select(ReactTrace)
-                .where(ReactTrace.agent_run_id == run_id)
+                .where(ReactTrace.agent_run_id == run_id, _run_in_scope(run_id, tenant_id))
                 .order_by(ReactTrace.order_index)
             )
             if limit is not None:
@@ -2062,7 +2169,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         limit: int | None = None,
         offset: int = 0,
         before: datetime | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[ToolCallReadRecord]:
+        """Tool calls of a run; empty when the run is outside ``tenant_id``."""
         from sqlalchemy import select
 
         _require_aware_utc("before", before)
@@ -2072,7 +2181,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async with self._session_factory() as session:
             stmt = (
                 select(ToolCallRecord)
-                .where(ToolCallRecord.agent_run_id == run_id)
+                .where(ToolCallRecord.agent_run_id == run_id, _run_in_scope(run_id, tenant_id))
                 .order_by(ToolCallRecord.created_at, ToolCallRecord.id)
             )
             if iteration_index is not None:
@@ -2108,25 +2217,41 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         run_id: str,
         *,
         event_type: str,
-        sequence_index: int = 0,
         iteration_index: int = 0,
         correlation_id: str | None = None,
         data: dict[str, Any] | None = None,
-    ) -> None:
-        from dendrux.db.models import RunEvent
+    ) -> int:
+        """Append an event with the next sequence index of its run; return the index.
+
+        One ``INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1``. On
+        Postgres the run row is first locked ``FOR NO KEY UPDATE`` in the same
+        transaction, so concurrent writers of one run (and the CAS paths in
+        :func:`_insert_event_locked`, which hold the same row lock) allocate
+        one at a time, in commit order; the next writer's statement sees the
+        previous commit. SQLite serializes writers already. Cost: one indexed
+        ``MAX`` lookup on ``(agent_run_id, sequence_index)``. There is no way to
+        pass an index (0.4.1 callers that do get a ``TypeError``, not a silently
+        wrong order).
+        """
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            record = RunEvent(
-                id=generate_ulid(),
-                agent_run_id=run_id,
-                event_type=event_type,
-                sequence_index=sequence_index,
+            if self._engine.dialect.name == "postgresql":
+                await session.execute(
+                    select(AgentRun.id).where(AgentRun.id == run_id).with_for_update(key_share=True)
+                )
+            seq = await _insert_event(
+                session,
+                run_id,
+                event_type,
+                data,
                 iteration_index=iteration_index,
                 correlation_id=correlation_id,
-                data=data,
             )
-            session.add(record)
             await session.commit()
+            return seq
 
     async def get_run_events(
         self,
@@ -2136,7 +2261,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         limit: int | None = None,
         event_types: list[str] | None = None,
         before: datetime | None = None,
+        tenant_id: TenantScope = UNSCOPED,
     ) -> list[RunEventRecord]:
+        """Events of a run by ``sequence_index``; empty when outside ``tenant_id``."""
         from sqlalchemy import false, select
 
         from dendrux.db.models import RunEvent
@@ -2146,7 +2273,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async with self._session_factory() as session:
             stmt = (
                 select(RunEvent)
-                .where(RunEvent.agent_run_id == run_id)
+                .where(RunEvent.agent_run_id == run_id, _run_in_scope(run_id, tenant_id))
                 .order_by(RunEvent.sequence_index)
             )
 
@@ -2670,7 +2797,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         *,
         limit: int = 50,
         offset: int = 0,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         status: str | list[str] | None = None,
         agent_name: str | None = None,
         parent_run_id: str | None = None,
@@ -2678,19 +2805,32 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[RunRecord]:
+        """Runs newest first, filtered in SQL. Never loads ``pause_data`` or ``pii_mapping``.
+
+        ``limit`` is clamped to 1..1000; ``offset`` above 10,000 raises
+        ``ValueError`` (deep OFFSET pages scan every skipped row).
+        """
         from sqlalchemy import select
+        from sqlalchemy.orm import defer
 
         from dendrux.db.models import AgentRun
 
         capped_limit = min(max(1, limit), self._MAX_LIST_LIMIT)
-        clamped_offset = max(0, offset)
+        clamped_offset = _check_offset(offset)
 
         async with self._session_factory() as session:
             # Secondary sort by id keeps pagination stable when created_at
             # ties — SQLite's DateTime is second-resolution, so concurrent
             # runs share timestamps and offset paging would otherwise skip
             # or duplicate rows across pages.
-            stmt = select(AgentRun).order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            stmt = (
+                select(AgentRun)
+                .options(
+                    defer(AgentRun.pause_data, raiseload=True),
+                    defer(AgentRun.pii_mapping, raiseload=True),
+                )
+                .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            )
             stmt = self._apply_run_filters(
                 stmt,
                 tenant_id=tenant_id,
@@ -2731,7 +2871,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     async def count_runs(
         self,
         *,
-        tenant_id: str | None = None,
+        tenant_id: TenantScope = UNSCOPED,
         status: str | list[str] | None = None,
         agent_name: str | None = None,
         parent_run_id: str | None = None,
@@ -2739,6 +2879,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
     ) -> int:
+        """Count runs matching the ``list_runs`` filters (same tenant semantics)."""
         from sqlalchemy import func, select
 
         from dendrux.db.models import AgentRun
@@ -2763,7 +2904,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         self,
         stmt: Any,
         *,
-        tenant_id: str | None,
+        tenant_id: TenantScope,
         status: str | list[str] | None,
         agent_name: str | None,
         parent_run_id: str | None,
@@ -2781,8 +2922,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         _require_aware_utc("started_after", started_after)
         _require_aware_utc("started_before", started_before)
 
-        if tenant_id is not None:
-            stmt = stmt.where(AgentRun.tenant_id == tenant_id)
+        stmt = _apply_tenant_scope(stmt, tenant_id)
         if status is not None:
             if isinstance(status, list):
                 if not status:
@@ -2796,10 +2936,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             stmt = stmt.where(AgentRun.agent_name == agent_name)
         if parent_run_id is not None:
             stmt = stmt.where(AgentRun.parent_run_id == parent_run_id)
+        # Normalized to UTC: SQLite stores UTC wall-clock text, so a non-UTC
+        # offset would otherwise compare against the wrong instant.
         if started_after is not None:
-            stmt = stmt.where(AgentRun.created_at >= started_after)
+            stmt = stmt.where(AgentRun.created_at >= _to_aware_utc(started_after))
         if started_before is not None:
-            stmt = stmt.where(AgentRun.created_at < started_before)
+            stmt = stmt.where(AgentRun.created_at < _to_aware_utc(started_before))
         if metadata_filter:
             stmt = self._apply_metadata_filter(stmt, metadata_filter)
         return stmt
@@ -2883,33 +3025,86 @@ async def _insert_event_locked(
     *,
     iteration_index: int = 0,
 ) -> int:
-    """Append a run event with ``max(sequence_index) + 1``, inside the caller's transaction.
+    """Append a run event with the run's next sequence index, in the caller's transaction.
 
     Called only after the caller's CAS UPDATE on the run row succeeded, so
-    the row lock serializes every transition writer allocating here.
+    the row lock serializes it with every other allocating writer
+    (:meth:`SQLAlchemyStateStore.save_run_event` takes the same lock).
+    Returns the allocated index.
     """
-    from sqlalchemy import func, select
+    return await _insert_event(session, run_id, event_type, data, iteration_index=iteration_index)
+
+
+async def _insert_event(
+    session: AsyncSession,
+    run_id: str,
+    event_type: str,
+    data: dict[str, Any] | None,
+    *,
+    iteration_index: int = 0,
+    correlation_id: str | None = None,
+) -> int:
+    """``INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1`` for one run; the index.
+
+    The caller provides the serialization (the run row lock on Postgres).
+    The ``MAX`` reads ``ix_run_events_agent_run_id_seq`` backwards.
+    """
+    import datetime as _dt
+
+    from sqlalchemy import JSON, DateTime, Integer, String, func, insert, literal, select
 
     from dendrux.db.models import RunEvent
 
-    current = (
-        await session.execute(
-            select(func.max(RunEvent.sequence_index)).where(RunEvent.agent_run_id == run_id)
-        )
-    ).scalar_one_or_none()
-    seq = 0 if current is None else int(current) + 1
-    session.add(
-        RunEvent(
-            id=generate_ulid(),
-            agent_run_id=run_id,
-            event_type=event_type,
-            sequence_index=seq,
-            iteration_index=iteration_index,
-            data=data,
-        )
+    next_index = (
+        select(func.coalesce(func.max(RunEvent.sequence_index), -1) + 1)
+        .where(RunEvent.agent_run_id == run_id)
+        .scalar_subquery()
     )
-    await session.flush()
-    return seq
+    source = select(
+        literal(generate_ulid(), String(26)),
+        literal(run_id, String(26)),
+        literal(event_type, String(50)),
+        next_index,
+        literal(iteration_index, Integer()),
+        literal(correlation_id, String(26)),
+        literal(data, JSON()),
+        literal(_dt.datetime.now(_dt.UTC), DateTime(timezone=True)),
+    )
+    stmt = (
+        insert(RunEvent)
+        .from_select(
+            [
+                RunEvent.id,
+                RunEvent.agent_run_id,
+                RunEvent.event_type,
+                RunEvent.sequence_index,
+                RunEvent.iteration_index,
+                RunEvent.correlation_id,
+                RunEvent.data,
+                RunEvent.created_at,
+            ],
+            source,
+        )
+        .returning(RunEvent.sequence_index)
+    )
+    return int((await session.execute(stmt)).scalar_one())
+
+
+# Unique indexes that enforce idempotency keys: the 0.5 tenant-scoped one, and
+# the pre-0.5 global ones (Alembic index, Postgres ``create_all`` constraint,
+# SQLite inline UNIQUE) still present on databases that were not rebuilt.
+_IDEMPOTENCY_VIOLATION_MARKERS = (
+    "uq_agent_runs_tenant_idempotency_key",
+    "ix_agent_runs_idempotency_key",
+    "agent_runs_idempotency_key_key",
+    "UNIQUE constraint failed: agent_runs.idempotency_key",
+)
+
+
+def _is_idempotency_violation(exc: Exception) -> bool:
+    """True when ``exc`` is a unique violation of an idempotency-key index."""
+    message = str(getattr(exc, "orig", None) or exc)
+    return any(marker in message for marker in _IDEMPOTENCY_VIOLATION_MARKERS)
 
 
 def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
@@ -2918,9 +3113,49 @@ def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
 
     if isinstance(tenant_id, _Unscoped):
         return stmt
+    _check_scope(tenant_id)
     if tenant_id is None:
         return stmt.where(AgentRun.tenant_id.is_(None))
     return stmt.where(AgentRun.tenant_id == tenant_id)
+
+
+def _check_scope(tenant_id: object) -> None:
+    """Fail closed on a scope that is not ``UNSCOPED``, ``None`` or a non-empty string."""
+    if tenant_id is None or isinstance(tenant_id, _Unscoped):
+        return
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError(
+            "tenant_id must be a non-empty str, None (untenanted runs) or UNSCOPED (all), "
+            f"got {tenant_id!r}."
+        )
+
+
+def _run_in_scope(run_id: str, tenant_id: TenantScope) -> Any:
+    """SQL predicate: the run exists within ``tenant_id`` (always true when ``UNSCOPED``).
+
+    Added to a child-table query (events, traces, ...) so the scope check is
+    part of the same statement.
+    """
+    from sqlalchemy import select, true
+
+    from dendrux.db.models import AgentRun
+
+    if isinstance(tenant_id, _Unscoped):
+        return true()
+    return _apply_tenant_scope(select(AgentRun.id).where(AgentRun.id == run_id), tenant_id).exists()
+
+
+MAX_LIST_OFFSET = 10_000
+"""Largest ``offset`` ``list_runs`` accepts. Keyset pagination is planned for 0.6."""
+
+
+def _check_offset(offset: int) -> int:
+    if offset > MAX_LIST_OFFSET:
+        raise ValueError(
+            f"offset {offset} is over the maximum of {MAX_LIST_OFFSET}. Narrow the query "
+            "with filters (status, agent_name, started_before, ...) instead of paging deeper."
+        )
+    return max(0, offset)
 
 
 def _extract_status(row: AgentRun) -> str:

@@ -330,38 +330,10 @@ async def _emit_init_events(
             )
 
 
-class EventSequencer:
-    """Monotonic sequence counter for run_events within a single run.
-
-    Shared between the runner (run-level events) and the PersistenceRecorder
-    (loop-level events) to guarantee a globally unique, ordered sequence_index
-    per run — including across pause/resume boundaries.
-
-    On resume, initialize with the max existing sequence_index from the DB.
-    """
-
-    def __init__(self, initial: int = 0) -> None:
-        self._seq = initial
-
-    def next(self) -> int:
-        seq = self._seq
-        self._seq += 1
-        return seq
-
-    @property
-    def current(self) -> int:
-        return self._seq
-
-    def advance_past(self, sequence_index: int) -> None:
-        """Skip past an index a store primitive allocated inside its own transaction."""
-        self._seq = max(self._seq, sequence_index + 1)
-
-
 async def _emit_event(
     state_store: StateStore | None,
     run_id: str,
     event_type: str,
-    sequencer: EventSequencer | None = None,
     data: dict[str, Any] | None = None,
     correlation_id: str | None = None,
 ) -> None:
@@ -370,11 +342,12 @@ async def _emit_event(
     Runner lifecycle events (run.started, run.paused, run.completed,
     run.error, run.resumed, run.cancelled) are authoritative truth —
     they get the same retry/propagate contract as PersistenceRecorder's
-    fail-closed writes.
+    fail-closed writes. The store allocates the event's sequence index in
+    the insert, so every writer of a run (runner, recorder, ``cancel_run``,
+    another process) gets the next index in commit order.
     """
     if state_store is None:
         return
-    seq = sequencer.next() if sequencer else 0
 
     from dendrux.runtime.durability import retry_critical
 
@@ -382,7 +355,6 @@ async def _emit_event(
         await state_store.save_run_event(
             run_id,
             event_type=event_type,
-            sequence_index=seq,
             correlation_id=correlation_id,
             data=data,
         )
@@ -394,7 +366,6 @@ async def _emit_event_safe(
     state_store: StateStore | None,
     run_id: str,
     event_type: str,
-    sequencer: EventSequencer | None = None,
     data: dict[str, Any] | None = None,
     correlation_id: str | None = None,
 ) -> None:
@@ -407,12 +378,10 @@ async def _emit_event_safe(
     """
     if state_store is None:
         return
-    seq = sequencer.next() if sequencer else 0
     try:
         await state_store.save_run_event(
             run_id,
             event_type=event_type,
-            sequence_index=seq,
             correlation_id=correlation_id,
             data=data,
         )
@@ -509,7 +478,6 @@ async def _persist_loop_outcome(
     state_store: StateStore,
     run_id: str,
     result: RunResult,
-    sequencer: EventSequencer,
 ) -> RunResult:
     """Persist a loop's terminal/pause result and emit the lifecycle event.
 
@@ -569,7 +537,6 @@ async def _persist_loop_outcome(
         won = await _transition_with_event(
             state_store,
             run_id,
-            sequencer,
             status=RunStatus.CANCELLED.value,
             allowed_current_statuses=allowed,
             event_type="run.cancelled",
@@ -638,7 +605,6 @@ async def _persist_loop_outcome(
         paused = await _pause_with_event(
             state_store,
             run_id,
-            sequencer,
             status=result.status.value,
             pause_data=pause_state.to_dict(),
             event_data=paused_data,
@@ -682,7 +648,6 @@ async def _persist_loop_outcome(
             state_store,
             run_id,
             "guardrail.unmapped_placeholder",
-            sequencer,
             {"placeholders": unmapped_placeholders},
         )
     stop_reason = result.stop_reason if result.status == RunStatus.SUCCESS else None
@@ -692,7 +657,6 @@ async def _persist_loop_outcome(
         state_store,
         run_id,
         "run.completed",
-        sequencer,
         {
             "status": result.status.value,
             "stop_reason": stop_reason,
@@ -722,7 +686,6 @@ async def _record_stop_reason(state_store: StateStore, run_id: str, stop_reason:
 async def _transition_with_event(
     state_store: StateStore,
     run_id: str,
-    sequencer: EventSequencer,
     *,
     status: str,
     allowed_current_statuses: list[str],
@@ -752,10 +715,7 @@ async def _transition_with_event(
             event_data=event_data,
             **finalize_kwargs,
         )
-        if seq is None:
-            return False
-        sequencer.advance_past(seq)
-        return True
+        return seq is not None
     won = await state_store.finalize_run_if_status_in(
         run_id,
         status=status,
@@ -763,14 +723,13 @@ async def _transition_with_event(
         **finalize_kwargs,
     )
     if won:
-        await _emit_event(state_store, run_id, event_type, sequencer, event_data)
+        await _emit_event(state_store, run_id, event_type, event_data)
     return bool(won)
 
 
 async def _pause_with_event(
     state_store: StateStore,
     run_id: str,
-    sequencer: EventSequencer,
     *,
     status: str,
     pause_data: dict[str, Any],
@@ -800,10 +759,7 @@ async def _pause_with_event(
             pii_mapping=pii_mapping,
             **usage_kwargs,
         )
-        if seq is None:
-            return False
-        sequencer.advance_past(seq)
-        return True
+        return seq is not None
     if await state_store.is_cancel_requested(run_id):
         return False
     await state_store.pause_run(
@@ -814,7 +770,7 @@ async def _pause_with_event(
         pii_mapping=pii_mapping,
         **usage_kwargs,
     )
-    await _emit_event(state_store, run_id, "run.paused", sequencer, event_data)
+    await _emit_event(state_store, run_id, "run.paused", event_data)
     # The read and the pause are separate here: a cancel committed in between
     # left a paused row with cancel_requested set. Finish it now; the caller
     # reloads and returns the persisted winner.
@@ -822,7 +778,6 @@ async def _pause_with_event(
         await _transition_with_event(
             state_store,
             run_id,
-            sequencer,
             status=RunStatus.CANCELLED.value,
             allowed_current_statuses=[status],
             event_type="run.cancelled",
@@ -1385,6 +1340,7 @@ async def run(
                     exc,
                     state_store,
                     idempotency_key,
+                    tenant_id=tenant_id,
                     agent_name=agent.name,
                     user_input=user_input,
                     items=input_items,
@@ -1421,7 +1377,6 @@ async def run(
         else:
             seeded_history = None
         recorder: LoopRecorder | None = None
-        sequencer = EventSequencer()
 
         # --- Delegation context ---
         parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
@@ -1506,7 +1461,7 @@ async def run(
                         task_manager.register_current(run_id)
                         registered = True
 
-                    # Create persistence recorder with shared sequencer
+                    # Create persistence recorder
                     from dendrux.runtime.persistence import PersistenceRecorder
                     from dendrux.tool import get_tool_def
 
@@ -1520,7 +1475,6 @@ async def run(
                         model=provider.model,
                         provider_name=type(provider).__name__,
                         target_lookup=target_lookup,
-                        event_sequencer=sequencer,
                         **_recorder_image_kwargs(tenant_id, provider),
                     )
 
@@ -1528,7 +1482,6 @@ async def run(
                     state_store,
                     run_id,
                     "run.started",
-                    sequencer,
                     {"agent_name": agent.name, "system_prompt": _system_prompt},
                 )
                 lifecycle_started = True
@@ -1643,7 +1596,6 @@ async def run(
                         state_store=state_store,
                         run_id=run_id,
                         result=result,
-                        sequencer=sequencer,
                     )
 
                 recorder_closed = True
@@ -1678,7 +1630,7 @@ async def run(
                     # Only the CAS winner emits the error event
                     if error_won:
                         await _emit_event(
-                            state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
+                            state_store, run_id, "run.error", {"error": str(exc)[:500]}
                         )
                 if lifecycle_started:
                     if not recorder_closed:
@@ -1705,7 +1657,7 @@ async def run(
             # Retain and drain the write task: shielding alone would let run()
             # return while cleanup is still pending after another cancellation.
             cleanup_task = asyncio.create_task(
-                _persist_task_cancellation(state_store, run_id, sequencer, interrupted=interrupted),
+                _persist_task_cancellation(state_store, run_id, interrupted=interrupted),
                 name=f"cancel-run:{run_id}",
             )
             while not cleanup_task.done():
@@ -1839,6 +1791,7 @@ async def _idempotent_hit_after_image_error(
     store: StateStore | None,
     idempotency_key: str | None,
     *,
+    tenant_id: str | None,
     agent_name: str,
     user_input: str,
     items: tuple[Any, ...],
@@ -1872,7 +1825,7 @@ async def _idempotent_hit_after_image_error(
     if check is None:
         return None
     try:
-        existing = await check(idempotency_key, "")
+        existing = await check(idempotency_key, "", tenant_id=tenant_id)
     except IdempotencyConflictError as found:
         existing_id = found.run_id
     else:
@@ -1909,7 +1862,7 @@ async def _idempotent_hit_after_image_error(
         skills=skills,
         user_input_parts=candidate,
     )
-    return await check(idempotency_key, fingerprint)
+    return await check(idempotency_key, fingerprint, tenant_id=tenant_id)
 
 
 def _replay_sources(replay_runs: Sequence[Any]) -> list[tuple[str, str | None, Any]]:
@@ -1935,7 +1888,6 @@ def _single_full_source(plan: ReplayPlan | None) -> bool:
 async def _persist_task_cancellation(
     state_store: StateStore | None,
     run_id: str,
-    sequencer: EventSequencer,
     *,
     interrupted: bool = False,
 ) -> RunResult:
@@ -1962,7 +1914,6 @@ async def _persist_task_cancellation(
                 state_store,
                 run_id,
                 "run.cancelled",
-                sequencer,
                 {"reason": "cancel_requested", **interrupt_meta}
                 if interrupted
                 else {"reason": "task_cancelled"},
@@ -2125,24 +2076,25 @@ async def retry(
         RunResult from the retry run.
 
     Raises:
+        RunNotFoundError: The source run does not exist or belongs to
+            another tenant.
         ValueError: If the source run is not terminal, if the source
             run was SingleCall, or if no traces exist.
     """
-    # 1. Validate source run is terminal
+    # 1. Validate source run is terminal. A missing run and another tenant's
+    # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
+    from dendrux.errors import RunNotFoundError
+
     source_run = await state_store.get_run(original_run_id)
     if source_run is None:
-        raise ValueError(f"Run '{original_run_id}' not found.")
+        raise RunNotFoundError(original_run_id)
 
     tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
     runner_entry_checks(
         agent, "retry", tenant_id=tenant_id, metadata=metadata, provider_kwargs=kwargs
     )
     if source_run.tenant_id != tenant_id:
-        from dendrux.errors import ReplayRunError
-
-        raise ReplayRunError(
-            original_run_id, "tenant_mismatch", "it belongs to a different tenant than this call"
-        )
+        raise RunNotFoundError(original_run_id)
     explicit = (source_run.meta or {}).get(META_KEY, {}).get("explicit", [])
     skill_session = SkillSession.prepare(
         agent, loop=loop or agent.loop or ReActLoop(), explicit=explicit
@@ -2227,7 +2179,6 @@ async def retry(
         provider_kwargs = dict(kwargs) if kwargs else {}
 
         run_id = generate_ulid()
-        sequencer = EventSequencer()
 
         parent_ctx = get_delegation_context()
         parent_run_id, delegation_level = resolve_parent_link(parent_ctx, state_store)
@@ -2288,7 +2239,6 @@ async def retry(
             model=provider.model,
             provider_name=type(provider).__name__,
             target_lookup=target_lookup,
-            event_sequencer=sequencer,
             **_recorder_image_kwargs(tenant_id, provider),
         )
 
@@ -2296,7 +2246,6 @@ async def retry(
             state_store,
             run_id,
             "run.started",
-            sequencer,
             {
                 "agent_name": agent.name,
                 "system_prompt": _system_prompt,
@@ -2409,7 +2358,6 @@ async def retry(
                 state_store=state_store,
                 run_id=run_id,
                 result=result,
-                sequencer=sequencer,
             )
 
             await record_run_finished(recorder, run_id, result)
@@ -2433,9 +2381,7 @@ async def retry(
                     "Failed to persist ERROR status for retry run %s", run_id, exc_info=True
                 )
             if error_won:
-                await _emit_event(
-                    state_store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-                )
+                await _emit_event(state_store, run_id, "run.error", {"error": str(exc)[:500]})
             await record_run_failed(recorder, run_id, exc)
             await notify_run_failed(extra_notifier, run_id, exc)
             raise
@@ -2593,7 +2539,7 @@ def run_stream(
 
     # Shared mutable state — generator populates on first iteration,
     # cleanup reads if the consumer abandons after setup.
-    _shared: dict[str, Any] = {"state_store": state_store, "sequencer": EventSequencer()}
+    _shared: dict[str, Any] = {"state_store": state_store}
 
     mcp_meta: dict[str, Any] = {}
 
@@ -2613,7 +2559,6 @@ def run_stream(
         recorder: LoopRecorder | None = None
         seeded_history = initial_seeded
         replay_plan: ReplayPlan | None = None
-        sequencer = _shared["sequencer"]
         image_runtime: ImageRuntime | None = None
         user_parts: tuple[ContentPart, ...] | None = None
         history_messages = normalized_history
@@ -2660,6 +2605,7 @@ def run_stream(
                     exc,
                     store,
                     idempotency_key,
+                    tenant_id=resolve_child_tenant(get_delegation_context(), tenant_id),
                     agent_name=agent.name,
                     user_input=user_input,
                     items=input_items,
@@ -2819,7 +2765,6 @@ def run_stream(
                     model=provider.model,
                     provider_name=type(provider).__name__,
                     target_lookup=target_lookup,
-                    event_sequencer=sequencer,
                     **_recorder_image_kwargs(eff_tenant, provider),
                 )
 
@@ -2841,7 +2786,6 @@ def run_stream(
                 store,
                 run_id,
                 "run.started",
-                sequencer,
                 {"agent_name": agent.name, "system_prompt": _system_prompt},
             )
             await record_run_started(
@@ -2958,7 +2902,6 @@ def run_stream(
                                 state_store=store,
                                 run_id=run_id,
                                 result=terminal_result,
-                                sequencer=sequencer,
                             )
                             # Pre-pause checkpoint can flip a PAUSED iteration to
                             # CANCELLED. Re-derive the event type from the persisted
@@ -3001,9 +2944,7 @@ def run_stream(
                 except Exception:
                     logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
                 if error_won:
-                    await _emit_event_safe(
-                        store, run_id, "run.error", sequencer, {"error": str(exc)[:500]}
-                    )
+                    await _emit_event_safe(store, run_id, "run.error", {"error": str(exc)[:500]})
             if not _shared.get("existing_run"):
                 try:
                     await record_run_failed(recorder, run_id, exc)
@@ -3054,7 +2995,6 @@ def run_stream(
         if _shared.get("existing_run"):
             return None
         store = _shared.get("state_store")
-        sequencer = _shared.get("sequencer")
 
         cancel_won = False
         partial_answer = _partial_answer(_shared)
@@ -3066,12 +3006,11 @@ def run_stream(
                     answer=partial_answer,
                     expected_current_status="running",
                 )
-                if cancel_won and sequencer:
+                if cancel_won:
                     await _emit_event(
                         store,
                         run_id,
                         "run.cancelled",
-                        sequencer,
                         {"reason": "stream_closed", "partial_output": partial_answer is not None},
                     )
             except Exception:
@@ -3211,7 +3150,6 @@ class _ResumeContext:
         "history",
         "recorder",
         "notifier",
-        "sequencer",
         "pause_state",
         "resolved_loop",
         "resolved_strategy",
@@ -3223,7 +3161,6 @@ class _ResumeContext:
         history: list[Message],
         recorder: LoopRecorder,
         notifier: LoopNotifier | None,
-        sequencer: EventSequencer,
         pause_state: PauseState,
         resolved_loop: Loop,
         resolved_strategy: Strategy,
@@ -3231,7 +3168,6 @@ class _ResumeContext:
         self.history = history
         self.recorder = recorder
         self.notifier = notifier
-        self.sequencer = sequencer
         self.pause_state = pause_state
         self.resolved_loop = resolved_loop
         self.resolved_strategy = resolved_strategy
@@ -3261,11 +3197,10 @@ async def _prepare_resume(
     post-submit_and_claim resume).
 
     Steps performed:
-      1. Initialize sequencer from DB (continues across pause boundaries)
-      2. Record durable run.resumed event
-      3. Build resume history (inject tool results or user input)
-      4. Create recorder with correct trace offset
-      5. Notify recorder of injected messages
+      1. Record durable run.resumed event (the store allocates its index)
+      2. Build resume history (inject tool results or user input)
+      3. Create recorder with correct trace offset
+      4. Notify recorder of injected messages
     """
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.tool import get_tool_def
@@ -3274,12 +3209,7 @@ async def _prepare_resume(
     resolved_loop = loop or agent.loop or ReActLoop()
     _validate_loop_skill_compat(agent, resolved_loop)
 
-    # 1. Initialize sequencer from DB max (continues across pause boundaries)
-    existing_events = await state_store.get_run_events(run_id)
-    max_seq = max((e.sequence_index for e in existing_events), default=-1)
-    sequencer = EventSequencer(initial=max_seq + 1)
-
-    # 2. Record resume event with enriched payload for dashboard
+    # 1. Record resume event with enriched payload for dashboard
     resume_data: dict[str, Any] = {"resumed_from": expected_status}
     if tool_results is not None:
         submitted: list[dict[str, Any]] = []
@@ -3293,7 +3223,7 @@ async def _prepare_resume(
         resume_data["user_input"] = user_input
         if user_parts is not None:
             resume_data["image_count"] = sum(1 for p in user_parts if isinstance(p, ImagePart))
-    await _emit_event(state_store, run_id, "run.resumed", sequencer, resume_data)
+    await _emit_event(state_store, run_id, "run.resumed", resume_data)
 
     # 3. Build resume history
     history = list(pause_state.history)
@@ -3321,7 +3251,6 @@ async def _prepare_resume(
         provider_name=type(provider).__name__,
         target_lookup=target_lookup,
         initial_order_index=trace_order_offset,
-        event_sequencer=sequencer,
         **_recorder_image_kwargs(tenant_id, provider),
     )
 
@@ -3334,7 +3263,6 @@ async def _prepare_resume(
         history=history,
         recorder=recorder,
         notifier=extra_notifier,
-        sequencer=sequencer,
         pause_state=pause_state,
         resolved_loop=resolved_loop,
         resolved_strategy=resolved_strategy,
@@ -4004,11 +3932,8 @@ async def _resume_core(
                         expected_current_status="running",
                     )
                     if won:
-                        seq = EventSequencer(
-                            initial=await state_store.get_next_event_sequence(run_id)
-                        )
                         await _emit_event(
-                            state_store, run_id, "run.error", seq, {"error": str(exc)[:500]}
+                            state_store, run_id, "run.error", {"error": str(exc)[:500]}
                         )
                 except Exception:
                     logger.error(
@@ -4095,7 +4020,7 @@ async def _resume_core(
         try:
             run_record = await state_store.get_run(run_id)
             run_tenant = run_record.tenant_id if run_record else None
-            # 4-8. Prepare history, notifier, sequencer (shared with resume_stream).
+            # 4-8. Prepare history and notifier (shared with resume_stream).
             #      Does NOT fire any lifecycle hooks — that's the caller's job.
             ctx = await _prepare_resume(
                 run_id,
@@ -4215,7 +4140,6 @@ async def _resume_core(
                         state_store=state_store,
                         run_id=run_id,
                         result=stop,
-                        sequencer=ctx.sequencer,
                     )
                     await record_run_finished(ctx.recorder, run_id, stopped)
                     await notify_run_finished(ctx.notifier, run_id, stopped)
@@ -4274,7 +4198,6 @@ async def _resume_core(
                 state_store=state_store,
                 run_id=run_id,
                 result=result,
-                sequencer=ctx.sequencer,
             )
 
             await record_run_finished(ctx.recorder, run_id, result)
@@ -4285,21 +4208,7 @@ async def _resume_core(
         except asyncio.CancelledError:
 
             async def persist_cancellation() -> RunResult:
-                sequencer = ctx.sequencer if ctx else EventSequencer()
-                if ctx is None:
-                    try:
-                        sequencer = EventSequencer(
-                            initial=await state_store.get_next_event_sequence(run_id)
-                        )
-                    except Exception:
-                        # Event numbering must not prevent the status transition
-                        # or replace the cancellation that triggered cleanup.
-                        logger.warning(
-                            "Failed to read cancellation event sequence for run %s",
-                            run_id,
-                            exc_info=True,
-                        )
-                return await _persist_task_cancellation(state_store, run_id, sequencer)
+                return await _persist_task_cancellation(state_store, run_id)
 
             cleanup = asyncio.create_task(persist_cancellation(), name=f"cancel-resume:{run_id}")
             while not cleanup.done():
@@ -4330,12 +4239,7 @@ async def _resume_core(
             except Exception:
                 logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
             if error_won:
-                # Use ctx.sequencer if available; otherwise fall back to a fresh
-                # sequencer so the run.error event still emits with sane numbering.
-                err_sequencer = ctx.sequencer if ctx is not None else EventSequencer()
-                await _emit_event(
-                    state_store, run_id, "run.error", err_sequencer, {"error": str(exc)[:500]}
-                )
+                await _emit_event(state_store, run_id, "run.error", {"error": str(exc)[:500]})
             # Fire on_run_failed only if _prepare_resume returned (ctx exists).
             # If _prepare_resume itself raised, on_run_started never fired, so
             # the lifecycle pair is balanced (both unfired).
@@ -4389,7 +4293,7 @@ def resume_stream(
         user_input, input_items = split_user_content(user_input)
     image_input = bool(input_items) or any(tr.images for tr in tool_results or ())
 
-    _shared: dict[str, Any] = {"state_store": state_store, "sequencer": None, "ctx": None}
+    _shared: dict[str, Any] = {"state_store": state_store, "ctx": None}
 
     mcp_meta: dict[str, Any] = {}
 
@@ -4487,7 +4391,7 @@ def resume_stream(
             if not claimed:
                 await _raise_resume_claim_failure(store, run_id, expected)
 
-            # 5. Prepare (shared helper — history, notifier, sequencer).
+            # 5. Prepare (shared helper — history, notifier).
             #    Does NOT fire any lifecycle hooks; that's done below inside
             #    the same try block so on_run_failed pairs with any failure
             #    after on_run_started fires.
@@ -4507,7 +4411,6 @@ def resume_stream(
                 tenant_id=run_tenant,
             )
             image_runtime = _image_runtime(agent, store, run_tenant, run_id)
-            _shared["sequencer"] = ctx.sequencer
             _shared["ctx"] = ctx
 
             # 5a. Fire run-level lifecycle hooks. After this point, any
@@ -4618,7 +4521,6 @@ def resume_stream(
                         state_store=store,
                         run_id=run_id,
                         result=stop,
-                        sequencer=ctx.sequencer,
                     )
                     await record_run_finished(ctx.recorder, run_id, stopped)
                     await notify_run_finished(ctx.notifier, run_id, stopped)
@@ -4695,7 +4597,6 @@ def resume_stream(
                             state_store=store,
                             run_id=run_id,
                             result=event.run_result,
-                            sequencer=ctx.sequencer,
                         )
                         if persisted.status == RunStatus.CANCELLED:
                             event = RunEvent(type=RunEventType.RUN_CANCELLED, run_result=persisted)
@@ -4712,7 +4613,6 @@ def resume_stream(
 
         except Exception as exc:
             store = _shared.get("state_store")
-            sequencer = _shared.get("sequencer")
             err_ctx = _shared.get("ctx")
             if store is not None:
                 error_won = False
@@ -4731,7 +4631,6 @@ def resume_stream(
                         store,
                         run_id,
                         "run.error",
-                        sequencer,
                         {"error": str(exc)[:500]},
                     )
             try:
@@ -4774,7 +4673,8 @@ def resume_stream(
         query store for actual status (falling back to CANCELLED).
         """
         store = _shared.get("state_store")
-        sequencer = _shared.get("sequencer")
+        # run.cancelled is recorded only once the resume itself was recorded.
+        resumed = _shared.get("ctx") is not None
 
         cancel_won = False
         partial_answer = _partial_answer(_shared)
@@ -4786,12 +4686,11 @@ def resume_stream(
                     answer=partial_answer,
                     expected_current_status="running",
                 )
-                if cancel_won and sequencer:
+                if cancel_won and resumed:
                     await _emit_event(
                         store,
                         run_id,
                         "run.cancelled",
-                        sequencer,
                         {"reason": "stream_closed", "partial_output": partial_answer is not None},
                     )
             except Exception:

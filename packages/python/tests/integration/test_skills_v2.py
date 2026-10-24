@@ -238,12 +238,12 @@ async def test_approved_execution_rechecks_policy(store, change):
 
 
 async def test_retry_rebuilds_activation_and_checks_tenant(store):
-    from dendrux.errors import ReplayRunError
+    from dendrux.errors import RunNotFoundError
 
     a = agent(store, [LLMResponse(text="done")])
     original = await a.run("raw", tenant_id="tenant", activate_skills=["demo"])
     new = agent(store, [LLMResponse(text="retried")], skills=[skill("updated body")])
-    with pytest.raises(ReplayRunError):
+    with pytest.raises(RunNotFoundError):
         await new.retry(original.run_id, tenant_id="other")
     result = await new.retry(original.run_id, tenant_id="tenant")
     assert result.status == RunStatus.SUCCESS
