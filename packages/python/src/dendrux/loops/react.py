@@ -69,8 +69,27 @@ from dendrux.media._image import Image, ToolOutput
 from dendrux.media._ingest import ingest
 from dendrux.media._policy import ImagePolicy
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
+from dendrux.tools._coerce import ArgumentCoercionError, build_call, get_args_spec
+from dendrux.tools._limits import (
+    ToolResultTooLargeError,
+    cap_value_payload,
+    enforce_call_limits,
+    result_cap,
+    size_limit_payload,
+)
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
-from dendrux.tools._validate import check_tool_call, check_tool_json
+from dendrux.tools._pool import (
+    CallTracker,
+    ToolCallLimiter,
+    ToolPoolSaturatedError,
+    run_sync_tool,
+)
+from dendrux.tools._validate import (
+    check_tool_call,
+    check_tool_json,
+    coercion_failure,
+    prepare_tool_call,
+)
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     AgentStep,
@@ -80,6 +99,7 @@ from dendrux.types import (
     ImagePart,
     ImageRef,
     ImageViewState,
+    Limits,
     LLMResponse,
     Message,
     PauseState,
@@ -706,18 +726,54 @@ async def _process_tool_calls(
         else:
             non_denied.append(tc)
 
+    async def reject(tc: ToolCall, result: ToolResult) -> None:
+        """Record, notify and append a call rejected before execution."""
+        await _record_tool(recorder, run_id, tc, result, iteration)
+        await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
+        result_msg = _format_result(strategy, result)
+        history.append(result_msg)
+        await _record_message(recorder, run_id, result_msg, iteration)
+        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
+        all_results.append((tc, result))
+
+    # --- Phase 0.25: Unknown tools are answered now, never hooked or approved ---
+    known: list[ToolCall] = []
+    for tc in non_denied:
+        if tc.name in lookups.fn:
+            known.append(tc)
+        else:
+            await reject(tc, _unknown_tool_result(tc, lookups))
+    non_denied = known
+
     # --- Phase 0.5: Deanonymize tool call params ---
+    pii_mapping = guardrail_engine.get_pii_mapping() if guardrail_engine is not None else {}
     if guardrail_engine is not None:
         for i, tc in enumerate(non_denied):
             if tc.params:
-                deaned = guardrail_engine.deanonymize(tc.params)
+                deaned = _restore_params(guardrail_engine, tc)
                 if deaned != tc.params:
-                    non_denied[i] = ToolCall(
-                        name=tc.name,
-                        params=deaned,
-                        id=tc.id,
-                        provider_tool_call_id=tc.provider_tool_call_id,
-                    )
+                    non_denied[i] = replace(tc, params=deaned)
+
+    # --- Phase 0.6: Validate, then coerce local tools to normalised arguments ---
+    # Before hooks and approval: a human never approves a malformed call, and
+    # everything downstream sees exactly the arguments the function receives.
+    placeholders = frozenset(pii_mapping)
+    valid_calls: list[ToolCall] = []
+    for tc in non_denied:
+        prepared = prepare_tool_call(
+            tc, lookups.defs.get(tc.name), lookups.fn.get(tc.name), placeholders=placeholders
+        )
+        if isinstance(prepared, ToolResult):
+            await reject(tc, prepared)
+        else:
+            valid_calls.append(prepared)
+
+    # --- Phase 0.7: Enforce max_calls_per_run (before hooks and approval) ---
+    non_denied, over_limit = enforce_call_limits(
+        valid_calls, max_calls=lookups.max_calls, call_counts=call_counts
+    )
+    for tc, limit_result in over_limit:
+        await reject(tc, limit_result)
 
     # Preflight before approval. Earlier valid activation barriers in this batch
     # may satisfy reads; execution rechecks against actual successful activations.
@@ -780,25 +836,22 @@ async def _process_tool_calls(
         for tc in non_denied:
             gate = gates.get(tc.id)
             if gate is not None:
+                approval_data: dict[str, Any] = {
+                    "tool_name": tc.name,
+                    "call_id": tc.id,
+                    "reason": "requires_approval",
+                }
                 if gate["source"] == "hook":
-                    event_data = {
-                        "tool_name": tc.name,
-                        "call_id": tc.id,
-                        "reason": gate["reason"] or "requires_approval",
-                        "source": "hook",
-                    }
-                else:
-                    event_data = {
-                        "tool_name": tc.name,
-                        "call_id": tc.id,
-                        "reason": "requires_approval",
-                    }
+                    approval_data["reason"] = gate["reason"] or "requires_approval"
+                    approval_data["source"] = "hook"
+                # What is being approved, in placeholder form (no restored PII).
+                approval_data["params"] = _placeholder_form(tc.params, pii_mapping)
                 await _record_governance(
                     recorder,
                     run_id,
                     "approval.requested",
                     iteration,
-                    event_data,
+                    approval_data,
                     correlation_id=tc.id,
                 )
                 await _notify_governance(
@@ -806,7 +859,7 @@ async def _process_tool_calls(
                     run_id,
                     "approval.requested",
                     iteration,
-                    event_data,
+                    approval_data,
                     correlation_id=tc.id,
                     warnings=warnings,
                 )
@@ -817,53 +870,10 @@ async def _process_tool_calls(
             approval_gates=gates,
         )
 
-    # --- Phase 1.5: Validate params against each tool's schema ---
-    valid_calls: list[ToolCall] = []
-    for tc in non_denied:
-        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
-        if invalid_result is None:
-            valid_calls.append(tc)
-            continue
-        await _record_tool(recorder, run_id, tc, invalid_result, iteration)
-        await _notify_tool(notifier, run_id, tc, invalid_result, iteration, warnings)
-        result_msg = _format_result(strategy, invalid_result)
-        history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
-        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-        all_results.append((tc, invalid_result))
-
-    # --- Phase 1: Enforce max_calls_per_run ---
-    allowed_calls: list[ToolCall] = []
-    batch_counts: dict[str, int] = {}
-    for tc in valid_calls:
-        max_calls = lookups.max_calls.get(tc.name)
-        current = call_counts.get(tc.name, 0) + batch_counts.get(tc.name, 0)
-        if max_calls is not None and current >= max_calls:
-            limit_msg = (
-                f"Tool '{tc.name}' has reached its maximum of {max_calls} calls for this run."
-            )
-            limit_result = ToolResult(
-                name=tc.name,
-                call_id=tc.id,
-                payload=json.dumps({"limit": limit_msg}),
-                success=False,
-                error=limit_msg,
-            )
-            await _record_tool(recorder, run_id, tc, limit_result, iteration)
-            await _notify_tool(notifier, run_id, tc, limit_result, iteration, warnings)
-            result_msg = _format_result(strategy, limit_result)
-            history.append(result_msg)
-            await _record_message(recorder, run_id, result_msg, iteration)
-            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-            all_results.append((tc, limit_result))
-        else:
-            batch_counts[tc.name] = batch_counts.get(tc.name, 0) + 1
-            allowed_calls.append(tc)
-
     # --- Phase 2: Split into server (execute now) vs non-server (pause) ---
     server_calls: list[ToolCall] = []
     pending_calls: list[ToolCall] = []
-    for tc in allowed_calls:
+    for tc in non_denied:
         target = lookups.target.get(tc.name, ToolTarget.SERVER)
         if target == ToolTarget.SERVER:
             server_calls.append(tc)
@@ -875,9 +885,23 @@ async def _process_tool_calls(
     executed: list[tuple[ToolCall, ToolResult]] = []
     for group, is_parallel in exec_groups:
         if is_parallel and len(group) > 1:
-            pairs = await asyncio.gather(
-                *[
-                    _execute_record_notify(
+            executed.extend(
+                await _execute_parallel_group(
+                    group,
+                    lookups,
+                    recorder,
+                    notifier,
+                    run_id,
+                    iteration,
+                    warnings,
+                    tool_result_transform,
+                    image_runtime=image_runtime,
+                )
+            )
+        else:
+            for tc in group:
+                executed.append(
+                    await _execute_record_notify(
                         tc,
                         lookups,
                         recorder,
@@ -888,20 +912,7 @@ async def _process_tool_calls(
                         tool_result_transform,
                         image_runtime=image_runtime,
                     )
-                    for tc in group
-                ]
-            )
-            executed.extend(pairs)
-        else:
-            for tc in group:
-                await _record_tool_started(recorder, run_id, tc, iteration)
-                await _notify_tool_started(notifier, run_id, tc, iteration, warnings)
-                tool_result = await _execute_tool(
-                    tc, lookups, tool_result_transform, image_runtime=image_runtime
                 )
-                await _record_tool(recorder, run_id, tc, tool_result, iteration)
-                await _notify_tool(notifier, run_id, tc, tool_result, iteration, warnings)
-                executed.append((tc, tool_result))
 
     # --- Phase 4: Append history in original order (deterministic for LLM) ---
     for tc, tool_result in executed:
@@ -2571,18 +2582,148 @@ async def _execute_record_notify(
     transform: ToolResultTransform | None = None,
     *,
     image_runtime: ImageRuntime | None = None,
+    tracker: CallTracker | None = None,
 ) -> tuple[ToolCall, ToolResult]:
-    """Execute a tool, record, then notify — for parallel execution.
+    """Execute a tool, record, then notify.
 
-    Each tool records and streams its event as soon as it finishes,
-    without waiting for siblings.
+    In a parallel batch each tool records and streams its event as soon as
+    it finishes, without waiting for siblings.
     """
     await _record_tool_started(recorder, run_id, tool_call, iteration)
     await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
-    result = await _execute_tool(tool_call, lookups, transform, image_runtime=image_runtime)
+    result = await _execute_tool(
+        tool_call,
+        lookups,
+        transform,
+        image_runtime=image_runtime,
+        tracker=tracker,
+        run_id=run_id,
+    )
     await _record_tool(recorder, run_id, tool_call, result, iteration)
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
     return tool_call, result
+
+
+_SIBLING_CANCELLED = "cancelled: another tool call in the same batch failed"
+_SIBLING_UNKNOWN = (
+    "outcome unknown: another tool call in the same batch failed while this one was "
+    "running; it may still finish and apply its effects"
+)
+
+
+async def _execute_parallel_group(
+    group: list[ToolCall],
+    lookups: ToolLookups,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    notifier_warnings: list[str],
+    transform: ToolResultTransform | None = None,
+    *,
+    image_runtime: ImageRuntime | None = None,
+) -> list[tuple[ToolCall, ToolResult]]:
+    """Run a parallel batch; a run-ending failure stops its siblings.
+
+    When one call fails in a way that ends the run (a persistence failure,
+    say), the other calls are cancelled and awaited before the failure
+    propagates, so none keeps running or writes rows after the run ended.
+    Each stopped sibling is recorded best effort: ``cancelled`` for async
+    calls and calls that never started, ``outcome_unknown`` for sync calls
+    whose thread had already started (a thread cannot be stopped). Outer
+    cancellation stops the siblings the same way.
+    """
+    trackers = [CallTracker() for _ in group]
+    tasks = [
+        asyncio.ensure_future(
+            _execute_record_notify(
+                tc,
+                lookups,
+                recorder,
+                notifier,
+                run_id,
+                iteration,
+                notifier_warnings,
+                transform,
+                image_runtime=image_runtime,
+                tracker=tracker,
+            )
+        )
+        for tc, tracker in zip(group, trackers, strict=True)
+    ]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except asyncio.CancelledError:
+        await _stop_siblings(tasks)
+        _log_stopped(run_id, group, tasks, trackers, reason="cancelled")
+        raise
+    failed = next(
+        (t for t in tasks if t.done() and not t.cancelled() and t.exception() is not None),
+        None,
+    )
+    if failed is None:
+        return [t.result() for t in tasks]
+    error = failed.exception()
+    assert error is not None
+    await _stop_siblings(tasks)
+    stopped = _log_stopped(run_id, group, tasks, trackers, reason="sibling_failed")
+    for tc, tracker in stopped:
+        message = _SIBLING_UNKNOWN if tracker.abandoned else _SIBLING_CANCELLED
+        code = "outcome_unknown" if tracker.abandoned else "cancelled"
+        result = ToolResult(
+            name=tc.name,
+            call_id=tc.id,
+            payload=json.dumps({"error": message, "code": code}),
+            success=False,
+            error=message,
+            meta={"code": code},
+        )
+        try:
+            await _record_tool(recorder, run_id, tc, result, iteration)
+            await _notify_tool(notifier, run_id, tc, result, iteration, notifier_warnings)
+        except Exception:
+            logger.warning(
+                "Could not record stopped tool call (code=%s, run_id=%s, tool=%s)",
+                code,
+                run_id,
+                tc.name,
+            )
+    raise error
+
+
+async def _stop_siblings(tasks: Sequence[asyncio.Future[Any]]) -> None:
+    """Cancel unfinished tasks and wait until each has unwound."""
+    pending = [t for t in tasks if not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        # Shielded so a second cancellation cannot leave siblings running.
+        await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+
+
+def _log_stopped(
+    run_id: str,
+    group: list[ToolCall],
+    tasks: Sequence[asyncio.Future[Any]],
+    trackers: list[CallTracker],
+    *,
+    reason: str,
+) -> list[tuple[ToolCall, CallTracker]]:
+    """Log each sibling that was stopped; return them."""
+    stopped = [
+        (tc, tracker)
+        for tc, task, tracker in zip(group, tasks, trackers, strict=True)
+        if task.cancelled()
+    ]
+    for tc, tracker in stopped:
+        logger.warning(
+            "Stopped tool call in a parallel batch (code=%s, reason=%s, run_id=%s, tool=%s)",
+            "outcome_unknown" if tracker.abandoned else "cancelled",
+            reason,
+            run_id,
+            tc.name,
+        )
+    return stopped
 
 
 _UNKNOWN_TOOL_LIST_LIMIT = 50
@@ -2604,17 +2745,143 @@ def _unknown_tool_message(name: str, lookups: ToolLookups) -> str:
     return f"Unknown tool: {name}. Available tools: {listed}"
 
 
+def _unknown_tool_result(tool_call: ToolCall, lookups: ToolLookups) -> ToolResult:
+    message = _unknown_tool_message(tool_call.name, lookups)
+    return ToolResult(
+        name=tool_call.name,
+        call_id=tool_call.id,
+        payload=json.dumps({"error": message}, ensure_ascii=False),
+        success=False,
+        error=message,
+    )
+
+
+def _restore_params(engine: GuardrailEngine, tool_call: ToolCall) -> dict[str, Any]:
+    """Real values for the call's PII placeholders, as the guardrail decides.
+
+    The PII guardrail owns the restore decision (``PII(restore=...)``); this
+    is its single call site in the tool pipeline.
+    """
+    return engine.deanonymize(tool_call.params)
+
+
+def _placeholder_form(value: Any, mapping: dict[str, str], _depth: int = 0) -> Any:
+    """``value`` with restored PII put back as its placeholders (bounded walk)."""
+    if not mapping or _depth > 50:
+        return value
+    if isinstance(value, str):
+        for placeholder, real in sorted(mapping.items(), key=lambda kv: -len(kv[1])):
+            if real and real in value:
+                value = value.replace(real, placeholder)
+        return value
+    if isinstance(value, dict):
+        return {k: _placeholder_form(v, mapping, _depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_placeholder_form(v, mapping, _depth + 1) for v in value]
+    return value
+
+
+class _ToolTimedOutError(Exception):
+    """The tool's own deadline (not a ``TimeoutError`` the tool raised)."""
+
+
+async def _invoke_tool(
+    fn: Callable[..., Any],
+    args: list[Any],
+    kwargs: dict[str, Any],
+    *,
+    timeout_s: float,
+    limiter: ToolCallLimiter | None,
+    result_limit: int,
+    tracker: CallTracker,
+) -> Any:
+    """Run the tool under its deadline; async on the loop, sync on the tool pool."""
+    deadline = asyncio.timeout(timeout_s)
+    try:
+        async with deadline:
+            with result_cap(result_limit):
+                if inspect.iscoroutinefunction(fn):
+                    tracker.started = True
+                    return await fn(*args, **kwargs)
+                return await run_sync_tool(fn, args, kwargs, limiter=limiter, tracker=tracker)
+    except TimeoutError:
+        if not deadline.expired():
+            raise  # the tool raised its own TimeoutError: an ordinary failure
+        if tracker.completed is not None:
+            # The thread finished right at the deadline: the outcome is known.
+            return tracker.completed.result()
+        raise _ToolTimedOutError from None
+
+
+def _timeout_result(
+    tool_call: ToolCall,
+    timeout_s: float,
+    tracker: CallTracker,
+    *,
+    is_explicit: bool,
+    duration_ms: int,
+    run_id: str | None,
+) -> ToolResult:
+    name = tool_call.name
+    meta: dict[str, Any]
+    if tracker.started:
+        code = "timeout_outcome_unknown"
+        error_msg = (
+            f"Tool '{name}' timed out after {timeout_s}s while running. It may still finish "
+            "and apply its effects: check before retrying, and do not retry blindly if the "
+            "tool changes anything."
+        )
+        meta = {"code": code}
+        if tracker.abandoned:
+            meta["zombie_threads"] = tracker.zombies
+    else:
+        code = "timeout_not_started"
+        error_msg = (
+            f"Tool '{name}' did not start within {timeout_s}s because every tool thread was "
+            "busy. It was not run and is safe to retry."
+        )
+        meta = {"code": code}
+    logger.warning(
+        "Tool '%s' timed out after %ss%s (code=%s, run_id=%s, zombie_threads=%s)",
+        name,
+        timeout_s,
+        "" if is_explicit else " (default). Set an explicit timeout: @tool(timeout_seconds=N)",
+        code,
+        run_id,
+        meta.get("zombie_threads", 0),
+    )
+    return ToolResult(
+        name=name,
+        call_id=tool_call.id,
+        payload=json.dumps({"error": error_msg, "code": code}),
+        success=False,
+        error=error_msg,
+        duration_ms=duration_ms,
+        meta=meta,
+    )
+
+
 async def _execute_tool(
     tool_call: ToolCall,
     lookups: ToolLookups,
     transform: ToolResultTransform | None = None,
     *,
     image_runtime: ImageRuntime | None = None,
+    tracker: CallTracker | None = None,
+    run_id: str | None = None,
 ) -> ToolResult:
     """Execute a server tool function and return a ToolResult.
 
     Non-server tools are filtered out by the loop before reaching this
     function. They trigger a pause instead of execution.
+
+    A local ``@tool`` receives arguments rebuilt from the call's normalised
+    JSON (:mod:`dendrux.tools._coerce`); a call that no longer validates
+    fails as ``invalid_params`` without running. Async tools run on the
+    loop; sync tools run on the bounded tool pool under the Agent's
+    ``tool_threads`` limiter. A timeout reports ``timeout_not_started`` (the
+    call never ran) or ``timeout_outcome_unknown`` (it started and may still
+    finish); a ``TimeoutError`` the tool raises itself is an ordinary error.
 
     ``transform`` (``Agent.tool_result_transform``) rewrites the raw
     return value of a successful call before serialization, so the
@@ -2624,34 +2891,45 @@ async def _execute_tool(
     A ``ToolOutput`` result serialises its ``result`` like a plain return and
     ingests its images through ``image_runtime`` (strict for local tools;
     lenient with per-image notes for MCP tools). An image ingest failure
-    fails the call like any tool exception.
+    fails the call like any tool exception. The serialised payload is capped
+    at ``Limits.max_tool_result_bytes`` (images excluded).
     """
     from dendrux.skills._session import SkillTool
 
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
-        message = _unknown_tool_message(tool_call.name, lookups)
-        return ToolResult(
-            name=tool_call.name,
-            call_id=tool_call.id,
-            payload=json.dumps({"error": message}, ensure_ascii=False),
-            success=False,
-            error=message,
-        )
+        return _unknown_tool_result(tool_call, lookups)
 
     if isinstance(fn, SkillTool):
         return await fn.session.execute(tool_call)
 
+    tracker = tracker if tracker is not None else CallTracker()
+    limiter = lookups.call_limiter if isinstance(lookups.call_limiter, ToolCallLimiter) else None
+    limits = limiter.limits if limiter is not None else Limits()
     timeout_s = lookups.timeout.get(tool_call.name, DEFAULT_TOOL_TIMEOUT)
     is_explicit = lookups.explicit_timeout.get(tool_call.name, False)
 
+    spec = get_args_spec(fn)
+    tool_def = lookups.defs.get(tool_call.name)
+    args: list[Any] = []
+    kwargs: dict[str, Any] = dict(tool_call.params or {})
+    if spec is not None and tool_def is not None:
+        try:
+            args, kwargs = build_call(spec, tool_call.params or {})
+        except ArgumentCoercionError as exc:
+            return coercion_failure(tool_call, tool_def, exc)
+
     start = time.monotonic()
     try:
-        if inspect.iscoroutinefunction(fn):
-            coro = fn(**tool_call.params)
-        else:
-            coro = asyncio.to_thread(fn, **tool_call.params)
-        result = await asyncio.wait_for(coro, timeout=timeout_s)
+        result = await _invoke_tool(
+            fn,
+            args,
+            kwargs,
+            timeout_s=timeout_s,
+            limiter=limiter,
+            result_limit=limits.max_tool_result_bytes,
+            tracker=tracker,
+        )
 
         duration_ms = int((time.monotonic() - start) * 1000)
         if transform is not None:
@@ -2691,6 +2969,28 @@ async def _execute_tool(
                 f"{type(result).__name__}. Tool return values must be JSON-serializable "
                 f"(str, int, float, bool, list, dict, or None).{hint}"
             ) from ser_err
+        payload, cap_meta = cap_value_payload(result, payload, limits.max_tool_result_bytes)
+        if cap_meta is not None:
+            logger.warning(
+                "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%d, limit=%d, "
+                "truncated=%s)",
+                tool_call.name,
+                cap_meta["code"],
+                run_id,
+                cap_meta["bytes"],
+                limits.max_tool_result_bytes,
+                bool(cap_meta.get("truncated")),
+            )
+            if not cap_meta.get("truncated"):
+                return ToolResult(
+                    name=tool_call.name,
+                    call_id=tool_call.id,
+                    payload=payload,
+                    success=False,
+                    error="result too large",
+                    duration_ms=duration_ms,
+                    meta=cap_meta,
+                )
         if output is not None and output.images:
             try:
                 if _tool_source(tool_call.name, lookups) == "mcp":
@@ -2719,24 +3019,52 @@ async def _execute_tool(
             duration_ms=duration_ms,
             images=images,
             notes=notes,
+            meta=cap_meta or {},
         )
-    except TimeoutError:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        error_msg = f"Tool '{tool_call.name}' timed out after {timeout_s}s"
-        if is_explicit:
-            logger.warning("%s", error_msg)
-        else:
-            logger.warning(
-                "%s (default). Set an explicit timeout: @tool(timeout_seconds=N)",
-                error_msg,
-            )
+    except _ToolTimedOutError:
+        return _timeout_result(
+            tool_call,
+            timeout_s,
+            tracker,
+            is_explicit=is_explicit,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            run_id=run_id,
+        )
+    except ToolResultTooLargeError as too_large:
+        # The source stopped reading an oversized result (MCP read cap).
+        payload, cap_meta = size_limit_payload(too_large.size)
+        logger.warning(
+            "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%s, limit=%d)",
+            tool_call.name,
+            cap_meta["code"],
+            run_id,
+            too_large.size,
+            limits.max_tool_result_bytes,
+        )
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,
-            payload=json.dumps({"error": error_msg}),
+            payload=payload,
+            success=False,
+            error="result too large",
+            duration_ms=int((time.monotonic() - start) * 1000),
+            meta=cap_meta,
+        )
+    except ToolPoolSaturatedError:
+        error_msg = (
+            f"Tool '{tool_call.name}' could not be queued because the tool pool is full. "
+            "It was not run and is safe to retry."
+        )
+        logger.warning(
+            "Tool '%s' rejected (code=tool_pool_saturated, run_id=%s)", tool_call.name, run_id
+        )
+        return ToolResult(
+            name=tool_call.name,
+            call_id=tool_call.id,
+            payload=json.dumps({"error": error_msg, "code": "tool_pool_saturated"}),
             success=False,
             error=error_msg,
-            duration_ms=duration_ms,
+            meta={"code": "tool_pool_saturated"},
         )
     except Exception as e:
         duration_ms = int((time.monotonic() - start) * 1000)

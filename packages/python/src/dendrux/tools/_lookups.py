@@ -36,9 +36,13 @@ class ToolLookups(NamedTuple):
 def make_call_limiter(tool_threads: int) -> Any:
     """Build the per-Agent tool call limiter for ``Agent(tool_threads=...)``.
 
-    Returns None (no limit) until the bounded tool pool lands.
+    It caps the Agent's concurrently running sync tool calls on the shared
+    tool pool (see :mod:`dendrux.tools._pool`). It is thread-safe and not
+    bound to an event loop.
     """
-    return None
+    from dendrux.tools._pool import ToolCallLimiter
+
+    return ToolCallLimiter(tool_threads)
 
 
 def build_tool_lookups(

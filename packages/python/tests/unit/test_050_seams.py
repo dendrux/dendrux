@@ -396,7 +396,10 @@ class TestAgentKwargs:
         assert agent._tool_threads == 8
         assert agent._on_governance_change == "warn"
         assert agent._on_governance_change_chosen is False
-        assert agent._tool_call_limiter is None
+        from dendrux.tools._pool import ToolCallLimiter
+
+        assert isinstance(agent._tool_call_limiter, ToolCallLimiter)
+        assert agent._tool_call_limiter.slots == 8
 
     def test_explicit_defaults_count_as_chosen(self) -> None:
         agent = Agent(

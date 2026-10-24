@@ -191,6 +191,7 @@ class TestDecisions:
             "call_id": tc_mail.id,
             "reason": "More than 10 recipients",
             "source": "hook",
+            "params": {"to": ["a"] * 11, "body": {}},
         }
         assert pause.to_dict()["approval_gates"] == pause.approval_gates
 
@@ -357,13 +358,18 @@ class TestStaticPrecedence:
         assert rec.events("approval.requested") == []
         assert EXECUTED == []
 
-    async def test_static_approval_event_payload_unchanged(self) -> None:
+    async def test_static_approval_event_payload_shows_params(self) -> None:
         rec = SpyRecorder()
         tc = ToolCall(name="refund", params={"order_id": 1})
         llm = MockLLM([LLMResponse(tool_calls=[tc])])
         await _run(_agent(lambda c: None, require_approval=["refund"]), llm, rec)
         assert rec.events("approval.requested") == [
-            {"tool_name": "refund", "call_id": tc.id, "reason": "requires_approval"}
+            {
+                "tool_name": "refund",
+                "call_id": tc.id,
+                "reason": "requires_approval",
+                "params": {"order_id": 1},
+            }
         ]
 
 
