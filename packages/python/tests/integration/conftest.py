@@ -34,10 +34,11 @@ is auto-rewritten so the database name always ends in ``_test``:
     # ↓ auto-rewritten to ↓
     postgresql+asyncpg://u:p@host:5432/dendrux_test
 
-The rewrite emits a one-line warning the first time it kicks in. Provision
-the selected test database before running the suite; fixtures connect only
-to that database and never create another database. A hard guardrail refuses
-to proceed if the final DB name does not end in ``_test`` — there is no escape hatch on purpose.
+The rewrite emits a one-line warning the first time it kicks in. The
+``dendrux_test`` database is created automatically on first use (via the
+maintenance ``postgres`` database on the same host); subsequent runs
+reuse it. A hard guardrail refuses to proceed if the final DB name does
+not end in ``_test`` — there is no escape hatch on purpose.
 
 To run the matrix locally:
 
@@ -114,12 +115,25 @@ def _rewrite_to_test_db(url: str) -> tuple[str, str, bool]:
 
 
 async def _ensure_test_db_exists(url: str, db_name: str) -> None:
-    """Verify the explicitly selected test database is reachable; never create databases."""
-    # Connect only to the selected database. Provision it outside the test suite.
-    eng = create_async_engine(url, poolclass=NullPool)
+    """``CREATE DATABASE {db_name}`` on the maintenance DB if missing.
+
+    Connects to ``postgres`` (the standard maintenance database) on the same
+    host with AUTOCOMMIT — PG forbids ``CREATE DATABASE`` inside a transaction.
+    Idempotent: if the DB already exists, this is a no-op.
+    """
+    parsed = urlparse(url)
+    maintenance_url = urlunparse(parsed._replace(path="/postgres"))
+
+    eng = create_async_engine(maintenance_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
     try:
         async with eng.connect() as conn:
-            await conn.execute(text("SELECT 1"))
+            result = await conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": db_name},
+            )
+            if result.first() is None:
+                # db_name is validated against _DB_NAME_RE above; safe to interpolate.
+                await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
     finally:
         await eng.dispose()
 
@@ -192,7 +206,8 @@ async def _pg_schema_setup() -> AsyncIterator[None]:
         yield
         return
 
-    # Verify the pre-provisioned database directly, without a maintenance connection.
+    # Auto-create the *_test database if missing — Django-style. Connects
+    # to the postgres maintenance DB on the same host. See module docstring.
     _, db_name, _ = _rewrite_to_test_db(os.environ[_PG_URL_ENV])
     await _ensure_test_db_exists(url, db_name)
 
