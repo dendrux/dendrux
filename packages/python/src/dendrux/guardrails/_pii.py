@@ -19,6 +19,7 @@ from typing import Literal, Protocol
 from dendrux.guardrails._protocol import Finding, Pattern
 
 Engine = Literal["regex", "presidio"]
+RestoreMode = Literal["all", "allowlisted"]
 
 
 _DEFAULT_PATTERNS: list[Pattern] = [
@@ -119,6 +120,10 @@ class PII:
             ``PatternRecognizer``).
         include_defaults: Include the five built-in entities. Set ``False``
             to use only ``extra_patterns``.
+        restore: Which tools get real values back in place of placeholders
+            (``action="redact"``). ``"all"`` (default) restores into every
+            tool call. ``"allowlisted"`` restores only into tools marked
+            ``@tool(receives_pii=...)``.
     """
 
     def __init__(
@@ -128,13 +133,17 @@ class PII:
         engine: Engine = "regex",
         extra_patterns: list[Pattern] | None = None,
         include_defaults: bool = True,
+        restore: RestoreMode = "all",
     ) -> None:
         if action not in ("redact", "block", "warn"):
             raise ValueError(f"Invalid action: {action!r}. Must be 'redact', 'block', or 'warn'.")
         if engine not in ("regex", "presidio"):
             raise ValueError(f"Invalid engine: {engine!r}. Must be 'regex' or 'presidio'.")
+        if restore not in ("all", "allowlisted"):
+            raise ValueError(f"Invalid restore: {restore!r}. Must be 'all' or 'allowlisted'.")
         self.action: Literal["redact", "block", "warn"] = action
         self.engine: Engine = engine
+        self.restore: RestoreMode = restore
 
         if engine == "regex":
             patterns: list[Pattern] = []

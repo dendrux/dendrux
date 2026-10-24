@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
 
+    from dendrux.errors import ProviderError
     from dendrux.media import Image
 
 from ulid import ULID
@@ -523,6 +524,9 @@ class ToolDef:
     has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
     meta: dict[str, Any] = field(default_factory=dict)  # MCP source info, annotations, etc.
     strict: bool = False
+    # PII restore allowlist (``PII(restore="allowlisted")``): False, True (every
+    # entity) or a frozenset of entity names. Ignored under ``restore="all"``.
+    receives_pii: bool | frozenset[str] = False
 
 
 @dataclass(frozen=True)
@@ -830,6 +834,8 @@ class Budget:
         max_cost_usd: Dollar limit (> 0), or None.
         on_exceed: ``"warn"``, ``"pause"`` or ``"cancel"``.
         include_children: Count delegated descendant runs' usage.
+        count_cache_tokens: Count cache read and write tokens toward
+            ``max_tokens``. ``None`` (default) means not chosen.
 
     Raises:
         ValueError: If neither limit is set, a limit is not positive, a
@@ -841,6 +847,7 @@ class Budget:
     max_cost_usd: float | None = None
     on_exceed: BudgetAction = "warn"
     include_children: bool = True
+    count_cache_tokens: bool | None = None
 
     def __post_init__(self) -> None:
         if self.max_tokens is None and self.max_cost_usd is None:
@@ -866,6 +873,8 @@ class Budget:
             )
         if not isinstance(self.include_children, bool):
             raise ValueError("Budget include_children must be a bool.")
+        if self.count_cache_tokens is not None and not isinstance(self.count_cache_tokens, bool):
+            raise ValueError("Budget count_cache_tokens must be a bool or None.")
 
 
 @dataclass
@@ -1007,6 +1016,115 @@ class GovernanceEventType(StrEnum):
     GUARDRAIL_IMAGE_UNSCANNED = "guardrail.image_unscanned"
 
 
+_MIB = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Limits:
+    """Size and count caps for one Agent (``Agent(limits=Limits(...))``).
+
+    Args:
+        max_tool_result_bytes: Largest tool result (local, MCP or client)
+            passed to the model, in bytes. Default 1 MiB.
+        max_input_bytes: Largest UTF-8 text input to a run or submit, in
+            bytes. Images have their own caps (``ImagePolicy``). Default 1 MiB.
+        max_metadata_bytes: Largest run ``metadata`` as encoded JSON, in
+            bytes. Default 64 KiB.
+        max_notes_per_run: Most notes ``submit_note`` accepts for one run.
+            Default 1000.
+
+    Raises:
+        ValueError: If a cap is not a positive integer.
+    """
+
+    max_tool_result_bytes: int = _MIB
+    max_input_bytes: int = _MIB
+    max_metadata_bytes: int = 64 * 1024
+    max_notes_per_run: int = 1000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_tool_result_bytes",
+            "max_input_bytes",
+            "max_metadata_bytes",
+            "max_notes_per_run",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+@dataclass(frozen=True)
+class ErrorInfo:
+    """Structured, safe description of a provider failure that ended a run.
+
+    Built from a :class:`dendrux.errors.ProviderError`. Every field is a code,
+    number or name: ``safe_message`` is the error's fixed template, never
+    vendor text. Persisted under ``agent_runs.meta["dendrux.error_info"]``.
+
+    Attributes:
+        category: The error's ``category`` (``"rate_limit"``, ``"timeout"``, ...).
+        retryable: Whether repeating the same request may succeed.
+        safe_message: ``"{provider} {category} (HTTP {status}, code {code})"``.
+        error_type: The exception class name.
+        provider: Provider name, when known.
+        model: Model name, when known.
+        status_code: HTTP status, when there was one.
+        provider_code: The provider's error code, when it sent one.
+    """
+
+    category: str
+    retryable: bool
+    safe_message: str
+    error_type: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    status_code: int | None = None
+    provider_code: str | None = None
+
+    @classmethod
+    def from_error(cls, exc: ProviderError) -> ErrorInfo:
+        """Build from a provider error, reading only its safe fields."""
+        return cls(
+            category=exc.category,
+            retryable=exc.retryable,
+            safe_message=exc.safe_message,
+            error_type=type(exc).__name__,
+            provider=exc.provider,
+            model=exc.model,
+            status_code=exc.status_code,
+            provider_code=exc.provider_code,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe dict for persistence and events."""
+        return {
+            "category": self.category,
+            "retryable": self.retryable,
+            "safe_message": self.safe_message,
+            "error_type": self.error_type,
+            "provider": self.provider,
+            "model": self.model,
+            "status_code": self.status_code,
+            "provider_code": self.provider_code,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ErrorInfo:
+        """Rebuild from :meth:`to_dict` output; unknown keys are ignored."""
+        status = data.get("status_code")
+        return cls(
+            category=str(data.get("category") or "unknown"),
+            retryable=bool(data.get("retryable", False)),
+            safe_message=str(data.get("safe_message") or ""),
+            error_type=data.get("error_type"),
+            provider=data.get("provider"),
+            model=data.get("model"),
+            status_code=int(status) if isinstance(status, int) else None,
+            provider_code=data.get("provider_code"),
+        )
+
+
 @dataclass
 class RunResult:
     """The outcome of an agent run.
@@ -1036,6 +1154,9 @@ class RunResult:
     ``truncated`` is True when that call hit the output-token limit
     (``stop_reason == "max_tokens"``): the run still ends SUCCESS, but the
     answer is cut off.
+
+    ``error_info`` describes a provider failure that ended the run (ERROR
+    only). ``pause_id`` identifies the current pause of a paused run.
     """
 
     run_id: str
@@ -1050,6 +1171,8 @@ class RunResult:
     commentary: list[str] = field(default_factory=list)
     replay: ReplaySummary | None = None
     stop_reason: StopReason | None = None
+    error_info: ErrorInfo | None = None
+    pause_id: str | None = None
 
     @property
     def truncated(self) -> bool:
@@ -1281,6 +1404,10 @@ class PauseState:
     budget_unpriced_calls: int = 0
     # Image view bookkeeping; None until a run has seen an image.
     image_view: ImageViewState | None = None
+    # Identifier of this pause (ULID); None on pauses written before 0.5.0.
+    pause_id: str | None = None
+    # Pause-state format version; None on pauses written before 0.5.0.
+    schema_version: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -1320,6 +1447,10 @@ class PauseState:
             d["budget_unpriced_calls"] = self.budget_unpriced_calls
         if self.image_view is not None:
             d["image_view"] = self.image_view.to_dict()
+        if self.pause_id is not None:
+            d["pause_id"] = self.pause_id
+        if self.schema_version is not None:
+            d["schema_version"] = self.schema_version
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1356,6 +1487,8 @@ class PauseState:
                 if data.get("image_view") is not None
                 else None
             ),
+            pause_id=data.get("pause_id"),
+            schema_version=data.get("schema_version"),
         )
 
 

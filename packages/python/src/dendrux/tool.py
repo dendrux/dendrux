@@ -14,6 +14,7 @@ import inspect
 import json
 import re
 import typing
+from collections.abc import Iterable
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -63,6 +64,7 @@ def tool(
     *,
     parameters: dict[str, Any] | None = None,
     strict: bool = False,
+    receives_pii: bool | Iterable[str] = False,
 ) -> Callable[..., Any]:
     """Decorator that registers a function as a Dendrux tool.
 
@@ -84,6 +86,10 @@ def tool(
             a schema Anthropic cannot take strictly (recursion, tuples,
             untyped values, or over the request's 20 strict tools / 24
             optional / 16 union-typed parameter limits) is sent non-strict.
+        receives_pii: Under ``PII(restore="allowlisted")``, whether this tool
+            receives real values instead of placeholders: ``True`` for every
+            entity, or a set of entity names (``{"EMAIL"}``). Ignored under
+            the default ``restore="all"``.
 
     Usage:
         @tool(target="server")
@@ -108,6 +114,7 @@ def tool(
                 f"'human' and 'agent' are reserved for future use."
             )
 
+        resolved_receives_pii = _normalize_receives_pii(receives_pii, name)
         explicit_timeout = timeout_seconds is not _SENTINEL
         resolved_timeout = float(timeout_seconds) if explicit_timeout else DEFAULT_TOOL_TIMEOUT
 
@@ -128,6 +135,7 @@ def tool(
             timeout_seconds=resolved_timeout,
             has_explicit_timeout=explicit_timeout,
             strict=strict,
+            receives_pii=resolved_receives_pii,
         )
         setattr(fn, _TOOL_DEF_ATTR, tool_def)
         return fn
@@ -144,6 +152,20 @@ tool.__signature__ = _tool_sig.replace(  # type: ignore[attr-defined]
         for p in _tool_sig.parameters.values()
     ]
 )
+
+
+def _normalize_receives_pii(value: Any, tool_name: str) -> bool | frozenset[str]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) or not isinstance(value, Iterable):
+        raise ValueError(
+            f"Tool '{tool_name}' receives_pii must be a bool or a set of entity names, "
+            f"got {type(value).__name__}."
+        )
+    entities = frozenset(value)
+    if not all(isinstance(e, str) and e for e in entities):
+        raise ValueError(f"Tool '{tool_name}' receives_pii entity names must be non-empty strings.")
+    return entities
 
 
 def get_tool_def(fn: Callable[..., Any]) -> ToolDef:

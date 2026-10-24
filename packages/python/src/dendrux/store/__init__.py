@@ -55,7 +55,7 @@ from dendrux.runtime.state import (
     TenantScope,
     _Unscoped,
 )
-from dendrux.types import ReplaySummary
+from dendrux.types import ErrorInfo, ReplaySummary
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -100,6 +100,7 @@ class RunSummary:
     delegation_level: int
     total_reasoning_tokens: int = 0
     replay: ReplaySummary | None = None
+    tenant_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +154,10 @@ class RunSubtree:
 
 @dataclass(frozen=True, slots=True)
 class RunDetail:
-    """A single run's full detail — summary fields plus answer and error."""
+    """A single run's full detail — summary fields plus answer and error.
+
+    ``error_info`` is set when a provider failure ended the run.
+    """
 
     run_id: str
     agent_name: str
@@ -178,6 +182,8 @@ class RunDetail:
     cancel_requested: bool = False
     replay: ReplaySummary | None = None
     pause_requested: bool = False
+    tenant_id: str | None = None
+    error_info: ErrorInfo | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +296,7 @@ class PausePair:
     pending_tool_calls: list[dict[str, Any]]
     submitted_results: list[dict[str, Any]]
     user_input: str | None
+    pause_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +933,8 @@ __all__ = [
     "RunUsage",
     "StoredEvent",
     "SubtreeNode",
+    "TenantScope",
     "ToolInvocation",
     "TraceEntry",
+    "UNSCOPED",
 ]
