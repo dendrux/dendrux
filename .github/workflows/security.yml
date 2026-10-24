@@ -35,15 +35,20 @@ jobs:
       - name: Install the package and the audit tool
         run: |
           python -m venv "$RUNNER_TEMP/target"
+          # The bundled pip is audited too; start from the current one.
+          "$RUNNER_TEMP/target/bin/pip" install --upgrade pip
           "$RUNNER_TEMP/target/bin/pip" install "./packages/python[all]"
           python -m venv "$RUNNER_TEMP/tool"
           "$RUNNER_TEMP/tool/bin/pip" install "pip-audit==2.10.1"
 
       - name: Audit
         run: |
+          # What was installed, from the environment that is audited.
+          "$RUNNER_TEMP/target/bin/python" -m pip list --format=json > "$RUNNER_TEMP/inventory.json"
           status=0
           "$RUNNER_TEMP/tool/bin/pip-audit" \
             --path "$RUNNER_TEMP"/target/lib/python3.12/site-packages \
             --format json --output "$RUNNER_TEMP/audit.json" --progress-spinner off || status=$?
-          echo "pip-audit exit status: $status (1 means findings; the gate decides)"
-          python .github/scripts/audit_gate.py "$RUNNER_TEMP/audit.json" .github/pip-audit-allowlist.json
+          echo "pip-audit exit status: $status"
+          python .github/scripts/audit_gate.py "$RUNNER_TEMP/audit.json" \
+            .github/pip-audit-allowlist.json "$RUNNER_TEMP/inventory.json" "$status"

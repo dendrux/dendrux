@@ -110,3 +110,46 @@ jobs:
         run: |
           python -m build --wheel --outdir "$RUNNER_TEMP/wheel" .
           python ../../.github/scripts/check_wheel_dashboard.py "$RUNNER_TEMP"/wheel/*.whl src/dendrux/dashboard/static
+
+  dashboard:
+    name: dashboard frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/dashboard
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/dashboard/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Frontend lint
+        run: npm run lint
+
+      - name: Frontend tests
+        run: npm test
+
+      # The built dashboard is committed and shipped in the wheel. Rebuilding must
+      # reproduce it exactly, so a source change without a rebuild fails here.
+      - name: Committed build matches the source
+        shell: bash
+        run: |
+          npm run build
+          cd ../python
+          git diff --exit-code --stat -- src/dendrux/dashboard/static
+          tracked="$(git ls-files src/dendrux/dashboard/static | sort)"
+          present="$(find src/dendrux/dashboard/static -type f | sort)"
+          if [ "$tracked" != "$present" ]; then
+            echo "::error::the build output and the committed files differ (new hashed files need git add -f)."
+            diff <(echo "$tracked") <(echo "$present") || true
+            exit 1
+          fi

@@ -109,6 +109,20 @@ class TestCodeQL:
         }
 
 
+class TestDashboardFrontendJob:
+    def test_frontend_is_linted_tested_and_its_committed_build_verified(self) -> None:
+        job = _workflow("ci.yml")["jobs"]["dashboard"]
+        runs = "\n".join(step.get("run", "") for step in job["steps"])
+        for command in ("npm ci", "npm run lint", "npm test", "npm run build"):
+            assert command in runs
+        assert "git diff --exit-code" in runs
+        assert "git ls-files" in runs
+
+    def test_frontend_test_suite_exists(self) -> None:
+        tests = list((REPO / "packages" / "dashboard" / "src").rglob("*.test.tsx"))
+        assert tests
+
+
 class TestPostgresRequirement:
     def test_ci_fails_when_the_postgres_url_is_missing_or_tests_skip(self) -> None:
         steps = {s.get("name"): s for s in _all_steps(_workflow("ci.yml"))}
@@ -244,31 +258,54 @@ class TestPackaging:
 class TestAuditGate:
     gate = _load_script("audit_gate") if GITHUB.is_dir() else None
     TODAY = dt.date(2026, 10, 24)
-    NONE = frozenset()
-
-    def _ev(self, audit: dict, allow: dict | None = None, expected: frozenset | None = None):
-        return self.gate.evaluate(
-            audit, allow or {"entries": []}, self.TODAY, self.NONE if expected is None else expected
-        )
+    NONE: frozenset[str] = frozenset()
 
     @staticmethod
-    def _audit(*vulns: dict, name: str = "pkg") -> dict:
-        return {"dependencies": [{"name": name, "version": "1.0", "vulns": list(vulns)}]}
+    def _audit(*vulns: dict, name: str = "pkg", version: str = "1.0") -> dict:
+        return {"dependencies": [{"name": name, "version": version, "vulns": list(vulns)}]}
+
+    @staticmethod
+    def _inventory_of(audit: dict) -> list[dict]:
+        return [
+            {"name": d["name"], "version": d.get("version", "1.0")}
+            for d in audit.get("dependencies", [])
+            if isinstance(d, dict) and "name" in d
+        ]
+
+    def _ev(
+        self,
+        audit: dict,
+        allow: dict | None = None,
+        *,
+        inventory: object = "auto",
+        status: int = 0,
+        expected: frozenset[str] | None = None,
+    ) -> list[str]:
+        inv = self._inventory_of(audit) if inventory == "auto" else inventory
+        return self.gate.evaluate(
+            audit,
+            allow or {"entries": []},
+            self.TODAY,
+            inv,
+            status,
+            self.NONE if expected is None else expected,
+        )
 
     def test_clean_audit_passes(self) -> None:
         assert self._ev(self._audit()) == []
 
     def test_unlisted_vulnerability_fails(self) -> None:
-        problems = self._ev(self._audit({"id": "PYSEC-1", "aliases": [], "fix_versions": ["1.1"]}))
+        audit = self._audit({"id": "PYSEC-1", "aliases": [], "fix_versions": ["1.1"]})
+        problems = self._ev(audit, status=1)
         assert len(problems) == 1
         assert "PYSEC-1" in problems[0]
 
     def test_allowlisted_by_id_or_alias_passes(self) -> None:
         entry = {"id": "GHSA-x", "reason": "unreachable", "expires": "2026-11-30"}
         by_alias = self._audit({"id": "PYSEC-1", "aliases": ["GHSA-x"], "fix_versions": []})
-        assert self._ev(by_alias, {"entries": [entry]}) == []
+        assert self._ev(by_alias, {"entries": [entry]}, status=1) == []
         by_id = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
-        assert self._ev(by_id, {"entries": [entry]}) == []
+        assert self._ev(by_id, {"entries": [entry]}, status=1) == []
 
     def test_expired_entry_fails_even_when_unmatched(self) -> None:
         entry = {"id": "GHSA-x", "reason": "r", "expires": "2026-10-23"}
@@ -277,7 +314,7 @@ class TestAuditGate:
     def test_expired_entry_no_longer_suppresses_its_vulnerability(self) -> None:
         entry = {"id": "GHSA-x", "reason": "r", "expires": "2026-10-23"}
         audit = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
-        assert len(self._ev(audit, {"entries": [entry]})) == 2
+        assert len(self._ev(audit, {"entries": [entry]}, status=1)) == 2
 
     @pytest.mark.parametrize(
         "entry",
@@ -292,7 +329,7 @@ class TestAuditGate:
     )
     def test_malformed_or_distant_entries_are_rejected(self, entry: dict) -> None:
         audit = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
-        assert len(self._ev(audit, {"entries": [entry]})) == 2
+        assert len(self._ev(audit, {"entries": [entry]}, status=1)) == 2
 
     @pytest.mark.parametrize(
         "report",
@@ -307,41 +344,85 @@ class TestAuditGate:
         ],
     )
     def test_malformed_reports_fail(self, report: dict) -> None:
-        assert self._ev(report)
+        assert self._ev(report, inventory=[{"name": "pkg", "version": "1"}])
 
     def test_unaudited_dependency_fails(self) -> None:
         report = {"dependencies": [{"name": "pkg", "skip_reason": "could not be audited"}]}
-        problems = self._ev(report)
+        problems = self._ev(report, inventory=[{"name": "pkg", "version": "1"}])
         assert len(problems) == 1
         assert "not audited" in problems[0]
 
-    def test_package_under_test_may_be_skipped(self) -> None:
-        report = {
+    def test_package_under_test_may_be_skipped_or_absent(self) -> None:
+        inventory = [
+            {"name": "dendrux", "version": "0.5.0.dev1"},
+            {"name": "pkg", "version": "1.0"},
+        ]
+        skipped = {
             "dependencies": [
                 {"name": "dendrux", "skip_reason": "Dependency not found on PyPI"},
-                {"name": "pkg", "version": "1", "vulns": []},
+                {"name": "pkg", "version": "1.0", "vulns": []},
             ]
         }
-        assert self._ev(report) == []
+        assert self._ev(skipped, inventory=inventory) == []
+        absent = self._audit()
+        assert self._ev(absent, inventory=inventory) == []
 
-    def test_expected_packages_must_be_audited(self) -> None:
-        problems = self._ev(self._audit(name="other"), expected=frozenset({"pydantic", "httpx"}))
-        assert sorted(problems) == [
-            "httpx: expected in the audit report but not audited.",
-            "pydantic: expected in the audit report but not audited.",
-        ]
-        ok = {
+    def test_installed_package_missing_from_the_report_fails(self) -> None:
+        inventory = [{"name": "pkg", "version": "1.0"}, {"name": "forgotten", "version": "2.3"}]
+        problems = self._ev(self._audit(), inventory=inventory)
+        assert problems == ["forgotten 2.3: installed but missing from the audit report."]
+
+    def test_report_record_without_a_version_fails(self) -> None:
+        report = {"dependencies": [{"name": "pkg", "vulns": []}]}
+        problems = self._ev(report, inventory=[{"name": "pkg", "version": "1.0"}])
+        assert problems == ["pkg: audit record has no version."]
+
+    def test_version_mismatch_fails(self) -> None:
+        problems = self._ev(
+            self._audit(version="1.0"), inventory=[{"name": "pkg", "version": "2.0"}]
+        )
+        assert problems == ["pkg: audited 1.0 but 2.0 is installed."]
+
+    def test_names_match_by_pep_503_normalisation(self) -> None:
+        report = {"dependencies": [{"name": "Typing_Extensions", "version": "4", "vulns": []}]}
+        assert self._ev(report, inventory=[{"name": "typing-extensions", "version": "4"}]) == []
+
+    @pytest.mark.parametrize(
+        "inventory", [None, [], "x", [{"name": "pkg"}], [{"version": "1"}], [1]]
+    )
+    def test_missing_or_malformed_inventory_fails(self, inventory: object) -> None:
+        problems = self._ev(self._audit(), inventory=inventory)
+        assert any("inventory" in p for p in problems)
+
+    def test_expected_packages_must_be_installed_and_audited(self) -> None:
+        problems = self._ev(self._audit(name="other"), expected=frozenset({"pydantic"}))
+        assert any("pydantic" in p and "not installed" in p for p in problems)
+        report = {
             "dependencies": [
                 {"name": "Pydantic", "version": "2", "vulns": []},
                 {"name": "httpx", "version": "1", "vulns": []},
             ]
         }
-        assert self._ev(ok, expected=frozenset({"pydantic", "httpx"})) == []
+        assert self._ev(report, expected=frozenset({"pydantic", "httpx"})) == []
 
-    def test_a_skipped_expected_package_is_not_counted_as_audited(self) -> None:
+    def test_a_skipped_expected_package_still_fails(self) -> None:
         report = {"dependencies": [{"name": "pydantic", "skip_reason": "x"}]}
         problems = self._ev(report, expected=frozenset({"pydantic"}))
-        assert len(problems) == 2
+        assert any("not audited" in p for p in problems)
+
+    @pytest.mark.parametrize("status", [2, 3, 127, 130, -9])
+    def test_unexpected_auditor_status_fails(self, status: int) -> None:
+        problems = self._ev(self._audit(), status=status)
+        assert any("exited with status" in p for p in problems)
+
+    def test_status_one_without_findings_is_an_auditor_error(self) -> None:
+        problems = self._ev(self._audit(), status=1)
+        assert any("no findings" in p for p in problems)
+
+    def test_status_one_with_allowlisted_findings_passes(self) -> None:
+        entry = {"id": "GHSA-x", "reason": "r", "expires": "2026-11-30"}
+        audit = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
+        assert self._ev(audit, {"entries": [entry]}, status=1) == []
 
     def test_default_expected_set_covers_core_packages(self) -> None:
         assert {"pydantic", "sqlalchemy", "httpx", "fastapi"} <= self.gate.EXPECTED_AUDITED
@@ -353,35 +434,48 @@ class TestAuditGate:
         _, problems = self.gate.check_allowlist(data, dt.datetime.now(dt.UTC).date())
         assert problems == []
 
-    def test_unreadable_report_fails_the_build(self, tmp_path: Path) -> None:
-        allow = tmp_path / "allow.json"
-        allow.write_text('{"entries": []}')
-        assert self.gate.main(["gate", str(tmp_path / "missing.json"), str(allow)]) == 1
-        bad = tmp_path / "bad.json"
-        bad.write_text("not json")
-        assert self.gate.main(["gate", str(bad), str(allow)]) == 1
-
     def test_main_exit_codes(self, tmp_path: Path) -> None:
         import json
 
+        names = sorted(self.gate.EXPECTED_AUDITED)
+        inventory = tmp_path / "inventory.json"
+        inventory.write_text(json.dumps([{"name": n, "version": "1"} for n in names]))
         allow = tmp_path / "allow.json"
         allow.write_text('{"entries": []}')
-        full = {
-            "dependencies": [
-                {"name": name, "version": "1", "vulns": []} for name in self.gate.EXPECTED_AUDITED
-            ]
-        }
+        records = [{"name": n, "version": "1", "vulns": []} for n in names]
         clean = tmp_path / "clean.json"
-        clean.write_text(json.dumps(full))
+        clean.write_text(json.dumps({"dependencies": records}))
         dirty = tmp_path / "dirty.json"
-        full["dependencies"][0]["vulns"] = [{"id": "X-1", "aliases": []}]
-        dirty.write_text(json.dumps(full))
+        dirty.write_text(
+            json.dumps(
+                {
+                    "dependencies": [
+                        {**records[0], "vulns": [{"id": "X-1", "aliases": []}]},
+                        *records[1:],
+                    ]
+                }
+            )
+        )
+        partial = tmp_path / "partial.json"
+        partial.write_text(json.dumps({"dependencies": records[:1]}))
         empty = tmp_path / "empty.json"
         empty.write_text("{}")
-        assert self.gate.main(["gate", str(clean), str(allow)]) == 0
-        assert self.gate.main(["gate", str(dirty), str(allow)]) == 1
-        assert self.gate.main(["gate", str(empty), str(allow)]) == 1
-        assert self.gate.main(["gate"]) == 2
+
+        def run(report: Path, status: str = "0", inv: Path = inventory) -> int:
+            return self.gate.main(["gate", str(report), str(allow), str(inv), status])
+
+        assert run(clean) == 0
+        assert run(dirty, "1") == 1
+        assert run(empty) == 1
+        assert run(partial) == 1  # installed packages missing from the report
+        assert run(clean, "2") == 1
+        assert run(clean, "not-a-number") == 1
+        assert run(tmp_path / "missing.json") == 1
+        assert run(clean, inv=tmp_path / "missing-inventory.json") == 1
+        bad = tmp_path / "bad.json"
+        bad.write_text("not json")
+        assert run(bad) == 1
+        assert self.gate.main(["gate", str(clean)]) == 2
 
 
 class TestWheelDashboardCheck:
