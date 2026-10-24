@@ -583,7 +583,11 @@ async def _init_loop_state(
 
     call_counts: dict[str, int] = {}
     for msg in history:
-        if msg.role == Role.TOOL and msg.name is not None:
+        if (
+            msg.role == Role.TOOL
+            and msg.name is not None
+            and not msg.meta.get("dendrux.not_executed")
+        ):
             call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
 
     steps: list[AgentStep] = list(initial_steps) if initial_steps else []
@@ -1263,6 +1267,17 @@ def _image_policy(agent: Any, image_runtime: ImageRuntime | None) -> ImagePolicy
     return policy if isinstance(policy, ImagePolicy) else ImagePolicy()
 
 
+def _mark_call_rejections(
+    history: list[Message], start: int, results: list[tuple[ToolCall, ToolResult]]
+) -> None:
+    """Keep generated cap rejections out of execution counts after a resume."""
+    rejected = {tc.id for tc, result in results if result.meta.get("code") == "max_calls"}
+    if rejected:
+        for message in history[start:]:
+            if message.role == Role.TOOL and message.call_id in rejected:
+                message.meta["dendrux.not_executed"] = True
+
+
 class ReActLoop(Loop):
     """Think → act → observe → repeat.
 
@@ -1851,6 +1866,10 @@ class ReActLoop(Loop):
                     notifier_warnings,
                     phase="commentary",
                 )
+                if state_store is not None:
+                    # The provider may have returned after sweep revoked this worker.
+                    await _read_control(state_store, resolved_run_id)
+                tool_history_start = len(history)
                 outcome = await _process_tool_calls(
                     step=step,
                     call_counts=call_counts,
@@ -1870,6 +1889,7 @@ class ReActLoop(Loop):
                     tenant_id=hook_tenant_id,
                     image_runtime=image_runtime,
                 )
+                _mark_call_rejections(history, tool_history_start, outcome.all_results)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -2441,6 +2461,10 @@ class ReActLoop(Loop):
                     notifier_warnings,
                     phase="commentary",
                 )
+                if state_store is not None:
+                    # The provider may have returned after sweep revoked this worker.
+                    await _read_control(state_store, resolved_run_id)
+                tool_history_start = len(history)
                 outcome = await _process_tool_calls(
                     step=step,
                     call_counts=call_counts,
@@ -2468,6 +2492,7 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         phase="commentary",
                     )
+                _mark_call_rejections(history, tool_history_start, outcome.all_results)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL

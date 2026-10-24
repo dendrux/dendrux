@@ -105,10 +105,8 @@ async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: Tenan
     """Raise ``RunNotFoundError`` unless the run exists within ``tenant_id``.
 
     Run before any write so a cross-tenant call changes nothing. A run's
-    tenant never changes, so this read cannot race. Omitted scope skips it.
+    tenant never changes, so this read cannot race. Missing runs use the same error.
     """
-    if tenant_id is UNSCOPED:
-        return
     from dendrux.errors import RunNotFoundError
 
     record = await store.get_run(run_id)
@@ -1505,6 +1503,7 @@ class Agent:
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
         tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Resume a paused run.
 
@@ -1520,6 +1519,7 @@ class Agent:
                 ``ToolResult.images`` are ingested before the run is claimed.
             user_input: Clarification answer (for human-in-the-loop runs): a
                 string, or strings and images.
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier. Composed with
                 PersistenceRecorder internally.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
@@ -1534,6 +1534,9 @@ class Agent:
                 both args provided, or neither provided.
             RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
+        from dendrux.runtime.submit import warn_missing_pause_id
+
+        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "resume",
@@ -1568,6 +1571,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                expected_pause_id=expected_pause_id,
             )
         if user_input is not None:
             return await resume_with_input(
@@ -1577,6 +1581,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                expected_pause_id=expected_pause_id,
             )
         # No-arg resume — approve path. Runner validates status is
         # WAITING_APPROVAL and executes pending tools.
@@ -1587,6 +1592,7 @@ class Agent:
             agent=self,
             provider=provider,
             extra_notifier=notifier,
+            expected_pause_id=expected_pause_id,
         )
 
     async def submit_tool_results(
@@ -1596,6 +1602,7 @@ class Agent:
         *,
         notifier: LoopNotifier | None = None,
         tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Submit client-side tool results and resume the paused run.
 
@@ -1611,6 +1618,7 @@ class Agent:
                 validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1629,6 +1637,9 @@ class Agent:
             RunAlreadyTerminalError: run already reached a terminal state.
             InvalidToolResultError: results don't match pending calls.
         """
+        from dendrux.runtime.submit import warn_missing_pause_id
+
+        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "submit_tool_results",
@@ -1641,6 +1652,7 @@ class Agent:
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
             claim_or_raise,
+            prepare_client_results,
             serialize_tool_results,
             validate_tool_results,
         )
@@ -1655,6 +1667,7 @@ class Agent:
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             pause = await validate_tool_results(store, run_id, results)
+            results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
             if any(r.images for r in results):
                 from dendrux.runtime.runner import ingest_submitted_tool_images
@@ -1662,13 +1675,21 @@ class Agent:
                 results, claim_kwargs = await ingest_submitted_tool_images(
                     self, provider, store, run_id, pause, results
                 )
-            await claim_or_raise(
+            epoch = await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_CLIENT_TOOL,
                 submitted_data={"submitted_tool_results": serialize_tool_results(results)},
+                agent=self,
+                expected_pause_id=(
+                    expected_pause_id if expected_pause_id is not None else pause.pause_id
+                ),
+                call_results=results,
                 **claim_kwargs,
             )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
 
             task = self._task_manager.spawn(
                 run_id,
@@ -1690,6 +1711,7 @@ class Agent:
         *,
         notifier: LoopNotifier | None = None,
         tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Submit clarification input and resume the paused run.
 
@@ -1700,6 +1722,7 @@ class Agent:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1711,6 +1734,9 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        from dendrux.runtime.submit import warn_missing_pause_id
+
+        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "submit_input",
@@ -1743,13 +1769,18 @@ class Agent:
                 submitted, claim_kwargs = await ingest_submitted_user_parts(
                     self, provider, store, run_id, projection, items
                 )
-            await claim_or_raise(
+            epoch = await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_HUMAN_INPUT,
                 submitted_data=submitted,
+                agent=self,
+                expected_pause_id=expected_pause_id,
                 **claim_kwargs,
             )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
 
             task = self._task_manager.spawn(
                 run_id,
@@ -1773,6 +1804,7 @@ class Agent:
         rejection_reason: str | None = None,
         notifier: LoopNotifier | None = None,
         tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Submit an approval decision for a run awaiting human approval.
 
@@ -1808,6 +1840,7 @@ class Agent:
             approved: Whole-batch decision.
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1820,6 +1853,9 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        from dendrux.runtime.submit import warn_missing_pause_id
+
+        warn_missing_pause_id(self, expected_pause_id, approval=bool(approved))
         tenant_id = entry_checks(
             self,
             "submit_approval",
@@ -1881,7 +1917,7 @@ class Agent:
                         run_id, PauseState.from_dict(current), pairs, target_lookup
                     )
 
-                await claim_or_raise(
+                epoch = await claim_or_raise(
                     store,
                     run_id,
                     expected_status=RunStatus.WAITING_APPROVAL,
@@ -1889,7 +1925,14 @@ class Agent:
                         "submitted_decisions": serialize_decisions(pause_state, decision_map)
                     },
                     validate=same_pause_generation,
+                    agent=self,
+                    expected_pause_id=(
+                        expected_pause_id if expected_pause_id is not None else pause_state.pause_id
+                    ),
                 )
+                from dendrux.runtime.state import claimed_store
+
+                store = claimed_store(store, run_id, epoch)
                 task = self._task_manager.spawn(
                     run_id,
                     resume_claimed(
@@ -1904,11 +1947,16 @@ class Agent:
                 return await task
 
             if approved:
-                await claim_or_raise(
+                epoch = await claim_or_raise(
                     store,
                     run_id,
                     expected_status=RunStatus.WAITING_APPROVAL,
+                    agent=self,
+                    expected_pause_id=expected_pause_id,
                 )
+                from dendrux.runtime.state import claimed_store
+
+                store = claimed_store(store, run_id, epoch)
                 task = self._task_manager.spawn(
                     run_id,
                     resume_approval_approved_claim(
@@ -1929,12 +1977,20 @@ class Agent:
                 await raise_for_non_paused_status(store, run_id)
             pause_state = PauseState.from_dict(raw_pause)
             synthetic = build_rejection_results(pause_state, rejection_reason)
-            await claim_or_raise(
+            epoch = await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_APPROVAL,
                 submitted_data={"submitted_tool_results": serialize_tool_results(synthetic)},
+                agent=self,
+                call_results=synthetic,
+                expected_pause_id=(
+                    expected_pause_id if expected_pause_id is not None else pause_state.pause_id
+                ),
             )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
             task = self._task_manager.spawn(
                 run_id,
                 resume_claimed(
@@ -2233,6 +2289,7 @@ class Agent:
         *,
         notifier: LoopNotifier | None = None,
         tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Resume a PAUSED run and block until its next pause or terminal state.
 
@@ -2245,6 +2302,7 @@ class Agent:
 
         Args:
             run_id: A run in status ``PAUSED``.
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -2257,6 +2315,9 @@ class Agent:
             WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        from dendrux.runtime.submit import warn_missing_pause_id
+
+        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
@@ -2273,7 +2334,16 @@ class Agent:
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
-            await claim_or_raise(store, run_id, expected_status=RunStatus.PAUSED)
+            epoch = await claim_or_raise(
+                store,
+                run_id,
+                expected_status=RunStatus.PAUSED,
+                agent=self,
+                expected_pause_id=expected_pause_id,
+            )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
             task = self._task_manager.spawn(
                 run_id,
                 resume_paused_claim(
@@ -2587,6 +2657,7 @@ class Agent:
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
         tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunStream:
         """Stream a resumed run as RunEvents.
 
@@ -2609,6 +2680,7 @@ class Agent:
             run_id: The paused run's ID.
             tool_results: Results for pending tool calls (client tool runs).
             user_input: Clarification answer (human-in-the-loop runs).
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -2623,6 +2695,9 @@ class Agent:
                 event, when ``run_id`` is outside ``tenant_id``. The run is
                 left untouched (the stream's close-time cleanup is a no-op).
         """
+        from dendrux.runtime.submit import warn_missing_pause_id
+
+        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "resume_stream",
@@ -2651,6 +2726,7 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
             extra_notifier=notifier,
+            expected_pause_id=expected_pause_id,
         )
         if tenant_id is UNSCOPED:
             return stream

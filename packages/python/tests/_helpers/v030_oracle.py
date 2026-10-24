@@ -1042,6 +1042,9 @@ def result_view(result: Any) -> dict[str, Any]:
     view["replay"] = jsonable(replay) if replay is not None else None
     pause = (result.meta or {}).get("pause_state")
     view["pause_state"] = pause.to_dict() if pause is not None else None
+    if view["pause_state"] is not None:
+        pause_id = view["pause_state"].pop("pause_id", None)
+        assert pause_id is None or re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", pause_id)
     return view
 
 
@@ -1632,7 +1635,12 @@ def normalise_rows(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     norm = Normalizer()
     out: dict[str, Any] = {}
     for name in ROW_TABLES:
-        out[name] = norm(rows[name])
+        projected = []
+        for row in rows[name]:
+            row, problem = _strip_050_additions(name, row)
+            assert problem is None, problem
+            projected.append(row)
+        out[name] = norm(projected)
     # Round-trip through sorted-key JSON so dialect JSON key order cannot matter.
     return json.loads(dumps_canonical(out))
 
@@ -1684,17 +1692,43 @@ def _strip_041_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
 
 
 def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Remove the 0.5.0 ``agent_runs.claim_epoch`` fencing column after checking it.
+    """Validate new integrity fields before comparing the older text wire shape.
 
-    It is ``NOT NULL DEFAULT 0`` (C1) and counts claims, so it is a
-    non-negative integer rather than NULL on a text-only run.
+    Strip ULIDs before Normalizer allocates identities, so an added pause ID
+    cannot renumber the pre-existing run and call IDs. Goldens stay unchanged.
     """
-    if table != "agent_runs" or "claim_epoch" not in row:
-        return row, None
     row = dict(row)
-    epoch = row.pop("claim_epoch")
-    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
-        return row, f"agent_runs.claim_epoch: expected a non-negative int, got {epoch!r}"
+    if table == "agent_runs":
+        if "claim_epoch" in row:
+            epoch = row.pop("claim_epoch")
+            if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+                return row, "agent_runs.claim_epoch: expected a non-negative int"
+        if isinstance(row.get("meta"), dict):
+            meta = dict(row["meta"])
+            governance = meta.pop("dendrux.governance", None)
+            if governance is not None and (
+                governance.get("version") != 1
+                or not re.fullmatch(r"[0-9a-f]{64}", governance.get("digest", ""))
+                or set(governance.get("parts", {}))
+                != {"guardrails", "before_tool", "deny", "require_approval", "limits", "budget"}
+                or not all(
+                    re.fullmatch(r"[0-9a-f]{64}", value) for value in governance["parts"].values()
+                )
+            ):
+                return row, "agent_runs.meta: invalid governance digest"
+            row["meta"] = meta
+        if isinstance(row.get("pause_data"), dict):
+            pause = dict(row["pause_data"])
+            pause.pop("pause_id", None)
+            pause.pop("status", None)
+            pause.pop("dendrux.governance", None)
+            row["pause_data"] = pause
+    if table == "run_events" and row.get("event_type") == "run.paused":
+        data = dict(row["data"] or {})
+        pause_id = data.pop("pause_id", None)
+        if pause_id is not None and not re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", pause_id):
+            return row, "run.paused: invalid pause_id"
+        row["data"] = data
     return row, None
 
 

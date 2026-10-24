@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from dendrux.errors import (
@@ -42,6 +42,7 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Sequence
 
+    from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._policy import ImagePolicy, Origin
@@ -109,6 +110,17 @@ async def raise_for_non_paused_status(store: StateStore, run_id: str) -> NoRetur
     raise RunNotPausedError(run_id, current)
 
 
+def _invalid_tool_result(run_id: str, reason: str) -> InvalidToolResultError:
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "Invalid client tool result: run_id=%s code=invalid_tool_result",
+        run_id,
+        extra={"run_id": run_id, "code": "invalid_tool_result"},
+    )
+    return InvalidToolResultError(run_id, reason)
+
+
 async def validate_tool_results(
     store: StateStore, run_id: str, results: list[ToolResult]
 ) -> PauseState:
@@ -139,8 +151,76 @@ async def validate_tool_results(
         parts.append(f"unexpected call_ids={extra}")
 
     if parts:
-        raise InvalidToolResultError(run_id, "; ".join(parts))
+        raise _invalid_tool_result(run_id, "; ".join(parts))
+    validate_result_names(run_id, pause_state, results, json_payload=False)
     return pause_state
+
+
+def validate_result_names(
+    run_id: str, pause: PauseState, results: list[ToolResult], *, json_payload: bool = True
+) -> None:
+    """Bind each client result to the pending call's name and JSON shape."""
+    import json
+
+    pending = {call.id: call.name for call in pause.pending_tool_calls}
+    if (
+        len(results) != len(pending)
+        or len({r.call_id for r in results}) != len(results)
+        or {r.call_id for r in results} != set(pending)
+    ):
+        raise _invalid_tool_result(run_id, "tool result call ids do not match pending calls")
+    for result in results:
+        if pending.get(result.call_id) != result.name:
+            raise _invalid_tool_result(run_id, "tool result name does not match pending call")
+        if not isinstance(result.payload, str):
+            raise _invalid_tool_result(run_id, "tool result payload must be a JSON string")
+        if not json_payload:
+            continue
+        try:
+            json.loads(result.payload, parse_constant=_invalid_json_constant)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise _invalid_tool_result(run_id, "tool result payload is not valid JSON") from exc
+
+
+def pause_validator(
+    run_id: str,
+    expected_pause_id: str | None,
+    *,
+    agent_name: str | None = None,
+    call_results: list[ToolResult] | None = None,
+) -> Callable[[dict[str, Any]], None]:
+    """Validation performed while the claim transaction holds the run row."""
+
+    def validate(current: dict[str, Any]) -> None:
+        current_id = current.get("pause_id")
+        if expected_pause_id is not None and expected_pause_id != current_id:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Pause generation mismatch: run_id=%s code=pause_id_mismatch",
+                run_id,
+                extra={"run_id": run_id, "code": "pause_id_mismatch"},
+            )
+            raise PauseStatusMismatchError(
+                run_id,
+                RunStatus(current.get("status", RunStatus.PAUSED.value)),
+                RunStatus(current.get("status", RunStatus.PAUSED.value)),
+                expected_pause_id=expected_pause_id,
+                current_pause_id=current_id,
+                reason="pause_id",
+            )
+        if agent_name is not None and current.get("agent_name") not in (None, agent_name):
+            raise ValueError("Agent name mismatch on resume")
+        if call_results is not None:
+            pending = {call["id"]: call["name"] for call in current.get("pending_tool_calls", [])}
+            if (
+                len(pending) != len(call_results)
+                or len({r.call_id for r in call_results}) != len(call_results)
+                or any(pending.get(result.call_id) != result.name for result in call_results)
+            ):
+                raise _invalid_tool_result(run_id, "tool results do not match pending calls")
+
+    return validate
 
 
 async def preflight_status(store: StateStore, run_id: str, expected_status: RunStatus) -> None:
@@ -171,10 +251,13 @@ async def claim_or_raise(
     *,
     expected_status: RunStatus,
     submitted_data: dict[str, Any] | None = None,
+    agent: Agent | None = None,
+    expected_pause_id: str | None = None,
+    call_results: list[ToolResult] | None = None,
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
-) -> None:
+) -> int:
     """Perform a status preflight, then persist-first handoff + CAS claim.
 
     The preflight reads the current status before attempting the CAS so
@@ -202,6 +285,18 @@ async def claim_or_raise(
     """
     await preflight_status(store, run_id, expected_status)
 
+    raw = await store.get_pause_state(run_id)
+    if raw is None:
+        await raise_for_non_paused_status(store, run_id)
+    validate = submission_validator(
+        run_id,
+        raw,
+        agent=agent,
+        expected_pause_id=expected_pause_id,
+        call_results=call_results,
+        extra=validate,
+    )
+
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
     if submitted_data is not None:
         claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
@@ -215,10 +310,24 @@ async def claim_or_raise(
             **claim_kwargs,
         )
     else:
-        won = await store.claim_paused_run(run_id, expected_status=expected_status.value)
+        claim_kwargs = {} if validate is None else {"validate": validate}
+        won = await store.claim_paused_run(
+            run_id, expected_status=expected_status.value, **claim_kwargs
+        )
 
     if won:
-        return
+        if agent is not None:
+            try:
+                await report_governance_change(agent, store, run_id, raw)
+            except BaseException:
+                release = getattr(store, "release_run_claim", None)
+                if release is not None and type(won) is int:
+                    import anyio
+
+                    with anyio.CancelScope(shield=True):
+                        await release(run_id, status=expected_status.value, claim_epoch=won)
+                raise
+        return won
 
     # CAS lost after preflight succeeded — something transitioned the run
     # between the two reads. Re-check to pick the most specific error.
@@ -635,3 +744,216 @@ def deserialize_decisions(raw: object) -> list[tuple[str, ApprovalDecision]]:
             )
         )
     return pairs
+
+
+GOVERNANCE_KEY = "dendrux.governance"
+
+
+def _invalid_json_constant(value: str) -> NoReturn:
+    raise ValueError("non-finite JSON number")
+
+
+def governance_snapshot(agent: Agent) -> dict[str, Any]:
+    """Versioned digests of stable governance configuration, never object reprs.
+
+    Budget amounts are intentionally excluded so a caller can raise them when
+    resuming a budget pause. Opaque custom settings opt in with a fingerprint.
+    """
+    import hashlib
+    import json
+
+    def qualified(value: Any) -> str:
+        return (
+            str(getattr(value, "__module__", type(value).__module__))
+            + "."
+            + str(getattr(value, "__qualname__", type(value).__qualname__))
+        )
+
+    def digest(value: Any) -> str:
+        wire = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(wire.encode("utf-8")) > 65536:
+            raise ValueError("Governance fingerprint exceeds 64 KiB")
+        return hashlib.sha256(wire.encode("utf-8")).hexdigest()
+
+    guards = []
+    for guard in agent.guardrails or ():
+        detectors = getattr(guard, "_detectors", None)
+        if detectors is None:
+            detectors = getattr(getattr(guard, "_scanner", None), "_detectors", ())
+        entities = getattr(guard, "entities", None)
+        if entities is None:
+            entities = [det.name for det in detectors or ()]
+        fingerprint = getattr(guard, "governance_fingerprint", None)
+        guards.append(
+            {
+                "class": qualified(type(guard)),
+                "action": guard.action,
+                "entities": sorted(set(entities)),
+                "engine": getattr(guard, "engine", None),
+                "restore": getattr(guard, "restore", None),
+                "fingerprint": fingerprint() if fingerprint is not None else None,
+            }
+        )
+    budget = agent.budget
+    parts = {
+        "guardrails": guards,
+        "before_tool": qualified(agent.before_tool) if agent.before_tool else None,
+        "deny": sorted(agent.deny),
+        "require_approval": sorted(agent.require_approval),
+        "limits": asdict(agent._limits),
+        "budget": (
+            {
+                "on_exceed": budget.on_exceed,
+                "include_children": budget.include_children,
+                "count_cache_tokens": bool(budget.count_cache_tokens),
+            }
+            if budget
+            else None
+        ),
+    }
+    hashed = {key: digest(value) for key, value in parts.items()}
+    return {"version": 1, "digest": digest(hashed), "parts": hashed}
+
+
+def _governance_change(agent: Agent, raw: dict[str, Any]) -> dict[str, Any] | None:
+    saved = raw.get(GOVERNANCE_KEY)
+    if saved is None:
+        return None
+    actual = governance_snapshot(agent)
+    if saved.get("digest") == actual["digest"]:
+        return None
+    changed = sorted(
+        key for key, value in actual["parts"].items() if saved.get("parts", {}).get(key) != value
+    )
+    return {
+        "expected_digest": saved.get("digest"),
+        "actual_digest": actual["digest"],
+        "changed": changed,
+    }
+
+
+def submission_validator(
+    run_id: str,
+    raw: dict[str, Any],
+    *,
+    agent: Agent | None,
+    expected_pause_id: str | None = None,
+    call_results: list[ToolResult] | None = None,
+    extra: Callable[[dict[str, Any]], None] | None = None,
+) -> Callable[[dict[str, Any]], None]:
+    """Validate before claiming, then repeat under the claim transaction's lock."""
+    from dendrux.errors import GovernanceMismatchError
+
+    # Even an optional-token client is bound to the generation we observed.
+    generation = expected_pause_id if expected_pause_id is not None else raw.get("pause_id")
+    base = pause_validator(
+        run_id, generation, agent_name=agent.name if agent else None, call_results=call_results
+    )
+
+    def validate(current: dict[str, Any]) -> None:
+        base(current)
+        if agent is not None and agent._on_governance_change == "raise":
+            change = _governance_change(agent, current)
+            if change is not None:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Governance mismatch: run_id=%s code=governance_mismatch",
+                    run_id,
+                    extra={"run_id": run_id, "code": "governance_mismatch"},
+                )
+                raise GovernanceMismatchError(run_id, **change)
+        if extra is not None:
+            extra(current)
+
+    validate(raw)
+    return validate
+
+
+async def report_governance_change(
+    agent: Agent, store: StateStore, run_id: str, raw: dict[str, Any]
+) -> None:
+    import logging
+    import warnings
+
+    log = logging.getLogger(__name__)
+    if GOVERNANCE_KEY not in raw:
+        log.info(
+            "Skipping pre-0.5 governance check: run_id=%s code=governance_legacy",
+            run_id,
+            extra={"run_id": run_id, "code": "governance_legacy"},
+        )
+        return
+    change = _governance_change(agent, raw)
+    if change is None:
+        return
+    log.warning(
+        "Governance changed: run_id=%s code=governance_changed",
+        run_id,
+        extra={"run_id": run_id, "code": "governance_changed"},
+    )
+    if not agent._on_governance_change_chosen:
+        warnings.warn(
+            "Changed governance warns in 0.5; the default becomes 'raise' in 0.6. "
+            "Choose on_governance_change explicitly.",
+            FutureWarning,
+            stacklevel=3,
+        )
+    await store.save_run_event(run_id, event_type="governance.changed", data=change)
+
+
+def warn_missing_pause_id(agent: Agent, expected: str | None, *, approval: bool = False) -> None:
+    if expected is None and (agent._strict_tenancy or approval):
+        import warnings
+
+        warnings.warn(
+            "Pass expected_pause_id to bind this submission to its pause. "
+            "It will be required for approvals in dendrux 0.6.",
+            FutureWarning,
+            stacklevel=3,
+        )
+
+
+async def prepare_client_results(
+    agent: Agent, run_id: str, pause: PauseState, results: list[ToolResult]
+) -> list[ToolResult]:
+    """Validate identity and JSON, cap payloads, then apply the configured transform."""
+    import json
+
+    from dendrux.loops.react import _apply_result_transform
+    from dendrux.tools import cap_tool_result
+
+    validate_result_names(run_id, pause, results, json_payload=False)
+    try:
+        capped = [
+            cap_tool_result(result, agent._limits.max_tool_result_bytes) for result in results
+        ]
+    except UnicodeError as exc:
+        raise _invalid_tool_result(run_id, "tool result payload is not valid UTF-8") from exc
+    validate_result_names(run_id, pause, capped)
+    lookups = await agent.get_tool_lookups()
+    pending = {call.id: call for call in pause.pending_tool_calls}
+    prepared = []
+    for result in capped:
+        if result.meta.get("code") == "size_limit":
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Client tool result capped: run_id=%s code=size_limit",
+                run_id,
+                extra={"run_id": run_id, "code": "size_limit"},
+            )
+        if result.success and agent.tool_result_transform is not None:
+            try:
+                value = await _apply_result_transform(
+                    agent.tool_result_transform,
+                    pending[result.call_id],
+                    lookups,
+                    json.loads(result.payload, parse_constant=_invalid_json_constant),
+                )
+                result = replace(result, payload=json.dumps(value, allow_nan=False))
+            except Exception as exc:
+                raise _invalid_tool_result(run_id, "client tool result transform failed") from exc
+            result = cap_tool_result(result, agent._limits.max_tool_result_bytes)
+        prepared.append(result)
+    return prepared

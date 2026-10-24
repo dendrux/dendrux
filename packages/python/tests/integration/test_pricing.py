@@ -84,7 +84,7 @@ async def test_unpriced_call_stays_unknown_after_pause_resume(store, stream, cac
             pause_data["usage"].pop(name)
         await store.pause_run(paused.run_id, status=paused.status, pause_data=pause_data)
     result = await agent.submit_tool_results(
-        paused.run_id, [ToolResult(name="lookup", call_id=call.id, payload="ok")]
+        paused.run_id, [ToolResult(name="lookup", call_id=call.id, payload='"ok"')]
     )
     assert result.status == RunStatus.SUCCESS
     assert result.usage.cost_usd is None

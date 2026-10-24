@@ -307,7 +307,7 @@ class TestPerCallDecisions:
         record = await store.get_run(paused.run_id)
         assert record.status == RunStatus.WAITING_APPROVAL.value
 
-    async def test_duplicate_ids_in_claimed_blob_finalize_error(self, store) -> None:
+    async def test_duplicate_ids_in_claimed_blob_release_claim(self, store) -> None:
         agent, _, paused, _ = await self._pause_three(store)
         pause = await store.get_pause_state(paused.run_id)
         gated = list(pause["approval_gates"])
@@ -328,7 +328,8 @@ class TestPerCallDecisions:
             )
         assert SERVER_SIDE_EFFECTS == []
         record = await store.get_run(paused.run_id)
-        assert record.status == RunStatus.ERROR.value
+        assert record.status == RunStatus.WAITING_APPROVAL.value
+        assert not await _events(store, paused.run_id, "run.error")
 
     async def test_wrong_pause_status(self, store) -> None:
         from dendrux.errors import PauseStatusMismatchError

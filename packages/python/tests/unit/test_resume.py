@@ -141,7 +141,20 @@ class RecordingStateStore(CancellationStubsMixin):
         return True
 
     async def get_run(self, run_id: str) -> Any:
-        return None
+        from dendrux.runtime.state import RunRecord
+
+        created = next((r for r in self.created_runs if r["run_id"] == run_id), None)
+        if created is None:
+            return None
+        finalized = next((r for r in reversed(self.finalized_runs) if r["run_id"] == run_id), {})
+        return RunRecord(
+            id=run_id,
+            agent_name=created["agent_name"],
+            status=self._run_status[run_id],
+            meta=created.get("meta"),
+            tenant_id=created.get("tenant_id"),
+            answer=finalized.get("answer"),
+        )
 
     async def get_traces(self, run_id: str) -> list[Any]:
         """Return trace records for order_index calculation."""
