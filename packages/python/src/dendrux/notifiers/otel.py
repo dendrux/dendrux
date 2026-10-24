@@ -31,7 +31,9 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+from dendrux.errors import ProviderError
 from dendrux.loops.base import BaseNotifier
+from dendrux.types import ErrorInfo
 
 if TYPE_CHECKING:
     from dendrux.types import LLMResponse, Message, RunResult, ToolCall, ToolDef, ToolResult
@@ -138,7 +140,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             span = self._tracer.start_span(span_name, attributes=attributes)
             self._run_spans[run_id] = span
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_run_started failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_run_started failed: %s", type(exc).__name__)
 
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
         # Close any in-flight child spans first — streaming cancellation can
@@ -153,10 +155,13 @@ class OpenTelemetryNotifier(BaseNotifier):
             return
         try:
             span.set_attribute("dendrux.run.status", result.status.value)
-            span.set_status(Status(StatusCode.OK))
+            if result.error_info is not None:
+                _set_error_info(span, result.error_info)
+            else:
+                span.set_status(Status(StatusCode.OK))
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_run_finished failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_run_finished failed: %s", type(exc).__name__)
 
     async def on_run_failed(
         self,
@@ -173,13 +178,12 @@ class OpenTelemetryNotifier(BaseNotifier):
         if span is None:
             return
         try:
-            span.record_exception(error)
-            span.set_status(Status(StatusCode.ERROR, str(error)))
+            _set_span_error(span, error)
             if iteration is not None:
                 span.set_attribute("dendrux.run.iteration", int(iteration))
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_run_failed failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_run_failed failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
     # LLM call (chat span)
@@ -211,7 +215,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             )
             self._llm_spans[(run_id, iteration)] = span
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_llm_call_started failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_llm_call_started failed: %s", type(exc).__name__)
 
     async def on_llm_call_completed(
         self,
@@ -246,7 +250,9 @@ class OpenTelemetryNotifier(BaseNotifier):
             span.set_status(Status(StatusCode.OK))
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_llm_call_completed failed: %s", exc)
+            _LOG.warning(
+                "OpenTelemetryNotifier.on_llm_call_completed failed: %s", type(exc).__name__
+            )
 
     def _set_image_attributes(self, span: Any, run_id: str, messages: list[Message]) -> None:
         """``dendrux.images.count`` / ``.estimated_tokens`` for visible images (ids only)."""
@@ -282,13 +288,12 @@ class OpenTelemetryNotifier(BaseNotifier):
         if span is None:
             return
         try:
-            span.record_exception(error)
-            span.set_status(Status(StatusCode.ERROR, str(error)))
+            _set_span_error(span, error)
             if duration_ms is not None:
                 span.set_attribute("dendrux.llm.duration_ms", int(duration_ms))
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_llm_call_failed failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_llm_call_failed failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
     # Tool call (execute_tool span)
@@ -314,7 +319,7 @@ class OpenTelemetryNotifier(BaseNotifier):
             )
             self._tool_spans[(run_id, tool_call.id)] = span
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_tool_started failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_tool_started failed: %s", type(exc).__name__)
 
     async def on_tool_completed(
         self,
@@ -337,7 +342,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 span.set_status(Status(StatusCode.ERROR, err_msg))
             span.end()
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_tool_completed failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_tool_completed failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
     # Governance events (span events on the run-level span)
@@ -363,7 +368,7 @@ class OpenTelemetryNotifier(BaseNotifier):
                 attrs[f"dendrux.governance.{k}"] = _to_attr_value(v)
             span.add_event(f"governance.{event_type}", attributes=attrs)
         except Exception as exc:  # noqa: BLE001 - fail open
-            _LOG.warning("OpenTelemetryNotifier.on_governance_event failed: %s", exc)
+            _LOG.warning("OpenTelemetryNotifier.on_governance_event failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -402,12 +407,15 @@ class OpenTelemetryNotifier(BaseNotifier):
                 continue
             try:
                 span.set_attribute("dendrux.span.orphan_close_reason", reason)
-                if error is not None:
-                    span.record_exception(error)
-                span.set_status(Status(StatusCode.ERROR, reason))
+                if isinstance(error, ProviderError):
+                    _set_span_error(span, error)
+                else:
+                    if error is not None:
+                        span.record_exception(error)
+                    span.set_status(Status(StatusCode.ERROR, reason))
                 span.end()
             except Exception as exc:  # noqa: BLE001 - fail open
-                _LOG.warning("orphan chat span close failed: %s", exc)
+                _LOG.warning("orphan chat span close failed: %s", type(exc).__name__)
 
         for tool_key in orphan_keys_tool:
             span = self._tool_spans.pop(tool_key, None)
@@ -416,10 +424,13 @@ class OpenTelemetryNotifier(BaseNotifier):
             try:
                 span.set_attribute("dendrux.span.orphan_close_reason", reason)
                 span.set_attribute("dendrux.tool.success", False)
-                span.set_status(Status(StatusCode.ERROR, reason))
+                if isinstance(error, ProviderError):
+                    _set_span_error(span, error)
+                else:
+                    span.set_status(Status(StatusCode.ERROR, reason))
                 span.end()
             except Exception as exc:  # noqa: BLE001 - fail open
-                _LOG.warning("orphan tool span close failed: %s", exc)
+                _LOG.warning("orphan tool span close failed: %s", type(exc).__name__)
 
     def _child_context(self, run_id: str) -> Any:
         """Return an OTel context with the run span set as parent.
@@ -470,3 +481,21 @@ def _image_family(model: str | None) -> str | None:
     if model.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
         return "openai"
     return None
+
+
+def _set_error_info(span: Any, info: ErrorInfo) -> None:
+    fields = {
+        f"dendrux.error.{key}": value for key, value in info.to_dict().items() if value is not None
+    }
+    for key, value in fields.items():
+        span.set_attribute(key, value)
+    span.add_event("provider.error", attributes=fields)
+    span.set_status(Status(StatusCode.ERROR, info.safe_message))
+
+
+def _set_span_error(span: Any, error: BaseException) -> None:
+    if isinstance(error, ProviderError):
+        _set_error_info(span, ErrorInfo.from_error(error))
+    else:
+        span.record_exception(error)
+        span.set_status(Status(StatusCode.ERROR, str(error)))

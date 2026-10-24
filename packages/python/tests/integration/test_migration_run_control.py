@@ -30,7 +30,7 @@ from tests.integration._migration_schema import test_database_url as _migrate_pg
 pytestmark = pytest.mark.asyncio
 
 PRIOR = "a4b5c6d7e8f9"
-HEAD = "d7e8f9a0b1c2"  # 0.4.0 image blobs and 0.5.0 R1 sit on top of run control
+HEAD = "e8f9a0b1c2d3"  # image blobs, R1 and bounded sweep indexes sit above run control
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 

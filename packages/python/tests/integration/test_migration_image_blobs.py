@@ -32,7 +32,7 @@ from tests.integration._migration_schema import (
 from tests.unit.test_blob_catalog import make_png, store_png
 
 PRIOR = "b5c6d7e8f9a0"
-HEAD = "d7e8f9a0b1c2"  # 0.5.0 R1 sits on top of the image blobs
+HEAD = "e8f9a0b1c2d3"  # R1 and sweep indexes sit above the image blobs
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 

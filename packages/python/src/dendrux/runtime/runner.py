@@ -62,6 +62,7 @@ from dendrux.runtime.context import (
     reset_delegation_context,
     resolve_child_tenant,
     resolve_parent_link,
+    safe_exception_info,
     set_delegation_context,
 )
 from dendrux.runtime.replay import (
@@ -409,7 +410,10 @@ async def _emit_event_safe(
         validate_event_index(index)
     except Exception:
         logger.warning(
-            "Failed to record %s for run %s (in error handler)", event_type, run_id, exc_info=True
+            "Failed to record %s for run %s (in error handler)",
+            event_type,
+            run_id,
+            exc_info=safe_exception_info(),
         )
 
 
@@ -435,7 +439,9 @@ async def _attach_undelivered_notes(
     try:
         notes = await get_notes(run_id, undelivered_only=True)
     except Exception:
-        logger.warning("Failed to read undelivered notes for run %s", run_id, exc_info=True)
+        logger.warning(
+            "Failed to read undelivered notes for run %s", run_id, exc_info=safe_exception_info()
+        )
         return
     if notes:
         result.meta["undelivered_notes"] = [n.id for n in notes]
@@ -448,7 +454,9 @@ async def _pause_request_message(state_store: StateStore, run_id: str) -> str | 
     try:
         record = await state_store.get_run(run_id)
     except Exception:
-        logger.warning("Failed to read pause request for run %s", run_id, exc_info=True)
+        logger.warning(
+            "Failed to read pause request for run %s", run_id, exc_info=safe_exception_info()
+        )
         return None
     request = ((record.meta if record else None) or {}).get(PAUSE_REQUEST_META_KEY)
     reason = request.get("reason") if isinstance(request, dict) else None
@@ -475,7 +483,9 @@ async def _closing_loop_stream(
         try:
             await loop_stream.aclose()
         except Exception:
-            logger.warning("Loop stream cleanup raised for run %s", run_id, exc_info=True)
+            logger.warning(
+                "Loop stream cleanup raised for run %s", run_id, exc_info=safe_exception_info()
+            )
 
 
 def _track_partial_text(shared: dict[str, Any], event: RunEvent) -> None:
@@ -728,9 +738,9 @@ async def _persist_loop_outcome(
     _run_pii = result.meta.get("pii_mapping")
     failure_kwargs: dict[str, Any] = {}
     base = unclaimed_store(state_store)
-    assert base is not None
     if (
-        result.status == RunStatus.ERROR
+        base is not None
+        and result.status == RunStatus.ERROR
         and result.meta.get("failure_reason") == "guardrail_blocked"
         and _accepts_kwarg(base.finalize_run, "failure_reason")
     ):
@@ -786,7 +796,9 @@ async def _record_stop_reason(state_store: StateStore, run_id: str, stop_reason:
     try:
         await update(run_id, {STOP_REASON_META_KEY: stop_reason})
     except Exception:
-        logger.warning("Failed to record stop_reason for run %s", run_id, exc_info=True)
+        logger.warning(
+            "Failed to record stop_reason for run %s", run_id, exc_info=safe_exception_info()
+        )
 
 
 async def _transition_with_event(
@@ -1126,7 +1138,9 @@ def _release_memory_edges(
             catalog.release_run(run_id)
         except Exception:
             logger.warning(
-                "Failed to release in-memory blob edges of run %s", run_id, exc_info=True
+                "Failed to release in-memory blob edges of run %s",
+                run_id,
+                exc_info=safe_exception_info(),
             )
 
 
@@ -1640,7 +1654,9 @@ async def run(
                             _mcp_error_payload(mcp_exc),
                         )
                     except Exception:
-                        logger.warning("Failed to emit mcp.error event", exc_info=True)
+                        logger.warning(
+                            "Failed to emit mcp.error event", exc_info=safe_exception_info()
+                        )
                     raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
                 replay_plan, seeded_history = await _apply_replay(
@@ -1752,7 +1768,9 @@ async def run(
                         )
                     except Exception:
                         logger.error(
-                            "Failed to persist ERROR status for run %s", run_id, exc_info=True
+                            "Failed to persist ERROR status for run %s",
+                            run_id,
+                            exc_info=safe_exception_info(),
                         )
                     # Only the CAS winner emits the error event
                     if error_won:
@@ -1808,7 +1826,11 @@ async def run(
                     try:
                         await record_run_finished(recorder, run_id, cancelled_result)
                     except Exception:
-                        logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
+                        logger.warning(
+                            "Recorder finish failed for run %s",
+                            run_id,
+                            exc_info=safe_exception_info(),
+                        )
                 if not notifier_closed:
                     notifier_closed = True
                     await notify_run_finished(extra_notifier, run_id, cancelled_result)
@@ -2027,7 +2049,11 @@ async def _persist_task_cancellation(
     from dendrux.types import RunResult
 
     interrupt_meta = {"interrupted": True, "partial_output": False} if interrupted else {}
-    result = RunResult(run_id=run_id, status=RunStatus.CANCELLED, meta=dict(interrupt_meta))
+    result = RunResult(
+        run_id=run_id,
+        status=RunStatus.CANCELLED,
+        meta={**interrupt_meta, "dendrux.cancel_persisted": False},
+    )
     if state_store is None:
         return result
     try:
@@ -2037,6 +2063,7 @@ async def _persist_task_cancellation(
             expected_current_status="running",
         )
         if won:
+            result.meta["dendrux.cancel_persisted"] = True
             await _emit_event(
                 state_store,
                 run_id,
@@ -2048,10 +2075,16 @@ async def _persist_task_cancellation(
             await _attach_undelivered_notes(state_store, run_id, result)
         elif await state_store.get_run(run_id) is not None:
             result = await _build_cached_result(state_store, run_id)
+            if result.status == RunStatus.CANCELLED:
+                result.meta["dendrux.cancel_persisted"] = True
         # No row: cancelled before create_run committed, or while resolving an
         # idempotent hit under the provisional id. Nothing to finalize.
     except Exception:
-        logger.error("Failed to cancel run %s during task cleanup", run_id, exc_info=True)
+        logger.error(
+            "Cancellation persistence failed: run_id=%s code=cancel_persist_failed",
+            run_id,
+            exc_info=safe_exception_info(),
+        )
     return result
 
 
@@ -2422,7 +2455,7 @@ async def retry(
                         _mcp_error_payload(mcp_exc),
                     )
                 except Exception:
-                    logger.warning("Failed to emit mcp.error event", exc_info=True)
+                    logger.warning("Failed to emit mcp.error event", exc_info=safe_exception_info())
                 raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
             current = current_prefix(agent, provider, resolved_loop, provider_kwargs)
@@ -2515,7 +2548,9 @@ async def retry(
                 )
             except Exception:
                 logger.error(
-                    "Failed to persist ERROR status for retry run %s", run_id, exc_info=True
+                    "Failed to persist ERROR status for retry run %s",
+                    run_id,
+                    exc_info=safe_exception_info(),
                 )
             if error_won:
                 await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
@@ -2963,7 +2998,7 @@ def run_stream(
                         _mcp_error_payload(mcp_exc),
                     )
                 except Exception:
-                    logger.warning("Failed to emit mcp.error event", exc_info=True)
+                    logger.warning("Failed to emit mcp.error event", exc_info=safe_exception_info())
                 raise mcp_exc.__cause__ or mcp_exc from mcp_exc.__cause__
 
             replay_plan, seeded_history = await _apply_replay(
@@ -3088,7 +3123,11 @@ def run_stream(
                         expected_current_status="running",
                     )
                 except Exception:
-                    logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+                    logger.error(
+                        "Failed to persist ERROR status for run %s",
+                        run_id,
+                        exc_info=safe_exception_info(),
+                    )
                 if error_won:
                     await _emit_event_safe(store, run_id, "run.error", _error_payload(exc))
             if not _shared.get("existing_run"):
@@ -3099,7 +3138,7 @@ def run_stream(
                     logger.warning(
                         "Lifecycle hooks failed during stream error handler for run %s",
                         run_id,
-                        exc_info=True,
+                        exc_info=safe_exception_info(),
                     )
 
             yield RunEvent(
@@ -3161,21 +3200,29 @@ def run_stream(
                         {"reason": "stream_closed", "partial_output": partial_answer is not None},
                     )
             except Exception:
-                logger.error("Failed to cancel run %s during stream cleanup", run_id, exc_info=True)
+                logger.error(
+                    "Failed to cancel run %s during stream cleanup",
+                    run_id,
+                    exc_info=safe_exception_info(),
+                )
 
         # Close the lifecycle pair if it was opened.
         if "notifier" in _shared:
             cleanup_recorder = _shared.get("recorder")
             terminal_status = RunStatus.CANCELLED
+            cancel_persisted = cancel_won
             if store is not None and not cancel_won:
                 try:
                     run_record = await store.get_run(run_id)
                     if run_record is not None:
                         terminal_status = RunStatus(run_record.status)
+                        cancel_persisted = terminal_status == RunStatus.CANCELLED
                 except Exception:
                     pass  # CANCELLED is a safe fallback
             cancelled_result = RunResult(
-                run_id=run_id, status=terminal_status, meta=deepcopy(mcp_meta)
+                run_id=run_id,
+                status=terminal_status,
+                meta={**deepcopy(mcp_meta), "dendrux.cancel_persisted": cancel_persisted},
             )
             try:
                 await record_run_finished(cleanup_recorder, run_id, cancelled_result)
@@ -3184,7 +3231,7 @@ def run_stream(
                 logger.warning(
                     "Lifecycle finish hooks failed during stream cleanup for run %s",
                     run_id,
-                    exc_info=True,
+                    exc_info=safe_exception_info(),
                 )
 
             return cancelled_result
@@ -4292,7 +4339,9 @@ async def _resume_core(
                         await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
                 except Exception:
                     logger.error(
-                        "Failed to persist claimed resume error for run %s", run_id, exc_info=True
+                        "Failed to persist claimed resume error for run %s",
+                        run_id,
+                        exc_info=safe_exception_info(),
                     )
                 await notify_run_failed(extra_notifier, run_id, exc)
             raise
@@ -4571,7 +4620,9 @@ async def _resume_core(
                 try:
                     await record_run_finished(ctx.recorder, run_id, cancelled_result)
                 except Exception:
-                    logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
+                    logger.warning(
+                        "Recorder finish failed for run %s", run_id, exc_info=safe_exception_info()
+                    )
                 await notify_run_finished(ctx.notifier, run_id, cancelled_result)
             if swallow and (current_task is None or current_task.cancelling() == 0):
                 return cancelled_result
@@ -4596,7 +4647,11 @@ async def _resume_core(
                     expected_current_status="running",
                 )
             except Exception:
-                logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+                logger.error(
+                    "Failed to persist ERROR status for run %s",
+                    run_id,
+                    exc_info=safe_exception_info(),
+                )
             if error_won:
                 await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
             # Fire on_run_failed only if _prepare_resume returned (ctx exists).
@@ -4610,7 +4665,7 @@ async def _resume_core(
                     logger.warning(
                         "Lifecycle hooks failed during resume error handler for run %s",
                         run_id,
-                        exc_info=True,
+                        exc_info=safe_exception_info(),
                     )
             raise
 
@@ -4981,7 +5036,11 @@ def resume_stream(
                         expected_current_status="running",
                     )
                 except Exception:
-                    logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
+                    logger.error(
+                        "Failed to persist ERROR status for run %s",
+                        run_id,
+                        exc_info=safe_exception_info(),
+                    )
                 if error_won:
                     await _emit_event_safe(
                         store,
@@ -5002,7 +5061,7 @@ def resume_stream(
                 logger.warning(
                     "Lifecycle hooks failed during resume_stream error handler for run %s",
                     run_id,
-                    exc_info=True,
+                    exc_info=safe_exception_info(),
                 )
 
             yield RunEvent(
@@ -5057,21 +5116,25 @@ def resume_stream(
                 logger.error(
                     "Failed to cancel run %s during resume stream cleanup",
                     run_id,
-                    exc_info=True,
+                    exc_info=safe_exception_info(),
                 )
 
         if "notifier" in _shared:
             cleanup_recorder = _shared.get("recorder")
             terminal_status = RunStatus.CANCELLED
+            cancel_persisted = cancel_won
             if store is not None and not cancel_won:
                 try:
                     run_record = await store.get_run(run_id)
                     if run_record is not None:
                         terminal_status = RunStatus(run_record.status)
+                        cancel_persisted = terminal_status == RunStatus.CANCELLED
                 except Exception:
                     pass  # CANCELLED is a safe fallback
             cancelled_result = RunResult(
-                run_id=run_id, status=terminal_status, meta=deepcopy(mcp_meta)
+                run_id=run_id,
+                status=terminal_status,
+                meta={**deepcopy(mcp_meta), "dendrux.cancel_persisted": cancel_persisted},
             )
             try:
                 await record_run_finished(cleanup_recorder, run_id, cancelled_result)
@@ -5080,7 +5143,7 @@ def resume_stream(
                 logger.warning(
                     "Lifecycle finish hooks failed during resume stream cleanup for run %s",
                     run_id,
-                    exc_info=True,
+                    exc_info=safe_exception_info(),
                 )
 
             return cancelled_result

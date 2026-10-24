@@ -129,14 +129,15 @@ class TestSqliteSyncFrom041:
 
 
 class TestMigration:
-    def test_r1_revision_is_the_single_head_on_top_of_041(self) -> None:
+    def test_sweep_revision_is_single_head_above_r1_and_041(self) -> None:
         from alembic.config import Config
         from alembic.script import ScriptDirectory
 
         cfg = Config()
         cfg.set_main_option("script_location", str(_MIGRATIONS.parent))
         script = ScriptDirectory.from_config(cfg)
-        assert script.get_heads() == ["d7e8f9a0b1c2"]
+        assert script.get_heads() == ["e8f9a0b1c2d3"]
+        assert script.get_revision("e8f9a0b1c2d3").down_revision == "d7e8f9a0b1c2"
         r1 = script.get_revision("d7e8f9a0b1c2")
         assert r1 is not None
         assert r1.down_revision == "c6d7e8f9a0b1"

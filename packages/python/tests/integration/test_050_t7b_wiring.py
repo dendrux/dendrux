@@ -479,7 +479,7 @@ async def test_postgres_concurrent_sweeps_cannot_revoke_refreshed_run(
         result = await original(session, statement, *args, **kwargs)
         if (
             isinstance(statement, Select)
-            and "EXISTS" in str(statement)
+            and "started" in statement.selected_columns
             and "agent_runs" in str(statement)
         ):
             count += 1

@@ -204,6 +204,13 @@ Index(
 )
 # Tenant-scoped run listings, newest first (D-124).
 Index("ix_agent_runs_tenant_id_created_at", AgentRun.tenant_id, AgentRun.created_at.desc())
+Index(
+    "ix_agent_runs_sweep_progress",
+    AgentRun.status,
+    func.coalesce(AgentRun.last_progress_at, AgentRun.created_at),
+    AgentRun.id,
+)
+Index("ix_agent_runs_sweep_waiting", AgentRun.status, AgentRun.updated_at, AgentRun.id)
 
 
 class ReactTrace(Base):
@@ -403,6 +410,7 @@ class RunEvent(Base):
     __table_args__ = (
         Index("ix_run_events_agent_run_id_seq", "agent_run_id", "sequence_index"),
         Index("ix_run_events_event_type", "event_type"),
+        Index("ix_run_events_run_type", "agent_run_id", "event_type"),
     )
 
 

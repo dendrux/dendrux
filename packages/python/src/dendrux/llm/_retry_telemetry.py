@@ -19,6 +19,7 @@ real LLM call.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
@@ -26,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator
 
     from dendrux.loops.base import LoopNotifier, LoopRecorder
     from dendrux.types import StreamEvent
@@ -186,31 +187,69 @@ def telemetry_event_hooks() -> dict[str, list[Callable[..., Awaitable[None]]]]:
     return {"response": [_on_response]}
 
 
-async def telemetry_stream(
+class TelemetryStream(AsyncGenerator["StreamEvent", None]):
+    """Own the provider immediately, including close before the first advance."""
+
+    def __init__(
+        self,
+        stream: AsyncGenerator[StreamEvent, None],
+        *,
+        run_id: str,
+        iteration: int,
+        recorder: LoopRecorder | None,
+        notifier: LoopNotifier | None,
+    ):
+        self._stream = stream
+        self._run_id, self._iteration = run_id, iteration
+        self._recorder, self._notifier = recorder, notifier
+        self._closed = False
+        with self._binding():
+            self._iterator = aiter(stream)
+
+    def _binding(self) -> Any:
+        return telemetry_context(
+            run_id=self._run_id,
+            iteration=self._iteration,
+            recorder=self._recorder,
+            notifier=self._notifier,
+        )
+
+    async def __anext__(self) -> StreamEvent:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            with self._binding():
+                return await anext(self._iterator)
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+
+    async def asend(self, value: None) -> StreamEvent:
+        return await self.__anext__()
+
+    async def athrow(self, *args: Any) -> StreamEvent:
+        with self._binding():
+            return await self._stream.athrow(*args)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self._binding():
+            await self._stream.aclose()
+
+
+def telemetry_stream(
     stream: AsyncGenerator[StreamEvent, None],
     *,
     run_id: str,
     iteration: int,
     recorder: LoopRecorder | None,
     notifier: LoopNotifier | None,
-) -> AsyncGenerator[StreamEvent, None]:
-    """Bind tokens within each await, including close; never across a yield."""
-    iterator = aiter(stream)
-    try:
-        while True:
-            try:
-                with telemetry_context(
-                    run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
-                ):
-                    event = await anext(iterator)
-            except StopAsyncIteration:
-                return
-            yield event
-    finally:
-        with telemetry_context(
-            run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
-        ):
-            await stream.aclose()
+) -> TelemetryStream:
+    return TelemetryStream(
+        stream, run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
+    )
 
 
 def make_telemetry_http_client(

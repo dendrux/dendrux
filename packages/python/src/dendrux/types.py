@@ -1430,7 +1430,7 @@ class PauseState:
     image_view: ImageViewState | None = None
     # Identifier of this pause (ULID); None on pauses written before 0.5.0.
     pause_id: str | None = None
-    # Pause-state format version; None on pauses written before 0.5.0.
+    # Current pause format; stored snapshots without a version read as 1.
     schema_version: int | None = 1
 
     provider_kwargs: dict[str, Any] = field(default_factory=dict)

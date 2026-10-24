@@ -25,12 +25,14 @@ LoopRecorder protocol so third-party recorders can subscribe.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import ImagePersistenceUnsupportedError
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
+from dendrux.runtime.context import safe_exception_info
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
@@ -378,15 +380,23 @@ class PersistenceRecorder(BaseRecorder):
                 "Failed to save llm_interaction for run %s iteration %d",
                 self._run_id,
                 iteration,
-                exc_info=True,
+                exc_info=safe_exception_info(),
             )
 
+        # Mint once per logical call, outside the bounded retry loop.
+        usage_id = generate_ulid()
+        usage_params = inspect.signature(self._store.save_usage).parameters
+        idempotent_usage = "usage_id" in usage_params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in usage_params.values()
+        )
         # BEST-EFFORT: token_usage (cost tracking)
         try:
+            usage_kwargs: dict[str, Any] = {"usage_id": usage_id} if idempotent_usage else {}
 
             async def _write_usage() -> None:
                 await self._store.save_usage(
                     self._run_id,
+                    **usage_kwargs,
                     iteration_index=iteration,
                     usage=response.usage,
                     model=response.model or self._model,
@@ -398,13 +408,17 @@ class PersistenceRecorder(BaseRecorder):
                     ),
                 )
 
-            await retry_transient_db(_write_usage, label="save_usage", run_id=self._run_id)
+            if idempotent_usage:
+                await retry_transient_db(_write_usage, label="save_usage", run_id=self._run_id)
+            else:
+                # A legacy store cannot safely replay an ambiguous commit.
+                await _write_usage()
         except Exception:
             logger.warning(
                 "Failed to save usage for run %s iteration %d",
                 self._run_id,
                 iteration,
-                exc_info=True,
+                exc_info=safe_exception_info(),
             )
 
         # FAIL-CLOSED: run event (lifecycle audit trail). correlation_id joins
@@ -432,14 +446,18 @@ class PersistenceRecorder(BaseRecorder):
         try:
             await self._store.touch_progress(self._run_id)
         except Exception:
-            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+            )
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Touch ``last_progress_at`` at dispatch so a long tool starts fresh. BEST-EFFORT."""
         try:
             await self._store.touch_progress(self._run_id)
         except Exception:
-            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+            )
 
     async def on_llm_call_failed(
         self,
@@ -456,15 +474,20 @@ class PersistenceRecorder(BaseRecorder):
         if not isinstance(error, ProviderError):
             return
         info = ErrorInfo.from_error(error)
-        await self._emit_event(
-            "llm.failed",
-            iteration,
-            {
-                "error_info": info.to_dict(),
-                "timeout_reason": info.timeout_reason,
-                "duration_ms": duration_ms,
-            },
-        )
+        try:
+            await self._emit_event(
+                "llm.failed",
+                iteration,
+                {
+                    "error_info": info.to_dict(),
+                    "timeout_reason": info.timeout_reason,
+                    "duration_ms": duration_ms,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Failed-call evidence unavailable: run_id=%s code=llm_failed_write", self._run_id
+            )
 
     async def on_tool_completed(
         self,
@@ -528,7 +551,9 @@ class PersistenceRecorder(BaseRecorder):
         try:
             await self._store.touch_progress(self._run_id)
         except Exception:
-            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+            )
 
     async def on_governance_event(
         self,

@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
+from dendrux.runtime.context import safe_exception_info
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -79,6 +81,7 @@ class RunTaskManager:
                 run_id,
                 type(exc).__name__,
                 extra={"run_id": run_id, "code": "run_failed"},
+                exc_info=safe_exception_info(),
             )
             raise
         finally:

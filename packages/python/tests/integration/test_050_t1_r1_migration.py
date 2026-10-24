@@ -174,7 +174,7 @@ async def test_database_stamped_early_is_detected_and_recovers(pg: Any) -> None:
         )
     assert conflict.value.run_id is None
 
-    await asyncio.to_thread(_alembic, url, "downgrade", "-1")
+    await asyncio.to_thread(_alembic, url, "downgrade", PRIOR)
     await asyncio.to_thread(_alembic, url, "upgrade", "head")
     await ensure_schema_current(engine)
 

@@ -241,8 +241,8 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
             total.cost_source = step_usage.cost_source
         elif total.cost_source != step_usage.cost_source:
             total.cost_source = "mixed"
-        assert step_usage.cost_usd is not None
-        total.cost_usd += step_usage.cost_usd
+        if step_usage.cost_usd is not None:
+            total.cost_usd += step_usage.cost_usd
     if step_usage.cache_read_input_tokens is not None:
         total.cache_read_input_tokens = (
             total.cache_read_input_tokens or 0

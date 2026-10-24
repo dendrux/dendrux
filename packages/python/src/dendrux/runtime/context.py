@@ -357,3 +357,21 @@ class StreamContext:
                 yield event
         finally:
             await self._step(generator.aclose())
+
+
+def safe_exception_info() -> bool:
+    """Keep diagnostic stacks only when their chain contains no provider text."""
+    import sys
+
+    from dendrux.errors import ProviderError
+
+    error = sys.exception()
+    seen: set[int] = set()
+    for _ in range(32):
+        if error is None:
+            return True
+        if isinstance(error, ProviderError) or id(error) in seen:
+            return False
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return False
