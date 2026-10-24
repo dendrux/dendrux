@@ -96,7 +96,7 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          pytest tests/ -v -rs --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80 | tee pytest.log
+          pytest tests/ -v -rs -n auto --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80 | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1

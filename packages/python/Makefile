@@ -1,7 +1,7 @@
 .PHONY: test lint typecheck format package-smoke ci clean
 
 test:
-	pytest tests/ -v --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80
+	pytest tests/ -v -n auto --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80
 
 lint:
 	ruff check .

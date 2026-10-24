@@ -62,6 +62,9 @@ dev = [
     "pytest>=8.0,<10.0",
     "pytest-asyncio>=0.23,<2.0",
     "pytest-cov>=5.0,<8.0",
+    # Random order and parallel runs: both are on for every test run.
+    "pytest-randomly>=3.15,<6.0",
+    "pytest-xdist>=3.5,<4.0",
     # Keep in step with .pre-commit-config.yaml (rev: v0.15.17).
     "ruff==0.15.17",
     "mypy>=1.10,<2.0",
