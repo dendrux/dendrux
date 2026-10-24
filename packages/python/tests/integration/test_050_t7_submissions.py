@@ -99,7 +99,7 @@ async def test_strict_tenancy_warns_without_pause_token(store):
     assert result.status == RunStatus.SUCCESS
 
 
-async def test_oversized_malformed_client_result_is_replaced_before_json_check(store):
+async def test_oversized_plain_text_is_capped_before_transform(store):
     seen = []
     a = agent(
         store,
@@ -110,9 +110,9 @@ async def test_oversized_malformed_client_result_is_replaced_before_json_check(s
     paused = await a.run("go")
     result = await a.submit_tool_results(paused.run_id, [result_for(paused, "{" * 1000)])
     assert result.status == RunStatus.SUCCESS
-    assert not seen  # a replacement error is not a successful tool value
+    assert len(seen) == 1 and len(seen[0].result) < 1000
     messages = [m for m in a.provider.messages[-1] if m.role.value == "tool"]
-    assert json.loads(messages[-1].content)["code"] == "size_limit"
+    assert json.loads(messages[-1].content) is None
 
 
 async def test_failed_transform_does_not_claim_or_expose_payload(store):

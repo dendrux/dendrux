@@ -1534,9 +1534,6 @@ class Agent:
                 both args provided, or neither provided.
             RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
-        from dendrux.runtime.submit import warn_missing_pause_id
-
-        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "resume",
@@ -1614,7 +1611,8 @@ class Agent:
             run_id: A run in status ``WAITING_CLIENT_TOOL``.
             results: One :class:`ToolResult` per pending tool call. Must
                 cover every pending call; unknown or missing ids raise
-                ``InvalidToolResultError``. ``ToolResult.images`` are
+                ``InvalidToolResultError``. Plain-text payloads are encoded as JSON strings
+                before the size cap and ``tool_result_transform``. ``ToolResult.images`` are
                 validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
@@ -1637,9 +1635,6 @@ class Agent:
             RunAlreadyTerminalError: run already reached a terminal state.
             InvalidToolResultError: results don't match pending calls.
         """
-        from dendrux.runtime.submit import warn_missing_pause_id
-
-        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "submit_tool_results",
@@ -1667,6 +1662,9 @@ class Agent:
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             pause = await validate_tool_results(store, run_id, results)
+            from dendrux.runtime.submit import warn_missing_pause_id
+
+            warn_missing_pause_id(self, expected_pause_id, pause_id=pause.pause_id)
             results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
             if any(r.images for r in results):
@@ -1734,9 +1732,6 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
-        from dendrux.runtime.submit import warn_missing_pause_id
-
-        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "submit_input",
@@ -1853,9 +1848,6 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
-        from dendrux.runtime.submit import warn_missing_pause_id
-
-        warn_missing_pause_id(self, expected_pause_id, approval=bool(approved))
         tenant_id = entry_checks(
             self,
             "submit_approval",
@@ -1876,6 +1868,7 @@ class Agent:
             serialize_decisions,
             serialize_tool_results,
             validate_approval_decisions,
+            warn_missing_pause_id,
         )
         from dendrux.types import PauseState, RunStatus
 
@@ -1907,6 +1900,13 @@ class Agent:
                 }
                 decision_map = validate_approval_decisions(
                     run_id, pause_state, pairs, target_lookup
+                )
+
+                warn_missing_pause_id(
+                    self,
+                    expected_pause_id,
+                    pause_id=pause_state.pause_id,
+                    approval=any(decision.approved for decision in decision_map.values()),
                 )
 
                 def same_pause_generation(current: dict[str, Any]) -> None:
@@ -1953,6 +1953,7 @@ class Agent:
                     expected_status=RunStatus.WAITING_APPROVAL,
                     agent=self,
                     expected_pause_id=expected_pause_id,
+                    approval=True,
                 )
                 from dendrux.runtime.state import claimed_store
 
@@ -1976,6 +1977,7 @@ class Agent:
             if raw_pause is None:
                 await raise_for_non_paused_status(store, run_id)
             pause_state = PauseState.from_dict(raw_pause)
+            warn_missing_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id)
             synthetic = build_rejection_results(pause_state, rejection_reason)
             epoch = await claim_or_raise(
                 store,
@@ -2315,9 +2317,6 @@ class Agent:
             WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
-        from dendrux.runtime.submit import warn_missing_pause_id
-
-        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
@@ -2695,9 +2694,6 @@ class Agent:
                 event, when ``run_id`` is outside ``tenant_id``. The run is
                 left untouched (the stream's close-time cleanup is a no-op).
         """
-        from dendrux.runtime.submit import warn_missing_pause_id
-
-        warn_missing_pause_id(self, expected_pause_id)
         tenant_id = entry_checks(
             self,
             "resume_stream",
@@ -2717,6 +2713,7 @@ class Agent:
             raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
+        from dendrux.runtime.submit import capture_warning_location
 
         stream = runner_resume_stream(
             run_id,
@@ -2727,9 +2724,8 @@ class Agent:
             user_input=user_input,
             extra_notifier=notifier,
             expected_pause_id=expected_pause_id,
+            warning_location=capture_warning_location(),
         )
-        if tenant_id is UNSCOPED:
-            return stream
         return self._tenant_checked_stream(stream, run_id, tenant_id)
 
     def _tenant_checked_stream(

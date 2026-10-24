@@ -658,9 +658,7 @@ async def test_resumed_terminal_metadata_and_lifecycle(mode: str) -> None:
         assert paused.status == RunStatus.WAITING_CLIENT_TOOL
         pause = await store.get_pause_state(paused.run_id)
         results = [
-            ToolResult(
-                name="read_data", call_id=pause["pending_tool_calls"][0]["id"], payload='"ok"'
-            )
+            ToolResult(name="read_data", call_id=pause["pending_tool_calls"][0]["id"], payload="ok")
         ]
         if mode == "blocking_error":
             with pytest.raises(IndexError) as caught:

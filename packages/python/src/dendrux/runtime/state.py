@@ -3681,6 +3681,12 @@ class _ClaimedStateStore:
         self._run_id = run_id
         self.claim_epoch = epoch
 
+    @property
+    def store_identity(self) -> str | None:
+        from dendrux.runtime.context import get_store_identity
+
+        return get_store_identity(self._store)
+
     def __getattr__(self, name: str) -> Any:
         import inspect
 
@@ -3716,6 +3722,13 @@ class _ClaimedStateStore:
 
     async def get_run_control(self, run_id: str) -> RunControl:
         control = await read_run_control(self._store, run_id)
+        if isinstance(self._store, SQLAlchemyStateStore) and control.claim_epoch is None:
+            # Older overrides may return flags only. Read the base projection
+            # to distinguish that from a missing row and retain epoch fencing.
+            from dataclasses import replace
+
+            persisted = await SQLAlchemyStateStore.get_run_control(self._store, run_id)
+            control = replace(control, claim_epoch=persisted.claim_epoch, status=persisted.status)
         if (
             (isinstance(self._store, SQLAlchemyStateStore) and control.claim_epoch is None)
             or (control.claim_epoch is not None and control.claim_epoch != self.claim_epoch)

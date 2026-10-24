@@ -263,8 +263,8 @@ async def test_failed_post_claim_validation_releases_owned_claim(store):
 
 @pytest.mark.parametrize("entry", ["submit", "resume", "resume_stream"])
 @pytest.mark.parametrize("bad", ["name", "json", "nan", "duplicate"])
-async def test_client_results_validate_identity_and_json_before_claim(store, entry, bad):
-    a = agent(store, [tool_call("client_read", pid="a")])
+async def test_client_results_validate_identity_and_normalize_text_before_claim(store, entry, bad):
+    a = agent(store, [tool_call("client_read", pid="a"), LLMResponse(text="done")])
     paused = await a.run("go")
     good = result_for(paused)
     results = [
@@ -274,6 +274,17 @@ async def test_client_results_validate_identity_and_json_before_claim(store, ent
     ]
     if bad == "duplicate":
         results = [good, good]
+    if bad in {"json", "nan"}:
+        if entry == "submit":
+            result = await a.submit_tool_results(paused.run_id, results)
+        elif entry == "resume":
+            result = await a.resume(paused.run_id, tool_results=results)
+        else:
+            result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
+        assert result.status == RunStatus.SUCCESS
+        message = next(m for m in a.provider.messages[-1] if m.role.value == "tool")
+        assert json.loads(message.content) == ("{" if bad == "json" else "NaN")
+        return
     if entry == "resume_stream":
         result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
         assert result.status == RunStatus.ERROR

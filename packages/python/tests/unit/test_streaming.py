@@ -734,7 +734,7 @@ class TestResumeStream:
                 ToolResult(
                     name="read_range",
                     call_id=tc.id,
-                    payload='"Revenue: $100M"',
+                    payload="Revenue: $100M",
                     success=True,
                 ),
             ],
@@ -777,7 +777,7 @@ class TestResumeStream:
                 ToolResult(
                     name="read_range",
                     call_id=tc.id,
-                    payload='"data"',
+                    payload="data",
                     success=True,
                 ),
             ],
@@ -826,7 +826,7 @@ class TestResumeStream:
                 ToolResult(
                     name="read_range",
                     call_id=tc.id,
-                    payload='"data"',
+                    payload="data",
                     success=True,
                 ),
             ],
@@ -913,7 +913,7 @@ class TestResumeStream:
                 ToolResult(
                     name="read_range",
                     call_id=tc.id,
-                    payload='"data"',
+                    payload="data",
                     success=True,
                 ),
             ],

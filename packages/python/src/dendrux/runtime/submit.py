@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from dendrux.errors import (
@@ -159,8 +160,7 @@ async def validate_tool_results(
 def validate_result_names(
     run_id: str, pause: PauseState, results: list[ToolResult], *, json_payload: bool = True
 ) -> None:
-    """Bind each client result to the pending call's name and JSON shape."""
-    import json
+    """Bind result IDs/names and require a string payload; text is normalized later."""
 
     pending = {call.id: call.name for call in pause.pending_tool_calls}
     if (
@@ -174,12 +174,6 @@ def validate_result_names(
             raise _invalid_tool_result(run_id, "tool result name does not match pending call")
         if not isinstance(result.payload, str):
             raise _invalid_tool_result(run_id, "tool result payload must be a JSON string")
-        if not json_payload:
-            continue
-        try:
-            json.loads(result.payload, parse_constant=_invalid_json_constant)
-        except (TypeError, ValueError, RecursionError) as exc:
-            raise _invalid_tool_result(run_id, "tool result payload is not valid JSON") from exc
 
 
 def pause_validator(
@@ -245,6 +239,76 @@ async def preflight_status(store: StateStore, run_id: str, expected_status: RunS
         raise RunAlreadyTerminalError(run_id, RunStatus.CANCELLED)
 
 
+@dataclass
+class _ClaimValidationSupport:
+    atomic: bool
+    logged: bool = False
+
+
+@lru_cache(maxsize=128)
+def _claim_validation_support(method: Any) -> _ClaimValidationSupport:
+    import inspect
+
+    params = inspect.signature(method).parameters
+    return _ClaimValidationSupport(
+        "validate" in params
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    )
+
+
+async def claim_paused_validated(
+    store: StateStore,
+    run_id: str,
+    *,
+    expected_status: str,
+    validate: Callable[[dict[str, Any]], None],
+) -> int:
+    """Use atomic validation when supported; preserve legacy claims best effort.
+
+    The cached key is the unbound implementation, not a store instance. Legacy
+    post-claim validation cannot eliminate a race; it stops execution on mismatch.
+    """
+    import logging
+
+    method = store.claim_paused_run
+    implementation = getattr(method, "__func__", method)
+    try:
+        hash(implementation)
+    except TypeError:
+        implementation = type(implementation).__call__
+    support = _claim_validation_support(implementation)
+    if support.atomic:
+        return await method(run_id, expected_status=expected_status, validate=validate)
+    if not support.logged:
+        support.logged = True
+        logging.getLogger(__name__).warning(
+            "Custom store lacks atomic claim validation; using pre/post checks: "
+            "run_id=%s code=legacy_claim_validation",
+            run_id,
+            extra={"run_id": run_id, "code": "legacy_claim_validation"},
+        )
+    current = await store.get_pause_state(run_id)
+    if current is None:
+        await raise_for_non_paused_status(store, run_id)
+    validate(current)
+    epoch = await method(run_id, expected_status=expected_status)
+    if epoch:
+        try:
+            current = await store.get_pause_state(run_id)
+            if current is None:
+                raise ValueError("Claimed run has no pause state")
+            validate(current)
+        except BaseException:
+            release = getattr(store, "release_run_claim", None)
+            if release is not None and type(epoch) is int:
+                import anyio
+
+                with anyio.CancelScope(shield=True):
+                    await release(run_id, status=expected_status, claim_epoch=epoch)
+            raise
+    return epoch
+
+
 async def claim_or_raise(
     store: StateStore,
     run_id: str,
@@ -253,6 +317,7 @@ async def claim_or_raise(
     submitted_data: dict[str, Any] | None = None,
     agent: Agent | None = None,
     expected_pause_id: str | None = None,
+    approval: bool = False,
     call_results: list[ToolResult] | None = None,
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
@@ -288,6 +353,10 @@ async def claim_or_raise(
     raw = await store.get_pause_state(run_id)
     if raw is None:
         await raise_for_non_paused_status(store, run_id)
+    if agent is not None:
+        warn_missing_pause_id(
+            agent, expected_pause_id, pause_id=raw.get("pause_id"), approval=approval
+        )
     validate = submission_validator(
         run_id,
         raw,
@@ -310,9 +379,11 @@ async def claim_or_raise(
             **claim_kwargs,
         )
     else:
-        claim_kwargs = {} if validate is None else {"validate": validate}
-        won = await store.claim_paused_run(
-            run_id, expected_status=expected_status.value, **claim_kwargs
+        won = await claim_paused_validated(
+            store,
+            run_id,
+            expected_status=expected_status.value,
+            validate=validate,
         )
 
     if won:
@@ -414,7 +485,7 @@ def deserialize_tool_results(raw: list[dict[str, Any]]) -> list[ToolResult]:
             ToolResult(
                 name=r["name"],
                 call_id=r["call_id"],
-                payload=r["payload"],
+                payload=_client_json_payload(r["payload"]),
                 success=r.get("success", True),
                 error=r.get("error"),
                 duration_ms=r.get("duration_ms", 0),
@@ -870,11 +941,68 @@ def submission_validator(
     return validate
 
 
+@dataclass(frozen=True)
+class _WarningLocation:
+    filename: str
+    lineno: int
+    module: str
+    registry: dict[str | tuple[str, type[Warning], int], int]
+
+
+def capture_warning_location() -> _WarningLocation | None:
+    """Keep a lazy stream's creation site without retaining the caller frame."""
+    import inspect
+
+    frame = inspect.currentframe()
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+        frame = frame.f_back
+    if frame is None:
+        return None
+    return _WarningLocation(
+        frame.f_code.co_filename,
+        frame.f_lineno,
+        frame.f_globals.get("__name__", ""),
+        frame.f_globals.setdefault("__warningregistry__", {}),
+    )
+
+
+def _warn_at_location(message: str, location: _WarningLocation | None) -> None:
+    import warnings
+
+    if location is not None:
+        warnings.warn_explicit(
+            message,
+            FutureWarning,
+            location.filename,
+            location.lineno,
+            module=location.module,
+            registry=location.registry,
+        )
+    else:
+        warnings.warn(message, FutureWarning, stacklevel=_user_warning_stacklevel())
+
+
+def _user_warning_stacklevel() -> int:
+    import inspect
+
+    frame = inspect.currentframe()
+    frame = frame.f_back if frame is not None else None
+    level = 1
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+        level += 1
+        frame = frame.f_back
+    return level
+
+
 async def report_governance_change(
-    agent: Agent, store: StateStore, run_id: str, raw: dict[str, Any]
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    raw: dict[str, Any],
+    *,
+    warning_location: _WarningLocation | None = None,
 ) -> None:
     import logging
-    import warnings
 
     log = logging.getLogger(__name__)
     if GOVERNANCE_KEY not in raw:
@@ -893,31 +1021,46 @@ async def report_governance_change(
         extra={"run_id": run_id, "code": "governance_changed"},
     )
     if not agent._on_governance_change_chosen:
-        warnings.warn(
+        _warn_at_location(
             "Changed governance warns in 0.5; the default becomes 'raise' in 0.6. "
             "Choose on_governance_change explicitly.",
-            FutureWarning,
-            stacklevel=3,
+            warning_location,
         )
     await store.save_run_event(run_id, event_type="governance.changed", data=change)
 
 
-def warn_missing_pause_id(agent: Agent, expected: str | None, *, approval: bool = False) -> None:
-    if expected is None and (agent._strict_tenancy or approval):
-        import warnings
-
-        warnings.warn(
+def warn_missing_pause_id(
+    agent: Agent,
+    expected: str | None,
+    *,
+    pause_id: str | None,
+    approval: bool = False,
+    warning_location: _WarningLocation | None = None,
+) -> None:
+    # A pre-0.5 pause has no token the caller could provide.
+    if pause_id is not None and expected is None and (agent._strict_tenancy or approval):
+        _warn_at_location(
             "Pass expected_pause_id to bind this submission to its pause. "
-            "It will be required for approvals in dendrux 0.6.",
-            FutureWarning,
-            stacklevel=3,
+            "It is planned to be required in 0.6 for approvals.",
+            warning_location,
         )
+
+
+def _client_json_payload(payload: str) -> str:
+    """Keep JSON values; encode legacy plain text as a JSON string."""
+    import json
+
+    try:
+        json.loads(payload, parse_constant=_invalid_json_constant)
+    except (ValueError, RecursionError):
+        return json.dumps(payload)
+    return payload
 
 
 async def prepare_client_results(
     agent: Agent, run_id: str, pause: PauseState, results: list[ToolResult]
 ) -> list[ToolResult]:
-    """Validate identity and JSON, cap payloads, then apply the configured transform."""
+    """Validate identity, normalize text to JSON, cap, transform, then re-cap."""
     import json
 
     from dendrux.loops.react import _apply_result_transform
@@ -926,7 +1069,11 @@ async def prepare_client_results(
     validate_result_names(run_id, pause, results, json_payload=False)
     try:
         capped = [
-            cap_tool_result(result, agent._limits.max_tool_result_bytes) for result in results
+            cap_tool_result(
+                replace(result, payload=_client_json_payload(result.payload)),
+                agent._limits.max_tool_result_bytes,
+            )
+            for result in results
         ]
     except UnicodeError as exc:
         raise _invalid_tool_result(run_id, "tool result payload is not valid UTF-8") from exc

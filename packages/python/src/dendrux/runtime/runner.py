@@ -87,11 +87,13 @@ from dendrux.runtime.replay import (
 from dendrux.runtime.state import claimed_store, unclaimed_store
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
+    claim_paused_validated,
     governance_snapshot,
     prepare_client_results,
     report_governance_change,
     submission_validator,
     validate_result_names,
+    warn_missing_pause_id,
 )
 from dendrux.skills._session import META_KEY, SkillSession, continuation, current
 from dendrux.skills._session import current as current_skill_session
@@ -131,6 +133,7 @@ if TYPE_CHECKING:
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime.state import StateStore
+    from dendrux.runtime.submit import _WarningLocation
     from dendrux.strategies.base import Strategy
     from dendrux.types import ContentPart, RunEvent, RunResult, RunStream, ToolCall, ToolResult
 
@@ -1651,7 +1654,15 @@ async def run(
 
             except RunFencedError:
                 assert state_store is not None
-                return await _build_cached_result(state_store, run_id)
+                fenced_result = await _build_cached_result(state_store, run_id)
+                if lifecycle_started:
+                    finish_recorder = None if recorder_closed else recorder
+                    finish_notifier = None if notifier_closed else extra_notifier
+                    recorder_closed = notifier_closed = True
+                    await _finish_fenced_lifecycle(
+                        run_id, fenced_result, finish_recorder, finish_notifier
+                    )
+                return fenced_result
 
             except Exception as exc:
                 if not lifecycle_started and isinstance(
@@ -2418,7 +2429,9 @@ async def retry(
             return result
 
         except RunFencedError:
-            return await _build_cached_result(state_store, run_id)
+            fenced_result = await _build_cached_result(state_store, run_id)
+            await _finish_fenced_lifecycle(run_id, fenced_result, recorder, extra_notifier)
+            return fenced_result
 
         except Exception as exc:
             _attach_run_error_meta(exc, run_id, mcp_meta)
@@ -3539,9 +3552,7 @@ async def _execute_approved_tools(
     target_history = history if history is not None else pause_state.history
     lookups = await agent.get_tool_lookups(loop=resolved_loop)
     outcomes = _approval_outcomes(pause_state, lookups.target, decisions)
-    decided = _decided_payload(run_id, outcomes, scalar="approved" if decisions is None else None)
     results: list[tuple[ToolCall, ToolResult]] = []
-    client_pending = [tc for tc, outcome, _ in outcomes if outcome == "client_pending"]
     counts: dict[str, int] = {}
     for message in pause_state.history:
         if (
@@ -3550,6 +3561,30 @@ async def _execute_approved_tools(
             and not message.meta.get("dendrux.not_executed")
         ):
             counts[message.name] = counts.get(message.name, 0) + 1
+    client_calls = [
+        tc
+        for tc, outcome, _ in outcomes
+        if outcome == "client_pending" and tc.name not in agent.deny
+    ]
+    _, limited = enforce_call_limits(client_calls, max_calls=lookups.max_calls, call_counts=counts)
+    client_rejections = {tc.id: result for tc, result in limited}
+    outcomes = [
+        (tc, "policy_denied", "denied_by_policy")
+        if outcome == "client_pending" and tc.name in agent.deny
+        else (tc, "call_limited", None)
+        if tc.id in client_rejections
+        else (tc, outcome, reason)
+        for tc, outcome, reason in outcomes
+    ]
+    client_pending = [tc for tc, outcome, _ in outcomes if outcome == "client_pending"]
+    decided = _decided_payload(
+        run_id,
+        [
+            (tc, "denied" if outcome in {"policy_denied", "call_limited"} else outcome, reason)
+            for tc, outcome, reason in outcomes
+        ],
+        scalar="approved" if decisions is None else None,
+    )
     session = current(agent)
     # An absent executor is a specified error only for a pinned approved script.
     # Inject an execution closure here without advertising the unavailable tool.
@@ -3574,6 +3609,32 @@ async def _execute_approved_tools(
 
     for index, (tc, outcome, reason) in enumerate(outcomes):
         if outcome == "client_pending":
+            continue
+        if outcome == "policy_denied":
+            from dendrux.loops._helpers import notify_governance, record_governance
+
+            denial_message = f"Tool '{tc.name}' is denied by policy."
+            data = {"tool_name": tc.name, "call_id": tc.id, "reason": "denied_by_policy"}
+            await record_governance(
+                recorder, run_id, "policy.denied", iteration, data, correlation_id=tc.id
+            )
+            await notify_governance(
+                notifier, run_id, "policy.denied", iteration, data, correlation_id=tc.id
+            )
+            await _append(
+                tc,
+                ToolResult(
+                    name=tc.name,
+                    call_id=tc.id,
+                    payload=json.dumps({"denied": denial_message}),
+                    success=False,
+                    error=denial_message,
+                ),
+                executed=False,
+            )
+            continue
+        if outcome == "call_limited":
+            await _append(tc, client_rejections[tc.id])
             continue
         if outcome == "denied":
             assert reason is not None
@@ -3983,6 +4044,24 @@ async def ingest_submitted_user_parts(
     }
 
 
+async def _finish_fenced_lifecycle(
+    run_id: str,
+    result: RunResult,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+) -> None:
+    """Close local lifecycle sinks with the persisted winner, without a status write."""
+    try:
+        await record_run_finished(recorder, run_id, result)
+    except Exception:
+        logger.warning(
+            "Fenced lifecycle recorder failed: run_id=%s code=fenced_finish_failed",
+            run_id,
+            extra={"run_id": run_id, "code": "fenced_finish_failed"},
+        )
+    await notify_run_finished(notifier, run_id, result)
+
+
 async def _check_claim(store: StateStore, run_id: str) -> None:
     getter = getattr(store, "get_run_control", None)
     if getter is not None:
@@ -3999,6 +4078,7 @@ async def _claim_resume(
     expected_pause_id: str | None,
     results: list[ToolResult] | None,
     user_input: Any = None,
+    warning_location: _WarningLocation | None = None,
 ) -> tuple[StateStore, str]:
     allowed = [expected]
     if results is not None and expected != RunStatus.WAITING_APPROVAL.value:
@@ -4008,18 +4088,32 @@ async def _claim_resume(
     validate = submission_validator(
         run_id, raw, agent=agent, expected_pause_id=expected_pause_id, call_results=results
     )
+    record = await store.get_run(run_id)
+    warn_missing_pause_id(
+        agent,
+        expected_pause_id,
+        pause_id=raw.get("pause_id"),
+        warning_location=warning_location,
+        approval=(
+            results is None
+            and user_input is None
+            and record is not None
+            and record.status == RunStatus.WAITING_APPROVAL.value
+        ),
+    )
     for status in allowed:
-        method = store.claim_paused_run
-        if _accepts_kwarg(method, "validate"):
-            epoch = await method(run_id, expected_status=status, validate=validate)
-        else:
-            if expected_pause_id is not None:
-                raise NotImplementedError("Custom StateStore must support claim validation")
-            epoch = await method(run_id, expected_status=status)
+        epoch = await claim_paused_validated(
+            store,
+            run_id,
+            expected_status=status,
+            validate=validate,
+        )
         if epoch:
             view = claimed_store(store, run_id, epoch)
             try:
-                await report_governance_change(agent, view, run_id, raw)
+                await report_governance_change(
+                    agent, view, run_id, raw, warning_location=warning_location
+                )
             except BaseException:
                 await _release_claim(view, run_id, status)
                 raise
@@ -4039,17 +4133,29 @@ async def _release_claim(store: StateStore, run_id: str, status: str) -> None:
 
 
 async def _shielded_cleanup(cleanup: Callable[[], Any]) -> Any:
-    # Anyio uses level cancellation; asyncio.shield alone does not mask it.
+    """Drain cleanup under cancellation, then propagate the caller's cancellation."""
     import anyio
 
+    cancellation: asyncio.CancelledError | None = None
     with anyio.CancelScope(shield=True):
         task = asyncio.create_task(cleanup())
         while not task.done():
             try:
                 await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-        return task.result()
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        try:
+            result = task.result()
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+    if cancellation is not None:
+        raise cancellation
+    # A level cancellation masked by the scope may never have reached the loop.
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    return result
 
 
 async def _resume_core(
@@ -4383,7 +4489,10 @@ async def _resume_core(
             raise
 
         except RunFencedError:
-            return await _build_cached_result(state_store, run_id)
+            fenced_result = await _build_cached_result(state_store, run_id)
+            if ctx is not None:
+                await _finish_fenced_lifecycle(run_id, fenced_result, ctx.recorder, ctx.notifier)
+            return fenced_result
 
         except Exception as exc:
             _attach_run_error_meta(exc, run_id, mcp_meta)
@@ -4431,6 +4540,7 @@ def resume_stream(
     user_input: UserContent | None = None,
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
+    warning_location: _WarningLocation | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
 
@@ -4537,6 +4647,7 @@ def resume_stream(
                 expected_pause_id=expected_pause_id,
                 results=stream_results,
                 user_input=user_input,
+                warning_location=warning_location,
             )
             _shared["state_store"] = store
             _shared["claimed"] = True
@@ -4886,8 +4997,12 @@ def resume_stream(
     )
 
 
-async def _owned_claim_view(store: StateStore, run_id: str) -> StateStore:
-    # Trusted internal callers may hand off a claim made directly on the store.
+async def _owned_claim_view(
+    store: StateStore, run_id: str, claim_epoch: int | None = None
+) -> StateStore:
+    if claim_epoch is not None:
+        return claimed_store(store, run_id, claim_epoch)
+    # Legacy internal callers without a token adopt the current epoch best effort.
     if getattr(store, "claim_epoch", None) is None:
         getter = getattr(store, "get_run_control", None)
         if getter is not None:
@@ -4946,8 +5061,14 @@ async def resume_claimed(
     provider: LLMProvider,
     extra_notifier: LoopNotifier | None = None,
     pre_claim_status: str | None = None,
+    claim_epoch: int | None = None,
 ) -> RunResult:
     """Resume a run that was already claimed via submit_and_claim().
+
+    Raw-store callers should pass the epoch returned by their claim as
+    ``claim_epoch=``. Omitting it retains the legacy best-effort current-epoch
+    lookup. SDK submissions pass an already-bound store view.
+
 
     Internal helper for the persist-first handoff. NOT a public API.
 
@@ -4983,7 +5104,7 @@ async def resume_claimed(
     from dendrux.runtime.submit import deserialize_tool_results
 
     try:
-        state_store = await _owned_claim_view(state_store, run_id)
+        state_store = await _owned_claim_view(state_store, run_id, claim_epoch)
         raw_pause = await _validate_owned_pause(
             state_store,
             run_id,
@@ -5069,8 +5190,14 @@ async def resume_approval_approved_claim(
     agent: Agent,
     provider: LLMProvider,
     extra_notifier: LoopNotifier | None = None,
+    claim_epoch: int | None = None,
 ) -> RunResult:
     """Resume an approval-approved run that was already claimed.
+
+    Raw-store callers should pass the epoch returned by their claim as
+    ``claim_epoch=``. Omitting it retains the legacy best-effort current-epoch
+    lookup. SDK submissions pass an already-bound store view.
+
 
     Paired with :func:`resume_claimed`: ``resume_claimed`` handles the
     post-claim path for tool results and user input, while this function
@@ -5083,7 +5210,7 @@ async def resume_approval_approved_claim(
     ``expected_status="waiting_approval"``.
     """
     try:
-        state_store = await _owned_claim_view(state_store, run_id)
+        state_store = await _owned_claim_view(state_store, run_id, claim_epoch)
         await _validate_owned_pause(state_store, run_id, agent, RunStatus.WAITING_APPROVAL.value)
     except RunFencedError:
         return await _build_cached_result(state_store, run_id)
@@ -5107,15 +5234,21 @@ async def resume_paused_claim(
     agent: Agent,
     provider: LLMProvider,
     extra_notifier: LoopNotifier | None = None,
+    claim_epoch: int | None = None,
 ) -> RunResult:
     """Continue a PAUSED run that :meth:`Agent.submit_resume` already claimed.
+
+    Raw-store callers should pass the epoch returned by their claim as
+    ``claim_epoch=``. Omitting it retains the legacy best-effort current-epoch
+    lookup. SDK submissions pass an already-bound store view.
+
 
     The claim cleared ``pause_requested``. The loop resumes with the full
     history; a pause that interrupted an approval batch first executes the
     batch's remainder with its persisted decisions.
     """
     try:
-        state_store = await _owned_claim_view(state_store, run_id)
+        state_store = await _owned_claim_view(state_store, run_id, claim_epoch)
         await _validate_owned_pause(state_store, run_id, agent, RunStatus.PAUSED.value)
     except RunFencedError:
         return await _build_cached_result(state_store, run_id)
