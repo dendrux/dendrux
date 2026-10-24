@@ -1,0 +1,604 @@
+"""0.5.0 T3: guardrail hardening (scan limits, detector quality, safe errors, PII restore)."""
+
+from __future__ import annotations
+
+import inspect
+import logging
+from typing import Any
+
+import pytest
+
+from dendrux.agent import Agent
+from dendrux.guardrails import PII, GuardrailEngine, SecretDetection
+from dendrux.guardrails import _engine as engine_mod
+from dendrux.guardrails._engine import deanonymize_text, has_placeholder
+from dendrux.guardrails._protocol import UNSCANNABLE, Finding
+from dendrux.llm.mock import MockLLM
+from dendrux.loops.base import BaseRecorder
+from dendrux.loops.react import ReActLoop
+from dendrux.strategies.native import NativeToolCalling
+from dendrux.tool import get_tool_def, tool
+from dendrux.types import LLMResponse, Message, Role, RunStatus, ToolCall, UsageStats
+
+_EMAIL = "alice@example.com"
+_AWS = "AKIAIOSFODNN7EXAMPLE"
+
+
+def _nested(value: object, depth: int) -> dict[str, Any]:
+    out: Any = value
+    for _ in range(depth):
+        out = {"a": out}
+    return {"x": out}
+
+
+# ---------------------------------------------------------------------------
+# D-030: no matched text in block errors
+# ---------------------------------------------------------------------------
+
+
+class TestBlockMessagesCarryNoMatchedText:
+    async def test_names_guardrail_kind_count(self) -> None:
+        engine = GuardrailEngine([PII(action="block")])
+        _, findings, block = await engine.scan_incoming("a@example.com and b@example.com")
+        assert block is not None
+        assert "PII" in block
+        assert "2 EMAIL_ADDRESS" in block
+        assert "example.com" not in block
+        assert all("example.com" not in repr(f) for f in findings)
+
+    async def test_incoming_message_location(self) -> None:
+        engine = GuardrailEngine([SecretDetection()])
+        msg = Message(Role.TOOL, f"key {_AWS}", name="lookup", call_id="call_1")
+        _, _, block = await engine.scan_incoming_message(msg, index=4)
+        assert block is not None
+        assert "message 4" in block
+        assert "role=tool" in block
+        assert "tool_call_id=call_1" in block
+        assert _AWS not in block
+
+    async def test_location_without_index(self) -> None:
+        engine = GuardrailEngine([SecretDetection()])
+        _, _, block = await engine.scan_incoming_message(Message(Role.USER, f"key {_AWS}"))
+        assert block is not None
+        assert "role=user" in block
+        assert _AWS not in block
+
+    async def test_outgoing_params_location(self) -> None:
+        engine = GuardrailEngine([SecretDetection()])
+        _, block = await engine.scan_outgoing("ok", [{"a": "fine"}, {"api_key": _AWS}])
+        assert block is not None
+        assert "tool call params (call 1)" in block
+        assert _AWS not in block
+
+    async def test_finding_repr_hides_text(self) -> None:
+        finding = Finding(entity_type="X", start=0, end=3, score=1.0, text="secret-value")
+        assert "secret-value" not in repr(finding)
+        assert finding.text == "secret-value"
+
+    async def test_run_error_and_events_never_carry_the_secret(self) -> None:
+        events: list[dict[str, Any]] = []
+
+        class Spy(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
+                pass
+
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
+                pass
+
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
+                pass
+
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
+                events.append({"event_type": event_type, "data": data})
+
+        agent = Agent(prompt="p", tools=[], guardrails=[SecretDetection(action="block")])
+        secret = "api_key=sk_live_" + "ABCDEFGHIJKLMNOPQRSTUVWX1234"
+        result = await ReActLoop().run(
+            agent=agent,
+            provider=MockLLM([]),
+            strategy=NativeToolCalling(),
+            user_input=f"config: {secret}",
+            recorder=Spy(),
+        )
+        assert result.status == RunStatus.ERROR
+        assert "sk_live" not in (result.error or "")
+        blocked = [e for e in events if e["event_type"] == "guardrail.blocked"]
+        assert len(blocked) == 1
+        assert "sk_live" not in str(events)
+
+
+# ---------------------------------------------------------------------------
+# D-027: scan limits fail closed
+# ---------------------------------------------------------------------------
+
+
+class TestUnscannableFailsClosed:
+    @pytest.mark.parametrize("guardrail_action", ["block", "redact"])
+    async def test_deep_params_block_under_block_and_redact(self, guardrail_action: str) -> None:
+        engine = GuardrailEngine([PII(action=guardrail_action)])  # type: ignore[arg-type]
+        findings, block = await engine.scan_outgoing("ok", [_nested(_EMAIL, 60)])
+        assert block is not None
+        assert UNSCANNABLE in block
+        assert _EMAIL not in block
+        assert any(f.entity_type == UNSCANNABLE for f in findings)
+
+    async def test_deep_params_only_reported_under_warn(self) -> None:
+        engine = GuardrailEngine([PII(action="warn")])
+        findings, block = await engine.scan_outgoing("ok", [_nested(_EMAIL, 60)])
+        assert block is None
+        assert [f.entity_type for f in findings] == [UNSCANNABLE]
+
+    async def test_depth_limit_boundary_is_still_scanned(self) -> None:
+        engine = GuardrailEngine([PII(action="block")])
+        _, block = await engine.scan_outgoing("ok", [_nested(_EMAIL, 40)])
+        assert block is not None
+        assert "EMAIL_ADDRESS" in block
+        assert UNSCANNABLE not in block
+
+    async def test_real_finding_wins_over_unscannable(self) -> None:
+        engine = GuardrailEngine([PII(action="block")])
+        params = {"shallow": _EMAIL, "deep": _nested("x", 60)["x"]}
+        _, block = await engine.scan_outgoing("ok", [params])
+        assert block is not None
+        assert "EMAIL_ADDRESS" in block
+
+    async def test_too_many_nodes_is_unscannable(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        params = {"items": ["x"] * (engine_mod._MAX_SCAN_NODES + 5)}
+        findings, block = await engine.scan_outgoing("ok", [params])
+        assert block is not None
+        assert UNSCANNABLE in block
+
+    async def test_oversize_leaf_is_unscannable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 100)
+        engine = GuardrailEngine([PII(action="block")])
+        _, block = await engine.scan_outgoing("ok", [{"blob": "x" * 500}])
+        assert block is not None
+        assert UNSCANNABLE in block
+
+    @pytest.mark.parametrize("action", ["block", "redact"])
+    async def test_oversize_text_blocks_incoming(
+        self, monkeypatch: pytest.MonkeyPatch, action: str
+    ) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 100)
+        engine = GuardrailEngine([PII(action=action)])  # type: ignore[arg-type]
+        text, findings, block = await engine.scan_incoming("x" * 500)
+        assert block is not None
+        assert UNSCANNABLE in block
+        assert text == "x" * 500
+
+    async def test_oversize_text_warn_reports_and_continues(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 100)
+        engine = GuardrailEngine([PII(action="warn")])
+        _, findings, block = await engine.scan_incoming("x" * 500)
+        assert block is None
+        assert [f.entity_type for f in findings] == [UNSCANNABLE]
+
+    async def test_oversize_text_blocks_outgoing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 100)
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        _, block = await engine.scan_outgoing("x" * 500, None)
+        assert block is not None
+        assert UNSCANNABLE in block
+
+    async def test_unscannable_ends_run_with_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 100)
+        agent = Agent(prompt="p", tools=[], guardrails=[PII(action="redact")])
+        llm = MockLLM([])
+        result = await ReActLoop().run(
+            agent=agent, provider=llm, strategy=NativeToolCalling(), user_input="x" * 500
+        )
+        assert result.status == RunStatus.ERROR
+        assert llm.calls_made == 0
+
+
+# ---------------------------------------------------------------------------
+# D-029: PII restore
+# ---------------------------------------------------------------------------
+
+
+@tool()
+async def plain_tool(to: str) -> str:
+    """No PII access."""
+    return to
+
+
+@tool(receives_pii=True)
+async def pii_tool(to: str) -> str:
+    """Receives any PII."""
+    return to
+
+
+@tool(receives_pii={"EMAIL"})
+async def email_tool(to: str) -> str:
+    """Receives e-mail only."""
+    return to
+
+
+def _engine(restore: str | None) -> GuardrailEngine:
+    if restore is None:
+        return GuardrailEngine([PII()])
+    return GuardrailEngine([PII(restore=restore)])  # type: ignore[arg-type]
+
+
+async def _mint(engine: GuardrailEngine) -> None:
+    await engine.scan_incoming(f"mail {_EMAIL} phone +1-555-123-4567")
+
+
+_PARAMS = {"to": "<<EMAIL_ADDRESS_1>>", "note": "call <<PHONE_NUMBER_1>> or <<EMAIL_ADDRESS_1>>"}
+
+
+class TestRestoreAll:
+    @pytest.mark.parametrize("restore", [None, "all"])
+    async def test_every_tool_gets_real_values_like_041(self, restore: str | None) -> None:
+        engine = _engine(restore)
+        await _mint(engine)
+        for t in (plain_tool, pii_tool, None):
+            td = get_tool_def(t) if t else None
+            out = engine.restore_params(_PARAMS, tool_def=td)
+            assert out.params == {
+                "to": _EMAIL,
+                "note": f"call +1-555-123-4567 or {_EMAIL}",
+            }
+            assert out.skipped == {}
+        assert engine.deanonymize(_PARAMS) == engine.deanonymize(_PARAMS, tool_def=None)
+        assert engine.restore_mode == "all"
+
+    async def test_mapping_is_exactly_the_041_shape(self) -> None:
+        engine = _engine("all")
+        await _mint(engine)
+        assert engine.get_pii_mapping() == {
+            "<<EMAIL_ADDRESS_1>>": _EMAIL,
+            "<<PHONE_NUMBER_1>>": "+1-555-123-4567",
+        }
+
+
+class TestRestoreAllowlisted:
+    async def test_plain_tool_keeps_placeholders_and_reports_counts(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        out = engine.restore_params(_PARAMS, tool_def=get_tool_def(plain_tool))
+        assert out.params == _PARAMS
+        assert out.skipped == {"EMAIL_ADDRESS": 2, "PHONE_NUMBER": 1}
+        data = out.event_data("plain_tool", "c1")
+        assert data == {
+            "tool_name": "plain_tool",
+            "call_id": "c1",
+            "entities": {"EMAIL_ADDRESS": 2, "PHONE_NUMBER": 1},
+            "count": 3,
+            "code": "pii_restore_skipped",
+        }
+        assert _EMAIL not in str(data)
+
+    async def test_receives_pii_true_restores_everything(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        out = engine.restore_params(_PARAMS, tool_def=get_tool_def(pii_tool))
+        assert out.params["to"] == _EMAIL
+        assert out.skipped == {}
+
+    async def test_entity_set_restores_only_listed_entities(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        out = engine.restore_params(_PARAMS, tool_def=get_tool_def(email_tool))
+        assert out.params == {
+            "to": _EMAIL,
+            "note": f"call <<PHONE_NUMBER_1>> or {_EMAIL}",
+        }
+        assert out.skipped == {"PHONE_NUMBER": 1}
+
+    async def test_exact_entity_name_is_accepted(self) -> None:
+        @tool(receives_pii={"EMAIL_ADDRESS"})
+        async def exact(to: str) -> str:
+            """Exact name."""
+            return to
+
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        assert engine.deanonymize(_PARAMS, tool_def=get_tool_def(exact))["to"] == _EMAIL
+
+    async def test_prefix_does_not_match_inside_a_word(self) -> None:
+        @tool(receives_pii={"PHONE_NUM"})
+        async def partial(to: str) -> str:
+            """Partial name."""
+            return to
+
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        assert engine.deanonymize(_PARAMS, tool_def=get_tool_def(partial)) == _PARAMS
+
+    async def test_no_tool_def_restores_nothing(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        assert engine.deanonymize(_PARAMS) == _PARAMS
+        assert engine.restore_params(_PARAMS).skipped["EMAIL_ADDRESS"] == 2
+
+    async def test_whole_value_placeholder_and_nesting(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        params = {"a": [{"b": "<<EMAIL_ADDRESS_1>>"}], "n": 3}
+        assert engine.deanonymize(params, tool_def=get_tool_def(plain_tool)) == params
+        out = engine.deanonymize(params, tool_def=get_tool_def(pii_tool))
+        assert out == {"a": [{"b": _EMAIL}], "n": 3}
+
+    async def test_unknown_placeholders_pass_through(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        out = engine.restore_params({"to": "<<EMAIL_ADDRESS_9>>"}, tool_def=get_tool_def(pii_tool))
+        assert out.params == {"to": "<<EMAIL_ADDRESS_9>>"}
+        assert out.skipped == {}
+
+    async def test_input_is_not_mutated(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        engine.deanonymize(params, tool_def=get_tool_def(pii_tool))
+        assert params == {"to": "<<EMAIL_ADDRESS_1>>"}
+
+    async def test_answer_text_for_the_developer_is_still_restored(self) -> None:
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        text, unmapped = deanonymize_text("hi <<EMAIL_ADDRESS_1>>", engine.get_pii_mapping())
+        assert text == f"hi {_EMAIL}"
+        assert unmapped == []
+
+    async def test_strictest_guardrail_wins(self) -> None:
+        engine = GuardrailEngine([PII(restore="all"), PII(restore="allowlisted")])
+        assert engine.restore_mode == "allowlisted"
+
+
+class TestToolResultProvenance:
+    async def _engine_with_tool_result(self) -> GuardrailEngine:
+        engine = _engine("allowlisted")
+        await engine.scan_incoming_message(Message(Role.USER, "hello"), index=0)
+        await engine.scan_incoming_message(
+            Message(Role.TOOL, f"found {_EMAIL}", name="pii_tool", call_id="c1"), index=1
+        )
+        return engine
+
+    async def test_restored_only_into_the_tool_that_produced_it(self) -> None:
+        engine = await self._engine_with_tool_result()
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+
+        @tool(receives_pii=True)
+        async def other_pii_tool(to: str) -> str:
+            """Allowed PII, but not the producer."""
+            return to
+
+        assert engine.deanonymize(params, tool_def=get_tool_def(pii_tool)) == {"to": _EMAIL}
+        out = engine.restore_params(params, tool_def=get_tool_def(other_pii_tool))
+        assert out.params == params
+        assert out.skipped == {"EMAIL_ADDRESS": 1}
+
+    async def test_producer_still_needs_to_be_allowed(self) -> None:
+        engine = _engine("allowlisted")
+        await engine.scan_incoming_message(
+            Message(Role.TOOL, f"found {_EMAIL}", name="plain_tool", call_id="c1")
+        )
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert engine.deanonymize(params, tool_def=get_tool_def(plain_tool)) == params
+
+    async def test_user_text_with_the_same_value_makes_it_trusted(self) -> None:
+        engine = await self._engine_with_tool_result()
+        await engine.scan_incoming_message(Message(Role.USER, f"my mail is {_EMAIL}"), index=2)
+
+        @tool(receives_pii=True)
+        async def other_pii_tool(to: str) -> str:
+            """Allowed PII."""
+            return to
+
+        out = engine.deanonymize(
+            {"to": "<<EMAIL_ADDRESS_1>>"}, tool_def=get_tool_def(other_pii_tool)
+        )
+        assert out == {"to": _EMAIL}
+
+    async def test_provenance_survives_pause_and_resume(self) -> None:
+        engine = await self._engine_with_tool_result()
+        saved = engine.get_pii_mapping()
+        assert set(saved) == {"<<EMAIL_ADDRESS_1>>", engine_mod._ORIGINS_KEY}
+        resumed = GuardrailEngine([PII(restore="allowlisted")], pii_mapping=saved)
+
+        @tool(receives_pii=True)
+        async def other_pii_tool(to: str) -> str:
+            """Allowed PII."""
+            return to
+
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert resumed.deanonymize(params, tool_def=get_tool_def(other_pii_tool)) == params
+        assert resumed.deanonymize(params, tool_def=get_tool_def(pii_tool)) == {"to": _EMAIL}
+        assert resumed.get_pii_mapping() == saved
+
+    async def test_new_placeholders_continue_numbering_after_resume(self) -> None:
+        engine = await self._engine_with_tool_result()
+        resumed = GuardrailEngine(
+            [PII(restore="allowlisted")], pii_mapping=engine.get_pii_mapping()
+        )
+        text, _, _ = await resumed.scan_incoming("and bob@example.com")
+        assert "<<EMAIL_ADDRESS_2>>" in text
+
+    async def test_corrupt_provenance_is_ignored(self) -> None:
+        mapping = {"<<EMAIL_ADDRESS_1>>": _EMAIL, engine_mod._ORIGINS_KEY: "not json"}
+        engine = GuardrailEngine([PII(restore="allowlisted")], pii_mapping=mapping)
+        assert engine.deanonymize(
+            {"to": "<<EMAIL_ADDRESS_1>>"}, tool_def=get_tool_def(pii_tool)
+        ) == {"to": _EMAIL}
+
+    async def test_provenance_is_not_tracked_under_all(self) -> None:
+        engine = _engine("all")
+        await engine.scan_incoming_message(
+            Message(Role.TOOL, f"found {_EMAIL}", name="pii_tool", call_id="c1")
+        )
+        assert engine_mod._ORIGINS_KEY not in engine.get_pii_mapping()
+        assert engine.deanonymize(
+            {"to": "<<EMAIL_ADDRESS_1>>"}, tool_def=get_tool_def(plain_tool)
+        ) == {"to": _EMAIL}
+
+    async def test_origins_key_never_rewrites_answer_text(self) -> None:
+        engine = await self._engine_with_tool_result()
+        mapping = engine.get_pii_mapping()
+        text, _ = deanonymize_text(f"see {engine_mod._ORIGINS_KEY}", mapping)
+        assert text == f"see {engine_mod._ORIGINS_KEY}"
+
+
+class TestHasPlaceholder:
+    def test_detects_nested_placeholders(self) -> None:
+        assert has_placeholder("x <<EMAIL_ADDRESS_1>> y")
+        assert has_placeholder({"a": [{"b": "<<PHONE_NUMBER_2>>"}]})
+        assert not has_placeholder({"a": ["plain", 3, None]})
+        assert not has_placeholder(_nested("<<EMAIL_ADDRESS_1>>", 80))
+
+
+class TestRestoreNotice:
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(engine_mod, "_restore_notice_logged", False)
+
+    @staticmethod
+    def _notices(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if "restore=" in r.getMessage()]
+
+    def test_logged_once_when_not_chosen(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="dendrux.guardrails._engine")
+        GuardrailEngine([PII()])
+        GuardrailEngine([PII()])
+        notices = self._notices(caplog)
+        assert len(notices) == 1
+        assert notices[0].levelno == logging.INFO
+        assert "allowlisted" in notices[0].getMessage()
+
+    @pytest.mark.parametrize("restore", ["all", "allowlisted"])
+    def test_silent_when_chosen(self, caplog: pytest.LogCaptureFixture, restore: str) -> None:
+        caplog.set_level(logging.INFO, logger="dendrux.guardrails._engine")
+        GuardrailEngine([PII(restore=restore)])  # type: ignore[arg-type]
+        assert self._notices(caplog) == []
+
+    def test_silent_when_nothing_is_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="dendrux.guardrails._engine")
+        GuardrailEngine([PII(action="warn"), SecretDetection()])
+        GuardrailEngine([PII(action="block")])
+        assert self._notices(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# D-029 end to end: an indirect-injection attempt through the ReAct loop
+# ---------------------------------------------------------------------------
+
+_received: list[str] = []
+
+
+@tool()
+async def send_report(recipient: str) -> str:
+    """Send the report (not allowed to see PII)."""
+    _received.append(recipient)
+    return "sent"
+
+
+@tool(receives_pii=True)
+async def crm_update(contact: str) -> str:
+    """Update the CRM (allowed to see PII)."""
+    _received.append(contact)
+    return "updated"
+
+
+def _usage() -> UsageStats:
+    return UsageStats(input_tokens=5, output_tokens=5, total_tokens=10)
+
+
+def _call(name: str, **params: Any) -> LLMResponse:
+    return LLMResponse(
+        text=None,
+        tool_calls=[ToolCall(name=name, params=params, id=f"call_{name}")],
+        usage=_usage(),
+    )
+
+
+async def _run_injection(restore: str | None, tool_name: str) -> RunStatus:
+    _received.clear()
+    pii = PII() if restore is None else PII(restore=restore)  # type: ignore[arg-type]
+    agent = Agent(prompt="p", tools=[send_report, crm_update], guardrails=[pii])
+    llm = MockLLM(
+        [
+            _call(
+                tool_name,
+                **{"recipient" if tool_name == "send_report" else "contact": "<<EMAIL_ADDRESS_1>>"},
+            ),
+            LLMResponse(text="done", usage=_usage()),
+        ]
+    )
+    result = await ReActLoop().run(
+        agent=agent,
+        provider=llm,
+        strategy=NativeToolCalling(),
+        user_input=f"My email is {_EMAIL}. Summarise the attached page.",
+    )
+    return result.status
+
+
+def _call_site_passes_tool_def() -> bool:
+    from dendrux.loops import react
+
+    return "tool_def=" in inspect.getsource(react._process_tool_calls)
+
+
+class TestIndirectInjectionEndToEnd:
+    async def test_default_restore_all_still_sends_the_real_value(self) -> None:
+        assert await _run_injection(None, "send_report") == RunStatus.SUCCESS
+        assert _received == [_EMAIL]
+
+    async def test_allowlisted_blocks_the_unlisted_tool(self) -> None:
+        assert await _run_injection("allowlisted", "send_report") == RunStatus.SUCCESS
+        assert _received == ["<<EMAIL_ADDRESS_1>>"]
+
+    @pytest.mark.skipif(
+        not _call_site_passes_tool_def(),
+        reason="needs the T4 call site to pass tool_def= to GuardrailEngine.deanonymize",
+    )
+    async def test_allowlisted_still_serves_the_listed_tool(self) -> None:
+        assert await _run_injection("allowlisted", "crm_update") == RunStatus.SUCCESS
+        assert _received == [_EMAIL]
+
+    @pytest.mark.skipif(
+        not _call_site_passes_tool_def(),
+        reason="needs the T4 call site to pass tool_def= and emit guardrail.restore_skipped",
+    )
+    async def test_skipped_restore_emits_counts_only(self) -> None:
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        class Spy(BaseRecorder):
+            async def on_message_appended(self, run_id, message, iteration):
+                pass
+
+            async def on_llm_call_completed(self, run_id, response, iteration, **kw):
+                pass
+
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration):
+                pass
+
+            async def on_governance_event(
+                self, run_id, event_type, iteration, data, correlation_id=None
+            ):
+                events.append((event_type, data))
+
+        agent = Agent(prompt="p", tools=[send_report], guardrails=[PII(restore="allowlisted")])
+        llm = MockLLM(
+            [
+                _call("send_report", recipient="<<EMAIL_ADDRESS_1>>"),
+                LLMResponse(text="ok", usage=_usage()),
+            ]
+        )
+        await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input=f"My email is {_EMAIL}.",
+            recorder=Spy(),
+        )
+        skipped = [d for t, d in events if t == "guardrail.restore_skipped"]
+        assert len(skipped) == 1
+        assert skipped[0]["tool_name"] == "send_report"
+        assert skipped[0]["entities"] == {"EMAIL_ADDRESS": 1}
+        assert _EMAIL not in str(events)
