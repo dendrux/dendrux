@@ -13,6 +13,14 @@ revision: drop ``ix_agent_runs_idempotency_key``, create
 and create the ``agent_runs (tenant_id, created_at DESC)`` index (D-124).
 Mirror each step in ``downgrade()``.
 
+!!! IMPORTANT FOR T1: every index step added here MUST be idempotent
+(``CREATE ... IF NOT EXISTS`` / ``DROP ... IF EXISTS``, or an inspector
+guard). A database may already be stamped at this revision with only the
+``claim_epoch`` step applied (anyone who ran ``dendrux db migrate`` on the
+T0 commit). Such a DB recovers with ``downgrade -1`` then ``migrate`` only
+if both directions tolerate the index steps being absent or present.
+Do not migrate persistent databases to this revision until T1's R1 lands.
+
 Revision ID: d7e8f9a0b1c2
 Revises: c6d7e8f9a0b1
 Create Date: 2026-10-24
@@ -41,9 +49,11 @@ def upgrade() -> None:
             server_default=sa.text("0"),
         ),
     )
-    # TODO(T1, R1): tenant-scoped idempotency indexes go here.
+    # TODO(T1, R1): tenant-scoped idempotency indexes go here, written idempotently
+    # (IF NOT EXISTS / IF EXISTS): a DB may already be stamped at this revision.
 
 
 def downgrade() -> None:
-    # TODO(T1, R1): reverse the tenant-scoped idempotency indexes here first.
+    # TODO(T1, R1): reverse the tenant-scoped idempotency indexes here first,
+    # idempotently (IF EXISTS / IF NOT EXISTS), for the same reason.
     op.drop_column("agent_runs", "claim_epoch")
