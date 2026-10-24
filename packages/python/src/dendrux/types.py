@@ -1431,7 +1431,9 @@ class PauseState:
     # Identifier of this pause (ULID); None on pauses written before 0.5.0.
     pause_id: str | None = None
     # Pause-state format version; None on pauses written before 0.5.0.
-    schema_version: int | None = None
+    schema_version: int | None = 1
+
+    provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -1475,6 +1477,11 @@ class PauseState:
             d["pause_id"] = self.pause_id
         if self.schema_version is not None:
             d["schema_version"] = self.schema_version
+        d["provider_kwargs"] = {
+            k: v
+            for k, v in self.provider_kwargs.items()
+            if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+        }
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1490,13 +1497,15 @@ class PauseState:
         """Deserialize from a dict (loaded from DB)."""
         return cls(
             agent_name=data["agent_name"],
-            pending_tool_calls=[_tool_call_from_dict(tc) for tc in data["pending_tool_calls"]],
+            pending_tool_calls=[
+                _tool_call_from_dict(tc) for tc in data.get("pending_tool_calls", [])
+            ],
             pending_targets=data.get("pending_targets", {}),
-            history=[_message_from_dict(m) for m in data["history"]],
-            steps=[_step_from_dict(s) for s in data["steps"]],
-            iteration=data["iteration"],
-            trace_order_offset=data["trace_order_offset"],
-            usage=_usage_from_dict(data["usage"]),
+            history=[_message_from_dict(m) for m in data.get("history", [])],
+            steps=[_step_from_dict(s) for s in data.get("steps", [])],
+            iteration=data.get("iteration", 0),
+            trace_order_offset=data.get("trace_order_offset", 0),
+            usage=_usage_from_dict(data.get("usage", {})),
             approval_gates=data.get("approval_gates"),
             pause_reason=data.get("pause_reason"),
             pause_message=data.get("pause_message"),
@@ -1512,7 +1521,12 @@ class PauseState:
                 else None
             ),
             pause_id=data.get("pause_id"),
-            schema_version=data.get("schema_version"),
+            schema_version=data.get("schema_version") or 1,
+            provider_kwargs={
+                k: v
+                for k, v in (data.get("provider_kwargs") or {}).items()
+                if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+            },
         )
 
 

@@ -11,7 +11,7 @@ from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.context import get_delegation_context
 from dendrux.skills._session import current
-from dendrux.types import LLMResponse, ToolCall, ToolResult
+from dendrux.types import LLMResponse, RunStatus, ToolCall, ToolResult
 from tests.integration.test_skills_v2 import agent, client
 from tests.unit.test_skill_runtime_fix1 import Reads
 
@@ -81,8 +81,11 @@ async def test_non_skill_cancel_during_resume_preparation_sequences_event(store,
             await a.cancel_run(paused.run_id)
         else:
             task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        if path == "submit":
+            assert (await task).status == RunStatus.CANCELLED
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
     assert (await store.get_run(paused.run_id)).status == "cancelled"
     events = await store.get_run_events(paused.run_id)
     cancelled = [e for e in events if e.event_type == "run.cancelled"]

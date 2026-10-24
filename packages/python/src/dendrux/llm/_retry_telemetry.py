@@ -26,9 +26,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.types import StreamEvent
 
 _logger = logging.getLogger(__name__)
 
@@ -180,6 +181,38 @@ async def _on_response(response: httpx.Response) -> None:
         _logger.warning("retry telemetry hook raised", exc_info=True)
 
 
+def telemetry_event_hooks() -> dict[str, list[Callable[..., Awaitable[None]]]]:
+    """Fresh httpx hooks for clients that also configure limits or deadlines."""
+    return {"response": [_on_response]}
+
+
+async def telemetry_stream(
+    stream: AsyncGenerator[StreamEvent, None],
+    *,
+    run_id: str,
+    iteration: int,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+) -> AsyncGenerator[StreamEvent, None]:
+    """Bind tokens within each await, including close; never across a yield."""
+    iterator = aiter(stream)
+    try:
+        while True:
+            try:
+                with telemetry_context(
+                    run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
+                ):
+                    event = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            yield event
+    finally:
+        with telemetry_context(
+            run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
+        ):
+            await stream.aclose()
+
+
 def make_telemetry_http_client(
     timeout: httpx.Timeout,
 ) -> httpx.AsyncClient:
@@ -191,7 +224,7 @@ def make_telemetry_http_client(
     """
     return httpx.AsyncClient(
         timeout=timeout,
-        event_hooks={"response": [_on_response]},
+        event_hooks=telemetry_event_hooks(),
     )
 
 
@@ -201,4 +234,6 @@ __all__ = [
     "end_call_attempt_tracking",
     "make_telemetry_http_client",
     "telemetry_context",
+    "telemetry_event_hooks",
+    "telemetry_stream",
 ]

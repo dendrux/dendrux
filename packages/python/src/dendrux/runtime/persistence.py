@@ -5,7 +5,8 @@ StateStore. The runner creates this when persistence is active.
 
 Write classification:
   - Fail-closed (retry with backoff, then propagate): save_trace, save_tool_call, save_run_event
-  - Best-effort (exceptions swallowed): save_usage, save_llm_interaction, touch_progress
+  - Best-effort (bounded transient retry, then swallowed): save_usage, save_llm_interaction
+  - Best-effort (exceptions swallowed): touch_progress
 
 Images (0.4.0): parts messages persist ``meta["dendrux.parts"]`` on traces
 and ``parts`` in ``semantic_request.messages``; tool results with images
@@ -30,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 from dendrux.errors import ImagePersistenceUnsupportedError
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
-from dendrux.runtime.durability import retry_critical
+from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -348,23 +349,29 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: llm_interactions (full forensics)
         try:
-            await self._store.save_llm_interaction(
-                self._run_id,
-                iteration_index=iteration,
-                usage=response.usage,
-                model=response.model or self._model,
-                provider=self._provider_name,
-                duration_ms=duration_ms,
-                semantic_request=semantic_request,
-                semantic_response=semantic_response,
-                provider_request=(
-                    scrub_inline_images(response.provider_request)
-                    if has_parts
-                    else response.provider_request
-                ),
-                provider_response=response.provider_response,
-                guardrail_findings=guardrail_findings,
-                interaction_id=interaction_id,
+
+            async def _write_interaction() -> None:
+                await self._store.save_llm_interaction(
+                    self._run_id,
+                    iteration_index=iteration,
+                    usage=response.usage,
+                    model=response.model or self._model,
+                    provider=self._provider_name,
+                    duration_ms=duration_ms,
+                    semantic_request=semantic_request,
+                    semantic_response=semantic_response,
+                    provider_request=(
+                        scrub_inline_images(response.provider_request)
+                        if has_parts
+                        else response.provider_request
+                    ),
+                    provider_response=response.provider_response,
+                    guardrail_findings=guardrail_findings,
+                    interaction_id=interaction_id,
+                )
+
+            await retry_transient_db(
+                _write_interaction, label="save_llm_interaction", run_id=self._run_id
             )
         except Exception:
             logger.warning(
@@ -376,18 +383,22 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: token_usage (cost tracking)
         try:
-            await self._store.save_usage(
-                self._run_id,
-                iteration_index=iteration,
-                usage=response.usage,
-                model=response.model or self._model,
-                provider=self._provider_name,
-                meta=(
-                    {"cost_source": response.usage.cost_source}
-                    if response.usage.cost_source is not None
-                    else None
-                ),
-            )
+
+            async def _write_usage() -> None:
+                await self._store.save_usage(
+                    self._run_id,
+                    iteration_index=iteration,
+                    usage=response.usage,
+                    model=response.model or self._model,
+                    provider=self._provider_name,
+                    meta=(
+                        {"cost_source": response.usage.cost_source}
+                        if response.usage.cost_source is not None
+                        else None
+                    ),
+                )
+
+            await retry_transient_db(_write_usage, label="save_usage", run_id=self._run_id)
         except Exception:
             logger.warning(
                 "Failed to save usage for run %s iteration %d",
@@ -429,6 +440,31 @@ class PersistenceRecorder(BaseRecorder):
             await self._store.touch_progress(self._run_id)
         except Exception:
             logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Persist safe failure/deadline evidence without inventing billed usage."""
+        from dendrux.errors import ProviderError
+        from dendrux.types import ErrorInfo
+
+        if not isinstance(error, ProviderError):
+            return
+        info = ErrorInfo.from_error(error)
+        await self._emit_event(
+            "llm.failed",
+            iteration,
+            {
+                "error_info": info.to_dict(),
+                "timeout_reason": info.timeout_reason,
+                "duration_ms": duration_ms,
+            },
+        )
 
     async def on_tool_completed(
         self,
@@ -477,6 +513,11 @@ class PersistenceRecorder(BaseRecorder):
                 "target": target,
                 "success": tool_result.success,
                 "duration_ms": tool_result.duration_ms,
+                **{
+                    k: tool_result.meta[k]
+                    for k in ("code", "zombie_threads")
+                    if k in tool_result.meta
+                },
                 **tool_call_parse_meta(tool_call),
                 **({"image_count": len(images)} if images else {}),
             },

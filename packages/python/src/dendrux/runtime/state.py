@@ -549,6 +549,8 @@ class StateStore(Protocol):
         expected_current_status: str | None = None,
         pii_mapping: dict[str, str] | None = None,
         claim_epoch: int | None = None,
+        error_info: dict[str, Any] | None = None,
+        failure_reason: str | None = None,
     ) -> bool: ...
 
     async def finalize_run_if_status_in(
@@ -1386,6 +1388,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         expected_current_status: str | None = None,
         pii_mapping: dict[str, str] | None = None,
         claim_epoch: int | None = None,
+        error_info: dict[str, Any] | None = None,
+        failure_reason: str | None = None,
     ) -> bool:
         """Finalize a run. Returns True if the update was applied.
 
@@ -1419,6 +1423,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 if pii_mapping is not None:
                     values["pii_mapping"] = pii_mapping
 
+                if failure_reason is not None:
+                    values["failure_reason"] = failure_reason
                 # Clear pause_data on finalize (D1: execution state cleaned up)
                 values["pause_data"] = None
                 # Clear cooperative cancel flag — terminal state is final;
@@ -1439,6 +1445,17 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 if claim_epoch is not None:
                     stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
                 result = await session.execute(stmt)
+                if result.rowcount and error_info is not None:
+                    from sqlalchemy import select
+
+                    old_meta = (
+                        await session.execute(select(AgentRun.meta).where(AgentRun.id == run_id))
+                    ).scalar_one_or_none()
+                    await session.execute(
+                        update(AgentRun)
+                        .where(AgentRun.id == run_id)
+                        .values(meta={**(old_meta or {}), "dendrux.error_info": error_info})
+                    )
                 await session.commit()
                 return (
                     bool(result.rowcount and result.rowcount > 0)
@@ -2283,6 +2300,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
                     .values(
                         status="running",
+                        last_progress_at=_dt.datetime.now(_dt.UTC),
                         pause_requested=False,
                         claim_epoch=AgentRun.claim_epoch + 1,
                     )
@@ -2366,6 +2384,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
                     .values(
                         status="running",
+                        last_progress_at=_dt.datetime.now(_dt.UTC),
                         pause_requested=False,
                         claim_epoch=AgentRun.claim_epoch + 1,
                     )
@@ -2660,192 +2679,133 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     async def sweep_stale_runs(
         self,
         older_than: timedelta,
+        *,
+        batch_size: int = 100,
+        max_runs: int = 1000,
     ) -> list[SweptRun]:
-        """Find RUNNING rows older than threshold and mark them ERROR.
-
-        Detection uses last_progress_at (or created_at if last_progress_at
-        is NULL — run never got far enough to record progress).
-
-        A stale row whose cancellation was already requested is finalized
-        CANCELLED instead (never ERROR): the request is honored, the
-        ``failure_reason`` still records the stale classification, and the
-        event is ``run.cancelled`` with ``reason="cancel_requested"``.
-
-        Classification is best-effort: absence of a run.started event
-        does NOT strictly prove 'never started' because that event is
-        emitted through a helper that swallows failures. Useful heuristic
-        for operator triage, not authoritative.
-        """
-        import datetime as _dt
-
-        from sqlalchemy import case, func, select, update
-
-        from dendrux.db.models import AgentRun, RunEvent
-
-        now = _dt.datetime.now(_dt.UTC)
-        cutoff = now - older_than
-        swept: list[SweptRun] = []
-
-        async with self._session_factory() as session:
-            # Find stale RUNNING rows
-            stmt = select(AgentRun).where(
-                AgentRun.status == "running",
-                # Stale if last_progress_at < cutoff, or if NULL then fall
-                # back to created_at < cutoff
-                func.coalesce(AgentRun.last_progress_at, AgentRun.created_at) < cutoff,
-            )
-            result = await session.execute(stmt)
-            stale_rows = result.scalars().all()
-
-            if not stale_rows:
-                return []
-
-            # Collect run IDs for batch event lookup
-            stale_ids = [r.id for r in stale_rows]
-
-            # Check which runs have a run.started event (for classification)
-            started_stmt = select(RunEvent.agent_run_id).where(
-                RunEvent.agent_run_id.in_(stale_ids),
-                RunEvent.event_type == "run.started",
-            )
-            started_result = await session.execute(started_stmt)
-            started_run_ids = {row[0] for row in started_result.all()}
-
-            # Process each stale run
-            for row in stale_rows:
-                classification = "stale_running" if row.id in started_run_ids else "never_started"
-                flagged = AgentRun.cancel_requested.is_(True)
-
-                # One CAS: a pending cancel finalizes CANCELLED, else ERROR.
-                # updated_at is filled by the model's onupdate hook.
-                update_stmt = (
-                    update(AgentRun)
-                    .where(AgentRun.id == row.id, AgentRun.status == "running")
-                    .values(
-                        status=case((flagged, "cancelled"), else_="error"),
-                        claim_epoch=AgentRun.claim_epoch + 1,
-                        failure_reason=classification,
-                        error=case((flagged, None), else_=f"Run swept as {classification}"),
-                        cancel_requested=False,
-                        pause_requested=False,
-                    )
-                )
-                update_result = await session.execute(update_stmt)
-
-                # CAS guard: skip if status already changed (race)
-                if not (update_result.rowcount and update_result.rowcount > 0):
-                    continue
-
-                new_status = (
-                    await session.execute(select(AgentRun.status).where(AgentRun.id == row.id))
-                ).scalar_one()
-                if new_status == "cancelled":
-                    event_type = "run.cancelled"
-                    data = {"reason": "cancel_requested", "failure_reason": classification}
-                else:
-                    event_type = "run.interrupted"
-                    data = {"failure_reason": classification}
-                await _insert_event_locked(
-                    session, row.id, event_type, data, iteration_index=row.iteration_count or 0
-                )
-
-                # Commit per-run so partial progress is durable.
-                # If run N+1 fails, runs 0..N are already committed.
-                await session.commit()
-
-                swept.append(
-                    SweptRun(
-                        run_id=row.id,
-                        agent_name=row.agent_name,
-                        previous_status="running",
-                        failure_reason=classification,
-                        last_progress_at=_to_aware_utc(row.last_progress_at),
-                        swept_at=_to_aware_utc(now),
-                        status=new_status,
-                    )
-                )
-
-        return swept
+        """Sweep at most max_runs stale candidates, with bounded projected pages."""
+        return await self._sweep_runs(
+            older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
+        )
 
     async def sweep_abandoned_runs(
         self,
         older_than: timedelta,
+        *,
+        batch_size: int = 100,
+        max_runs: int = 1000,
     ) -> list[SweptRun]:
-        """Find WAITING_* and PAUSED rows older than threshold and mark them
-        ERROR with failure_reason=abandoned_waiting.
-        """
-        import datetime as _dt
+        """Sweep at most max_runs abandoned candidates; call again to drain more."""
+        return await self._sweep_runs(
+            older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
+        )
 
-        from sqlalchemy import select, update
+    async def _sweep_runs(
+        self,
+        older_than: timedelta,
+        *,
+        waiting: bool,
+        batch_size: int,
+        max_runs: int,
+    ) -> list[SweptRun]:
+        from sqlalchemy import case, exists, func, select, update
 
-        from dendrux.db.enums import AgentRunStatus
-        from dendrux.db.models import AgentRun
+        from dendrux.db.models import AgentRun, RunEvent
 
+        for name, value, ceiling in (
+            ("batch_size", batch_size, 1000),
+            ("max_runs", max_runs, 10000),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
+                raise ValueError(f"{name} must be between 1 and {ceiling}")
         now = _dt.datetime.now(_dt.UTC)
         cutoff = now - older_than
-
-        waiting_statuses = [
-            AgentRunStatus.WAITING_CLIENT_TOOL,
-            AgentRunStatus.WAITING_HUMAN_INPUT,
-            AgentRunStatus.WAITING_APPROVAL,
-            AgentRunStatus.PAUSED,
-        ]
-
+        age = (
+            AgentRun.updated_at
+            if waiting
+            else func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
+        )
+        statuses = (
+            ["waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"]
+            if waiting
+            else ["running"]
+        )
+        started = exists().where(
+            RunEvent.agent_run_id == AgentRun.id, RunEvent.event_type == "run.started"
+        )
         swept: list[SweptRun] = []
-
-        async with self._session_factory() as session:
-            # Find abandoned waiting rows
-            stmt = select(AgentRun).where(
-                AgentRun.status.in_(waiting_statuses),
-                AgentRun.updated_at < cutoff,
-            )
-            result = await session.execute(stmt)
-            abandoned_rows = result.scalars().all()
-
-            if not abandoned_rows:
-                return swept
-
-            # Process each abandoned run
-            for row in abandoned_rows:
-                previous_status = row.status
-
-                # CAS-guarded update: only if still in the expected waiting status.
-                # updated_at is filled by the model's onupdate hook (Python aware-UTC).
-                update_stmt = (
-                    update(AgentRun)
-                    .where(AgentRun.id == row.id, AgentRun.status == previous_status)
-                    .values(
-                        status=AgentRunStatus.ERROR,
-                        claim_epoch=AgentRun.claim_epoch + 1,
-                        failure_reason="abandoned_waiting",
-                        cancel_requested=False,
-                        pause_requested=False,
+        after = ""
+        visited = 0
+        while visited < max_runs:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            AgentRun.id,
+                            AgentRun.agent_name,
+                            AgentRun.status,
+                            AgentRun.last_progress_at,
+                            AgentRun.iteration_count,
+                            started.label("started"),
+                        )
+                        .where(AgentRun.status.in_(statuses), age < cutoff, AgentRun.id > after)
+                        .order_by(AgentRun.id)
+                        .limit(min(batch_size, max_runs - visited))
                     )
+                ).all()
+            if not rows:
+                break
+            visited += len(rows)
+            after = rows[-1].id
+            for row in rows:
+                reason = (
+                    "abandoned_waiting"
+                    if waiting
+                    else "stale_running"
+                    if row.started
+                    else "never_started"
                 )
-                update_result = await session.execute(update_stmt)
-
-                if update_result.rowcount == 0:
-                    continue  # Status changed between SELECT and UPDATE
-
-                # Emit run.abandoned with a sequence allocated under the row lock.
-                await _insert_event_locked(
-                    session, row.id, "run.abandoned", {"failure_reason": "abandoned_waiting"}
-                )
-
-                # Per-run commit for isolation
-                await session.commit()
-
+                flagged = AgentRun.cancel_requested.is_(True)
+                new_status = "error" if waiting else case((flagged, "cancelled"), else_="error")
+                async with self._session_factory() as session:
+                    result = await session.execute(
+                        update(AgentRun)
+                        .where(AgentRun.id == row.id, AgentRun.status == row.status, age < cutoff)
+                        .values(
+                            status=new_status,
+                            claim_epoch=AgentRun.claim_epoch + 1,
+                            failure_reason=reason,
+                            error=f"Run swept as {reason}"
+                            if waiting
+                            else case((flagged, None), else_=f"Run swept as {reason}"),
+                            cancel_requested=False,
+                            pause_requested=False,
+                        )
+                        .returning(AgentRun.status)
+                    )
+                    status = result.scalar_one_or_none()
+                    if status is None:
+                        continue
+                    event_type = "run.abandoned" if waiting else "run.interrupted"
+                    data = {"failure_reason": reason}
+                    if status == "cancelled":
+                        event_type = "run.cancelled"
+                        data["reason"] = "cancel_requested"
+                    await _insert_event_locked(
+                        session, row.id, event_type, data, iteration_index=row.iteration_count or 0
+                    )
+                    await session.commit()
                 swept.append(
                     SweptRun(
                         run_id=row.id,
                         agent_name=row.agent_name,
-                        previous_status=previous_status,
-                        failure_reason="abandoned_waiting",
+                        previous_status=row.status,
+                        failure_reason=reason,
                         last_progress_at=_to_aware_utc(row.last_progress_at),
                         swept_at=_to_aware_utc(now),
+                        status=status,
                     )
                 )
-
         return swept
 
     # ------------------------------------------------------------------

@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
-from dendrux.llm._retry_telemetry import telemetry_context
+from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
     StreamInterruptedError,
@@ -152,6 +152,43 @@ _notify_tool_started = notify_tool_started
 _notify_governance = notify_governance
 
 
+def _blocked_data(direction: str, error: str, findings: list[Any], location: str) -> dict[str, Any]:
+    from collections import Counter
+
+    counts = dict(Counter(f.entity_type for f in findings))
+    return {
+        "direction": direction,
+        "error": error,
+        "code": "guardrail_blocked",
+        "kinds": sorted(counts),
+        "counts": counts,
+        "location": location,
+    }
+
+
+def _image_block_data(error: str, state: ImageViewState) -> dict[str, Any]:
+    from collections import Counter
+
+    counts = dict(
+        Counter(
+            kind
+            for verdict in state.guardrail_verdicts.values()
+            if verdict.action == "block"
+            for kind in verdict.entities
+        )
+    )
+    return {
+        **_blocked_data("incoming_image", error, [], "incoming_image"),
+        "kinds": sorted(counts),
+        "counts": counts,
+    }
+
+
+def _incoming_location(msg: Message, index: int) -> str:
+    call = f", tool_call_id={msg.call_id}" if msg.call_id else ""
+    return f"message {index} (role={msg.role.value}{call})"
+
+
 class _ToolCallOutcome(NamedTuple):
     """Result of processing tool calls in a single iteration."""
 
@@ -194,8 +231,8 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
     total.output_tokens += step_usage.output_tokens
     total.total_tokens += step_usage.total_tokens
     total.usage_reported = total.usage_reported and step_usage.usage_reported
-    total.cost_unknown = cost_unknown or step_usage.cost_usd is None
-    if cost_unknown or step_usage.cost_usd is None:
+    total.cost_unknown = cost_unknown or step_usage.cost_unknown or step_usage.cost_usd is None
+    if total.cost_unknown:
         total.cost_usd = None
         total.cost_source = None
     else:
@@ -204,6 +241,7 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
             total.cost_source = step_usage.cost_source
         elif total.cost_source != step_usage.cost_source:
             total.cost_source = "mixed"
+        assert step_usage.cost_usd is not None
         total.cost_usd += step_usage.cost_usd
     if step_usage.cache_read_input_tokens is not None:
         total.cache_read_input_tokens = (
@@ -1372,7 +1410,9 @@ class ReActLoop(Loop):
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
         g_engine = (
-            GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
+            GuardrailEngine(
+                agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
+            )
             if agent.guardrails
             else None
         )
@@ -1451,7 +1491,9 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
-                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg)
+                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
+                        msg, index=msg_idx
+                    )
                     if findings:
                         all_in_findings.extend(findings)
                     if block_err is not None:
@@ -1460,14 +1502,18 @@ class ReActLoop(Loop):
                             resolved_run_id,
                             "guardrail.blocked",
                             iteration,
-                            {"direction": "incoming", "error": block_err},
+                            _blocked_data(
+                                "incoming", block_err, findings, _incoming_location(msg, msg_idx)
+                            ),
                         )
                         await _notify_governance(
                             notifier,
                             resolved_run_id,
                             "guardrail.blocked",
                             iteration,
-                            {"direction": "incoming", "error": block_err},
+                            _blocked_data(
+                                "incoming", block_err, findings, _incoming_location(msg, msg_idx)
+                            ),
                             warnings=notifier_warnings,
                         )
                         return RunResult(
@@ -1478,7 +1524,10 @@ class ReActLoop(Loop):
                             commentary=_commentary(steps),
                             iteration_count=iteration,
                             usage=total_usage,
-                            meta=guardrail_meta(g_engine, notifier_warnings),
+                            meta={
+                                **guardrail_meta(g_engine, notifier_warnings),
+                                "failure_reason": "guardrail_blocked",
+                            },
                         )
                     if cleaned_msg is not msg:
                         _in_was_redacted = True
@@ -1740,14 +1789,14 @@ class ReActLoop(Loop):
                         resolved_run_id,
                         "guardrail.blocked",
                         iteration,
-                        {"direction": "outgoing", "error": out_block},
+                        _blocked_data("outgoing", out_block, out_findings, "output"),
                     )
                     await _notify_governance(
                         notifier,
                         resolved_run_id,
                         "guardrail.blocked",
                         iteration,
-                        {"direction": "outgoing", "error": out_block},
+                        _blocked_data("outgoing", out_block, out_findings, "output"),
                         warnings=notifier_warnings,
                     )
                     return RunResult(
@@ -1758,7 +1807,10 @@ class ReActLoop(Loop):
                         commentary=_commentary(steps),
                         iteration_count=iteration,
                         usage=total_usage,
-                        meta=guardrail_meta(g_engine, notifier_warnings),
+                        meta={
+                            **guardrail_meta(g_engine, notifier_warnings),
+                            "failure_reason": "guardrail_blocked",
+                        },
                     )
 
             # Record the LLM response (raw — DB is ground truth)
@@ -1941,9 +1993,7 @@ class ReActLoop(Loop):
         meta: dict[str, Any],
     ) -> RunResult:
         """ERROR result for an image guardrail ``block`` (commit step 4)."""
-        await images.emit(
-            "guardrail.blocked", {"direction": "incoming_image", "error": error}, iteration
-        )
+        await images.emit("guardrail.blocked", _image_block_data(error, images.state), iteration)
         return RunResult(
             run_id=run_id,
             status=RunStatus.ERROR,
@@ -1952,7 +2002,7 @@ class ReActLoop(Loop):
             commentary=_commentary(steps),
             iteration_count=iteration,
             usage=usage,
-            meta=meta,
+            meta={**meta, "failure_reason": "guardrail_blocked"},
         )
 
     async def run_stream(
@@ -2144,19 +2194,18 @@ class ReActLoop(Loop):
             )
             t0 = time.monotonic()
             llm_response: LLMResponse | None = None
-            _stream_telemetry = telemetry_context(
+            provider_stream = telemetry_stream(
+                provider.complete_stream(
+                    prepared.wire,
+                    tools=tools,
+                    run_id=resolved_run_id,
+                    cache_key_prefix=cache_key_prefix,
+                    **_pkw,
+                ),
                 run_id=resolved_run_id,
                 iteration=iteration,
                 recorder=recorder,
                 notifier=notifier,
-            )
-            _stream_telemetry.__enter__()
-            provider_stream = provider.complete_stream(
-                prepared.wire,
-                tools=tools,
-                run_id=resolved_run_id,
-                cache_key_prefix=cache_key_prefix,
-                **_pkw,
             )
             partial_text: list[str] = []
             # Text after a tool block in the same call is known commentary.
@@ -2286,16 +2335,21 @@ class ReActLoop(Loop):
                         semantic_tools=tools,
                     )
                     t0 = time.monotonic()
-                    provider_stream = provider.complete_stream(
-                        prepared.wire,
-                        tools=tools,
+                    provider_stream = telemetry_stream(
+                        provider.complete_stream(
+                            prepared.wire,
+                            tools=tools,
+                            run_id=resolved_run_id,
+                            cache_key_prefix=cache_key_prefix,
+                            **_pkw,
+                        ),
                         run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
+                        iteration=iteration,
+                        recorder=recorder,
+                        notifier=notifier,
                     )
             finally:
                 await provider_stream.aclose()
-                _stream_telemetry.__exit__(None, None, None)
 
             if stop_control is not None:
                 stop_result = _control_stop_result(

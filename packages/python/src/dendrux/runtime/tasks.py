@@ -64,6 +64,7 @@ class RunTaskManager:
         task: asyncio.Task[T] = asyncio.create_task(
             self._run_wrapper(run_id, coro), name=f"run:{run_id}"
         )
+        task.add_done_callback(_retrieve_exception)
         self._tasks[run_id] = task
         return task
 
@@ -72,8 +73,13 @@ class RunTaskManager:
             return await coro
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Run %s failed with exception", run_id)
+        except Exception as exc:
+            logger.error(
+                "Run %s failed: code=run_failed error_type=%s",
+                run_id,
+                type(exc).__name__,
+                extra={"run_id": run_id, "code": "run_failed"},
+            )
             raise
         finally:
             self._tasks.pop(run_id, None)
@@ -87,7 +93,7 @@ class RunTaskManager:
         """
         delivered = False
         task = self._tasks.get(run_id)
-        if task is not None:
+        if task is not None and self._owned.get(run_id) is not task:
             task.cancel()
             delivered = True
         signal = self._interrupts.get(run_id)
@@ -174,3 +180,9 @@ class RunTaskManager:
 
     def __len__(self) -> int:
         return len(self._tasks)
+
+
+def _retrieve_exception(task: asyncio.Task[Any]) -> None:
+    """Consume failures without changing what a later awaiter receives."""
+    if not task.cancelled():
+        task.exception()

@@ -38,6 +38,8 @@ async def sweep(
     state_store: StateStore | None = None,
     stale_running: timedelta | None = None,
     abandoned_waiting: timedelta | None = None,
+    batch_size: int = 100,
+    max_runs: int = 1000,
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
 
@@ -61,6 +63,10 @@ async def sweep(
             PAUSED runs with no state change beyond this duration are
             swept. If None, no abandoned-waiting sweep is performed.
 
+        batch_size: Candidate rows per projected page (default 100, maximum 1000).
+        max_runs: Candidates inspected per category (default 1000, maximum 10000).
+            Repeat sweep to drain more work; returned lists never exceed this cap.
+
     Returns:
         SweepResult with lists of swept runs by category.
 
@@ -76,6 +82,9 @@ async def sweep(
     if stale_running is None and abandoned_waiting is None:
         return SweepResult(stale_running=[])
 
+    for name, value, ceiling in (("batch_size", batch_size, 1000), ("max_runs", max_runs, 10000)):
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
+            raise ValueError(f"{name} must be between 1 and {ceiling}")
     store: StateStore
     engine = None
 
@@ -86,10 +95,20 @@ async def sweep(
         store = state_store
 
     try:
-        stale = await store.sweep_stale_runs(older_than=stale_running) if stale_running else []
+        # Preserve legacy custom-store signatures at the default settings.
+        limits = (
+            {}
+            if (batch_size, max_runs) == (100, 1000)
+            else {"batch_size": batch_size, "max_runs": max_runs}
+        )
+        stale = (
+            await store.sweep_stale_runs(older_than=stale_running, **limits)
+            if stale_running is not None
+            else []
+        )
         abandoned = (
-            await store.sweep_abandoned_runs(older_than=abandoned_waiting)
-            if abandoned_waiting
+            await store.sweep_abandoned_runs(older_than=abandoned_waiting, **limits)
+            if abandoned_waiting is not None
             else []
         )
         return SweepResult(stale_running=stale, abandoned_waiting=abandoned)

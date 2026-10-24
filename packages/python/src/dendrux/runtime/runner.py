@@ -70,6 +70,7 @@ from dendrux.runtime.replay import (
     ReplayLast,
     ReplayPlan,
     ReplayRequest,
+    _pair_tool_calls,
     build_seed,
     current_prefix,
     expand_replay,
@@ -100,6 +101,7 @@ from dendrux.skills._session import current as current_skill_session
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     ApprovalDecision,
+    ErrorInfo,
     GovernanceEventType,
     IdempotencyConflictError,
     ImagePart,
@@ -493,12 +495,56 @@ def _partial_answer(shared: dict[str, Any]) -> str | None:
     return "".join(parts) if parts else None
 
 
-def _ensure_pause_generation(result: RunResult) -> None:
+def _provider_error_info(exc: Exception) -> ErrorInfo | None:
+    from dendrux.errors import ProviderError
+
+    return ErrorInfo.from_error(exc) if isinstance(exc, ProviderError) else None
+
+
+def _safe_error(exc: Exception) -> str:
+    info = _provider_error_info(exc)
+    return info.safe_message if info else str(exc)
+
+
+def _error_payload(exc: Exception) -> dict[str, Any]:
+    info = _provider_error_info(exc)
+    return {"error": _safe_error(exc)[:500], **({"error_info": info.to_dict()} if info else {})}
+
+
+def _error_store_kwargs(store: StateStore, exc: Exception) -> dict[str, Any]:
+    info = _provider_error_info(exc)
+    base = unclaimed_store(store)
+    if info and base is not None and _accepts_kwarg(base.finalize_run, "error_info"):
+        return {"error_info": info.to_dict()}
+    return {}
+
+
+def _error_info_from_meta(meta: dict[str, Any] | None) -> ErrorInfo | None:
+    data = (meta or {}).get("dendrux.error_info")
+    return ErrorInfo.from_dict(data) if isinstance(data, dict) else None
+
+
+def _public_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    result = dict(meta)
+    mapping = result.get("pii_mapping")
+    if isinstance(mapping, dict):
+        result["pii_mapping"] = {k: v for k, v in mapping.items() if k != "__dendrux_origins__"}
+    return result
+
+
+def _ensure_pause_generation(
+    result: RunResult, provider_kwargs: dict[str, Any] | None = None
+) -> None:
     if result.status in _PAUSE_STATUSES:
         pause = result.meta.get("pause_state")
         if pause is not None:
             if pause.pause_id is None:
                 pause.pause_id = generate_ulid()
+            pause.provider_kwargs = {
+                k: v
+                for k, v in (provider_kwargs or pause.provider_kwargs).items()
+                if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+            }
             result.pause_id = pause.pause_id
 
 
@@ -507,6 +553,7 @@ async def _persist_loop_outcome(
     state_store: StateStore,
     run_id: str,
     result: RunResult,
+    provider_kwargs: dict[str, Any] | None = None,
 ) -> RunResult:
     """Persist a loop's terminal/pause result and emit the lifecycle event.
 
@@ -538,11 +585,13 @@ async def _persist_loop_outcome(
             run_id=run_id,
             status=status,
             answer=user_answer,
+            output=result.output,
+            error_info=result.error_info,
             error=result.error,
             steps=result.steps,
             iteration_count=result.iteration_count,
             usage=result.usage,
-            meta={**result.meta, "_finalize_won": won},
+            meta={**_public_meta(result.meta), "_finalize_won": won},
             commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
             replay=result.replay,
             stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
@@ -556,6 +605,9 @@ async def _persist_loop_outcome(
         persisted = _wrap(status=status, won=False)
         if record is not None:
             persisted.answer = record.answer
+            persisted.output = None
+            persisted.error = record.error
+            persisted.error_info = _error_info_from_meta(record.meta)
         if status not in _PAUSE_STATUSES:
             persisted.meta.pop("pause_state", None)
             await _attach_undelivered_notes(state_store, run_id, persisted)
@@ -609,6 +661,7 @@ async def _persist_loop_outcome(
         # pause and its run.paused event commit together, so a finalizer of
         # paused runs (cancel_run, sweep) always acts after the event.
         await _check_claim(state_store, run_id)
+        _ensure_pause_generation(result, provider_kwargs)
         pause_state: PauseState = result.meta["pause_state"]
         # A pause generation belongs to this transition, never to the prior
         # pause from which this execution was resumed.
@@ -673,6 +726,15 @@ async def _persist_loop_outcome(
     # a cancel requested after the last checkpoint does not override a run
     # that finished — its work and side effects happened.
     _run_pii = result.meta.get("pii_mapping")
+    failure_kwargs: dict[str, Any] = {}
+    base = unclaimed_store(state_store)
+    assert base is not None
+    if (
+        result.status == RunStatus.ERROR
+        and result.meta.get("failure_reason") == "guardrail_blocked"
+        and _accepts_kwarg(base.finalize_run, "failure_reason")
+    ):
+        failure_kwargs["failure_reason"] = "guardrail_blocked"
     finalize_won = await state_store.finalize_run(
         run_id,
         status=result.status.value,
@@ -681,6 +743,8 @@ async def _persist_loop_outcome(
         total_usage=result.usage,
         expected_current_status="running",
         pii_mapping=_run_pii,
+        error=result.error,
+        **failure_kwargs,
     )
     if not finalize_won:
         return await _persisted(result.status)
@@ -697,8 +761,9 @@ async def _persist_loop_outcome(
     await _emit_event(
         state_store,
         run_id,
-        "run.completed",
+        "run.error" if result.status == RunStatus.ERROR else "run.completed",
         {
+            **({"error": result.error} if result.status == RunStatus.ERROR else {}),
             "status": result.status.value,
             "stop_reason": stop_reason,
             "truncated": stop_reason == "max_tokens",
@@ -1637,9 +1702,10 @@ async def run(
                 if replay_plan is not None:
                     result.replay = replay_plan.summary
                 _attach_mcp_meta(result, mcp_meta)
-                _ensure_pause_generation(result)
+                _ensure_pause_generation(result, provider_kwargs)
                 if state_store is not None:
                     result = await _persist_loop_outcome(
+                        provider_kwargs=provider_kwargs,
                         state_store=state_store,
                         run_id=run_id,
                         result=result,
@@ -1650,6 +1716,7 @@ async def run(
                 notifier_closed = True
                 await notify_run_finished(extra_notifier, run_id, result)
 
+                result.meta = _public_meta(result.meta)
                 return result
 
             except RunFencedError:
@@ -1678,7 +1745,8 @@ async def run(
                         error_won = await state_store.finalize_run(
                             run_id,
                             status=RunStatus.ERROR.value,
-                            error=str(exc),
+                            error=_safe_error(exc),
+                            **_error_store_kwargs(state_store, exc),
                             total_usage=None,
                             expected_current_status="running",
                         )
@@ -1688,9 +1756,7 @@ async def run(
                         )
                     # Only the CAS winner emits the error event
                     if error_won:
-                        await _emit_event(
-                            state_store, run_id, "run.error", {"error": str(exc)[:500]}
-                        )
+                        await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
                 if lifecycle_started:
                     if not recorder_closed:
                         recorder_closed = True
@@ -2077,6 +2143,7 @@ async def _build_cached_result(
             )
         ),
         error=run.error,
+        error_info=_error_info_from_meta(run.meta),
         replay=_replay_from_meta(run.meta),
         stop_reason=(
             _stop_reason_from_meta(run.meta) if run.status == RunStatus.SUCCESS.value else None
@@ -2183,7 +2250,7 @@ async def retry(
         #    blocks only seed a retry on the model that made them.
         traces = await state_store.get_traces(original_run_id)
         retry_model = (kwargs or {}).get("model") or provider.model
-        initial_history = rebuild_messages(traces, reasoning_for=retry_model)
+        initial_history = _pair_tool_calls(rebuild_messages(traces, reasoning_for=retry_model))
 
         if not initial_history:
             raise ValueError(
@@ -2418,6 +2485,7 @@ async def retry(
                 result.replay = replay_plan.summary
             _attach_mcp_meta(result, mcp_meta)
             result = await _persist_loop_outcome(
+                provider_kwargs=provider_kwargs,
                 state_store=state_store,
                 run_id=run_id,
                 result=result,
@@ -2440,7 +2508,8 @@ async def retry(
                 error_won = await state_store.finalize_run(
                     run_id,
                     status=RunStatus.ERROR.value,
-                    error=str(exc),
+                    error=_safe_error(exc),
+                    **_error_store_kwargs(state_store, exc),
                     total_usage=None,
                     expected_current_status="running",
                 )
@@ -2449,7 +2518,7 @@ async def retry(
                     "Failed to persist ERROR status for retry run %s", run_id, exc_info=True
                 )
             if error_won:
-                await _emit_event(state_store, run_id, "run.error", {"error": str(exc)[:500]})
+                await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
             await record_run_failed(recorder, run_id, exc)
             await notify_run_failed(extra_notifier, run_id, exc)
             raise
@@ -2966,12 +3035,13 @@ def run_stream(
                     )
                     terminal_result = event.run_result if event.type in _terminal_types else None
                     if terminal_result is not None:
-                        _ensure_pause_generation(terminal_result)
+                        _ensure_pause_generation(terminal_result, provider_kwargs)
                         if replay_plan is not None:
                             terminal_result.replay = replay_plan.summary
                         _attach_mcp_meta(terminal_result, mcp_meta)
                         if store is not None:
                             persisted = await _persist_loop_outcome(
+                                provider_kwargs=provider_kwargs,
                                 state_store=store,
                                 run_id=run_id,
                                 result=terminal_result,
@@ -2995,6 +3065,8 @@ def run_stream(
                             # (OTel root span) don't leak.
                             await record_run_finished(recorder, run_id, terminal_result)
                             await notify_run_finished(extra_notifier, run_id, terminal_result)
+                        if event.run_result is not None:
+                            event.run_result.meta = _public_meta(event.run_result.meta)
                         yield event
                     else:
                         # TEXT_DELTA, TOOL_USE_START, TOOL_USE_END, TOOL_RESULT — pass through
@@ -3010,14 +3082,15 @@ def run_stream(
                     error_won = await store.finalize_run(
                         run_id,
                         status=RunStatus.ERROR.value,
-                        error=str(exc),
+                        error=_safe_error(exc),
+                        **_error_store_kwargs(store, exc),
                         total_usage=None,
                         expected_current_status="running",
                     )
                 except Exception:
                     logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
                 if error_won:
-                    await _emit_event_safe(store, run_id, "run.error", {"error": str(exc)[:500]})
+                    await _emit_event_safe(store, run_id, "run.error", _error_payload(exc))
             if not _shared.get("existing_run"):
                 try:
                     await record_run_failed(recorder, run_id, exc)
@@ -3034,11 +3107,12 @@ def run_stream(
                 run_result=RunResult(
                     run_id=run_id,
                     status=RunStatus.ERROR,
-                    error=str(exc),
+                    error=_safe_error(exc),
+                    error_info=_provider_error_info(exc),
                     meta=_stream_error_meta(mcp_meta, exc),
                 ),
                 run_id=run_id,
-                error=str(exc),
+                error=_safe_error(exc),
             )
 
         finally:
@@ -4210,13 +4284,12 @@ async def _resume_core(
                     won = await state_store.finalize_run(
                         run_id,
                         status=RunStatus.ERROR.value,
-                        error=str(exc),
+                        error=_safe_error(exc),
+                        **_error_store_kwargs(state_store, exc),
                         expected_current_status="running",
                     )
                     if won:
-                        await _emit_event(
-                            state_store, run_id, "run.error", {"error": str(exc)[:500]}
-                        )
+                        await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
                 except Exception:
                     logger.error(
                         "Failed to persist claimed resume error for run %s", run_id, exc_info=True
@@ -4279,6 +4352,7 @@ async def _resume_core(
         ctx: _ResumeContext | None = None
         ctx_token = None
         mcp_meta: dict[str, Any] = {}
+        agent._task_manager.register_current(run_id)
 
         try:
             run_record = await state_store.get_run(run_id)
@@ -4400,6 +4474,7 @@ async def _resume_core(
                 if stop is not None:
                     _attach_mcp_meta(stop, mcp_meta)
                     stopped = await _persist_loop_outcome(
+                        provider_kwargs=ctx.pause_state.provider_kwargs,
                         state_store=state_store,
                         run_id=run_id,
                         result=stop,
@@ -4446,6 +4521,7 @@ async def _resume_core(
                 initial_steps=ctx.pause_state.steps,
                 iteration_offset=ctx.pause_state.iteration,
                 initial_usage=ctx.pause_state.usage,
+                provider_kwargs=ctx.pause_state.provider_kwargs or None,
                 initial_pii_mapping=_saved_pii_mapping,
                 state_store=state_store,
                 **_budget_carry_kwargs(ctx.resolved_loop.run, ctx.pause_state),
@@ -4458,6 +4534,7 @@ async def _resume_core(
 
             _attach_mcp_meta(result, mcp_meta)
             result = await _persist_loop_outcome(
+                provider_kwargs=ctx.pause_state.provider_kwargs,
                 state_store=state_store,
                 run_id=run_id,
                 result=result,
@@ -4469,9 +4546,19 @@ async def _resume_core(
             return result
 
         except asyncio.CancelledError:
+            interrupted, others_pending = agent._task_manager.take_interrupt(run_id)
+            current_task = asyncio.current_task()
+            swallow = (
+                interrupted
+                and not others_pending
+                and current_task is not None
+                and current_task.uncancel() == 0
+            )
 
             async def persist_cancellation() -> RunResult:
-                return await _persist_task_cancellation(state_store, run_id)
+                return await _persist_task_cancellation(
+                    state_store, run_id, interrupted=interrupted
+                )
 
             cleanup = asyncio.create_task(persist_cancellation(), name=f"cancel-resume:{run_id}")
             while not cleanup.done():
@@ -4486,6 +4573,8 @@ async def _resume_core(
                 except Exception:
                     logger.warning("Recorder finish failed for run %s", run_id, exc_info=True)
                 await notify_run_finished(ctx.notifier, run_id, cancelled_result)
+            if swallow and (current_task is None or current_task.cancelling() == 0):
+                return cancelled_result
             raise
 
         except RunFencedError:
@@ -4501,14 +4590,15 @@ async def _resume_core(
                 error_won = await state_store.finalize_run(
                     run_id,
                     status=RunStatus.ERROR.value,
-                    error=str(exc),
+                    error=_safe_error(exc),
+                    **_error_store_kwargs(state_store, exc),
                     total_usage=None,
                     expected_current_status="running",
                 )
             except Exception:
                 logger.error("Failed to persist ERROR status for run %s", run_id, exc_info=True)
             if error_won:
-                await _emit_event(state_store, run_id, "run.error", {"error": str(exc)[:500]})
+                await _emit_event(state_store, run_id, "run.error", _error_payload(exc))
             # Fire on_run_failed only if _prepare_resume returned (ctx exists).
             # If _prepare_resume itself raised, on_run_started never fired, so
             # the lifecycle pair is balanced (both unfired).
@@ -4525,6 +4615,7 @@ async def _resume_core(
             raise
 
         finally:
+            agent._task_manager.release_current(run_id)
             if ctx_token is not None:
                 reset_delegation_context(ctx_token)
 
@@ -4779,6 +4870,7 @@ def resume_stream(
                 if stop is not None:
                     _attach_mcp_meta(stop, mcp_meta)
                     stopped = await _persist_loop_outcome(
+                        provider_kwargs=ctx.pause_state.provider_kwargs,
                         state_store=store,
                         run_id=run_id,
                         result=stop,
@@ -4833,6 +4925,7 @@ def resume_stream(
                 initial_steps=ctx.pause_state.steps,
                 iteration_offset=ctx.pause_state.iteration,
                 initial_usage=ctx.pause_state.usage,
+                provider_kwargs=ctx.pause_state.provider_kwargs or None,
                 state_store=store,
                 interrupt=interrupt,
                 **_budget_carry_kwargs(ctx.resolved_loop.run_stream, ctx.pause_state),
@@ -4855,6 +4948,7 @@ def resume_stream(
                     ):
                         _attach_mcp_meta(event.run_result, mcp_meta)
                         persisted = await _persist_loop_outcome(
+                            provider_kwargs=ctx.pause_state.provider_kwargs,
                             state_store=store,
                             run_id=run_id,
                             result=event.run_result,
@@ -4881,7 +4975,8 @@ def resume_stream(
                     error_won = await store.finalize_run(
                         run_id,
                         status=RunStatus.ERROR.value,
-                        error=str(exc),
+                        error=_safe_error(exc),
+                        **_error_store_kwargs(store, exc),
                         total_usage=None,
                         expected_current_status="running",
                     )
@@ -4892,7 +4987,7 @@ def resume_stream(
                         store,
                         run_id,
                         "run.error",
-                        {"error": str(exc)[:500]},
+                        _error_payload(exc),
                     )
             try:
                 if err_ctx is not None:
@@ -4915,10 +5010,11 @@ def resume_stream(
                 run_result=RunResult(
                     run_id=run_id,
                     status=RunStatus.ERROR,
-                    error=str(exc),
+                    error=_safe_error(exc),
+                    error_info=_provider_error_info(exc),
                     meta=_stream_error_meta(mcp_meta, exc),
                 ),
-                error=str(exc),
+                error=_safe_error(exc),
             )
 
         finally:

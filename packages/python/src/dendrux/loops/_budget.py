@@ -8,9 +8,10 @@ tool call without results; the cost is an overshoot of at most one iteration.
 
 Usage source:
 
-- With a recording state store, usage is read live from ``llm_interactions``:
-  the root-inclusive subtree rollup when ``include_children`` is set, the
-  run's own rollup otherwise. Tokens are input + output, plus cache read and
+- In-memory own usage is an enforcement floor. With a recording state store,
+  persisted own usage fills gaps, and descendants are added from the
+  root-inclusive subtree rollup when ``include_children`` is set. Tokens are
+  input + output, plus cache read and
   cache write tokens when ``Budget(count_cache_tokens=True)``; the cost limit
   uses ``known_cost_usd`` (priced calls only).
 - Without one (or a store predating the rollup reads), usage is the loop's
@@ -168,6 +169,11 @@ class BudgetTracker:
             self._known_cost = 0.0
             self._unpriced = 1 if usage.cost_unknown or usage.total_tokens else 0
         self._store_reader = self._pick_reader(budget, state_store, recorder)
+        self._own_reader = (
+            getattr(state_store, "run_usage", None)
+            if budget is not None and budget.include_children
+            else None
+        )
 
     @property
     def action(self) -> str:
@@ -197,7 +203,7 @@ class BudgetTracker:
 
     def add_response(self, usage: UsageStats) -> None:
         """Account one LLM response in the in-memory spend."""
-        if usage.cost_usd is None:
+        if usage.cost_unknown or usage.cost_usd is None:
             self._unpriced += 1
         else:
             self._known_cost = round(self._known_cost + usage.cost_usd, _COST_DECIMALS)
@@ -225,44 +231,42 @@ class BudgetTracker:
             self._notifier, self._run_id, event_type, iteration, data, warnings=self._warnings
         )
 
+    def _tokens(self, usage: Any, *, rollup: bool = False) -> int:
+        tokens = usage.input_tokens + usage.output_tokens
+        if not rollup and not self._count_cache:
+            tokens = max(tokens, usage.total_tokens)
+        if self._count_cache:
+            tokens += (
+                usage.cache_read_tokens + usage.cache_write_tokens
+                if rollup
+                else (usage.cache_read_input_tokens or 0) + (usage.cache_creation_input_tokens or 0)
+            )
+        return int(tokens)
+
     async def _measure(self) -> _Usage:
+        # Persisted own usage is a lower bound, never a replacement for spend
+        # already observed in this execution. Descendants remain DB-coordinated.
+        local = _Usage(self._tokens(self._usage), self._known_cost, self._unpriced)
+        measured = local
         if self._store_reader is not None:
             try:
                 rollup = await self._store_reader(self._run_id)
+                own = await self._own_reader(self._run_id) if self._own_reader else rollup
+                measured = _Usage(
+                    tokens=max(local.tokens, self._tokens(own, rollup=True))
+                    + max(0, self._tokens(rollup, rollup=True) - self._tokens(own, rollup=True)),
+                    known_cost_usd=max(local.known_cost_usd, own.known_cost_usd)
+                    + max(0.0, rollup.known_cost_usd - own.known_cost_usd),
+                    unpriced_calls=max(local.unpriced_calls, own.unpriced_calls)
+                    + max(0, rollup.unpriced_calls - own.unpriced_calls),
+                )
             except Exception:
                 logger.warning(
                     "Live budget usage read failed for run %s; using in-memory usage",
                     self._run_id,
-                    exc_info=True,
                 )
-            else:
-                tokens = rollup.input_tokens + rollup.output_tokens
-                if self._count_cache:
-                    tokens += rollup.cache_read_tokens + rollup.cache_write_tokens
-                self._seen_unpriced = max(self._seen_unpriced, rollup.unpriced_calls)
-                return _Usage(
-                    tokens=tokens,
-                    known_cost_usd=rollup.known_cost_usd,
-                    unpriced_calls=rollup.unpriced_calls,
-                )
-        u = self._usage
-        if self._count_cache:
-            # Built from the components: ``total_tokens`` is supplied separately
-            # by providers and may be absent.
-            tokens = (
-                u.input_tokens
-                + u.output_tokens
-                + (u.cache_read_input_tokens or 0)
-                + (u.cache_creation_input_tokens or 0)
-            )
-        else:
-            tokens = u.total_tokens
-        self._seen_unpriced = max(self._seen_unpriced, self._unpriced)
-        return _Usage(
-            tokens=tokens,
-            known_cost_usd=self._known_cost,
-            unpriced_calls=self._unpriced,
-        )
+        self._seen_unpriced = max(self._seen_unpriced, measured.unpriced_calls)
+        return measured
 
     async def evaluate(self, iteration: int) -> list[BudgetBreach]:
         """Measure usage, emit newly crossed budget events, return reached limits."""

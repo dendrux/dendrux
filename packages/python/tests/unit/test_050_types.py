@@ -106,13 +106,13 @@ def _pause_state(**kwargs: object) -> PauseState:
 
 
 class TestPauseStateFields:
-    def test_defaults_are_none_and_not_serialized(self) -> None:
+    def test_defaults_serialize_current_schema_version(self) -> None:
         state = _pause_state()
         assert state.pause_id is None
-        assert state.schema_version is None
+        assert state.schema_version == 1
         d = state.to_dict()
         assert "pause_id" not in d
-        assert "schema_version" not in d
+        assert d["schema_version"] == 1
 
     def test_roundtrip_when_set(self) -> None:
         state = _pause_state(pause_id="01JPAUSE", schema_version=2)
@@ -124,10 +124,11 @@ class TestPauseStateFields:
 
     def test_reader_tolerates_missing_and_unknown_keys(self) -> None:
         d = _pause_state().to_dict()
+        d.pop("schema_version")
         d["written_by_a_newer_version"] = {"x": 1}
         back = PauseState.from_dict(d)
         assert back.pause_id is None
-        assert back.schema_version is None
+        assert back.schema_version == 1
 
 
 class TestBudgetCountCacheTokens:

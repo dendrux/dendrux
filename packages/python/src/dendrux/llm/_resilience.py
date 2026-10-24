@@ -46,7 +46,7 @@ from dendrux.errors import (
     ProviderUnavailableError,
 )
 from dendrux.llm._helpers import GatewayErrorKind, classify_gateway_error
-from dendrux.llm._retry_telemetry import _on_response as _telemetry_on_response
+from dendrux.llm._retry_telemetry import telemetry_event_hooks
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
@@ -216,7 +216,7 @@ def make_http_client(sdk: ModuleType, deadlines: Deadlines) -> httpx.AsyncClient
         follow_redirects=False,
         event_hooks={
             "request": [_on_request],
-            "response": [_on_response, _telemetry_on_response],
+            "response": [_on_response, *telemetry_event_hooks()["response"]],
         },
     )
     return client

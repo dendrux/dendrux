@@ -1027,6 +1027,12 @@ class RunOutcome:
     events: list[list[Any]] | None = None
 
 
+def _strip_pause_versioned_fields(pause: dict[str, Any]) -> None:
+    """These text-era scenarios pass no per-call provider options."""
+    assert pause.pop("schema_version", 1) == 1
+    assert pause.pop("provider_kwargs", {}) == {}
+
+
 def result_view(result: Any) -> dict[str, Any]:
     """Stable subset of RunResult (text-era fields) + pause JSON."""
     view: dict[str, Any] = {
@@ -1043,6 +1049,7 @@ def result_view(result: Any) -> dict[str, Any]:
     pause = (result.meta or {}).get("pause_state")
     view["pause_state"] = pause.to_dict() if pause is not None else None
     if view["pause_state"] is not None:
+        _strip_pause_versioned_fields(view["pause_state"])
         pause_id = view["pause_state"].pop("pause_id", None)
         assert pause_id is None or re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", pause_id)
     return view
@@ -1719,6 +1726,7 @@ def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
             row["meta"] = meta
         if isinstance(row.get("pause_data"), dict):
             pause = dict(row["pause_data"])
+            _strip_pause_versioned_fields(pause)
             pause.pop("pause_id", None)
             pause.pop("status", None)
             pause.pop("dendrux.governance", None)
