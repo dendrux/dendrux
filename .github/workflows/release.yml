@@ -4,10 +4,14 @@ name: Release
 # them. Publishing to PyPI uses trusted publishing (OIDC, no stored token)
 # through the `pypi` environment, whose required reviewer is the owner.
 #
-# The publish job stays off until the owner has (1) registered this workflow as
-# a trusted publisher on PyPI, (2) added the owner as required reviewer on the
-# `pypi` environment, and then (3) set the repository variable
+# The publish job stays off until the owner has completed every step of
+# .github/RELEASING.md, in order, and only then set the repository variable
 # PYPI_TRUSTED_PUBLISHING=true. Until then a tag only builds and checks.
+#
+# The checks in this file are not the security boundary: workflow code comes
+# from the tagged commit. The boundary is the GitHub environment (required
+# reviewer, tag-only deployments), a tag ruleset, and a PyPI trusted publisher
+# pinned to environment `pypi`.
 on:
   push:
     tags: ["v*"]
@@ -69,7 +73,11 @@ jobs:
   publish:
     name: publish to PyPI
     needs: build
-    if: ${{ vars.PYPI_TRUSTED_PUBLISHING == 'true' }}
+    if: >-
+      ${{ vars.PYPI_TRUSTED_PUBLISHING == 'true'
+      && github.repository == 'dendrux/dendrux'
+      && github.ref_type == 'tag'
+      && startsWith(github.ref_name, 'v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -82,6 +90,17 @@ jobs:
         with:
           name: dist
           path: dist
+
+      - name: Distributions must match the tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              "dendrux-${version}-"*.whl | "dendrux-${version}.tar.gz") ;;
+              *) echo "::error::$f does not belong to $GITHUB_REF_NAME."; exit 1 ;;
+            esac
+          done
 
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:

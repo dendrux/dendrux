@@ -86,6 +86,9 @@ build-backend = "hatchling.build"
 packages = ["src/dendrux"]
 # Keep upload tooling compatible while Core Metadata 2.5 adoption is incomplete.
 core-metadata-version = "2.4"
+# The committed dashboard build ships in the wheel even if a .gitignore rule
+# matches it (the rule exists so a rebuild's stray files are not staged by accident).
+artifacts = ["src/dendrux/dashboard/static/**"]
 
 # Explicit allowlist so the sdist is deterministic: only these paths ship,
 # regardless of untracked working-tree files. Without it, hatchling's default
@@ -93,6 +96,7 @@ core-metadata-version = "2.4"
 # output). The `output` exclude guards example runs that write in-tree.
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"
+artifacts = ["src/dendrux/dashboard/static/**"]
 include = [
     "src",
     "examples",

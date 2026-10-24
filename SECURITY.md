@@ -47,5 +47,7 @@ your database credentials.
 
 CI actions are pinned to commit SHAs and workflows run with read-only permissions.
 Dependencies are scanned with `pip-audit` on every change and daily, and the code with
-CodeQL. Releases are built in CI and published with PyPI trusted publishing after a
-manual approval.
+CodeQL. A release workflow builds and checks the distributions for every version tag.
+Publishing through PyPI trusted publishing, behind a manual approval, is being enabled;
+the owner steps are in `.github/RELEASING.md`, and until they are done releases are
+uploaded manually.

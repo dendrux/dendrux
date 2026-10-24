@@ -109,4 +109,4 @@ jobs:
         if: matrix.python-version == '3.12'
         run: |
           python -m build --wheel --outdir "$RUNNER_TEMP/wheel" .
-          python ../../.github/scripts/check_wheel_dashboard.py "$RUNNER_TEMP"/wheel/*.whl
+          python ../../.github/scripts/check_wheel_dashboard.py "$RUNNER_TEMP"/wheel/*.whl src/dendrux/dashboard/static

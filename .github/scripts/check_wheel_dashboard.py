@@ -5,7 +5,11 @@ The React dashboard ships as committed build output under
 forgotten ``git add`` would publish an ``index.html`` that points at assets
 the wheel does not contain.
 
-Usage: check_wheel_dashboard.py path/to/dendrux-X.Y.Z-py3-none-any.whl
+Usage: check_wheel_dashboard.py path/to/dendrux-X.Y.Z-py3-none-any.whl [static_dir]
+
+With ``static_dir`` (the committed build directory), every file in it must also
+be in the wheel, which catches lazy chunks and CSS-referenced assets that
+``index.html`` does not name.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from __future__ import annotations
 import re
 import sys
 import zipfile
+from pathlib import Path
 
 STATIC = "dendrux/dashboard/static/"
 _REF = re.compile(r"""(?:src|href)=["'](?:\./)?(assets/[^"'?#]+)""")
@@ -34,8 +39,19 @@ def problems(names: set[str], index_html: str | None) -> list[str]:
     return found
 
 
+def missing_from_wheel(names: set[str], static_dir: Path) -> list[str]:
+    """Files of the committed build that the wheel lacks."""
+    return [
+        f"{STATIC}{path.relative_to(static_dir).as_posix()} is committed but not in the wheel."
+        for path in sorted(static_dir.rglob("*"))
+        if path.is_file()
+        and f"{STATIC}{path.relative_to(static_dir).as_posix()}" not in names
+        and path.name != ".gitkeep"
+    ]
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
+    if len(argv) not in {2, 3}:
         print(__doc__)
         return 2
     with zipfile.ZipFile(argv[1]) as wheel:
@@ -43,6 +59,8 @@ def main(argv: list[str]) -> int:
         has_index = f"{STATIC}index.html" in names
         index = wheel.read(f"{STATIC}index.html").decode() if has_index else None
     errors = problems(names, index)
+    if len(argv) == 3:
+        errors.extend(missing_from_wheel(names, Path(argv[2])))
     for error in errors:
         print(f"::error::{error}")
     if not errors:

@@ -18,6 +18,16 @@ from typing import Any
 
 MAX_EXPIRY_DAYS = 90
 
+# Packages that must appear in the report as audited. Their absence means the
+# auditor looked at the wrong environment or silently skipped it.
+EXPECTED_AUDITED = frozenset({"alembic", "fastapi", "httpx", "pydantic", "sqlalchemy", "typer"})
+# The package under test may not be on PyPI yet (a pre-release version).
+SKIP_ALLOWED = frozenset({"dendrux"})
+
+
+def _norm(name: object) -> str:
+    return str(name).lower().replace("_", "-")
+
 
 def check_allowlist(
     allowlist: dict[str, Any], today: dt.date
@@ -48,17 +58,45 @@ def check_allowlist(
     return active, problems
 
 
-def evaluate(audit: dict[str, Any], allowlist: dict[str, Any], today: dt.date) -> list[str]:
-    """Every reason the build should fail; empty when the audit is clean."""
+def evaluate(
+    audit: dict[str, Any],
+    allowlist: dict[str, Any],
+    today: dt.date,
+    expected: frozenset[str] = EXPECTED_AUDITED,
+) -> list[str]:
+    """Every reason the build should fail; empty when the audit is clean.
+
+    A report that is malformed, that skipped a dependency it could not audit, or
+    that lacks an expected package fails: "nothing found" must mean "audited".
+    """
     active, problems = check_allowlist(allowlist, today)
-    for dep in audit.get("dependencies", []):
-        for vuln in dep.get("vulns", []):
+    dependencies = audit.get("dependencies") if isinstance(audit, dict) else None
+    if not isinstance(dependencies, list) or not dependencies:
+        return [*problems, "audit report has no dependencies; pip-audit did not run properly."]
+    audited: set[str] = set()
+    for dep in dependencies:
+        if not isinstance(dep, dict) or not dep.get("name"):
+            problems.append("audit report has a malformed dependency entry.")
+            continue
+        name = _norm(dep["name"])
+        if "skip_reason" in dep:
+            if name not in SKIP_ALLOWED:
+                reason = str(dep["skip_reason"])[:120]
+                problems.append(f"{dep['name']}: not audited ({reason}).")
+            continue
+        vulns = dep.get("vulns")
+        if not isinstance(vulns, list):
+            problems.append(f"{dep['name']}: malformed entry (no vulns list).")
+            continue
+        audited.add(name)
+        for vuln in vulns:
             ids = {vuln.get("id", ""), *vuln.get("aliases", [])}
             if ids.isdisjoint(active):
                 fixes = ", ".join(vuln.get("fix_versions", [])) or "no fix released"
-                problems.append(
-                    f"{dep.get('name')} {dep.get('version')}: {vuln.get('id')} ({fixes})."
-                )
+                problems.append(f"{dep['name']} {dep.get('version')}: {vuln.get('id')} ({fixes}).")
+    problems.extend(
+        f"{name}: expected in the audit report but not audited." for name in sorted(expected - audited)
+    )
     return problems
 
 

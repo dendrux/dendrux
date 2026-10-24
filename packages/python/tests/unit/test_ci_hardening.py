@@ -99,6 +99,16 @@ class TestWorkflows:
                 assert writes <= allowed.get(path.name, set()), (path.name, writes)
 
 
+class TestCodeQL:
+    def test_covers_python_actions_and_the_dashboard_frontend(self) -> None:
+        job = _workflow("codeql.yml")["jobs"]["analyze"]
+        assert set(job["strategy"]["matrix"]["language"]) == {
+            "python",
+            "actions",
+            "javascript-typescript",
+        }
+
+
 class TestPostgresRequirement:
     def test_ci_fails_when_the_postgres_url_is_missing_or_tests_skip(self) -> None:
         steps = {s.get("name"): s for s in _all_steps(_workflow("ci.yml"))}
@@ -129,6 +139,43 @@ class TestRelease:
         assert any(u.startswith("pypa/gh-action-pypi-publish@") for u in uses)
         assert "password" not in str(publish)
 
+    def test_publish_job_is_limited_to_this_repository_and_tags(self) -> None:
+        condition = _workflow("release.yml")["jobs"]["publish"]["if"]
+        for fragment in (
+            "vars.PYPI_TRUSTED_PUBLISHING == 'true'",
+            "github.repository == 'dendrux/dendrux'",
+            "github.ref_type == 'tag'",
+            "startsWith(github.ref_name, 'v')",
+        ):
+            assert fragment in condition
+
+    def test_publish_rechecks_that_distributions_match_the_tag(self) -> None:
+        steps = _workflow("release.yml")["jobs"]["publish"]["steps"]
+        run = next(s["run"] for s in steps if s.get("name") == "Distributions must match the tag")
+        assert "GITHUB_REF_NAME" in run
+        assert "exit 1" in run
+
+    def test_owner_checklist_is_ordered_and_names_every_boundary(self) -> None:
+        text = (GITHUB / "RELEASING.md").read_text()
+        steps = re.split(r"\n(?=\d\. \*\*)", text.split("## Releasing")[0])[1:]
+        assert len(steps) == 6
+        expected = [
+            ("`pypi` environment", "required reviewer", "`v*`"),
+            ("tag ruleset", "`v*`"),
+            ("Protect `main`",),
+            ("PyPI trusted publisher", "environment **`pypi`**"),
+            ("organisation-level variable",),
+            ("Only now", "PYPI_TRUSTED_PUBLISHING"),
+        ]
+        for step, fragments in zip(steps, expected, strict=True):
+            for fragment in fragments:
+                assert fragment in step, (fragment, step)
+
+    def test_security_policy_does_not_claim_publishing_is_live(self) -> None:
+        text = (REPO / "SECURITY.md").read_text()
+        assert "is being enabled" in text
+        assert ".github/RELEASING.md" in text
+
     def test_build_checks_the_tag_and_the_distributions(self) -> None:
         text = "\n".join(s.get("run", "") for s in _all_steps(_workflow("release.yml")))
         assert "merge-base --is-ancestor" in text
@@ -145,7 +192,8 @@ class TestDependabot:
     def test_covers_pip_and_actions(self) -> None:
         config = yaml.safe_load((GITHUB / "dependabot.yml").read_text())
         ecosystems = {u["package-ecosystem"]: u for u in config["updates"]}
-        assert set(ecosystems) == {"pip", "github-actions"}
+        assert set(ecosystems) == {"pip", "npm", "github-actions"}
+        assert ecosystems["npm"]["directory"] == "/packages/dashboard"
         assert ecosystems["pip"]["directory"] == "/packages/python"
         assert ecosystems["github-actions"]["directory"] == "/"
 
@@ -178,6 +226,11 @@ class TestPackaging:
         rev = next(r["rev"] for r in pre_commit["repos"] if "ruff" in r["repo"])
         assert rev == f"v{pinned}"
 
+    def test_dashboard_build_is_a_hatch_artifact(self, project: dict) -> None:
+        targets = project["tool"]["hatch"]["build"]["targets"]
+        for target in ("wheel", "sdist"):
+            assert "src/dendrux/dashboard/static/**" in targets[target]["artifacts"]
+
     def test_cli_is_inside_the_coverage_gate(self, project: dict) -> None:
         omit = project["tool"]["coverage"]["run"]["omit"]
         assert not any("cli" in pattern for pattern in omit)
@@ -191,37 +244,40 @@ class TestPackaging:
 class TestAuditGate:
     gate = _load_script("audit_gate") if GITHUB.is_dir() else None
     TODAY = dt.date(2026, 10, 24)
+    NONE = frozenset()
+
+    def _ev(self, audit: dict, allow: dict | None = None, expected: frozenset | None = None):
+        return self.gate.evaluate(
+            audit, allow or {"entries": []}, self.TODAY, self.NONE if expected is None else expected
+        )
 
     @staticmethod
-    def _audit(*vulns: dict) -> dict:
-        return {"dependencies": [{"name": "pkg", "version": "1.0", "vulns": list(vulns)}]}
+    def _audit(*vulns: dict, name: str = "pkg") -> dict:
+        return {"dependencies": [{"name": name, "version": "1.0", "vulns": list(vulns)}]}
 
     def test_clean_audit_passes(self) -> None:
-        assert self.gate.evaluate({"dependencies": []}, {"entries": []}, self.TODAY) == []
+        assert self._ev(self._audit()) == []
 
     def test_unlisted_vulnerability_fails(self) -> None:
-        audit = self._audit({"id": "PYSEC-1", "aliases": [], "fix_versions": ["1.1"]})
-        problems = self.gate.evaluate(audit, {"entries": []}, self.TODAY)
+        problems = self._ev(self._audit({"id": "PYSEC-1", "aliases": [], "fix_versions": ["1.1"]}))
         assert len(problems) == 1
         assert "PYSEC-1" in problems[0]
 
     def test_allowlisted_by_id_or_alias_passes(self) -> None:
         entry = {"id": "GHSA-x", "reason": "unreachable", "expires": "2026-11-30"}
         by_alias = self._audit({"id": "PYSEC-1", "aliases": ["GHSA-x"], "fix_versions": []})
-        assert self.gate.evaluate(by_alias, {"entries": [entry]}, self.TODAY) == []
+        assert self._ev(by_alias, {"entries": [entry]}) == []
         by_id = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
-        assert self.gate.evaluate(by_id, {"entries": [entry]}, self.TODAY) == []
+        assert self._ev(by_id, {"entries": [entry]}) == []
 
     def test_expired_entry_fails_even_when_unmatched(self) -> None:
         entry = {"id": "GHSA-x", "reason": "r", "expires": "2026-10-23"}
-        problems = self.gate.evaluate({"dependencies": []}, {"entries": [entry]}, self.TODAY)
-        assert any("expired" in p for p in problems)
+        assert any("expired" in p for p in self._ev(self._audit(), {"entries": [entry]}))
 
     def test_expired_entry_no_longer_suppresses_its_vulnerability(self) -> None:
         entry = {"id": "GHSA-x", "reason": "r", "expires": "2026-10-23"}
         audit = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
-        problems = self.gate.evaluate(audit, {"entries": [entry]}, self.TODAY)
-        assert len(problems) == 2
+        assert len(self._ev(audit, {"entries": [entry]})) == 2
 
     @pytest.mark.parametrize(
         "entry",
@@ -236,8 +292,59 @@ class TestAuditGate:
     )
     def test_malformed_or_distant_entries_are_rejected(self, entry: dict) -> None:
         audit = self._audit({"id": "GHSA-x", "aliases": [], "fix_versions": []})
-        problems = self.gate.evaluate(audit, {"entries": [entry]}, self.TODAY)
-        assert len(problems) == 2  # the entry itself and the vulnerability it fails to cover
+        assert len(self._ev(audit, {"entries": [entry]})) == 2
+
+    @pytest.mark.parametrize(
+        "report",
+        [
+            {},
+            {"dependencies": []},
+            {"dependencies": "nope"},
+            {"dependencies": [{"name": "pkg", "version": "1"}]},  # no vulns field
+            {"dependencies": [{"name": "pkg", "vulns": "x"}]},
+            {"dependencies": [{"version": "1", "vulns": []}]},
+            {"dependencies": ["pkg"]},
+        ],
+    )
+    def test_malformed_reports_fail(self, report: dict) -> None:
+        assert self._ev(report)
+
+    def test_unaudited_dependency_fails(self) -> None:
+        report = {"dependencies": [{"name": "pkg", "skip_reason": "could not be audited"}]}
+        problems = self._ev(report)
+        assert len(problems) == 1
+        assert "not audited" in problems[0]
+
+    def test_package_under_test_may_be_skipped(self) -> None:
+        report = {
+            "dependencies": [
+                {"name": "dendrux", "skip_reason": "Dependency not found on PyPI"},
+                {"name": "pkg", "version": "1", "vulns": []},
+            ]
+        }
+        assert self._ev(report) == []
+
+    def test_expected_packages_must_be_audited(self) -> None:
+        problems = self._ev(self._audit(name="other"), expected=frozenset({"pydantic", "httpx"}))
+        assert sorted(problems) == [
+            "httpx: expected in the audit report but not audited.",
+            "pydantic: expected in the audit report but not audited.",
+        ]
+        ok = {
+            "dependencies": [
+                {"name": "Pydantic", "version": "2", "vulns": []},
+                {"name": "httpx", "version": "1", "vulns": []},
+            ]
+        }
+        assert self._ev(ok, expected=frozenset({"pydantic", "httpx"})) == []
+
+    def test_a_skipped_expected_package_is_not_counted_as_audited(self) -> None:
+        report = {"dependencies": [{"name": "pydantic", "skip_reason": "x"}]}
+        problems = self._ev(report, expected=frozenset({"pydantic"}))
+        assert len(problems) == 2
+
+    def test_default_expected_set_covers_core_packages(self) -> None:
+        assert {"pydantic", "sqlalchemy", "httpx", "fastapi"} <= self.gate.EXPECTED_AUDITED
 
     def test_shipped_allowlist_is_valid_today(self) -> None:
         import json
@@ -259,12 +366,21 @@ class TestAuditGate:
 
         allow = tmp_path / "allow.json"
         allow.write_text('{"entries": []}')
+        full = {
+            "dependencies": [
+                {"name": name, "version": "1", "vulns": []} for name in self.gate.EXPECTED_AUDITED
+            ]
+        }
         clean = tmp_path / "clean.json"
-        clean.write_text(json.dumps({"dependencies": []}))
+        clean.write_text(json.dumps(full))
         dirty = tmp_path / "dirty.json"
-        dirty.write_text(json.dumps(self._audit({"id": "X-1", "aliases": []})))
+        full["dependencies"][0]["vulns"] = [{"id": "X-1", "aliases": []}]
+        dirty.write_text(json.dumps(full))
+        empty = tmp_path / "empty.json"
+        empty.write_text("{}")
         assert self.gate.main(["gate", str(clean), str(allow)]) == 0
         assert self.gate.main(["gate", str(dirty), str(allow)]) == 1
+        assert self.gate.main(["gate", str(empty), str(allow)]) == 1
         assert self.gate.main(["gate"]) == 2
 
 
@@ -298,6 +414,25 @@ class TestWheelDashboardCheck:
         }
         html = (static / "index.html").read_text()
         assert self.check.problems(names, html) == []
+
+    def test_committed_file_missing_from_the_wheel_fails(self, tmp_path: Path) -> None:
+        static = tmp_path / "static"
+        (static / "assets").mkdir(parents=True)
+        (static / "index.html").write_text("x")
+        (static / "assets" / "lazy-chunk.js").write_text("x")
+        names = {f"{self.S}index.html"}
+        problems = self.check.missing_from_wheel(names, static)
+        assert problems == [f"{self.S}assets/lazy-chunk.js is committed but not in the wheel."]
+        assert (
+            self.check.missing_from_wheel(names | {f"{self.S}assets/lazy-chunk.js"}, static) == []
+        )
+
+    def test_real_static_dir_is_fully_in_a_wheel_listing(self) -> None:
+        static = REPO / "packages" / "python" / "src" / "dendrux" / "dashboard" / "static"
+        names = {
+            f"{self.S}{p.relative_to(static).as_posix()}" for p in static.rglob("*") if p.is_file()
+        }
+        assert self.check.missing_from_wheel(names, static) == []
 
     def test_main_reads_a_wheel(self, tmp_path: Path) -> None:
         import zipfile

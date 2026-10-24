@@ -41,7 +41,9 @@ jobs:
 
       - name: Audit
         run: |
+          status=0
           "$RUNNER_TEMP/tool/bin/pip-audit" \
             --path "$RUNNER_TEMP"/target/lib/python3.12/site-packages \
-            --format json --output "$RUNNER_TEMP/audit.json" --progress-spinner off || true
+            --format json --output "$RUNNER_TEMP/audit.json" --progress-spinner off || status=$?
+          echo "pip-audit exit status: $status (1 means findings; the gate decides)"
           python .github/scripts/audit_gate.py "$RUNNER_TEMP/audit.json" .github/pip-audit-allowlist.json
