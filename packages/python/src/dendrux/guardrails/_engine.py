@@ -210,6 +210,8 @@ class GuardrailEngine:
         self,
         guardrails: list[Guardrail],
         pii_mapping: dict[str, str] | None = None,
+        *,
+        run_id: str | None = None,
     ) -> None:
         self._guardrails = list(guardrails)
         # Image-only guardrails (``ImageGuardrail`` without ``scan``) are
@@ -220,6 +222,16 @@ class GuardrailEngine:
         ]
         raw = dict(pii_mapping) if pii_mapping else {}
         origins_raw = raw.pop(_ORIGINS_KEY, None)
+        # Legacy runs may already exceed the cap. Keep every historical value
+        # available for redaction/restoration, but admit no new distinct value.
+        self._at_mapping_cap = len(raw) >= MAX_MAPPING_ENTRIES
+        if len(raw) > MAX_MAPPING_ENTRIES:
+            logger.warning(
+                "Resumed PII mapping exceeds cap: run_id=%s count=%d cap=%d",
+                run_id,
+                len(raw),
+                MAX_MAPPING_ENTRIES,
+            )
         # Forward: <<EMAIL_ADDRESS_1>> → real value
         self._pii_mapping: dict[str, str] = raw
         # Reverse: real value → <<EMAIL_ADDRESS_1>>
@@ -333,14 +345,15 @@ class GuardrailEngine:
         oversize = len(text) > MAX_SCAN_CHARS
 
         for guardrail in self._text_guardrails:
-            findings = [] if oversize else _deoverlap(await guardrail.scan(text))
-            if oversize or _has_unscannable(findings):
+            raw_findings = [] if oversize else await guardrail.scan(text)
+            if oversize or _has_unscannable(raw_findings):
                 block = _unscannable_outcome(
                     guardrail, all_findings, where="text over the scan limit", location=location
                 )
                 if block is not None:
                     return text, all_findings, block
                 continue
+            findings = _deoverlap(raw_findings)
             if not findings:
                 continue
             all_findings.extend(findings)
@@ -354,7 +367,7 @@ class GuardrailEngine:
 
             if guardrail.action == "redact":
                 new_values = {f.text for f in findings if f.text not in self._reverse}
-                if len(self._pii_mapping) + len(new_values) > MAX_MAPPING_ENTRIES:
+                if new_values and len(self._pii_mapping) + len(new_values) > MAX_MAPPING_ENTRIES:
                     block = _unscannable_outcome(
                         guardrail,
                         all_findings,
@@ -365,6 +378,7 @@ class GuardrailEngine:
                         return text, all_findings, block
                     continue
                 text = await self._redact(text, findings, origin)
+                self._at_mapping_cap = len(self._pii_mapping) >= MAX_MAPPING_ENTRIES
             # warn: findings collected but text unchanged
 
         return text, all_findings, None
@@ -446,14 +460,15 @@ class GuardrailEngine:
         oversize = len(text) > MAX_SCAN_CHARS
 
         for guardrail in self._text_guardrails:
-            findings = [] if oversize else _deoverlap(await guardrail.scan(text))
-            if oversize or _has_unscannable(findings):
+            raw_findings = [] if oversize else await guardrail.scan(text)
+            if oversize or _has_unscannable(raw_findings):
                 block = _unscannable_outcome(
                     guardrail, all_findings, where="LLM output over the scan limit"
                 )
                 if block is not None:
                     return all_findings, block
                 continue
+            findings = _deoverlap(raw_findings)
             if findings:
                 all_findings.extend(findings)
                 if guardrail.action == "block":

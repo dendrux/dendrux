@@ -903,11 +903,12 @@ class TestRedactionIsBounded:
     async def test_restore_of_many_placeholders_is_linear(self) -> None:
         engine = GuardrailEngine([PII(action="redact")])
         await engine.scan_incoming(_ips(5_000))
-        params = {"items": [f"<<IP_ADDRESS_{i}>>" for i in range(1, 2001)]}
+        params = {"items": [f"value=<<IP_ADDRESS_{i}>>!" for i in range(1, 2001)]}
         start = time.perf_counter()
         out = engine.deanonymize(params)
         assert time.perf_counter() - start < 1.0
         assert "<<" not in str(out)
+        assert all(item.startswith("value=10.") and item.endswith("!") for item in out["items"])
 
 
 class TestGuardrailReportedUnscannable:
@@ -933,3 +934,53 @@ class TestGuardrailReportedUnscannable:
         _, findings, block = await engine.scan_incoming("hello")
         assert block is None
         assert [f.entity_type for f in findings] == [UNSCANNABLE]
+
+    class _Partial:
+        def __init__(self, action: str) -> None:
+            self.action = action
+
+        async def scan(self, text: str) -> list[Finding]:
+            return [
+                Finding("EMAIL_ADDRESS", 0, 3, 1.0, text[:3]),
+                Finding(UNSCANNABLE, 0, 0, 1.0, ""),
+            ]
+
+    @pytest.mark.parametrize("action", ["redact", "warn", "block"])
+    @pytest.mark.parametrize("outgoing", [False, True])
+    async def test_mixed_findings_keep_unscannable(self, action: str, outgoing: bool) -> None:
+        engine = GuardrailEngine([self._Partial(action)])  # type: ignore[list-item]
+        if outgoing:
+            findings, block = await engine.scan_outgoing("abc secret")
+        else:
+            text, findings, block = await engine.scan_incoming("abc secret")
+            assert text == "abc secret"
+        assert [f.entity_type for f in findings] == [UNSCANNABLE]
+        if action == "warn":
+            assert block is None
+        else:
+            assert block is not None and UNSCANNABLE in block
+
+
+class TestLegacyOversizeMapping:
+    async def test_resumed_mapping_keeps_existing_values_and_rejects_new(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mapping = {f"<<IP_ADDRESS_{i + 1}>>": f"10.0.{i // 256}.{i % 256}" for i in range(20_001)}
+        engine = GuardrailEngine([PII(action="redact")], pii_mapping=mapping, run_id="run-legacy")
+        assert engine._at_mapping_cap
+        assert engine.get_pii_mapping() == mapping
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "run-legacy" in warnings[0].message
+        assert "20001" in warnings[0].message
+
+        old = mapping["<<IP_ADDRESS_1>>"]
+        text, _, block = await engine.scan_incoming(f"old {old}")
+        assert block is None
+        assert text == "old <<IP_ADDRESS_1>>"
+        text, findings, block = await engine.scan_incoming("new 192.168.1.1")
+        assert text == "new 192.168.1.1"
+        assert block is not None and UNSCANNABLE in block
+        assert any(f.entity_type == UNSCANNABLE for f in findings)
+        assert engine.get_pii_mapping() == mapping
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
