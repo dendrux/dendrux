@@ -28,6 +28,11 @@ class TestWorkerScopedPgUrl:
         got = worker_scoped_pg_url(BASE.format("x_test") + "?sslmode=require", "gw2")
         assert got == BASE.format("x_gw2_test") + "?sslmode=require"
 
+    def test_scoping_twice_does_not_stack_the_worker_name(self) -> None:
+        # a nested pytest session in a worker runs pytest_configure again
+        once = worker_scoped_pg_url(BASE.format("dendrux_test"), "gw0")
+        assert worker_scoped_pg_url(once, "gw0") == once
+
     def test_distinct_workers_get_distinct_databases(self) -> None:
         urls = {worker_scoped_pg_url(BASE.format("d_test"), f"gw{i}") for i in range(4)}
         assert len(urls) == 4

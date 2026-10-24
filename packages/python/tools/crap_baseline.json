@@ -13,15 +13,17 @@
  },
  "src/dendrux/_sentinel.py::_OmittedType.__repr__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "e040f928ef94"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "e040f928ef94",
+  "waived": "worse"
  },
  "src/dendrux/_sentinel.py::_UnsetType.__repr__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "9d43aad09223"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "9d43aad09223",
+  "waived": "worse"
  },
  "src/dendrux/agent.py::Agent.__aenter__": {
   "complexity": 1,
@@ -37,7 +39,7 @@
  },
  "src/dendrux/agent.py::Agent.__init__": {
   "complexity": 54,
-  "coverage": 0.9847,
+  "coverage": 0.9846,
   "crap": 54.01,
   "digest": "a200e9617ee3"
  },
@@ -55,14 +57,14 @@
  },
  "src/dendrux/agent.py::Agent._blob_services": {
   "complexity": 6,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 6.02,
   "digest": "cb7805c6f658"
  },
  "src/dendrux/agent.py::Agent._cancel_one": {
   "complexity": 4,
-  "coverage": 0.8889,
-  "crap": 4.02,
+  "coverage": 0.875,
+  "crap": 4.03,
   "digest": "b0e14f435a61"
  },
  "src/dendrux/agent.py::Agent._create_private_engine": {
@@ -79,7 +81,7 @@
  },
  "src/dendrux/agent.py::Agent._ensure_discovered": {
   "complexity": 20,
-  "coverage": 0.9474,
+  "coverage": 0.9464,
   "crap": 20.06,
   "digest": "36d8d5d22c29"
  },
@@ -91,8 +93,8 @@
  },
  "src/dendrux/agent.py::Agent._image_backend": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "513ad0421773"
  },
  "src/dendrux/agent.py::Agent._image_gc": {
@@ -127,8 +129,8 @@
  },
  "src/dendrux/agent.py::Agent._resolve_state_store": {
   "complexity": 12,
-  "coverage": 0.925,
-  "crap": 12.06,
+  "coverage": 0.9231,
+  "crap": 12.07,
   "digest": "75ddd909d2d9"
  },
  "src/dendrux/agent.py::Agent._tenant_checked_stream": {
@@ -151,14 +153,14 @@
  },
  "src/dendrux/agent.py::Agent._validate": {
   "complexity": 43,
-  "coverage": 1.0,
-  "crap": 43.0,
+  "coverage": 0.9831,
+  "crap": 43.01,
   "digest": "5bd2d837066c"
  },
  "src/dendrux/agent.py::Agent._validate_governance_names": {
   "complexity": 10,
-  "coverage": 0.8824,
-  "crap": 10.16,
+  "coverage": 0.875,
+  "crap": 10.2,
   "digest": "24ca8ab7e559"
  },
  "src/dendrux/agent.py::Agent._validate_skill_contents": {
@@ -187,14 +189,14 @@
  },
  "src/dendrux/agent.py::Agent.cancel_run": {
   "complexity": 14,
-  "coverage": 0.9737,
-  "crap": 14.0,
+  "coverage": 0.9231,
+  "crap": 14.09,
   "digest": "b9398899cce9"
  },
  "src/dendrux/agent.py::Agent.close": {
   "complexity": 6,
-  "coverage": 0.9048,
-  "crap": 6.03,
+  "coverage": 0.9,
+  "crap": 6.04,
   "digest": "1d3be817bf8e"
  },
  "src/dendrux/agent.py::Agent.deny": {
@@ -271,8 +273,8 @@
  },
  "src/dendrux/agent.py::Agent.refresh": {
   "complexity": 3,
-  "coverage": 0.8462,
-  "crap": 3.03,
+  "coverage": 0.8333,
+  "crap": 3.04,
   "digest": "82ef41f28831"
  },
  "src/dendrux/agent.py::Agent.request_pause": {
@@ -307,19 +309,19 @@
  },
  "src/dendrux/agent.py::Agent.run": {
   "complexity": 8,
-  "coverage": 0.9048,
+  "coverage": 0.9,
   "crap": 8.06,
   "digest": "ea88a0ceb7ef"
  },
  "src/dendrux/agent.py::Agent.stream": {
   "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
+  "coverage": 0.9286,
+  "crap": 4.01,
   "digest": "938b22744010"
  },
  "src/dendrux/agent.py::Agent.submit_approval": {
   "complexity": 14,
-  "coverage": 0.9608,
+  "coverage": 0.9592,
   "crap": 14.01,
   "digest": "d986ad5b99c7"
  },
@@ -331,7 +333,7 @@
  },
  "src/dendrux/agent.py::Agent.submit_input": {
   "complexity": 3,
-  "coverage": 0.96,
+  "coverage": 0.9583,
   "crap": 3.0,
   "digest": "b1826f8f12c8"
  },
@@ -367,8 +369,8 @@
  },
  "src/dendrux/agent.py::_AgentBlobs._target": {
   "complexity": 3,
-  "coverage": 0.875,
-  "crap": 3.02,
+  "coverage": 0.8571,
+  "crap": 3.03,
   "digest": "48a837d02030"
  },
  "src/dendrux/agent.py::_AgentBlobs.collect_garbage": {
@@ -379,9 +381,10 @@
  },
  "src/dendrux/agent.py::_AgentBlobs.info": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "a8a92ede746a"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "a8a92ede746a",
+  "waived": "worse"
  },
  "src/dendrux/agent.py::_AgentBlobs.purge": {
   "complexity": 1,
@@ -397,9 +400,10 @@
  },
  "src/dendrux/agent.py::_AgentBlobs.references": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "0055f53f36c4"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "0055f53f36c4",
+  "waived": "worse"
  },
  "src/dendrux/agent.py::_blob_services_factory": {
   "complexity": 1,
@@ -409,8 +413,8 @@
  },
  "src/dendrux/agent.py::_build_provider_from_spec": {
   "complexity": 7,
-  "coverage": 0.7895,
-  "crap": 7.46,
+  "coverage": 0.7778,
+  "crap": 7.54,
   "digest": "9984c7d70261"
  },
  "src/dendrux/agent.py::_cascade_order": {
@@ -463,7 +467,7 @@
  },
  "src/dendrux/chat.py::ChatMessage.__post_init__": {
   "complexity": 10,
-  "coverage": 0.9524,
+  "coverage": 0.95,
   "crap": 10.01,
   "digest": "7306397c50bc"
  },
@@ -493,7 +497,7 @@
  },
  "src/dendrux/chat.py::normalize_chat_history": {
   "complexity": 6,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 6.02,
   "digest": "5adcf9ed5700"
  },
@@ -511,8 +515,8 @@
  },
  "src/dendrux/cli/db.py::_build_alembic_config": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.7273,
+  "crap": 3.18,
   "digest": "3028e70932c2"
  },
  "src/dendrux/cli/db.py::_database_url": {
@@ -523,8 +527,8 @@
  },
  "src/dendrux/cli/db.py::_find_alembic_ini": {
   "complexity": 4,
-  "coverage": 0.5455,
-  "crap": 5.5,
+  "coverage": 0.5,
+  "crap": 6.0,
   "digest": "36380e93e726"
  },
  "src/dendrux/cli/db.py::_read_schema_state": {
@@ -535,21 +539,23 @@
  },
  "src/dendrux/cli/db.py::check": {
   "complexity": 10,
-  "coverage": 0.9189,
-  "crap": 10.05,
+  "coverage": 0.9167,
+  "crap": 10.06,
   "digest": "ddaadc801102"
  },
  "src/dendrux/cli/db.py::migrate": {
   "complexity": 3,
-  "coverage": 0.0714,
-  "crap": 10.21,
-  "digest": "a942c2a2774d"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "a942c2a2774d",
+  "waived": "worse"
  },
  "src/dendrux/cli/db.py::status": {
   "complexity": 2,
-  "coverage": 0.125,
-  "crap": 4.68,
-  "digest": "6022d3f86782"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "6022d3f86782",
+  "waived": "worse"
  },
  "src/dendrux/cli/main.py::_register_subcommands": {
   "complexity": 1,
@@ -565,7 +571,7 @@
  },
  "src/dendrux/cli/runs.py::_list_runs": {
   "complexity": 9,
-  "coverage": 0.9118,
+  "coverage": 0.9091,
   "crap": 9.06,
   "digest": "8f0fef3f6378"
  },
@@ -577,8 +583,8 @@
  },
  "src/dendrux/cli/traces.py::_show_traces": {
   "complexity": 19,
-  "coverage": 0.8909,
-  "crap": 19.47,
+  "coverage": 0.8889,
+  "crap": 19.5,
   "digest": "80420a4f2e27"
  },
  "src/dendrux/cli/traces.py::show_traces": {
@@ -613,8 +619,8 @@
  },
  "src/dendrux/context_blocks.py::fold_first_parts": {
   "complexity": 4,
-  "coverage": 0.6667,
-  "crap": 4.59,
+  "coverage": 0.6,
+  "crap": 5.02,
   "digest": "37e306339cbd"
  },
  "src/dendrux/context_blocks.py::render_band": {
@@ -655,8 +661,8 @@
  },
  "src/dendrux/db/_index_check.py::index_matches": {
   "complexity": 9,
-  "coverage": 0.7692,
-  "crap": 10.0,
+  "coverage": 0.75,
+  "crap": 10.27,
   "digest": "ed8963f21c9e"
  },
  "src/dendrux/db/_index_check.py::read_pg_indexes": {
@@ -685,7 +691,7 @@
  },
  "src/dendrux/db/_pool_guard.py::close_fully": {
   "complexity": 6,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 6.02,
   "digest": "8819ad6bbacd"
  },
@@ -733,8 +739,8 @@
  },
  "src/dendrux/db/_schema_check.py::read_actual_indexes": {
   "complexity": 8,
-  "coverage": 0.9167,
-  "crap": 8.04,
+  "coverage": 0.9091,
+  "crap": 8.05,
   "digest": "883d94b25ab1"
  },
  "src/dendrux/db/_schema_check.py::read_actual_schema": {
@@ -763,7 +769,7 @@
  },
  "src/dendrux/db/_sqlite_sync.py::_apply": {
   "complexity": 6,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 6.02,
   "digest": "3fac8e24966c"
  },
@@ -853,14 +859,14 @@
  },
  "src/dendrux/db/_sqlite_sync.py::_reconcile_indexes": {
   "complexity": 7,
-  "coverage": 0.8947,
-  "crap": 7.06,
+  "coverage": 0.8889,
+  "crap": 7.07,
   "digest": "0a6be69a2240"
  },
  "src/dendrux/db/_sqlite_sync.py::_rollback": {
   "complexity": 2,
-  "coverage": 0.6,
-  "crap": 2.26,
+  "coverage": 0.5,
+  "crap": 2.5,
   "digest": "0678c5492ea3"
  },
  "src/dendrux/db/_sqlite_sync.py::_run": {
@@ -895,14 +901,14 @@
  },
  "src/dendrux/db/_sqlite_sync.py::_unsafe_reason": {
   "complexity": 8,
-  "coverage": 0.8571,
-  "crap": 8.19,
+  "coverage": 0.8462,
+  "crap": 8.23,
   "digest": "dc5250c79f5d"
  },
  "src/dendrux/db/_sqlite_sync.py::_wanted_indexes": {
   "complexity": 13,
-  "coverage": 0.9167,
-  "crap": 13.1,
+  "coverage": 0.9091,
+  "crap": 13.13,
   "digest": "175664783cfe"
  },
  "src/dendrux/db/_sqlite_sync.py::_warn_legacy_idempotency_unique": {
@@ -925,8 +931,8 @@
  },
  "src/dendrux/db/_sqlite_sync.py::sync_sqlite_schema": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "cfc797c5de25"
  },
  "src/dendrux/db/models.py::_utc_now": {
@@ -937,14 +943,14 @@
  },
  "src/dendrux/db/session.py::_bind_to_current_loop": {
   "complexity": 2,
-  "coverage": 0.8462,
-  "crap": 2.01,
+  "coverage": 1.0,
+  "crap": 2.0,
   "digest": "8bfafd629da0"
  },
  "src/dendrux/db/session.py::_bind_to_current_loop.<locals>._check_loop": {
   "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
+  "coverage": 0.6667,
+  "crap": 3.33,
   "digest": "1273a35008ec"
  },
  "src/dendrux/db/session.py::_published": {
@@ -967,8 +973,8 @@
  },
  "src/dendrux/db/session.py::get_session": {
   "complexity": 7,
-  "coverage": 0.4783,
-  "crap": 13.96,
+  "coverage": 0.5,
+  "crap": 13.12,
   "digest": "ff445534174c"
  },
  "src/dendrux/db/session.py::reset_engine": {
@@ -1225,8 +1231,8 @@
  },
  "src/dendrux/guardrails/_detectors.py::luhn_valid": {
   "complexity": 7,
-  "coverage": 0.9167,
-  "crap": 7.03,
+  "coverage": 0.9091,
+  "crap": 7.04,
   "digest": "5189b4ff17a6"
  },
  "src/dendrux/guardrails/_detectors.py::phone_context": {
@@ -1315,9 +1321,10 @@
  },
  "src/dendrux/guardrails/_engine.py::GuardrailEngine.has_guardrails": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "646b8f0b0ba2"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "646b8f0b0ba2",
+  "waived": "worse"
  },
  "src/dendrux/guardrails/_engine.py::GuardrailEngine.restore_mode": {
   "complexity": 2,
@@ -1333,13 +1340,13 @@
  },
  "src/dendrux/guardrails/_engine.py::GuardrailEngine.scan_incoming": {
   "complexity": 14,
-  "coverage": 0.9615,
+  "coverage": 0.96,
   "crap": 14.01,
   "digest": "de710c715c27"
  },
  "src/dendrux/guardrails/_engine.py::GuardrailEngine.scan_incoming_message": {
   "complexity": 12,
-  "coverage": 0.9688,
+  "coverage": 0.9677,
   "crap": 12.0,
   "digest": "844739982633"
  },
@@ -1357,13 +1364,13 @@
  },
  "src/dendrux/guardrails/_engine.py::_block_message": {
   "complexity": 6,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 6.02,
   "digest": "f992f7ffe561"
  },
  "src/dendrux/guardrails/_engine.py::_collect_leaves": {
   "complexity": 23,
-  "coverage": 0.9787,
+  "coverage": 0.9783,
   "crap": 23.01,
   "digest": "1a80c129f1ae"
  },
@@ -1381,8 +1388,8 @@
  },
  "src/dendrux/guardrails/_engine.py::_deoverlap": {
   "complexity": 5,
-  "coverage": 0.9167,
-  "crap": 5.01,
+  "coverage": 0.9091,
+  "crap": 5.02,
   "digest": "1d37f0b9d87b"
  },
  "src/dendrux/guardrails/_engine.py::_entity_matches": {
@@ -1411,8 +1418,8 @@
  },
  "src/dendrux/guardrails/_engine.py::_note_restore_default": {
   "complexity": 7,
-  "coverage": 0.9167,
-  "crap": 7.03,
+  "coverage": 0.9091,
+  "crap": 7.04,
   "digest": "b4cad33d692b"
  },
  "src/dendrux/guardrails/_engine.py::_projection": {
@@ -1423,8 +1430,8 @@
  },
  "src/dendrux/guardrails/_engine.py::_restore_value": {
   "complexity": 11,
-  "coverage": 0.9615,
-  "crap": 11.01,
+  "coverage": 0.9412,
+  "crap": 11.02,
   "digest": "1e8e8025659a"
  },
  "src/dendrux/guardrails/_engine.py::_restore_value.<locals>.swap": {
@@ -1441,8 +1448,8 @@
  },
  "src/dendrux/guardrails/_engine.py::_scan_leaf_for_findings": {
   "complexity": 11,
-  "coverage": 0.7931,
-  "crap": 12.07,
+  "coverage": 0.7857,
+  "crap": 12.19,
   "digest": "48ea16d358e1"
  },
  "src/dendrux/guardrails/_engine.py::_scan_params_for_findings": {
@@ -1465,8 +1472,8 @@
  },
  "src/dendrux/guardrails/_engine.py::deanonymize_text": {
   "complexity": 9,
-  "coverage": 0.9,
-  "crap": 9.08,
+  "coverage": 0.8889,
+  "crap": 9.11,
   "digest": "e2db2b5d906a"
  },
  "src/dendrux/guardrails/_engine.py::has_placeholder": {
@@ -1513,8 +1520,8 @@
  },
  "src/dendrux/guardrails/_pii.py::_PresidioScanner.scan": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.7273,
+  "crap": 3.18,
   "digest": "9b5d90744386"
  },
  "src/dendrux/guardrails/_pii.py::_RegexScanner.__init__": {
@@ -1573,8 +1580,8 @@
  },
  "src/dendrux/guardrails/_protocol.py::guardrail_identity": {
   "complexity": 4,
-  "coverage": 0.8571,
-  "crap": 4.05,
+  "coverage": 0.8333,
+  "crap": 4.07,
   "digest": "7706fb593154"
  },
  "src/dendrux/guardrails/_protocol.py::scans_images": {
@@ -1591,8 +1598,8 @@
  },
  "src/dendrux/guardrails/_secrets.py::SecretDetection.__init__": {
   "complexity": 5,
-  "coverage": 0.7143,
-  "crap": 5.58,
+  "coverage": 0.6667,
+  "crap": 5.93,
   "digest": "846e39685646"
  },
  "src/dendrux/guardrails/_secrets.py::SecretDetection._scan_sync": {
@@ -1609,9 +1616,10 @@
  },
  "src/dendrux/llm/__init__.py::__getattr__": {
   "complexity": 6,
-  "coverage": 0.4118,
-  "crap": 13.33,
-  "digest": "0b21735274ff"
+  "coverage": 0.375,
+  "crap": 14.79,
+  "digest": "0b21735274ff",
+  "waived": "worse"
  },
  "src/dendrux/llm/_helpers.py::_body_field": {
   "complexity": 3,
@@ -1639,8 +1647,8 @@
  },
  "src/dendrux/llm/_helpers.py::_is_image_rejected": {
   "complexity": 9,
-  "coverage": 0.875,
-  "crap": 9.16,
+  "coverage": 0.8571,
+  "crap": 9.24,
   "digest": "a349963eb901"
  },
  "src/dendrux/llm/_helpers.py::_is_image_unsupported": {
@@ -1753,14 +1761,14 @@
  },
  "src/dendrux/llm/_images.py::WireImageRegistry.sanitize": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "c7e54984638b"
  },
  "src/dendrux/llm/_images.py::WireImageRegistry.scrub_text": {
   "complexity": 3,
-  "coverage": 0.8,
-  "crap": 3.07,
+  "coverage": 0.75,
+  "crap": 3.14,
   "digest": "49de1a90c806"
  },
  "src/dendrux/llm/_images.py::_str_or_none": {
@@ -1813,14 +1821,14 @@
  },
  "src/dendrux/llm/_images.py::image_request_error": {
   "complexity": 13,
-  "coverage": 0.9375,
-  "crap": 13.04,
+  "coverage": 0.9333,
+  "crap": 13.05,
   "digest": "be61ed89c9d3"
  },
  "src/dendrux/llm/_images.py::normalize_base_url": {
   "complexity": 7,
-  "coverage": 0.8125,
-  "crap": 7.32,
+  "coverage": 0.8,
+  "crap": 7.39,
   "digest": "8dc9d2b1f653"
  },
  "src/dendrux/llm/_images.py::openai_image_support": {
@@ -1837,8 +1845,8 @@
  },
  "src/dendrux/llm/_images.py::portable_tool_text": {
   "complexity": 3,
-  "coverage": 0.8333,
-  "crap": 3.04,
+  "coverage": 0.8,
+  "crap": 3.07,
   "digest": "658e12232848"
  },
  "src/dendrux/llm/_images.py::responses_image": {
@@ -1861,8 +1869,8 @@
  },
  "src/dendrux/llm/_images.py::sdk_error_facts": {
   "complexity": 16,
-  "coverage": 0.8621,
-  "crap": 16.67,
+  "coverage": 0.8571,
+  "crap": 16.75,
   "digest": "2d30d430f488"
  },
  "src/dendrux/llm/_images.py::sdk_image_request_error": {
@@ -1903,8 +1911,8 @@
  },
  "src/dendrux/llm/_resilience.py::LoopClients.pop_current_loop_extra": {
   "complexity": 4,
-  "coverage": 0.6667,
-  "crap": 4.59,
+  "coverage": 0.6364,
+  "crap": 4.77,
   "digest": "794ff766b3fb"
  },
  "src/dendrux/llm/_resilience.py::LoopClients.resolve": {
@@ -1969,9 +1977,10 @@
  },
  "src/dendrux/llm/_resilience.py::_TimeoutUnset.__repr__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "bc7dce8e48f8"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "bc7dce8e48f8",
+  "waived": "worse"
  },
  "src/dendrux/llm/_resilience.py::_check_seconds": {
   "complexity": 6,
@@ -1999,8 +2008,8 @@
  },
  "src/dendrux/llm/_resilience.py::_on_response": {
   "complexity": 3,
-  "coverage": 0.7778,
-  "crap": 3.1,
+  "coverage": 0.75,
+  "crap": 3.14,
   "digest": "8b5b6735d5f6"
  },
  "src/dendrux/llm/_resilience.py::_timeout_reason_for": {
@@ -2017,8 +2026,8 @@
  },
  "src/dendrux/llm/_resilience.py::close_quietly": {
   "complexity": 6,
-  "coverage": 0.8333,
-  "crap": 6.17,
+  "coverage": 0.8182,
+  "crap": 6.22,
   "digest": "8e3c249af44b"
  },
  "src/dendrux/llm/_resilience.py::content_filter_error": {
@@ -2035,8 +2044,8 @@
  },
  "src/dendrux/llm/_resilience.py::error_from_fields": {
   "complexity": 37,
-  "coverage": 0.9714,
-  "crap": 37.03,
+  "coverage": 0.9697,
+  "crap": 37.04,
   "digest": "5dd60f435c5c"
  },
  "src/dendrux/llm/_resilience.py::error_from_fields.<locals>.text": {
@@ -2083,8 +2092,8 @@
  },
  "src/dendrux/llm/_resilience.py::map_sdk_error": {
   "complexity": 8,
-  "coverage": 0.8125,
-  "crap": 8.42,
+  "coverage": 0.8,
+  "crap": 8.51,
   "digest": "8d4cdf38cf52"
  },
  "src/dendrux/llm/_resilience.py::parse_retry_after": {
@@ -2113,8 +2122,8 @@
  },
  "src/dendrux/llm/_resilience.py::run_with_deadline": {
   "complexity": 4,
-  "coverage": 0.9333,
-  "crap": 4.0,
+  "coverage": 0.9286,
+  "crap": 4.01,
   "digest": "35a148b2a9d7"
  },
  "src/dendrux/llm/_resilience.py::safe_token": {
@@ -2137,8 +2146,8 @@
  },
  "src/dendrux/llm/_retry_telemetry.py::_on_response": {
   "complexity": 14,
-  "coverage": 0.8235,
-  "crap": 15.08,
+  "coverage": 0.8182,
+  "crap": 15.18,
   "digest": "5dc0eb781de5"
  },
  "src/dendrux/llm/_retry_telemetry.py::begin_call_attempt_tracking": {
@@ -2179,14 +2188,14 @@
  },
  "src/dendrux/llm/_schema.py::_anthropic_cycle": {
   "complexity": 5,
-  "coverage": 0.8095,
-  "crap": 5.17,
+  "coverage": 1.0,
+  "crap": 5.0,
   "digest": "e06ea3356902"
  },
  "src/dendrux/llm/_schema.py::_anthropic_cycle.<locals>.visit": {
   "complexity": 5,
-  "coverage": 0.6923,
-  "crap": 5.73,
+  "coverage": 0.6667,
+  "crap": 5.93,
   "digest": "bdcf081f3ecb"
  },
  "src/dendrux/llm/_schema.py::_anthropic_def_name": {
@@ -2203,8 +2212,8 @@
  },
  "src/dendrux/llm/_schema.py::_anthropic_normalize": {
   "complexity": 19,
-  "coverage": 0.9655,
-  "crap": 19.01,
+  "coverage": 0.9643,
+  "crap": 19.02,
   "digest": "ec3a00ff4872"
  },
  "src/dendrux/llm/_schema.py::_anthropic_note": {
@@ -2221,7 +2230,7 @@
  },
  "src/dendrux/llm/_schema.py::_anthropic_pattern_ok": {
   "complexity": 18,
-  "coverage": 0.9714,
+  "coverage": 0.9706,
   "crap": 18.01,
   "digest": "a8c8b472233a"
  },
@@ -2245,25 +2254,25 @@
  },
  "src/dendrux/llm/_schema.py::_anthropic_walk_owned": {
   "complexity": 1,
-  "coverage": 0.9565,
+  "coverage": 1.0,
   "crap": 1.0,
   "digest": "443a2049b4dd"
  },
  "src/dendrux/llm/_schema.py::_anthropic_walk_owned.<locals>.visit": {
   "complexity": 11,
-  "coverage": 0.9474,
+  "coverage": 0.9444,
   "crap": 11.02,
   "digest": "0878d1b21dc3"
  },
  "src/dendrux/llm/_schema.py::_normalize_object": {
   "complexity": 16,
-  "coverage": 0.96,
+  "coverage": 0.9583,
   "crap": 16.02,
   "digest": "62d99b56751b"
  },
  "src/dendrux/llm/_schema.py::anthropic_strict_budget": {
   "complexity": 14,
-  "coverage": 0.9565,
+  "coverage": 0.9545,
   "crap": 14.02,
   "digest": "3bf9624db98e"
  },
@@ -2329,8 +2338,8 @@
  },
  "src/dendrux/llm/_usage.py::_has_long_ttl_writes": {
   "complexity": 10,
-  "coverage": 0.8667,
-  "crap": 10.24,
+  "coverage": 0.8571,
+  "crap": 10.29,
   "digest": "1f0f8d05a990"
  },
  "src/dendrux/llm/_usage.py::extra_field": {
@@ -2383,14 +2392,14 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._apply_cache_control": {
   "complexity": 6,
-  "coverage": 0.8889,
-  "crap": 6.05,
+  "coverage": 0.8824,
+  "crap": 6.06,
   "digest": "19cec77ec160"
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._apply_output_format": {
   "complexity": 3,
-  "coverage": 0.7778,
-  "crap": 3.1,
+  "coverage": 0.75,
+  "crap": 3.14,
   "digest": "f400ec56f891"
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._apply_thinking": {
@@ -2401,7 +2410,7 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._build_api_kwargs": {
   "complexity": 14,
-  "coverage": 0.9677,
+  "coverage": 0.9667,
   "crap": 14.01,
   "digest": "f45c4f19c844"
  },
@@ -2419,7 +2428,7 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._convert_tools": {
   "complexity": 12,
-  "coverage": 0.9667,
+  "coverage": 0.9655,
   "crap": 12.01,
   "digest": "9073e7648cb7"
  },
@@ -2479,8 +2488,8 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._normalize_structured_response": {
   "complexity": 7,
-  "coverage": 0.9231,
-  "crap": 7.02,
+  "coverage": 0.9167,
+  "crap": 7.03,
   "digest": "ac47739f2f7a"
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._raise_on_refusal": {
@@ -2509,7 +2518,7 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._stream_attempt": {
   "complexity": 32,
-  "coverage": 0.9885,
+  "coverage": 0.9884,
   "crap": 32.0,
   "digest": "ce535e7c7e82"
  },
@@ -2521,8 +2530,8 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._structured_output_tool": {
   "complexity": 5,
-  "coverage": 0.9167,
-  "crap": 5.01,
+  "coverage": 0.9091,
+  "crap": 5.02,
   "digest": "820b159b7004"
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider._tool_result_position": {
@@ -2557,7 +2566,7 @@
  },
  "src/dendrux/llm/anthropic.py::AnthropicProvider.complete": {
   "complexity": 14,
-  "coverage": 0.9756,
+  "coverage": 0.975,
   "crap": 14.0,
   "digest": "feb0de733565"
  },
@@ -2647,8 +2656,8 @@
  },
  "src/dendrux/llm/anthropic.py::_warn_strict_once": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "49e91b40ce93"
  },
  "src/dendrux/llm/base.py::LLMProvider.__aenter__": {
@@ -2773,15 +2782,17 @@
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.__aenter__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "903225e2017d"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "903225e2017d",
+  "waived": "worse"
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.__aexit__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "ea7dd3d05446"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "ea7dd3d05446",
+  "waived": "worse"
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.__init__": {
   "complexity": 3,
@@ -2827,8 +2838,8 @@
  },
  "src/dendrux/llm/openai.py::OpenAIProvider._drain_tool_buffers": {
   "complexity": 6,
-  "coverage": 0.8667,
-  "crap": 6.09,
+  "coverage": 0.8571,
+  "crap": 6.1,
   "digest": "413a23e70cc3"
  },
  "src/dendrux/llm/openai.py::OpenAIProvider._flush_tool_images": {
@@ -2845,8 +2856,8 @@
  },
  "src/dendrux/llm/openai.py::OpenAIProvider._inject_structured_output": {
   "complexity": 1,
-  "coverage": 0.1429,
-  "crap": 1.63,
+  "coverage": 0.0,
+  "crap": 2.0,
   "digest": "e53a7356df73"
  },
  "src/dendrux/llm/openai.py::OpenAIProvider._map_failure": {
@@ -2875,7 +2886,7 @@
  },
  "src/dendrux/llm/openai.py::OpenAIProvider._stream_attempt": {
   "complexity": 43,
-  "coverage": 0.9904,
+  "coverage": 0.9903,
   "crap": 43.0,
   "digest": "e2d59383faca"
  },
@@ -2887,13 +2898,13 @@
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.complete": {
   "complexity": 7,
-  "coverage": 0.931,
+  "coverage": 0.9286,
   "crap": 7.02,
   "digest": "a99410271e9a"
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.complete_stream": {
   "complexity": 3,
-  "coverage": 0.9333,
+  "coverage": 0.9286,
   "crap": 3.0,
   "digest": "e5c55f3aa63c"
  },
@@ -2953,8 +2964,8 @@
  },
  "src/dendrux/llm/openai.py::_track_sse_done": {
   "complexity": 3,
-  "coverage": 0.875,
-  "crap": 3.02,
+  "coverage": 0.8,
+  "crap": 3.07,
   "digest": "e058e38babc9"
  },
  "src/dendrux/llm/openai.py::_track_sse_done.<locals>.tracked": {
@@ -2965,15 +2976,17 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.__aenter__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "0ec424697ffd"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "0ec424697ffd",
+  "waived": "worse"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.__aexit__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "ea7dd3d05446"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "ea7dd3d05446",
+  "waived": "worse"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.__init__": {
   "complexity": 8,
@@ -2995,7 +3008,7 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider._build_api_kwargs": {
   "complexity": 20,
-  "coverage": 0.9535,
+  "coverage": 0.9524,
   "crap": 20.04,
   "digest": "3282cdeb42b6"
  },
@@ -3013,7 +3026,7 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider._convert_messages": {
   "complexity": 24,
-  "coverage": 0.9762,
+  "coverage": 0.9756,
   "crap": 24.01,
   "digest": "b6f90571547c"
  },
@@ -3043,8 +3056,8 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider._inject_structured_output": {
   "complexity": 1,
-  "coverage": 0.1429,
-  "crap": 1.63,
+  "coverage": 0.0,
+  "crap": 2.0,
   "digest": "33d19bb7eab8"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider._map_failure": {
@@ -3067,8 +3080,8 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider._stream_attempt": {
   "complexity": 38,
-  "coverage": 0.9474,
-  "crap": 38.21,
+  "coverage": 0.9468,
+  "crap": 38.22,
   "digest": "917cea530a34"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider._stream_event_image_error": {
@@ -3085,19 +3098,20 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.close": {
   "complexity": 1,
-  "coverage": 0.25,
-  "crap": 1.42,
-  "digest": "5f5f33de554e"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "5f5f33de554e",
+  "waived": "worse"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.complete": {
   "complexity": 7,
-  "coverage": 0.9333,
-  "crap": 7.01,
+  "coverage": 0.931,
+  "crap": 7.02,
   "digest": "524f58adfff2"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.complete_stream": {
   "complexity": 3,
-  "coverage": 0.9286,
+  "coverage": 0.9231,
   "crap": 3.0,
   "digest": "fe72af3f3059"
  },
@@ -3109,8 +3123,8 @@
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.image_input_support": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "f745d3903194"
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.model": {
@@ -3217,14 +3231,14 @@
  },
  "src/dendrux/llm/openrouter.py::OpenRouterProvider._ensure_reasoning_allowed": {
   "complexity": 5,
-  "coverage": 0.8462,
-  "crap": 5.09,
+  "coverage": 0.8333,
+  "crap": 5.12,
   "digest": "759d00ea3dd9"
  },
  "src/dendrux/llm/openrouter.py::OpenRouterProvider._normalize_usage": {
   "complexity": 6,
-  "coverage": 0.75,
-  "crap": 6.56,
+  "coverage": 0.7273,
+  "crap": 6.73,
   "digest": "440f046b6971"
  },
  "src/dendrux/llm/openrouter.py::OpenRouterProvider._reasoning_block": {
@@ -3301,9 +3315,10 @@
  },
  "src/dendrux/llm/openrouter.py::_fetch_catalog": {
   "complexity": 3,
-  "coverage": 0.0909,
-  "crap": 9.76,
-  "digest": "24c3fc10bc50"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "24c3fc10bc50",
+  "waived": "worse"
  },
  "src/dendrux/llm/openrouter.py::_get_catalog": {
   "complexity": 3,
@@ -3343,8 +3358,8 @@
  },
  "src/dendrux/llm/openrouter.py::_read_usage_extra": {
   "complexity": 5,
-  "coverage": 0.8333,
-  "crap": 5.12,
+  "coverage": 0.8182,
+  "crap": 5.15,
   "digest": "d5fc4737ee2b"
  },
  "src/dendrux/llm/structured.py::structured_complete": {
@@ -3445,8 +3460,8 @@
  },
  "src/dendrux/loops/_helpers.py::_InterruptibleStream.__anext__": {
   "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
+  "coverage": 0.8889,
+  "crap": 5.03,
   "digest": "189c45481860"
  },
  "src/dendrux/loops/_helpers.py::_InterruptibleStream.__anext__.<locals>._on_signal": {
@@ -3487,27 +3502,30 @@
  },
  "src/dendrux/loops/_helpers.py::notify_governance": {
   "complexity": 4,
-  "coverage": 0.5556,
-  "crap": 5.4,
-  "digest": "f7cac78ee80d"
+  "coverage": 0.5,
+  "crap": 6.0,
+  "digest": "f7cac78ee80d",
+  "waived": "worse"
  },
  "src/dendrux/loops/_helpers.py::notify_llm": {
   "complexity": 4,
-  "coverage": 0.6667,
-  "crap": 4.59,
+  "coverage": 0.625,
+  "crap": 4.84,
   "digest": "d1d15fd8ef54"
  },
  "src/dendrux/loops/_helpers.py::notify_llm_failed": {
   "complexity": 4,
-  "coverage": 0.5556,
-  "crap": 5.4,
-  "digest": "e94fd27b4433"
+  "coverage": 0.5,
+  "crap": 6.0,
+  "digest": "e94fd27b4433",
+  "waived": "worse"
  },
  "src/dendrux/loops/_helpers.py::notify_llm_started": {
   "complexity": 4,
-  "coverage": 0.5556,
-  "crap": 5.4,
-  "digest": "ab0abc6fd978"
+  "coverage": 0.5,
+  "crap": 6.0,
+  "digest": "ab0abc6fd978",
+  "waived": "worse"
  },
  "src/dendrux/loops/_helpers.py::notify_message": {
   "complexity": 4,
@@ -3517,33 +3535,35 @@
  },
  "src/dendrux/loops/_helpers.py::notify_run_failed": {
   "complexity": 4,
-  "coverage": 0.8889,
-  "crap": 4.02,
+  "coverage": 0.875,
+  "crap": 4.03,
   "digest": "2551c201e4ff"
  },
  "src/dendrux/loops/_helpers.py::notify_run_finished": {
   "complexity": 4,
-  "coverage": 0.6667,
-  "crap": 4.59,
+  "coverage": 0.625,
+  "crap": 4.84,
   "digest": "c4c2d8dfd206"
  },
  "src/dendrux/loops/_helpers.py::notify_run_started": {
   "complexity": 4,
-  "coverage": 0.6667,
-  "crap": 4.59,
+  "coverage": 0.625,
+  "crap": 4.84,
   "digest": "f1e17b2d4bba"
  },
  "src/dendrux/loops/_helpers.py::notify_tool": {
   "complexity": 4,
-  "coverage": 0.5556,
-  "crap": 5.4,
-  "digest": "0a5d69b579b4"
+  "coverage": 0.5,
+  "crap": 6.0,
+  "digest": "0a5d69b579b4",
+  "waived": "worse"
  },
  "src/dendrux/loops/_helpers.py::notify_tool_started": {
   "complexity": 4,
-  "coverage": 0.5556,
-  "crap": 5.4,
-  "digest": "51ab56b8cec7"
+  "coverage": 0.5,
+  "crap": 6.0,
+  "digest": "51ab56b8cec7",
+  "waived": "worse"
  },
  "src/dendrux/loops/_helpers.py::price_response": {
   "complexity": 3,
@@ -3613,7 +3633,7 @@
  },
  "src/dendrux/loops/_images.py::ImageCallSite._on_rejected": {
   "complexity": 19,
-  "coverage": 0.963,
+  "coverage": 0.9615,
   "crap": 19.02,
   "digest": "df2fbeb60f73"
  },
@@ -3673,7 +3693,7 @@
  },
  "src/dendrux/loops/_images.py::_advance_drop": {
   "complexity": 8,
-  "coverage": 0.9333,
+  "coverage": 0.9286,
   "crap": 8.02,
   "digest": "fb948825489e"
  },
@@ -3685,26 +3705,26 @@
  },
  "src/dendrux/loops/_images.py::_call_describe": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
+  "coverage": 0.8333,
+  "crap": 3.04,
   "digest": "eb2e7579e17c"
  },
  "src/dendrux/loops/_images.py::_cap_violation": {
   "complexity": 14,
-  "coverage": 0.8696,
-  "crap": 14.43,
+  "coverage": 0.8636,
+  "crap": 14.5,
   "digest": "8b8b97328618"
  },
  "src/dendrux/loops/_images.py::_capability_key": {
   "complexity": 2,
-  "coverage": 0.8333,
-  "crap": 2.02,
+  "coverage": 0.8,
+  "crap": 2.03,
   "digest": "a4a3706d74c3"
  },
  "src/dendrux/loops/_images.py::_capability_source": {
   "complexity": 4,
-  "coverage": 0.7778,
-  "crap": 4.18,
+  "coverage": 0.75,
+  "crap": 4.25,
   "digest": "75bff745eaa0"
  },
  "src/dendrux/loops/_images.py::_check_descriptor": {
@@ -3733,7 +3753,7 @@
  },
  "src/dendrux/loops/_images.py::_estimate": {
   "complexity": 4,
-  "coverage": 0.9,
+  "coverage": 0.8889,
   "crap": 4.02,
   "digest": "d844e7891993"
  },
@@ -3763,8 +3783,8 @@
  },
  "src/dendrux/loops/_images.py::_read_bytes": {
   "complexity": 3,
-  "coverage": 0.875,
-  "crap": 3.02,
+  "coverage": 0.8571,
+  "crap": 3.03,
   "digest": "f38d02940975"
  },
  "src/dendrux/loops/_images.py::_rebuild": {
@@ -3787,7 +3807,7 @@
  },
  "src/dendrux/loops/_images.py::_scan_images": {
   "complexity": 22,
-  "coverage": 0.975,
+  "coverage": 0.9744,
   "crap": 22.01,
   "digest": "c1d17c1531d3"
  },
@@ -3817,8 +3837,8 @@
  },
  "src/dendrux/loops/_images.py::effective_capability": {
   "complexity": 9,
-  "coverage": 0.9286,
-  "crap": 9.03,
+  "coverage": 0.9231,
+  "crap": 9.04,
   "digest": "49384b36e5f7"
  },
  "src/dendrux/loops/_images.py::has_images": {
@@ -3829,8 +3849,8 @@
  },
  "src/dendrux/loops/_images.py::learn_image_unsupported": {
   "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
+  "coverage": 0.8462,
+  "crap": 4.06,
   "digest": "b2a9ce848202"
  },
  "src/dendrux/loops/_images.py::no_control": {
@@ -3847,15 +3867,16 @@
  },
  "src/dendrux/loops/_images.py::prepare_request": {
   "complexity": 51,
-  "coverage": 0.9677,
+  "coverage": 0.9674,
   "crap": 51.09,
   "digest": "fb833d3d9d28"
  },
  "src/dendrux/loops/_images.py::provider_family": {
   "complexity": 6,
-  "coverage": 0.3846,
-  "crap": 14.39,
-  "digest": "0beb57618b24"
+  "coverage": 0.3333,
+  "crap": 16.67,
+  "digest": "0beb57618b24",
+  "waived": "worse"
  },
  "src/dendrux/loops/_images.py::rejection_candidates": {
   "complexity": 18,
@@ -4003,9 +4024,10 @@
  },
  "src/dendrux/loops/base.py::Loop.run_stream": {
   "complexity": 3,
-  "coverage": 0.1,
-  "crap": 9.56,
-  "digest": "59a78814d936"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "59a78814d936",
+  "waived": "worse"
  },
  "src/dendrux/loops/base.py::LoopNotifier.on_governance_event": {
   "complexity": 1,
@@ -4135,8 +4157,8 @@
  },
  "src/dendrux/loops/react.py::ReActLoop.run": {
   "complexity": 55,
-  "coverage": 0.9329,
-  "crap": 55.91,
+  "coverage": 0.931,
+  "crap": 55.99,
   "digest": "70090d473139"
  },
  "src/dendrux/loops/react.py::ReActLoop.run.<locals>._control_reader": {
@@ -4147,8 +4169,8 @@
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream": {
   "complexity": 57,
-  "coverage": 0.9202,
-  "crap": 58.65,
+  "coverage": 0.9172,
+  "crap": 58.84,
   "digest": "e3ca4bca2495"
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream.<locals>._control_reader": {
@@ -4261,7 +4283,7 @@
  },
  "src/dendrux/loops/react.py::_deliver_inbox": {
   "complexity": 5,
-  "coverage": 0.9286,
+  "coverage": 0.9231,
   "crap": 5.01,
   "digest": "4d2d3ed26428"
  },
@@ -4273,7 +4295,7 @@
  },
  "src/dendrux/loops/react.py::_execute_parallel_group": {
   "complexity": 17,
-  "coverage": 0.9667,
+  "coverage": 0.9655,
   "crap": 17.01,
   "digest": "2873265560dc"
  },
@@ -4315,8 +4337,8 @@
  },
  "src/dendrux/loops/react.py::_ingest_mcp_images": {
   "complexity": 6,
-  "coverage": 0.9167,
-  "crap": 6.02,
+  "coverage": 0.9091,
+  "crap": 6.03,
   "digest": "68f5ed7a2d8d"
  },
  "src/dendrux/loops/react.py::_ingest_tool_images": {
@@ -4333,13 +4355,13 @@
  },
  "src/dendrux/loops/react.py::_interrupted_result": {
   "complexity": 3,
-  "coverage": 0.8333,
-  "crap": 3.04,
+  "coverage": 0.8,
+  "crap": 3.07,
   "digest": "76cd15416432"
  },
  "src/dendrux/loops/react.py::_invoke_tool": {
   "complexity": 5,
-  "coverage": 0.9333,
+  "coverage": 0.9286,
   "crap": 5.01,
   "digest": "15ba47b6875e"
  },
@@ -4381,20 +4403,20 @@
  },
  "src/dendrux/loops/react.py::_read_control": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "fff104686e05"
  },
  "src/dendrux/loops/react.py::_referenced_images": {
   "complexity": 6,
-  "coverage": 0.9545,
+  "coverage": 1.0,
   "crap": 6.0,
   "digest": "288fec159df0"
  },
  "src/dendrux/loops/react.py::_referenced_images.<locals>.walk": {
   "complexity": 9,
-  "coverage": 0.9167,
-  "crap": 9.05,
+  "coverage": 0.9091,
+  "crap": 9.06,
   "digest": "403b36df63aa"
  },
  "src/dendrux/loops/react.py::_restore_params": {
@@ -4447,14 +4469,14 @@
  },
  "src/dendrux/loops/single.py::SingleCall.run": {
   "complexity": 47,
-  "coverage": 0.8211,
-  "crap": 59.64,
+  "coverage": 0.8197,
+  "crap": 59.95,
   "digest": "b5d601f723be"
  },
  "src/dendrux/loops/single.py::SingleCall.run_stream": {
   "complexity": 34,
-  "coverage": 0.9279,
-  "crap": 34.43,
+  "coverage": 0.9273,
+  "crap": 34.44,
   "digest": "69485adc5079"
  },
  "src/dendrux/loops/single.py::_call_usage": {
@@ -4573,26 +4595,26 @@
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter._observe_response": {
   "complexity": 16,
-  "coverage": 0.875,
-  "crap": 16.5,
+  "coverage": 0.871,
+  "crap": 16.55,
   "digest": "8850770a2e88"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter._open": {
   "complexity": 11,
-  "coverage": 0.9565,
+  "coverage": 0.9556,
   "crap": 11.01,
   "digest": "8c5e73a31bdf"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter._require_client": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "b46e05af0c2d"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter._run_lifecycle": {
   "complexity": 4,
-  "coverage": 0.8462,
-  "crap": 4.06,
+  "coverage": 0.8333,
+  "crap": 4.07,
   "digest": "28c924dcef1b"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter._safe_error": {
@@ -4609,21 +4631,22 @@
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter.close": {
   "complexity": 3,
-  "coverage": 0.6,
-  "crap": 3.58,
+  "coverage": 0.5556,
+  "crap": 3.79,
   "digest": "a4ff30f59a81"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter.connect": {
   "complexity": 4,
-  "coverage": 0.5385,
-  "crap": 5.57,
+  "coverage": 0.5,
+  "crap": 6.0,
   "digest": "90698388207f"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter.connected": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "de0bc2f554e8"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "de0bc2f554e8",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter.list_tools": {
   "complexity": 4,
@@ -4639,8 +4662,8 @@
  },
  "src/dendrux/mcp/_client.py::_diagnostic_origin": {
   "complexity": 6,
-  "coverage": 0.875,
-  "crap": 6.07,
+  "coverage": 0.8571,
+  "crap": 6.1,
   "digest": "b702cd51ab95"
  },
  "src/dendrux/mcp/_client.py::_is_session_rejection": {
@@ -4783,20 +4806,22 @@
  },
  "src/dendrux/mcp/_host.py::MCPHost.__aenter__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "044939872171"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "044939872171",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_host.py::MCPHost.__aexit__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "ea7dd3d05446"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "ea7dd3d05446",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_host.py::MCPHost.__init__": {
   "complexity": 8,
-  "coverage": 0.7647,
-  "crap": 8.83,
+  "coverage": 0.75,
+  "crap": 9.0,
   "digest": "7d50adc898fe"
  },
  "src/dendrux/mcp/_host.py::MCPHost._close_servers": {
@@ -4807,26 +4832,26 @@
  },
  "src/dendrux/mcp/_host.py::MCPHost._create_executor": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "ed7470f2a934"
  },
  "src/dendrux/mcp/_host.py::MCPHost._discover": {
   "complexity": 4,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 4.01,
   "digest": "10c2fdd9bf05"
  },
  "src/dendrux/mcp/_host.py::MCPHost.close": {
   "complexity": 2,
-  "coverage": 0.8333,
-  "crap": 2.02,
+  "coverage": 0.8,
+  "crap": 2.03,
   "digest": "afa3dd54c1bf"
  },
  "src/dendrux/mcp/_host.py::MCPHost.refresh": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "7fefc4210759"
  },
  "src/dendrux/mcp/_host.py::MCPHost.tool_sources": {
@@ -4861,15 +4886,17 @@
  },
  "src/dendrux/mcp/_host.py::_HostedMCPServer.last_error": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "3692500291a0"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "3692500291a0",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_host.py::_HostedMCPServer.last_error#2": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "1f61b6a98bf9"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "1f61b6a98bf9",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_http.py::CappedResponseStream.__aiter__": {
   "complexity": 3,
@@ -4975,8 +5002,8 @@
  },
  "src/dendrux/mcp/_http.py::_map_errors": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "d909d64cda90"
  },
  "src/dendrux/mcp/_http.py::_origin": {
@@ -4987,14 +5014,14 @@
  },
  "src/dendrux/mcp/_http.py::create_http_client": {
   "complexity": 8,
-  "coverage": 0.9545,
-  "crap": 8.01,
+  "coverage": 1.0,
+  "crap": 8.0,
   "digest": "2223e0db5a87"
  },
  "src/dendrux/mcp/_http.py::create_http_client.<locals>.scope_credentials": {
   "complexity": 7,
-  "coverage": 0.9091,
-  "crap": 7.04,
+  "coverage": 0.9,
+  "crap": 7.05,
   "digest": "35c1a1fc4efd"
  },
  "src/dendrux/mcp/_http.py::wire_cap": {
@@ -5005,7 +5032,7 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth.__init__": {
   "complexity": 8,
-  "coverage": 0.9615,
+  "coverage": 0.96,
   "crap": 8.0,
   "digest": "22e4b7f63b44"
  },
@@ -5017,8 +5044,8 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._begin": {
   "complexity": 24,
-  "coverage": 0.913,
-  "crap": 24.38,
+  "coverage": 0.9111,
+  "crap": 24.4,
   "digest": "d9bdc36c66d4"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._child_done": {
@@ -5029,14 +5056,14 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._close_impl": {
   "complexity": 9,
-  "coverage": 0.9231,
-  "crap": 9.04,
+  "coverage": 0.9167,
+  "crap": 9.05,
   "digest": "bd116f47dfed"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._complete": {
   "complexity": 34,
-  "coverage": 0.8868,
-  "crap": 35.68,
+  "coverage": 0.8846,
+  "crap": 35.78,
   "digest": "86efa5bc807f"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._consume": {
@@ -5047,26 +5074,26 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._discover": {
   "complexity": 39,
-  "coverage": 0.9,
-  "crap": 40.52,
+  "coverage": 0.9024,
+  "crap": 40.41,
   "digest": "aa5ecb8e234d"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._discover.<locals>.endpoint": {
   "complexity": 5,
-  "coverage": 0.875,
-  "crap": 5.05,
+  "coverage": 0.8571,
+  "crap": 5.07,
   "digest": "952245894226"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._get_json": {
   "complexity": 8,
-  "coverage": 0.9231,
-  "crap": 8.03,
+  "coverage": 0.9167,
+  "crap": 8.04,
   "digest": "6b90433602c7"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._load": {
   "complexity": 5,
-  "coverage": 0.9091,
-  "crap": 5.02,
+  "coverage": 0.9,
+  "crap": 5.03,
   "digest": "4fd5a81a6426"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._now": {
@@ -5083,26 +5110,26 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._probe": {
   "complexity": 5,
-  "coverage": 0.9167,
-  "crap": 5.01,
+  "coverage": 0.9091,
+  "crap": 5.02,
   "digest": "cb793cd54be0"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._remote_revoke": {
   "complexity": 7,
-  "coverage": 0.9375,
+  "coverage": 0.9333,
   "crap": 7.01,
   "digest": "19d42c011644"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._resolve_client": {
   "complexity": 29,
-  "coverage": 0.8293,
-  "crap": 33.19,
+  "coverage": 0.825,
+  "crap": 33.51,
   "digest": "ce18f60b66e5"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._revoke": {
   "complexity": 10,
-  "coverage": 0.8947,
-  "crap": 10.12,
+  "coverage": 0.8889,
+  "crap": 10.14,
   "digest": "06f700f4ab38"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._run": {
@@ -5119,8 +5146,8 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._save_flow": {
   "complexity": 3,
-  "coverage": 0.625,
-  "crap": 3.47,
+  "coverage": 0.5714,
+  "crap": 3.71,
   "digest": "6092a16c8453"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._send": {
@@ -5131,14 +5158,14 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._status": {
   "complexity": 12,
-  "coverage": 0.8889,
-  "crap": 12.2,
+  "coverage": 0.8824,
+  "crap": 12.23,
   "digest": "8acee4da21c8"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._take_flow": {
   "complexity": 5,
-  "coverage": 0.6667,
-  "crap": 5.93,
+  "coverage": 0.6364,
+  "crap": 6.2,
   "digest": "6f1b39feddd8"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._url": {
@@ -5155,7 +5182,7 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuth._write": {
   "complexity": 5,
-  "coverage": 0.9375,
+  "coverage": 0.9286,
   "crap": 5.01,
   "digest": "120eaa6ce8ce"
  },
@@ -5209,14 +5236,14 @@
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuthClient.dynamic": {
   "complexity": 17,
-  "coverage": 0.8182,
-  "crap": 18.74,
+  "coverage": 0.8095,
+  "crap": 19.0,
   "digest": "41208f416331"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuthClient.preregistered": {
   "complexity": 12,
-  "coverage": 0.8947,
-  "crap": 12.17,
+  "coverage": 0.8889,
+  "crap": 12.2,
   "digest": "dfb0f11df507"
  },
  "src/dendrux/mcp/_oauth.py::MCPOAuthClientRecord.__repr__": {
@@ -5323,7 +5350,7 @@
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider.__init__": {
   "complexity": 5,
-  "coverage": 0.9286,
+  "coverage": 0.9231,
   "crap": 5.01,
   "digest": "1d3aee5ae4a8"
  },
@@ -5335,7 +5362,7 @@
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider._cleanup": {
   "complexity": 5,
-  "coverage": 0.9286,
+  "coverage": 0.9231,
   "crap": 5.01,
   "digest": "3c5de25f5672"
  },
@@ -5347,7 +5374,7 @@
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider._get_auth": {
   "complexity": 15,
-  "coverage": 0.9333,
+  "coverage": 0.931,
   "crap": 15.07,
   "digest": "9f58182f0bef"
  },
@@ -5365,8 +5392,8 @@
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider._refresh_locked": {
   "complexity": 47,
-  "coverage": 0.9174,
-  "crap": 48.24,
+  "coverage": 0.9167,
+  "crap": 48.28,
   "digest": "486aa261150f"
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider._required": {
@@ -5395,9 +5422,10 @@
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider.oauth": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "6e366b6a40cf"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "6e366b6a40cf",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider.on_auth_rejected": {
   "complexity": 1,
@@ -5461,8 +5489,8 @@
  },
  "src/dendrux/mcp/_oauth.py::_parse_token": {
   "complexity": 2,
-  "coverage": 0.6,
-  "crap": 2.26,
+  "coverage": 0.5,
+  "crap": 2.5,
   "digest": "ad89365bf602"
  },
  "src/dendrux/mcp/_oauth.py::_parse_token_fields": {
@@ -5479,8 +5507,8 @@
  },
  "src/dendrux/mcp/_oauth.py::_positive": {
   "complexity": 7,
-  "coverage": 0.8571,
-  "crap": 7.14,
+  "coverage": 0.8333,
+  "crap": 7.23,
   "digest": "52245c287f5d"
  },
  "src/dendrux/mcp/_oauth.py::_sample_flow": {
@@ -5497,9 +5525,10 @@
  },
  "src/dendrux/mcp/_oauth.py::_scope_tokens": {
   "complexity": 5,
-  "coverage": 0.75,
-  "crap": 5.39,
-  "digest": "9d17e1ef7395"
+  "coverage": 0.6667,
+  "crap": 5.93,
+  "digest": "9d17e1ef7395",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_oauth.py::_usable": {
   "complexity": 1,
@@ -5527,26 +5556,26 @@
  },
  "src/dendrux/mcp/_oauth_http.py::OAuthHTTP._close_response": {
   "complexity": 1,
-  "coverage": 0.9,
+  "coverage": 1.0,
   "crap": 1.0,
   "digest": "e03d7cde6a95"
  },
  "src/dendrux/mcp/_oauth_http.py::OAuthHTTP._close_response.<locals>.close": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "a4fbfd54e71b"
  },
  "src/dendrux/mcp/_oauth_http.py::OAuthHTTP._precheck": {
   "complexity": 15,
-  "coverage": 0.7941,
-  "crap": 16.96,
+  "coverage": 0.7879,
+  "crap": 17.15,
   "digest": "1d1a45ec1b98"
  },
  "src/dendrux/mcp/_oauth_http.py::OAuthHTTP.aclose": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.7143,
+  "crap": 3.21,
   "digest": "70d6a86f1dce"
  },
  "src/dendrux/mcp/_oauth_http.py::OAuthHTTP.send": {
@@ -5581,8 +5610,8 @@
  },
  "src/dendrux/mcp/_oauth_http.py::_valid_host": {
   "complexity": 6,
-  "coverage": 0.7143,
-  "crap": 6.84,
+  "coverage": 0.6667,
+  "crap": 7.33,
   "digest": "67a1884b8ef3"
  },
  "src/dendrux/mcp/_oauth_http.py::canonical_url": {
@@ -5593,8 +5622,8 @@
  },
  "src/dendrux/mcp/_oauth_http.py::is_loopback_host": {
   "complexity": 4,
-  "coverage": 0.8889,
-  "crap": 4.02,
+  "coverage": 0.875,
+  "crap": 4.03,
   "digest": "2ec8c0a43c8f"
  },
  "src/dendrux/mcp/_oauth_http.py::origin_of": {
@@ -5617,9 +5646,10 @@
  },
  "src/dendrux/mcp/_observability.py::MCPConnectionSnapshot.identity": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "9cd02038f7c7"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "9cd02038f7c7",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_observability.py::MCPOAuthRefreshFailed.__repr__": {
   "complexity": 1,
@@ -5647,9 +5677,10 @@
  },
  "src/dendrux/mcp/_observability.py::MCPOpenCircuitSnapshot.identity": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "9cd02038f7c7"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "9cd02038f7c7",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_observability.py::MCPRuntimeObserver.on_event": {
   "complexity": 1,
@@ -5665,8 +5696,8 @@
  },
  "src/dendrux/mcp/_result.py::_image_input": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.7143,
+  "crap": 3.21,
   "digest": "c3cbaa3ca40a"
  },
  "src/dendrux/mcp/_result.py::_is_image": {
@@ -5683,13 +5714,14 @@
  },
  "src/dendrux/mcp/_result.py::_model_dump": {
   "complexity": 4,
-  "coverage": 0.3333,
-  "crap": 8.74,
-  "digest": "5eabaa9fd34d"
+  "coverage": 0.25,
+  "crap": 10.75,
+  "digest": "5eabaa9fd34d",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_result.py::_normalize_with_parts": {
   "complexity": 7,
-  "coverage": 0.9474,
+  "coverage": 0.9444,
   "crap": 7.01,
   "digest": "bc9f99db933f"
  },
@@ -5707,7 +5739,7 @@
  },
  "src/dendrux/mcp/_result.py::normalize_mcp_result": {
   "complexity": 11,
-  "coverage": 0.9474,
+  "coverage": 0.9444,
   "crap": 11.02,
   "digest": "437d6a8f1f07"
  },
@@ -5719,8 +5751,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPConnection.call_tool": {
   "complexity": 21,
-  "coverage": 0.9333,
-  "crap": 21.13,
+  "coverage": 0.9,
+  "crap": 21.44,
   "digest": "13ac5c6a5d48"
  },
  "src/dendrux/mcp/_runtime.py::MCPConnection.discover": {
@@ -5815,8 +5847,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._check_call_state": {
   "complexity": 10,
-  "coverage": 0.9333,
-  "crap": 10.03,
+  "coverage": 0.9286,
+  "crap": 10.04,
   "digest": "e2cd3bc01168"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._circuit_retry_after": {
@@ -5833,7 +5865,7 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._close_impl": {
   "complexity": 25,
-  "coverage": 0.9792,
+  "coverage": 0.9783,
   "crap": 25.01,
   "digest": "aa34c008023e"
  },
@@ -5851,8 +5883,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._connection_lost": {
   "complexity": 7,
-  "coverage": 0.8571,
-  "crap": 7.14,
+  "coverage": 0.85,
+  "crap": 7.17,
   "digest": "3287511d90ec"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._consume_task_exception": {
@@ -5875,8 +5907,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._emit": {
   "complexity": 9,
-  "coverage": 0.8095,
-  "crap": 9.56,
+  "coverage": 0.8,
+  "crap": 9.65,
   "digest": "f8a2a5c4e401"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._emit_call_terminal": {
@@ -5917,7 +5949,7 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._enqueue_admission": {
   "complexity": 3,
-  "coverage": 0.9,
+  "coverage": 0.8889,
   "crap": 3.01,
   "digest": "7af58e9251d2"
  },
@@ -5929,8 +5961,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._entry_status": {
   "complexity": 8,
-  "coverage": 0.9,
-  "crap": 8.06,
+  "coverage": 0.8889,
+  "crap": 8.09,
   "digest": "1e6d195b06e4"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._establish_connection": {
@@ -5959,8 +5991,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._execute_call": {
   "complexity": 29,
-  "coverage": 0.9697,
-  "crap": 29.02,
+  "coverage": 0.9667,
+  "crap": 29.03,
   "digest": "7083bdb7bda8"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._execute_call.<locals>._cancelled_event": {
@@ -6055,8 +6087,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._on_idle_expired": {
   "complexity": 4,
-  "coverage": 0.8571,
-  "crap": 4.05,
+  "coverage": 0.8333,
+  "crap": 4.07,
   "digest": "35ac6eab0cf1"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._open_connection": {
@@ -6067,8 +6099,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._pump_admissions": {
   "complexity": 5,
-  "coverage": 0.6667,
-  "crap": 5.93,
+  "coverage": 0.6364,
+  "crap": 6.2,
   "digest": "f16a0c3d6d81"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._pump_calls": {
@@ -6079,14 +6111,14 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._ready_entry": {
   "complexity": 14,
-  "coverage": 0.9333,
+  "coverage": 0.931,
   "crap": 14.06,
   "digest": "403d5555bdc6"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._reauthenticate": {
   "complexity": 7,
-  "coverage": 0.8125,
-  "crap": 7.32,
+  "coverage": 0.8,
+  "crap": 7.39,
   "digest": "c4f9d12b96cb"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._record_circuit_connection_success": {
@@ -6103,8 +6135,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._record_healthy_tool_response": {
   "complexity": 4,
-  "coverage": 0.8462,
-  "crap": 4.06,
+  "coverage": 0.8333,
+  "crap": 4.07,
   "digest": "812f21c3c75d"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._release": {
@@ -6163,20 +6195,20 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._rotate": {
   "complexity": 17,
-  "coverage": 0.973,
+  "coverage": 0.9722,
   "crap": 17.01,
   "digest": "52a06797ac48"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._rotate_entry": {
   "complexity": 17,
-  "coverage": 0.9556,
+  "coverage": 0.9545,
   "crap": 17.03,
   "digest": "2c5c60ba1e69"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._rotation_registration": {
   "complexity": 4,
-  "coverage": 0.8889,
-  "crap": 4.02,
+  "coverage": 0.875,
+  "crap": 4.03,
   "digest": "ca7cd5dab18c"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._settle_teardown_tasks": {
@@ -6211,8 +6243,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._try_pressure_retire": {
   "complexity": 11,
-  "coverage": 0.9375,
-  "crap": 11.03,
+  "coverage": 0.9333,
+  "crap": 11.04,
   "digest": "24b8c536107c"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime._validate_binding": {
@@ -6247,7 +6279,7 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime.bind": {
   "complexity": 19,
-  "coverage": 0.975,
+  "coverage": 0.9744,
   "crap": 19.01,
   "digest": "bf0bacef5f1b"
  },
@@ -6283,8 +6315,8 @@
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime.rotate_credentials": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
+  "coverage": 0.8333,
+  "crap": 3.04,
   "digest": "18e3fed21853"
  },
  "src/dendrux/mcp/_runtime.py::MCPRuntime.snapshot": {
@@ -6367,14 +6399,14 @@
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._create_executor": {
   "complexity": 6,
-  "coverage": 0.9688,
+  "coverage": 1.0,
   "crap": 6.0,
   "digest": "f01a9a3660ca"
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._create_executor.<locals>.guarded_executor": {
   "complexity": 8,
-  "coverage": 1.0,
-  "crap": 8.0,
+  "coverage": 0.9231,
+  "crap": 8.03,
   "digest": "bf974ad6ada5"
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._create_executor.<locals>.inactive": {
@@ -6385,14 +6417,14 @@
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._create_executor.<locals>.lease_check": {
   "complexity": 1,
-  "coverage": 0.8571,
+  "coverage": 1.0,
   "crap": 1.0,
   "digest": "18c8eca534fd"
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._create_executor.<locals>.lease_check.<locals>.check_lease": {
   "complexity": 4,
-  "coverage": 0.8,
-  "crap": 4.13,
+  "coverage": 0.75,
+  "crap": 4.25,
   "digest": "b385c52bbe79"
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._discover": {
@@ -6403,8 +6435,8 @@
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource._relink": {
   "complexity": 7,
-  "coverage": 0.7059,
-  "crap": 8.25,
+  "coverage": 0.6875,
+  "crap": 8.5,
   "digest": "24a9e17d786c"
  },
  "src/dendrux/mcp/_runtime.py::_ViewToolSource.close": {
@@ -6415,8 +6447,8 @@
  },
  "src/dendrux/mcp/_runtime.py::_apply_oauth_credentials": {
   "complexity": 7,
-  "coverage": 0.8571,
-  "crap": 7.14,
+  "coverage": 0.8333,
+  "crap": 7.23,
   "digest": "8a173e1df531"
  },
  "src/dendrux/mcp/_runtime.py::_apply_source_credentials": {
@@ -6445,8 +6477,8 @@
  },
  "src/dendrux/mcp/_runtime.py::_diagnostic_tool_name": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "607d23c8335a"
  },
  "src/dendrux/mcp/_runtime.py::_is_insufficient_scope": {
@@ -6535,20 +6567,20 @@
  },
  "src/dendrux/mcp/_server.py::MCPServer._create_executor": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "7652eb50e323"
  },
  "src/dendrux/mcp/_server.py::MCPServer._discover": {
   "complexity": 5,
-  "coverage": 0.9474,
+  "coverage": 0.9444,
   "crap": 5.0,
   "digest": "fecafd8103c2"
  },
  "src/dendrux/mcp/_server.py::MCPServer.close": {
   "complexity": 6,
-  "coverage": 0.7857,
-  "crap": 6.35,
+  "coverage": 0.7692,
+  "crap": 6.44,
   "digest": "388f098d5a27"
  },
  "src/dendrux/mcp/_server.py::MCPServer.from_source": {
@@ -6625,9 +6657,10 @@
  },
  "src/dendrux/mcp/_source.py::MCPSource.__post_init__": {
   "complexity": 38,
-  "coverage": 0.7609,
-  "crap": 57.75,
-  "digest": "971742101167"
+  "coverage": 0.7556,
+  "crap": 59.09,
+  "digest": "971742101167",
+  "waived": "worse"
  },
  "src/dendrux/mcp/_source.py::MCPSource.http": {
   "complexity": 2,
@@ -6643,8 +6676,8 @@
  },
  "src/dendrux/mcp/_source.py::MCPSource.stdio": {
   "complexity": 4,
-  "coverage": 0.75,
-  "crap": 4.25,
+  "coverage": 0.6667,
+  "crap": 4.59,
   "digest": "eb2db75c2161"
  },
  "src/dendrux/mcp/_source.py::MCPSource.transport": {
@@ -6661,8 +6694,8 @@
  },
  "src/dendrux/mcp/_source.py::_copy_string_mapping": {
   "complexity": 10,
-  "coverage": 0.875,
-  "crap": 10.2,
+  "coverage": 0.8571,
+  "crap": 10.29,
   "digest": "7f3953c25d99"
  },
  "src/dendrux/mcp/_source.py::exception_class_name": {
@@ -6685,8 +6718,8 @@
  },
  "src/dendrux/mcp/_source.py::redact_source_value": {
   "complexity": 14,
-  "coverage": 0.9444,
-  "crap": 14.03,
+  "coverage": 0.9412,
+  "crap": 14.04,
   "digest": "6f93a2de0822"
  },
  "src/dendrux/mcp/_source.py::redact_transport_text": {
@@ -6883,15 +6916,17 @@
  },
  "src/dendrux/media/_fetch.py::_PinnedBackend.connect_unix_socket": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "8a78aa67339a"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "8a78aa67339a",
+  "waived": "worse"
  },
  "src/dendrux/media/_fetch.py::_PinnedBackend.sleep": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "af8aa4580091"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "af8aa4580091",
+  "waived": "worse"
  },
  "src/dendrux/media/_fetch.py::_PinnedTransport.__init__": {
   "complexity": 1,
@@ -6937,7 +6972,7 @@
  },
  "src/dendrux/media/_fetch.py::_fetch_hops": {
   "complexity": 13,
-  "coverage": 0.9355,
+  "coverage": 0.9333,
   "crap": 13.05,
   "digest": "3a4aca69701a"
  },
@@ -6949,15 +6984,16 @@
  },
  "src/dendrux/media/_fetch.py::_literal_ip": {
   "complexity": 7,
-  "coverage": 0.8182,
-  "crap": 7.29,
+  "coverage": 0.8,
+  "crap": 7.39,
   "digest": "9d864c63ef00"
  },
  "src/dendrux/media/_fetch.py::_system_resolve": {
   "complexity": 2,
-  "coverage": 0.3333,
-  "crap": 3.19,
-  "digest": "135e03de9a90"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "135e03de9a90",
+  "waived": "worse"
  },
  "src/dendrux/media/_fetch.py::fetch_url": {
   "complexity": 15,
@@ -7057,20 +7093,20 @@
  },
  "src/dendrux/media/_image.py::_safe_host": {
   "complexity": 3,
-  "coverage": 0.5714,
-  "crap": 3.71,
+  "coverage": 0.5,
+  "crap": 4.12,
   "digest": "af1101b565df"
  },
  "src/dendrux/media/_ingest.py::_abandon_own_pending": {
   "complexity": 4,
-  "coverage": 0.8182,
-  "crap": 4.1,
+  "coverage": 0.8,
+  "crap": 4.13,
   "digest": "c4363a9887b6"
  },
  "src/dendrux/media/_ingest.py::_canonical_ref": {
   "complexity": 7,
-  "coverage": 0.9231,
-  "crap": 7.02,
+  "coverage": 0.9167,
+  "crap": 7.03,
   "digest": "0355062c841f"
  },
  "src/dendrux/media/_ingest.py::_catalog_now": {
@@ -7087,8 +7123,8 @@
  },
  "src/dendrux/media/_ingest.py::_is_stale_pending": {
   "complexity": 3,
-  "coverage": 0.8,
-  "crap": 3.07,
+  "coverage": 0.75,
+  "crap": 3.14,
   "digest": "07b96c9ffcce"
  },
  "src/dendrux/media/_ingest.py::_lookup_refs": {
@@ -7153,8 +7189,8 @@
  },
  "src/dendrux/media/_ingest.py::_store_blob": {
   "complexity": 23,
-  "coverage": 0.9298,
-  "crap": 23.18,
+  "coverage": 0.9464,
+  "crap": 23.08,
   "digest": "6e8974ef94c0"
  },
  "src/dendrux/media/_ingest.py::_validate_bytes": {
@@ -7165,13 +7201,13 @@
  },
  "src/dendrux/media/_ingest.py::check_image_policy": {
   "complexity": 7,
-  "coverage": 0.8333,
-  "crap": 7.23,
+  "coverage": 0.8182,
+  "crap": 7.29,
   "digest": "902a5d66409a"
  },
  "src/dendrux/media/_ingest.py::ingest": {
   "complexity": 28,
-  "coverage": 0.9833,
+  "coverage": 0.9831,
   "crap": 28.0,
   "digest": "c2cf884573d5"
  },
@@ -7189,8 +7225,8 @@
  },
  "src/dendrux/media/_policy.py::UrlPolicy.__post_init__": {
   "complexity": 25,
-  "coverage": 0.8788,
-  "crap": 26.11,
+  "coverage": 0.875,
+  "crap": 26.22,
   "digest": "502a7000b340"
  },
  "src/dendrux/media/_policy.py::_positive_int": {
@@ -7207,8 +7243,8 @@
  },
  "src/dendrux/media/_read.py::_read_path_sync": {
   "complexity": 11,
-  "coverage": 0.8529,
-  "crap": 11.38,
+  "coverage": 0.8485,
+  "crap": 11.42,
   "digest": "38d864d7866c"
  },
  "src/dendrux/media/_read.py::check_bytes_source": {
@@ -7255,14 +7291,14 @@
  },
  "src/dendrux/media/_sniff.py::_parse_gif": {
   "complexity": 12,
-  "coverage": 0.9091,
-  "crap": 12.11,
+  "coverage": 0.9062,
+  "crap": 12.12,
   "digest": "45a8041e6a7e"
  },
  "src/dendrux/media/_sniff.py::_parse_jpeg": {
   "complexity": 28,
-  "coverage": 0.913,
-  "crap": 28.52,
+  "coverage": 0.9111,
+  "crap": 28.55,
   "digest": "157a830e5cd7"
  },
  "src/dendrux/media/_sniff.py::_parse_png": {
@@ -7273,20 +7309,20 @@
  },
  "src/dendrux/media/_sniff.py::_parse_webp": {
   "complexity": 23,
-  "coverage": 0.8947,
-  "crap": 23.62,
+  "coverage": 0.8929,
+  "crap": 23.65,
   "digest": "72bb3b6afd9e"
  },
  "src/dendrux/media/_sniff.py::_skip_gif_subblocks": {
   "complexity": 5,
-  "coverage": 0.9167,
-  "crap": 5.01,
+  "coverage": 0.9091,
+  "crap": 5.02,
   "digest": "2c78441e26bb"
  },
  "src/dendrux/media/_sniff.py::_u32be": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "75cbae7021dd"
  },
  "src/dendrux/media/_sniff.py::inspect_image": {
@@ -7441,27 +7477,31 @@
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_governance_event": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "010ea7239a89"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "010ea7239a89",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_completed": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "84618c4e4a43"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "84618c4e4a43",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_failed": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "15a30df87f7a"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "15a30df87f7a",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_started": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "72d9076c04f6"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "72d9076c04f6",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_message_appended": {
   "complexity": 3,
@@ -7471,33 +7511,38 @@
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_run_failed": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "abc498d1141b"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "abc498d1141b",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_run_finished": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "7b38b56a0f63"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "7b38b56a0f63",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_run_started": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "84fc456facf2"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "84fc456facf2",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_tool_completed": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "e959f26f0d60"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "e959f26f0d60",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_tool_started": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "bccd317afd39"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "bccd317afd39",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.__init__": {
   "complexity": 1,
@@ -7507,9 +7552,10 @@
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_governance_event": {
   "complexity": 17,
-  "coverage": 0.3559,
-  "crap": 94.21,
-  "digest": "a91f7cc8c702"
+  "coverage": 0.3448,
+  "crap": 98.28,
+  "digest": "a91f7cc8c702",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_llm_call_completed": {
   "complexity": 9,
@@ -7519,15 +7565,17 @@
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_llm_call_failed": {
   "complexity": 2,
-  "coverage": 0.3333,
-  "crap": 3.19,
-  "digest": "4e4a60367449"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "4e4a60367449",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_llm_call_started": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "ac8e2918a6cd"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "ac8e2918a6cd",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_message_appended": {
   "complexity": 5,
@@ -7537,50 +7585,56 @@
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_run_failed": {
   "complexity": 1,
-  "coverage": 0.3333,
-  "crap": 1.3,
-  "digest": "ffbe9df81b2b"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "ffbe9df81b2b",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_run_finished": {
   "complexity": 2,
-  "coverage": 0.3333,
-  "crap": 3.19,
-  "digest": "f5fa58ff894b"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "f5fa58ff894b",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_run_started": {
   "complexity": 5,
-  "coverage": 0.1429,
-  "crap": 20.74,
-  "digest": "6e2101c19363"
+  "coverage": 0.0,
+  "crap": 30.0,
+  "digest": "6e2101c19363",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_tool_completed": {
   "complexity": 7,
-  "coverage": 0.9333,
-  "crap": 7.01,
+  "coverage": 0.9286,
+  "crap": 7.02,
   "digest": "5a432d2f86d1"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_tool_started": {
   "complexity": 3,
-  "coverage": 0.1667,
-  "crap": 8.21,
-  "digest": "c34239d69035"
+  "coverage": 0.0,
+  "crap": 12.0,
+  "digest": "c34239d69035",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.print_summary": {
   "complexity": 13,
-  "coverage": 0.0455,
-  "crap": 159.99,
-  "digest": "6c35619cdbba"
+  "coverage": 0.0,
+  "crap": 182.0,
+  "digest": "6c35619cdbba",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::_format_params": {
   "complexity": 5,
-  "coverage": 0.0769,
-  "crap": 24.66,
-  "digest": "3978790684c3"
+  "coverage": 0.0,
+  "crap": 30.0,
+  "digest": "3978790684c3",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/console.py::_truncate": {
   "complexity": 2,
-  "coverage": 0.75,
-  "crap": 2.06,
+  "coverage": 0.6667,
+  "crap": 2.15,
   "digest": "7bdb49060f57"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.__init__": {
@@ -7591,9 +7645,10 @@
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.__repr__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "66aaed027ded"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "66aaed027ded",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier._child_context": {
   "complexity": 2,
@@ -7603,32 +7658,32 @@
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier._close_orphan_children": {
   "complexity": 14,
-  "coverage": 0.7586,
-  "crap": 16.76,
+  "coverage": 0.75,
+  "crap": 17.06,
   "digest": "9cc45d30b5af"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier._set_image_attributes": {
   "complexity": 9,
-  "coverage": 0.8824,
-  "crap": 9.13,
+  "coverage": 0.875,
+  "crap": 9.16,
   "digest": "c7ed2f547e8e"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_governance_event": {
   "complexity": 5,
-  "coverage": 0.7692,
-  "crap": 5.31,
+  "coverage": 0.75,
+  "crap": 5.39,
   "digest": "d1c3d5cb1567"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_llm_call_completed": {
   "complexity": 8,
-  "coverage": 0.9474,
+  "coverage": 0.9444,
   "crap": 8.01,
   "digest": "a884a36725cf"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_llm_call_failed": {
   "complexity": 4,
-  "coverage": 0.75,
-  "crap": 4.25,
+  "coverage": 0.7273,
+  "crap": 4.32,
   "digest": "d00b1d5dd4ee"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_llm_call_started": {
@@ -7639,8 +7694,8 @@
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_run_failed": {
   "complexity": 4,
-  "coverage": 0.7857,
-  "crap": 4.16,
+  "coverage": 0.7692,
+  "crap": 4.2,
   "digest": "64d8aa1a0e33"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_run_finished": {
@@ -7657,26 +7712,27 @@
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_tool_completed": {
   "complexity": 5,
-  "coverage": 0.9286,
+  "coverage": 0.9231,
   "crap": 5.01,
   "digest": "ce9b0430936d"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_tool_started": {
   "complexity": 4,
-  "coverage": 0.8,
-  "crap": 4.13,
+  "coverage": 0.7778,
+  "crap": 4.18,
   "digest": "acc376dad83d"
  },
  "src/dendrux/notifiers/otel.py::_image_family": {
   "complexity": 5,
-  "coverage": 0.5,
-  "crap": 8.12,
-  "digest": "ac4401747b7b"
+  "coverage": 0.4444,
+  "crap": 9.29,
+  "digest": "ac4401747b7b",
+  "waived": "worse"
  },
  "src/dendrux/notifiers/otel.py::_to_attr_value": {
   "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
+  "coverage": 0.6667,
+  "crap": 3.33,
   "digest": "a53957eb72b2"
  },
  "src/dendrux/pricing.py::ModelPricing.__post_init__": {
@@ -7747,8 +7803,8 @@
  },
  "src/dendrux/pricing.py::_warn_cache_tokens_not_chosen": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.7143,
+  "crap": 3.21,
   "digest": "fe5e0c80f9bf"
  },
  "src/dendrux/pricing.py::check_budget_config": {
@@ -7795,8 +7851,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::CachingBlobResolver._put": {
   "complexity": 4,
-  "coverage": 0.8182,
-  "crap": 4.1,
+  "coverage": 0.8,
+  "crap": 4.13,
   "digest": "79fa5b003e37"
  },
  "src/dendrux/runtime/_blob_catalog.py::CachingBlobResolver.cached_bytes": {
@@ -7825,14 +7881,15 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._can_touch_object": {
   "complexity": 3,
-  "coverage": 0.6,
-  "crap": 3.58,
-  "digest": "31afd2101303"
+  "coverage": 0.5,
+  "crap": 4.12,
+  "digest": "31afd2101303",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._collect": {
   "complexity": 9,
-  "coverage": 0.913,
-  "crap": 9.05,
+  "coverage": 0.9091,
+  "crap": 9.06,
   "digest": "2139d7d84bed"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._delete_object": {
@@ -7855,14 +7912,14 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._guarded": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "487beb362110"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._recover": {
   "complexity": 7,
-  "coverage": 0.85,
-  "crap": 7.17,
+  "coverage": 0.8421,
+  "crap": 7.19,
   "digest": "996790df3f1e"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._require_catalog": {
@@ -7879,8 +7936,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor.collect_garbage": {
   "complexity": 6,
-  "coverage": 0.8947,
-  "crap": 6.04,
+  "coverage": 0.8889,
+  "crap": 6.05,
   "digest": "b8623d0ccf5e"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor.info": {
@@ -7891,14 +7948,14 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor.purge": {
   "complexity": 8,
-  "coverage": 0.95,
+  "coverage": 0.9474,
   "crap": 8.01,
   "digest": "37fbae4076be"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor.read": {
   "complexity": 8,
-  "coverage": 0.9286,
-  "crap": 8.02,
+  "coverage": 0.9231,
+  "crap": 8.03,
   "digest": "a0f49f26bc26"
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor.references": {
@@ -7927,8 +7984,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::GcOnFullBlobStore.put": {
   "complexity": 4,
-  "coverage": 0.8889,
-  "crap": 4.02,
+  "coverage": 0.875,
+  "crap": 4.03,
   "digest": "7acf2f9d4eaa"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.__init__": {
@@ -7945,13 +8002,13 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog._cas": {
   "complexity": 5,
-  "coverage": 0.8889,
-  "crap": 5.03,
+  "coverage": 0.875,
+  "crap": 5.05,
   "digest": "dc502eef03fa"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog._drop_edge": {
   "complexity": 6,
-  "coverage": 0.9333,
+  "coverage": 0.9286,
   "crap": 6.01,
   "digest": "ffd960d19f24"
  },
@@ -7969,14 +8026,14 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.add_blob_refs": {
   "complexity": 17,
-  "coverage": 0.9688,
+  "coverage": 0.9677,
   "crap": 17.01,
   "digest": "5a662763cecd"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.adopt_pending": {
   "complexity": 1,
-  "coverage": 0.25,
-  "crap": 1.42,
+  "coverage": 0.3333,
+  "crap": 1.3,
   "digest": "e443e26c48ce"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.blob_references": {
@@ -7999,8 +8056,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.delete_row": {
   "complexity": 5,
-  "coverage": 0.8571,
-  "crap": 5.07,
+  "coverage": 0.8333,
+  "crap": 5.12,
   "digest": "1b77b52d8ca6"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.finish_purge": {
@@ -8035,8 +8092,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.insert_row": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
+  "coverage": 0.8333,
+  "crap": 3.04,
   "digest": "411ba00cadfa"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.mark_deleting": {
@@ -8047,15 +8104,16 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.mark_deleting_row": {
   "complexity": 8,
-  "coverage": 0.8333,
-  "crap": 8.3,
+  "coverage": 0.8182,
+  "crap": 8.38,
   "digest": "ab118cd7dda4"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.mark_purging": {
   "complexity": 2,
-  "coverage": 0.3333,
-  "crap": 3.19,
-  "digest": "2cba0a10acb4"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "2cba0a10acb4",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.mark_purging_row": {
   "complexity": 2,
@@ -8131,14 +8189,15 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog._touch_live_in": {
   "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "8f870c8fc785"
+  "coverage": 0.6667,
+  "crap": 5.93,
+  "digest": "8f870c8fc785",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.add_blob_refs": {
   "complexity": 2,
-  "coverage": 0.875,
-  "crap": 2.01,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "862d1b16b285"
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.add_blob_refs.<locals>._attempt": {
@@ -8191,7 +8250,7 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.get_current": {
   "complexity": 4,
-  "coverage": 0.9231,
+  "coverage": 0.9167,
   "crap": 4.01,
   "digest": "263ac03bc8c3"
  },
@@ -8227,9 +8286,10 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.mark_purging": {
   "complexity": 2,
-  "coverage": 0.3333,
-  "crap": 3.19,
-  "digest": "2cba0a10acb4"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "2cba0a10acb4",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.mark_purging_row": {
   "complexity": 2,
@@ -8275,8 +8335,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.touch_live": {
   "complexity": 2,
-  "coverage": 0.9091,
-  "crap": 2.0,
+  "coverage": 0.8,
+  "crap": 2.03,
   "digest": "db3eedd6b10c"
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.touch_live.<locals>._attempt": {
@@ -8311,14 +8371,14 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::_call": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "fa69ad052b4c"
  },
  "src/dendrux/runtime/_blob_catalog.py::_catalog_now": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "41e61bfd1507"
  },
  "src/dendrux/runtime/_blob_catalog.py::_check_batch_owner_keys": {
@@ -8371,9 +8431,10 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::_mark_purging_row": {
   "complexity": 4,
-  "coverage": 0.5,
-  "crap": 6.0,
-  "digest": "ca5ac29f280e"
+  "coverage": 0.4444,
+  "crap": 6.74,
+  "digest": "ca5ac29f280e",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_blob_catalog.py::_marker_for_b64": {
   "complexity": 2,
@@ -8383,9 +8444,10 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::_plain": {
   "complexity": 4,
-  "coverage": 0.6,
-  "crap": 5.02,
-  "digest": "e3cee5b741f3"
+  "coverage": 0.5,
+  "crap": 6.0,
+  "digest": "e3cee5b741f3",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_blob_catalog.py::_py_now": {
   "complexity": 1,
@@ -8413,8 +8475,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::_scrub_image_slot": {
   "complexity": 3,
-  "coverage": 0.8,
-  "crap": 3.07,
+  "coverage": 0.75,
+  "crap": 3.14,
   "digest": "40b02da0262c"
  },
  "src/dendrux/runtime/_blob_catalog.py::_scrub_str": {
@@ -8425,8 +8487,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::_tenant_matches": {
   "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
+  "coverage": 0.6667,
+  "crap": 3.33,
   "digest": "201923bd72b9"
  },
  "src/dendrux/runtime/_blob_catalog.py::as_blob_catalog": {
@@ -8449,9 +8511,10 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::write_blob_refs": {
   "complexity": 34,
-  "coverage": 0.9649,
-  "crap": 34.05,
-  "digest": "5a30a91e8d6f"
+  "coverage": 0.9153,
+  "crap": 34.7,
+  "digest": "5a30a91e8d6f",
+  "waived": "worse"
  },
  "src/dendrux/runtime/_entry_checks.py::entry_checks": {
   "complexity": 4,
@@ -8485,8 +8548,8 @@
  },
  "src/dendrux/runtime/_limit_checks.py::_text_bytes": {
   "complexity": 7,
-  "coverage": 0.75,
-  "crap": 7.77,
+  "coverage": 0.7273,
+  "crap": 7.99,
   "digest": "70ec0bfd4a12"
  },
  "src/dendrux/runtime/_limit_checks.py::check_entry": {
@@ -8551,9 +8614,10 @@
  },
  "src/dendrux/runtime/context.py::DelegationContext.__hash__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "fb480394ad66"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "fb480394ad66",
+  "waived": "worse"
  },
  "src/dendrux/runtime/context.py::DelegationDepthExceededError.__init__": {
   "complexity": 1,
@@ -8683,7 +8747,7 @@
  },
  "src/dendrux/runtime/durability.py::retry_transient_db": {
   "complexity": 7,
-  "coverage": 0.9375,
+  "coverage": 0.9333,
   "crap": 7.01,
   "digest": "fc940311b060"
  },
@@ -8725,8 +8789,8 @@
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_llm_call_completed": {
   "complexity": 27,
-  "coverage": 0.9189,
-  "crap": 27.39,
+  "coverage": 0.9167,
+  "crap": 27.42,
   "digest": "ce7c66d48b1d"
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_message_appended": {
@@ -8785,8 +8849,8 @@
  },
  "src/dendrux/runtime/persistence.py::provider_family": {
   "complexity": 5,
-  "coverage": 0.7778,
-  "crap": 5.27,
+  "coverage": 0.75,
+  "crap": 5.39,
   "digest": "94b1f35c80c6"
  },
  "src/dendrux/runtime/replay.py::ReplayRequest.fingerprint": {
@@ -8809,8 +8873,8 @@
  },
  "src/dendrux/runtime/replay.py::_event_key": {
   "complexity": 3,
-  "coverage": 0.8333,
-  "crap": 3.04,
+  "coverage": 0.8,
+  "crap": 3.07,
   "digest": "584adea13e35"
  },
  "src/dendrux/runtime/replay.py::_first_user_trace": {
@@ -8821,8 +8885,8 @@
  },
  "src/dendrux/runtime/replay.py::_fold_state_event": {
   "complexity": 27,
-  "coverage": 0.8214,
-  "crap": 31.15,
+  "coverage": 0.8148,
+  "crap": 31.63,
   "digest": "0ef2c882f3c4"
  },
  "src/dendrux/runtime/replay.py::_full_turn": {
@@ -8863,8 +8927,8 @@
  },
  "src/dendrux/runtime/replay.py::_raw_input": {
   "complexity": 4,
-  "coverage": 0.7143,
-  "crap": 4.37,
+  "coverage": 0.6667,
+  "crap": 4.59,
   "digest": "af131a0efe9d"
  },
  "src/dendrux/runtime/replay.py::_raw_parts": {
@@ -8875,7 +8939,7 @@
  },
  "src/dendrux/runtime/replay.py::_raw_user_message": {
   "complexity": 4,
-  "coverage": 0.9,
+  "coverage": 0.8889,
   "crap": 4.02,
   "digest": "b918b4753c68"
  },
@@ -9055,13 +9119,13 @@
  },
  "src/dendrux/runtime/runner.py::_attach_undelivered_notes": {
   "complexity": 5,
-  "coverage": 0.7273,
-  "crap": 5.51,
+  "coverage": 0.7,
+  "crap": 5.68,
   "digest": "88618abba334"
  },
  "src/dendrux/runtime/runner.py::_barrier_pause_result": {
   "complexity": 13,
-  "coverage": 0.9583,
+  "coverage": 0.9565,
   "crap": 13.01,
   "digest": "35285a26a246"
  },
@@ -9073,9 +9137,10 @@
  },
  "src/dendrux/runtime/runner.py::_build_cached_result": {
   "complexity": 8,
-  "coverage": 0.6154,
-  "crap": 11.64,
-  "digest": "5ae6358a3d36"
+  "coverage": 0.5833,
+  "crap": 12.63,
+  "digest": "5ae6358a3d36",
+  "waived": "worse"
  },
  "src/dendrux/runtime/runner.py::_carry_budget_fields": {
   "complexity": 1,
@@ -9103,8 +9168,8 @@
  },
  "src/dendrux/runtime/runner.py::_claim_resume": {
   "complexity": 12,
-  "coverage": 0.8095,
-  "crap": 13.0,
+  "coverage": 0.8,
+  "crap": 13.15,
   "digest": "9563b3519501"
  },
  "src/dendrux/runtime/runner.py::_closing_loop_stream": {
@@ -9133,8 +9198,8 @@
  },
  "src/dendrux/runtime/runner.py::_emit_event_safe": {
   "complexity": 3,
-  "coverage": 0.7,
-  "crap": 3.24,
+  "coverage": 0.6667,
+  "crap": 3.33,
   "digest": "02c56ffc7b1c"
  },
  "src/dendrux/runtime/runner.py::_emit_init_events": {
@@ -9181,8 +9246,8 @@
  },
  "src/dendrux/runtime/runner.py::_idempotent_hit_after_image_error": {
   "complexity": 26,
-  "coverage": 0.8056,
-  "crap": 30.97,
+  "coverage": 0.8,
+  "crap": 31.41,
   "digest": "8619a0c5dfcb"
  },
  "src/dendrux/runtime/runner.py::_image_loop_kwargs": {
@@ -9211,8 +9276,8 @@
  },
  "src/dendrux/runtime/runner.py::_ingest_resume_images": {
   "complexity": 16,
-  "coverage": 0.931,
-  "crap": 16.08,
+  "coverage": 0.9231,
+  "crap": 16.12,
   "digest": "8136c7123747"
  },
  "src/dendrux/runtime/runner.py::_ingest_resume_images.<locals>._tool_capability": {
@@ -9235,14 +9300,14 @@
  },
  "src/dendrux/runtime/runner.py::_input_edge_kwargs": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "b9f92456c471"
  },
  "src/dendrux/runtime/runner.py::_live_edges": {
   "complexity": 8,
-  "coverage": 0.8,
-  "crap": 8.51,
+  "coverage": 0.75,
+  "crap": 9.0,
   "digest": "1942cab113ff"
  },
  "src/dendrux/runtime/runner.py::_mcp_error_payload": {
@@ -9271,31 +9336,31 @@
  },
  "src/dendrux/runtime/runner.py::_pause_request_message": {
   "complexity": 6,
-  "coverage": 0.7,
-  "crap": 6.97,
+  "coverage": 0.6667,
+  "crap": 7.33,
   "digest": "f9de6ae53b8d"
  },
  "src/dendrux/runtime/runner.py::_pause_with_event": {
   "complexity": 7,
-  "coverage": 0.9333,
-  "crap": 7.01,
+  "coverage": 0.9286,
+  "crap": 7.02,
   "digest": "9ca2f85ab836"
  },
  "src/dendrux/runtime/runner.py::_pending_decision_map": {
   "complexity": 4,
-  "coverage": 0.75,
-  "crap": 4.25,
+  "coverage": 0.6667,
+  "crap": 4.59,
   "digest": "ce99045b247e"
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome": {
   "complexity": 27,
-  "coverage": 0.9737,
-  "crap": 27.01,
+  "coverage": 0.9828,
+  "crap": 27.0,
   "digest": "e51d715c57d7"
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome.<locals>._finalize_cancelled": {
   "complexity": 2,
-  "coverage": 0.875,
+  "coverage": 0.8571,
   "crap": 2.01,
   "digest": "89259de8dd50"
  },
@@ -9331,8 +9396,8 @@
  },
  "src/dendrux/runtime/runner.py::_record_stop_reason": {
   "complexity": 3,
-  "coverage": 0.875,
-  "crap": 3.02,
+  "coverage": 0.8571,
+  "crap": 3.03,
   "digest": "f5dc60d25f1f"
  },
  "src/dendrux/runtime/runner.py::_record_user_trace": {
@@ -9367,8 +9432,8 @@
  },
  "src/dendrux/runtime/runner.py::_release_memory_edges": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
+  "coverage": 0.8333,
+  "crap": 3.04,
   "digest": "e765d840dd62"
  },
  "src/dendrux/runtime/runner.py::_replay_from_meta": {
@@ -9415,8 +9480,8 @@
  },
  "src/dendrux/runtime/runner.py::_resume_core": {
   "complexity": 52,
-  "coverage": 0.9365,
-  "crap": 52.69,
+  "coverage": 0.9355,
+  "crap": 52.73,
   "digest": "edd87b4a321b"
  },
  "src/dendrux/runtime/runner.py::_resume_core.<locals>.persist_cancellation": {
@@ -9451,14 +9516,14 @@
  },
  "src/dendrux/runtime/runner.py::_seed_edges": {
   "complexity": 4,
-  "coverage": 0.9091,
-  "crap": 4.01,
+  "coverage": 0.9,
+  "crap": 4.02,
   "digest": "1c535471c2ff"
  },
  "src/dendrux/runtime/runner.py::_shielded_cleanup": {
   "complexity": 7,
-  "coverage": 0.8095,
-  "crap": 7.34,
+  "coverage": 0.8,
+  "crap": 7.39,
   "digest": "c39440312946"
  },
  "src/dendrux/runtime/runner.py::_signature_params": {
@@ -9535,8 +9600,8 @@
  },
  "src/dendrux/runtime/runner.py::_validate_owned_pause": {
   "complexity": 7,
-  "coverage": 0.9,
-  "crap": 7.05,
+  "coverage": 0.8947,
+  "crap": 7.06,
   "digest": "01670bcf633c"
  },
  "src/dendrux/runtime/runner.py::_validated_decisions": {
@@ -9547,8 +9612,8 @@
  },
  "src/dendrux/runtime/runner.py::_write_edges": {
   "complexity": 4,
-  "coverage": 0.7143,
-  "crap": 4.37,
+  "coverage": 0.6667,
+  "crap": 4.59,
   "digest": "b84514d6805c"
  },
  "src/dendrux/runtime/runner.py::ingest_submitted_tool_images": {
@@ -9565,7 +9630,7 @@
  },
  "src/dendrux/runtime/runner.py::ingest_submitted_user_parts": {
   "complexity": 5,
-  "coverage": 0.9286,
+  "coverage": 0.9167,
   "crap": 5.01,
   "digest": "fc3f82103374"
  },
@@ -9589,8 +9654,8 @@
  },
  "src/dendrux/runtime/runner.py::resume_claimed": {
   "complexity": 11,
-  "coverage": 0.913,
-  "crap": 11.08,
+  "coverage": 0.9091,
+  "crap": 11.09,
   "digest": "c00a4a9e5b0d"
  },
  "src/dendrux/runtime/runner.py::resume_paused_claim": {
@@ -9601,20 +9666,20 @@
  },
  "src/dendrux/runtime/runner.py::resume_stream": {
   "complexity": 5,
-  "coverage": 0.9068,
-  "crap": 5.02,
+  "coverage": 1.0,
+  "crap": 5.0,
   "digest": "f31cfa072d88"
  },
  "src/dendrux/runtime/runner.py::resume_stream.<locals>._cleanup": {
   "complexity": 12,
-  "coverage": 0.7812,
-  "crap": 13.51,
+  "coverage": 0.7742,
+  "crap": 13.66,
   "digest": "7004e6633fa2"
  },
  "src/dendrux/runtime/runner.py::resume_stream.<locals>._generate": {
   "complexity": 44,
-  "coverage": 0.9322,
-  "crap": 44.6,
+  "coverage": 0.9316,
+  "crap": 44.62,
   "digest": "b2f380a4fd5f"
  },
  "src/dendrux/runtime/runner.py::resume_with_input": {
@@ -9625,32 +9690,32 @@
  },
  "src/dendrux/runtime/runner.py::retry": {
   "complexity": 55,
-  "coverage": 0.8819,
-  "crap": 59.98,
+  "coverage": 0.881,
+  "crap": 60.1,
   "digest": "8f2530c01649"
  },
  "src/dendrux/runtime/runner.py::run": {
   "complexity": 84,
-  "coverage": 0.9634,
+  "coverage": 0.9632,
   "crap": 84.35,
   "digest": "686ce79555e9"
  },
  "src/dendrux/runtime/runner.py::run_stream": {
   "complexity": 14,
-  "coverage": 0.9238,
-  "crap": 14.09,
+  "coverage": 1.0,
+  "crap": 14.0,
   "digest": "a315d24471a3"
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._cleanup": {
   "complexity": 12,
-  "coverage": 0.8065,
-  "crap": 13.04,
+  "coverage": 0.8,
+  "crap": 13.15,
   "digest": "7ac39d5b2234"
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._generate": {
   "complexity": 60,
-  "coverage": 0.9325,
-  "crap": 61.11,
+  "coverage": 0.9321,
+  "crap": 61.13,
   "digest": "0900c88f9e11"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.__init__": {
@@ -9673,14 +9738,14 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._bfs_descendants": {
   "complexity": 6,
-  "coverage": 0.963,
+  "coverage": 0.9615,
   "crap": 6.0,
   "digest": "115d54ac20bd"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._cas_finalize": {
   "complexity": 10,
-  "coverage": 0.9048,
-  "crap": 10.09,
+  "coverage": 0.9,
+  "crap": 10.1,
   "digest": "279e71304d63"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._check_idempotency": {
@@ -9691,7 +9756,7 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._traverse_subtree_bfs": {
   "complexity": 13,
-  "coverage": 0.9583,
+  "coverage": 0.9565,
   "crap": 13.01,
   "digest": "a962dfdfde5c"
  },
@@ -9703,9 +9768,10 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._walk_ancestry": {
   "complexity": 6,
-  "coverage": 0.0476,
-  "crap": 37.1,
-  "digest": "0d501b529e4b"
+  "coverage": 0.0,
+  "crap": 42.0,
+  "digest": "0d501b529e4b",
+  "waived": "worse"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.add_note": {
   "complexity": 4,
@@ -9853,8 +9919,8 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.get_pause_summary": {
   "complexity": 19,
-  "coverage": 0.8485,
-  "crap": 20.26,
+  "coverage": 0.8438,
+  "crap": 20.38,
   "digest": "d7e17cf6ec59"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.get_pii_mapping": {
@@ -10063,13 +10129,13 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.sweep_abandoned_runs": {
   "complexity": 4,
-  "coverage": 0.96,
+  "coverage": 0.9583,
   "crap": 4.0,
   "digest": "53516aa45bd1"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.sweep_stale_runs": {
   "complexity": 10,
-  "coverage": 0.9706,
+  "coverage": 0.9697,
   "crap": 10.0,
   "digest": "0510791e7f8c"
  },
@@ -10081,26 +10147,26 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.try_pause_run": {
   "complexity": 1,
-  "coverage": 0.875,
+  "coverage": 1.0,
   "crap": 1.0,
   "digest": "c7d3e2730b56"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.try_pause_run.<locals>._attempt": {
   "complexity": 6,
-  "coverage": 0.8333,
-  "crap": 6.17,
+  "coverage": 0.8182,
+  "crap": 6.22,
   "digest": "9590b634f79a"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.update_run_meta": {
   "complexity": 1,
-  "coverage": 0.9091,
+  "coverage": 1.0,
   "crap": 1.0,
   "digest": "c7eec8d6f651"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.update_run_meta.<locals>._attempt": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
+  "coverage": 0.8333,
+  "crap": 3.04,
   "digest": "e6a2e52d0a06"
  },
  "src/dendrux/runtime/state.py::StateStore.add_note": {
@@ -10387,9 +10453,10 @@
  },
  "src/dendrux/runtime/state.py::_Unscoped.__repr__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "17d02857ca82"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "17d02857ca82",
+  "waived": "worse"
  },
  "src/dendrux/runtime/state.py::_apply_tenant_scope": {
   "complexity": 3,
@@ -10447,8 +10514,8 @@
  },
  "src/dendrux/runtime/state.py::_json_value": {
   "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
+  "coverage": 0.6667,
+  "crap": 3.33,
   "digest": "6dee05bd1240"
  },
  "src/dendrux/runtime/state.py::_require_aware_utc": {
@@ -10483,8 +10550,8 @@
  },
  "src/dendrux/runtime/state.py::claimed_store": {
   "complexity": 3,
-  "coverage": 0.8333,
-  "crap": 3.04,
+  "coverage": 0.8,
+  "crap": 3.07,
   "digest": "9366014285d0"
  },
  "src/dendrux/runtime/state.py::read_run_control": {
@@ -10519,9 +10586,10 @@
  },
  "src/dendrux/runtime/submit.py::_as_part": {
   "complexity": 3,
-  "coverage": 0.5,
-  "crap": 4.12,
-  "digest": "bc8ea1ee1900"
+  "coverage": 0.4,
+  "crap": 4.94,
+  "digest": "bc8ea1ee1900",
+  "waived": "worse"
  },
  "src/dendrux/runtime/submit.py::_cap_client_result": {
   "complexity": 4,
@@ -10543,15 +10611,16 @@
  },
  "src/dendrux/runtime/submit.py::_governance_change": {
   "complexity": 5,
-  "coverage": 0.8889,
-  "crap": 5.03,
+  "coverage": 0.875,
+  "crap": 5.05,
   "digest": "c9ea8a5a2f27"
  },
  "src/dendrux/runtime/submit.py::_invalid_json_constant": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "5ba050c3c470"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "5ba050c3c470",
+  "waived": "worse"
  },
  "src/dendrux/runtime/submit.py::_invalid_tool_result": {
   "complexity": 1,
@@ -10585,26 +10654,27 @@
  },
  "src/dendrux/runtime/submit.py::capture_warning_location": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "39c56dd04646"
  },
  "src/dendrux/runtime/submit.py::check_new_image_capability": {
   "complexity": 7,
-  "coverage": 0.8571,
-  "crap": 7.14,
+  "coverage": 0.8462,
+  "crap": 7.18,
   "digest": "e4bf3da15771"
  },
  "src/dendrux/runtime/submit.py::claim_or_raise": {
   "complexity": 15,
-  "coverage": 0.6579,
-  "crap": 24.01,
-  "digest": "c017db334416"
+  "coverage": 0.6486,
+  "crap": 24.76,
+  "digest": "c017db334416",
+  "waived": "worse"
  },
  "src/dendrux/runtime/submit.py::claim_paused_validated": {
   "complexity": 10,
-  "coverage": 0.7879,
-  "crap": 10.95,
+  "coverage": 0.7812,
+  "crap": 11.05,
   "digest": "c920c7984f67"
  },
  "src/dendrux/runtime/submit.py::deserialize_decisions": {
@@ -10621,20 +10691,20 @@
  },
  "src/dendrux/runtime/submit.py::effective_image_capability": {
   "complexity": 8,
-  "coverage": 0.8667,
-  "crap": 8.15,
+  "coverage": 0.8571,
+  "crap": 8.19,
   "digest": "d1f8f277a5fb"
  },
  "src/dendrux/runtime/submit.py::governance_snapshot": {
   "complexity": 11,
-  "coverage": 0.9583,
-  "crap": 11.01,
+  "coverage": 1.0,
+  "crap": 11.0,
   "digest": "e602eab6f04c"
  },
  "src/dendrux/runtime/submit.py::governance_snapshot.<locals>.digest": {
   "complexity": 2,
-  "coverage": 0.8,
-  "crap": 2.03,
+  "coverage": 0.75,
+  "crap": 2.06,
   "digest": "f7b0e4435705"
  },
  "src/dendrux/runtime/submit.py::governance_snapshot.<locals>.qualified": {
@@ -10699,32 +10769,32 @@
  },
  "src/dendrux/runtime/submit.py::pause_validator": {
   "complexity": 1,
-  "coverage": 0.8571,
+  "coverage": 1.0,
   "crap": 1.0,
   "digest": "77630fc4712b"
  },
  "src/dendrux/runtime/submit.py::pause_validator.<locals>.validate": {
   "complexity": 12,
-  "coverage": 0.8333,
-  "crap": 12.67,
+  "coverage": 0.8182,
+  "crap": 12.87,
   "digest": "9e200cad076b"
  },
  "src/dendrux/runtime/submit.py::preflight_status": {
   "complexity": 6,
-  "coverage": 0.9231,
-  "crap": 6.02,
+  "coverage": 0.8333,
+  "crap": 6.17,
   "digest": "66c66b1bb7b0"
  },
  "src/dendrux/runtime/submit.py::prepare_client_results": {
   "complexity": 11,
-  "coverage": 0.9259,
-  "crap": 11.05,
+  "coverage": 0.9231,
+  "crap": 11.06,
   "digest": "c8327cb1e48e"
  },
  "src/dendrux/runtime/submit.py::raise_for_non_paused_status": {
   "complexity": 3,
-  "coverage": 0.75,
-  "crap": 3.14,
+  "coverage": 0.7143,
+  "crap": 3.21,
   "digest": "1774339c891a"
  },
  "src/dendrux/runtime/submit.py::report_governance_change": {
@@ -10777,8 +10847,8 @@
  },
  "src/dendrux/runtime/submit.py::validate_result_names": {
   "complexity": 10,
-  "coverage": 0.8889,
-  "crap": 10.14,
+  "coverage": 0.875,
+  "crap": 10.2,
   "digest": "8f57a49fe277"
  },
  "src/dendrux/runtime/submit.py::validate_tool_results": {
@@ -10939,8 +11009,8 @@
  },
  "src/dendrux/skills/_fs.py::SkillDir.__init__": {
   "complexity": 7,
-  "coverage": 0.8824,
-  "crap": 7.08,
+  "coverage": 0.875,
+  "crap": 7.1,
   "digest": "a8f5f7b2cf31"
  },
  "src/dendrux/skills/_fs.py::SkillDir.close": {
@@ -10981,14 +11051,15 @@
  },
  "src/dendrux/skills/_fs.py::_open_entry": {
   "complexity": 8,
-  "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "66ef17d22a4d"
+  "coverage": 0.75,
+  "crap": 9.0,
+  "digest": "66ef17d22a4d",
+  "waived": "worse"
  },
  "src/dendrux/skills/_fs.py::_read_fd": {
   "complexity": 3,
-  "coverage": 0.7273,
-  "crap": 3.18,
+  "coverage": 0.7,
+  "crap": 3.24,
   "digest": "3ac8c25e0f39"
  },
  "src/dendrux/skills/_fs.py::_read_regular_file": {
@@ -11215,8 +11286,8 @@
  },
  "src/dendrux/skills/_package.py::format_size": {
   "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
+  "coverage": 0.875,
+  "crap": 6.07,
   "digest": "1c1a8d574854"
  },
  "src/dendrux/skills/_package.py::package_bytes": {
@@ -11299,7 +11370,7 @@
  },
  "src/dendrux/skills/_session.py::SkillSession.preflight": {
   "complexity": 27,
-  "coverage": 0.9459,
+  "coverage": 0.9444,
   "crap": 27.12,
   "digest": "207ad475ff7f"
  },
@@ -11401,9 +11472,10 @@
  },
  "src/dendrux/store/__init__.py::RunStore._active_pause_sequence": {
   "complexity": 6,
-  "coverage": 0.4,
-  "crap": 13.78,
-  "digest": "64ff1c137462"
+  "coverage": 0.3333,
+  "crap": 16.67,
+  "digest": "64ff1c137462",
+  "waived": "worse"
  },
  "src/dendrux/store/__init__.py::RunStore._approval_params": {
   "complexity": 3,
@@ -11431,8 +11503,8 @@
  },
  "src/dendrux/store/__init__.py::RunStore._status": {
   "complexity": 3,
-  "coverage": 0.6667,
-  "crap": 3.33,
+  "coverage": 0.6,
+  "crap": 3.58,
   "digest": "425b1ec12632"
  },
  "src/dendrux/store/__init__.py::RunStore.blobs": {
@@ -11443,8 +11515,8 @@
  },
  "src/dendrux/store/__init__.py::RunStore.close": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "c475150687c5"
  },
  "src/dendrux/store/__init__.py::RunStore.count_runs": {
@@ -11497,7 +11569,7 @@
  },
  "src/dendrux/store/__init__.py::RunStore.get_pause_page": {
   "complexity": 14,
-  "coverage": 0.9545,
+  "coverage": 0.9524,
   "crap": 14.02,
   "digest": "c65275a4f7c8"
  },
@@ -11509,8 +11581,8 @@
  },
  "src/dendrux/store/__init__.py::RunStore.get_pending": {
   "complexity": 9,
-  "coverage": 0.7083,
-  "crap": 11.01,
+  "coverage": 0.6957,
+  "crap": 11.28,
   "digest": "7e89ecfed07f"
  },
  "src/dendrux/store/__init__.py::RunStore.get_pii_mapping": {
@@ -11551,13 +11623,13 @@
  },
  "src/dendrux/store/__init__.py::RunStore.read_image": {
   "complexity": 7,
-  "coverage": 0.9286,
-  "crap": 7.02,
+  "coverage": 0.8571,
+  "crap": 7.14,
   "digest": "fcaa6854492a"
  },
  "src/dendrux/store/__init__.py::RunStore.stream_events": {
   "complexity": 7,
-  "coverage": 0.9444,
+  "coverage": 0.9412,
   "crap": 7.01,
   "digest": "6655956d545b"
  },
@@ -11569,8 +11641,8 @@
  },
  "src/dendrux/store/__init__.py::_InitOnFirstUse.__getattr__": {
   "complexity": 2,
-  "coverage": 0.8889,
-  "crap": 2.01,
+  "coverage": 0.8333,
+  "crap": 2.02,
   "digest": "d1be16ea6f73"
  },
  "src/dendrux/store/__init__.py::_InitOnFirstUse.__getattr__.<locals>.guarded": {
@@ -11593,8 +11665,8 @@
  },
  "src/dendrux/store/__init__.py::_accepts_tenant": {
   "complexity": 2,
-  "coverage": 0.6,
-  "crap": 2.26,
+  "coverage": 0.5,
+  "crap": 2.5,
   "digest": "62ba831aa8cb"
  },
  "src/dendrux/store/__init__.py::_build_pause_pair": {
@@ -11605,8 +11677,8 @@
  },
  "src/dendrux/store/__init__.py::_derive_pauses": {
   "complexity": 7,
-  "coverage": 0.9333,
-  "crap": 7.01,
+  "coverage": 0.9286,
+  "crap": 7.02,
   "digest": "69cdf85ad0b7"
  },
  "src/dendrux/store/__init__.py::_error_info_of": {
@@ -11629,8 +11701,8 @@
  },
  "src/dendrux/store/__init__.py::_pending_from": {
   "complexity": 20,
-  "coverage": 0.9412,
-  "crap": 20.08,
+  "coverage": 0.9375,
+  "crap": 20.1,
   "digest": "0ecb0e55a371"
  },
  "src/dendrux/store/__init__.py::_replay_of": {
@@ -11683,14 +11755,14 @@
  },
  "src/dendrux/store/_follow.py::EventFeed.__init__": {
   "complexity": 9,
-  "coverage": 0.8421,
-  "crap": 9.32,
+  "coverage": 0.8333,
+  "crap": 9.38,
   "digest": "d82607a9e92a"
  },
  "src/dendrux/store/_follow.py::EventFeed._acquire": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "36bfffea38d5"
  },
  "src/dendrux/store/_follow.py::EventFeed._drop": {
@@ -11701,8 +11773,8 @@
  },
  "src/dendrux/store/_follow.py::EventFeed._feed_for": {
   "complexity": 6,
-  "coverage": 0.8462,
-  "crap": 6.13,
+  "coverage": 0.8333,
+  "crap": 6.17,
   "digest": "e5eea177fa7e"
  },
  "src/dendrux/store/_follow.py::EventFeed._release": {
@@ -11713,20 +11785,20 @@
  },
  "src/dendrux/store/_follow.py::EventFeed._wait_for_closing": {
   "complexity": 6,
-  "coverage": 0.9,
-  "crap": 6.04,
+  "coverage": 0.8889,
+  "crap": 6.05,
   "digest": "71260af1ff71"
  },
  "src/dendrux/store/_follow.py::EventFeed.aclose": {
   "complexity": 8,
-  "coverage": 0.7143,
-  "crap": 9.49,
+  "coverage": 0.6923,
+  "crap": 9.86,
   "digest": "9b74c75127fc"
  },
  "src/dendrux/store/_follow.py::EventFeed.follow": {
   "complexity": 3,
-  "coverage": 0.8,
-  "crap": 3.07,
+  "coverage": 0.75,
+  "crap": 3.14,
   "digest": "9ad7a7e1184f"
  },
  "src/dendrux/store/_follow.py::EventFeed.followers": {
@@ -11791,8 +11863,8 @@
  },
  "src/dendrux/store/_follow.py::Follow._run": {
   "complexity": 29,
-  "coverage": 0.9054,
-  "crap": 29.71,
+  "coverage": 0.9041,
+  "crap": 29.74,
   "digest": "eb3bc2c5329f"
  },
  "src/dendrux/store/_follow.py::Follow._view": {
@@ -11809,7 +11881,7 @@
  },
  "src/dendrux/store/_follow.py::Follow.start": {
   "complexity": 7,
-  "coverage": 0.9444,
+  "coverage": 0.9412,
   "crap": 7.01,
   "digest": "4cefc01ffbae"
  },
@@ -11821,9 +11893,10 @@
  },
  "src/dendrux/store/_follow.py::FollowCapacityError.__reduce__": {
   "complexity": 1,
-  "coverage": 0.5,
-  "crap": 1.12,
-  "digest": "2c459b1d12c7"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "2c459b1d12c7",
+  "waived": "worse"
  },
  "src/dendrux/store/_follow.py::_Follower.end": {
   "complexity": 2,
@@ -11857,8 +11930,8 @@
  },
  "src/dendrux/store/_follow.py::_RunFeed._poll": {
   "complexity": 22,
-  "coverage": 0.878,
-  "crap": 22.88,
+  "coverage": 0.875,
+  "crap": 22.95,
   "digest": "5cd910314999"
  },
  "src/dendrux/store/_follow.py::_RunFeed._publish": {
@@ -11869,8 +11942,8 @@
  },
  "src/dendrux/store/_follow.py::_RunFeed.add": {
   "complexity": 5,
-  "coverage": 0.875,
-  "crap": 5.05,
+  "coverage": 0.8571,
+  "crap": 5.07,
   "digest": "97cdce3b9d58"
  },
  "src/dendrux/store/_follow.py::_RunFeed.remove": {
@@ -11881,14 +11954,15 @@
  },
  "src/dendrux/store/_follow.py::_current_head": {
   "complexity": 5,
-  "coverage": 0.5,
-  "crap": 8.12,
-  "digest": "18fc270544c7"
+  "coverage": 0.4545,
+  "crap": 9.06,
+  "digest": "18fc270544c7",
+  "waived": "worse"
  },
  "src/dendrux/store/_follow.py::approval_calls": {
   "complexity": 6,
-  "coverage": 0.8235,
-  "crap": 6.2,
+  "coverage": 0.8125,
+  "crap": 6.24,
   "digest": "e0efd439cf49"
  },
  "src/dendrux/store/_follow.py::redact_event": {
@@ -11899,8 +11973,8 @@
  },
  "src/dendrux/store/_follow.py::without_params": {
   "complexity": 4,
-  "coverage": 0.75,
-  "crap": 4.25,
+  "coverage": 0.6667,
+  "crap": 4.59,
   "digest": "fa02e3586e7c"
  },
  "src/dendrux/strategies/base.py::Strategy.build_messages": {
@@ -11965,20 +12039,20 @@
  },
  "src/dendrux/tool.py::_dataclass_schema": {
   "complexity": 6,
-  "coverage": 0.9375,
+  "coverage": 0.9333,
   "crap": 6.01,
   "digest": "0ea2023fb780"
  },
  "src/dendrux/tool.py::_dict_schema": {
   "complexity": 4,
-  "coverage": 0.9,
+  "coverage": 0.8889,
   "crap": 4.02,
   "digest": "f433e92284fd"
  },
  "src/dendrux/tool.py::_enum_schema": {
   "complexity": 5,
-  "coverage": 0.7778,
-  "crap": 5.27,
+  "coverage": 0.75,
+  "crap": 5.39,
   "digest": "27c348cd0330"
  },
  "src/dendrux/tool.py::_generate_schema": {
@@ -11989,14 +12063,14 @@
  },
  "src/dendrux/tool.py::_inline_refs": {
   "complexity": 10,
-  "coverage": 0.9375,
-  "crap": 10.02,
+  "coverage": 0.9333,
+  "crap": 10.03,
   "digest": "d206b9f3befc"
  },
  "src/dendrux/tool.py::_is_json_serializable": {
   "complexity": 2,
-  "coverage": 0.6667,
-  "crap": 2.15,
+  "coverage": 0.6,
+  "crap": 2.26,
   "digest": "5216e0e87ee2"
  },
  "src/dendrux/tool.py::_is_optional": {
@@ -12013,15 +12087,16 @@
  },
  "src/dendrux/tool.py::_literal_json_type": {
   "complexity": 4,
-  "coverage": 0.8571,
-  "crap": 4.05,
+  "coverage": 0.8333,
+  "crap": 4.07,
   "digest": "c0ca9e53b389"
  },
  "src/dendrux/tool.py::_make_nullable": {
   "complexity": 6,
-  "coverage": 0.6364,
-  "crap": 7.73,
-  "digest": "c61b93e95187"
+  "coverage": 0.6,
+  "crap": 8.3,
+  "digest": "c61b93e95187",
+  "waived": "worse"
  },
  "src/dendrux/tool.py::_normalize_receives_pii": {
   "complexity": 7,
@@ -12073,8 +12148,8 @@
  },
  "src/dendrux/tool.py::_unwrap_optional": {
   "complexity": 5,
-  "coverage": 0.8333,
-  "crap": 5.12,
+  "coverage": 0.8,
+  "crap": 5.2,
   "digest": "9ad58ab692a7"
  },
  "src/dendrux/tool.py::_validate_explicit_parameters": {
@@ -12121,14 +12196,14 @@
  },
  "src/dendrux/tools/_coerce.py::_path": {
   "complexity": 5,
-  "coverage": 0.8889,
-  "crap": 5.03,
+  "coverage": 0.875,
+  "crap": 5.05,
   "digest": "2aa026870877"
  },
  "src/dendrux/tools/_coerce.py::_problems": {
   "complexity": 5,
-  "coverage": 0.9091,
-  "crap": 5.02,
+  "coverage": 0.9,
+  "crap": 5.03,
   "digest": "d47405e10d24"
  },
  "src/dendrux/tools/_coerce.py::_validate": {
@@ -12151,15 +12226,16 @@
  },
  "src/dendrux/tools/_coerce.py::build_call": {
   "complexity": 4,
-  "coverage": 0.9167,
+  "coverage": 0.9091,
   "crap": 4.01,
   "digest": "c15fc8706d61"
  },
  "src/dendrux/tools/_coerce.py::contains_placeholder": {
   "complexity": 9,
-  "coverage": 0.5,
-  "crap": 19.12,
-  "digest": "84b805077d65"
+  "coverage": 0.4444,
+  "crap": 22.89,
+  "digest": "84b805077d65",
+  "waived": "worse"
  },
  "src/dendrux/tools/_coerce.py::get_args_spec": {
   "complexity": 2,
@@ -12181,7 +12257,7 @@
  },
  "src/dendrux/tools/_limits.py::_truncate": {
   "complexity": 4,
-  "coverage": 0.9286,
+  "coverage": 0.9231,
   "crap": 4.01,
   "digest": "8677b9a66a0d"
  },
@@ -12235,7 +12311,7 @@
  },
  "src/dendrux/tools/_lookups.py::build_tool_lookups": {
   "complexity": 11,
-  "coverage": 0.9767,
+  "coverage": 0.9762,
   "crap": 11.0,
   "digest": "d63066cacb51"
  },
@@ -12247,8 +12323,8 @@
  },
  "src/dendrux/tools/_mask.py::approval_view": {
   "complexity": 5,
-  "coverage": 0.8947,
-  "crap": 5.03,
+  "coverage": 1.0,
+  "crap": 5.0,
   "digest": "bfe3cdd05621"
  },
  "src/dendrux/tools/_mask.py::approval_view.<locals>.leaks": {
@@ -12259,8 +12335,8 @@
  },
  "src/dendrux/tools/_mask.py::approval_view.<locals>.walk": {
   "complexity": 10,
-  "coverage": 0.8,
-  "crap": 10.8,
+  "coverage": 0.7778,
+  "crap": 11.1,
   "digest": "4b4b64e73240"
  },
  "src/dendrux/tools/_mask.py::placeholder_mapping": {
@@ -12289,7 +12365,7 @@
  },
  "src/dendrux/tools/_pool.py::ToolCallLimiter.acquire": {
   "complexity": 6,
-  "coverage": 0.9375,
+  "coverage": 0.9333,
   "crap": 6.01,
   "digest": "d73e96b9bf32"
  },
@@ -12301,8 +12377,8 @@
  },
  "src/dendrux/tools/_pool.py::ToolCallLimiter.release": {
   "complexity": 4,
-  "coverage": 0.8333,
-  "crap": 4.07,
+  "coverage": 0.8182,
+  "crap": 4.1,
   "digest": "95f983bff060"
  },
  "src/dendrux/tools/_pool.py::_ToolPool.__init__": {
@@ -12355,9 +12431,10 @@
  },
  "src/dendrux/tools/_pool.py::_shutdown_pool": {
   "complexity": 2,
-  "coverage": 0.25,
-  "crap": 3.69,
-  "digest": "ad6febc37490"
+  "coverage": 0.0,
+  "crap": 6.0,
+  "digest": "ad6febc37490",
+  "waived": "worse"
  },
  "src/dendrux/tools/_pool.py::get_pool": {
   "complexity": 3,
@@ -12367,8 +12444,8 @@
  },
  "src/dendrux/tools/_pool.py::run_sync_tool": {
   "complexity": 8,
-  "coverage": 0.92,
-  "crap": 8.03,
+  "coverage": 0.9167,
+  "crap": 8.04,
   "digest": "87fe4233ee97"
  },
  "src/dendrux/tools/_pool.py::tool_pool_stats": {
@@ -12397,8 +12474,8 @@
  },
  "src/dendrux/tools/_validate.py::_dump": {
   "complexity": 2,
-  "coverage": 0.6,
-  "crap": 2.26,
+  "coverage": 0.5,
+  "crap": 2.5,
   "digest": "7139d0271ce9"
  },
  "src/dendrux/tools/_validate.py::_json_equal": {
@@ -12409,8 +12486,8 @@
  },
  "src/dendrux/tools/_validate.py::_json_type_name": {
   "complexity": 8,
-  "coverage": 0.8125,
-  "crap": 8.42,
+  "coverage": 0.8,
+  "crap": 8.51,
   "digest": "5d49ec083240"
  },
  "src/dendrux/tools/_validate.py::_lower_first": {
@@ -12433,8 +12510,8 @@
  },
  "src/dendrux/tools/_validate.py::check_tool_call": {
   "complexity": 8,
-  "coverage": 0.9231,
-  "crap": 8.03,
+  "coverage": 0.9167,
+  "crap": 8.04,
   "digest": "ef53a43b2a90"
  },
  "src/dendrux/tools/_validate.py::check_tool_json": {
@@ -12637,8 +12714,8 @@
  },
  "src/dendrux/types.py::PauseState.to_dict": {
   "complexity": 18,
-  "coverage": 0.9375,
-  "crap": 18.08,
+  "coverage": 0.9355,
+  "crap": 18.09,
   "digest": "a88a622652cd"
  },
  "src/dendrux/types.py::ReplaySummary.from_dict": {
@@ -12703,8 +12780,8 @@
  },
  "src/dendrux/types.py::RunStream._finalize": {
   "complexity": 4,
-  "coverage": 0.9091,
-  "crap": 4.01,
+  "coverage": 0.9,
+  "crap": 4.02,
   "digest": "fe930a4b2bee"
  },
  "src/dendrux/types.py::RunStream._wrap": {
@@ -12781,14 +12858,14 @@
  },
  "src/dendrux/types.py::_action_from_dict": {
   "complexity": 4,
-  "coverage": 0.8889,
-  "crap": 4.02,
+  "coverage": 0.875,
+  "crap": 4.03,
   "digest": "6ff844d24877"
  },
  "src/dendrux/types.py::_action_to_dict": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "923f03285124"
  },
  "src/dendrux/types.py::_history_fingerprint_entry": {
