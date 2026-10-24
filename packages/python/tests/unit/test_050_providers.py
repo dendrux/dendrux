@@ -14,12 +14,15 @@ clients (D-086), thinking + structured output (D-042), cache-write usage
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
+import os
 import pickle
 import threading
 import time
 import warnings
+import weakref
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -330,6 +333,52 @@ def r_in_progress() -> dict[str, Any]:
     }
 
 
+# --- A real local HTTP server (MockTransport opens no sockets) -------------
+
+
+class _ChatServer:
+    """Threaded keep-alive HTTP/1.1 server answering every POST with a completion."""
+
+    def __init__(self) -> None:
+        import http.server
+
+        payload = json.dumps(c_completion({"content": "ok"})).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("content-length", 0))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: Any) -> None:
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self.base_url = f"http://127.0.0.1:{self._server.server_address[1]}/v1"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _open_fds() -> int:
+    for path in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(path))
+        except OSError:
+            continue
+    pytest.skip("cannot count open file descriptors on this platform")
+
+
 # ---------------------------------------------------------------------------
 # Error taxonomy (B5 / B10)
 # ---------------------------------------------------------------------------
@@ -430,6 +479,7 @@ class TestAnthropicTaxonomy:
             await provider.complete(USER)
         assert info.value.timeout_reason == "call_deadline"
         assert info.value.retryable is False
+        assert "socket read timeout" in info.value.message
 
     async def test_connection_error_is_unavailable(self) -> None:
         provider = anthropic_provider()
@@ -487,6 +537,26 @@ class TestOpenAITaxonomy:
         assert SECRET not in str(err)
         if cls is ProviderRateLimitError:
             assert err.retry_after == 1.5 and err.retryable is True
+
+    @pytest.mark.parametrize(
+        ("status", "extra"),
+        [
+            (400, {"type": "api_error"}),
+            (400, {"code": "server_error"}),
+            (404, {"type": "overloaded_error"}),
+            (413, {"code": "rate_limit_exceeded"}),
+        ],
+    )
+    async def test_4xx_status_decides_over_5xx_like_labels(
+        self, status: int, extra: dict[str, Any]
+    ) -> None:
+        """Review P2-4: a definite 4xx is never unavailable/retryable."""
+        provider = chat_provider()
+        wire(provider, json_handler(status, {"error": {"message": SECRET, **extra}}))
+        with pytest.raises(ProviderError) as info:
+            await provider.complete(USER)
+        assert info.value.category == "rejected"
+        assert info.value.retryable is False
 
     async def test_openrouter_numeric_code_in_stream_error(self) -> None:
         provider = openrouter_provider()
@@ -588,6 +658,25 @@ class TestStreamIncomplete:
         with pytest.raises(ProviderStreamIncompleteError):
             await drain(provider.complete_stream(USER))
         assert len(w.requests) == 1
+
+    async def test_chat_usage_on_every_chunk_is_not_terminal(self) -> None:
+        """Review P2-2: a backend repeating usage on content chunks, cut mid-stream."""
+        provider = chat_provider()
+        usage = {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        body = sse(
+            (None, {**c_chunk("a"), "usage": usage}), (None, {**c_chunk("b"), "usage": usage})
+        )
+        w = wire(provider, stream_handler([body]))
+        with pytest.raises(ProviderStreamIncompleteError):
+            await drain(provider.complete_stream(USER))
+        assert len(w.requests) == 1  # text was yielded, so no retry
+
+    async def test_chat_final_usage_chunk_is_terminal(self) -> None:
+        provider = chat_provider()
+        body = sse((None, c_chunk("a")), (None, c_usage()))
+        wire(provider, stream_handler([body]))
+        events = await drain(provider.complete_stream(USER))
+        assert events[-1].raw.text == "a"
 
     async def test_chat_done_sentinel_alone_is_terminal(self) -> None:
         provider = chat_provider()
@@ -1049,6 +1138,113 @@ class TestTransport:
         assert seen["home"] is provider._client
         assert seen["other"] is not provider._client
         assert seen["other"]._client is not provider._client._client
+
+    def test_dead_loop_copies_evicted_and_sockets_released(self) -> None:
+        """P1-1: 20 threads each run ``asyncio.run`` against a real socket while the
+        owner loop stays alive; no copy, pool or socket outlives its loop."""
+        server = _ChatServer()
+        provider = OpenAIProvider(
+            model="gpt-4o", api_key="k", base_url=server.base_url, max_retries=0
+        )
+        home_ready = threading.Event()
+        release = threading.Event()
+        home: dict[str, Any] = {}
+
+        def owner() -> None:
+            async def main() -> None:
+                home["loop"] = asyncio.get_running_loop()
+                await provider.complete(USER)  # the owner holds a live socket
+                home_ready.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+
+            asyncio.run(main())
+
+        owner_thread = threading.Thread(target=owner)
+        owner_thread.start()
+        try:
+            assert home_ready.wait(10)
+            gc.collect()
+            baseline = _open_fds()
+            copies: list[weakref.ref[Any]] = []
+
+            def worker() -> None:
+                async def main() -> None:
+                    copies.append(weakref.ref(provider._sdk()))
+                    assert (await provider.complete(USER)).text == "ok"
+
+                asyncio.run(main())
+
+            workers = [threading.Thread(target=worker) for _ in range(20)]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join(30)
+            assert len(copies) == 20
+
+            async def touch() -> None:
+                provider._sdk()
+
+            # The next access (from any loop) evicts the copies of closed loops.
+            asyncio.run_coroutine_threadsafe(touch(), home["loop"]).result(10)
+            assert len(provider._clients) == 0
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                gc.collect()
+            assert all(ref() is None for ref in copies)
+            deadline = time.monotonic() + 5
+            while _open_fds() > baseline + 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert _open_fds() <= baseline + 2
+        finally:
+            release.set()
+            owner_thread.join(10)
+            server.close()
+
+    def test_loop_copies_are_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_resilience, "MAX_LOOP_CLIENTS", 3)
+        provider = chat_provider()
+        release = threading.Event()
+        started = threading.Barrier(6)
+
+        async def touch() -> None:
+            provider._sdk()
+
+        asyncio.run(touch())  # an owner loop that is now closed is rebuilt...
+        owner_ready = threading.Event()
+
+        def owner() -> None:
+            async def main() -> None:
+                provider._sdk()
+                owner_ready.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+
+            asyncio.run(main())
+
+        threads = [threading.Thread(target=owner)]
+        threads[0].start()
+        assert owner_ready.wait(5)
+
+        def live_worker() -> None:
+            async def main() -> None:
+                provider._sdk()
+                started.wait(5)
+                while not release.is_set():
+                    await asyncio.sleep(0.01)
+
+            asyncio.run(main())
+
+        for _ in range(5):
+            threads.append(threading.Thread(target=live_worker))
+            threads[-1].start()
+        started.wait(5)  # all five worker loops alive at once
+        try:
+            assert len(provider._clients) == 3
+        finally:
+            release.set()
+            for t in threads:
+                t.join(10)
 
     def test_close_after_loop_change_never_awaits_the_dead_transport(self) -> None:
         provider = chat_provider()

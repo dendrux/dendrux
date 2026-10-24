@@ -127,6 +127,11 @@ def _warn_strict_once(key: str, message: str, *args: Any) -> None:
     (logger.warning if first else logger.debug)(message, *args)
 
 
+def _message_ref(message: str) -> str:
+    """A short digest of a vendor error message: correlates log lines, shows no text."""
+    return hashlib.sha256(message.encode()).hexdigest()[:12]
+
+
 def _strict_entry_key(entry: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
 
@@ -305,7 +310,12 @@ class AnthropicProvider(LLMProvider):
             call_timeout: Wall-clock limit in seconds for one non-streaming
                 call, SDK retries included. When it fires the call is
                 abandoned and never retried (``ProviderTimeoutError``).
-                ``None`` turns it off.
+                ``None`` turns it off, but the socket read timeout still
+                applies (the largest deadline + 30 s, or 600 s) and the SDK
+                retries a read timeout, so a slow
+                generation can be re-run (and paid for) up to
+                ``max_retries + 1`` times. For long generations stream, or
+                set a large ``call_timeout`` instead.
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream events (``ping`` does not count), and before the first
                 one. ``None`` turns it off.
@@ -1254,9 +1264,9 @@ class AnthropicProvider(LLMProvider):
                 _warn_strict_once(
                     f"rejected:{label}",
                     "Anthropic rejected strict mode for %s; retrying without strict "
-                    "(and sending it non-strict for the rest of this process): %s",
+                    "(and sending it non-strict for the rest of this process); error ref %s",
                     label,
-                    message[:300],
+                    _message_ref(message),
                 )
             reverted.append(original)
         api_kwargs["tools"] = reverted
@@ -1266,12 +1276,13 @@ class AnthropicProvider(LLMProvider):
     @staticmethod
     def _warn_unmatched_fallback(labels: list[str], message: str) -> None:
         names = ", ".join(labels)
+        ref = _message_ref(message)
         _warn_strict_once(
-            f"unmatched:{names}:{message[:80]}",
+            f"unmatched:{names}:{ref}",
             "Anthropic returned a 400 for a request with strict entries (%s); it succeeded "
-            "without strict, so strict stays on for later requests: %s",
+            "without strict, so strict stays on for later requests; error ref %s",
             names,
-            message[:300],
+            ref,
         )
 
     async def _create_with_strict_fallback(

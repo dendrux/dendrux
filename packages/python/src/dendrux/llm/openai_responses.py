@@ -277,7 +277,12 @@ class OpenAIResponsesProvider(LLMProvider):
             call_timeout: Wall-clock limit in seconds for one non-streaming
                 call, SDK retries included. When it fires the call is
                 abandoned and never retried (``ProviderTimeoutError``).
-                ``None`` turns it off.
+                ``None`` turns it off, but the socket read timeout still
+                applies (the largest deadline + 30 s, or 600 s) and the SDK
+                retries a read timeout, so a slow
+                generation can be re-run (and paid for) up to
+                ``max_retries + 1`` times. For long generations stream, or
+                set a large ``call_timeout`` instead.
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream events (``response.in_progress`` does not count), and
                 before the first one. ``None`` turns it off.
@@ -887,14 +892,11 @@ class OpenAIResponsesProvider(LLMProvider):
             del stream
             raise failure
 
-        if _completed_response is None and isinstance(stream, openai.AsyncStream):
-            # Enforced on the SDK's own stream (the only one a real request
-            # returns); a test double keeps the 0.4.1 contract.
+        if _completed_response is None:
             raise stream_incomplete(_PROVIDER, model)
         if refusal_parts:
             raise refusal_error(_PROVIDER, model, refusal_text="".join(refusal_parts))
-        if _completed_response is not None:
-            self._check_response(_completed_response, model)
+        self._check_response(_completed_response, model)
 
         # Reasoning items (for multi-turn replay) come from the completed response.
         blocks = [
@@ -904,11 +906,7 @@ class OpenAIResponsesProvider(LLMProvider):
         ]
         reasoning_blocks: list[Any] | None = blocks or None
 
-        stop_reason, raw_stop_reason = (
-            responses_stop_reason(_completed_response)
-            if _completed_response is not None
-            else (None, None)
-        )
+        stop_reason, raw_stop_reason = responses_stop_reason(_completed_response)
 
         # Assemble the final LLMResponse
         llm_response = LLMResponse(
@@ -923,7 +921,7 @@ class OpenAIResponsesProvider(LLMProvider):
         )
         llm_response.provider_request = request.captured_request
         llm_response.model = model
-        if _completed_response is not None and hasattr(_completed_response, "model_dump"):
+        if hasattr(_completed_response, "model_dump"):
             llm_response.provider_response = _completed_response.model_dump()
 
         yield StreamEvent(type=StreamEventType.DONE, raw=llm_response)

@@ -321,7 +321,12 @@ class OpenAIProvider(LLMProvider):
             call_timeout: Wall-clock limit in seconds for one non-streaming
                 call, SDK retries included. When it fires the call is
                 abandoned and never retried (``ProviderTimeoutError``).
-                ``None`` turns it off.
+                ``None`` turns it off, but the socket read timeout still
+                applies (the largest deadline + 30 s, or 600 s) and the SDK
+                retries a read timeout, so a slow
+                generation can be re-run (and paid for) up to
+                ``max_retries + 1`` times. For long generations stream, or
+                set a large ``call_timeout`` instead.
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream chunks, and before the first one. ``None`` turns it off.
             stream_total_timeout: Wall-clock limit in seconds for a whole
@@ -755,10 +760,12 @@ class OpenAIProvider(LLMProvider):
                         break
                     semantic = False
 
-                    # Usage arrives in the final chunk
+                    # Usage arrives in the final chunk (``include_usage``: no
+                    # choices). Some backends repeat usage on every content
+                    # chunk; only the choice-less shape marks the end.
                     if chunk.usage:
                         usage = self._normalize_usage(chunk.usage)
-                        saw_usage = True
+                        saw_usage = saw_usage or not chunk.choices
                         semantic = True
 
                     if not chunk.choices:
@@ -856,14 +863,7 @@ class OpenAIProvider(LLMProvider):
             del stream
             raise failure
 
-        if (
-            isinstance(stream, openai.AsyncStream)
-            and finish_reason is None
-            and not saw_usage
-            and not (done_seen and done_seen[0])
-        ):
-            # Enforced on the SDK's own stream (the only one a real request
-            # returns); a test double keeps the 0.4.1 contract.
+        if finish_reason is None and not saw_usage and not (done_seen and done_seen[0]):
             raise stream_incomplete(self._image_provider_name, model)
         if refusal_parts:
             raise refusal_error(

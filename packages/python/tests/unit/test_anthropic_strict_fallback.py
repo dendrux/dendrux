@@ -175,6 +175,7 @@ class TestBatchFallback:
         assert json.dumps(result.provider_request["tools"]) == json.dumps(wire.tools(1))
         warned = _warnings(caplog)
         assert len(warned) == 1 and "lookup_code" in warned[0]
+        assert message[:40] not in caplog.text
 
     @pytest.mark.parametrize(
         "message",
@@ -198,7 +199,9 @@ class TestBatchFallback:
         assert wire.tools(2)[1]["strict"] is True  # not remembered
         assert not anthropic_mod._STRICT_REJECTED
         warned = _warnings(caplog)
-        assert len(warned) == 1 and message[:40] in warned[0] and "lookup_code" in warned[0]
+        assert len(warned) == 1 and "lookup_code" in warned[0] and "error ref" in warned[0]
+        # Vendor error text never reaches the logs (it can quote schema details).
+        assert message[:40] not in caplog.text
 
     async def test_unmatched_400_second_failure_raises_second(
         self, claude: AnthropicProvider, caplog: pytest.LogCaptureFixture
@@ -521,6 +524,7 @@ async def test_fallback_warning_redacts_echoed_image_data(
     with caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"):
         await claude.complete(USER_IMAGE, tools=[STRICT_TOOL])
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "[redacted]" in logged
+    # No vendor text is logged at all (0.5.0), only a digest to correlate.
+    assert "error ref" in logged and "bad request near" not in logged
     for marker in LEAK_MARKERS:
         assert marker not in logged

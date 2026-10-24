@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -665,6 +666,8 @@ class OpenRouterProvider(OpenAIProvider):
         try:
             value = float(cost)
         except ValueError:
+            return base
+        if not math.isfinite(value) or value < 0:
             return base
         return replace(base, cost_usd=value, cost_source="provider")
 

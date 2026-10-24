@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -609,6 +610,11 @@ class TestAnthropicCacheControlOnToolResult:
 
 
 class _EmptyStream:
+    """No content, only the terminal event (Chat usage chunk / Responses completed).
+
+    0.5.0: a stream with no terminal event at all is an incomplete stream.
+    """
+
     def __init__(self) -> None:
         self._done = False
 
@@ -616,7 +622,18 @@ class _EmptyStream:
         return self
 
     async def __anext__(self) -> Any:
-        raise StopAsyncIteration
+        if self._done:
+            raise StopAsyncIteration
+        self._done = True
+        completed = SimpleNamespace(
+            status="completed", output=[], usage=None, incomplete_details=None
+        )
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=0),
+            choices=[],
+            type="response.completed",
+            response=completed,
+        )
 
 
 class TestOpenAIStreamForwardsCacheKey:

@@ -222,17 +222,26 @@ def make_http_client(sdk: ModuleType, deadlines: Deadlines) -> httpx.AsyncClient
     return client
 
 
+# Live loops other than the owner that may hold their own client copy at once.
+MAX_LOOP_CLIENTS = 64
+
+
 class LoopClients(Generic[T]):
-    """Keeps an SDK client usable across event loops.
+    """Keeps an SDK client usable across event loops, with a bounded cache.
 
     httpx connections belong to the loop that opened them. The first loop to
     use the provider owns its client. When that loop has closed (a later
     ``asyncio.run``), the client's HTTP transport is replaced with a fresh one
     built by ``new_http`` (same SDK object, same connection limits); the old
-    transport is dropped, never awaited across loops. A different loop that
-    is still alive gets its own copy of the SDK client. Copies are held
-    weakly per loop, so their number is bounded by the live loops using the
-    provider.
+    transport is dropped, never awaited across loops.
+
+    A different loop that is still alive gets its own copy of the SDK client.
+    Copies are keyed by a weak reference to their loop. Every access first
+    evicts the copies whose loop has closed or been collected: they cannot be
+    awaited from another loop, so they are dropped and their sockets are
+    released when the garbage collector finalises them. At most
+    :data:`MAX_LOOP_CLIENTS` copies are kept; past that the oldest is evicted
+    (a call already using it keeps its own reference and finishes normally).
     """
 
     def __init__(
@@ -243,15 +252,27 @@ class LoopClients(Generic[T]):
         self._new_http = new_http
         self._fork = fork
         self._home_loop: weakref.ref[asyncio.AbstractEventLoop] | None = None
-        self._others: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, T] = (
-            weakref.WeakKeyDictionary()
-        )
+        # id(loop) -> (weak ref to the loop, client copy), oldest first.
+        self._others: dict[int, tuple[weakref.ref[asyncio.AbstractEventLoop], T]] = {}
         self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        """Number of cached copies for loops other than the owner."""
+        with self._lock:
+            return len(self._others)
+
+    def _evict_dead_locked(self) -> None:
+        for key, (ref, _client) in list(self._others.items()):
+            loop = ref()
+            if loop is None or loop.is_closed():
+                del self._others[key]
+                logger.debug("provider.client_evicted reason=event_loop_closed")
 
     def resolve(self, home: T) -> T:
         """The client to use on the running loop."""
         loop = asyncio.get_running_loop()
         with self._lock:
+            self._evict_dead_locked()
             bound = self._home_loop() if self._home_loop is not None else None
             if self._home_loop is None or bound is loop:
                 self._home_loop = weakref.ref(loop)
@@ -261,23 +282,33 @@ class LoopClients(Generic[T]):
                 self._home_loop = weakref.ref(loop)
                 logger.debug("provider.client_rebuilt reason=event_loop_changed")
                 return home
-            client = self._others.get(loop)
-            if client is None:
-                client = self._fork(home, self._new_http())
-                self._others[loop] = client
+            entry = self._others.get(id(loop))
+            if entry is not None and entry[0]() is loop:
+                return entry[1]
+            client = self._fork(home, self._new_http())
+            self._others[id(loop)] = (weakref.ref(loop), client)
+            while len(self._others) > MAX_LOOP_CLIENTS:
+                del self._others[next(iter(self._others))]
+                logger.debug("provider.client_evicted reason=cache_full")
             return client
 
     def pop_current_loop_extra(self) -> T | None:
-        """Detach the copy used by the running loop, if any (for ``close``)."""
+        """Detach the copy used by the running loop, if any (for ``close``).
+
+        Copies of other live loops stay cached: they cannot be closed from
+        this loop, and are evicted once their loop closes.
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return None
         with self._lock:
-            client = self._others.pop(loop, None)
-            # Copies bound to other loops cannot be closed from here; drop them.
-            self._others.clear()
-            return client
+            self._evict_dead_locked()
+            entry = self._others.get(id(loop))
+            if entry is None or entry[0]() is not loop:
+                return None
+            del self._others[id(loop)]
+            return entry[1]
 
 
 # ------------------------------------------------------------------
@@ -300,6 +331,8 @@ _UNAVAILABLE_TYPES = frozenset({"api_error", "overloaded_error", "server_error",
 _UNAVAILABLE_CODES = frozenset(
     {"server_error", "overloaded", "service_unavailable", "internal_error", "server_overloaded"}
 )
+# 4xx statuses decided by the status alone (408/409/429 are retryable kinds).
+_CLIENT_ERROR_STATUSES = frozenset(range(400, 500)) - {408, 409, 429}
 _REJECTED_TYPES = frozenset(
     {"invalid_request_error", "not_found_error", "request_too_large", "invalid_request"}
 )
@@ -397,6 +430,16 @@ def error_from_fields(
 
     if lcode in _FILTER_CODES:
         return ContentFilteredError(**common, message=text("content_filter"))
+    if effective_status is not None and effective_status in _CLIENT_ERROR_STATUSES:
+        # A definite client error: the status decides, never a 5xx-ish
+        # type or code (some gateways label 4xx bodies ``api_error``), so it
+        # is never retryable. Anthropic's "credit balance is too low" is a 400
+        # ``invalid_request_error`` and lands in rejected.
+        if effective_status in (401, 403):
+            return ProviderAuthError(**common, message=text("auth"))
+        if effective_status == 402 or ltype in _CREDIT_TYPES or lcode in _CREDIT_CODES:
+            return ProviderError(**common, category="credits", message=text("credits"))
+        return ProviderError(**common, category="rejected", message=text("rejected"))
     if effective_status in (401, 403) or ltype in _AUTH_TYPES or lcode in _AUTH_CODES:
         return ProviderAuthError(**common, message=text("auth"))
     if effective_status == 402 or ltype in _CREDIT_TYPES or lcode in _CREDIT_CODES:
@@ -526,7 +569,13 @@ def map_sdk_error(
             error_type="timeout",
             timeout_reason=reason,
             retryable=reason == "connect",
-            message=timeout_message(reason),
+            message=(
+                timeout_message(reason)
+                if reason == "connect"
+                else "The provider connection timed out reading the response (socket read "
+                "timeout, after SDK retries). For long generations use streaming, or "
+                "raise call_timeout / stream_idle_timeout on the provider."
+            ),
         )
     if isinstance(exc, sdk.APIConnectionError):
         return ProviderUnavailableError(
