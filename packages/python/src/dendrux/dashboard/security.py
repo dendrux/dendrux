@@ -152,12 +152,24 @@ class DashboardGuard:
 
     @staticmethod
     def _route_path(scope: Scope) -> str:
-        """Path relative to where the app is mounted (``root_path`` stripped)."""
+        """The path Starlette's router will match, computed the way Starlette does.
+
+        ``root_path`` is stripped only when the path starts with it **on a
+        ``/`` boundary**; otherwise the path is used unchanged (never assumed
+        to be already stripped).
+        """
         path: str = scope.get("path", "")
         root: str = scope.get("root_path", "")
-        if root and path.startswith(root):
-            path = path[len(root) :]
-        return path
+        if not root or not path.startswith(root):
+            return path
+        if path == root:
+            return ""
+        return path[len(root) :] if path[len(root)] == "/" else path
+
+    @staticmethod
+    def _is_api(path: str) -> bool:
+        """True when any path segment is ``api``, wherever the app is mounted."""
+        return "api" in path.split("/")
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -170,8 +182,11 @@ class DashboardGuard:
             await self._reject(scope, send, 403, "Host not allowed.")
             return
 
-        path = self._route_path(scope)
-        needs_token = path == "/api" or path.startswith("/api/")
+        # Fail closed: an ``api`` segment anywhere in the delivered path, or in
+        # the path after root_path stripping, needs the token. The decision
+        # never depends on how a server or proxy splits root_path from path.
+        # (The built dashboard's static files have no ``api`` segment.)
+        needs_token = self._is_api(scope.get("path", "")) or self._is_api(self._route_path(scope))
         if scope["type"] == "websocket":
             needs_token = True
         if (

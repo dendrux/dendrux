@@ -16,10 +16,12 @@ endpoint is paged with a hard maximum.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -32,6 +34,7 @@ from dendrux.dashboard.security import (
 )
 
 _STATIC_DIR = Path(__file__).parent / "static"
+logger = logging.getLogger("dendrux.dashboard")
 
 # Page-size bounds. Every list endpoint returns at most ``*_MAX`` rows; a
 # caller asking for more is clamped, never refused.
@@ -40,6 +43,13 @@ RUNS_MAX_OFFSET = 10_000
 DRILLDOWN_DEFAULT_LIMIT = 200
 DRILLDOWN_MAX_LIMIT = 500  # the store clamps to 1000; keep room for the has_more probe
 LLM_CALLS_MAX_LIMIT = 200  # rows carry raw provider payloads
+
+# Delegation block on the run-detail page. A run with more direct children
+# than this, or whose full traversal takes longer than the time budget, gets a
+# bounded view flagged ``truncated`` instead of walking the whole tree.
+MAX_DELEGATION_CHILDREN = 500
+MAX_DELEGATION_ANCESTRY = 25
+DELEGATION_TIME_BUDGET_S = 5.0
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -142,16 +152,108 @@ def _delegation_to_dict(info: DelegationInfo) -> dict[str, Any]:
 
 
 def _page_bounds(limit: int, offset: int, *, max_limit: int) -> tuple[int, int]:
-    return min(max(1, limit), max_limit), min(max(0, offset), RUNS_MAX_OFFSET)
+    """Clamp ``limit`` into 1..max_limit; ``offset`` is validated by the endpoint."""
+    return min(max(1, limit), max_limit), offset
 
 
 def _page_info(limit: int, offset: int, has_more: bool) -> dict[str, Any]:
+    """Paging fields. An end that stops at the offset cap is explicit, never repeated.
+
+    ``next_offset`` is ``None`` once the next page would start past
+    ``RUNS_MAX_OFFSET``; ``capped`` then tells the caller that rows remain but
+    this endpoint cannot page to them (narrow the query instead).
+    """
+    nxt = offset + limit
+    reachable = has_more and nxt <= RUNS_MAX_OFFSET
     return {
         "limit": limit,
         "offset": offset,
         "has_more": has_more,
-        "next_offset": offset + limit if has_more else None,
+        "next_offset": nxt if reachable else None,
+        "capped": has_more and not reachable,
     }
+
+
+def _brief(run: Any) -> dict[str, Any]:
+    return {
+        "run_id": run.id,
+        "agent_name": run.agent_name,
+        "status": run.status,
+        "delegation_level": run.delegation_level,
+    }
+
+
+async def _bounded_delegation(
+    state_store: StateStore, run_id: str, child_count: int
+) -> dict[str, Any] | None:
+    """Delegation block built from bounded reads: capped ancestry and children."""
+    run = await state_store.get_run(run_id)
+    if run is None:
+        return None
+    ancestry: list[Any] = []
+    complete = True
+    seen = {run_id}
+    current = run.parent_run_id
+    while current:
+        if current in seen or len(ancestry) >= MAX_DELEGATION_ANCESTRY:
+            complete = False
+            break
+        seen.add(current)
+        row = await state_store.get_run(current)
+        if row is None:
+            complete = False
+            break
+        ancestry.append(row)
+        current = row.parent_run_id
+    children = await state_store.list_runs(parent_run_id=run_id, limit=MAX_DELEGATION_CHILDREN)
+    status_counts: dict[str, int] = {run.status: 1}
+    for child in children:
+        status_counts[child.status] = status_counts.get(child.status, 0) + 1
+    parent: dict[str, Any] | None = None
+    if run.parent_run_id:
+        row = ancestry[0] if ancestry else None
+        parent = {
+            "run_id": run.parent_run_id,
+            "resolved": row is not None and row.id == run.parent_run_id,
+            "agent_name": row.agent_name if row is not None else None,
+            "status": row.status if row is not None else None,
+            "delegation_level": row.delegation_level if row is not None else None,
+        }
+    return {
+        "parent": parent,
+        "children": [_brief(c) for c in children],
+        "ancestry": [_brief(a) for a in reversed(ancestry)],
+        "subtree_summary": {
+            "direct_child_count": child_count,
+            "descendant_count": child_count,
+            "max_depth": 1,
+            "subtree_input_tokens": run.total_input_tokens,
+            "subtree_output_tokens": run.total_output_tokens,
+            "subtree_cost_usd": None,
+            "unknown_cost_count": 0,
+            "status_counts": status_counts,
+        },
+        "ancestry_complete": complete,
+        "truncated": True,
+    }
+
+
+async def _delegation_block(state_store: StateStore, run_id: str) -> dict[str, Any] | None:
+    """Full delegation info when the tree is small; a bounded, flagged view otherwise."""
+    child_count = await state_store.count_runs(parent_run_id=run_id)
+    if child_count <= MAX_DELEGATION_CHILDREN:
+        try:
+            info = await asyncio.wait_for(
+                state_store.get_delegation_info(run_id), DELEGATION_TIME_BUDGET_S
+            )
+        except TimeoutError:
+            info = None
+            logger.warning("dashboard.delegation_budget_exceeded run_id=%s", run_id)
+        else:
+            if info is None:
+                return None
+            return {**_delegation_to_dict(info), "truncated": False}
+    return await _bounded_delegation(state_store, run_id, child_count)
 
 
 def create_dashboard_api(
@@ -173,7 +275,9 @@ def create_dashboard_api(
             ``bind_host`` is not loopback.
         bind_host: The interface the server listens on. A non-loopback value
             without a token raises ``ValueError``; the host is also added to
-            the accepted ``Host`` names.
+            the accepted ``Host`` names. The guard cannot see the socket, so an
+            embedder that serves this app beyond loopback with its own server
+            must pass the real ``bind_host`` (and a token) here.
         allowed_hosts: Extra ``Host`` names to accept besides loopback names,
             IP literals and ``bind_host`` (``["*"]`` turns the check off, for
             embedding behind a gateway that validates it).
@@ -214,7 +318,7 @@ def create_dashboard_api(
     @app.get("/api/runs")
     async def list_runs(
         limit: int = 50,
-        offset: int = 0,
+        offset: int = Query(0, ge=0, le=RUNS_MAX_OFFSET),
         status: str | None = None,
         agent: str | None = None,
         tenant: str | None = None,
@@ -286,8 +390,7 @@ def create_dashboard_api(
 
         # Delegation block — always present since timeline check
         # already verified the run exists. The else is defensive.
-        delegation_info = await state_store.get_delegation_info(run_id)
-        result["delegation"] = _delegation_to_dict(delegation_info) if delegation_info else None
+        result["delegation"] = await _delegation_block(state_store, run_id)
 
         return result
 
@@ -333,7 +436,7 @@ def create_dashboard_api(
     async def get_run_traces(
         run_id: str,
         limit: int = DRILLDOWN_DEFAULT_LIMIT,
-        offset: int = 0,
+        offset: int = Query(0, ge=0, le=RUNS_MAX_OFFSET),
     ) -> dict[str, Any]:
         """Get conversation traces for payload inspection (one bounded page)."""
         page, skip = _page_bounds(limit, offset, max_limit=DRILLDOWN_MAX_LIMIT)
@@ -362,7 +465,7 @@ def create_dashboard_api(
     async def get_run_tool_calls(
         run_id: str,
         limit: int = DRILLDOWN_DEFAULT_LIMIT,
-        offset: int = 0,
+        offset: int = Query(0, ge=0, le=RUNS_MAX_OFFSET),
     ) -> dict[str, Any]:
         """Get tool call records for a run (one bounded page)."""
         page, skip = _page_bounds(limit, offset, max_limit=DRILLDOWN_MAX_LIMIT)
@@ -396,7 +499,7 @@ def create_dashboard_api(
     async def get_run_llm_calls(
         run_id: str,
         limit: int = LLM_CALLS_MAX_LIMIT,
-        offset: int = 0,
+        offset: int = Query(0, ge=0, le=RUNS_MAX_OFFSET),
     ) -> dict[str, Any]:
         """Get LLM interaction records for payload inspection (one bounded page)."""
         page, skip = _page_bounds(limit, offset, max_limit=LLM_CALLS_MAX_LIMIT)

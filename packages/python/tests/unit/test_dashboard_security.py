@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -406,14 +407,50 @@ class TestBoundedPages:
             assert len(resp["llm_calls"]) == dashboard_api.LLM_CALLS_MAX_LIMIT
             assert resp["has_more"] is True
 
-    async def test_runs_list_clamps_limit_and_offset(self) -> None:
+    async def test_runs_list_clamps_limit_and_rejects_bad_offsets(self) -> None:
         store = DashboardMockStore(_runs=[_Run(id=f"R{i}", agent_name="a") for i in range(5)])
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         async with _client(app) as c:
-            body = (await c.get("/api/runs?limit=999999&offset=99999999")).json()
-            assert body["runs"] == []
-            body = (await c.get("/api/runs?limit=0&offset=-5")).json()
-            assert len(body["runs"]) == 1
+            assert len((await c.get("/api/runs?limit=999999")).json()["runs"]) == 5
+            assert len((await c.get("/api/runs?limit=0")).json()["runs"]) == 1
+            assert (await c.get("/api/runs?offset=-5")).status_code == 422
+            over = dashboard_api.RUNS_MAX_OFFSET + 1
+            assert (await c.get(f"/api/runs?offset={over}")).status_code == 422
+
+    @pytest.mark.parametrize("path", ["traces", "tool-calls", "llm-calls"])
+    async def test_offset_beyond_the_cap_is_an_error_not_a_repeat(self, path: str) -> None:
+        app = create_dashboard_api(self._big_store(3))  # type: ignore[arg-type]
+        async with _client(app) as c:
+            over = dashboard_api.RUNS_MAX_OFFSET + 1
+            assert (await c.get(f"/api/runs/R1/{path}?offset={over}")).status_code == 422
+            assert (await c.get(f"/api/runs/R1/{path}?offset=-1")).status_code == 422
+
+    async def test_paging_stops_explicitly_at_the_offset_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dashboard_api, "RUNS_MAX_OFFSET", 30)
+        app = create_dashboard_api(self._big_store(100))  # type: ignore[arg-type]
+        async with _client(app) as c:
+            seen: list[str] = []
+            offset: int | None = 0
+            pages = 0
+            while offset is not None:
+                body = (await c.get(f"/api/runs/R1/traces?limit=10&offset={offset}")).json()
+                seen += [t["id"] for t in body["traces"]]
+                offset = body["next_offset"]
+                pages += 1
+                assert pages < 10, "pagination did not terminate"
+            assert body["has_more"] is True
+            assert body["capped"] is True
+            assert body["next_offset"] is None
+            assert len(seen) == len(set(seen))  # no page repeated
+
+    async def test_end_of_data_is_not_capped(self) -> None:
+        app = create_dashboard_api(self._big_store(5))  # type: ignore[arg-type]
+        async with _client(app) as c:
+            body = (await c.get("/api/runs/R1/traces?limit=10")).json()
+        assert body["has_more"] is False
+        assert body["capped"] is False
 
     async def test_timeline_flags_truncation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(normalizer, "MAX_TIMELINE_ROWS", 7)
@@ -442,3 +479,214 @@ class TestBoundedPages:
             body = (await c.get("/api/runs/R1")).json()
         assert body["truncated"] is False
         assert len(body["messages_by_iteration"]["0"]) == 10
+
+
+class TestRootPathBoundary:
+    """The auth decision must agree with Starlette's routing and fail closed."""
+
+    @staticmethod
+    async def _status(path: str, root_path: str, *, token: str | None = TOKEN) -> int:
+        from dendrux.dashboard.security import DashboardGuard
+
+        reached: list[bool] = []
+
+        async def inner(scope: Any, receive: Any, send: Any) -> None:
+            reached.append(True)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        guard = DashboardGuard(inner, allowed_hosts=["*"], token=token)
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "root_path": root_path,
+            "headers": [(b"host", b"localhost")],
+        }
+        await guard(scope, receive, send)
+        return int(sent[0]["status"])
+
+    @pytest.mark.parametrize(
+        ("path", "root_path"),
+        [
+            ("/api/runs", ""),
+            ("/api/runs", "/"),  # not a boundary strip: Starlette routes /api/runs
+            ("/api/runs", "/a"),
+            ("/api/runs", "/ap"),
+            ("/api/runs", "/api"),  # path equals-prefix of root, still an API path
+            ("/dash/api/runs", "/dash"),
+            ("/dash/api/runs", "/dash/"),
+            (
+                "/api/runs",
+                "/dash",
+            ),  # unprefixed path with a root_path set: never "already stripped"
+            ("/api/runs", "/dashboard"),
+            ("/dashboard/api/runs", "/dash"),  # prefix confusion
+            ("/dash/api", "/dash"),
+            ("/api", ""),
+        ],
+    )
+    async def test_api_paths_need_the_token(self, path: str, root_path: str) -> None:
+        status = await self._status(path, root_path)
+        is_api_like = "/api" in path
+        assert status == (401 if is_api_like else 200), (path, root_path)
+
+    @pytest.mark.parametrize(
+        ("path", "root_path"),
+        [("/", ""), ("/assets/app.js", "/dash"), ("/dash/", "/dash"), ("/dash", "/dash")],
+    )
+    async def test_static_paths_stay_open(self, path: str, root_path: str) -> None:
+        assert await self._status(path, root_path) == 200
+
+    async def test_valid_token_passes_for_every_shape(self) -> None:
+        from dendrux.dashboard.security import DashboardGuard
+
+        results = []
+        for path, root in (("/api/runs", ""), ("/dash/api/runs", "/dash"), ("/api/runs", "/a")):
+            sent: list[dict[str, Any]] = []
+
+            async def inner(scope: Any, receive: Any, send: Any) -> None:
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+
+            async def send(message: dict[str, Any], sent: list[dict[str, Any]] = sent) -> None:
+                sent.append(message)
+
+            async def receive() -> dict[str, Any]:
+                return {"type": "http.request", "body": b""}
+
+            guard = DashboardGuard(inner, allowed_hosts=["*"], token=TOKEN)
+            await guard(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": path,
+                    "root_path": root,
+                    "headers": [(b"host", b"x"), (b"authorization", f"Bearer {TOKEN}".encode())],
+                },
+                receive,
+                send,
+            )
+            results.append(sent[0]["status"])
+        assert results == [200, 200, 200]
+
+    def test_route_path_matches_starlette(self) -> None:
+        from starlette._utils import get_route_path
+
+        from dendrux.dashboard.security import DashboardGuard
+
+        cases = [
+            ("/api/runs", ""),
+            ("/api/runs", "/"),
+            ("/api/runs", "/a"),
+            ("/dash/api/runs", "/dash"),
+            ("/dash/api/runs", "/dash/"),
+            ("/dash", "/dash"),
+            ("/dashboard/x", "/dash"),
+            ("/x", "/dash"),
+        ]
+        for path, root in cases:
+            scope = {"type": "http", "path": path, "root_path": root}
+            assert DashboardGuard._route_path(scope) == get_route_path(scope), (path, root)
+
+    async def test_partial_prefix_root_path_does_not_bypass_a_real_app(self) -> None:
+        """Embedded under FastAPI(root_path="/a"), the dashboard still demands the token."""
+        dash = create_dashboard_api(_store(), auth_token=TOKEN)  # type: ignore[arg-type]
+        for root in ("/a", "/ap", "/"):
+            parent = FastAPI(root_path=root)
+            parent.mount("/", dash)
+            async with _client(parent) as c:
+                assert (await c.get("/api/runs")).status_code == 401, root
+                ok = await c.get("/api/runs", headers={"Authorization": f"Bearer {TOKEN}"})
+                assert ok.status_code == 200, root
+
+
+class TestDelegationBound:
+    @staticmethod
+    def _tree(children: int) -> DashboardMockStore:
+        runs = [_Run(id="P", agent_name="parent")]
+        runs += [_Run(id=f"C{i}", agent_name="child", parent_run_id="P") for i in range(children)]
+        return DashboardMockStore(_runs=runs)
+
+    async def test_small_tree_gets_the_full_block(self) -> None:
+        app = create_dashboard_api(self._tree(2))  # type: ignore[arg-type]
+        async with _client(app) as c:
+            body = (await c.get("/api/runs/P")).json()
+        assert body["delegation"]["truncated"] is False
+        assert len(body["delegation"]["children"]) == 2
+
+    async def test_wide_tree_gets_a_bounded_flagged_view_without_the_full_walk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dashboard_api, "MAX_DELEGATION_CHILDREN", 3)
+        store = self._tree(7)
+
+        async def forbidden(run_id: str) -> Any:
+            raise AssertionError("the unbounded traversal must not run")
+
+        store.get_delegation_info = forbidden  # type: ignore[method-assign]
+        app = create_dashboard_api(store)  # type: ignore[arg-type]
+        async with _client(app) as c:
+            body = (await c.get("/api/runs/P")).json()
+        block = body["delegation"]
+        assert block["truncated"] is True
+        assert len(block["children"]) == 3
+        assert block["subtree_summary"]["direct_child_count"] == 7
+
+    async def test_deep_ancestry_is_capped_in_the_bounded_view(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dashboard_api, "MAX_DELEGATION_CHILDREN", 0)
+        monkeypatch.setattr(dashboard_api, "MAX_DELEGATION_ANCESTRY", 3)
+        runs = [_Run(id=f"A{i}", agent_name="a", parent_run_id=f"A{i + 1}") for i in range(10)]
+        runs.append(_Run(id="A10", agent_name="a"))
+        runs.append(_Run(id="LEAF", agent_name="leaf", parent_run_id="A0"))
+        runs.append(_Run(id="KID", agent_name="kid", parent_run_id="LEAF"))
+        app = create_dashboard_api(DashboardMockStore(_runs=runs))  # type: ignore[arg-type]
+        async with _client(app) as c:
+            block = (await c.get("/api/runs/LEAF")).json()["delegation"]
+        assert block["truncated"] is True
+        assert len(block["ancestry"]) == 3
+        assert block["ancestry_complete"] is False
+        assert block["parent"]["run_id"] == "A0"
+        assert block["parent"]["resolved"] is True
+
+    async def test_slow_traversal_falls_back_to_the_bounded_view(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        monkeypatch.setattr(dashboard_api, "DELEGATION_TIME_BUDGET_S", 0.05)
+        store = self._tree(2)
+
+        async def slow(run_id: str) -> Any:
+            await asyncio.sleep(5)
+
+        store.get_delegation_info = slow  # type: ignore[method-assign]
+        app = create_dashboard_api(store)  # type: ignore[arg-type]
+        async with _client(app) as c:
+            body = (await c.get("/api/runs/P")).json()
+        assert body["delegation"]["truncated"] is True
+        assert len(body["delegation"]["children"]) == 2
+
+
+class TestShippedFrontendShowsTruncation:
+    """The committed build must carry the notices for every bounded read."""
+
+    def test_built_bundle_contains_the_notices(self) -> None:
+        static = Path(dashboard_api.__file__).parent / "static" / "assets"
+        bundle = "".join(p.read_text(errors="ignore") for p in static.glob("index-*.js"))
+        for text in (
+            "more events than the dashboard reads",
+            "delegation tree is very large",
+            "more LLM calls than the dashboard loads",
+            "most recent of",
+        ):
+            assert text in bundle, text

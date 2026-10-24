@@ -162,6 +162,15 @@ export interface LLMInteraction {
 
 export interface LLMCallsResponse {
   llm_calls: LLMInteraction[];
+  has_more?: boolean;
+  next_offset?: number | null;
+  capped?: boolean;
+}
+
+/** LLM calls loaded for a run; `incomplete` when the dashboard stopped before the end. */
+export interface LLMCallsResult {
+  llm_calls: LLMInteraction[];
+  incomplete: boolean;
 }
 
 // -- Delegation types --
@@ -198,6 +207,8 @@ export interface DelegationInfo {
   ancestry: RunBrief[];
   subtree_summary: SubtreeSummary;
   ancestry_complete: boolean;
+  /** True when the server returned a bounded view of a very large delegation tree. */
+  truncated?: boolean;
 }
 
 // -- API response shapes --
@@ -208,6 +219,8 @@ export interface RunDetailResponse {
   system_prompt: string | null;
   messages_by_iteration: Record<string, TraceMessage[]>;
   delegation: DelegationInfo | null;
+  /** True when the run had more rows than the timeline reads; the tail is not shown. */
+  truncated?: boolean;
 }
 
 export interface RunListItem {

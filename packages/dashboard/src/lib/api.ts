@@ -1,6 +1,11 @@
 /** API client for the Dendrux dashboard. */
 
-import type { LLMCallsResponse, RunDetailResponse, RunListResponse } from "./types";
+import type {
+  LLMCallsResponse,
+  LLMCallsResult,
+  RunDetailResponse,
+  RunListResponse,
+} from "./types";
 
 /**
  * Resolve the API base URL.
@@ -79,8 +84,21 @@ export async function fetchRunDetail(runId: string): Promise<RunDetailResponse> 
   return get<RunDetailResponse>(`/runs/${runId}`);
 }
 
-export async function fetchLLMCalls(runId: string): Promise<LLMCallsResponse> {
-  return get<LLMCallsResponse>(`/runs/${runId}/llm-calls`);
+/** Pages the server serves per request are bounded; load at most this many pages. */
+const LLM_CALL_MAX_PAGES = 5;
+
+/** Load a run's LLM calls page by page, stopping at a bound and saying so. */
+export async function fetchLLMCalls(runId: string): Promise<LLMCallsResult> {
+  const calls: LLMCallsResult["llm_calls"] = [];
+  let offset = 0;
+  for (let page = 0; page < LLM_CALL_MAX_PAGES; page++) {
+    const res = await get<LLMCallsResponse>(`/runs/${runId}/llm-calls?offset=${offset}`);
+    calls.push(...res.llm_calls);
+    if (!res.has_more) return { llm_calls: calls, incomplete: false };
+    if (res.next_offset == null) break;
+    offset = res.next_offset;
+  }
+  return { llm_calls: calls, incomplete: true };
 }
 
 export async function fetchHealth(): Promise<{ status: string }> {

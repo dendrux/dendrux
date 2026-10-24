@@ -20,6 +20,7 @@ import type {
   FinishNode,
 } from "@/lib/types";
 import { fetchLLMCalls } from "@/lib/api";
+import { TruncationNotice } from "@/components/TruncationNotice";
 import { useDashboardStore } from "@/lib/store";
 import { formatDuration, formatTokens, formatCost } from "@/lib/format";
 
@@ -131,6 +132,13 @@ function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
 
   return (
     <>
+      {llmCallsData?.incomplete && !interaction && (
+        <TruncationNotice>
+          This run has more LLM calls than the dashboard loads ({llmCallsData.llm_calls.length}).
+          The payload for this call is not shown, but it is stored.
+        </TruncationNotice>
+      )}
+
       {/* Stats */}
       <div className="flex gap-3 p-5 border-b border-white/[0.06]">
         <StatCard label="Input" value={formatTokens(node.input_tokens)} mono />
