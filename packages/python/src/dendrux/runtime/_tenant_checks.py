@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 RESERVED_METADATA_PREFIX = "dendrux."
 _NEW_RUN_ENTRIES = frozenset({"run", "stream", "retry"})
-_STRICT_DEFAULT_WARNED = False
 
 
 def resolve_tenant(
@@ -51,7 +50,8 @@ def resolve_tenant(
     :class:`TenantScopeRequiredError` instead, unless the call runs inside a
     delegated run (``runtime.context.get_delegation_context``): a new child
     run then inherits the parent's tenant, and any other entry point is
-    scoped to the parent's tenant.
+    scoped to the parent's tenant. An omitted tenant on an Agent that did not
+    choose ``strict_tenancy`` emits a ``FutureWarning`` (the 0.6 default flip).
     """
     if not isinstance(tenant_id, _OmittedType):
         return tenant_id
@@ -73,16 +73,17 @@ def resolve_tenant(
 
 
 def _warn_strict_default() -> None:
-    global _STRICT_DEFAULT_WARNED  # noqa: PLW0603
-    if _STRICT_DEFAULT_WARNED:
-        return
-    _STRICT_DEFAULT_WARNED = True
+    """B19: a ``FutureWarning`` (shown by default), deduplicated per caller location.
+
+    ``stacklevel`` points at the code that called the Agent method:
+    this function, ``resolve_tenant``, ``entry_checks``, the Agent method.
+    """
     warnings.warn(
         "An Agent method was called without tenant_id on an Agent that did not choose "
         "strict_tenancy. In dendrux 0.6 strict_tenancy defaults to True and this call "
         "raises TenantScopeRequiredError. Pass tenant_id= (None for untenanted runs), or "
         "choose Agent(strict_tenancy=...) explicitly.",
-        DeprecationWarning,
+        FutureWarning,
         stacklevel=5,
     )
 

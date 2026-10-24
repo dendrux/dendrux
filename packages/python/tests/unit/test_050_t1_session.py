@@ -11,7 +11,6 @@ from typing import Any
 
 import pytest
 
-import dendrux.agent as agent_module
 from dendrux import Agent
 from dendrux.db import session
 from dendrux.llm.mock import MockLLM
@@ -29,25 +28,26 @@ async def test_reinitialize_error_masks_passwords(monkeypatch: pytest.MonkeyPatc
     assert "***" in message
 
 
-async def test_env_store_warns_once(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(agent_module, "_ENV_STORE_WARNED", False)
+async def test_env_store_warning_points_at_the_caller(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("DENDRUX_DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'env.db'}")
     await session.reset_engine()
     try:
         with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+            warnings.simplefilter("default")
             for _ in range(2):
                 agent = Agent(provider=MockLLM([LLMResponse(text="ok")]), prompt="p")
                 assert (await agent.run("hi", tenant_id=None)).answer == "ok"
         deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecations) == 1
+        assert len(deprecations) == 1  # deduplicated per location by `warnings`
+        assert deprecations[0].filename == __file__
         assert "state_store=" in str(deprecations[0].message)
     finally:
         await session.reset_engine()
 
 
-async def test_explicit_store_does_not_warn(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(agent_module, "_ENV_STORE_WARNED", False)
+async def test_explicit_store_does_not_warn(tmp_path: Any) -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         agent = Agent(

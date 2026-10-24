@@ -167,25 +167,30 @@ class TestStrictTenancy:
         assert "code=tenant_scope_required" in caplog.text
 
 
-class TestStrictDefaultDeprecation:
-    def test_warns_once_when_not_chosen_and_tenant_omitted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(_tenant_checks, "_STRICT_DEFAULT_WARNED", False)
+class TestStrictDefaultFutureWarning:
+    async def test_future_warning_points_at_the_caller_and_dedups(self, store: Any) -> None:
+        agent = _agent(store)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            for _ in range(3):
+                await agent.run("hi")  # one location: shown once
+            await agent.run("hi")  # another location: shown again
+        future = [w for w in caught if issubclass(w.category, FutureWarning)]
+        assert len(future) == 2
+        assert all(w.filename == __file__ for w in future)
+        assert "strict_tenancy" in str(future[0].message)
+
+    def test_visible_under_default_filters(self) -> None:
         from dendrux._sentinel import _OMITTED
 
-        agent = _agent()
         with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            _tenant_checks.resolve_tenant(agent, "run", _OMITTED, default=None)
-            _tenant_checks.resolve_tenant(agent, "resume", _OMITTED, default=UNSCOPED)
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecations) == 1
-        assert "strict_tenancy" in str(deprecations[0].message)
+            warnings.resetwarnings()  # Python's defaults: FutureWarning is shown
+            warnings.simplefilter("default", FutureWarning)
+            _tenant_checks.resolve_tenant(_agent(), "run", _OMITTED, default=None)
+        assert [w.category for w in caught] == [FutureWarning]
 
     @pytest.mark.parametrize("chosen", [True, False])
-    def test_no_warning_when_chosen(self, monkeypatch: pytest.MonkeyPatch, chosen: bool) -> None:
-        monkeypatch.setattr(_tenant_checks, "_STRICT_DEFAULT_WARNED", False)
+    def test_no_warning_when_chosen(self, chosen: bool) -> None:
         from dendrux._sentinel import _OMITTED
 
         agent = _agent(strict_tenancy=chosen)
@@ -196,10 +201,9 @@ class TestStrictDefaultDeprecation:
                     _tenant_checks.resolve_tenant(agent, "run", _OMITTED, default=None)
             else:
                 _tenant_checks.resolve_tenant(agent, "run", _OMITTED, default=None)
-        assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert not [w for w in caught if issubclass(w.category, FutureWarning)]
 
-    def test_no_warning_for_an_explicit_tenant(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(_tenant_checks, "_STRICT_DEFAULT_WARNED", False)
+    def test_no_warning_for_an_explicit_tenant(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             _tenant_checks.resolve_tenant(_agent(), "run", "acme", default=None)

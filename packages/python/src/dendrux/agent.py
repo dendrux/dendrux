@@ -182,15 +182,13 @@ def _record_to_run_result(record: Any) -> RunResult:
     )
 
 
-_ENV_STORE_WARNED = False
-
-
 def _warn_env_store_deprecated() -> None:
-    """One ``DeprecationWarning`` per process for the implicit DENDRUX_DATABASE_URL store (B6)."""
-    global _ENV_STORE_WARNED  # noqa: PLW0603
-    if _ENV_STORE_WARNED:
-        return
-    _ENV_STORE_WARNED = True
+    """B6 ``DeprecationWarning`` for the implicit DENDRUX_DATABASE_URL store.
+
+    Deduplicated by ``warnings`` per caller location; ``stacklevel`` points at
+    the code that called the Agent method (this function,
+    ``_resolve_state_store``, the Agent method).
+    """
     import warnings
 
     warnings.warn(
