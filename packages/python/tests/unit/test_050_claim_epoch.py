@@ -142,4 +142,5 @@ class TestMigration:
         assert r1.down_revision == "c6d7e8f9a0b1"
         source = Path(r1.path).read_text()
         assert '"claim_epoch"' in source
-        assert "TODO(T1, R1)" in source
+        assert "uq_agent_runs_tenant_idempotency_key" in source
+        assert "IF NOT EXISTS" in source
