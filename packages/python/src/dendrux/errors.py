@@ -28,7 +28,17 @@ Suggested HTTP mappings:
     ImageFetchError             -> 400 (502 when reason is "http_status" or "timeout")
     UnsupportedModalityError    -> 400
     ImageRejectedError          -> 422
-    ProviderError               -> 502
+    ProviderError               -> 502 (base of the provider errors below)
+    ProviderAuthError           -> 502
+    ProviderRateLimitError      -> 503 (``retry_after``)
+    ProviderTimeoutError        -> 504
+    ProviderUnavailableError    -> 503
+    ProviderStreamIncompleteError -> 502
+    ModelRefusalError           -> 422
+    ContentFilteredError        -> 422
+    BudgetConfigurationError    -> 500 (configuration)
+    TenantScopeRequiredError    -> 500 (configuration: pass tenant_id)
+    GovernanceMismatchError     -> 409
     BlobNotFoundError           -> 404
     BlobIntegrityError          -> 500
     ImagePersistenceUnsupportedError -> 500
@@ -44,8 +54,9 @@ paths/queries/credentials, and are raised with no ``__cause__`` and no
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Literal, TypeAlias, get_args
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -262,36 +273,6 @@ class SkillMismatchError(SkillContinuityError):
     """Raised when every skill is attached but some have different content."""
 
 
-class ContextLengthExceededError(RuntimeError):
-    """Raised when an LLM endpoint rejects a request as too large for the model's context window.
-
-    Raised by the OpenAI-compatible providers (and therefore
-    ``OpenRouterProvider``) for both batch and streaming calls. The message
-    never contains prompt content; the original SDK exception is chained as
-    ``__cause__`` for debugging.
-
-    Attributes:
-        status_code: HTTP status the endpoint returned (``None`` for an
-            in-stream error event).
-        provider_code: Provider error code when one was sent
-            (for example ``"context_length_exceeded"``), else ``None``.
-        model: Model name the request targeted, when known.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        provider_code: str | None = None,
-        model: str | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self.provider_code = provider_code
-        self.model = model
-        super().__init__(message)
-
-
 class SqliteSchemaSyncError(RuntimeError):
     """A SQLite database cannot be upgraded in place to the current schema.
 
@@ -349,6 +330,12 @@ class SchemaOutOfDateError(RuntimeError):
 
 def _rebuild_error(cls: type[BaseException], kwargs: dict[str, object]) -> BaseException:
     return cls(**kwargs)
+
+
+def _rebuild_context_length_error(
+    cls: type[BaseException], message: str, kwargs: dict[str, object]
+) -> BaseException:
+    return cls(message, **kwargs)
 
 
 class _KwargsReduceMixin:
@@ -561,34 +548,268 @@ class ImageRejectedError(_KwargsReduceMixin, RuntimeError):
         )
 
 
-class ProviderError(_KwargsReduceMixin, RuntimeError):
-    """A provider failure on an image-bearing request, with a sanitised message.
+ProviderErrorCategory: TypeAlias = Literal[
+    "auth",
+    "credits",
+    "rate_limit",
+    "rejected",
+    "unavailable",
+    "timeout",
+    "context_length",
+    "refusal",
+    "content_filter",
+    "stream_incomplete",
+    "unknown",
+]
+PROVIDER_ERROR_CATEGORIES: tuple[str, ...] = get_args(ProviderErrorCategory)
 
-    Text-only requests keep their v0.3.0 exception types. ``message`` is the
-    vendor message truncated to 500 characters with base64 runs and data
-    URLs replaced by ``[redacted]``.
+# A provider code is echoed into ``safe_message`` only when it looks like a code.
+_SAFE_PROVIDER_CODE = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
+
+
+class ProviderError(_KwargsReduceMixin, RuntimeError):
+    """A provider request failed.
+
+    ``category`` classifies the failure (see :data:`PROVIDER_ERROR_CATEGORIES`)
+    and ``retryable`` says whether repeating the same request may succeed.
+    Both default per subclass. ``safe_message`` is a fixed template built only
+    from these fields (never vendor text), safe to persist, log and show.
+
+    On image-bearing requests ``message`` is the vendor message truncated to
+    500 characters with base64 runs and data URLs replaced by ``[redacted]``.
     """
 
-    _init_fields = ("provider", "model", "status_code", "provider_code", "error_type", "message")
+    _init_fields: tuple[str, ...] = (
+        "provider",
+        "model",
+        "status_code",
+        "provider_code",
+        "error_type",
+        "message",
+        "category",
+        "retryable",
+    )
+    default_category: ClassVar[ProviderErrorCategory] = "unknown"
+    default_retryable: ClassVar[bool] = False
 
     def __init__(
         self,
         *,
-        provider: str | None,
-        model: str | None,
+        provider: str | None = None,
+        model: str | None = None,
         status_code: int | None = None,
         provider_code: str | None = None,
         error_type: str | None = None,
         message: str = "",
+        category: ProviderErrorCategory | None = None,
+        retryable: bool | None = None,
     ) -> None:
+        self._set_provider_fields(
+            provider=provider,
+            model=model,
+            status_code=status_code,
+            provider_code=provider_code,
+            error_type=error_type,
+            message=message[:500],
+            category=category,
+            retryable=retryable,
+        )
+        status = f" (HTTP {status_code})" if status_code is not None else ""
+        super().__init__(f"Provider {provider!r} error{status}: {self.message}")
+
+    def _set_provider_fields(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        status_code: int | None,
+        provider_code: str | None,
+        error_type: str | None,
+        message: str,
+        category: ProviderErrorCategory | None,
+        retryable: bool | None,
+    ) -> None:
+        resolved = self.default_category if category is None else category
+        if resolved not in PROVIDER_ERROR_CATEGORIES:
+            raise ValueError(f"Unknown provider error category {resolved!r}.")
         self.provider = provider
         self.model = model
         self.status_code = status_code
         self.provider_code = provider_code
         self.error_type = error_type
-        self.message = message[:500]
-        status = f" (HTTP {status_code})" if status_code is not None else ""
-        super().__init__(f"Provider {provider!r} error{status}: {self.message}")
+        self.message = message
+        self.category: ProviderErrorCategory = resolved
+        self.retryable: bool = self.default_retryable if retryable is None else bool(retryable)
+
+    @property
+    def safe_message(self) -> str:
+        """``"{provider} {category} (HTTP {status}, code {provider_code})"``; no vendor text."""
+        status = self.status_code if self.status_code is not None else "n/a"
+        code = self.provider_code
+        shown = code if code is not None and _SAFE_PROVIDER_CODE.match(code) else "n/a"
+        return f"{self.provider or 'provider'} {self.category} (HTTP {status}, code {shown})"
+
+
+class ProviderAuthError(ProviderError):
+    """The provider rejected the credentials (HTTP 401/403)."""
+
+    default_category = "auth"
+
+
+class ProviderRateLimitError(ProviderError):
+    """The provider rate-limited the request (HTTP 429).
+
+    ``retry_after`` is the server's suggested wait in seconds, when it sent one.
+    """
+
+    _init_fields = (*ProviderError._init_fields, "retry_after")
+    default_category = "rate_limit"
+    default_retryable = True
+
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        error_type: str | None = None,
+        message: str = "",
+        category: ProviderErrorCategory | None = None,
+        retryable: bool | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        self.retry_after = retry_after
+        super().__init__(
+            provider=provider,
+            model=model,
+            status_code=status_code,
+            provider_code=provider_code,
+            error_type=error_type,
+            message=message,
+            category=category,
+            retryable=retryable,
+        )
+
+
+class ProviderTimeoutError(ProviderError, TimeoutError):
+    """A provider call hit a deadline. Also a builtin :class:`TimeoutError`."""
+
+    default_category = "timeout"
+
+
+class ProviderUnavailableError(ProviderError, ConnectionError):
+    """The provider could not be reached or is overloaded (connection, 5xx).
+
+    Also a builtin :class:`ConnectionError`.
+    """
+
+    default_category = "unavailable"
+    default_retryable = True
+
+
+class ProviderStreamIncompleteError(ProviderError):
+    """A response stream ended without its terminal event."""
+
+    default_category = "stream_incomplete"
+
+
+class ModelRefusalError(ProviderError):
+    """The model refused to answer.
+
+    ``refusal_text`` is an in-process attribute only: it is never persisted,
+    emitted, logged or carried through pickling.
+    """
+
+    default_category = "refusal"
+
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        error_type: str | None = None,
+        message: str = "",
+        category: ProviderErrorCategory | None = None,
+        retryable: bool | None = None,
+        refusal_text: str | None = None,
+    ) -> None:
+        self.refusal_text = refusal_text
+        super().__init__(
+            provider=provider,
+            model=model,
+            status_code=status_code,
+            provider_code=provider_code,
+            error_type=error_type,
+            message=message,
+            category=category,
+            retryable=retryable,
+        )
+
+
+class ContentFilteredError(ProviderError):
+    """The provider's content filter stopped the request or the response."""
+
+    default_category = "content_filter"
+
+
+class ContextLengthExceededError(ProviderError):
+    """Raised when an LLM endpoint rejects a request as too large for the model's context window.
+
+    Raised by the OpenAI-compatible providers (and therefore
+    ``OpenRouterProvider``) for both batch and streaming calls. The message
+    never contains prompt content; the original SDK exception is chained as
+    ``__cause__`` for debugging. ``str(exc)`` is ``message`` unchanged.
+
+    Attributes:
+        status_code: HTTP status the endpoint returned (``None`` for an
+            in-stream error event).
+        provider_code: Provider error code when one was sent
+            (for example ``"context_length_exceeded"``), else ``None``.
+        model: Model name the request targeted, when known.
+    """
+
+    _init_fields = (
+        "message",
+        "status_code",
+        "provider_code",
+        "model",
+        "provider",
+        "error_type",
+        "category",
+        "retryable",
+    )
+    default_category = "context_length"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        error_type: str | None = None,
+        category: ProviderErrorCategory | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        self._set_provider_fields(
+            provider=provider,
+            model=model,
+            status_code=status_code,
+            provider_code=provider_code,
+            error_type=error_type,
+            message=message,
+            category=category,
+            retryable=retryable,
+        )
+        RuntimeError.__init__(self, message)
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        kwargs = {name: getattr(self, name) for name in self._init_fields if name != "message"}
+        return (_rebuild_context_length_error, (type(self), self.message, kwargs))
 
 
 class BlobNotFoundError(_KwargsReduceMixin, LookupError):
@@ -660,22 +881,115 @@ class BlobContentionError(_KwargsReduceMixin, RuntimeError):
         super().__init__(f"Could not store {what} due to concurrent changes; retry the call.")
 
 
+# ---------------------------------------------------------------------------
+# Trust (0.5.0)
+# ---------------------------------------------------------------------------
+
+
+class BudgetConfigurationError(_KwargsReduceMixin, ValueError):
+    """A dollar budget cannot be enforced because the model has no pricing source.
+
+    Raised when ``Budget(max_cost_usd=...)`` is set but neither the provider
+    reports cost nor the agent's ``PriceTable`` prices ``model``. ``reason``
+    is a stable code (``"unpriced_model"``).
+    """
+
+    _init_fields = ("model", "reason")
+
+    def __init__(self, *, model: str | None = None, reason: str = "unpriced_model") -> None:
+        self.model = model
+        self.reason = reason
+        super().__init__(
+            f"Budget max_cost_usd cannot be enforced for model {model!r} ({reason}): add a "
+            "PriceTable entry for the model you request, or use a provider that reports cost."
+        )
+
+
+class TenantScopeRequiredError(_KwargsReduceMixin, ValueError):
+    """An entry point was called without ``tenant_id`` on an ``Agent(strict_tenancy=True)``.
+
+    ``operation`` names the method (``"run"``, ``"submit_input"``, ...).
+    """
+
+    _init_fields = ("operation",)
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        super().__init__(
+            f"{operation}() requires an explicit tenant_id= because the agent has "
+            "strict_tenancy=True."
+        )
+
+
+class GovernanceMismatchError(_KwargsReduceMixin, RuntimeError):
+    """A paused run was resumed with governance different from what it started with.
+
+    Raised only with ``Agent(on_governance_change="raise")``. ``expected_digest``
+    and ``actual_digest`` are opaque digests; ``changed`` names the parts that
+    differ (for example ``"guardrails"``, ``"deny"``). The run stays paused.
+    """
+
+    _init_fields = ("run_id", "expected_digest", "actual_digest", "changed")
+
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        expected_digest: str | None = None,
+        actual_digest: str | None = None,
+        changed: Iterable[str] = (),
+    ) -> None:
+        self.run_id = run_id
+        self.expected_digest = expected_digest
+        self.actual_digest = actual_digest
+        self.changed: tuple[str, ...] = tuple(changed)
+        what = f" ({', '.join(self.changed)})" if self.changed else ""
+        super().__init__(
+            f"Run '{run_id}' was started with different governance{what}; "
+            "resume it with the same guardrails, hooks, deny and approval settings."
+        )
+
+
+class RunFencedError(_KwargsReduceMixin, RuntimeError):
+    """Internal: this worker lost its claim on the run (a newer claim epoch exists).
+
+    Not public API. The runner stops without writing further state.
+    """
+
+    _init_fields = ("run_id", "claim_epoch")
+
+    def __init__(self, run_id: str, *, claim_epoch: int | None = None) -> None:
+        self.run_id = run_id
+        self.claim_epoch = claim_epoch
+        super().__init__(f"Run '{run_id}' is fenced: claim epoch {claim_epoch} is stale.")
+
+
 __all__ = [
     "BlobContentionError",
     "BlobIntegrityError",
     "BlobNotFoundError",
+    "BudgetConfigurationError",
+    "ContentFilteredError",
     "ContextLengthExceededError",
+    "GovernanceMismatchError",
     "ImageError",
     "ImageFetchError",
     "ImageLimitError",
     "ImagePersistenceUnsupportedError",
     "ImageRejectedError",
     "InvalidImageError",
-    "ProviderError",
-    "UnsupportedModalityError",
     "InvalidToolResultError",
+    "ModelRefusalError",
+    "PROVIDER_ERROR_CATEGORIES",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
+    "ProviderAuthError",
+    "ProviderError",
+    "ProviderErrorCategory",
+    "ProviderRateLimitError",
+    "ProviderStreamIncompleteError",
+    "ProviderTimeoutError",
+    "ProviderUnavailableError",
     "ReplayRunError",
     "RunAlreadyClaimedError",
     "RunAlreadyTerminalError",
@@ -689,4 +1003,6 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "SqliteSchemaSyncError",
+    "TenantScopeRequiredError",
+    "UnsupportedModalityError",
 ]

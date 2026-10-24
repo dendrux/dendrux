@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from dendrux.db._sqlite_sync import create_sqlite_schema
-from dendrux.errors import BlobNotFoundError
+from dendrux.errors import BlobNotFoundError, RunNotFoundError
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
@@ -66,8 +66,8 @@ if TYPE_CHECKING:
     from dendrux.media import BlobStore
 
 
-class RunNotFoundError(Exception):
-    """Raised when streaming is requested for a non-existent run."""
+# ``RunNotFoundError`` is re-exported from :mod:`dendrux.errors`: one class
+# everywhere since 0.5.0 (its constructor takes the run id).
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +570,7 @@ class RunStore:
 
         record = await require_store_method(self._state, "get_subtree")(run_id, tenant_id=tenant_id)
         if record is None:
-            raise RunNotFoundError(f"Run '{run_id}' does not exist.")
+            raise RunNotFoundError(run_id)
         return RunSubtree(
             root_run_id=run_id,
             nodes=[
@@ -598,7 +598,7 @@ class RunStore:
         """
         run = await self._state.get_run(run_id)
         if run is None:
-            raise RunNotFoundError(f"Run '{run_id}' does not exist.")
+            raise RunNotFoundError(run_id)
 
         cursor = after_sequence_index
         while True:
@@ -708,7 +708,7 @@ class RunStore:
         if not isinstance(tenant_id, _Unscoped):
             record = await self._state.get_run(run_id)
             if record is None or record.tenant_id != tenant_id:
-                raise RunNotFoundError(f"Run '{run_id}' does not exist.")
+                raise RunNotFoundError(run_id)
             rows = await get_notes(run_id, undelivered_only=undelivered_only, tenant_id=tenant_id)
         else:
             rows = await get_notes(run_id, undelivered_only=undelivered_only)
