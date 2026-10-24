@@ -881,7 +881,7 @@ class TestSubmitAndClaim:
 
 
 # ------------------------------------------------------------------
-# Run Events (Dashboard Phase 0)
+# Run Events (operator UI Phase 0)
 # ------------------------------------------------------------------
 
 
@@ -938,7 +938,7 @@ class TestRunEvents:
         assert events[0].correlation_id == "tc_abc123"
 
     async def test_pause_resume_events_give_exact_timing(self, store) -> None:
-        """Pause and resume events provide durable timestamps for the dashboard."""
+        """Pause and resume events provide durable timestamps for the operator UI."""
         await store.create_run("run_pr_ev", "Agent")
 
         await store.save_run_event(

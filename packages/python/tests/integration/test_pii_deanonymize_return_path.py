@@ -80,7 +80,7 @@ class TestReturnPathDeanonymize:
 
     async def test_db_row_keeps_raw_placeholder(self, db_store) -> None:
         """DB persists the LLM's raw output (placeholder); only the return value
-        is deanonymized. Dashboard's audit view stays placeholder-faithful."""
+        is deanonymized. operator UI's audit view stays placeholder-faithful."""
         llm = MockLLM([_resp("Hello <<PERSON_1>>!")])
         agent = Agent(
             provider=llm,

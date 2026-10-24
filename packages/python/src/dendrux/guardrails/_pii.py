@@ -11,7 +11,7 @@ NLP-backed detection of ~18 entities (adds PERSON, LOCATION, DATE_TIME,
 IBAN_CODE, US_PASSPORT, etc.). Requires ``pip install dendrux[presidio]``.
 
 Entity names are canonical to Presidio's vocabulary across both engines
-so dashboards/tests see one set of names regardless of backend.
+so inspection tools/tests see one set of names regardless of backend.
 """
 
 from __future__ import annotations

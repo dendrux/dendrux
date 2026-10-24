@@ -4,7 +4,7 @@ Covers:
   - LLMResponse provider payload fields
   - Recorder enriched on_llm_call_completed with semantic payloads + dual-write
   - _resume_core CAS bug fix
-  - Dashboard /api/runs/{run_id}/llm-calls endpoint
+  - RunStore LLM call reads
 """
 
 from __future__ import annotations

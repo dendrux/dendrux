@@ -2,7 +2,7 @@
 
 - ``RunStore.get_pending``: every pause kind, the bounded JSON extraction on
   both dialects, and the fail-closed tenant scope.
-- B2 amendment: with the router defaults (``include_payloads=False``) the
+- B2 amendment: with the store defaults (``include_payloads=False``) the
   client-tools flow and the approval flow still see the active pause's
   arguments; past pauses and other payloads stay hidden.
 - ``RunStore.follow`` under concurrency: many followers of one run share one
@@ -16,11 +16,8 @@ import json
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
 
 from dendrux.errors import RunNotFoundError
-from dendrux.http import make_read_router
 from dendrux.store import UNSCOPED, EventFeed, FollowEnd, RunStore, StoredEvent, redact_event
 from dendrux.types import ToolResult
 from tests.integration.test_tenant_run_control import _pause
@@ -31,18 +28,6 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture
 def run_store(engine: Any) -> RunStore:
     return RunStore.from_engine(engine)
-
-
-async def _allow() -> None:
-    return None
-
-
-def _client(run_store: RunStore) -> AsyncClient:
-    app = FastAPI()
-    app.include_router(
-        make_read_router(store=run_store, authorize=_allow, tenant_resolver=UNSCOPED)
-    )
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
 
 
 # ---------------------------------------------------------------------------
@@ -155,62 +140,33 @@ async def test_pending_read_does_not_load_history(
 
 
 # ---------------------------------------------------------------------------
-# B2 amendment: the default router still serves the client-tools and approval flows
+# B2 amendment: the read primitives serve the client-tools and approval flows
 # ---------------------------------------------------------------------------
-
-
-def _sse_events(body: str) -> list[dict[str, Any]]:
-    out = []
-    for block in body.split("\n\n"):
-        lines = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
-        if "data" in lines and lines.get("event", "message") == "message":
-            out.append(json.loads(lines["data"]))
-    return out
 
 
 async def test_client_tools_flow_with_defaults(store: Any, run_store: RunStore) -> None:
     paused = await _pause("client", store, None)
-    run_id = paused.run_id
-    async with _client(run_store) as http:
-        events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
-        call = next(e for e in events if e["event_type"] == "run.paused")["data"][
-            "pending_tool_calls"
-        ][0]
-        assert call["params"] == {
-            "sheet": "S1"
-        }  # what executeLocally(call.name, call.params) needs
-        pauses = (await http.get(f"/runs/{run_id}/pauses")).json()["items"]
-        assert pauses[-1]["pending_tool_calls"][0]["params"] == {"sheet": "S1"}
-
-        result = await paused.agent.submit_tool_results(
-            run_id, [ToolResult(name="read_range", call_id=call["id"], payload='"rows"')]
-        )
-        assert result.status.value == "success"
-
-        # The pause is history now: its arguments are hidden again.
-        events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
-        past = next(e for e in events if e["event_type"] == "run.paused")
-        assert "params" not in past["data"]["pending_tool_calls"][0]
-        pauses = (await http.get(f"/runs/{run_id}/pauses")).json()["items"]
-        assert "params" not in pauses[-1]["pending_tool_calls"][0]
-        stream = (await http.get(f"/runs/{run_id}/events/stream")).text
-        paused_frame = next(e for e in _sse_events(stream) if e["event_type"] == "run.paused")
-        assert "params" not in paused_frame["data"]["pending_tool_calls"][0]
+    pending = await run_store.get_pending(paused.run_id, tenant_id=None)
+    call = pending.tool_calls[0]
+    assert call.params == {"sheet": "S1"}
+    result = await paused.agent.submit_tool_results(
+        paused.run_id,
+        [ToolResult(name=call.name, call_id=call.id, payload='"rows"')],
+        tenant_id=None,
+    )
+    assert result.status.value == "success"
+    events = await run_store.get_events(paused.run_id, tenant_id=None)
+    past = next(e for e in events if e.event_type == "run.paused")
+    view = await run_store.get_event_view(paused.run_id, past, tenant_id=None)
+    assert "params" not in view.data["pending_tool_calls"][0]
 
 
 async def test_approval_flow_with_defaults(store: Any, run_store: RunStore) -> None:
     paused = await _pause("approval", store, None)
-    run_id = paused.run_id
-    async with _client(run_store) as http:
-        events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
-        data = next(e for e in events if e["event_type"] == "run.paused")["data"]
-        assert data["status"] == "waiting_approval"
-        assert data["pending_tool_calls"][0]["params"] == {"order_id": 7}
-        assert not data["pending_tool_calls"][0].get("args_hidden")
-    pending = await run_store.get_pending(run_id, tenant_id=UNSCOPED)
-    assert pending is not None and pending.tool_calls[0].params == {"order_id": 7}
-    assert pending.tool_calls[0].args_hidden is False
-    result = await paused.agent.submit_approval(run_id, approved=True)
+    pending = await run_store.get_pending(paused.run_id, tenant_id=None)
+    assert pending.tool_calls[0].params == {"order_id": 7}
+    assert not pending.tool_calls[0].args_hidden
+    result = await paused.agent.submit_approval(paused.run_id, approved=True, tenant_id=None)
     assert result.status.value == "success"
 
 
@@ -347,25 +303,6 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
     assert pending.tool_calls[0].params == {"to": "<<EMAIL_ADDRESS_1>>"}
     assert real not in json.dumps(pending.to_dict())
 
-    for include_payloads in (False, True):
-        app = FastAPI()
-        app.include_router(
-            make_read_router(
-                store=run_store,
-                authorize=_allow,
-                tenant_resolver=lambda: "acme",
-                include_payloads=include_payloads,
-            )
-        )
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as http:
-            events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
-            data = next(e for e in events if e["event_type"] == "run.paused")["data"]
-            assert data["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
-            assert real not in json.dumps(events)
-            pauses = (await http.get(f"/runs/{run_id}/pauses")).json()["items"]
-            assert pauses[-1]["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
-            assert real not in json.dumps(pauses)
-
     follow = run_store.follow(run_id, tenant_id="acme", max_duration_s=0.5)
     async with follow as f:
         items = [item async for item in f]
@@ -406,7 +343,6 @@ async def test_pause_display_uses_recorded_args_on_every_path(
     recorded: bool,
     mapped: bool,
 ) -> None:
-    from dendrux.http.read_router import _sse_frames
 
     await store.create_run("display", "a", tenant_id="T")
     # Reused call IDs from older pauses must never supply the new approval view.
@@ -445,30 +381,20 @@ async def test_pause_display_uses_recorded_args_on_every_path(
     assert pending.tool_calls[0].params == expected
     assert pending.tool_calls[0].args_hidden == (expected is None)
     for payloads in (False, True):
-        app = FastAPI()
-        app.include_router(
-            make_read_router(
-                store=run_store,
-                authorize=_allow,
-                tenant_resolver=lambda: "T",
-                include_payloads=payloads,
-            )
+        events = await run_store.get_events("display", tenant_id="T")
+        view = await run_store.get_event_view(
+            "display", events[-1], tenant_id="T", include_payloads=payloads
         )
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as http:
-            events = (await http.get("/runs/display/events")).json()["items"]
-            pair = (await http.get("/runs/display/pauses")).json()["items"][-1]
-        call = events[-1]["data"]["pending_tool_calls"][0]
+        call = view.data["pending_tool_calls"][0]
         assert call["params"] == expected
-        assert pair["pending_tool_calls"][0]["params"] == expected
         if expected is None:
             assert call["args_hidden"] is True
         async with run_store.follow(
             "display", tenant_id="T", include_payloads=payloads, max_duration_s=0.1
         ) as follow:
-            frames = [frame async for frame in _sse_frames(follow)]
-        shown = [json.loads(f.split("data: ")[1]) for f in frames if "event: message\n" in f]
-        assert shown[-1]["event_type"] == "run.paused"
-        assert shown[-1]["data"]["pending_tool_calls"][0]["params"] == expected
+            shown = [item async for item in follow if isinstance(item, StoredEvent)]
+        assert shown[-1].event_type == "run.paused"
+        assert shown[-1].data["pending_tool_calls"][0]["params"] == expected
 
 
 async def test_pause_page_pairs_at_boundary_and_reports_truncation(
@@ -483,10 +409,6 @@ async def test_pause_page_pairs_at_boundary_and_reports_truncation(
     assert [p.resume_sequence_index for p in items] == [1, 3]
     items, truncated = await run_store.get_pause_page("pages", limit=5)
     assert len(items) == 5 and not truncated
-    async with _client(run_store) as http:
-        body = (await http.get("/runs/pages/pauses?limit=2")).json()
-        assert body["truncated"] and body["limit"] == 2 and len(body["items"]) == 2
-        assert (await http.get("/runs/pages/pauses?limit=1001")).status_code == 422
 
 
 async def test_delegation_traversal_bounds_and_projection(store: Any, engine: Any) -> None:

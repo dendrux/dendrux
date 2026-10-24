@@ -1051,7 +1051,7 @@ class TestGuardrailSingleCall:
 
 class TestNotifierGuardrailFindingsSymmetry:
     """The recorder receives ``guardrail_findings`` on every LLM call.
-    The notifier must receive the same kwarg so OTel/dashboard subscribers
+    The notifier must receive the same kwarg so OTel/operator UI subscribers
     can attach guardrail context to LLM events without joining through
     the separate ``guardrail.*`` governance event stream.
     """
@@ -1414,7 +1414,7 @@ class TestPromptInjectionToolResultBoundary:
     async def test_governance_events_emitted_for_prompt_injection(self):
         """PromptInjection findings emit `guardrail.detected` and on block,
         `guardrail.blocked` — same wiring used by PII / SecretDetection so the
-        dashboard timeline picks them up automatically."""
+        operator UI timeline picks them up automatically."""
         llm = MockLLM([_response("never reached")])
         agent = Agent(
             prompt="Helper.",

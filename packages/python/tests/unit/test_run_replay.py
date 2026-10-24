@@ -469,11 +469,3 @@ class TestAnthropicReplayWire:
         _, api = provider._convert_messages(msgs, stable_indices=indices)
         assert indices == [2]
         assert api[2]["content"][0]["type"] == "tool_result"
-
-
-def test_dashboard_continued_from():
-    from dendrux.dashboard.api import _continued_from
-
-    assert _continued_from(None) == []
-    assert _continued_from({"dendrux.replay": "bad"}) == []
-    assert _continued_from({"dendrux.replay": {"runs": ["a", 3, "b"]}}) == ["a", "b"]
