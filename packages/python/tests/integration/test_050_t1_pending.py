@@ -72,7 +72,8 @@ async def test_approval_pause_carries_args_and_gate(store: Any, run_store: RunSt
     pending = await run_store.get_pending(paused.run_id, tenant_id=None)
     assert pending is not None and pending.kind == "approval"
     (call,) = pending.tool_calls
-    assert (call.name, call.params, call.args_hidden) == ("refund", None, True)
+    # With T4 merged, approval.requested records the model-sent args, so they show.
+    assert (call.name, call.params, call.args_hidden) == ("refund", {"order_id": 7}, False)
     assert call.approval is not None and call.approval == {
         "source": "static",
         "reason": "requires_approval",
@@ -204,11 +205,11 @@ async def test_approval_flow_with_defaults(store: Any, run_store: RunStore) -> N
         events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
         data = next(e for e in events if e["event_type"] == "run.paused")["data"]
         assert data["status"] == "waiting_approval"
-        assert data["pending_tool_calls"][0]["params"] is None
-        assert data["pending_tool_calls"][0]["args_hidden"] is True
+        assert data["pending_tool_calls"][0]["params"] == {"order_id": 7}
+        assert not data["pending_tool_calls"][0].get("args_hidden")
     pending = await run_store.get_pending(run_id, tenant_id=UNSCOPED)
-    assert pending is not None and pending.tool_calls[0].params is None
-    assert pending.tool_calls[0].args_hidden is True
+    assert pending is not None and pending.tool_calls[0].params == {"order_id": 7}
+    assert pending.tool_calls[0].args_hidden is False
     result = await paused.agent.submit_approval(run_id, approved=True)
     assert result.status.value == "success"
 
@@ -313,15 +314,6 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
         guardrails=[PII()],
         state_store=store,
     )
-    # Emulate T4's producer contract; this branch's loop has no params yet.
-    original_save = store.save_run_event
-
-    async def save_with_model_args(run_id: str, **kw: Any) -> int:
-        if kw["event_type"] == "approval.requested":
-            kw["data"] = {**kw["data"], "params": {"to": "<<EMAIL_ADDRESS_1>>"}}
-        return await original_save(run_id, **kw)
-
-    store.save_run_event = save_with_model_args
     real = "bob@example.com"
     paused = await agent.run(f"mail {real} please", tenant_id="acme")
     run_id = paused.run_id
