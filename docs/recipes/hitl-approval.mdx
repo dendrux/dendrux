@@ -156,7 +156,9 @@ See [HTTP API surface](/docs/reference/http-api) for the full set of write route
 
 ## Notes
 
-- **Approval requires persistence.** No `database_url` (or `state_store`, or `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
+- **Send the `pause_id` back with the decision.** Hand `result.pause_id` to your client with the pending approval and pass it as `expected_pause_id=` when you submit. A stale decision then fails with `PauseStatusMismatchError` (409) instead of approving a later pause. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+- **Approval requires persistence.** No `database_url` or `state_store` (or the deprecated `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
 - **The agent instance does not have to be the same one that started the run.** Any agent process with the same DB and same tool definitions can serve the approval. That is what makes pause/resume crash-resilient and worker-friendly.
 - **One decision per pause.** Decide the batch with `approved=`, or each gated call with `decisions=`; either way the whole pause resolves in one `submit_approval` call.
 - **Client tools never run server-side on approval.** If the batch also holds client-target calls, the run moves on to `waiting_client_tool` for them.

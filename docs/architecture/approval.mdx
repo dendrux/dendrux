@@ -143,6 +143,24 @@ Pass exactly one of `approved=` or `decisions=`; passing both or neither raises 
 | `approved=False` | Every pending call receives a synthetic failed `ToolResult` whose payload is `rejection_reason` as a JSON string (default `"User declined to run this tool."`). Same bytes as before 0.3. |
 | `decisions={call_id: ApprovalDecision.approve() \| ApprovalDecision.deny(reason)}` | Each gated call is decided on its own. A denied call gets a failed result whose payload is `{"denied": reason}`. |
 
+## What the reviewer approves is what runs
+
+For a local `@tool`, the arguments shown in `approval.requested` are the validated, coerced and normalised JSON (see [How arguments are checked](/docs/reference/tools#how-arguments-are-checked)), in placeholder form when a PII guardrail redacted them. The function receives objects built from exactly that JSON, and the pause state stores the same thing, so the approved call cannot differ from the one displayed. The call is validated before the pause: an invalid call is returned to the model, never put in front of a person.
+
+The read router leaves `approval.requested` parameters visible even with `include_payloads=False`, because they are the thing being approved. Everything else payload-like stays hidden.
+
+## Approving the right pause
+
+A decision can arrive late, from a tab left open or a retried request. Pass `expected_pause_id=` (the `pause_id` from `RunResult`, the `run.paused` event or `RunStore.get_pauses`) and a decision aimed at an older pause raises `PauseStatusMismatchError` instead of approving the newer one. It is optional in 0.5 and required in 0.6. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+```python
+await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
+```
+
+On resume the run re-checks `deny` and the per-tool call limits before executing approved calls, so a tool denied or capped after the pause is not run.
+
+[//]: # "VERIFY-0.5.0: resume-side deny and call-limit re-check and expected_pause_id are T7 wave 2; the approval-event argument form is T4"
+
 ## Per-call decisions
 
 ```python

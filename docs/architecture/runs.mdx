@@ -7,7 +7,9 @@ description: The state machine every dendrux agent moves through, in plain terms
 
 A **run** is one execution of an agent, from the moment you call `agent.run(input)` to the moment it produces a final answer (or pauses, fails, or is cancelled). Everything dendrux does is in service of making that run resumable, observable, and safe.
 
-This page covers the four things you need to know about runs: their identity, their status, their shape, and how they move between statuses. Every output shown below was captured from a real run against `dendrux==0.2.0a1`.
+This page covers the four things you need to know about runs: their identity, their status, their shape, and how they move between statuses. Every output shown below was captured from a real run on an earlier release; ids and timestamps will differ.
+
+[//]: # "VERIFY-0.5.0: stale-version cleanup: Re-capture the outputs on the release candidate"
 
 ## A run has an ID and an owner
 
@@ -145,6 +147,12 @@ Where else to read it:
 - **Events.** The `run.completed` event data is `{"status", "stop_reason", "truncated"}`. Both new keys are always present; `stop_reason` is `null` on `max_iterations` or when the provider reported none. It reaches `RunStore.get_events` and `make_read_router` SSE.
 - **Traces.** Each `llm_interactions.semantic_response` includes the `stop_reason` of that call.
 - **`cancel_run`.** On a run that already succeeded, `cancel_run` returns the stored `stop_reason`.
+
+## When the provider fails
+
+A failed LLM request ends the run `error`. Since 0.5.0 the cause is a typed `ProviderError` (rate limit, timeout, refusal, empty stream and so on) summarised as `RunResult.error_info` and `RunDetail.error_info`, and `RunResult.error` is a fixed safe message, never the vendor's text. A run no longer ends `success` with an empty answer when the provider returned nothing. See [Handling provider errors](/docs/recipes/handling-provider-errors).
+
+[//]: # "VERIFY-0.5.0: the run-level wiring of error_info and the safe error message is T7 wave 2; recheck this section after it merges"
 
 ## Verified end-to-end
 

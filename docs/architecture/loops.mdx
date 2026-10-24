@@ -7,7 +7,9 @@ description: The pluggable strategy that drives an agent's turn cycle, with two 
 
 A **loop** is the piece of dendrux that decides how many LLM turns to do and when to stop. It is pluggable. You pass one to the `Agent` constructor, and from then on every `agent.run(...)` call hands control to that loop to drive the think, act, observe cycle. If you do not pass one, dendrux uses `ReActLoop`.
 
-Two loops ship in the box: `ReActLoop` (the default) and `SingleCall`. They target two different shapes of work. This page covers what each one is, when to pick it, and how `iteration_count` behaves under each. Every claim below is read from the `dendrux==0.2.0a1` source.
+Two loops ship in the box: `ReActLoop` (the default) and `SingleCall`. They target two different shapes of work. This page covers what each one is, when to pick it, and how `iteration_count` behaves under each. Every claim below is read from the Dendrux source.
+
+[//]: # "VERIFY-0.5.0: stale-version cleanup: Recheck the claims on this page against the 0.5.0 loops"
 
 ## What a loop actually does
 
@@ -182,9 +184,11 @@ Before any tool runs, `ReActLoop` checks the call's arguments against the tool's
 - **Missing required arguments.** Anything listed in `required`.
 - **Basic types and `enum`.** Top-level arguments are checked against `string`, `integer`, `number`, `boolean`, `array`, `object` and `null`, including type arrays like `["string", "null"]`. `integer` rejects booleans. Optional arguments may be `null`.
 
+For local `@tool` functions that use generated schemas, validation is followed by coercion to the annotated types, and `Field(...)` constraints are enforced (0.5.0). See [How arguments are checked](/docs/reference/tools#how-arguments-are-checked). MCP and client tools get only the JSON-schema check described here.
+
 The validator only rejects what it understands. A property that uses `anyOf`, `oneOf`, `allOf`, `$ref`, or an unknown type is not type-checked, and nested objects are not checked.
 
-If the arguments fail validation, the tool's code does not run. The model gets one failed tool result that lists every problem it found:
+Messages name the argument and the problem, never the value the model sent. If the arguments fail validation, the tool's code does not run. The model gets one failed tool result that lists every problem it found:
 
 ```json
 {"error": "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result.", "code": "invalid_params"}

@@ -37,6 +37,24 @@ async def read_image(run_id: str, sha256: str, *, tenant_id=...) -> bytes
 
 `from_database_url` creates and owns an engine; `close()` (or exiting the `async with`) disposes it. `from_engine` reuses an engine you already have; `close()` is then a no-op and you dispose the engine yourself. `RunStore` is an async context manager.
 
+## Tenant scope
+
+Every read takes a keyword-only `tenant_id: TenantScope = UNSCOPED`, where `TenantScope` is `str | None | UNSCOPED`:
+
+| Value | Reads |
+| --- | --- |
+| `"acme"` | that tenant's runs only |
+| `None` | untenanted runs only (changed in 0.5.0: `None` used to mean "all" on `list_runs` and `count_runs`) |
+| `UNSCOPED` (the default) | every tenant |
+
+A run outside the scope behaves exactly like a missing one: `get_run` returns `None`, and the other per-run reads raise `RunNotFoundError`. The scope is part of the same query as the read. `get_subtree`, `get_notes` and `read_image` already took a tenant and work the same way. Pass the authenticated caller's tenant from every route of your own; see [Multi-tenancy](/docs/architecture/multi-tenancy).
+
+```python
+from dendrux import UNSCOPED
+```
+
+[//]: # "VERIFY-0.5.0: T1 adds tenant_id to these RunStore methods; the signatures below follow spec section 5.1"
+
 ## Read methods
 
 ```python
@@ -45,7 +63,7 @@ async def list_runs(
     status: str | list[str] | None = None,
     agent_name: str | None = None,
     parent_run_id: str | None = None,
-    tenant_id: str | None = None,
+    tenant_id: TenantScope = UNSCOPED,
     started_after: datetime | None = None,
     started_before: datetime | None = None,
     metadata_filter: dict[str, Any] | None = None,
@@ -54,9 +72,10 @@ async def list_runs(
 ) -> list[RunSummary]
 
 async def count_runs(*, status=..., agent_name=..., parent_run_id=...,
-                     tenant_id=..., started_after=..., started_before=...,
+                     tenant_id: TenantScope = UNSCOPED, started_after=..., started_before=...,
                      metadata_filter=...) -> int
 
+# every method below also takes tenant_id: TenantScope = UNSCOPED
 async def get_run(run_id: str) -> RunDetail | None
 async def get_events(run_id: str, *, after_sequence_index: int | None = None,
                      limit: int | None = None, event_types: list[str] | None = None,
@@ -105,8 +124,8 @@ print(tree.usage.input_tokens, tree.usage.output_tokens, tree.usage.cost_usd)
 - `RunUsage` has `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `cost_usd`, `known_cost_usd`, `unpriced_calls` and `llm_calls`. `known_cost_usd` is the sum over the priced calls; `cost_usd` equals it only when every call was priced and is `None` when any was not (an unknown cost is never counted as zero).
 - **`RunSubtree.usage` is the live rollup of successfully recorded `llm_interactions`.** It includes unfinished runs, but interaction writes are best-effort, so it is not a billing guarantee. The `total_*` fields on each node's `RunSummary` are the snapshots persisted on `agent_runs` and may lag, or read 0 for a run still in progress. Use `usage` for live spend; this is also the figure [budgets](/docs/architecture/budget) enforce.
 - The reads are best-effort, not one snapshot transaction. A run that is still writing can make the node list and the usage differ by a call or a child.
-- **Tenancy.** Omit `tenant_id` for a trusted, unscoped read of all descendants. Pass a string to scope to that tenant, or an explicit `None` to scope to untenanted runs. The root must be in scope (otherwise it reads as missing) and so must every descendant; a run outside the scope is excluded together with everything below it.
-- Raises `dendrux.store.RunNotFoundError` if the root does not exist or is out of scope.
+- **Tenancy.** Omit `tenant_id` (or pass `UNSCOPED`) for a trusted, unscoped read of all descendants. Pass a string to scope to that tenant, or an explicit `None` to scope to untenanted runs. The root must be in scope (otherwise it reads as missing) and so must every descendant; a run outside the scope is excluded together with everything below it.
+- Raises `RunNotFoundError` if the root does not exist or is out of scope.
 
 ### `get_notes`
 
@@ -114,9 +133,9 @@ print(tree.usage.input_tokens, tree.usage.output_tokens, tree.usage.cost_usd)
 notes = await store.get_notes(run_id, undelivered_only=True)
 ```
 
-The run's [inbox](/docs/architecture/inbox) notes as `RunNote` records (`note_id`, `run_id`, `text`, `metadata`, `created_at`, `delivered_at`, `delivered_iteration`) in delivery order. `delivered_at` is `None` for a note the model has not seen. With `tenant_id=` the run must belong to exactly that tenant or `dendrux.store.RunNotFoundError` is raised; without it, a missing run gives an empty list.
+The run's [inbox](/docs/architecture/inbox) notes as `RunNote` records (`note_id`, `run_id`, `text`, `metadata`, `created_at`, `delivered_at`, `delivered_iteration`) in delivery order. `delivered_at` is `None` for a note the model has not seen. With `tenant_id=` the run must belong to exactly that tenant or `RunNotFoundError` is raised; without it, a missing run gives an empty list.
 
-> `dendrux.store.RunNotFoundError` (raised by `RunStore` reads) is a separate class from `dendrux.errors.RunNotFoundError` (raised by `Agent` methods). Catch the one that matches the API you called.
+> Since 0.5.0 `dendrux.store.RunNotFoundError` and `dendrux.errors.RunNotFoundError` are the same class, constructed from a run id (`RunNotFoundError("01J...")`). One `except` clause covers `Agent` methods and `RunStore` reads. Code that raised it with a message must pass the run id instead.
 
 ### Time and type filters
 
@@ -144,9 +163,9 @@ See [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
 
 All returned from `dendrux.store`. Fields, exact as persisted:
 
-**`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`.
+**`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`, and (0.5.0) `tenant_id`. List views never load pause state, and `offset` is capped at 10,000.
 
-**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status), `pause_requested` (`True` between a `request_pause` request and the run pausing).
+**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status), `pause_requested` (`True` between a `request_pause` request and the run pausing), and (0.5.0) `error_info`, the structured summary of a provider failure that ended the run (`None` otherwise).
 
 **`StoredEvent`** (from `get_events`): `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data`, `created_at`.
 
@@ -158,7 +177,7 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`RunSubtree`**, **`SubtreeNode`**, **`RunUsage`** (from `get_subtree`) and **`RunNote`** (from `get_notes`) are described under [`get_subtree`](#get_subtree) and [`get_notes`](#get_notes).
 
-**`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`.
+**`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`, and (0.5.0) `pause_id`, which you can pass back as `expected_pause_id=` to a `submit_*` call. `pending_tool_calls` carries the pending calls' ids, names and parameters, so `get_pauses` is the public way to read a client tool's call ids when you are not holding the original `RunResult` (see [Client-side tools](/docs/recipes/client-tools)). `pause_id` is `None` for pauses recorded before 0.5.0.
 
 ## Where this fits
 
