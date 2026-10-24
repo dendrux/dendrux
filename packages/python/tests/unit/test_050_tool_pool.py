@@ -371,6 +371,16 @@ class TestLimiter:
         assert errors == []
         assert limiter.in_use == 0
 
+    async def test_a_forked_child_gets_full_limiters(self) -> None:
+        limiter = ToolCallLimiter(2)
+        await limiter.acquire()
+        await limiter.acquire()
+        assert limiter.in_use == 2
+        pool_mod._reset_after_fork()  # what os.register_at_fork runs in the child
+        assert limiter.in_use == 0
+        await limiter.acquire()
+        limiter.release()
+
     async def test_cancelled_waiters_never_leak_slots(self) -> None:
         limiter = ToolCallLimiter(1)
         await limiter.acquire()

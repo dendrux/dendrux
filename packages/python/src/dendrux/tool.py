@@ -132,11 +132,14 @@ def tool(
             schema = _validate_explicit_parameters(parameters, name)
         else:
             schema = _generate_schema(fn)
-            # Explicit ``parameters=`` tools keep JSON-Schema validation only;
-            # generated ones also get lax Pydantic coercion at call time.
-            from dendrux.tools._coerce import attach_args_spec
+            # Server tools with a generated schema also get lax Pydantic
+            # coercion. Explicit ``parameters=`` tools and client tools keep
+            # JSON-Schema validation only: a client receives its arguments
+            # exactly as the model sent them.
+            if resolved_target == ToolTarget.SERVER:
+                from dendrux.tools._coerce import attach_args_spec
 
-            attach_args_spec(fn)
+                attach_args_spec(fn)
         if strict:
             schema = _strict_schema(schema, name)
 

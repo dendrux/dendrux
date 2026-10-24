@@ -129,6 +129,55 @@ class TestParallelSiblings:
             await asyncio.sleep(0.01)
         assert "sync finished" in LOG
 
+    async def test_a_sibling_that_already_returned_is_not_recorded_twice(self) -> None:
+        class SlowRecorder(Recorder):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration) -> None:
+                if tool_call.name == "fast":
+                    await asyncio.sleep(0.05)
+                    raise RuntimeError("constraint violation")
+                self.tools.append((tool_call, tool_result))
+                await asyncio.sleep(0.5)  # still recording when the failure lands
+
+        @tool()
+        def b_sync(x: int) -> int:
+            """Quick sync tool."""
+            LOG.append("b ran")
+            return x
+
+        rec = SlowRecorder()
+        calls = [ToolCall(name="fast", params={"x": 1}), ToolCall(name="b_sync", params={"x": 2})]
+        llm = MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="ok")])
+        with pytest.raises(RuntimeError, match="constraint violation"):
+            await _run(Agent(prompt="p", tools=[fast, b_sync]), llm, rec)
+        assert LOG == ["b ran"]
+        rows = [(c.name, r.success, r.payload) for c, r in rec.tools]
+        assert rows == [("b_sync", True, "2")]
+
+    async def test_a_finished_sibling_cut_off_mid_record_is_logged_not_rewritten(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class CancelBeforeWrite(Recorder):
+            async def on_tool_completed(self, run_id, tool_call, tool_result, iteration) -> None:
+                if tool_call.name == "fast":
+                    await asyncio.sleep(0.05)
+                    raise RuntimeError("constraint violation")
+                await asyncio.sleep(0.5)  # cancelled before the row is written
+                self.tools.append((tool_call, tool_result))
+
+        @tool()
+        async def c_async(x: int) -> int:
+            """Quick async tool."""
+            return x
+
+        rec = CancelBeforeWrite()
+        calls = [ToolCall(name="fast", params={"x": 1}), ToolCall(name="c_async", params={"x": 3})]
+        llm = MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="ok")])
+        with caplog.at_level("WARNING"), pytest.raises(RuntimeError):
+            await _run(Agent(prompt="p", tools=[fast, c_async]), llm, rec)
+        # No synthetic "cancelled" row for a call that ran.
+        assert rec.tools == []
+        assert any("tool_row_may_be_missing" in r.getMessage() for r in caplog.records)
+
     async def test_successful_batches_are_unchanged(self) -> None:
         rec = Recorder()
         calls = [ToolCall(name="fast", params={"x": n}) for n in range(5)]

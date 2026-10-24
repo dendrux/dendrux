@@ -35,6 +35,9 @@ _TRUNCATION_MARKER = "\n[truncated by Dendrux: the result was {size} bytes; the 
 # The result cap of the tool call running in this context. The MCP HTTP
 # layer reads it to stop reading an oversized response early.
 _result_cap: ContextVar[int | None] = ContextVar("dendrux_tool_result_cap", default=None)
+# Wire bytes allowed for image blocks in the running call's result: zero unless
+# the run can ingest images (see ``result_cap``).
+_image_allowance: ContextVar[int] = ContextVar("dendrux_tool_image_allowance", default=0)
 
 
 class ToolResultTooLargeError(Exception):
@@ -53,13 +56,20 @@ def current_result_cap() -> int | None:
     return _result_cap.get()
 
 
+def current_image_allowance() -> int:
+    """Extra wire bytes for image blocks in the running tool call (0: no images)."""
+    return _image_allowance.get()
+
+
 @contextmanager
-def result_cap(limit: int | None) -> Iterator[None]:
-    """Make ``limit`` the current tool-result cap while a tool runs."""
+def result_cap(limit: int | None, *, image_bytes: int = 0) -> Iterator[None]:
+    """Make ``limit`` (and an image allowance) current while a tool runs."""
     token = _result_cap.set(limit)
+    image_token = _image_allowance.set(image_bytes)
     try:
         yield
     finally:
+        _image_allowance.reset(image_token)
         _result_cap.reset(token)
 
 

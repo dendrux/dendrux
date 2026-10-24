@@ -43,8 +43,9 @@ from dendrux.mcp import (
     MCPSource,
     MCPToolCallError,
 )
-from dendrux.mcp import _http as mcp_http
 from dendrux.mcp._client import MCPClientAdapter
+from dendrux.mcp._http import wire_cap
+from dendrux.tools._limits import result_cap
 from dendrux.types import Limits, LLMResponse, RunStatus, ToolCall
 
 # Protocol versions of the initialize-handshake era (2024 and 2025 specs).
@@ -331,9 +332,8 @@ async def test_stateless_server_404_is_an_ordinary_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_cap_stops_an_oversized_response(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Without the image allowance the cap is 4x the text cap: 4 KB here.
-    monkeypatch.setattr(mcp_http, "_IMAGE_WIRE_ALLOWANCE", 0)
+async def test_read_cap_stops_an_oversized_response() -> None:
+    # Runs without image ingest get no image allowance: the cap is 4x the text cap.
     harness = Harness()
     async with _serve(harness.app) as url, _runtime(url, max_result_bytes=1000) as (_, conn):
         agent = Agent(prompt="p", tool_sources=[conn.tools()])
@@ -386,3 +386,11 @@ async def test_source_cap_in_a_run_is_a_size_limit_result() -> None:
         assert body["code"] == "size_limit" and body["error"] == "result too large"
         assert body["bytes"] > 1000
         await agent.close()
+
+
+def test_wire_cap_follows_limits_and_adds_image_room_only_with_images() -> None:
+    assert wire_cap(1_000_000) == 4_000_000
+    with result_cap(2000):
+        assert wire_cap(1_000_000) == 8000
+    with result_cap(1024 * 1024, image_bytes=33 * 1024 * 1024):
+        assert wire_cap(1_000_000) == 4_000_000 + 33 * 1024 * 1024

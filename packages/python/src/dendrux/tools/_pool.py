@@ -30,6 +30,7 @@ import contextvars
 import logging
 import os
 import threading
+import weakref
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -208,11 +209,18 @@ def _shutdown_pool() -> None:
         pool.shutdown()
 
 
+# Every live limiter, so a forked child can reset them (see _reset_after_fork).
+_limiters: weakref.WeakSet[ToolCallLimiter] = weakref.WeakSet()
+
+
 def _reset_after_fork() -> None:
-    # Worker threads do not survive fork; the child builds its own pool.
+    # Worker threads do not survive fork; the child builds its own pool, and
+    # slots held by the parent's in-flight calls would never come back.
     global _pool, _pool_lock
     _pool = None
     _pool_lock = threading.Lock()
+    for limiter in list(_limiters):
+        limiter._reset()
 
 
 atexit.register(_shutdown_pool)
@@ -251,6 +259,13 @@ class ToolCallLimiter:
         self._lock = threading.Lock()
         self._available = slots
         self._waiters: deque[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = deque()
+        _limiters.add(self)
+
+    def _reset(self) -> None:
+        """Full capacity, no waiters (a forked child's fresh state)."""
+        self._lock = threading.Lock()
+        self._available = self.slots
+        self._waiters = deque()
 
     @property
     def in_use(self) -> int:
@@ -315,6 +330,10 @@ class CallTracker:
     abandoned: bool = False
     zombies: int = 0
     completed: Future[Any] | None = None
+    # Set by the loop: the tool's result once it returned, and whether its
+    # tool_calls row was written. A stopped sibling is never recorded twice.
+    result: Any = None
+    recorded: bool = False
 
 
 async def run_sync_tool(

@@ -24,7 +24,12 @@ from dendrux.loops.react import ReActLoop, _execute_tool, _process_tool_calls
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.tool import get_tool_def, tool
 from dendrux.tools import build_tool_lookups
-from dendrux.tools._coerce import ArgumentCoercionError, build_args_spec, normalize_arguments
+from dendrux.tools._coerce import (
+    ArgumentCoercionError,
+    build_args_spec,
+    get_args_spec,
+    normalize_arguments,
+)
 from dendrux.types import AgentStep, LLMResponse, RunStatus, ToolCall
 
 SEEN: list[tuple[str, Any]] = []
@@ -610,8 +615,10 @@ async def email_user(to: Annotated[str, Field(pattern=r"^[^@<>]+@[^@<>]+$")], bo
     return "sent"
 
 
-async def _process(calls: list[ToolCall], engine: _Engine, **kw: Any):
-    lookups = build_tool_lookups([email_user])
+async def _process(
+    calls: list[ToolCall], engine: Any, *, tools: list[Any] | None = None, **kw: Any
+):
+    lookups = build_tool_lookups(tools or [email_user])
     rec = Recorder()
     history: list[Any] = []
     step = AgentStep(reasoning=None, action=calls[0], meta={"all_tool_calls": calls})
@@ -660,3 +667,191 @@ class TestPII:
         outcome, _ = await _process([tc], engine)
         [(_, result)] = outcome.all_results
         assert json.loads(result.payload)["code"] == "invalid_params"
+
+
+# ------------------------------------------------------------------
+# Fix round: restored PII never reaches approval events in any form
+# ------------------------------------------------------------------
+
+
+class BankAccount(BaseModel):
+    number: int
+
+
+class Contact(BaseModel):
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def lower(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class Reading(BaseModel):
+    value: float
+
+
+@tool()
+async def lookup(acc: BankAccount) -> str:
+    """Look up an account."""
+    SEEN.append(("lookup", acc))
+    return "ok"
+
+
+@tool()
+async def notify(contact: Contact, numbers: list[int], score: Reading) -> str:
+    """Notify."""
+    SEEN.append(("notify", (contact, numbers, score)))
+    return "ok"
+
+
+@tool(target="client")
+async def client_pick(n: int, when: datetime) -> str:
+    """A client-side tool."""
+    return "client"
+
+
+PHONE = "5551234567"
+MAPPING = {
+    "<<PHONE_1>>": PHONE,
+    "<<EMAIL_1>>": " Alice.Smith@Example.COM ",
+    "<<NUMBER_1>>": "4111",
+    "<<NUMBER_2>>": "98.6",
+}
+
+
+def _no_real_value_in(event: dict[str, Any]) -> None:
+    text = json.dumps(event).casefold()
+    for real in MAPPING.values():
+        assert real.strip().casefold() not in text, real
+    assert PHONE not in json.dumps(event)
+
+
+class TestPlaceholderView:
+    async def test_phone_coerced_to_int_stays_masked(self) -> None:
+        engine = _Engine(MAPPING, restore=True)
+        tc = ToolCall(name="lookup", params={"acc": {"number": "<<PHONE_1>>"}})
+        outcome, rec = await _process(
+            [tc], engine, tools=[lookup], require_approval=frozenset({"lookup"})
+        )
+        [pending] = outcome.pending_calls
+        assert pending.params == {"acc": {"number": int(PHONE)}}  # executes with the real value
+        [event] = rec.events("approval.requested")
+        assert event["params"] == {"acc": {"number": "<<PHONE_1>>"}}
+        _no_real_value_in(event)
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            # lowercasing / stripping validator
+            {"contact": {"email": "<<EMAIL_1>>"}, "numbers": [1], "score": {"value": 1}},
+            # list of ints from placeholder strings
+            {
+                "contact": {"email": "x@y.z"},
+                "numbers": ["<<NUMBER_1>>", 2],
+                "score": {"value": 1},
+            },
+            # float from a placeholder string
+            {"contact": {"email": "x@y.z"}, "numbers": [1], "score": {"value": "<<NUMBER_2>>"}},
+            # everything at once
+            {
+                "contact": {"email": "<<EMAIL_1>>"},
+                "numbers": ["<<NUMBER_1>>", "<<PHONE_1>>"],
+                "score": {"value": "<<NUMBER_2>>"},
+            },
+        ],
+    )
+    async def test_no_coercion_shape_leaks_a_restored_value(self, params: dict[str, Any]) -> None:
+        engine = _Engine(MAPPING, restore=True)
+        tc = ToolCall(name="notify", params=params)
+        outcome, rec = await _process(
+            [tc], engine, tools=[notify], require_approval=frozenset({"notify"})
+        )
+        assert outcome.pending_approval
+        [event] = rec.events("approval.requested")
+        _no_real_value_in(event)
+
+    async def test_unrelated_text_is_not_rewritten(self) -> None:
+        engine = _Engine({"<<PERSON_1>>": "Al"}, restore=True)
+        tc = ToolCall(name="email_user", params={"to": "a@b.c", "body": "Always <<PERSON_1>>"})
+        _, rec = await _process([tc], engine, require_approval=frozenset({"email_user"}))
+        [event] = rec.events("approval.requested")
+        assert event["params"] == {"to": "a@b.c", "body": "Always <<PERSON_1>>"}
+
+    async def test_bookkeeping_keys_in_the_mapping_are_ignored(self) -> None:
+        engine = _Engine({**MAPPING, "__dendrux_origins__": '{"x": 1}'}, restore=True)
+        tc = ToolCall(name="lookup", params={"acc": {"number": "<<PHONE_1>>"}})
+        _, rec = await _process(
+            [tc], engine, tools=[lookup], require_approval=frozenset({"lookup"})
+        )
+        [event] = rec.events("approval.requested")
+        assert event["params"] == {"acc": {"number": "<<PHONE_1>>"}}
+
+
+class _AllowlistEngine(_Engine):
+    """Stand-in for T3's engine: ``restore_params`` with skipped counts."""
+
+    def restore_params(self, params: dict[str, Any], *, tool_def: Any = None) -> Any:
+        from types import SimpleNamespace
+
+        def event_data(tool_name: str, call_id: str | None) -> dict[str, Any]:
+            return {"tool_name": tool_name, "call_id": call_id, "entities": {"EMAIL": 1}}
+
+        self.seen_tool_def = tool_def
+        return SimpleNamespace(params=params, skipped={"EMAIL": 1}, event_data=event_data)
+
+
+class TestRestoreCallSite:
+    async def test_tool_def_is_passed_and_skips_are_reported(self) -> None:
+        engine = _AllowlistEngine({"<<EMAIL_1>>": "a@b.c"}, restore=False)
+        tc = ToolCall(name="email_user", params={"to": "x@y.z", "body": "<<EMAIL_1>>"})
+        await _process([tc], engine)
+        assert engine.seen_tool_def is get_tool_def(email_user)
+        # restore_skipped is emitted with counts only
+        rec = Recorder()
+        lookups = build_tool_lookups([email_user])
+        step = AgentStep(reasoning=None, action=tc, meta={"all_tool_calls": [tc]})
+        await _process_tool_calls(
+            step=step,
+            call_counts={},
+            lookups=lookups,
+            strategy=NativeToolCalling(),
+            recorder=rec,
+            notifier=None,
+            run_id="r",
+            iteration=1,
+            history=[],
+            warnings=[],
+            guardrail_engine=engine,  # type: ignore[arg-type]
+        )
+        assert rec.events("guardrail.restore_skipped") == [
+            {"tool_name": "email_user", "call_id": tc.id, "entities": {"EMAIL": 1}}
+        ]
+
+
+class TestFixRound:
+    async def test_hooks_and_rows_see_ints_not_floats(self) -> None:
+        seen: list[Any] = []
+        rec = Recorder()
+        llm = _llm(
+            ToolCall(
+                name="schedule",
+                params={"when": "2026-10-24T10:00:00Z", "color": "red", "count": 3.0},
+            )
+        )
+        agent = Agent(prompt="p", tools=[schedule], before_tool=lambda c: seen.append(c.params))
+        await _run(agent, llm, rec)
+        assert type(seen[0]["count"]) is int
+        [(row_call, _)] = rec.tools
+        assert type(row_call.params["count"]) is int
+        assert json.dumps(row_call.params["count"]) == "3"
+
+    async def test_client_tool_arguments_are_left_as_sent(self) -> None:
+        sent = {"n": 3.0, "when": "2024-01-01T00:00:00+00:00"}
+        llm = MockLLM([LLMResponse(tool_calls=[ToolCall(name="client_pick", params=sent)])])
+        result = await _run(Agent(prompt="p", tools=[client_pick]), llm)
+        assert result.status == RunStatus.WAITING_CLIENT_TOOL
+        [pending] = result.meta["pause_state"].pending_tool_calls
+        assert pending.params == sent
+        assert json.dumps(pending.params) == json.dumps(sent)
+        assert get_args_spec(client_pick) is None

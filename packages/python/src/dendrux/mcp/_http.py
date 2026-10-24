@@ -13,7 +13,7 @@ import httpx2
 
 from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy
 from dendrux.mcp._errors import MCPDestinationDeniedError
-from dendrux.tools._limits import current_result_cap
+from dendrux.tools._limits import current_image_allowance, current_result_cap
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
@@ -137,28 +137,27 @@ async def _map_errors() -> AsyncIterator[None]:
         raise
 
 
-# Base64 of one image at ``ImagePolicy.max_source_bytes`` (25 MiB) is about
-# 33.4 MiB; the read cap leaves room for one such image block.
-_IMAGE_WIRE_ALLOWANCE = 34 * 1024 * 1024
-# JSON escaping (``\uXXXX``) and SSE framing can make the wire form of text
-# several times its decoded size.
+# JSON escaping and SSE framing can make the wire form of text several times
+# its decoded size.
 _TEXT_WIRE_FACTOR = 4
 
 
 def wire_cap(source_max_result_bytes: int) -> int:
     """Byte cap for reading one ``tools/call`` response body.
 
-    Derived from the result's text cap: the source's ``max_result_bytes``,
-    or the running Agent's ``Limits.max_tool_result_bytes`` when smaller.
-    The final result is still checked against the text cap after decoding;
-    this bound only keeps an oversized or hostile response from being read
-    into memory in full.
+    ``4 × text cap`` plus, only in a run that can ingest images, room for one
+    image block at the run's ``ImagePolicy.max_source_bytes`` (base64). The
+    text cap is the source's ``max_result_bytes``, or the running Agent's
+    ``Limits.max_tool_result_bytes`` when smaller. The decoded result is still
+    checked against the text cap; this bound only keeps an oversized or
+    hostile response from being read into memory in full. It counts the
+    whole response body, including SSE framing and progress notifications.
     """
     text_cap = source_max_result_bytes
     agent_cap = current_result_cap()
     if agent_cap is not None:
         text_cap = min(text_cap, agent_cap)
-    return text_cap * _TEXT_WIRE_FACTOR + _IMAGE_WIRE_ALLOWANCE
+    return text_cap * _TEXT_WIRE_FACTOR + current_image_allowance()
 
 
 class ResponseTooLargeError(httpx2.StreamError):

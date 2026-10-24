@@ -224,8 +224,8 @@ def prepare_tool_call(
         normalized = normalize_arguments(spec, tool_call.params or {})
     except ArgumentCoercionError as exc:
         return coercion_failure(tool_call, tool_def, exc, placeholders=placeholders)
-    if normalized == tool_call.params:
-        return tool_call
+    # Always the normalised dict: ``3 == 3.0`` in Python, but hooks, approvals
+    # and stored calls must see the JSON the function is called with.
     return dataclasses.replace(tool_call, params=normalized)
 
 

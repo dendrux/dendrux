@@ -78,6 +78,7 @@ from dendrux.tools._limits import (
     size_limit_payload,
 )
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
+from dendrux.tools._mask import placeholder_mapping, placeholder_view
 from dendrux.tools._pool import (
     CallTracker,
     ToolCallLimiter,
@@ -120,7 +121,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
     from pydantic import BaseModel
 
@@ -746,11 +747,27 @@ async def _process_tool_calls(
     non_denied = known
 
     # --- Phase 0.5: Deanonymize tool call params ---
-    pii_mapping = guardrail_engine.get_pii_mapping() if guardrail_engine is not None else {}
+    pii_mapping = (
+        placeholder_mapping(guardrail_engine.get_pii_mapping())
+        if guardrail_engine is not None
+        else {}
+    )
+    # The arguments as the model sent them (placeholder form), per call id.
+    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in non_denied}
     if guardrail_engine is not None:
+
+        async def restore_skipped(data: dict[str, Any], call_id: str) -> None:
+            event = "guardrail.restore_skipped"
+            await _record_governance(
+                recorder, run_id, event, iteration, data, correlation_id=call_id
+            )
+            await _notify_governance(
+                notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
+            )
+
         for i, tc in enumerate(non_denied):
             if tc.params:
-                deaned = _restore_params(guardrail_engine, tc)
+                deaned = await _restore_params(guardrail_engine, tc, lookups, restore_skipped)
                 if deaned != tc.params:
                     non_denied[i] = replace(tc, params=deaned)
 
@@ -844,8 +861,11 @@ async def _process_tool_calls(
                 if gate["source"] == "hook":
                     approval_data["reason"] = gate["reason"] or "requires_approval"
                     approval_data["source"] = "hook"
-                # What is being approved, in placeholder form (no restored PII).
-                approval_data["params"] = _placeholder_form(tc.params, pii_mapping)
+                # What is being approved, in placeholder form: never a restored
+                # value, whatever form coercion gave it.
+                approval_data["params"] = placeholder_view(
+                    tc.params, sent_params.get(tc.id, _NO_SENT_PARAMS), pii_mapping
+                )
                 await _record_governance(
                     recorder,
                     run_id,
@@ -2599,7 +2619,11 @@ async def _execute_record_notify(
         tracker=tracker,
         run_id=run_id,
     )
+    if tracker is not None:
+        tracker.result = result
     await _record_tool(recorder, run_id, tool_call, result, iteration)
+    if tracker is not None:
+        tracker.recorded = True
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
     return tool_call, result
 
@@ -2668,6 +2692,17 @@ async def _execute_parallel_group(
     await _stop_siblings(tasks)
     stopped = _log_stopped(run_id, group, tasks, trackers, reason="sibling_failed")
     for tc, tracker in stopped:
+        if tracker.result is not None:
+            # The tool returned and its own row write had started (it may or
+            # may not have landed). Never write a second row for the call.
+            if not tracker.recorded:
+                logger.warning(
+                    "A finished tool call was stopped while being recorded "
+                    "(code=tool_row_may_be_missing, run_id=%s, tool=%s)",
+                    run_id,
+                    tc.name,
+                )
+            continue
         message = _SIBLING_UNKNOWN if tracker.abandoned else _SIBLING_CANCELLED
         code = "outcome_unknown" if tracker.abandoned else "cancelled"
         result = ToolResult(
@@ -2716,6 +2751,8 @@ def _log_stopped(
         if task.cancelled()
     ]
     for tc, tracker in stopped:
+        if tracker.result is not None:
+            continue  # it finished; only its row or event was cut short
         logger.warning(
             "Stopped tool call in a parallel batch (code=%s, reason=%s, run_id=%s, tool=%s)",
             "outcome_unknown" if tracker.abandoned else "cancelled",
@@ -2756,29 +2793,37 @@ def _unknown_tool_result(tool_call: ToolCall, lookups: ToolLookups) -> ToolResul
     )
 
 
-def _restore_params(engine: GuardrailEngine, tool_call: ToolCall) -> dict[str, Any]:
+_NO_SENT_PARAMS: dict[str, Any] = {}
+
+
+async def _restore_params(
+    engine: GuardrailEngine,
+    tool_call: ToolCall,
+    lookups: ToolLookups,
+    on_skipped: Callable[[dict[str, Any], str], Awaitable[None]],
+) -> dict[str, Any]:
     """Real values for the call's PII placeholders, as the guardrail decides.
 
-    The PII guardrail owns the restore decision (``PII(restore=...)``); this
-    is its single call site in the tool pipeline.
+    The PII guardrail owns the restore decision (``PII(restore=...)``,
+    ``@tool(receives_pii=...)``); this is its single call site in the tool
+    pipeline. Placeholders it deliberately leaves in place are reported as
+    ``guardrail.restore_skipped`` (counts and kinds only).
     """
-    return engine.deanonymize(tool_call.params)
+    restore = getattr(engine, "restore_params", None)
+    if restore is None:  # guardrail engines without the restore allowlist
+        return engine.deanonymize(tool_call.params)
+    outcome = restore(tool_call.params, tool_def=lookups.defs.get(tool_call.name))
+    if outcome.skipped:
+        await on_skipped(outcome.event_data(tool_call.name, tool_call.id), tool_call.id)
+    params: dict[str, Any] = outcome.params
+    return params
 
 
-def _placeholder_form(value: Any, mapping: dict[str, str], _depth: int = 0) -> Any:
-    """``value`` with restored PII put back as its placeholders (bounded walk)."""
-    if not mapping or _depth > 50:
-        return value
-    if isinstance(value, str):
-        for placeholder, real in sorted(mapping.items(), key=lambda kv: -len(kv[1])):
-            if real and real in value:
-                value = value.replace(real, placeholder)
-        return value
-    if isinstance(value, dict):
-        return {k: _placeholder_form(v, mapping, _depth + 1) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_placeholder_form(v, mapping, _depth + 1) for v in value]
-    return value
+def _image_wire_bytes(image_runtime: ImageRuntime | None) -> int:
+    """Read-cap room for one image block (base64 of the policy's largest source)."""
+    if image_runtime is None:
+        return 0
+    return -(-image_runtime.policy.max_source_bytes * 4 // 3) + 4096
 
 
 class _ToolTimedOutError(Exception):
@@ -2793,13 +2838,14 @@ async def _invoke_tool(
     timeout_s: float,
     limiter: ToolCallLimiter | None,
     result_limit: int,
+    image_wire_bytes: int,
     tracker: CallTracker,
 ) -> Any:
     """Run the tool under its deadline; async on the loop, sync on the tool pool."""
     deadline = asyncio.timeout(timeout_s)
     try:
         async with deadline:
-            with result_cap(result_limit):
+            with result_cap(result_limit, image_bytes=image_wire_bytes):
                 if inspect.iscoroutinefunction(fn):
                     tracker.started = True
                     return await fn(*args, **kwargs)
@@ -2928,6 +2974,7 @@ async def _execute_tool(
             timeout_s=timeout_s,
             limiter=limiter,
             result_limit=limits.max_tool_result_bytes,
+            image_wire_bytes=_image_wire_bytes(image_runtime),
             tracker=tracker,
         )
 
