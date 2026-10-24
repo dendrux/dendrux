@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 __all__ = [
     "TOKEN_ENV",
     "DashboardGuard",
+    "bearer_matches",
     "is_loopback_host",
     "normalize_origins",
     "resolve_token",
@@ -109,8 +110,34 @@ def _is_ip_literal(host: str) -> bool:
     return True
 
 
+def bearer_matches(headers: Iterable[tuple[bytes, bytes]], expected: bytes | None) -> bool:
+    """True when ``expected`` (``b"Bearer <token>"``) matches the first Authorization header.
+
+    Works on raw header bytes with a constant-time compare, so a non-ASCII
+    value is simply a mismatch. ``expected=None`` means no token is configured.
+    """
+    if expected is None:
+        return True
+    for key, value in headers:
+        if key == b"authorization":
+            return hmac.compare_digest(value, expected)
+    return False
+
+
+def expected_bearer(token: str | None) -> bytes | None:
+    """The exact ``Authorization`` header bytes a client must send, or None."""
+    return None if not token else b"Bearer " + token.encode("utf-8")
+
+
 class DashboardGuard:
-    """ASGI middleware: Host check on every request, bearer token on ``/api/``.
+    """ASGI middleware: Host check on every request, bearer token on the API.
+
+    The token decision is made on the **app-relative** path, computed the way
+    Starlette's router computes it, so a parent application's mount prefix
+    (for example ``/api/dashboard``) never counts as part of the API. The API
+    routes also enforce the token themselves (a router dependency in
+    ``create_dashboard_api``); this middleware is the first line, the
+    dependency the authoritative one.
 
     An IP-literal ``Host`` is always accepted (DNS rebinding needs a DNS name);
     ``localhost`` names are accepted; any other name must be in
@@ -129,7 +156,7 @@ class DashboardGuard:
         hosts = {h.strip().lower().strip("[]") for h in allowed_hosts if h.strip()}
         self._any_host = ANY_HOST in hosts
         self._hosts = frozenset(hosts)
-        self._expected = None if token is None else b"Bearer " + token.encode("utf-8")
+        self._expected = expected_bearer(token)
 
     def _host_ok(self, headers: list[tuple[bytes, bytes]]) -> bool:
         if self._any_host:
@@ -141,14 +168,6 @@ class DashboardGuard:
         else:
             return False
         return is_loopback_host(host) or _is_ip_literal(host) or host in self._hosts
-
-    def _token_ok(self, headers: list[tuple[bytes, bytes]]) -> bool:
-        if self._expected is None:
-            return True
-        for key, value in headers:
-            if key == b"authorization":
-                return hmac.compare_digest(value, self._expected)
-        return False
 
     @staticmethod
     def _route_path(scope: Scope) -> str:
@@ -166,10 +185,18 @@ class DashboardGuard:
             return ""
         return path[len(root) :] if path[len(root)] == "/" else path
 
-    @staticmethod
-    def _is_api(path: str) -> bool:
-        """True when any path segment is ``api``, wherever the app is mounted."""
-        return "api" in path.split("/")
+    @classmethod
+    def _is_api(cls, scope: Scope) -> bool:
+        """True when the app-relative path is under ``/api``.
+
+        Checks Starlette's own route path and, to fail closed on a trailing-slash
+        ``root_path``, the path stripped with the slash removed from the root.
+        """
+        candidates = {cls._route_path(scope)}
+        root: str = scope.get("root_path", "")
+        if root.endswith("/") and root != "/":
+            candidates.add(cls._route_path({**scope, "root_path": root.rstrip("/")}))
+        return any(p == "/api" or p.startswith("/api/") for p in candidates)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -182,18 +209,14 @@ class DashboardGuard:
             await self._reject(scope, send, 403, "Host not allowed.")
             return
 
-        # Fail closed: an ``api`` segment anywhere in the delivered path, or in
-        # the path after root_path stripping, needs the token. The decision
-        # never depends on how a server or proxy splits root_path from path.
-        # (The built dashboard's static files have no ``api`` segment.)
-        needs_token = self._is_api(scope.get("path", "")) or self._is_api(self._route_path(scope))
+        needs_token = self._is_api(scope)
         if scope["type"] == "websocket":
             needs_token = True
         if (
             needs_token
             and scope.get("method") != "OPTIONS"
             and self._expected is not None
-            and not self._token_ok(headers)
+            and not bearer_matches(headers, self._expected)
         ):
             logger.warning("dashboard.auth_rejected")
             await self._reject(

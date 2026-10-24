@@ -521,30 +521,53 @@ class TestRootPathBoundary:
             ("/api/runs", "/"),  # not a boundary strip: Starlette routes /api/runs
             ("/api/runs", "/a"),
             ("/api/runs", "/ap"),
-            ("/api/runs", "/api"),  # path equals-prefix of root, still an API path
             ("/dash/api/runs", "/dash"),
-            ("/dash/api/runs", "/dash/"),
-            (
-                "/api/runs",
-                "/dash",
-            ),  # unprefixed path with a root_path set: never "already stripped"
+            ("/dash/api/runs", "/dash/"),  # trailing slash on the root: still an API path
+            ("/api/runs", "/dash"),  # unprefixed with a root set: never "already stripped"
             ("/api/runs", "/dashboard"),
-            ("/dashboard/api/runs", "/dash"),  # prefix confusion
             ("/dash/api", "/dash"),
             ("/api", ""),
+            ("/api/dashboard/api/runs", "/api/dashboard"),  # mount prefix is not the API
+            ("/api/dashboard/api/health", "/api/dashboard"),
         ],
     )
     async def test_api_paths_need_the_token(self, path: str, root_path: str) -> None:
-        status = await self._status(path, root_path)
-        is_api_like = "/api" in path
-        assert status == (401 if is_api_like else 200), (path, root_path)
+        assert await self._status(path, root_path) == 401, (path, root_path)
 
     @pytest.mark.parametrize(
         ("path", "root_path"),
-        [("/", ""), ("/assets/app.js", "/dash"), ("/dash/", "/dash"), ("/dash", "/dash")],
+        [
+            ("/", ""),
+            ("/assets/app.js", "/dash"),
+            ("/dash/", "/dash"),
+            ("/dash", "/dash"),
+            ("/api/dashboard/", "/api/dashboard"),  # HTML under an `api` mount prefix
+            ("/api/dashboard", "/api/dashboard"),
+            ("/api/dashboard/assets/index.js", "/api/dashboard"),
+            ("/api/dashboard/index.html", "/api/dashboard"),
+        ],
     )
     async def test_static_paths_stay_open(self, path: str, root_path: str) -> None:
+        assert await self._status(path, root_path) == 200, (path, root_path)
+
+    @pytest.mark.parametrize(
+        ("path", "root_path"),
+        [
+            ("/api/runs", "/api"),  # the router sees /runs
+            ("/dashboard/api/runs", "/dash"),  # no boundary: the router sees it unchanged
+        ],
+    )
+    async def test_paths_the_router_cannot_serve_as_api_are_left_to_it(
+        self, path: str, root_path: str
+    ) -> None:
+        """The guard agrees with Starlette; the router then serves no data there."""
         assert await self._status(path, root_path) == 200
+        dash = create_dashboard_api(_store(), auth_token=TOKEN)  # type: ignore[arg-type]
+        transport = ASGITransport(app=dash, root_path=root_path, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://localhost") as c:
+            resp = await c.get(path)
+        assert resp.status_code in {401, 404}
+        assert "R1" not in resp.text
 
     async def test_valid_token_passes_for_every_shape(self) -> None:
         from dendrux.dashboard.security import DashboardGuard
@@ -576,6 +599,47 @@ class TestRootPathBoundary:
             )
             results.append(sent[0]["status"])
         assert results == [200, 200, 200]
+
+    async def test_dashboard_mounted_under_an_api_prefix_loads_and_stays_protected(self) -> None:
+        dash = create_dashboard_api(_store(), auth_token=TOKEN)  # type: ignore[arg-type]
+        parent = FastAPI()
+        parent.mount("/api/dashboard", dash)
+        asset = next((Path(dashboard_api.__file__).parent / "static" / "assets").glob("index-*.js"))
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        async with _client(parent) as c:
+            html = await c.get("/api/dashboard/")
+            assert html.status_code == 200
+            assert "<html" in html.text.lower()
+            js = await c.get(f"/api/dashboard/assets/{asset.name}")
+            assert js.status_code == 200
+            assert len(js.content) > 1000
+            # The API under the same prefix is still locked.
+            for path in ("/api/dashboard/api/runs", "/api/dashboard/api/health"):
+                assert (await c.get(path)).status_code == 401, path
+                assert (
+                    await c.get(path, headers={"Authorization": "Bearer nope"})
+                ).status_code == 401
+                assert (await c.get(path, headers=auth)).status_code == 200, path
+            assert (await c.get("/api/dashboard/api/runs/R1")).status_code == 401
+
+    async def test_the_api_routes_enforce_the_token_without_the_middleware(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The router dependency is authoritative: a bypassed guard still cannot serve data."""
+        from dendrux.dashboard.security import DashboardGuard
+
+        async def passthrough(self: Any, scope: Any, receive: Any, send: Any) -> None:
+            await self._app(scope, receive, send)
+
+        monkeypatch.setattr(DashboardGuard, "__call__", passthrough)
+        dash = create_dashboard_api(_store(), auth_token=TOKEN)  # type: ignore[arg-type]
+        async with _client(dash) as c:
+            for path in ("/api/runs", "/api/runs/R1", "/api/health", "/api/runs/R1/events"):
+                assert (await c.get(path)).status_code == 401, path
+                bad = await c.get(path, headers={"Authorization": b"Bearer s3cr\xe9t"})
+                assert bad.status_code == 401, path
+                ok = await c.get(path, headers={"Authorization": f"Bearer {TOKEN}"})
+                assert ok.status_code == 200, path
 
     def test_route_path_matches_starlette(self) -> None:
         from starlette._utils import get_route_path
@@ -609,72 +673,111 @@ class TestRootPathBoundary:
 
 
 class TestDelegationBound:
+    """Delegation is built from bounded reads; no test lowers a threshold."""
+
     @staticmethod
-    def _tree(children: int) -> DashboardMockStore:
-        runs = [_Run(id="P", agent_name="parent")]
-        runs += [_Run(id=f"C{i}", agent_name="child", parent_run_id="P") for i in range(children)]
-        return DashboardMockStore(_runs=runs)
-
-    async def test_small_tree_gets_the_full_block(self) -> None:
-        app = create_dashboard_api(self._tree(2))  # type: ignore[arg-type]
-        async with _client(app) as c:
-            body = (await c.get("/api/runs/P")).json()
-        assert body["delegation"]["truncated"] is False
-        assert len(body["delegation"]["children"]) == 2
-
-    async def test_wide_tree_gets_a_bounded_flagged_view_without_the_full_walk(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(dashboard_api, "MAX_DELEGATION_CHILDREN", 3)
-        store = self._tree(7)
+    def _store(runs: list[_Run]) -> DashboardMockStore:
+        store = DashboardMockStore(_runs=runs)
 
         async def forbidden(run_id: str) -> Any:
-            raise AssertionError("the unbounded traversal must not run")
+            raise AssertionError("the unbounded subtree walk must never run")
 
         store.get_delegation_info = forbidden  # type: ignore[method-assign]
+        return store
+
+    async def _block(self, store: DashboardMockStore, run_id: str) -> dict[str, Any]:
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         async with _client(app) as c:
-            body = (await c.get("/api/runs/P")).json()
-        block = body["delegation"]
-        assert block["truncated"] is True
-        assert len(block["children"]) == 3
-        assert block["subtree_summary"]["direct_child_count"] == 7
+            resp = await c.get(f"/api/runs/{run_id}")
+        assert resp.status_code == 200
+        return resp.json()["delegation"]
 
-    async def test_deep_ancestry_is_capped_in_the_bounded_view(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(dashboard_api, "MAX_DELEGATION_CHILDREN", 0)
-        monkeypatch.setattr(dashboard_api, "MAX_DELEGATION_ANCESTRY", 3)
-        runs = [_Run(id=f"A{i}", agent_name="a", parent_run_id=f"A{i + 1}") for i in range(10)]
-        runs.append(_Run(id="A10", agent_name="a"))
-        runs.append(_Run(id="LEAF", agent_name="leaf", parent_run_id="A0"))
-        runs.append(_Run(id="KID", agent_name="kid", parent_run_id="LEAF"))
-        app = create_dashboard_api(DashboardMockStore(_runs=runs))  # type: ignore[arg-type]
-        async with _client(app) as c:
-            block = (await c.get("/api/runs/LEAF")).json()["delegation"]
+    async def test_small_tree_is_complete_and_not_truncated(self) -> None:
+        runs = [_Run(id="P", agent_name="p", total_input_tokens=10, total_output_tokens=1)]
+        runs += [
+            _Run(
+                id=f"C{i}",
+                agent_name="c",
+                parent_run_id="P",
+                total_input_tokens=5,
+                total_output_tokens=2,
+                total_cost_usd=0.5,
+            )
+            for i in range(2)
+        ]
+        block = await self._block(self._store(runs), "P")
+        assert block["truncated"] is False
+        assert len(block["children"]) == 2
+        ss = block["subtree_summary"]
+        assert ss["descendant_count"] == 2
+        assert ss["subtree_input_tokens"] == 20
+        assert ss["subtree_cost_usd"] == 1.0
+        assert ss["unknown_cost_count"] == 1  # the parent has no cost
+
+    async def test_wide_second_level_is_flagged_without_walking_it(self) -> None:
+        """One child that itself has 2,000 children: the 10,001-row shape in miniature."""
+        runs = [_Run(id="P", agent_name="p"), _Run(id="C", agent_name="c", parent_run_id="P")]
+        runs += [_Run(id=f"G{i}", agent_name="g", parent_run_id="C") for i in range(2000)]
+        store = self._store(runs)
+        block = await self._block(store, "P")
         assert block["truncated"] is True
-        assert len(block["ancestry"]) == 3
+        assert [c["run_id"] for c in block["children"]] == ["C"]
+        # The grandchildren are never loaded, so the summary does not claim them.
+        assert block["subtree_summary"]["descendant_count"] == 1
+
+    async def test_more_children_than_the_cap_are_cut_and_flagged(self) -> None:
+        n = dashboard_api.MAX_DELEGATION_CHILDREN + 100
+        runs = [_Run(id="P", agent_name="p")]
+        runs += [_Run(id=f"C{i}", agent_name="c", parent_run_id="P") for i in range(n)]
+        block = await self._block(self._store(runs), "P")
+        assert block["truncated"] is True
+        assert len(block["children"]) == dashboard_api.MAX_DELEGATION_CHILDREN
+        assert block["subtree_summary"]["direct_child_count"] == n
+
+    async def test_children_beyond_the_probe_budget_are_flagged(self) -> None:
+        n = dashboard_api.MAX_DELEGATION_PROBES + 1
+        runs = [_Run(id="P", agent_name="p")]
+        runs += [_Run(id=f"C{i}", agent_name="c", parent_run_id="P") for i in range(n)]
+        block = await self._block(self._store(runs), "P")
+        assert len(block["children"]) == n
+        assert block["truncated"] is True  # not every child could be checked for descendants
+
+    async def test_deep_ancestor_chain_is_capped_and_flagged(self) -> None:
+        depth = dashboard_api.MAX_DELEGATION_ANCESTRY + 15
+        runs = [
+            _Run(id=f"N{i}", agent_name="n", parent_run_id=f"N{i + 1}", delegation_level=depth - i)
+            for i in range(depth)
+        ]
+        runs.append(_Run(id=f"N{depth}", agent_name="root"))
+        block = await self._block(self._store(runs), "N0")
+        assert len(block["ancestry"]) == dashboard_api.MAX_DELEGATION_ANCESTRY
         assert block["ancestry_complete"] is False
-        assert block["parent"]["run_id"] == "A0"
+        assert block["truncated"] is True
+        assert block["parent"]["run_id"] == "N1"
         assert block["parent"]["resolved"] is True
 
-    async def test_slow_traversal_falls_back_to_the_bounded_view(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import asyncio
+    async def test_short_chain_is_complete(self) -> None:
+        runs = [
+            _Run(id="A", agent_name="a"),
+            _Run(id="B", agent_name="b", parent_run_id="A"),
+            _Run(id="C", agent_name="c", parent_run_id="B"),
+        ]
+        block = await self._block(self._store(runs), "C")
+        assert [a["run_id"] for a in block["ancestry"]] == ["A", "B"]
+        assert block["ancestry_complete"] is True
+        assert block["truncated"] is False
 
-        monkeypatch.setattr(dashboard_api, "DELEGATION_TIME_BUDGET_S", 0.05)
-        store = self._tree(2)
-
-        async def slow(run_id: str) -> Any:
-            await asyncio.sleep(5)
-
-        store.get_delegation_info = slow  # type: ignore[method-assign]
-        app = create_dashboard_api(store)  # type: ignore[arg-type]
-        async with _client(app) as c:
-            body = (await c.get("/api/runs/P")).json()
-        assert body["delegation"]["truncated"] is True
-        assert len(body["delegation"]["children"]) == 2
+    async def test_cycle_and_missing_parent_are_reported_incomplete(self) -> None:
+        cyc = [
+            _Run(id="A", agent_name="a", parent_run_id="B"),
+            _Run(id="B", agent_name="b", parent_run_id="A"),
+        ]
+        block = await self._block(self._store(cyc), "A")
+        assert block["ancestry_complete"] is False
+        orphan = [_Run(id="X", agent_name="x", parent_run_id="GONE")]
+        block = await self._block(self._store(orphan), "X")
+        assert block["ancestry_complete"] is False
+        assert block["parent"]["resolved"] is False
 
 
 class TestShippedFrontendShowsTruncation:

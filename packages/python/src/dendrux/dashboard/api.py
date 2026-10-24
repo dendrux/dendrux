@@ -16,12 +16,11 @@ endpoint is paged with a hard maximum.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -29,6 +28,8 @@ from dendrux.dashboard.normalizer import normalize_timeline, timeline_to_dict
 from dendrux.dashboard.security import (
     ANY_HOST,
     DashboardGuard,
+    bearer_matches,
+    expected_bearer,
     is_loopback_host,
     normalize_origins,
 )
@@ -44,18 +45,16 @@ DRILLDOWN_DEFAULT_LIMIT = 200
 DRILLDOWN_MAX_LIMIT = 500  # the store clamps to 1000; keep room for the has_more probe
 LLM_CALLS_MAX_LIMIT = 200  # rows carry raw provider payloads
 
-# Delegation block on the run-detail page. A run with more direct children
-# than this, or whose full traversal takes longer than the time budget, gets a
-# bounded view flagged ``truncated`` instead of walking the whole tree.
+# Delegation block on the run-detail page, built from bounded reads only.
 MAX_DELEGATION_CHILDREN = 500
 MAX_DELEGATION_ANCESTRY = 25
-DELEGATION_TIME_BUDGET_S = 5.0
+MAX_DELEGATION_PROBES = 50  # children checked for descendants of their own
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
 
-    from dendrux.runtime.state import DelegationInfo, StateStore
+    from dendrux.runtime.state import StateStore
 
 
 async def _count_pauses_per_run(state_store: StateStore, run_ids: list[str]) -> dict[str, int]:
@@ -105,52 +104,6 @@ def _utc_iso(ts: datetime | None) -> str | None:
     return ts.isoformat() + "Z"
 
 
-def _delegation_to_dict(info: DelegationInfo) -> dict[str, Any]:
-    """Serialize DelegationInfo to a JSON-safe dict."""
-    parent_dict: dict[str, Any] | None = None
-    if info.parent is not None:
-        parent_dict = {
-            "run_id": info.parent.run_id,
-            "resolved": info.parent.resolved,
-            "agent_name": info.parent.agent_name,
-            "status": info.parent.status,
-            "delegation_level": info.parent.delegation_level,
-        }
-
-    return {
-        "parent": parent_dict,
-        "children": [
-            {
-                "run_id": c.run_id,
-                "agent_name": c.agent_name,
-                "status": c.status,
-                "delegation_level": c.delegation_level,
-            }
-            for c in info.children
-        ],
-        "ancestry": [
-            {
-                "run_id": a.run_id,
-                "agent_name": a.agent_name,
-                "status": a.status,
-                "delegation_level": a.delegation_level,
-            }
-            for a in info.ancestry
-        ],
-        "subtree_summary": {
-            "direct_child_count": info.subtree_summary.direct_child_count,
-            "descendant_count": info.subtree_summary.descendant_count,
-            "max_depth": info.subtree_summary.max_depth,
-            "subtree_input_tokens": info.subtree_summary.subtree_input_tokens,
-            "subtree_output_tokens": info.subtree_summary.subtree_output_tokens,
-            "subtree_cost_usd": info.subtree_summary.subtree_cost_usd,
-            "unknown_cost_count": info.subtree_summary.unknown_cost_count,
-            "status_counts": info.subtree_summary.status_counts,
-        },
-        "ancestry_complete": info.ancestry_complete,
-    }
-
-
 def _page_bounds(limit: int, offset: int, *, max_limit: int) -> tuple[int, int]:
     """Clamp ``limit`` into 1..max_limit; ``offset`` is validated by the endpoint."""
     return min(max(1, limit), max_limit), offset
@@ -183,20 +136,32 @@ def _brief(run: Any) -> dict[str, Any]:
     }
 
 
-async def _bounded_delegation(
-    state_store: StateStore, run_id: str, child_count: int
-) -> dict[str, Any] | None:
-    """Delegation block built from bounded reads: capped ancestry and children."""
+async def _delegation_block(state_store: StateStore, run_id: str) -> dict[str, Any] | None:
+    """Delegation block from bounded reads only; never walks the whole subtree.
+
+    Ancestry is capped at ``MAX_DELEGATION_ANCESTRY``, children at
+    ``MAX_DELEGATION_CHILDREN``. The subtree summary covers the run and the
+    children listed. ``truncated`` is set whenever that is not provably the
+    whole subtree: more children than the cap, a capped or broken ancestry,
+    a child that has children of its own, or more children than were probed.
+    A bounded row- and depth-limited traversal in the store is a follow-up.
+    """
     run = await state_store.get_run(run_id)
     if run is None:
         return None
-    ancestry: list[Any] = []
+
+    ancestry: list[Any] = []  # nearest first
     complete = True
+    truncated = False
     seen = {run_id}
     current = run.parent_run_id
     while current:
-        if current in seen or len(ancestry) >= MAX_DELEGATION_ANCESTRY:
+        if current in seen:
             complete = False
+            break
+        if len(ancestry) >= MAX_DELEGATION_ANCESTRY:
+            complete = False
+            truncated = True
             break
         seen.add(current)
         row = await state_store.get_run(current)
@@ -205,16 +170,32 @@ async def _bounded_delegation(
             break
         ancestry.append(row)
         current = row.parent_run_id
+
+    child_count = await state_store.count_runs(parent_run_id=run_id)
     children = await state_store.list_runs(parent_run_id=run_id, limit=MAX_DELEGATION_CHILDREN)
-    status_counts: dict[str, int] = {run.status: 1}
-    for child in children:
-        status_counts[child.status] = status_counts.get(child.status, 0) + 1
+    if child_count > len(children):
+        truncated = True
+    # Does anything live below the children? Probe a bounded number of them.
+    probed = children[:MAX_DELEGATION_PROBES]
+    if len(children) > len(probed):
+        truncated = True
+    for child in probed:
+        if await state_store.count_runs(parent_run_id=child.id) > 0:
+            truncated = True
+            break
+
+    members = [run, *children]
+    known = [m.total_cost_usd for m in members if m.total_cost_usd is not None]
+    status_counts: dict[str, int] = {}
+    for member in members:
+        status_counts[member.status] = status_counts.get(member.status, 0) + 1
+
     parent: dict[str, Any] | None = None
     if run.parent_run_id:
         row = ancestry[0] if ancestry else None
         parent = {
             "run_id": run.parent_run_id,
-            "resolved": row is not None and row.id == run.parent_run_id,
+            "resolved": row is not None,
             "agent_name": row.agent_name if row is not None else None,
             "status": row.status if row is not None else None,
             "delegation_level": row.delegation_level if row is not None else None,
@@ -226,34 +207,16 @@ async def _bounded_delegation(
         "subtree_summary": {
             "direct_child_count": child_count,
             "descendant_count": child_count,
-            "max_depth": 1,
-            "subtree_input_tokens": run.total_input_tokens,
-            "subtree_output_tokens": run.total_output_tokens,
-            "subtree_cost_usd": None,
-            "unknown_cost_count": 0,
+            "max_depth": 1 if child_count else 0,
+            "subtree_input_tokens": sum(m.total_input_tokens for m in members),
+            "subtree_output_tokens": sum(m.total_output_tokens for m in members),
+            "subtree_cost_usd": float(sum(known)) if known else None,
+            "unknown_cost_count": len(members) - len(known),
             "status_counts": status_counts,
         },
         "ancestry_complete": complete,
-        "truncated": True,
+        "truncated": truncated,
     }
-
-
-async def _delegation_block(state_store: StateStore, run_id: str) -> dict[str, Any] | None:
-    """Full delegation info when the tree is small; a bounded, flagged view otherwise."""
-    child_count = await state_store.count_runs(parent_run_id=run_id)
-    if child_count <= MAX_DELEGATION_CHILDREN:
-        try:
-            info = await asyncio.wait_for(
-                state_store.get_delegation_info(run_id), DELEGATION_TIME_BUDGET_S
-            )
-        except TimeoutError:
-            info = None
-            logger.warning("dashboard.delegation_budget_exceeded run_id=%s", run_id)
-        else:
-            if info is None:
-                return None
-            return {**_delegation_to_dict(info), "truncated": False}
-    return await _bounded_delegation(state_store, run_id, child_count)
 
 
 def create_dashboard_api(
@@ -315,7 +278,21 @@ def create_dashboard_api(
         )
     app.add_middleware(DashboardGuard, allowed_hosts=hosts, token=None)
 
-    @app.get("/api/runs")
+    expected = expected_bearer(auth_token)
+
+    async def require_token(request: Request) -> None:
+        """Authoritative token check, attached to every API route."""
+        if not bearer_matches(request.scope.get("headers") or [], expected):
+            logger.warning("dashboard.auth_rejected")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing auth token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    api = APIRouter(dependencies=[Depends(require_token)])
+
+    @api.get("/api/runs")
     async def list_runs(
         limit: int = 50,
         offset: int = Query(0, ge=0, le=RUNS_MAX_OFFSET),
@@ -376,7 +353,7 @@ def create_dashboard_api(
 
         return {"runs": items, "total": total_filtered}
 
-    @app.get("/api/runs/{run_id}")
+    @api.get("/api/runs/{run_id}")
     async def get_run_detail(run_id: str) -> dict[str, Any]:
         """Get the full normalized timeline for a single run.
 
@@ -394,7 +371,7 @@ def create_dashboard_api(
 
         return result
 
-    @app.get("/api/runs/{run_id}/events")
+    @api.get("/api/runs/{run_id}/events")
     async def get_run_events(
         run_id: str,
         limit: int = DRILLDOWN_DEFAULT_LIMIT,
@@ -432,7 +409,7 @@ def create_dashboard_api(
             "next_after": events[-1].sequence_index if has_more else None,
         }
 
-    @app.get("/api/runs/{run_id}/traces")
+    @api.get("/api/runs/{run_id}/traces")
     async def get_run_traces(
         run_id: str,
         limit: int = DRILLDOWN_DEFAULT_LIMIT,
@@ -461,7 +438,7 @@ def create_dashboard_api(
             **_page_info(page, skip, len(rows) > page),
         }
 
-    @app.get("/api/runs/{run_id}/tool-calls")
+    @api.get("/api/runs/{run_id}/tool-calls")
     async def get_run_tool_calls(
         run_id: str,
         limit: int = DRILLDOWN_DEFAULT_LIMIT,
@@ -495,7 +472,7 @@ def create_dashboard_api(
             **_page_info(page, skip, len(rows) > page),
         }
 
-    @app.get("/api/runs/{run_id}/llm-calls")
+    @api.get("/api/runs/{run_id}/llm-calls")
     async def get_run_llm_calls(
         run_id: str,
         limit: int = LLM_CALLS_MAX_LIMIT,
@@ -533,9 +510,11 @@ def create_dashboard_api(
             **_page_info(page, skip, len(rows) > page),
         }
 
-    @app.get("/api/health")
+    @api.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    app.include_router(api)
 
     # Serve pre-built React dashboard (if static assets exist).
     # In development, Vite dev server handles this via proxy.

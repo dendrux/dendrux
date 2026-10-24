@@ -939,13 +939,16 @@ class TestDelegationBlock:
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://localhost") as client:
-            # Root sees full tree
+            # Root sees itself and its direct children; the grandchild is not
+            # walked, so the summary is a lower bound and says so.
             resp = await client.get("/api/runs/root")
-            ss = resp.json()["delegation"]["subtree_summary"]
-            assert ss["descendant_count"] == 2
-            assert ss["max_depth"] == 2
-            assert ss["subtree_input_tokens"] == 350  # 100+200+50
-            assert ss["status_counts"] == {"success": 2, "error": 1}
+            block = resp.json()["delegation"]
+            ss = block["subtree_summary"]
+            assert block["truncated"] is True
+            assert ss["descendant_count"] == 1
+            assert ss["max_depth"] == 1
+            assert ss["subtree_input_tokens"] == 300  # 100+200
+            assert ss["status_counts"] == {"success": 2}
 
             # Middle node sees itself + leaf
             resp = await client.get("/api/runs/mid")
@@ -958,6 +961,7 @@ class TestDelegationBlock:
             assert ss["descendant_count"] == 1
             assert ss["max_depth"] == 1
             assert ss["direct_child_count"] == 1
+            assert d["truncated"] is False  # its only child is a leaf
 
             # Leaf has ancestry [root, mid]
             resp = await client.get("/api/runs/leaf")
