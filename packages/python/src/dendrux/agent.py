@@ -1611,9 +1611,9 @@ class Agent:
             run_id: A run in status ``WAITING_CLIENT_TOOL``.
             results: One :class:`ToolResult` per pending tool call. Must
                 cover every pending call; unknown or missing ids raise
-                ``InvalidToolResultError``. Plain-text payloads are encoded as JSON strings
-                before the size cap and ``tool_result_transform``. ``ToolResult.images`` are
-                validated and stored before the claim; an image error
+                ``InvalidToolResultError``. Text and JSON payloads keep their original
+                bytes unless capped or changed by ``tool_result_transform``.
+                ``ToolResult.images`` are validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
             expected_pause_id: Current pause generation; stale submissions are rejected.

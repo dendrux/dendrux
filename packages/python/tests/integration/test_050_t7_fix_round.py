@@ -312,7 +312,7 @@ async def test_example_09_plain_text_round_trip(store, monkeypatch):
     assert events[-1]["type"] == "run_completed"
     assert events[-1]["run_result"]["status"] == "success"
     message = next(m for m in provider.messages[-1] if m.role.value == "tool")
-    assert json.loads(message.content) == "Revenue: $100M"
+    assert message.content == "Revenue: $100M"
 
 
 @pytest.mark.parametrize("entry", ["batch", "decisions", "resume", "resume_stream"])

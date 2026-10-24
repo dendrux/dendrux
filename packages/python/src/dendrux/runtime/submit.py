@@ -485,7 +485,7 @@ def deserialize_tool_results(raw: list[dict[str, Any]]) -> list[ToolResult]:
             ToolResult(
                 name=r["name"],
                 call_id=r["call_id"],
-                payload=_client_json_payload(r["payload"]),
+                payload=r["payload"],
                 success=r.get("success", True),
                 error=r.get("error"),
                 duration_ms=r.get("duration_ms", 0),
@@ -1047,7 +1047,7 @@ def warn_missing_pause_id(
 
 
 def _client_json_payload(payload: str) -> str:
-    """Keep JSON values; encode legacy plain text as a JSON string."""
+    """JSON form for storage and transforms, without changing the model's text."""
     import json
 
     try:
@@ -1057,10 +1057,27 @@ def _client_json_payload(payload: str) -> str:
     return payload
 
 
+def _cap_client_result(result: ToolResult, limit: int) -> ToolResult:
+    """Preserve wire bytes; use the shared string truncator for oversized text."""
+    import json
+
+    from dendrux.tools import cap_tool_result
+
+    if len(result.payload.encode("utf-8")) <= limit:
+        return cap_tool_result(result, limit)
+    normalized = _client_json_payload(result.payload)
+    capped = cap_tool_result(replace(result, payload=normalized), limit)
+    if normalized != result.payload:
+        value = json.loads(capped.payload)
+        if isinstance(value, str):
+            capped = replace(capped, payload=value)
+    return capped
+
+
 async def prepare_client_results(
     agent: Agent, run_id: str, pause: PauseState, results: list[ToolResult]
 ) -> list[ToolResult]:
-    """Validate identity, normalize text to JSON, cap, transform, then re-cap."""
+    """Validate identity and cap; preserve wire bytes unless a transform applies."""
     import json
 
     from dendrux.loops.react import _apply_result_transform
@@ -1069,11 +1086,7 @@ async def prepare_client_results(
     validate_result_names(run_id, pause, results, json_payload=False)
     try:
         capped = [
-            cap_tool_result(
-                replace(result, payload=_client_json_payload(result.payload)),
-                agent._limits.max_tool_result_bytes,
-            )
-            for result in results
+            _cap_client_result(result, agent._limits.max_tool_result_bytes) for result in results
         ]
     except UnicodeError as exc:
         raise _invalid_tool_result(run_id, "tool result payload is not valid UTF-8") from exc
@@ -1096,7 +1109,9 @@ async def prepare_client_results(
                     agent.tool_result_transform,
                     pending[result.call_id],
                     lookups,
-                    json.loads(result.payload, parse_constant=_invalid_json_constant),
+                    json.loads(
+                        _client_json_payload(result.payload), parse_constant=_invalid_json_constant
+                    ),
                 )
                 result = replace(result, payload=json.dumps(value, allow_nan=False))
             except Exception as exc:

@@ -1950,12 +1950,14 @@ class RunStream:
         if self._closed:
             return
         self._closed = True
-        if not self._terminated:
-            try:
-                self._result = await self._cleanup()
-            except Exception:
-                logger.warning("RunStream cleanup failed", exc_info=True)
-        await self._gen.aclose()
+        try:
+            if not self._terminated:
+                try:
+                    self._result = await self._cleanup()
+                except Exception:
+                    logger.warning("RunStream cleanup failed", exc_info=True)
+        finally:
+            await self._gen.aclose()
 
     async def text(self) -> AsyncGenerator[str, None]:
         """Convenience filter — yields only text deltas as plain strings."""

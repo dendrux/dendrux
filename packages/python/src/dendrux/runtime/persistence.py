@@ -440,6 +440,12 @@ class PersistenceRecorder(BaseRecorder):
         """Persist tool call record + event."""
         params = tool_call.params if tool_call.params else None
         target = self._target_lookup.get(tool_call.name, "server")
+        result_payload = tool_result.payload
+        if target == "client":
+            from dendrux.runtime.submit import _client_json_payload
+
+            # Keep client text unchanged in model messages, but JSON-safe in storage.
+            result_payload = _client_json_payload(result_payload)
         meta = dict(tool_result.meta) if tool_result.meta else {}
         images = [image_dict(i) for i in tool_result.images]
         if images:
@@ -458,7 +464,7 @@ class PersistenceRecorder(BaseRecorder):
                 tool_name=tool_call.name,
                 target=target,
                 params=params,
-                result_payload=tool_result.payload,
+                result_payload=result_payload,
                 success=tool_result.success,
                 duration_ms=tool_result.duration_ms,
                 iteration_index=iteration,
