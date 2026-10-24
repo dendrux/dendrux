@@ -428,22 +428,31 @@ class EventFeed:
         if self._feeds.get(feed.run_id) is feed:
             del self._feeds[feed.run_id]
 
-    async def _feed_for(self, run_id: str) -> _RunFeed:
-        if self._closed:
-            raise RuntimeError("This event feed is closed.")
+    async def _wait_for_closing(self, run_id: str) -> None:
         feed = self._feeds.get(run_id)
-        if feed is not None:
-            if feed.closing:
+        if feed is None or not feed.closing:
+            return
+        task = feed.task
+        if task is not None and not task.done():
+            _, pending = await asyncio.wait({task}, timeout=self.stop_timeout_s)
+            if pending:
                 raise FollowCapacityError(self.max_followers)
-            return feed
-        head = await _current_head(self.store, run_id)
-        if self._closed:
-            raise RuntimeError("This event feed is closed.")
-        # Another follower may have created the feed while we read the head.
-        feed = self._feeds.setdefault(run_id, _RunFeed(self, run_id, head))
-        if feed.closing:
-            raise FollowCapacityError(self.max_followers)
-        return feed
+        self._drop(feed)
+
+    async def _feed_for(self, run_id: str) -> _RunFeed:
+        while True:
+            if self._closed:
+                raise RuntimeError("This event feed is closed.")
+            feed = self._feeds.get(run_id)
+            if feed is None:
+                head = await _current_head(self.store, run_id)
+                if self._closed:
+                    raise RuntimeError("This event feed is closed.")
+                # Another follower may have created the feed while we read the head.
+                feed = self._feeds.setdefault(run_id, _RunFeed(self, run_id, head))
+            if not feed.closing:
+                return feed
+            await self._wait_for_closing(run_id)
 
     async def aclose(self) -> None:
         """Stop all pollers and await their actual completion before disposing the store.
@@ -518,6 +527,7 @@ class Follow:
                 self.run_id, after_sequence_index=self._cursor, limit=1
             )
             self.drained_terminal = not pending
+        await self._owner._wait_for_closing(self.run_id)
         self._owner._acquire()
         self._holds_slot = True
         self._started = True

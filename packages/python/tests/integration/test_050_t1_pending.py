@@ -386,6 +386,23 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
     assert received == [real]  # the approved tool still receives the real value
 
 
+async def test_immediate_refollow_reuses_slot_without_capacity_errors(
+    store: Any, run_store: RunStore
+) -> None:
+    await store.create_run("refollow", "a", tenant_id="acme")
+    await store.save_run_event("refollow", event_type="tick")
+    feed = EventFeed(run_store, max_followers=1, poll_interval_s=0.001, poll_max_s=0.002)
+    try:
+        async with asyncio.timeout(90):
+            for _ in range(400):
+                async with feed.follow("refollow", tenant_id="acme") as follow:
+                    event = await anext(follow)
+                    assert isinstance(event, StoredEvent) and event.sequence_index == 0
+        assert feed.followers == 0
+    finally:
+        await feed.aclose()
+
+
 @pytest.mark.parametrize(
     "status", ["waiting_approval", "waiting_human_input", "waiting_client_tool"]
 )

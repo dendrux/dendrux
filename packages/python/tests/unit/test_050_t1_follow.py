@@ -422,7 +422,8 @@ class TestFixRound:
                 assert follow._follower is not None
                 follow._follower.push(StoredEvent(3, 0, "tick", None, {}, None))
             await asyncio.sleep(0.06)
-            assert await anext(follow) == FollowEnd("max_duration", first.sequence_index)
+            async with asyncio.timeout(2):
+                assert await anext(follow) == FollowEnd("max_duration", first.sequence_index)
 
     async def test_blocked_read_obeys_duration(
         self, state: Any, store: RunStore, monkeypatch: Any
