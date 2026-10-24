@@ -16,10 +16,13 @@ from __future__ import annotations
 import re
 from typing import Literal, Protocol
 
+from dendrux._sentinel import _UnsetType
 from dendrux.guardrails._protocol import Finding, Pattern
 
 Engine = Literal["regex", "presidio"]
 RestoreMode = Literal["all", "allowlisted"]
+
+_RESTORE_NOT_CHOSEN = _UnsetType()
 
 
 _DEFAULT_PATTERNS: list[Pattern] = [
@@ -123,7 +126,8 @@ class PII:
         restore: Which tools get real values back in place of placeholders
             (``action="redact"``). ``"all"`` (default) restores into every
             tool call. ``"allowlisted"`` restores only into tools marked
-            ``@tool(receives_pii=...)``.
+            ``@tool(receives_pii=...)``. ``_restore_chosen`` records whether
+            it was passed explicitly.
     """
 
     def __init__(
@@ -133,12 +137,15 @@ class PII:
         engine: Engine = "regex",
         extra_patterns: list[Pattern] | None = None,
         include_defaults: bool = True,
-        restore: RestoreMode = "all",
+        restore: RestoreMode | _UnsetType = _RESTORE_NOT_CHOSEN,
     ) -> None:
         if action not in ("redact", "block", "warn"):
             raise ValueError(f"Invalid action: {action!r}. Must be 'redact', 'block', or 'warn'.")
         if engine not in ("regex", "presidio"):
             raise ValueError(f"Invalid engine: {engine!r}. Must be 'regex' or 'presidio'.")
+        self._restore_chosen: bool = not isinstance(restore, _UnsetType)
+        if isinstance(restore, _UnsetType):
+            restore = "all"
         if restore not in ("all", "allowlisted"):
             raise ValueError(f"Invalid restore: {restore!r}. Must be 'all' or 'allowlisted'.")
         self.action: Literal["redact", "block", "warn"] = action

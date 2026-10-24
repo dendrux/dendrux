@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from dendrux.agent import Agent
     from dendrux.types import UsageStats
 
 __all__ = ["CostSource", "ModelPricing", "PriceTable", "price_usage"]
@@ -179,6 +180,16 @@ def price_usage(
     if cost is None:
         return usage
     return replace(usage, cost_usd=cost, cost_source="table")
+
+
+def check_budget_config(agent: Agent, *, model: str | None = None) -> None:
+    """Check that a dollar budget can be priced (B4). Inert for now.
+
+    Called from ``Agent.__init__`` (``model=None``: the provider's configured
+    model) and at every ``run`` / ``stream`` / ``retry`` entry with the per-call
+    requested ``model=`` override, when one was passed. Will raise
+    :class:`~dendrux.errors.BudgetConfigurationError`.
+    """
 
 
 def _is_glob(key: str) -> bool:

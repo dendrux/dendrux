@@ -429,10 +429,10 @@ class Agent:
         before_tool: BeforeToolHook | None = None,
         images: ImagePolicy | None = None,
         blob_store: BlobStore | None = None,
-        strict_tenancy: bool = False,
+        strict_tenancy: bool | _UnsetType = _UNSET,
         limits: Limits | None = None,
         tool_threads: int = 8,
-        on_governance_change: Literal["warn", "raise"] = "warn",
+        on_governance_change: Literal["warn", "raise"] | _UnsetType = _UNSET,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -515,6 +515,14 @@ class Agent:
         from dendrux.tools._lookups import make_call_limiter
         from dendrux.types import Limits as _Limits
 
+        # "Not chosen" is kept apart from an explicit False / "warn": the 0.6
+        # default flips warn only developers who did not choose.
+        self._strict_tenancy_chosen: bool = not isinstance(strict_tenancy, _UnsetType)
+        self._on_governance_change_chosen: bool = not isinstance(on_governance_change, _UnsetType)
+        if isinstance(strict_tenancy, _UnsetType):
+            strict_tenancy = False
+        if isinstance(on_governance_change, _UnsetType):
+            on_governance_change = "warn"
         if not isinstance(strict_tenancy, bool):
             raise ValueError(f"Agent '{self.name}' strict_tenancy must be a bool.")
         if limits is not None and not isinstance(limits, _Limits):
@@ -532,7 +540,8 @@ class Agent:
                 f"got {on_governance_change!r}."
             )
         self._strict_tenancy: bool = strict_tenancy
-        self._limits: Limits | None = limits
+        # None means the default caps: B12 applies them unless the developer overrides.
+        self._limits: Limits = limits if limits is not None else _Limits()
         self._tool_threads: int = tool_threads
         self._on_governance_change: Literal["warn", "raise"] = on_governance_change
         self._tool_call_limiter: Any = make_call_limiter(tool_threads)
@@ -654,6 +663,10 @@ class Agent:
         self._validate_skill_contents(self._explicit_skills or [])
 
         self._validate()
+
+        from dendrux import pricing as _pricing
+
+        _pricing.check_budget_config(self)
 
     # ------------------------------------------------------------------
     # Properties
@@ -1335,6 +1348,7 @@ class Agent:
             user_input=user_input,
             history=history,
             context=context,
+            provider_kwargs=kwargs,
         )
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
@@ -1432,7 +1446,13 @@ class Agent:
                 SingleCall.
         """
         tenant_id = entry_checks(
-            self, "retry", tenant_id, default_tenant=None, run_id=run_id, metadata=metadata
+            self,
+            "retry",
+            tenant_id,
+            default_tenant=None,
+            run_id=run_id,
+            metadata=metadata,
+            provider_kwargs=kwargs,
         )
         provider = self._require_provider()
         store = await self._resolve_state_store()
@@ -1780,7 +1800,13 @@ class Agent:
             RunAlreadyTerminalError.
         """
         tenant_id = entry_checks(
-            self, "submit_approval", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+            self,
+            "submit_approval",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            rejection_reason=rejection_reason,
+            decisions=decisions,
         )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
@@ -2321,9 +2347,19 @@ class Agent:
             raise PersistenceNotConfiguredError()
 
         add_note = require_store_method(store, "add_note")
+        from dendrux.runtime.runner import _accepts_kwarg
+
+        note_kwargs: dict[str, Any] = {}
+        if _accepts_kwarg(add_note, "max_notes"):  # custom stores written before 0.5.0
+            note_kwargs["max_notes"] = self._limits.max_notes_per_run
         note_id = generate_ulid()
         if await add_note(
-            run_id, note_id=note_id, text=text, metadata=metadata, tenant_id=tenant_id
+            run_id,
+            note_id=note_id,
+            text=text,
+            metadata=metadata,
+            tenant_id=tenant_id,
+            **note_kwargs,
         ):
             return note_id
         record = await store.get_run(run_id)
@@ -2477,6 +2513,7 @@ class Agent:
             user_input=user_input,
             history=history,
             context=context,
+            provider_kwargs=kwargs,
         )
         _validate_max_delegation_depth(max_delegation_depth)
 

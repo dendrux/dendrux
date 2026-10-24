@@ -1,17 +1,23 @@
 """Entry-point check dispatcher (internal).
 
-Every public Agent entry point calls :func:`entry_checks` first, and the
-runner calls :func:`run_meta_checks` where it merges developer metadata into
-``run_meta``. Both dispatch to two separately owned modules:
-:mod:`dendrux.runtime._tenant_checks` (tenancy and metadata) and
-:mod:`dendrux.runtime._limit_checks` (size and count caps). The modules are
-looked up at call time, so tests can monkeypatch their functions.
+Every public Agent entry point calls :func:`entry_checks` first, before any
+I/O. The runner's ``run`` / ``retry`` / ``run_stream`` call
+:func:`runner_entry_checks` right after the delegated-child tenant is
+resolved, before any I/O, so direct ``dendrux.run(...)`` callers, runs without
+a store and delegated children are covered too.
+
+Both dispatch to separately owned modules:
+:mod:`dendrux.runtime._tenant_checks` (tenancy and metadata),
+:mod:`dendrux.runtime._limit_checks` (size and count caps) and, for new runs,
+:func:`dendrux.pricing.check_budget_config` (B4). The modules are looked up at
+call time, so tests can monkeypatch their functions.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar
 
+from dendrux import pricing
 from dendrux.runtime import _limit_checks, _tenant_checks
 
 if TYPE_CHECKING:
@@ -33,6 +39,9 @@ EntryPoint: TypeAlias = Literal[
     "request_pause",
     "submit_note",
 ]
+RunnerEntryPoint: TypeAlias = Literal["run", "stream", "retry"]
+
+_NEW_RUN_ENTRIES = frozenset({"run", "stream", "retry"})
 
 _T = TypeVar("_T", bound="TenantScope")
 
@@ -45,20 +54,37 @@ def entry_checks(
     default_tenant: _T,
     **fields: Any,
 ) -> _T:
-    """Resolve the entry point's tenant and run both check modules; return the tenant."""
+    """Resolve the entry point's tenant and run every check module; return the tenant.
+
+    For ``run`` / ``stream`` / ``retry`` it also calls
+    ``pricing.check_budget_config`` with the per-call ``model=`` override from
+    ``provider_kwargs`` (None when the call uses the provider's model).
+    """
     resolved = _tenant_checks.resolve_tenant(agent, entry, tenant_id, default=default_tenant)
     _tenant_checks.check_entry(agent, entry, tenant_id=resolved, **fields)
     _limit_checks.check_entry(agent, entry, tenant_id=resolved, **fields)
+    if entry in _NEW_RUN_ENTRIES:
+        provider_kwargs = fields.get("provider_kwargs") or {}
+        model = provider_kwargs.get("model")
+        pricing.check_budget_config(agent, model=model if isinstance(model, str) else None)
     return resolved
 
 
-def run_meta_checks(
+def runner_entry_checks(
     agent: Agent,
-    entry: Literal["run", "stream", "retry"],
+    entry: RunnerEntryPoint,
     *,
     tenant_id: str | None,
     metadata: dict[str, Any] | None,
+    **fields: Any,
 ) -> None:
-    """Checks at the runner's ``run_meta`` merge, after tenant inheritance."""
-    _tenant_checks.check_run_metadata(agent, entry, tenant_id=tenant_id, metadata=metadata)
-    _limit_checks.check_run_metadata(agent, entry, tenant_id=tenant_id, metadata=metadata)
+    """Checks at the runner's entry, after tenant inheritance and before any I/O.
+
+    ``tenant_id`` is the effective tenant (a delegated child's is its
+    parent's). ``fields`` carries ``user_input`` (run, stream) and
+    ``provider_kwargs``.
+    """
+    _tenant_checks.check_runner_entry(
+        agent, entry, tenant_id=tenant_id, metadata=metadata, **fields
+    )
+    _limit_checks.check_runner_entry(agent, entry, tenant_id=tenant_id, metadata=metadata, **fields)

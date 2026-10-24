@@ -636,12 +636,18 @@ class StateStore(Protocol):
         text: str,
         metadata: Any = None,
         tenant_id: TenantScope = UNSCOPED,
+        max_notes: int | None = None,
     ) -> bool:
         """Insert an inbox note only if the run exists, is non-terminal and in scope.
 
         One conditional ``INSERT ... SELECT`` that share-locks the run row, so
         a concurrent finalize either sees the note or the note sees the
         terminal status. Returns False when nothing was inserted.
+
+        ``max_notes`` (``Limits.max_notes_per_run``): when set, the insert is
+        also conditional on the run having fewer notes, in the same statement,
+        and :class:`~dendrux.errors.NoteLimitExceededError` is raised when it
+        has that many already. Not enforced yet.
         """
         ...
 
@@ -1702,8 +1708,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         text: str,
         metadata: Any = None,
         tenant_id: TenantScope = UNSCOPED,
+        max_notes: int | None = None,
     ) -> bool:
-        """Conditional ``INSERT ... SELECT`` guarded by status and tenant, row share-locked."""
+        """Conditional ``INSERT ... SELECT`` guarded by status and tenant, row share-locked.
+
+        ``max_notes`` is accepted but not enforced yet (see :meth:`StateStore.add_note`).
+        """
         import datetime as _dt
 
         from sqlalchemy import JSON, DateTime, String, Text, insert, literal, null, select

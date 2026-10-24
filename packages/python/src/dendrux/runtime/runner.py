@@ -53,7 +53,7 @@ from dendrux.loops._helpers import (
     record_run_started,
 )
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime._entry_checks import run_meta_checks
+from dendrux.runtime._entry_checks import runner_entry_checks
 from dendrux.runtime.context import (
     DelegationContext,
     StreamContext,
@@ -1318,6 +1318,14 @@ async def run(
         parent_ctx = get_delegation_context()
         effective_max_depth = _resolve_max_delegation_depth(max_delegation_depth, parent_ctx)
         tenant_id = resolve_child_tenant(parent_ctx, tenant_id)
+        runner_entry_checks(
+            agent,
+            "run",
+            tenant_id=tenant_id,
+            metadata=metadata,
+            user_input=user_input,
+            provider_kwargs=kwargs,
+        )
 
         resolved_strategy = strategy or NativeToolCalling()
         resolved_loop = loop or agent.loop or ReActLoop()
@@ -1436,7 +1444,6 @@ async def run(
                 if state_store is not None:
                     # Create the run record before the loop starts
                     # Merge loop type + depth limit into developer metadata
-                    run_meta_checks(agent, "run", tenant_id=tenant_id, metadata=metadata)
                     run_meta = dict(metadata) if metadata else {}
                     run_meta["dendrux.loop"] = type(resolved_loop).__name__
                     if skill_session.configured:
@@ -2127,6 +2134,9 @@ async def retry(
         raise ValueError(f"Run '{original_run_id}' not found.")
 
     tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
+    runner_entry_checks(
+        agent, "retry", tenant_id=tenant_id, metadata=metadata, provider_kwargs=kwargs
+    )
     if source_run.tenant_id != tenant_id:
         from dendrux.errors import ReplayRunError
 
@@ -2225,7 +2235,6 @@ async def retry(
 
         _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
-        run_meta_checks(agent, "retry", tenant_id=tenant_id, metadata=metadata)
         run_meta = dict(metadata) if metadata else {}
         run_meta["dendrux.loop"] = type(resolved_loop).__name__
         if skill_session.configured:
@@ -2551,6 +2560,7 @@ def run_stream(
     # surfaces to the caller immediately, not as a RUN_ERROR event. Image
     # ingest is async: it runs on first iteration, before create_run, and
     # its errors are raised from the first ``__anext__`` (no run row).
+    entry_user_input = user_input  # as passed, for the runner entry checks
     user_input, input_items = split_user_content(user_input)
     validate_chat_history(history)
     image_input = bool(input_items) or history_has_images(history)
@@ -2607,6 +2617,26 @@ def run_stream(
         image_runtime: ImageRuntime | None = None
         user_parts: tuple[ContentPart, ...] | None = None
         history_messages = normalized_history
+
+        # Entry checks after tenant inheritance, before any I/O. Like image
+        # setup they raise (no RUN_ERROR event, no run row, no hooks). A child
+        # whose explicit tenant differs from its parent's still fails later, as
+        # RUN_ERROR, exactly as before.
+        try:
+            entry_tenant = resolve_child_tenant(get_delegation_context(), tenant_id)
+        except ValueError:
+            pass
+        else:
+            _shared["existing_run"] = True
+            runner_entry_checks(
+                agent,
+                "stream",
+                tenant_id=entry_tenant,
+                metadata=metadata,
+                user_input=entry_user_input,
+                provider_kwargs=provider_kwargs,
+            )
+            _shared["existing_run"] = False
 
         if image_input:
             # Image setup raises (no RUN_ERROR event, no run row, no hooks).
@@ -2709,7 +2739,6 @@ def run_stream(
                 _shared["existing_run"] = False
 
             if store is not None:
-                run_meta_checks(agent, "stream", tenant_id=eff_tenant, metadata=metadata)
                 run_meta = dict(metadata) if metadata else {}
                 run_meta["dendrux.loop"] = type(resolved_loop).__name__
                 if skill_session.configured:

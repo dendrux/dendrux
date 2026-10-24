@@ -120,6 +120,7 @@ async def _record_rejected_call(
     warnings: list[str],
     semantic_messages: list[Message] | None,
     duration_ms: int,
+    model: str | None = None,
 ) -> None:
     """Record a structured call whose output failed validation as a completed call.
 
@@ -149,7 +150,9 @@ async def _record_rejected_call(
             stop_reason=response.stop_reason,
             raw_stop_reason=response.raw_stop_reason,
         )
-    response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+    response = price_response(
+        response, pricing=agent.pricing, default_model=provider.model, model=model
+    )
     exc.usage = response.usage
     exc.model = response.model or provider.model
     await record_llm(
@@ -441,6 +444,7 @@ class SingleCall(Loop):
                     warnings=notifier_warnings,
                     semantic_messages=prepared.semantic,
                     duration_ms=int((time.monotonic() - t0) * 1000),
+                    model=_pkw.get("model"),
                 )
                 raise
             except Exception as _llm_exc:
@@ -501,7 +505,12 @@ class SingleCall(Loop):
 
         prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
-        response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+        response = price_response(
+            response,
+            pricing=agent.pricing,
+            default_model=provider.model,
+            model=_pkw.get("model"),
+        )
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
@@ -944,7 +953,10 @@ class SingleCall(Loop):
         prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
         llm_response = price_response(
-            llm_response, pricing=agent.pricing, default_model=provider.model
+            llm_response,
+            pricing=agent.pricing,
+            default_model=provider.model,
+            model=_pkw.get("model"),
         )
 
         await record_llm(

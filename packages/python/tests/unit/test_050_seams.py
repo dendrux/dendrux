@@ -111,14 +111,21 @@ class TestEntryChecksFireOncePerEntryPoint:
 
     async def test_run_fields(self, calls: dict[str, list[Any]]) -> None:
         with pytest.raises(_StopError):
-            await _agent().run("hi", metadata={"k": 1})
+            await _agent().run("hi", metadata={"k": 1}, model="m-2", temperature=0)
         _, _, fields = calls["tenant"][0]
         assert fields == {
             "metadata": {"k": 1},
             "user_input": "hi",
             "history": None,
             "context": None,
+            "provider_kwargs": {"model": "m-2", "temperature": 0},
         }
+
+    async def test_submit_approval_fields(self, calls: dict[str, list[Any]]) -> None:
+        with pytest.raises(_StopError):
+            await _agent().submit_approval("r1", approved=False, rejection_reason="no")
+        _, _, fields = calls["tenant"][0]
+        assert fields == {"run_id": "r1", "rejection_reason": "no", "decisions": None}
 
 
 class TestTenantResolution:
@@ -143,30 +150,34 @@ class TestTenantResolution:
         agent = _agent()
         assert _tenant_checks.check_entry(agent, "run", tenant_id=None, metadata={}) is None
         assert _limit_checks.check_entry(agent, "run", tenant_id=None, user_input="x") is None
-        assert (
-            _tenant_checks.check_run_metadata(agent, "run", tenant_id=None, metadata=None) is None
-        )
-        assert _limit_checks.check_run_metadata(agent, "run", tenant_id=None, metadata=None) is None
+        for module in (_tenant_checks, _limit_checks):
+            assert module.check_runner_entry(agent, "run", tenant_id=None, metadata=None) is None
 
 
 @pytest.fixture
-def meta_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, Any, Any]]:
-    record: list[tuple[str, str, Any, Any]] = []
+def runner_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, Any, Any, dict[str, Any]]]:
+    record: list[tuple[str, str, Any, Any, dict[str, Any]]] = []
 
     def _make(module: str) -> Any:
-        def _check(agent: Any, entry: Any, *, tenant_id: Any, metadata: Any) -> None:
-            record.append((module, entry, tenant_id, metadata))
+        def _check(agent: Any, entry: Any, *, tenant_id: Any, metadata: Any, **fields: Any) -> None:
+            record.append((module, entry, tenant_id, metadata, fields))
 
         return _check
 
-    monkeypatch.setattr(_tenant_checks, "check_run_metadata", _make("tenant"))
-    monkeypatch.setattr(_limit_checks, "check_run_metadata", _make("limit"))
+    monkeypatch.setattr(_tenant_checks, "check_runner_entry", _make("tenant"))
+    monkeypatch.setattr(_limit_checks, "check_runner_entry", _make("limit"))
     return record
 
 
-class TestRunMetaMergeSeam:
+def _modules(record: list[tuple[str, str, Any, Any, dict[str, Any]]]) -> list[tuple[Any, ...]]:
+    return [r[:4] for r in record]
+
+
+class TestRunnerEntrySeam:
     async def test_run_stream_retry_each_fire_once(
-        self, tmp_path: Path, meta_calls: list[tuple[str, str, Any, Any]]
+        self, tmp_path: Path, runner_calls: list[tuple[str, str, Any, Any, dict[str, Any]]]
     ) -> None:
         agent = Agent(
             provider=MockLLM([LLMResponse(text="a"), LLMResponse(text="b"), LLMResponse(text="c")]),
@@ -176,44 +187,223 @@ class TestRunMetaMergeSeam:
         try:
             first = await agent.run("hi", tenant_id="t", metadata={"k": 1})
             assert first.status == RunStatus.SUCCESS
-            assert meta_calls == [
+            assert _modules(runner_calls) == [
                 ("tenant", "run", "t", {"k": 1}),
                 ("limit", "run", "t", {"k": 1}),
             ]
-            meta_calls.clear()
+            assert runner_calls[0][4] == {"user_input": "hi", "provider_kwargs": {}}
+            runner_calls.clear()
 
             async with agent.stream("again", tenant_id="t", metadata={"s": 2}) as stream:
                 async for _ in stream:
                     pass
-            assert meta_calls == [
+            assert _modules(runner_calls) == [
                 ("tenant", "stream", "t", {"s": 2}),
                 ("limit", "stream", "t", {"s": 2}),
             ]
-            meta_calls.clear()
+            assert runner_calls[0][4] == {"user_input": "again", "provider_kwargs": {}}
+            runner_calls.clear()
 
             retried = await agent.retry(first.run_id, tenant_id="t", metadata={"r": 3})
             assert retried.status == RunStatus.SUCCESS
-            assert meta_calls == [
+            assert _modules(runner_calls) == [
                 ("tenant", "retry", "t", {"r": 3}),
                 ("limit", "retry", "t", {"r": 3}),
             ]
         finally:
             await agent.close()
 
-    async def test_no_store_no_merge(self, meta_calls: list[tuple[str, str, Any, Any]]) -> None:
-        agent = Agent(provider=MockLLM([LLMResponse(text="a")]), prompt="p")
+    async def test_fires_without_a_store(
+        self, runner_calls: list[tuple[str, str, Any, Any, dict[str, Any]]]
+    ) -> None:
+        agent = Agent(provider=MockLLM([LLMResponse(text="a"), LLMResponse(text="b")]), prompt="p")
         assert (await agent.run("hi", metadata={"k": 1})).status == RunStatus.SUCCESS
-        assert meta_calls == []
+        async with agent.stream("hi", metadata={"k": 2}) as stream:
+            async for _ in stream:
+                pass
+        assert _modules(runner_calls) == [
+            ("tenant", "run", None, {"k": 1}),
+            ("limit", "run", None, {"k": 1}),
+            ("tenant", "stream", None, {"k": 2}),
+            ("limit", "stream", None, {"k": 2}),
+        ]
+
+    async def test_delegated_child_sees_the_inherited_tenant(
+        self, runner_calls: list[tuple[str, str, Any, Any, dict[str, Any]]]
+    ) -> None:
+        from dendrux.runtime.context import (
+            DelegationContext,
+            reset_delegation_context,
+            set_delegation_context,
+        )
+
+        child = Agent(provider=MockLLM([LLMResponse(text="a")]), prompt="p")
+        token = set_delegation_context(DelegationContext(run_id="parent", tenant_id="t-parent"))
+        try:
+            assert (await child.run("hi")).status == RunStatus.SUCCESS
+        finally:
+            reset_delegation_context(token)
+        assert _modules(runner_calls)[0] == ("tenant", "run", "t-parent", None)
+
+    @pytest.mark.parametrize("entry", ["run", "stream"])
+    async def test_direct_runner_callers_are_checked_before_any_io(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str
+    ) -> None:
+        from dendrux import run as runner_run
+        from dendrux.runtime.runner import run_stream
+
+        def _stop(*args: Any, **kwargs: Any) -> None:
+            raise _StopError
+
+        monkeypatch.setattr(_tenant_checks, "check_runner_entry", _stop)
+        agent = Agent(provider=MockLLM([]), prompt="p")
+        store = _SpyStore()
+        with pytest.raises(_StopError):
+            if entry == "run":
+                await runner_run(agent, provider=agent.provider, user_input="hi", state_store=store)  # type: ignore[arg-type]
+            else:
+                stream = run_stream(
+                    agent, provider=agent.provider, user_input="hi", state_store=store
+                )  # type: ignore[arg-type]
+                async for _ in stream:
+                    pass
+        assert store.calls == []
+
+
+class _SpyStore:
+    """Records every attribute access as a store call; nothing may be touched."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.calls.append(name)
+        raise AttributeError(name)
+
+
+class TestBudgetConfigSeam:
+    def test_called_at_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from dendrux import pricing
+
+        seen: list[Any] = []
+        monkeypatch.setattr(
+            pricing, "check_budget_config", lambda agent, *, model=None: seen.append(model)
+        )
+        _agent()
+        assert seen == [None]
+
+    @pytest.mark.parametrize(
+        ("entry", "call"),
+        [
+            ("run", lambda a: a.run("hi", model="m-2")),
+            ("retry", lambda a: a.retry("r1", model="m-2")),
+        ],
+    )
+    async def test_called_at_new_run_entries_with_requested_model(
+        self, calls: dict[str, list[Any]], monkeypatch: pytest.MonkeyPatch, entry: str, call: Any
+    ) -> None:
+        from dendrux import pricing
+
+        agent = _agent()
+        seen: list[Any] = []
+        monkeypatch.setattr(
+            pricing, "check_budget_config", lambda agent, *, model=None: seen.append(model)
+        )
+        # The patched limit check stops the call first, so lift it for this test.
+        monkeypatch.setattr(_limit_checks, "check_entry", lambda *a, **k: None)
+        with pytest.raises(Exception):  # noqa: B017 - fails later, on missing persistence/run
+            await call(agent)
+        assert seen == ["m-2"]
+
+    def test_stream_entry_uses_provider_model_when_not_overridden(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dendrux import pricing
+
+        agent = _agent()
+        seen: list[Any] = []
+        monkeypatch.setattr(
+            pricing, "check_budget_config", lambda agent, *, model=None: seen.append(model)
+        )
+        agent.stream("hi")
+        assert seen == [None]
+
+    @pytest.mark.parametrize("entry", ["resume", "cancel_run"])
+    async def test_not_called_for_continuations(
+        self, monkeypatch: pytest.MonkeyPatch, entry: str
+    ) -> None:
+        from dendrux import pricing
+
+        agent = _agent()
+        seen: list[Any] = []
+        monkeypatch.setattr(
+            pricing, "check_budget_config", lambda agent, *, model=None: seen.append(model)
+        )
+        with pytest.raises(Exception):  # noqa: B017 - no persistence configured
+            await getattr(agent, entry)("r1")
+        assert seen == []
+
+
+class TestNoteCapPlumbing:
+    async def test_submit_note_passes_max_notes(self) -> None:
+        agent = Agent(provider=MockLLM([]), prompt="p", limits=Limits(max_notes_per_run=7))
+        seen: dict[str, Any] = {}
+
+        class _Store:
+            async def add_note(self, run_id: str, **kwargs: Any) -> bool:
+                seen.update(kwargs)
+                return True
+
+        agent._state_store = _Store()  # type: ignore[assignment]
+        await agent.submit_note("r1", "note")
+        assert seen["max_notes"] == 7
+
+    async def test_store_without_max_notes_keeps_working(self) -> None:
+        agent = _agent()
+        seen: dict[str, Any] = {}
+
+        class _LegacyStore:
+            async def add_note(
+                self, run_id: str, *, note_id: str, text: str, metadata: Any, tenant_id: Any
+            ) -> bool:
+                seen["called"] = True
+                return True
+
+        agent._state_store = _LegacyStore()  # type: ignore[assignment]
+        await agent.submit_note("r1", "note")
+        assert seen == {"called": True}
+
+    async def test_default_cap_is_1000(self) -> None:
+        agent = _agent()
+        seen: dict[str, Any] = {}
+
+        class _Store:
+            async def add_note(self, run_id: str, **kwargs: Any) -> bool:
+                seen.update(kwargs)
+                return True
+
+        agent._state_store = _Store()  # type: ignore[assignment]
+        await agent.submit_note("r1", "note")
+        assert seen["max_notes"] == 1000
 
 
 class TestAgentKwargs:
     def test_defaults(self) -> None:
         agent = _agent()
         assert agent._strict_tenancy is False
-        assert agent._limits is None
+        assert agent._strict_tenancy_chosen is False
+        assert agent._limits == Limits()
         assert agent._tool_threads == 8
         assert agent._on_governance_change == "warn"
+        assert agent._on_governance_change_chosen is False
         assert agent._tool_call_limiter is None
+
+    def test_explicit_defaults_count_as_chosen(self) -> None:
+        agent = Agent(
+            provider=MockLLM([]), prompt="p", strict_tenancy=False, on_governance_change="warn"
+        )
+        assert (agent._strict_tenancy, agent._strict_tenancy_chosen) == (False, True)
+        assert (agent._on_governance_change, agent._on_governance_change_chosen) == ("warn", True)
 
     def test_stored(self) -> None:
         limits = Limits(max_input_bytes=10)
@@ -234,6 +424,7 @@ class TestAgentKwargs:
         ("kwargs", "match"),
         [
             ({"strict_tenancy": 1}, "strict_tenancy"),
+            ({"strict_tenancy": None}, "strict_tenancy"),
             ({"limits": {"max_input_bytes": 1}}, "limits"),
             ({"tool_threads": 0}, "tool_threads"),
             ({"tool_threads": True}, "tool_threads"),

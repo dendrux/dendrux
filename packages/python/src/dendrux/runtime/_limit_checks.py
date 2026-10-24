@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from dendrux.agent import Agent
-    from dendrux.runtime._entry_checks import EntryPoint
+    from dendrux.runtime._entry_checks import EntryPoint, RunnerEntryPoint
     from dendrux.runtime.state import TenantScope
 
 
@@ -23,7 +23,16 @@ def check_entry(agent: Agent, entry: EntryPoint, *, tenant_id: TenantScope, **fi
     """
 
 
-def check_run_metadata(
-    agent: Agent, entry: EntryPoint, *, tenant_id: str | None, metadata: dict[str, Any] | None
+def check_runner_entry(
+    agent: Agent,
+    entry: RunnerEntryPoint,
+    *,
+    tenant_id: str | None,
+    metadata: dict[str, Any] | None,
+    **fields: Any,
 ) -> None:
-    """Hook at the runner's ``run_meta`` merge. Inert for now."""
+    """Caps at the runner's entry, before any I/O. Inert for now.
+
+    Receives the same arguments as
+    :func:`dendrux.runtime._tenant_checks.check_runner_entry`.
+    """

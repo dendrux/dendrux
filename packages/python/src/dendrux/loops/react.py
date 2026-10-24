@@ -1605,7 +1605,12 @@ class ReActLoop(Loop):
                     )
             prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
-            response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+            response = price_response(
+                response,
+                pricing=agent.pricing,
+                default_model=provider.model,
+                model=_pkw.get("model"),
+            )
 
             # Output guardrail — detection-only. Persistence stores raw
             # (DB is ground truth); the next scan_incoming redacts for
@@ -2285,7 +2290,10 @@ class ReActLoop(Loop):
             prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
             llm_response = price_response(
-                llm_response, pricing=agent.pricing, default_model=provider.model
+                llm_response,
+                pricing=agent.pricing,
+                default_model=provider.model,
+                model=_pkw.get("model"),
             )
 
             await _record_llm(

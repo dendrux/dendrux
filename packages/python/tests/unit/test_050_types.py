@@ -261,3 +261,64 @@ class TestStoreDataclassFields:
         p = PausePair(1, _NOW, None, None, "waiting_client_tool", [], [], None)
         assert p.pause_id is None
         assert PausePair(1, _NOW, None, None, "x", [], [], None, pause_id="p1").pause_id == "p1"
+
+
+class TestFixRoundTypes:
+    def test_error_info_scrubs_provider_code_and_carries_timeout_reason(self) -> None:
+        exc = ProviderRateLimitError(
+            provider="p",
+            provider_code="free text leak here",
+            timeout_reason="deadline_during_backoff",
+        )
+        info = ErrorInfo.from_error(exc)
+        assert info.provider_code is None
+        assert info.timeout_reason == "deadline_during_backoff"
+        assert "leak" not in json.dumps(info.to_dict())
+        assert ErrorInfo.from_dict(info.to_dict()) == info
+
+    def test_error_info_from_dict_rejects_wrong_types(self) -> None:
+        info = ErrorInfo.from_dict(
+            {
+                "category": {"x": 1},
+                "retryable": "yes",
+                "safe_message": 7,
+                "provider": ["p"],
+                "status_code": True,
+                "provider_code": 3,
+                "timeout_reason": 1,
+            }
+        )
+        assert info == ErrorInfo(category="unknown", retryable=False, safe_message="")
+
+    def test_new_governance_event_types(self) -> None:
+        from dendrux.types import GovernanceEventType
+
+        assert GovernanceEventType.GUARDRAIL_RESTORE_SKIPPED == "guardrail.restore_skipped"
+        assert GovernanceEventType.GOVERNANCE_CHANGED == "governance.changed"
+
+    def test_pii_restore_not_chosen_vs_chosen(self) -> None:
+        default = PII()
+        assert (default.restore, default._restore_chosen) == ("all", False)
+        explicit = PII(restore="all")
+        assert (explicit.restore, explicit._restore_chosen) == ("all", True)
+        assert PII(restore="allowlisted")._restore_chosen is True
+
+    def test_price_response_accepts_requested_model(self) -> None:
+        from dendrux.loops._helpers import price_response
+        from dendrux.types import LLMResponse
+
+        response = LLMResponse(text="x", usage=UsageStats(input_tokens=1, output_tokens=1))
+        assert price_response(response, pricing=None, default_model="m", model="m-2") is response
+
+    def test_check_budget_config_is_inert(self) -> None:
+        from dendrux.pricing import check_budget_config
+
+        agent = dendrux_agent()
+        assert check_budget_config(agent) is None
+        assert check_budget_config(agent, model="m-2") is None
+
+
+def dendrux_agent() -> object:
+    from dendrux import Agent
+
+    return Agent(provider=MockLLM([]), prompt="p", budget=Budget(max_cost_usd=1.0))

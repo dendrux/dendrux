@@ -14,7 +14,7 @@ from dendrux._sentinel import _OmittedType
 
 if TYPE_CHECKING:
     from dendrux.agent import Agent
-    from dendrux.runtime._entry_checks import EntryPoint
+    from dendrux.runtime._entry_checks import EntryPoint, RunnerEntryPoint
     from dendrux.runtime.state import TenantScope
 
 _T = TypeVar("_T", bound="TenantScope")
@@ -41,16 +41,24 @@ def check_entry(agent: Agent, entry: EntryPoint, *, tenant_id: TenantScope, **fi
 
     ``tenant_id`` is the resolved tenant. ``fields`` carries what the entry
     point has: ``run_id``, ``metadata`` (run metadata), ``user_input``,
-    ``history``, ``context``, ``tool_results``, ``note_text``,
-    ``note_metadata``.
+    ``history``, ``context``, ``provider_kwargs`` (run, stream, retry),
+    ``tool_results``, ``rejection_reason`` and ``decisions``
+    (submit_approval), ``note_text``, ``note_metadata``.
     """
 
 
-def check_run_metadata(
-    agent: Agent, entry: EntryPoint, *, tenant_id: str | None, metadata: dict[str, Any] | None
+def check_runner_entry(
+    agent: Agent,
+    entry: RunnerEntryPoint,
+    *,
+    tenant_id: str | None,
+    metadata: dict[str, Any] | None,
+    **fields: Any,
 ) -> None:
-    """Validate developer ``metadata`` where the runner merges it into ``run_meta``.
+    """Validate a new run at the runner's entry, before any I/O. Inert for now.
 
-    ``tenant_id`` is the effective tenant, after delegated-child inheritance.
-    Inert for now.
+    ``tenant_id`` is the effective tenant, after delegated-child inheritance
+    (``resolve_child_tenant``). Also reached by direct ``dendrux.run(...)``
+    callers and runs without a store. ``fields``: ``user_input`` (run,
+    stream), ``provider_kwargs``.
     """

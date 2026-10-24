@@ -267,8 +267,12 @@ def price_response(
     *,
     pricing: PriceTable | None,
     default_model: str | None,
+    model: str | None = None,
 ) -> LLMResponse:
     """Resolve ``response.usage.cost_usd`` from the agent's price table.
+
+    ``model`` is the per-call requested model (``run(model=...)``), or None
+    when the call used the provider's configured ``default_model``.
 
     Applied once per LLM call, before the response is recorded, so the
     persisted usage, the ``llm.completed`` event, the budget check and the
