@@ -988,6 +988,8 @@ class GovernanceEventType(StrEnum):
     GUARDRAIL_REDACTED = "guardrail.redacted"
     GUARDRAIL_BLOCKED = "guardrail.blocked"
     GUARDRAIL_UNMAPPED_PLACEHOLDER = "guardrail.unmapped_placeholder"
+    # PII(restore="allowlisted") kept placeholders for a non-allowlisted tool (counts only)
+    GUARDRAIL_RESTORE_SKIPPED = "guardrail.restore_skipped"
 
     # Init events: Skills + MCP
     SKILL_CATALOG_RESOLVED = "skill.catalog_resolved"
@@ -1014,6 +1016,9 @@ class GovernanceEventType(StrEnum):
     IMAGE_DEGRADED = "image.degraded"
     IMAGE_WARNING = "image.warning"
     GUARDRAIL_IMAGE_UNSCANNED = "guardrail.image_unscanned"
+
+    # Resume with governance different from the run's start (digests only)
+    GOVERNANCE_CHANGED = "governance.changed"
 
 
 _MIB = 1024 * 1024
@@ -1070,7 +1075,10 @@ class ErrorInfo:
         provider: Provider name, when known.
         model: Model name, when known.
         status_code: HTTP status, when there was one.
-        provider_code: The provider's error code, when it sent one.
+        provider_code: The provider's error code when it looks like a code
+            (``ProviderError.safe_provider_code``), else None.
+        timeout_reason: Why a deadline fired (``"call_deadline"``,
+            ``"stream_idle"``, ...), when one did.
     """
 
     category: str
@@ -1081,6 +1089,7 @@ class ErrorInfo:
     model: str | None = None
     status_code: int | None = None
     provider_code: str | None = None
+    timeout_reason: str | None = None
 
     @classmethod
     def from_error(cls, exc: ProviderError) -> ErrorInfo:
@@ -1093,7 +1102,8 @@ class ErrorInfo:
             provider=exc.provider,
             model=exc.model,
             status_code=exc.status_code,
-            provider_code=exc.provider_code,
+            provider_code=exc.safe_provider_code,
+            timeout_reason=exc.timeout_reason,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1107,21 +1117,35 @@ class ErrorInfo:
             "model": self.model,
             "status_code": self.status_code,
             "provider_code": self.provider_code,
+            "timeout_reason": self.timeout_reason,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ErrorInfo:
-        """Rebuild from :meth:`to_dict` output; unknown keys are ignored."""
+        """Rebuild from :meth:`to_dict` output.
+
+        Unknown keys are ignored, and a field of the wrong type reads as its
+        default, since stored run meta is not trusted input.
+        """
+
+        def _text(key: str) -> str | None:
+            value = data.get(key)
+            return value if isinstance(value, str) else None
+
         status = data.get("status_code")
+        retryable = data.get("retryable")
         return cls(
-            category=str(data.get("category") or "unknown"),
-            retryable=bool(data.get("retryable", False)),
-            safe_message=str(data.get("safe_message") or ""),
-            error_type=data.get("error_type"),
-            provider=data.get("provider"),
-            model=data.get("model"),
-            status_code=int(status) if isinstance(status, int) else None,
-            provider_code=data.get("provider_code"),
+            category=_text("category") or "unknown",
+            retryable=retryable if isinstance(retryable, bool) else False,
+            safe_message=_text("safe_message") or "",
+            error_type=_text("error_type"),
+            provider=_text("provider"),
+            model=_text("model"),
+            status_code=status
+            if isinstance(status, int) and not isinstance(status, bool)
+            else None,
+            provider_code=_text("provider_code"),
+            timeout_reason=_text("timeout_reason"),
         )
 
 
@@ -1975,15 +1999,21 @@ class IdempotencyConflictError(RuntimeError):
 
     This indicates a bug in the caller — keys must not be reused across
     different requests. Generate a new key for each distinct request.
+    ``run_id`` is None when the existing run must not be disclosed (for
+    example, it belongs to another tenant).
     """
 
-    def __init__(self, run_id: str, idempotency_key: str) -> None:
+    def __init__(self, run_id: str | None, idempotency_key: str) -> None:
         self.run_id = run_id
         self.idempotency_key = idempotency_key
+        where = f" for run {run_id}" if run_id is not None else ""
         super().__init__(
-            f"Idempotency key '{idempotency_key}' already used for run {run_id} "
+            f"Idempotency key '{idempotency_key}' already used{where} "
             f"with different input. Keys must not be reused across different requests."
         )
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (type(self), (self.run_id, self.idempotency_key))
 
 
 class StructuredOutputValidationError(RuntimeError):

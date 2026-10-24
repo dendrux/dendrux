@@ -285,3 +285,110 @@ class TestRunNotFoundErrorAlias:
             with pytest.raises(RunNotFoundError):
                 async for _ in store.stream_events("missing"):
                     pass
+
+
+class TestFixRoundErrors:
+    @pytest.mark.parametrize(
+        "reason",
+        ["connect", "call_deadline", "stream_idle", "stream_total", "deadline_during_backoff"],
+    )
+    def test_timeout_reason_on_base_and_subclasses(self, reason: str) -> None:
+        from dendrux.errors import TIMEOUT_REASONS
+
+        assert reason in TIMEOUT_REASONS
+        for exc in (
+            ProviderError(timeout_reason=reason),  # type: ignore[arg-type]
+            ProviderRateLimitError(timeout_reason=reason),  # type: ignore[arg-type]
+            ProviderTimeoutError(timeout_reason=reason),  # type: ignore[arg-type]
+            ModelRefusalError(timeout_reason=reason),  # type: ignore[arg-type]
+            ContextLengthExceededError("x", timeout_reason=reason),  # type: ignore[arg-type]
+        ):
+            assert exc.timeout_reason == reason
+            assert _roundtrip(exc).timeout_reason == reason  # type: ignore[attr-defined]
+
+    def test_deadline_during_backoff_keeps_rate_limit_category(self) -> None:
+        exc = ProviderRateLimitError(provider="p", timeout_reason="deadline_during_backoff")
+        assert exc.category == "rate_limit"
+
+    def test_timeout_reason_defaults_none_and_is_validated(self) -> None:
+        assert ProviderError().timeout_reason is None
+        with pytest.raises(ValueError, match="timeout reason"):
+            ProviderError(timeout_reason="whenever")  # type: ignore[arg-type]
+
+    def test_safe_provider_code(self) -> None:
+        assert ProviderError(provider_code="rate_limit_error").safe_provider_code == (
+            "rate_limit_error"
+        )
+        assert ProviderError(provider_code="free text leak here").safe_provider_code is None
+        assert ProviderError().safe_provider_code is None
+
+    def test_run_not_found_unpickles_with_one_message(self) -> None:
+        clone = _roundtrip(RunNotFoundError("r1"))
+        assert str(clone) == "Run 'r1' not found."
+        assert clone.run_id == "r1"  # type: ignore[attr-defined]
+
+    def test_pause_status_mismatch_status_form_unchanged(self) -> None:
+        from dendrux.errors import PauseStatusMismatchError
+        from dendrux.types import RunStatus
+
+        exc = PauseStatusMismatchError(
+            "r1", RunStatus.WAITING_HUMAN_INPUT, RunStatus.WAITING_CLIENT_TOOL
+        )
+        assert exc.reason == "status"
+        assert exc.expected_pause_id is None and exc.current_pause_id is None
+        assert (
+            str(exc)
+            == "Run 'r1' is waiting_human_input, but this method requires waiting_client_tool."
+        )
+        clone = _roundtrip(exc)
+        assert str(clone) == str(exc)
+        assert clone.current_status is RunStatus.WAITING_HUMAN_INPUT  # type: ignore[attr-defined]
+
+    def test_pause_status_mismatch_pause_id_form(self) -> None:
+        from dendrux.errors import PauseStatusMismatchError
+        from dendrux.types import RunStatus
+
+        exc = PauseStatusMismatchError(
+            "r1",
+            RunStatus.WAITING_CLIENT_TOOL,
+            RunStatus.WAITING_CLIENT_TOOL,
+            expected_pause_id="p-old",
+            current_pause_id="p-new",
+            reason="pause_id",
+        )
+        assert "stale" in str(exc)
+        assert "waiting_client_tool, but" not in str(exc)
+        clone = _roundtrip(exc)
+        assert (clone.reason, clone.expected_pause_id, clone.current_pause_id) == (  # type: ignore[attr-defined]
+            "pause_id",
+            "p-old",
+            "p-new",
+        )
+        with pytest.raises(ValueError, match="reason"):
+            PauseStatusMismatchError(
+                "r1",
+                RunStatus.PAUSED,
+                RunStatus.PAUSED,
+                reason="other",  # type: ignore[arg-type]
+            )
+
+    def test_note_limit_exceeded_error(self) -> None:
+        from dendrux.errors import NoteLimitExceededError
+
+        exc = NoteLimitExceededError("r1", limit=1000)
+        assert isinstance(exc, ValueError)
+        assert (exc.run_id, exc.limit) == ("r1", 1000)
+        clone = _roundtrip(exc)
+        assert (clone.run_id, clone.limit, str(clone)) == ("r1", 1000, str(exc))  # type: ignore[attr-defined]
+
+    def test_idempotency_conflict_without_run_id(self) -> None:
+        from dendrux.types import IdempotencyConflictError
+
+        exc = IdempotencyConflictError(None, "k1")
+        assert exc.run_id is None
+        assert "for run" not in str(exc)
+        assert "None" not in str(exc)
+        clone = _roundtrip(exc)
+        assert (clone.run_id, clone.idempotency_key, str(clone)) == (None, "k1", str(exc))  # type: ignore[attr-defined]
+        with_id = _roundtrip(IdempotencyConflictError(run_id="r1", idempotency_key="k1"))
+        assert "for run r1" in str(with_id)

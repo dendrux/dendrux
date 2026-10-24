@@ -15,6 +15,7 @@ _ERRORS = [
     "ContentFilteredError",
     "GovernanceMismatchError",
     "ModelRefusalError",
+    "NoteLimitExceededError",
     "ProviderAuthError",
     "ProviderError",
     "ProviderRateLimitError",

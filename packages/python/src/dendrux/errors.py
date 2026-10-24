@@ -38,6 +38,7 @@ Suggested HTTP mappings:
     ContentFilteredError        -> 422
     BudgetConfigurationError    -> 500 (configuration)
     TenantScopeRequiredError    -> 500 (configuration: pass tenant_id)
+    NoteLimitExceededError      -> 429 or 409 (too many notes on this run)
     GovernanceMismatchError     -> 409
     BlobNotFoundError           -> 404
     BlobIntegrityError          -> 500
@@ -64,8 +65,36 @@ if TYPE_CHECKING:
     from dendrux.types import RunStatus
 
 
-class RunNotFoundError(LookupError):
+def _rebuild_error(cls: type[BaseException], kwargs: dict[str, object]) -> BaseException:
+    return cls(**kwargs)
+
+
+def _rebuild_context_length_error(
+    cls: type[BaseException], message: str, kwargs: dict[str, object]
+) -> BaseException:
+    return cls(message, **kwargs)
+
+
+class _KwargsReduceMixin:
+    """Pickle/copy support for errors whose ``__init__`` takes named fields.
+
+    ``_init_fields`` lists the constructor parameters, each stored as an
+    attribute of the same name; the rebuilt error has no traceback or chain.
+    """
+
+    _init_fields: tuple[str, ...] = ()
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (
+            _rebuild_error,
+            (type(self), {name: getattr(self, name) for name in self._init_fields}),
+        )
+
+
+class RunNotFoundError(_KwargsReduceMixin, LookupError):
     """Raised when ``run_id`` does not exist in the store."""
+
+    _init_fields = ("run_id",)
 
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
@@ -86,27 +115,53 @@ class RunNotPausedError(RuntimeError):
         super().__init__(f"Run '{run_id}' is not paused (current status: {current_status.value}).")
 
 
-class PauseStatusMismatchError(RuntimeError):
-    """Raised when a submit method is called for the wrong pause type.
+class PauseStatusMismatchError(_KwargsReduceMixin, RuntimeError):
+    """Raised when a submit targets the wrong pause.
 
-    Example: calling :meth:`Agent.submit_tool_results` on a run that is
-    ``WAITING_HUMAN_INPUT`` rather than ``WAITING_CLIENT_TOOL``. The run
-    is paused, but not for the kind of signal this method delivers.
+    ``reason="status"``: the run is paused, but not for the kind of signal
+    this method delivers (for example :meth:`Agent.submit_tool_results` on a
+    ``WAITING_HUMAN_INPUT`` run). ``reason="pause_id"``: the run is paused for
+    the right kind of signal, but not the pause the caller expected
+    (``expected_pause_id`` differs from ``current_pause_id``; a stale submit).
     """
+
+    _init_fields = (
+        "run_id",
+        "current_status",
+        "expected_status",
+        "expected_pause_id",
+        "current_pause_id",
+        "reason",
+    )
 
     def __init__(
         self,
         run_id: str,
         current_status: RunStatus,
         expected_status: RunStatus,
+        *,
+        expected_pause_id: str | None = None,
+        current_pause_id: str | None = None,
+        reason: Literal["status", "pause_id"] = "status",
     ) -> None:
+        if reason not in ("status", "pause_id"):
+            raise ValueError(f"Unknown PauseStatusMismatchError reason {reason!r}.")
         self.run_id = run_id
         self.current_status = current_status
         self.expected_status = expected_status
-        super().__init__(
-            f"Run '{run_id}' is {current_status.value}, "
-            f"but this method requires {expected_status.value}."
-        )
+        self.expected_pause_id = expected_pause_id
+        self.current_pause_id = current_pause_id
+        self.reason: Literal["status", "pause_id"] = reason
+        if reason == "pause_id":
+            super().__init__(
+                f"Run '{run_id}' is paused at pause {current_pause_id!r}, "
+                f"not the expected pause {expected_pause_id!r}; the submit is stale."
+            )
+        else:
+            super().__init__(
+                f"Run '{run_id}' is {current_status.value}, "
+                f"but this method requires {expected_status.value}."
+            )
 
 
 class RunAlreadyClaimedError(RuntimeError):
@@ -328,32 +383,6 @@ class SchemaOutOfDateError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _rebuild_error(cls: type[BaseException], kwargs: dict[str, object]) -> BaseException:
-    return cls(**kwargs)
-
-
-def _rebuild_context_length_error(
-    cls: type[BaseException], message: str, kwargs: dict[str, object]
-) -> BaseException:
-    return cls(message, **kwargs)
-
-
-class _KwargsReduceMixin:
-    """Pickle/copy support for errors whose ``__init__`` takes named fields.
-
-    ``_init_fields`` lists the constructor parameters, each stored as an
-    attribute of the same name; the rebuilt error has no traceback or chain.
-    """
-
-    _init_fields: tuple[str, ...] = ()
-
-    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
-        return (
-            _rebuild_error,
-            (type(self), {name: getattr(self, name) for name in self._init_fields}),
-        )
-
-
 class ImageError(ValueError):
     """Base class of image input errors (bad input -> HTTP 400 family).
 
@@ -563,6 +592,15 @@ ProviderErrorCategory: TypeAlias = Literal[
 ]
 PROVIDER_ERROR_CATEGORIES: tuple[str, ...] = get_args(ProviderErrorCategory)
 
+TimeoutReason: TypeAlias = Literal[
+    "connect",
+    "call_deadline",
+    "stream_idle",
+    "stream_total",
+    "deadline_during_backoff",
+]
+TIMEOUT_REASONS: tuple[str, ...] = get_args(TimeoutReason)
+
 # A provider code is echoed into ``safe_message`` only when it looks like a code.
 _SAFE_PROVIDER_CODE = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
 
@@ -588,6 +626,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
         "message",
         "category",
         "retryable",
+        "timeout_reason",
     )
     default_category: ClassVar[ProviderErrorCategory] = "unknown"
     default_retryable: ClassVar[bool] = False
@@ -603,6 +642,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
         message: str = "",
         category: ProviderErrorCategory | None = None,
         retryable: bool | None = None,
+        timeout_reason: TimeoutReason | None = None,
     ) -> None:
         self._set_provider_fields(
             provider=provider,
@@ -613,6 +653,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
             message=message[:500],
             category=category,
             retryable=retryable,
+            timeout_reason=timeout_reason,
         )
         status = f" (HTTP {status_code})" if status_code is not None else ""
         super().__init__(f"Provider {provider!r} error{status}: {self.message}")
@@ -628,10 +669,13 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
         message: str,
         category: ProviderErrorCategory | None,
         retryable: bool | None,
+        timeout_reason: TimeoutReason | None,
     ) -> None:
         resolved = self.default_category if category is None else category
         if resolved not in PROVIDER_ERROR_CATEGORIES:
             raise ValueError(f"Unknown provider error category {resolved!r}.")
+        if timeout_reason is not None and timeout_reason not in TIMEOUT_REASONS:
+            raise ValueError(f"Unknown provider timeout reason {timeout_reason!r}.")
         self.provider = provider
         self.model = model
         self.status_code = status_code
@@ -640,13 +684,19 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
         self.message = message
         self.category: ProviderErrorCategory = resolved
         self.retryable: bool = self.default_retryable if retryable is None else bool(retryable)
+        self.timeout_reason: TimeoutReason | None = timeout_reason
+
+    @property
+    def safe_provider_code(self) -> str | None:
+        """``provider_code`` when it looks like a code (``[A-Za-z0-9_.:-]{1,64}``), else None."""
+        code = self.provider_code
+        return code if isinstance(code, str) and _SAFE_PROVIDER_CODE.match(code) else None
 
     @property
     def safe_message(self) -> str:
         """``"{provider} {category} (HTTP {status}, code {provider_code})"``; no vendor text."""
         status = self.status_code if self.status_code is not None else "n/a"
-        code = self.provider_code
-        shown = code if code is not None and _SAFE_PROVIDER_CODE.match(code) else "n/a"
+        shown = self.safe_provider_code or "n/a"
         return f"{self.provider or 'provider'} {self.category} (HTTP {status}, code {shown})"
 
 
@@ -677,6 +727,7 @@ class ProviderRateLimitError(ProviderError):
         message: str = "",
         category: ProviderErrorCategory | None = None,
         retryable: bool | None = None,
+        timeout_reason: TimeoutReason | None = None,
         retry_after: float | None = None,
     ) -> None:
         self.retry_after = retry_after
@@ -689,6 +740,7 @@ class ProviderRateLimitError(ProviderError):
             message=message,
             category=category,
             retryable=retryable,
+            timeout_reason=timeout_reason,
         )
 
 
@@ -718,7 +770,8 @@ class ModelRefusalError(ProviderError):
     """The model refused to answer.
 
     ``refusal_text`` is an in-process attribute only: it is never persisted,
-    emitted, logged or carried through pickling.
+    emitted, logged or carried through pickling. ``copy.copy`` and
+    ``copy.deepcopy`` go through the same reduce path and drop it too.
     """
 
     default_category = "refusal"
@@ -734,6 +787,7 @@ class ModelRefusalError(ProviderError):
         message: str = "",
         category: ProviderErrorCategory | None = None,
         retryable: bool | None = None,
+        timeout_reason: TimeoutReason | None = None,
         refusal_text: str | None = None,
     ) -> None:
         self.refusal_text = refusal_text
@@ -746,6 +800,7 @@ class ModelRefusalError(ProviderError):
             message=message,
             category=category,
             retryable=retryable,
+            timeout_reason=timeout_reason,
         )
 
 
@@ -780,6 +835,7 @@ class ContextLengthExceededError(ProviderError):
         "error_type",
         "category",
         "retryable",
+        "timeout_reason",
     )
     default_category = "context_length"
 
@@ -794,6 +850,7 @@ class ContextLengthExceededError(ProviderError):
         error_type: str | None = None,
         category: ProviderErrorCategory | None = None,
         retryable: bool | None = None,
+        timeout_reason: TimeoutReason | None = None,
     ) -> None:
         self._set_provider_fields(
             provider=provider,
@@ -804,6 +861,7 @@ class ContextLengthExceededError(ProviderError):
             message=message,
             category=category,
             retryable=retryable,
+            timeout_reason=timeout_reason,
         )
         RuntimeError.__init__(self, message)
 
@@ -921,6 +979,17 @@ class TenantScopeRequiredError(_KwargsReduceMixin, ValueError):
         )
 
 
+class NoteLimitExceededError(_KwargsReduceMixin, ValueError):
+    """``Agent.submit_note`` would exceed ``Limits.max_notes_per_run`` for this run."""
+
+    _init_fields = ("run_id", "limit")
+
+    def __init__(self, run_id: str, *, limit: int) -> None:
+        self.run_id = run_id
+        self.limit = limit
+        super().__init__(f"Run '{run_id}' already has the maximum of {limit} notes.")
+
+
 class GovernanceMismatchError(_KwargsReduceMixin, RuntimeError):
     """A paused run was resumed with governance different from what it started with.
 
@@ -980,6 +1049,7 @@ __all__ = [
     "InvalidImageError",
     "InvalidToolResultError",
     "ModelRefusalError",
+    "NoteLimitExceededError",
     "PROVIDER_ERROR_CATEGORIES",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
@@ -1003,6 +1073,8 @@ __all__ = [
     "SkillMissingError",
     "SkillValidationError",
     "SqliteSchemaSyncError",
+    "TIMEOUT_REASONS",
     "TenantScopeRequiredError",
+    "TimeoutReason",
     "UnsupportedModalityError",
 ]

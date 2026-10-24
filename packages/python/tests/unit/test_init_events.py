@@ -120,8 +120,9 @@ class TestGovernanceEventTypeEnum:
         """The seven v2 skill events replace the original three; +3 before_tool events;
         +1 inbox.delivered; +1 budget.unpriced; +6 image events (0.4.0): image.rejected,
         image.state, image.view_changed, image.degraded, image.warning,
-        guardrail.image_unscanned."""
-        assert len(GovernanceEventType) == 31
+        guardrail.image_unscanned; +2 in 0.5.0: guardrail.restore_skipped,
+        governance.changed."""
+        assert len(GovernanceEventType) == 33
 
     def test_guardrail_unmapped_placeholder_member(self) -> None:
         assert (

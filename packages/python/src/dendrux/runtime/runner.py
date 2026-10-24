@@ -1871,6 +1871,8 @@ async def _idempotent_hit_after_image_error(
     else:
         return existing
     conflict = IdempotencyConflictError(run_id=existing_id, idempotency_key=idempotency_key)
+    if existing_id is None:  # the existing run is not disclosed (another tenant)
+        raise conflict
     record = await store.get_run(existing_id)
     stored = _stored_parts((record.input_data or {}).get(PARTS_KEY)) if record else None
     if stored is None or len(stored) != len(items):
