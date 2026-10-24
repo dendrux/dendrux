@@ -96,11 +96,16 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          pytest tests/ -v -rs -n auto --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80 | tee pytest.log
+          pytest tests/ -v -rs -n auto --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80 | tee pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
           fi
+
+      # Coverage is the same on every leg, so one leg judges it.
+      - name: CRAP ratchet
+        if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        run: python tools/crap_ratchet.py check --coverage coverage.json
 
       - name: Build and smoke-test distributions
         run: python scripts/mcp_distribution_smoke.py
