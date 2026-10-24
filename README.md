@@ -22,9 +22,25 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.4.1` - core API stabilizing, actively developed.
+> `v0.5.0` - core API stabilizing, actively developed.
+
+<!-- VERIFY-0.5.0: the version banner and the 'What's new in 0.5.0' block are written ahead of the release PR; confirm the version number and the release date when the four version sites are bumped -->
 
 ---
+
+## What's new in 0.5.0
+
+0.5.0 ("Trust") makes Dendrux safe by default for multi-tenant, production use. Read the [upgrade guide](docs/upgrading-to-0.5.0.mdx) before you deploy: run `dendrux db migrate`, then roll your workers (rolling deploys are supported).
+
+- **Tenant-scoped reads.** `make_read_router(..., tenant_resolver=...)` is now required: a dependency that returns the caller's tenant, or `UNSCOPED` for a single-tenant app. Every `RunStore` read takes `tenant_id=`, a run in another tenant looks exactly like a missing one, and idempotency keys are per tenant. Opt into `Agent(strict_tenancy=True)` to make forgetting `tenant_id=` an error. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
+- **Payloads hidden by default.** The read router leaves out provider requests and responses, raw tool data, the system prompt and the PII mapping unless you pass `include_payloads=True`. SSE streams close when a run finishes, share one poller per run and are bounded in number and duration.
+- **No more silent provider failures.** Every failed request is a typed `ProviderError` (`.category`, `.retryable`, `.safe_message`); empty streams, refusals and failed Responses calls end the run `error` with `RunResult.error_info` instead of an empty `success`. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](docs/recipes/handling-provider-errors.mdx).
+- **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
+- **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
+- **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. The default is unchanged. See [PII restore](docs/architecture/pii-restore.mdx).
+- **Run integrity.** Pauses carry a `pause_id` so a stale submit is rejected (`expected_pause_id=`), claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
+- **Secure dashboard.** `dendrux dashboard` needs a token (`DENDRUX_DASHBOARD_TOKEN`) when it listens off loopback.
+- **Migration.** Run `dendrux db migrate` (revision `d7e8f9a0b1c2`). Several defaults flip in 0.6; 0.5 prints a `DeprecationWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
 
 ## What's new in 0.4.1
 
@@ -147,7 +163,7 @@ Runs crash. Processes die. Dendrux handles it.
 
 **Durable persistence**: every trace, tool call, and lifecycle event is written through a durability layer with retry and exponential backoff. Transient DB failures (connection drops, lock timeouts, SQLite busy) are retried automatically. Logical errors propagate immediately. LLM interactions and token usage are persisted best-effort.
 
-**Sweep stale runs**: call `sweep()` at app startup to detect runs that were RUNNING when the process died or WAITING when no one came back. They're marked ERROR with structured failure reasons.
+**Sweep stale runs**: call `sweep()` at app startup (or on a schedule you own) to detect runs that were RUNNING when the process died or WAITING when no one came back. They're marked ERROR with structured failure reasons. Claims are fenced with an epoch, so a worker whose run was taken over stops instead of overwriting the new owner.
 
 ```python
 from dendrux import sweep
@@ -166,7 +182,7 @@ results = await sweep(
 result = await agent.retry("01JR...")
 ```
 
-**Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`.
+**Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`. Keys are unique per tenant.
 
 ```python
 result = await agent.run(
@@ -229,7 +245,7 @@ agent = Agent(
 **Budget**: `budget=Budget(max_tokens=N, max_cost_usd=D)` fires governance events at configurable thresholds (50%, 75%, 90%) and when usage reaches a limit, counting delegated child runs. By default (`on_exceed="warn"`) it is advisory and the run continues; `on_exceed="pause"` parks the run for a person to raise the limit and resume, and `"cancel"` ends it. Pause and cancel take effect at the next iteration boundary.
 
 **Guardrails**: `guardrails=[PII(), SecretDetection()]` scans content crossing the LLM boundary. Three actions:
-- `redact` - PII replaced with `<<EMAIL_ADDRESS_1>>` placeholders. Tools receive real values (deanonymized). Run-scoped mapping persisted for audit.
+- `redact` - PII replaced with `<<EMAIL_ADDRESS_1>>` placeholders. Tools receive real values (deanonymized); with `PII(restore="allowlisted")` only tools marked `@tool(receives_pii=...)` do. Run-scoped mapping persisted for audit.
 - `block` - run terminates immediately. The LLM never sees the content.
 - `warn` - findings logged, content unchanged. Shadow rollout before promoting to redact.
 
@@ -344,7 +360,14 @@ class ResultsBody(BaseModel):
     results: list[ResultItem]
 
 store = RunStore.from_database_url(db_url)
-app.include_router(make_read_router(store=store, authorize=require_user), prefix="/api")
+
+async def tenant_of(user=Depends(require_user)) -> str:
+    return user.org_id          # the caller's tenant; single-tenant apps pass UNSCOPED instead
+
+app.include_router(
+    make_read_router(store=store, authorize=require_user, tenant_resolver=tenant_of),  # or UNSCOPED
+    prefix="/api",
+)
 
 @app.post("/runs/{run_id}/tool-results")
 async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
@@ -354,7 +377,7 @@ async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
         ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
         for r in body.results
     ]
-    return await agent.submit_tool_results(run_id, results)
+    return await agent.submit_tool_results(run_id, results, tenant_id=user.org_id)
 ```
 
 Pause/resume orchestration, CAS-safe claim, and SSE transport are Dendrux's job. Auth, schema, error shape, and framework choice are yours.
@@ -419,7 +442,7 @@ from dendrux.llm.openai_responses import OpenAIResponsesProvider
 provider = OpenAIResponsesProvider(model="gpt-4o", builtin_tools=["web_search_preview"])
 ```
 
-All providers accept `max_tokens`, `temperature`, `timeout`, and `max_retries` at construction or per-call.
+All providers accept `max_tokens`, `temperature`, `max_retries`, and the deadlines `call_timeout` and `stream_idle_timeout` (default 600 s each) at construction or per-call.
 
 > **Note:** Reasoning models (o-series, GPT-5) with multi-turn tool calling have a [known limitation](packages/python/src/dendrux/llm/openai_responses.py). Reasoning items are not preserved between turns. Use OpenAIProvider (Chat Completions) for reasoning model tool loops.
 
@@ -438,9 +461,9 @@ agent = Agent(
 )
 ```
 
-Postgres supported via Alembic migrations: `dendrux db migrate`
+Postgres supported via Alembic migrations: `dendrux db migrate` (check with `dendrux db check`).
 
-Set `DENDRUX_DATABASE_URL` once to skip passing `database_url` to every agent.
+In a server, create one state store at startup and pass `state_store=` to every agent; do not pass `database_url=` per request. Falling back to the `DENDRUX_DATABASE_URL` environment variable is deprecated in 0.5.0 (the CLI still reads it).
 
 Omit `database_url` entirely for ephemeral runs. No persistence, no overhead.
 
@@ -456,6 +479,8 @@ dendrux traces <run_id> --tools # with tool call details
 dendrux db migrate              # run Alembic migrations (Postgres)
 dendrux dashboard               # launch web dashboard at :8001
 ```
+
+The dashboard opens without a token on loopback only; on any other address set `DENDRUX_DASHBOARD_TOKEN`.
 
 The dashboard shows runs, timelines, tool calls, token usage, delegation trees, and LLM payloads. All data is read-only. Traces and tool calls are rendered raw; when a PII guardrail is active, `agent_runs.pii_mapping` carries the bijection the LLM saw and can be applied at render time to produce an LLM-eye view.
 
@@ -504,22 +529,22 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 | Metric | Value |
 |--------|-------|
-| Source code | 17,600+ lines |
-| Test code | 25,200+ lines |
-| Test functions | 1,225 |
-| Test-to-source ratio | 1.43 : 1 |
+| Source code | 55,000+ lines |
+| Test code | 90,000+ lines |
+| Test cases | 6,100+ (about 5,400 run on SQLite alone; the rest need Postgres) |
+| Test-to-source ratio | 1.6 : 1 |
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
 | CI checks | lint, format, types, tests |
-| Alembic migrations | 10 |
-| Examples | 17 runnable scripts + 4 HTTP demos |
+| Alembic migrations | 16 |
+| Examples | 34 runnable scripts + 6 example apps |
 | Development started | March 11, 2026 |
 
 ---
 
 ## Status
 
-Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore`, and `make_read_router` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore`, and `make_read_router` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
@@ -538,11 +563,13 @@ Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Age
 | Client-side tool pause/resume | Stabilizing |
 | Public HTTP surface (`make_read_router`, `RunStore`) | Stabilizing |
 
-Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 1,225 tests, strict types, Apache 2.0.
+Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 6,100+ tests, strict types, Apache 2.0.
+
+<!-- VERIFY-0.5.0: refresh the counts in The Numbers (lines of code, test cases, migrations, examples) from the release candidate -->
 
 ## What Dendrux Is Not
 
-Dendrux is not a hosted platform, a task queue, or a deployment tool. You own your server, your auth, your infra. Dendrux gives you `agent.run()` and gets out of the way.
+Dendrux is not a hosted platform, a task queue, or a deployment tool. You own your server, your auth, your infra. Dendrux gives you `agent.run()` and gets out of the way. It provides developer-called recovery primitives (sweep, heartbeat, fencing) but never runs background workers or schedules them.
 
 ## License
 
