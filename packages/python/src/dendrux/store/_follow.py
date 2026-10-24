@@ -35,7 +35,7 @@ from dendrux.errors import RunNotFoundError
 from dendrux.runtime.state import _check_scope
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
 
     from dendrux.runtime.state import TenantScope
     from dendrux.store import RunStore, StoredEvent
@@ -92,12 +92,55 @@ class FollowEnd:
 FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa: UP007
 
 
-def redact_event(
-    event: StoredEvent, *, include_payloads: bool = False, active_pause: bool = False
-) -> StoredEvent:
-    """The event as a reader without payload access may see it (B2).
+# Pauses whose arguments are shown to a human as the model sent them.
+_PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
 
-    With ``include_payloads=True`` the event is returned unchanged. Otherwise:
+
+def to_placeholders(value: Any, pii_mapping: Mapping[str, str] | None) -> Any:
+    """``value`` with every real value of ``pii_mapping`` put back as its placeholder.
+
+    ``pii_mapping`` is the run's ``{placeholder: real value}`` map. The
+    runtime de-anonymises tool arguments before an approval pause; this
+    restores the form the model sent (``<<EMAIL_ADDRESS_1>>``). Longer values
+    are replaced first. Dicts and lists are walked; other values are kept.
+    """
+    if not pii_mapping:
+        return value
+    pairs = sorted(
+        ((real, ph) for ph, real in pii_mapping.items() if isinstance(real, str) and real),
+        key=lambda p: len(p[0]),
+        reverse=True,
+    )
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, str):
+            for real, ph in pairs:
+                v = v.replace(real, ph)
+            return v
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+
+    return walk(value)
+
+
+def redact_event(
+    event: StoredEvent,
+    *,
+    include_payloads: bool = False,
+    active_pause: bool = False,
+    pii_mapping: Mapping[str, str] | None = None,
+) -> StoredEvent:
+    """The event as a reader may see it (B2 and the approval-arguments rule).
+
+    In every mode, the arguments of an **approval or input** ``run.paused``
+    are shown in placeholder form, as the model sent them, using the run's
+    ``pii_mapping`` (``RunStore.get_pii_mapping``): a human approving a call
+    never sees de-anonymised values. Client-tool pauses keep the 0.4.1 form.
+
+    With ``include_payloads=True`` nothing else changes. Otherwise:
 
     - the system prompt (``run.started``), provider request and response
       bodies and any ``pii_mapping`` are removed from ``data``;
@@ -109,9 +152,18 @@ def redact_event(
     Tool results and server-tool arguments never appear in event data; read
     them with ``RunStore.get_tool_invocations`` (trusted readers only).
     """
-    if include_payloads or not event.data:
+    if not event.data:
         return event
-    data = {k: v for k, v in event.data.items() if k not in _HIDDEN_EVENT_KEYS}
+    data = dict(event.data)
+    if (
+        event.event_type == "run.paused"
+        and data.get("status") in _PLACEHOLDER_PAUSES
+        and isinstance(data.get("pending_tool_calls"), list)
+    ):
+        data["pending_tool_calls"] = to_placeholders(data["pending_tool_calls"], pii_mapping)
+    if include_payloads:
+        return dataclasses.replace(event, data=data) if data != event.data else event
+    data = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}
     if (
         event.event_type == "run.paused"
         and not active_pause
@@ -400,6 +452,7 @@ class Follow:
         self._holds_slot = False
         self._closed = False
         self._active_pause_seq: int | None = None
+        self._pii_mapping: dict[str, str] | None = None
         self._gen: AsyncIterator[FollowItem] | None = None
         self.drained_terminal = False
         """True after :meth:`start` when the run is terminal and nothing is left
@@ -464,11 +517,20 @@ class Follow:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
-    def _view(self, event: StoredEvent, *, live: bool) -> StoredEvent:
+    async def _view(self, event: StoredEvent, *, live: bool) -> StoredEvent:
         active = event.event_type == "run.paused" and (
             live or event.sequence_index == self._active_pause_seq
         )
-        return redact_event(event, include_payloads=self._include_payloads, active_pause=active)
+        status = (event.data or {}).get("status")
+        if event.event_type == "run.paused" and status in _PLACEHOLDER_PAUSES:
+            # The mapping grows during a run: read it when an approval is shown.
+            self._pii_mapping = await self._owner.store.get_pii_mapping(self.run_id) or None
+        return redact_event(
+            event,
+            include_payloads=self._include_payloads,
+            active_pause=active,
+            pii_mapping=self._pii_mapping,
+        )
 
     async def _run(self) -> AsyncIterator[FollowItem]:
         owner = self._owner
@@ -495,7 +557,7 @@ class Follow:
                         if ev.sequence_index > head:
                             passed_head = True
                             break
-                        yield self._view(ev, live=False)
+                        yield await self._view(ev, live=False)
                         cursor = ev.sequence_index
                     if len(batch) < owner.batch or cursor is None or cursor >= head:
                         break
@@ -504,7 +566,7 @@ class Follow:
                 while follower.buffer:
                     ev = follower.buffer.popleft()
                     if cursor is None or ev.sequence_index > cursor:
-                        yield self._view(ev, live=True)
+                        yield await self._view(ev, live=True)
                         cursor = ev.sequence_index
                         last_write = loop.time()
                 if follower.end_reason is not None:

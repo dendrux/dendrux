@@ -57,6 +57,7 @@ from dendrux.store._follow import (
     FollowEnd,
     FollowHeartbeat,
     redact_event,
+    to_placeholders,
     without_params,
 )
 
@@ -66,7 +67,7 @@ if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
     from dendrux.runtime.state import TenantScope
-    from dendrux.store import RunStore, StoredEvent
+    from dendrux.store import PausePair, RunStore, StoredEvent
 
 logger = logging.getLogger(__name__)
 
@@ -308,10 +309,17 @@ def make_read_router(
         # that reset to null after an empty batch would miss future events.
         next_cursor = events[-1].sequence_index if events else after
         active = None
-        if not payloads and any(e.event_type == "run.paused" for e in events):
+        mapping = None
+        if any(e.event_type == "run.paused" for e in events):
             active = await _active_pause_sequence(store, run_id, scope)
+            mapping = await store.get_pii_mapping(run_id, tenant_id=scope)
         items = [
-            redact_event(e, include_payloads=payloads, active_pause=e.sequence_index == active)
+            redact_event(
+                e,
+                include_payloads=payloads,
+                active_pause=e.sequence_index == active,
+                pii_mapping=mapping,
+            )
             for e in events
         ]
         return {"items": items, "next_cursor": next_cursor}
@@ -429,16 +437,10 @@ def make_read_router(
         if await store.get_run(run_id, tenant_id=scope) is None:
             raise _not_found(run_id)
         items = await store.get_pauses(run_id, tenant_id=scope)
-        if not payloads and items:
+        if items:
             active = await _active_pause_sequence(store, run_id, scope)
-            items = [
-                p
-                if p.pause_sequence_index == active and p.resume_sequence_index is None
-                else dataclasses.replace(
-                    p, pending_tool_calls=[without_params(c) for c in p.pending_tool_calls]
-                )
-                for p in items
-            ]
+            mapping = await store.get_pii_mapping(run_id, tenant_id=scope)
+            items = [_pause_view(p, active, mapping, payloads) for p in items]
         return {"items": items}
 
     router.include_router(auth_router)
@@ -459,6 +461,19 @@ async def _active_pause_sequence(store: RunStore, run_id: str, scope: Any) -> in
     if run is None or run.status not in PAUSE_STATUSES:
         return None
     return await store._latest_pause_sequence(run_id)
+
+
+def _pause_view(
+    pause: PausePair, active: int | None, mapping: dict[str, str], payloads: bool
+) -> PausePair:
+    """Approval/input pauses show placeholder-form args; past pauses hide them by default."""
+    calls = pause.pending_tool_calls
+    if pause.reason in ("waiting_approval", "waiting_human_input"):
+        calls = to_placeholders(calls, mapping)
+    is_active = pause.pause_sequence_index == active and pause.resume_sequence_index is None
+    if not payloads and not is_active:
+        calls = [without_params(c) for c in calls]
+    return dataclasses.replace(pause, pending_tool_calls=calls)
 
 
 def _make_feed(store: RunStore, max_followers: int) -> EventFeed:

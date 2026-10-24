@@ -209,6 +209,7 @@ class PauseSummary:
     pause: dict[str, Any]
     last_step: dict[str, Any] | None = None
     paused_event_sequence: int | None = None
+    pii_mapping: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -2050,18 +2051,22 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         else:
             parts = [AgentRun.pause_data]
         stmt = _apply_tenant_scope(
-            select(AgentRun.status, paused_seq, *parts).where(AgentRun.id == run_id), tenant_id
+            select(AgentRun.status, paused_seq, AgentRun.pii_mapping, *parts).where(
+                AgentRun.id == run_id
+            ),
+            tenant_id,
         )
         async with self._session_factory() as session:
             row = (await session.execute(stmt)).first()
         if row is None:
             return None
-        status, seq, *values = row
+        status, seq, mapping, *values = row
+        mapping = dict(mapping) if isinstance(mapping, dict) else None
         if dialect not in ("postgresql", "sqlite"):
             data = dict(values[0] or {})
             steps = data.get("steps") or []
             pause = {k: data[k] for k in PAUSE_SUMMARY_KEYS if k in data}
-            return PauseSummary(str(status), pause, steps[-1] if steps else None, seq)
+            return PauseSummary(str(status), pause, steps[-1] if steps else None, seq, mapping)
         if dialect == "sqlite":
             # json_extract returns arrays/objects as JSON text and scalars as values.
             keys = (*PAUSE_SUMMARY_KEYS, "steps")
@@ -2075,7 +2080,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             k: v for k, v in zip(PAUSE_SUMMARY_KEYS, decoded[:-1], strict=True) if v is not None
         }
         last = decoded[-1]
-        return PauseSummary(str(status), pause, last if isinstance(last, dict) else None, seq)
+        last_step = last if isinstance(last, dict) else None
+        return PauseSummary(str(status), pause, last_step, seq, mapping)
 
     async def get_pii_mapping(
         self, run_id: str, *, tenant_id: TenantScope = UNSCOPED

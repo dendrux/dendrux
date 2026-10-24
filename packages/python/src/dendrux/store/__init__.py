@@ -68,6 +68,7 @@ from dendrux.store._follow import (
     FollowHeartbeat,
     FollowItem,
     redact_event,
+    to_placeholders,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
 
@@ -331,11 +332,13 @@ _KIND_BY_STATUS: dict[str, PendingKind] = {
 class PendingToolCall:
     """One call the active pause waits on: a client tool to run, or a call to approve.
 
-    ``params`` are the arguments in the form the 0.4.1 ``run.paused`` event
-    and ``RunResult.meta["pause_state"]`` carry them, which is the form a
-    client tool receives: after guardrail de-anonymisation, so with
-    ``PII(restore="all")`` (the default) they hold real values, not
-    ``<<TYPE_N>>`` placeholders. ``target`` is ``"client"`` or ``"server"``.
+    ``params``: for a **client-tool** pause, the arguments in the form the
+    0.4.1 ``run.paused`` event and ``RunResult.meta["pause_state"]`` carry
+    them, which is the form the client tool receives: after guardrail
+    de-anonymisation, so with ``PII(restore="all")`` (the default) they hold
+    real values. For an **approval** pause, the placeholder form the model
+    sent (``<<EMAIL_ADDRESS_1>>``), never de-anonymised values: that is what a
+    human approves. ``target`` is ``"client"`` or ``"server"``.
     ``approval`` is ``{"source": "static" | "hook", "reason": ...}`` for a
     call waiting for approval, else None.
     """
@@ -922,6 +925,7 @@ class RunStore:
             if summary is None:
                 raise RunNotFoundError(run_id)
             status, pause, last_step = summary.status, summary.pause, summary.last_step
+            mapping = summary.pii_mapping
         else:  # custom store: scope by lookup, then the full pause state
             record = await self._scoped_run(run_id, tenant_id)
             if record is None:
@@ -931,9 +935,15 @@ class RunStore:
             pause = dict(full)
             steps = full.get("steps") or []
             last_step = steps[-1] if steps else None
+            mapping = await self._state.get_pii_mapping(run_id)
         kind = _KIND_BY_STATUS.get(status)
         if kind is None:
             return None
+        if kind in ("approval", "input"):
+            pause = {
+                **pause,
+                "pending_tool_calls": to_placeholders(pause.get("pending_tool_calls"), mapping),
+            }
         return _pending_from(run_id, status, kind, pause, last_step)
 
     def follow(
@@ -1301,4 +1311,5 @@ __all__ = [
     "TraceEntry",
     "UNSCOPED",
     "redact_event",
+    "to_placeholders",
 ]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import warnings
 from typing import Any
 
@@ -103,6 +104,44 @@ class TestRedactEvent:
         kept = redact_event(ev, active_pause=True).data["pending_tool_calls"][0]
         assert kept["params"] == {"s": 1}
         assert ev.data == _PAUSED  # the input is not mutated
+
+
+class TestApprovalPlaceholders:
+    def test_approval_args_are_put_back_in_placeholder_form(self) -> None:
+        from dendrux.store import to_placeholders
+
+        mapping = {"<<EMAIL_ADDRESS_1>>": "bob@example.com", "<<PERSON_1>>": "Bob"}
+        args = {"to": "bob@example.com", "cc": ["Bob <bob@example.com>"], "n": 3}
+        assert to_placeholders(args, mapping) == {
+            "to": "<<EMAIL_ADDRESS_1>>",
+            "cc": ["<<PERSON_1>> <<<EMAIL_ADDRESS_1>>>"],
+            "n": 3,
+        }
+        assert to_placeholders(args, None) is args
+
+    def test_redact_event_shows_approval_args_as_placeholders_in_every_mode(self) -> None:
+        mapping = {"<<EMAIL_ADDRESS_1>>": "bob@example.com"}
+        ev = StoredEvent(
+            sequence_index=3,
+            iteration_index=0,
+            event_type="run.paused",
+            correlation_id=None,
+            data={
+                "status": "waiting_approval",
+                "pending_tool_calls": [
+                    {"id": "c", "name": "send", "params": {"to": "bob@example.com"}}
+                ],
+            },
+            created_at=None,
+        )
+        for payloads in (False, True):
+            shown = redact_event(
+                ev, include_payloads=payloads, active_pause=True, pii_mapping=mapping
+            )
+            assert shown.data["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
+        client = dataclasses.replace(ev, data={**ev.data, "status": "waiting_client_tool"})
+        kept = redact_event(client, active_pause=True, pii_mapping=mapping)
+        assert kept.data["pending_tool_calls"][0]["params"] == {"to": "bob@example.com"}  # 0.4.1
 
 
 class TestScope:

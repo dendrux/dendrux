@@ -274,3 +274,81 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore) -> Non
         )
         assert items[-1] == FollowEnd("terminal", n_events - 1)
     assert feed.watched_runs == 0 and feed.followers == 0
+
+
+# ---------------------------------------------------------------------------
+# Approval arguments are shown as the model sent them (placeholders), never
+# de-anonymised, on every read path; the approved tool still gets real values.
+# ---------------------------------------------------------------------------
+
+
+async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store: RunStore) -> None:
+    from dendrux import Agent, tool
+    from dendrux.guardrails import PII
+    from dendrux.llm.mock import MockLLM
+    from dendrux.types import LLMResponse, ToolCall
+
+    received: list[str] = []
+
+    @tool()
+    async def send_mail(to: str) -> str:
+        received.append(to)
+        return "sent"
+
+    llm = MockLLM(
+        [
+            LLMResponse(
+                tool_calls=[ToolCall(name="send_mail", params={"to": "<<EMAIL_ADDRESS_1>>"})]
+            ),
+            LLMResponse(text="done"),
+        ]
+    )
+    agent = Agent(
+        provider=llm,
+        prompt="p",
+        tools=[send_mail],
+        require_approval=["send_mail"],
+        guardrails=[PII()],
+        state_store=store,
+    )
+    real = "bob@example.com"
+    paused = await agent.run(f"mail {real} please", tenant_id="acme")
+    run_id = paused.run_id
+    assert paused.status.value == "waiting_approval"
+    # The stored pause holds the de-anonymised value (that is what will execute).
+    assert (await store.get_pause_state(run_id))["pending_tool_calls"][0]["params"]["to"] == real
+
+    pending = await run_store.get_pending(run_id, tenant_id="acme")
+    assert pending is not None
+    assert pending.tool_calls[0].params == {"to": "<<EMAIL_ADDRESS_1>>"}
+    assert real not in json.dumps(pending.to_dict())
+
+    for include_payloads in (False, True):
+        app = FastAPI()
+        app.include_router(
+            make_read_router(
+                store=run_store,
+                authorize=_allow,
+                tenant_resolver=lambda: "acme",
+                include_payloads=include_payloads,
+            )
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as http:
+            events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
+            data = next(e for e in events if e["event_type"] == "run.paused")["data"]
+            assert data["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
+            assert real not in json.dumps(events)
+            pauses = (await http.get(f"/runs/{run_id}/pauses")).json()["items"]
+            assert pauses[-1]["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
+            assert real not in json.dumps(pauses)
+
+    follow = run_store.follow(run_id, tenant_id="acme", max_duration_s=0.5)
+    async with follow as f:
+        items = [item async for item in f]
+    shown = [i for i in items if isinstance(i, StoredEvent)]
+    assert any(i.event_type == "run.paused" for i in shown)
+    assert real not in json.dumps([i.data for i in shown])
+
+    result = await agent.submit_approval(run_id, approved=True, tenant_id="acme")
+    assert result.status.value == "success"
+    assert received == [real]  # the approved tool still receives the real value
