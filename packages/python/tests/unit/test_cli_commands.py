@@ -312,3 +312,143 @@ class TestDashboardCommand:
             return codes
 
         assert asyncio.run(probe()) == [200, 200, 403]
+
+
+class TestNoSecretsInTracebacks:
+    """An exception that escapes must not print the token or the database URL."""
+
+    TOKEN = "SECRET-TOKEN-XYZ"
+
+    @staticmethod
+    def _run_escaping(monkeypatch: pytest.MonkeyPatch, *, show_locals: bool | None) -> None:
+        import sys
+
+        import dendrux.dashboard.security as security
+        from dendrux.cli import main as cli_main
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise ValueError("kaboom")
+
+        monkeypatch.setattr(security, "resolve_token", boom)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["dendrux", "dashboard", "--token", TestNoSecretsInTracebacks.TOKEN],
+        )
+        if show_locals is not None:
+            monkeypatch.setattr(cli_main.app, "pretty_exceptions_show_locals", show_locals)
+        # Typer installs sys.excepthook and lets the exception escape; the
+        # interpreter then calls the hook. Emulate that here.
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+        try:
+            cli_main.app()
+        except ValueError:
+            sys.excepthook(*sys.exc_info())
+
+    def test_root_app_never_shows_locals(self) -> None:
+        assert app.pretty_exceptions_show_locals is False
+        from dendrux.cli.runs import app as runs_app
+
+        assert runs_app.pretty_exceptions_show_locals is False
+
+    def test_escaped_exception_does_not_print_the_token(
+        self, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        self._run_escaping(monkeypatch, show_locals=None)
+        out, err = capfd.readouterr()
+        assert "kaboom" in out + err
+        assert self.TOKEN not in out + err
+
+    def test_the_check_would_catch_locals_being_shown(
+        self, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        """Control: with locals on, the same crash does print the token."""
+        self._run_escaping(monkeypatch, show_locals=True)
+        out, err = capfd.readouterr()
+        assert self.TOKEN in out + err
+
+    def test_server_failure_is_reported_without_traceback_or_secrets(
+        self, fake_uvicorn: type[_FakeServer], seeded_db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def failing_serve(self: Any) -> None:
+            raise OSError(f"cannot bind postgresql://u:{PASSWORD}@h/db")
+
+        monkeypatch.setattr(_FakeServer, "serve", failing_serve)
+        result = runner.invoke(app, ["dashboard", "--token", self.TOKEN])
+        assert result.exit_code == 1
+        out = _plain(result.output)
+        assert "Dashboard stopped" in out
+        assert "OSError" in out
+        assert self.TOKEN not in out
+        assert PASSWORD not in out
+        assert "Traceback" not in out
+
+
+class TestDashboardBannerAndWarnings:
+    def test_ipv6_host_is_bracketed_in_the_url(
+        self, fake_uvicorn: type[_FakeServer], seeded_db: str
+    ) -> None:
+        result = runner.invoke(app, ["dashboard", "--host", "::1", "--port", "9124"])
+        assert result.exit_code == 0, result.output
+        assert "http://[::1]:9124" in _plain(result.output)
+
+    def test_star_allowed_host_warns(self, fake_uvicorn: type[_FakeServer], seeded_db: str) -> None:
+        out = _plain(runner.invoke(app, ["dashboard", "--allowed-host", "*"]).output)
+        assert "turns the Host check off" in out
+
+    def test_named_allowed_host_does_not_warn(
+        self, fake_uvicorn: type[_FakeServer], seeded_db: str
+    ) -> None:
+        out = _plain(runner.invoke(app, ["dashboard", "--allowed-host", "dash.example"]).output)
+        assert "Host check off" not in out
+
+
+class TestTraceLimitNotices:
+    """The overflow probe must work at the store's own maximum, not just below it."""
+
+    @staticmethod
+    def _seed(url: str, traces: int, tool_calls: int) -> None:
+        from dendrux.db.session import get_engine, reset_engine
+        from dendrux.runtime.state import SQLAlchemyStateStore
+
+        async def seed() -> None:
+            engine = await get_engine(url)
+            store = SQLAlchemyStateStore(engine)
+            await store.create_run("big", "A")
+            for i in range(traces):
+                await store.save_trace("big", "assistant", f"t{i}", order_index=i)
+            for i in range(tool_calls):
+                await store.save_tool_call(
+                    "big",
+                    tool_call_id=f"tc{i}",
+                    provider_tool_call_id=None,
+                    tool_name="tool",
+                    target="server",
+                    params=None,
+                    result_payload='"ok"',
+                    success=True,
+                    duration_ms=1,
+                    iteration_index=0,
+                )
+            await reset_engine()
+
+        asyncio.run(seed())
+
+    def test_notice_when_one_more_row_exists_exactly_at_the_limit(self, seeded_db: str) -> None:
+        self._seed(seeded_db, traces=4, tool_calls=4)
+        out = _plain(runner.invoke(app, ["traces", "big", "--tools", "--limit", "3"]).output)
+        assert "more traces not shown" in out
+        assert "more tool calls not shown" in out
+
+    def test_no_notice_when_exactly_the_limit_exists(self, seeded_db: str) -> None:
+        self._seed(seeded_db, traces=3, tool_calls=3)
+        out = _plain(runner.invoke(app, ["traces", "big", "--tools", "--limit", "3"]).output)
+        assert "not shown" not in out
+
+    def test_notice_at_the_store_maximum(self, seeded_db: str) -> None:
+        from dendrux.cli.traces import MAX_ROWS
+
+        self._seed(seeded_db, traces=MAX_ROWS + 1, tool_calls=MAX_ROWS + 1)
+        out = _plain(runner.invoke(app, ["traces", "big", "--tools", "--limit", "999999"]).output)
+        assert "more traces not shown" in out
+        assert "more tool calls not shown" in out

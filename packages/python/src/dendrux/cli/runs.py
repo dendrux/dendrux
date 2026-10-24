@@ -12,7 +12,12 @@ from rich.table import Table
 
 from dendrux._redact import mask_database_urls_in
 
-app = typer.Typer(name="runs", help="Query agent runs.", invoke_without_command=True)
+app = typer.Typer(
+    name="runs",
+    help="Query agent runs.",
+    invoke_without_command=True,
+    pretty_exceptions_show_locals=False,
+)
 console = Console()
 
 

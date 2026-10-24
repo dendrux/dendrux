@@ -66,9 +66,12 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
         )
 
         # Fetch and display traces
-        traces = await store.get_traces(run_id, limit=limit + 1)
-        more_traces = len(traces) > limit
-        traces = traces[:limit]
+        traces = await store.get_traces(run_id, limit=limit)
+        # Probe one row past the page in a separate read: the store clamps
+        # ``limit`` to 1000, so asking for limit + 1 cannot detect overflow at the maximum.
+        more_traces = len(traces) == limit and bool(
+            await store.get_traces(run_id, limit=1, offset=limit)
+        )
         if not traces:
             console.print("[dim]No traces recorded.[/dim]")
         else:
@@ -94,9 +97,10 @@ async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> 
 
         # Optionally show tool calls
         if show_tool_calls:
-            records = await store.get_tool_calls(run_id, limit=limit + 1)
-            more_calls = len(records) > limit
-            records = records[:limit]
+            records = await store.get_tool_calls(run_id, limit=limit)
+            more_calls = len(records) == limit and bool(
+                await store.get_tool_calls(run_id, limit=1, offset=limit)
+            )
             if not records:
                 console.print("[dim]No tool calls recorded.[/dim]")
             else:

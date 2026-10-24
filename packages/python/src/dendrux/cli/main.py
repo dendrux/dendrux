@@ -20,6 +20,9 @@ app = typer.Typer(
     name="dendrux",
     help="Dendrux — The runtime for agents that act in the real world.",
     no_args_is_help=True,
+    # Older Typer versions print frame locals in tracebacks, which would put the
+    # dashboard token and the unmasked database URL on stderr.
+    pretty_exceptions_show_locals=False,
 )
 console = Console()
 
@@ -149,6 +152,12 @@ def dashboard(
         )
         raise typer.Exit(1)
 
+    if any(h.strip() == "*" for h in allowed_host or []):
+        console.print(
+            "[yellow]Warning:[/yellow] --allowed-host '*' turns the Host check off, which "
+            "removes the DNS-rebinding protection."
+        )
+
     try:
         from dendrux.dashboard.security import normalize_origins
 
@@ -181,10 +190,12 @@ def dashboard(
 
             resolved = db_url or get_database_url()
             shown_host = "localhost" if host in {"0.0.0.0", "::", ""} else host
+            if ":" in shown_host and not shown_host.startswith("["):
+                shown_host = f"[{shown_host}]"
             url = f"http://{shown_host}:{port}"
-            console.print(
-                f"[bold green]Dendrux Dashboard[/bold green] running at [link={url}]{url}[/link]"
-            )
+            # A bracketed IPv6 host cannot sit inside rich's [link=...] tag.
+            shown_url = escape(url) if "[" in url else f"[link={url}]{url}[/link]"
+            console.print(f"[bold green]Dendrux Dashboard[/bold green] running at {shown_url}")
             console.print(f"[dim]Database: {escape(mask_database_url(resolved))}[/dim]")
             if resolved_token is not None:
                 console.print(
@@ -205,6 +216,15 @@ def dashboard(
             config = uvicorn.Config(api, host=host, port=port, log_level="warning")
             server = uvicorn.Server(config)
             await server.serve()
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            # No traceback: its locals would include the token and the database URL.
+            console.print(
+                f"[red]Dashboard stopped:[/red] {type(exc).__name__}: "
+                f"{escape(mask_database_urls_in(str(exc)))}"
+            )
+            raise typer.Exit(1) from None
         finally:
             await reset_engine()
 
