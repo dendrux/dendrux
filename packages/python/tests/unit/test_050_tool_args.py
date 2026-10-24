@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, TypedDict
 
 import pytest
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from dendrux.agent import Agent
 from dendrux.llm.mock import MockLLM
@@ -468,7 +468,7 @@ class TestNormalisedArguments:
         assert row_call.params == normalised and row_result.success
         assert SEEN[0][1][2] == 2 and type(SEEN[0][1][2]) is int
 
-    async def test_approval_pause_and_event_carry_normalised_arguments(self) -> None:
+    async def test_approval_event_shows_sent_args_and_the_pause_the_normalised_ones(self) -> None:
         rec = Recorder()
         params = {"when": "2026-10-24T10:00:00+00:00", "color": "blue", "count": 7.0}
         tc = ToolCall(name="schedule", params=params)
@@ -479,8 +479,9 @@ class TestNormalisedArguments:
         normalised = {"when": "2026-10-24T10:00:00Z", "color": "blue", "count": 7}
         [pending] = result.meta["pause_state"].pending_tool_calls
         assert pending.params == normalised
+        # Approvers see the call exactly as the model sent it (spec §5.4 amendment).
         [event] = rec.events("approval.requested")
-        assert event["params"] == normalised
+        assert event["params"] == params
         assert SEEN == []
 
         # What was approved is exactly what runs.
@@ -855,3 +856,113 @@ class TestFixRound:
         assert pending.params == sent
         assert json.dumps(pending.params) == json.dumps(sent)
         assert get_args_spec(client_pick) is None
+
+
+# ------------------------------------------------------------------
+# Fix round 2: the approval view is the model-sent arguments, verbatim
+# ------------------------------------------------------------------
+
+
+class FullName(BaseModel):
+    """A validator that splits one value into new fields."""
+
+    full: str = ""
+    first: str = ""
+    last: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def split(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("full") and not data.get("first"):
+            first, _, last = str(data["full"]).partition(" ")
+            return {"first": first, "last": last}
+        return data
+
+
+@tool()
+async def greet(name: FullName) -> str:
+    """Greet."""
+    SEEN.append(("greet", name))
+    return "hi"
+
+
+@tool()
+async def tag(labels: dict[str, int]) -> str:
+    """Tag."""
+    SEEN.append(("tag", labels))
+    return "ok"
+
+
+ROUND2 = {
+    "<<PERSON_1>>": "Alice Smith",
+    "<<EMAIL_1>>": "alice@example.com",
+    "<<PHONE_1>>": PHONE,
+}
+
+
+def _assert_no_real_value(*objects: Any) -> None:
+    text = json.dumps(objects, default=str).casefold()
+    for real in ("alice smith", "alice@example.com", PHONE, '"alice"', '"smith"'):
+        assert real not in text, real
+
+
+class TestApprovalViewIsVerbatim:
+    @pytest.mark.parametrize(
+        ("tools", "call"),
+        [
+            # a validator that splits a restored value into new fields
+            ([greet], ToolCall(name="greet", params={"name": {"full": "<<PERSON_1>>"}})),
+            # a restored value used as a dict key
+            ([tag], ToolCall(name="tag", params={"labels": {"<<EMAIL_1>>": 1}})),
+            # a phone string coerced to int
+            ([lookup], ToolCall(name="lookup", params={"acc": {"number": "<<PHONE_1>>"}})),
+            # several coercion shapes at once
+            (
+                [notify],
+                ToolCall(
+                    name="notify",
+                    params={
+                        "contact": {"email": "<<EMAIL_1>>"},
+                        "numbers": ["<<PHONE_1>>"],
+                        "score": {"value": "1.5"},
+                    },
+                ),
+            ),
+        ],
+    )
+    async def test_no_restored_value_reaches_the_approval_event(
+        self, tools: list[Any], call: ToolCall
+    ) -> None:
+        engine = _Engine(ROUND2, restore=True)
+        name = call.name
+        outcome, rec = await _process(
+            [call], engine, tools=tools, require_approval=frozenset({name})
+        )
+        assert outcome.pending_approval
+        [event] = rec.events("approval.requested")
+        assert event["params"] == call.params  # verbatim, placeholder form
+        _assert_no_real_value(event, rec.governance)
+        # The pending call carries the real, coerced values for execution
+        # (stored execution state, hidden by default under B2).
+        [pending] = outcome.pending_calls
+        assert pending.params != call.params
+
+    async def test_split_fields_still_run_with_real_values(self) -> None:
+        engine = _Engine(ROUND2, restore=True)
+        call = ToolCall(name="greet", params={"name": {"full": "<<PERSON_1>>"}})
+        outcome, _ = await _process([call], engine, tools=[greet])
+        assert not outcome.pending_approval
+        [(_, (name))] = SEEN
+        assert (name.first, name.last) == ("Alice", "Smith")
+
+    def test_defence_in_depth_redacts_real_values_in_keys_and_values(self) -> None:
+        from dendrux.tools._mask import approval_view
+
+        sent = {"to": "Alice@Example.com", "map": {"alice@example.com": 5}, "n": int(PHONE)}
+        view = approval_view(sent, ROUND2)
+        assert view == {
+            "to": "<<REDACTED>>",
+            "map": {"<<REDACTED>>": 5},
+            "n": "<<REDACTED>>",
+        }
+        assert approval_view({"to": "<<EMAIL_1>>"}, ROUND2) == {"to": "<<EMAIL_1>>"}

@@ -224,7 +224,8 @@ async def test_approved_call_runs_with_objects_built_from_the_approved_json(stor
         for e in await store.get_run_events(paused.run_id)
         if e.event_type == "approval.requested"
     ]
-    assert [d["params"] for d in requested] == [{"order": {"id": 7}}]
+    # The approval view is the call as the model sent it.
+    assert [d["params"] for d in requested] == [{"order": {"id": 7.0}}]
 
     result = await agent.submit_approval(paused.run_id, approved=True)
 

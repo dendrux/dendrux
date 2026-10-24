@@ -78,7 +78,7 @@ from dendrux.tools._limits import (
     size_limit_payload,
 )
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
-from dendrux.tools._mask import placeholder_mapping, placeholder_view
+from dendrux.tools._mask import approval_view, placeholder_mapping
 from dendrux.tools._pool import (
     CallTracker,
     ToolCallLimiter,
@@ -752,7 +752,8 @@ async def _process_tool_calls(
         if guardrail_engine is not None
         else {}
     )
-    # The arguments as the model sent them (placeholder form), per call id.
+    # The arguments as the model sent them (placeholder form, pre-restore and
+    # pre-coercion), per call id: the only form approval views ever show.
     sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in non_denied}
     if guardrail_engine is not None:
 
@@ -861,10 +862,11 @@ async def _process_tool_calls(
                 if gate["source"] == "hook":
                     approval_data["reason"] = gate["reason"] or "requires_approval"
                     approval_data["source"] = "hook"
-                # What is being approved, in placeholder form: never a restored
-                # value, whatever form coercion gave it.
-                approval_data["params"] = placeholder_view(
-                    tc.params, sent_params.get(tc.id, _NO_SENT_PARAMS), pii_mapping
+                # What is being approved: the call as the model sent it
+                # (placeholder form, pre-coercion). Coercion is deterministic
+                # from these arguments, and no restored value can appear.
+                approval_data["params"] = approval_view(
+                    sent_params.get(tc.id, _NO_SENT_PARAMS), pii_mapping
                 )
                 await _record_governance(
                     recorder,
