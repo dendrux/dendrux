@@ -1679,11 +1679,27 @@ def _strip_041_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
     return row, None
 
 
+def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Remove the 0.5.0 ``agent_runs.claim_epoch`` fencing column after checking it.
+
+    It is ``NOT NULL DEFAULT 0`` (C1) and counts claims, so it is a
+    non-negative integer rather than NULL on a text-only run.
+    """
+    if table != "agent_runs" or "claim_epoch" not in row:
+        return row, None
+    row = dict(row)
+    epoch = row.pop("claim_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        return row, f"agent_runs.claim_epoch: expected a non-negative int, got {epoch!r}"
+    return row, None
+
+
 def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None:
     """None when identical. New nullable columns in ``actual`` must be NULL (R-02/P-06).
 
-    The 0.4.1 stop-reason keys are validated and then ignored (see
-    :func:`_strip_041_additions`).
+    The 0.4.1 stop-reason keys and the 0.5.0 ``claim_epoch`` column are
+    validated and then ignored (see :func:`_strip_041_additions` and
+    :func:`_strip_050_additions`).
     """
     for table in ROW_TABLES:
         exp_rows, act_rows = expected[table], actual[table]
@@ -1691,6 +1707,9 @@ def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None
             return f"{table}: {len(exp_rows)} rows expected, {len(act_rows)} found"
         for i, (e, raw) in enumerate(zip(exp_rows, act_rows, strict=True)):
             a, problem = _strip_041_additions(table, raw)
+            if problem:
+                return f"{table}[{i}]: {problem}"
+            a, problem = _strip_050_additions(table, a)
             if problem:
                 return f"{table}[{i}]: {problem}"
             for col in e:

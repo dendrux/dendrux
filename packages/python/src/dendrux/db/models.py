@@ -38,6 +38,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -135,6 +136,13 @@ class AgentRun(Base):
     # when the runner persists any pause, on every claim, and on finalize.
     pause_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
+    )
+    # Fencing epoch: every claim increments it, and status writes check it, so
+    # a worker that lost its claim cannot finalize the run. A server default
+    # lets the SQLite sync add it to existing files and lets 0.4.1 writers
+    # insert rows during a rolling deploy.
+    claim_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
     )
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)

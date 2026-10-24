@@ -30,7 +30,7 @@ from dendrux.runtime.state import SQLAlchemyStateStore
 pytestmark = pytest.mark.asyncio
 
 PRIOR = "a4b5c6d7e8f9"
-HEAD = "c6d7e8f9a0b1"  # 0.4.0 image blobs sit on top of run control
+HEAD = "d7e8f9a0b1c2"  # 0.4.0 image blobs and 0.5.0 R1 sit on top of run control
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 
@@ -208,6 +208,7 @@ async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
             await conn.execute(text("DROP TABLE dendrux_blobs"))
             await conn.execute(text("DROP TABLE run_inbox"))
             await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN pause_requested"))
+            await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN claim_epoch"))  # 0.5.0 R1
             await _seed_prior_rows(conn)
         await asyncio.to_thread(_alembic, url, "stamp", PRIOR)
 

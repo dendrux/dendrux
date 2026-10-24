@@ -29,7 +29,7 @@ from dendrux.store import RunStore
 from tests.unit.test_blob_catalog import make_png, store_png
 
 PRIOR = "b5c6d7e8f9a0"
-HEAD = "c6d7e8f9a0b1"
+HEAD = "d7e8f9a0b1c2"  # 0.5.0 R1 sits on top of the image blobs
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 
@@ -199,6 +199,8 @@ async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(text("DROP TABLE dendrux_blob_refs"))
             await conn.execute(text("DROP TABLE dendrux_blobs"))
+            # 0.5.0 R1 sits above the image blobs.
+            await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN claim_epoch"))
             await _seed(conn)
         async with engine.connect() as conn:
             before = await _snapshot(conn)
