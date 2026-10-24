@@ -30,7 +30,13 @@ from typing import TYPE_CHECKING, Any
 from dendrux.types import GovernanceEventType as _GovType
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from datetime import datetime
+
+# Upper bound on rows read per source (events, traces, tool calls) for one
+# timeline, so a pathological run cannot exhaust memory. A larger run renders
+# its first MAX_TIMELINE_ROWS rows and is flagged ``truncated``.
+MAX_TIMELINE_ROWS = 10_000
 
 # ------------------------------------------------------------------
 # Timeline node types
@@ -248,11 +254,31 @@ class NormalizedTimeline:
     system_prompt: str | None = None
     # Traces keyed by iteration for payload inspection
     messages_by_iteration: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    # True when a source hit MAX_TIMELINE_ROWS and the timeline shows a prefix.
+    truncated: bool = False
 
 
 # ------------------------------------------------------------------
 # Normalizer
 # ------------------------------------------------------------------
+
+_STORE_PAGE = 1000  # the StateStore clamps ``limit`` to 1000
+
+
+async def _read_capped(fetch: Callable[[list[Any], int], Awaitable[list[Any]]]) -> list[Any]:
+    """Read pages until the source is drained or MAX_TIMELINE_ROWS + 1 rows are held.
+
+    The extra row lets the caller tell "exactly at the cap" from "over it".
+    ``fetch(rows_so_far, n)`` returns the next page of at most ``n`` rows.
+    """
+    rows: list[Any] = []
+    while len(rows) <= MAX_TIMELINE_ROWS:
+        want = min(_STORE_PAGE, MAX_TIMELINE_ROWS + 1 - len(rows))
+        page = await fetch(rows, want)
+        rows.extend(page)
+        if len(page) < want:
+            break
+    return rows
 
 
 def _utc_iso(ts: datetime | None) -> str | None:
@@ -313,9 +339,23 @@ async def normalize_timeline(
     )
 
     # 2. Load all data sources
-    events = await state_store.get_run_events(run_id)
-    traces = await state_store.get_traces(run_id)
-    tool_calls = await state_store.get_tool_calls(run_id)
+    events = await _read_capped(
+        lambda rows, n: state_store.get_run_events(
+            run_id,
+            after_sequence_index=rows[-1].sequence_index if rows else None,
+            limit=n,
+        )
+    )
+    traces = await _read_capped(
+        lambda rows, n: state_store.get_traces(run_id, limit=n, offset=len(rows))
+    )
+    tool_calls = await _read_capped(
+        lambda rows, n: state_store.get_tool_calls(run_id, limit=n, offset=len(rows))
+    )
+    truncated = any(len(rows) > MAX_TIMELINE_ROWS for rows in (events, traces, tool_calls))
+    events = events[:MAX_TIMELINE_ROWS]
+    traces = traces[:MAX_TIMELINE_ROWS]
+    tool_calls = tool_calls[:MAX_TIMELINE_ROWS]
 
     # 3. Build lookup indexes for enrichment
     # Tool calls by tool_call_id (correlation_id on tool.completed events)
@@ -505,6 +545,7 @@ async def normalize_timeline(
         nodes=nodes,
         system_prompt=system_prompt,
         messages_by_iteration=messages_by_iteration,
+        truncated=truncated,
     )
 
 
@@ -520,6 +561,7 @@ def timeline_to_dict(timeline: NormalizedTimeline) -> dict[str, Any]:
         "nodes": [_node_to_dict(n) for n in timeline.nodes],
         "system_prompt": timeline.system_prompt,
         "messages_by_iteration": {str(k): v for k, v in timeline.messages_by_iteration.items()},
+        "truncated": timeline.truncated,
     }
 
 

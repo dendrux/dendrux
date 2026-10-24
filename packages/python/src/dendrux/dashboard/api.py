@@ -8,6 +8,10 @@ render time to produce an LLM-eye view.
 
 Never exposes ``pause_data`` — that column is execution state,
 cleared on finalize, and out of scope for public readers.
+
+Closed by default (see ``dendrux.dashboard.security``): Host check, no CORS
+unless origins are listed, bearer token required beyond loopback. Every list
+endpoint is paged with a hard maximum.
 """
 
 from __future__ import annotations
@@ -15,15 +19,30 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from dendrux.dashboard.normalizer import normalize_timeline, timeline_to_dict
+from dendrux.dashboard.security import (
+    ANY_HOST,
+    DashboardGuard,
+    is_loopback_host,
+    normalize_origins,
+)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
+# Page-size bounds. Every list endpoint returns at most ``*_MAX`` rows; a
+# caller asking for more is clamped, never refused.
+RUNS_MAX_LIMIT = 200
+RUNS_MAX_OFFSET = 10_000
+DRILLDOWN_DEFAULT_LIMIT = 200
+DRILLDOWN_MAX_LIMIT = 500  # the store clamps to 1000; keep room for the has_more probe
+LLM_CALLS_MAX_LIMIT = 200  # rows carry raw provider payloads
+
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import datetime
 
     from dendrux.runtime.state import DelegationInfo, StateStore
@@ -45,7 +64,9 @@ async def _count_pauses_per_run(state_store: StateStore, run_ids: list[str]) -> 
         return counts
     result: dict[str, int] = {}
     for rid in run_ids:
-        events = await state_store.get_run_events(rid, event_types=["run.paused"])
+        events = await state_store.get_run_events(
+            rid, event_types=["run.paused"], limit=DRILLDOWN_MAX_LIMIT
+        )
         count = len(events)
         if count:
             result[rid] = count
@@ -120,51 +141,75 @@ def _delegation_to_dict(info: DelegationInfo) -> dict[str, Any]:
     }
 
 
+def _page_bounds(limit: int, offset: int, *, max_limit: int) -> tuple[int, int]:
+    return min(max(1, limit), max_limit), min(max(0, offset), RUNS_MAX_OFFSET)
+
+
+def _page_info(limit: int, offset: int, has_more: bool) -> dict[str, Any]:
+    return {
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": offset + limit if has_more else None,
+    }
+
+
 def create_dashboard_api(
     state_store: StateStore,
     auth_token: str | None = None,
+    *,
+    bind_host: str = "127.0.0.1",
+    allowed_hosts: Sequence[str] = (),
+    allow_origins: Sequence[str] = (),
 ) -> FastAPI:
     """Create the read-only dashboard API.
 
     Args:
         state_store: The same StateStore used by the runtime.
             Reads from the same DB — no separate connection needed.
-        auth_token: Optional Bearer token for API access. When set,
-            all API requests must include ``Authorization: Bearer <token>``.
-            Static files (HTML/CSS/JS) are served without auth.
+        auth_token: Bearer token for API access. When set, every ``/api/``
+            request must carry ``Authorization: Bearer <token>``. Static
+            files (HTML/CSS/JS) are served without auth. Required when
+            ``bind_host`` is not loopback.
+        bind_host: The interface the server listens on. A non-loopback value
+            without a token raises ``ValueError``; the host is also added to
+            the accepted ``Host`` names.
+        allowed_hosts: Extra ``Host`` names to accept besides loopback names,
+            IP literals and ``bind_host`` (``["*"]`` turns the check off, for
+            embedding behind a gateway that validates it).
+        allow_origins: Browser origins allowed to call the API cross-origin
+            (``https://host[:port]``). Empty by default: no CORS headers.
     """
-    app = FastAPI(title="Dendrux Dashboard API", version="0.1.0a1")
+    if not is_loopback_host(bind_host) and not auth_token:
+        raise ValueError(
+            "The dashboard serves run payloads; set a token "
+            "(DENDRUX_DASHBOARD_TOKEN) when binding to a non-loopback address."
+        )
+    origins = normalize_origins(allow_origins)
+    hosts = [*allowed_hosts]
+    if bind_host and bind_host not in {"0.0.0.0", "::", ANY_HOST}:
+        hosts.append(bind_host)
 
-    # Allow dashboard frontend (served on same or different port) to call the API
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET"],
-        allow_headers=["*", "Authorization"],
+    # Interactive docs and the schema are not needed by the React app.
+    app = FastAPI(
+        title="Dendrux Dashboard API",
+        version="0.1.0a1",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
-    if auth_token is not None:
-        import hmac
-
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import JSONResponse
-
-        _expected = f"Bearer {auth_token}"
-
-        class _AuthMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
-                # Static files and CORS preflight served without auth
-                if not request.url.path.startswith("/api/") or request.method == "OPTIONS":
-                    return await call_next(request)
-                header = request.headers.get("authorization", "")
-                if not hmac.compare_digest(header, _expected):
-                    return JSONResponse(
-                        status_code=401,
-                        content={"detail": "Invalid or missing auth token."},
-                    )
-                return await call_next(request)
-
-        app.add_middleware(_AuthMiddleware)
+    # Added innermost first: token check, then CORS (so a 401 still carries the
+    # CORS headers the browser needs to read it), then the Host check.
+    app.add_middleware(DashboardGuard, allowed_hosts=[ANY_HOST], token=auth_token or None)
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_methods=["GET"],
+            allow_headers=["Authorization"],
+        )
+    app.add_middleware(DashboardGuard, allowed_hosts=hosts, token=None)
 
     @app.get("/api/runs")
     async def list_runs(
@@ -180,20 +225,22 @@ def create_dashboard_api(
         surface that powers the public ``RunStore``. Pause counts are
         rolled up in a single aggregation query (no N+1).
         """
-        capped_limit = min(max(1, limit), 200)
-        clamped_offset = max(0, offset)
+        capped_limit, clamped_offset = _page_bounds(limit, offset, max_limit=RUNS_MAX_LIMIT)
 
+        # No ``?tenant=`` means every tenant: leave the argument out (the
+        # store's default is the all-tenants scope) rather than passing None.
+        scope: dict[str, Any] = {} if tenant is None else {"tenant_id": tenant}
         runs = await state_store.list_runs(
             limit=capped_limit,
             offset=clamped_offset,
             status=status,
-            tenant_id=tenant,
             agent_name=agent,
+            **scope,
         )
         total_filtered = await state_store.count_runs(
             status=status,
-            tenant_id=tenant,
             agent_name=agent,
+            **scope,
         )
 
         # Batch aggregation on the default SQLAlchemy backend; falls back
@@ -245,13 +292,24 @@ def create_dashboard_api(
         return result
 
     @app.get("/api/runs/{run_id}/events")
-    async def get_run_events(run_id: str) -> dict[str, Any]:
-        """Get raw run events (for debugging)."""
-        events = await state_store.get_run_events(run_id)
-        if not events:
+    async def get_run_events(
+        run_id: str,
+        limit: int = DRILLDOWN_DEFAULT_LIMIT,
+        after: int | None = None,
+    ) -> dict[str, Any]:
+        """Get raw run events (for debugging), one bounded page at a time.
+
+        ``after`` is a ``sequence_index`` cursor: pass the previous
+        ``next_after`` to read the next page.
+        """
+        page = min(max(1, limit), DRILLDOWN_MAX_LIMIT)
+        rows = await state_store.get_run_events(run_id, after_sequence_index=after, limit=page + 1)
+        if not rows:
             run = await state_store.get_run(run_id)
             if run is None:
                 raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+        has_more = len(rows) > page
+        events = rows[:page]
 
         return {
             "events": [
@@ -265,17 +323,26 @@ def create_dashboard_api(
                     "created_at": _utc_iso(e.created_at),
                 }
                 for e in events
-            ]
+            ],
+            "limit": page,
+            "has_more": has_more,
+            "next_after": events[-1].sequence_index if has_more else None,
         }
 
     @app.get("/api/runs/{run_id}/traces")
-    async def get_run_traces(run_id: str) -> dict[str, Any]:
-        """Get conversation traces for payload inspection."""
+    async def get_run_traces(
+        run_id: str,
+        limit: int = DRILLDOWN_DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Get conversation traces for payload inspection (one bounded page)."""
+        page, skip = _page_bounds(limit, offset, max_limit=DRILLDOWN_MAX_LIMIT)
         run = await state_store.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
 
-        traces = await state_store.get_traces(run_id)
+        rows = await state_store.get_traces(run_id, limit=page + 1, offset=skip)
+        traces = rows[:page]
         return {
             "traces": [
                 {
@@ -287,17 +354,24 @@ def create_dashboard_api(
                     "created_at": _utc_iso(t.created_at),
                 }
                 for t in traces
-            ]
+            ],
+            **_page_info(page, skip, len(rows) > page),
         }
 
     @app.get("/api/runs/{run_id}/tool-calls")
-    async def get_run_tool_calls(run_id: str) -> dict[str, Any]:
-        """Get tool call records for a run."""
+    async def get_run_tool_calls(
+        run_id: str,
+        limit: int = DRILLDOWN_DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Get tool call records for a run (one bounded page)."""
+        page, skip = _page_bounds(limit, offset, max_limit=DRILLDOWN_MAX_LIMIT)
         run = await state_store.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
 
-        tool_calls = await state_store.get_tool_calls(run_id)
+        rows = await state_store.get_tool_calls(run_id, limit=page + 1, offset=skip)
+        tool_calls = rows[:page]
         return {
             "tool_calls": [
                 {
@@ -314,17 +388,24 @@ def create_dashboard_api(
                     "created_at": _utc_iso(tc.created_at),
                 }
                 for tc in tool_calls
-            ]
+            ],
+            **_page_info(page, skip, len(rows) > page),
         }
 
     @app.get("/api/runs/{run_id}/llm-calls")
-    async def get_run_llm_calls(run_id: str) -> dict[str, Any]:
-        """Get LLM interaction records for payload inspection."""
+    async def get_run_llm_calls(
+        run_id: str,
+        limit: int = LLM_CALLS_MAX_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Get LLM interaction records for payload inspection (one bounded page)."""
+        page, skip = _page_bounds(limit, offset, max_limit=LLM_CALLS_MAX_LIMIT)
         run = await state_store.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
 
-        interactions = await state_store.get_llm_interactions(run_id)
+        rows = await state_store.get_llm_interactions(run_id, limit=page + 1, offset=skip)
+        interactions = rows[:page]
         return {
             "llm_calls": [
                 {
@@ -345,7 +426,8 @@ def create_dashboard_api(
                     "created_at": _utc_iso(i.created_at),
                 }
                 for i in interactions
-            ]
+            ],
+            **_page_info(page, skip, len(rows) > page),
         }
 
     @app.get("/api/health")

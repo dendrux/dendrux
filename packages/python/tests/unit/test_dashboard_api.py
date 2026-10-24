@@ -354,7 +354,7 @@ class TestHealthEndpoint:
         store = DashboardMockStore()
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/health")
             assert resp.status_code == 200
             assert resp.json() == {"status": "ok"}
@@ -365,7 +365,7 @@ class TestListRuns:
         store = DashboardMockStore()
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs")
             assert resp.status_code == 200
             assert resp.json()["runs"] == []
@@ -386,7 +386,7 @@ class TestListRuns:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs")
             data = resp.json()
             assert len(data["runs"]) == 1
@@ -410,7 +410,7 @@ class TestListRuns:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs")
             assert resp.json()["runs"][0]["pause_count"] == 2
 
@@ -430,7 +430,7 @@ class TestListRuns:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs")
             runs = resp.json()["runs"]
 
@@ -451,7 +451,7 @@ class TestListRuns:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs?status=error")
             assert len(resp.json()["runs"]) == 1
             assert resp.json()["runs"][0]["run_id"] == "r2"
@@ -469,7 +469,7 @@ class TestListRuns:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs?agent=AgentA")
             data = resp.json()
             assert data["total"] == 3
@@ -508,7 +508,7 @@ class TestRunDetail:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1")
             assert resp.status_code == 200
             data = resp.json()
@@ -522,7 +522,7 @@ class TestRunDetail:
         store = DashboardMockStore()
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/nonexistent")
             assert resp.status_code == 404
 
@@ -545,7 +545,7 @@ class TestRunEvents:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1/events")
             assert resp.status_code == 200
             assert len(resp.json()["events"]) == 1
@@ -565,7 +565,7 @@ class TestRunTraces:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1/traces")
             assert resp.status_code == 200
             assert len(resp.json()["traces"]) == 2
@@ -574,7 +574,7 @@ class TestRunTraces:
         store = DashboardMockStore()
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/nonexistent/traces")
             assert resp.status_code == 404
 
@@ -600,7 +600,7 @@ class TestRunToolCalls:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1/tool-calls")
             assert resp.status_code == 200
             tc = resp.json()["tool_calls"][0]
@@ -638,7 +638,7 @@ class TestLLMCallsEndpoint:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1/llm-calls")
             assert resp.status_code == 200
             calls = resp.json()["llm_calls"]
@@ -652,7 +652,7 @@ class TestLLMCallsEndpoint:
         store = DashboardMockStore()
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/nonexistent/llm-calls")
             assert resp.status_code == 404
 
@@ -660,7 +660,7 @@ class TestLLMCallsEndpoint:
         store = DashboardMockStore(_runs=[_Run(id="r1", agent_name="Agent")])
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1/llm-calls")
             assert resp.status_code == 200
             assert resp.json()["llm_calls"] == []
@@ -706,7 +706,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/r1")
             assert resp.status_code == 200
             d = resp.json()["delegation"]
@@ -781,7 +781,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             # Check parent (root) detail
             resp = await client.get("/api/runs/root")
             d = resp.json()["delegation"]
@@ -847,7 +847,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/orphan")
             d = resp.json()["delegation"]
             # Parent is unresolved
@@ -938,7 +938,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             # Root sees full tree
             resp = await client.get("/api/runs/root")
             ss = resp.json()["delegation"]["subtree_summary"]
@@ -1025,7 +1025,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/root")
             ss = resp.json()["delegation"]["subtree_summary"]
             assert ss["direct_child_count"] == 3
@@ -1063,7 +1063,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/a")
             d = resp.json()["delegation"]
             # Cycle detected — ancestry is incomplete
@@ -1124,7 +1124,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/root")
             ss = resp.json()["delegation"]["subtree_summary"]
             # Cost only includes root (0.01) + c2 (0.03) = 0.04
@@ -1166,7 +1166,7 @@ class TestDelegationBlock:
         )
         app = create_dashboard_api(store)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs/root")
             ss = resp.json()["delegation"]["subtree_summary"]
             assert ss["subtree_cost_usd"] is None
@@ -1186,7 +1186,7 @@ class TestDashboardAuth:
         store = DashboardMockStore()
         app = create_dashboard_api(store, auth_token=None)  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs")
             assert resp.status_code == 200
 
@@ -1195,7 +1195,7 @@ class TestDashboardAuth:
         store = DashboardMockStore()
         app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
         transport = ASGITransport(app=app, raise_app_exceptions=False)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/api/runs")
             assert resp.status_code == 401
             assert "auth token" in resp.json()["detail"].lower()
@@ -1205,7 +1205,7 @@ class TestDashboardAuth:
         store = DashboardMockStore()
         app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
         transport = ASGITransport(app=app, raise_app_exceptions=False)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get(
                 "/api/runs",
                 headers={"Authorization": "Bearer wrong"},
@@ -1217,7 +1217,7 @@ class TestDashboardAuth:
         store = DashboardMockStore()
         app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get(
                 "/api/runs",
                 headers={"Authorization": "Bearer secret123"},
@@ -1229,6 +1229,6 @@ class TestDashboardAuth:
         store = DashboardMockStore()
         app = create_dashboard_api(store, auth_token="secret123")  # type: ignore[arg-type]
         transport = ASGITransport(app=app, raise_app_exceptions=False)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with AsyncClient(transport=transport, base_url="http://localhost") as client:
             resp = await client.get("/")
             assert resp.status_code == 200
