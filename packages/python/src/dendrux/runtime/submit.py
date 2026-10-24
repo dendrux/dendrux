@@ -1047,7 +1047,7 @@ def warn_missing_pause_id(
 
 
 def _client_json_payload(payload: str) -> str:
-    """JSON form for storage and transforms, without changing the model's text."""
+    """JSON form for caps and transform input, without changing model text."""
     import json
 
     try:
@@ -1081,7 +1081,6 @@ async def prepare_client_results(
     import json
 
     from dendrux.loops.react import _apply_result_transform
-    from dendrux.tools import cap_tool_result
 
     validate_result_names(run_id, pause, results, json_payload=False)
     try:
@@ -1105,17 +1104,23 @@ async def prepare_client_results(
             )
         if result.success and agent.tool_result_transform is not None:
             try:
+                normalized = _client_json_payload(result.payload)
                 value = await _apply_result_transform(
                     agent.tool_result_transform,
                     pending[result.call_id],
                     lookups,
-                    json.loads(
-                        _client_json_payload(result.payload), parse_constant=_invalid_json_constant
-                    ),
+                    json.loads(normalized, parse_constant=_invalid_json_constant),
                 )
-                result = replace(result, payload=json.dumps(value, allow_nan=False))
+                # A string returned for legacy plain text is already model text.
+                # JSON inputs and structured outputs retain JSON serialization.
+                payload = (
+                    value
+                    if normalized != result.payload and isinstance(value, str)
+                    else json.dumps(value, allow_nan=False)
+                )
+                result = replace(result, payload=payload)
             except Exception as exc:
                 raise _invalid_tool_result(run_id, "client tool result transform failed") from exc
-            result = cap_tool_result(result, agent._limits.max_tool_result_bytes)
+            result = _cap_client_result(result, agent._limits.max_tool_result_bytes)
         prepared.append(result)
     return prepared

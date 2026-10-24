@@ -8,6 +8,7 @@ import pytest
 
 from dendrux import Limits
 from dendrux.runtime import runner
+from dendrux.store import RunStore
 from dendrux.types import LLMResponse, RunStatus
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_050_t7_integrity import agent, consume, result_for
@@ -97,11 +98,13 @@ async def test_client_payload_reaches_model_byte_for_byte_as_041(store, entry, p
     message = next(m for m in llm.messages[-1] if m.role.value == "tool")
     assert message.content.encode("utf-8") == payload.encode("utf-8")
     stored = (await store.get_tool_calls(paused.run_id))[-1].result
-    assert stored == (payload if payload == "NaN" else _stored_value(payload))
+    (invocation,) = await RunStore(store).get_tool_invocations(paused.run_id, tenant_id=None)
+    expected = {"raw": payload} if payload == "NaN" else _stored_value(payload)
+    assert stored == invocation.result == expected
 
 
 def _stored_value(payload):
     try:
         return json.loads(payload)
     except ValueError:
-        return payload
+        return {"raw": payload}

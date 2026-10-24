@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import math
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -1205,10 +1206,14 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     ) -> None:
         from dendrux.db.models import ToolCallRecord
 
-        # Parse result_payload back to dict for JSON column
+        # Non-JSON text is stored as {"raw": original_payload}, as in 0.4.1.
+        # Any NaN/Infinity or overflowing float anywhere in a result takes
+        # that fallback for the entire payload; quoted strings remain JSON.
         try:
-            result_dict = json.loads(result_payload)
-        except (json.JSONDecodeError, TypeError):
+            result_dict = json.loads(
+                result_payload, parse_constant=_finite_json_float, parse_float=_finite_json_float
+            )
+        except (ValueError, TypeError):
             logger.warning(
                 "Tool call result JSON decode failed — run=%s tool=%s payload_len=%d",
                 run_id,
@@ -3533,6 +3538,14 @@ def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
     if tenant_id is None:
         return stmt.where(AgentRun.tenant_id.is_(None))
     return stmt.where(AgentRun.tenant_id == tenant_id)
+
+
+def _finite_json_float(value: str) -> float:
+    """Reject NaN/Infinity and overflow so tool results stay JSON-column safe."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
 
 
 def _json_value(value: Any) -> Any:
