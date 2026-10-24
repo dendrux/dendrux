@@ -32,6 +32,10 @@ history.append(ChatMessage.user("Hi"))
 history.append(ChatMessage.assistant(result.answer))
 ```
 
+### History is the previous transcript only
+
+`history=` holds the turns **before** this one. The current message goes in `user_input=`. Do not also append it to `history`: the model would read it twice. If you rebuild `history` from your database on every request, build it **before** you save the new message (or leave that row out), and skip assistant turns that failed or are still streaming. A helper that does this is in [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary#the-history-rule).
+
 `ChatMessage` is intentionally narrower than the internal `Message` — only `role` and text (a user turn may also carry images, see [Images](/docs/recipes/images#history-and-follow-up-turns)). Tool calls, call IDs, and runtime metadata are hidden so the dev can't accidentally inject malformed runtime state.
 
 **Storage of the conversation is the dev's job.** Dendrux only reads `history=` as input for the next turn. Persist the chat log in your own table — this preserves the library-not-platform boundary. The chatbot example at `examples/18_chatbot.py` keeps `history` in a Python list; a real app would load it from `messages` in your DB before each turn. For the full picture of which data lives in your DB vs Dendrux's, a minimal app schema, and the per-turn request lifecycle, see [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary).
