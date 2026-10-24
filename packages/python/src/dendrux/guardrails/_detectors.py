@@ -59,8 +59,24 @@ def scan_detectors(text: str, detectors: list[Detector]) -> list[Finding]:
                     text=match.group(),
                 )
             )
-    findings.sort(key=lambda f: f.start)
-    return findings
+    findings.sort(key=lambda f: (f.start, -(f.end - f.start)))
+    return _drop_nested(findings)
+
+
+def _drop_nested(findings: list[Finding]) -> list[Finding]:
+    """Drop a finding wholly inside a longer one of the same entity type.
+
+    Two expressions for one entity (a phone with and without its country
+    code) can both match the same number.
+    """
+    kept: list[Finding] = []
+    covered_to: dict[str, int] = {}
+    for f in findings:
+        if f.end <= covered_to.get(f.entity_type, -1):
+            continue
+        covered_to[f.entity_type] = max(covered_to.get(f.entity_type, -1), f.end)
+        kept.append(f)
+    return kept
 
 
 async def run_scan(

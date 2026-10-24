@@ -40,7 +40,13 @@ _PII_CORPUS: list[tuple[str, set[str]]] = [
     ("Host 192.168.1.1.", {"IP_ADDRESS"}),
     ("Host 10.0.0.255 up", {"IP_ADDRESS"}),
     ("Host 255.255.255.255", {"IP_ADDRESS"}),
+    # a phone followed by an extension or another field keeps its own boundary
+    ("Call +14155552671 12345", {"PHONE_NUMBER"}),
+    ("Call +1-555-123-4567 12345", {"PHONE_NUMBER"}),
+    ("Call +44 20 7946 0958 ext 12", {"PHONE_NUMBER"}),
+    ("Call +1 (555) 123-4567 now", {"PHONE_NUMBER"}),
     # negatives: the false positives this release removes
+    ("id +123456789012345678", set()),
     ("order 1234567890 shipped", set()),
     ("tracking 9400111899223197428490", set()),
     ("timestamp 1699999999999", set()),
@@ -194,6 +200,90 @@ class TestScansLeaveTheLoop:
             pii = PII(engine="presidio")
         except Exception as exc:  # model not installed
             pytest.skip(f"presidio unavailable: {type(exc).__name__}")
-        calls = self._spy(monkeypatch)
+        submitted: list[str] = []
+        executor = pii._scanner._executor  # type: ignore[attr-defined]
+        real_submit = executor.submit
+
+        def spy(fn, /, *args, **kwargs):
+            submitted.append(fn.__name__)
+            return real_submit(fn, *args, **kwargs)
+
+        monkeypatch.setattr(executor, "submit", spy)
         await pii.scan("John Smith lives in Boston.")
-        assert calls == ["_scan_sync"]
+        assert submitted == ["_scan_sync"]
+
+
+class TestPhoneBoundaries:
+    @pytest.mark.parametrize(
+        ("text", "span"),
+        [
+            ("Call +14155552671 12345", "+14155552671"),
+            ("Call +1-555-123-4567 12345", "+1-555-123-4567"),
+            ("Call +44 20 7946 0958 ext 12", "+44 20 7946 0958"),
+            ("Call +1 (555) 123-4567 now", "+1 (555) 123-4567"),
+        ],
+    )
+    async def test_exact_span(self, text: str, span: str) -> None:
+        findings = await PII().scan(text)
+        assert [f.text for f in findings] == [span]
+
+
+class TestPresidioQueueIsBounded:
+    @staticmethod
+    def _scanner(delay: float):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from dendrux.guardrails._pii import _PresidioScanner
+
+        class Analyzer:
+            def analyze(self, text: str, language: str):
+                time.sleep(delay)
+                return []
+
+        scanner = object.__new__(_PresidioScanner)
+        scanner._analyzer = Analyzer()
+        scanner._executor = ThreadPoolExecutor(max_workers=1)
+        scanner._pending = 0
+        scanner._pending_lock = threading.Lock()
+        return scanner
+
+    async def test_excess_scans_are_unscannable_not_queued(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dendrux.guardrails import _pii
+        from dendrux.guardrails._protocol import UNSCANNABLE
+
+        monkeypatch.setattr(_pii, "PRESIDIO_MAX_PENDING", 4)
+        scanner = self._scanner(0.05)
+        results = await asyncio.gather(*(scanner.scan("x") for _ in range(12)))
+        refused = [r for r in results if r and r[0].entity_type == UNSCANNABLE]
+        assert len(refused) == 8
+        assert scanner._pending == 0
+        scanner._executor.shutdown()
+
+    async def test_waiting_scans_do_not_starve_the_default_executor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dendrux.guardrails import _pii
+
+        monkeypatch.setattr(_pii, "PRESIDIO_MAX_PENDING", 30)
+        scanner = self._scanner(0.02)
+        tasks = [asyncio.create_task(scanner.scan("x")) for _ in range(30)]
+        await asyncio.sleep(0.05)
+        start = time.perf_counter()
+        await asyncio.to_thread(lambda: None)
+        assert time.perf_counter() - start < 0.3
+        await asyncio.gather(*tasks)
+        scanner._executor.shutdown()
+
+    async def test_cancelled_waiters_release_their_slot(self) -> None:
+        scanner = self._scanner(0.1)
+        tasks = [asyncio.create_task(scanner.scan("x")) for _ in range(5)]
+        await asyncio.sleep(0.02)
+        for task in tasks[2:]:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.3)
+        assert scanner._pending == 0
+        scanner._executor.shutdown()

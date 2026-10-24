@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -301,6 +303,16 @@ class TestRestoreAllowlisted:
         await _mint(engine)
         assert engine.deanonymize(_PARAMS, tool_def=get_tool_def(exact))["to"] == _EMAIL
 
+    async def test_entity_names_are_case_insensitive(self) -> None:
+        @tool(receives_pii={"email"})
+        async def lower(to: str) -> str:
+            """Lower-case name."""
+            return to
+
+        engine = _engine("allowlisted")
+        await _mint(engine)
+        assert engine.deanonymize(_PARAMS, tool_def=get_tool_def(lower))["to"] == _EMAIL
+
     async def test_prefix_does_not_match_inside_a_word(self) -> None:
         @tool(receives_pii={"PHONE_NUM"})
         async def partial(to: str) -> str:
@@ -420,12 +432,119 @@ class TestToolResultProvenance:
         text, _, _ = await resumed.scan_incoming("and bob@example.com")
         assert "<<EMAIL_ADDRESS_2>>" in text
 
-    async def test_corrupt_provenance_is_ignored(self) -> None:
-        mapping = {"<<EMAIL_ADDRESS_1>>": _EMAIL, engine_mod._ORIGINS_KEY: "not json"}
+    @pytest.mark.parametrize(
+        "origins",
+        [
+            None,
+            "not json",
+            "[1, 2]",
+            '{"<<EMAIL_ADDRESS_1>>": 5}',
+            '{"<<EMAIL_ADDRESS_1>>": []}',
+            '{"<<EMAIL_ADDRESS_9>>": true}',
+            '{"<<EMAIL_ADDRESS_1>>": [1, 2]}',
+        ],
+    )
+    async def test_missing_or_corrupt_provenance_restores_nowhere(
+        self, origins: str | None
+    ) -> None:
+        mapping = {"<<EMAIL_ADDRESS_1>>": _EMAIL}
+        if origins is not None:
+            mapping[engine_mod._ORIGINS_KEY] = origins
         engine = GuardrailEngine([PII(restore="allowlisted")], pii_mapping=mapping)
-        assert engine.deanonymize(
-            {"to": "<<EMAIL_ADDRESS_1>>"}, tool_def=get_tool_def(pii_tool)
-        ) == {"to": _EMAIL}
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        out = engine.restore_params(params, tool_def=get_tool_def(pii_tool))
+        assert out.params == params
+        assert out.skipped == {"EMAIL_ADDRESS": 1}
+
+    async def test_legacy_mapping_is_rebuilt_from_trusted_history(self) -> None:
+        engine = GuardrailEngine(
+            [PII(restore="allowlisted")], pii_mapping={"<<EMAIL_ADDRESS_1>>": _EMAIL}
+        )
+        await engine.scan_incoming_message(Message(Role.USER, f"mail {_EMAIL}"), index=0)
+        out = engine.deanonymize({"to": "<<EMAIL_ADDRESS_1>>"}, tool_def=get_tool_def(pii_tool))
+        assert out == {"to": _EMAIL}
+
+    async def test_legacy_mapping_rescanned_from_a_tool_result_stays_with_that_tool(self) -> None:
+        engine = GuardrailEngine(
+            [PII(restore="allowlisted")], pii_mapping={"<<EMAIL_ADDRESS_1>>": _EMAIL}
+        )
+        await engine.scan_incoming_message(
+            Message(Role.TOOL, f"found {_EMAIL}", name="source", call_id="c1")
+        )
+
+        @tool(receives_pii=True)
+        async def sink(to: str) -> str:
+            """Allowed PII, not the producer."""
+            return to
+
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert engine.deanonymize(params, tool_def=get_tool_def(sink)) == params
+
+    async def test_partial_provenance_only_covers_the_recorded_placeholders(self) -> None:
+        mapping = {
+            "<<EMAIL_ADDRESS_1>>": _EMAIL,
+            "<<EMAIL_ADDRESS_2>>": "bob@example.com",
+            engine_mod._ORIGINS_KEY: '{"<<EMAIL_ADDRESS_1>>": true}',
+        }
+        engine = GuardrailEngine([PII(restore="allowlisted")], pii_mapping=mapping)
+        out = engine.deanonymize(
+            {"a": "<<EMAIL_ADDRESS_1>>", "b": "<<EMAIL_ADDRESS_2>>"},
+            tool_def=get_tool_def(pii_tool),
+        )
+        assert out == {"a": _EMAIL, "b": "<<EMAIL_ADDRESS_2>>"}
+
+    async def test_assistant_text_cannot_erase_a_tool_origin_restriction(self) -> None:
+        engine = await self._engine_with_tool_result()
+        await engine.scan_incoming_message(Message(Role.ASSISTANT, f"it is {_EMAIL}"), index=2)
+
+        @tool(receives_pii=True)
+        async def other_pii_tool(to: str) -> str:
+            """Allowed PII, not the producer."""
+            return to
+
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert engine.deanonymize(params, tool_def=get_tool_def(other_pii_tool)) == params
+        assert engine.deanonymize(params, tool_def=get_tool_def(pii_tool)) == {"to": _EMAIL}
+
+    async def test_model_minted_placeholder_is_restored_nowhere_until_trusted(self) -> None:
+        engine = _engine("allowlisted")
+        await engine.scan_incoming_message(Message(Role.ASSISTANT, f"it is {_EMAIL}"), index=0)
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert engine.deanonymize(params, tool_def=get_tool_def(pii_tool)) == params
+        await engine.scan_incoming_message(Message(Role.USER, f"I am {_EMAIL}"), index=1)
+        assert engine.deanonymize(params, tool_def=get_tool_def(pii_tool)) == {"to": _EMAIL}
+
+    async def test_two_tools_that_produced_the_value_may_both_receive_it(self) -> None:
+        engine = await self._engine_with_tool_result()
+        await engine.scan_incoming_message(
+            Message(Role.TOOL, f"also {_EMAIL}", name="other_pii_tool", call_id="c2")
+        )
+
+        @tool(receives_pii=True)
+        async def other_pii_tool(to: str) -> str:
+            """Second producer."""
+            return to
+
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert engine.deanonymize(params, tool_def=get_tool_def(pii_tool)) == {"to": _EMAIL}
+        assert engine.deanonymize(params, tool_def=get_tool_def(other_pii_tool)) == {"to": _EMAIL}
+
+    async def test_provenance_survives_resume_for_cross_tool_denial_after_assistant_echo(
+        self,
+    ) -> None:
+        engine = await self._engine_with_tool_result()
+        await engine.scan_incoming_message(Message(Role.ASSISTANT, _EMAIL), index=2)
+        resumed = GuardrailEngine(
+            [PII(restore="allowlisted")], pii_mapping=engine.get_pii_mapping()
+        )
+
+        @tool(receives_pii=True)
+        async def other_pii_tool(to: str) -> str:
+            """Allowed PII, not the producer."""
+            return to
+
+        params = {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert resumed.deanonymize(params, tool_def=get_tool_def(other_pii_tool)) == params
 
     async def test_provenance_is_not_tracked_under_all(self) -> None:
         engine = _engine("all")
@@ -602,3 +721,215 @@ class TestIndirectInjectionEndToEnd:
         assert skipped[0]["tool_name"] == "send_report"
         assert skipped[0]["entities"] == {"EMAIL_ADDRESS": 1}
         assert _EMAIL not in str(events)
+
+
+# ---------------------------------------------------------------------------
+# Params walk: keys, numbers and bounded traversal
+# ---------------------------------------------------------------------------
+
+
+class TestParamsWalkIsBounded:
+    async def test_long_key_with_many_items_is_fast(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block"), PII(action="warn")])
+        params = {"k" * 100_000: ["x"] * 2000}
+        start = time.perf_counter()
+        findings, block = await engine.scan_outgoing("ok", [params])
+        assert time.perf_counter() - start < 1.0
+        assert block is None
+        assert findings == []
+
+    async def test_oversize_key_is_unscannable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 1000)
+        engine = GuardrailEngine([PII(action="block")])
+        for params in (
+            {"x" * 2000: "ok"},
+            {"x" * 2000: ["a", "b"]},
+            {"a": {"x" * 2000: {}}},
+            {"a": [{"x" * 2000: 1}]},
+        ):
+            _, block = await engine.scan_outgoing("ok", [params])
+            assert block is not None, params
+            assert UNSCANNABLE in block
+
+    async def test_keys_are_scanned_once_as_leaves(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        _, block = await engine.scan_outgoing("ok", [{_AWS: 1}])
+        assert block is not None
+        assert "AWS_ACCESS_KEY" in block
+        assert _AWS not in block
+
+    async def test_numbers_are_scanned(self) -> None:
+        engine = GuardrailEngine([PII(action="block")])
+        _, block = await engine.scan_outgoing("ok", [{"card": 4111111111111111}])
+        assert block is not None
+        assert "CREDIT_CARD" in block
+
+    async def test_booleans_and_none_are_ignored(self) -> None:
+        engine = GuardrailEngine([PII(action="block")])
+        findings, block = await engine.scan_outgoing("ok", [{"a": True, "b": None, "c": 1.5}])
+        assert (findings, block) == ([], None)
+
+    async def test_number_too_long_to_convert_is_unscannable(self) -> None:
+        engine = GuardrailEngine([PII(action="block")])
+        _, block = await engine.scan_outgoing("ok", [{"n": 10**5000}])
+        assert block is not None
+        assert UNSCANNABLE in block
+
+    async def test_wide_list_is_rejected_without_expanding_it(self) -> None:
+        import tracemalloc
+
+        wide = [0] * 1_000_000
+        tracemalloc.start()
+        try:
+            leaves = engine_mod._collect_leaves({"x": wide})
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert leaves.limit == "node count"
+        assert peak < 3_000_000
+
+    async def test_wide_dict_is_rejected_without_expanding_it(self) -> None:
+        import tracemalloc
+
+        wide = {str(i): 0 for i in range(300_000)}
+        tracemalloc.start()
+        try:
+            leaves = engine_mod._collect_leaves({"x": wide})
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert leaves.limit == "node count"
+        assert peak < 3_000_000
+
+    async def test_over_depth_siblings_are_still_counted(self) -> None:
+        leaves = engine_mod._collect_leaves({"x": [_nested("a", 60)["x"]] * 30_000})
+        assert leaves.limit in ("node count", "nesting depth")
+
+    async def test_scan_cost_with_context_is_bounded_by_the_key_tail(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        _, block = await engine.scan_outgoing(
+            "ok", [{"a" * 5000 + "api_key": "sk_live_" + "ABCDEFGHIJKLMNOPQRSTUVWX1234"}]
+        )
+        assert block is not None
+        assert "GENERIC_API_KEY" in block
+
+
+# ---------------------------------------------------------------------------
+# Redaction: linear, off the loop, bounded mapping
+# ---------------------------------------------------------------------------
+
+
+def _ips(n: int) -> str:
+    return " ".join(f"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}" for i in range(n))
+
+
+class TestRedactionIsBounded:
+    async def test_mebibyte_of_distinct_ips_fails_closed_quickly(self) -> None:
+        text = _ips(88_000)
+        assert len(text) > 1_000_000
+        engine = GuardrailEngine([PII(action="redact")])
+        start = time.perf_counter()
+        _, findings, block = await engine.scan_incoming(text)
+        assert time.perf_counter() - start < 3.0
+        assert block is not None
+        assert UNSCANNABLE in block
+        assert len(engine.get_pii_mapping()) == 0
+
+    async def test_many_distinct_values_below_the_cap_redact_in_linear_time(self) -> None:
+        text = _ips(10_000)
+        engine = GuardrailEngine([PII(action="redact")])
+        start = time.perf_counter()
+        out, findings, block = await engine.scan_incoming(text)
+        assert time.perf_counter() - start < 2.0
+        assert block is None
+        assert len(findings) == 10_000
+        assert "10." not in out
+        assert len(engine.get_pii_mapping()) == 10_000
+
+    async def test_repeated_value_dedupes_to_one_mapping_entry(self) -> None:
+        text = "192.168.1.1 " * 90_000
+        engine = GuardrailEngine([PII(action="redact")])
+        start = time.perf_counter()
+        out, findings, block = await engine.scan_incoming(text)
+        assert time.perf_counter() - start < 3.0
+        assert block is None
+        assert len(findings) == 90_000
+        assert set(out.split()) == {"<<IP_ADDRESS_1>>"}
+        assert engine.get_pii_mapping() == {"<<IP_ADDRESS_1>>": "192.168.1.1"}
+
+    async def test_mapping_cap_blocks_under_redact_and_reports_under_warn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_MAPPING_ENTRIES", 5)
+        text = _ips(6)
+        _, _, block = await GuardrailEngine([PII(action="redact")]).scan_incoming(text)
+        assert block is not None
+        assert UNSCANNABLE in block
+        engine = GuardrailEngine([PII(action="redact"), SecretDetection(action="warn")])
+        _, findings, block = await engine.scan_incoming(_ips(5))
+        assert block is None
+        assert len(engine.get_pii_mapping()) == 5
+
+    async def test_existing_values_do_not_count_against_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_mod, "MAX_MAPPING_ENTRIES", 3)
+        engine = GuardrailEngine([PII(action="redact")])
+        await engine.scan_incoming(_ips(3))
+        _, _, block = await engine.scan_incoming(_ips(3))
+        assert block is None
+
+    async def test_large_redaction_runs_in_a_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        names: list[str] = []
+        real = asyncio.to_thread
+
+        async def spy(fn, /, *args, **kwargs):
+            names.append(getattr(fn, "__name__", "?"))
+            return await real(fn, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", spy)
+        engine = GuardrailEngine([PII(action="redact")])
+        await engine.scan_incoming(_ips(5_000))
+        assert "_apply_redaction" in names
+        names.clear()
+        await engine.scan_incoming("mail alice@example.com")
+        assert "_apply_redaction" not in names
+
+    async def test_placeholders_are_numbered_right_to_left_like_041(self) -> None:
+        engine = GuardrailEngine([PII(action="redact")])
+        text, _, _ = await engine.scan_incoming("a@example.com then b@example.com")
+        assert text == "<<EMAIL_ADDRESS_2>> then <<EMAIL_ADDRESS_1>>"
+
+    async def test_restore_of_many_placeholders_is_linear(self) -> None:
+        engine = GuardrailEngine([PII(action="redact")])
+        await engine.scan_incoming(_ips(5_000))
+        params = {"items": [f"<<IP_ADDRESS_{i}>>" for i in range(1, 2001)]}
+        start = time.perf_counter()
+        out = engine.deanonymize(params)
+        assert time.perf_counter() - start < 1.0
+        assert "<<" not in str(out)
+
+
+class TestGuardrailReportedUnscannable:
+    class _Busy:
+        def __init__(self, action: str) -> None:
+            self.action = action
+
+        async def scan(self, text: str) -> list[Finding]:
+            return [Finding(entity_type=UNSCANNABLE, start=0, end=0, score=1.0, text="")]
+
+    @pytest.mark.parametrize("action", ["block", "redact"])
+    async def test_blocks(self, action: str) -> None:
+        engine = GuardrailEngine([self._Busy(action)])  # type: ignore[list-item]
+        text, findings, block = await engine.scan_incoming("hello")
+        assert block is not None
+        assert UNSCANNABLE in block
+        assert text == "hello"
+        _, out_block = await engine.scan_outgoing("hello", [{"a": "b"}])
+        assert out_block is not None
+
+    async def test_warn_reports_and_continues(self) -> None:
+        engine = GuardrailEngine([self._Busy("warn")])  # type: ignore[list-item]
+        _, findings, block = await engine.scan_incoming("hello")
+        assert block is None
+        assert [f.entity_type for f in findings] == [UNSCANNABLE]

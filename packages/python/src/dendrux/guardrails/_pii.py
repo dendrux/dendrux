@@ -16,8 +16,10 @@ so dashboards/tests see one set of names regardless of backend.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Protocol
 
 from dendrux._sentinel import _UnsetType
@@ -29,12 +31,15 @@ from dendrux.guardrails._detectors import (
     run_scan,
     scan_detectors,
 )
-from dendrux.guardrails._protocol import Finding, Pattern
+from dendrux.guardrails._protocol import UNSCANNABLE, Finding, Pattern
 
 Engine = Literal["regex", "presidio"]
 RestoreMode = Literal["all", "allowlisted"]
 
 _RESTORE_NOT_CHOSEN = _UnsetType()
+
+# Presidio scans in flight (running plus queued) per scanner.
+PRESIDIO_MAX_PENDING = 16
 
 
 # Every expression is bounded so one scan is O(len(text)); see ``_detectors``.
@@ -48,9 +53,17 @@ _DEFAULT_DETECTORS: list[Detector] = [
     ),
     # E.164 (with or without separators), then separator-formatted national
     # numbers, then a bare 10-digit run only right after a phone keyword.
+    # Candidates are delimited by what follows (``(?!\d)``) and by a bounded
+    # group count, so a number followed by an extension or another field is
+    # still found at its own boundary.
     Detector(
         "PHONE_NUMBER",
-        re.compile(r"(?<![\w+])\+\d{1,3}(?:[-.\s]?\(?\d{1,4}\)?){1,5}"),
+        re.compile(r"(?<![\w+])\+[1-9]\d{7,14}(?!\d)"),
+        prefilter="+",
+    ),
+    Detector(
+        "PHONE_NUMBER",
+        re.compile(r"(?<![\w+])\+\d{1,3}(?:[-.\s]?\(\d{1,4}\)|[-.\s]\d{1,4}){2,3}(?!\d)"),
         validate=e164_digit_count,
         prefilter="+",
     ),
@@ -115,8 +128,11 @@ class _PresidioScanner:
             ) from e
 
         self._analyzer = AnalyzerEngine()
-        # The NLP pipeline is not documented as thread-safe: one scan at a time.
-        self._lock = threading.Lock()
+        # The NLP pipeline is not documented as thread-safe: one dedicated worker
+        # runs every scan, so callers wait on the loop, not in shared pool threads.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dendrux-presidio")
+        self._pending = 0
+        self._pending_lock = threading.Lock()
         for p in extra_patterns:
             recognizer = PatternRecognizer(
                 supported_entity=p.name,
@@ -125,8 +141,7 @@ class _PresidioScanner:
             self._analyzer.registry.add_recognizer(recognizer)
 
     def _scan_sync(self, text: str) -> list[Finding]:
-        with self._lock:
-            results = self._analyzer.analyze(text=text, language="en")
+        results = self._analyzer.analyze(text=text, language="en")
         findings = [
             Finding(
                 entity_type=r.entity_type,
@@ -140,9 +155,28 @@ class _PresidioScanner:
         findings.sort(key=lambda f: f.start)
         return findings
 
+    def _release(self, _future: object) -> None:
+        with self._pending_lock:
+            self._pending -= 1
+
     async def scan(self, text: str) -> list[Finding]:
-        # NLP analysis stalls the loop even on small inputs: always off-loop.
-        return await run_scan(self._scan_sync, text, force_thread=True)
+        """Scan on the dedicated worker, with at most ``PRESIDIO_MAX_PENDING`` in flight.
+
+        NLP analysis stalls the loop even on small inputs, so it is always
+        off-loop. When the queue is full the scan is reported ``UNSCANNABLE``
+        (the engine then fails closed) instead of queueing without bound.
+        """
+        with self._pending_lock:
+            if self._pending >= PRESIDIO_MAX_PENDING:
+                return [Finding(entity_type=UNSCANNABLE, start=0, end=0, score=1.0, text="")]
+            self._pending += 1
+        try:
+            future = self._executor.submit(self._scan_sync, text)
+        except BaseException:
+            self._release(None)
+            raise
+        future.add_done_callback(self._release)
+        return await asyncio.wrap_future(future)
 
 
 class PII:

@@ -8,14 +8,16 @@ and testable in isolation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+from dendrux.guardrails._detectors import THREAD_SCAN_THRESHOLD
 from dendrux.guardrails._protocol import UNSCANNABLE, Finding, scans_images, scans_text
 
 if TYPE_CHECKING:
@@ -30,10 +32,16 @@ _MAX_RECURSION_DEPTH = 50
 # Text or params past these limits are not scanned; see ``_unscannable``.
 MAX_SCAN_CHARS = 4 * 1024 * 1024
 _MAX_SCAN_NODES = 10_000
+# Distinct redacted values per run. Past it a redacting scan is unscannable.
+MAX_MAPPING_ENTRIES = 20_000
+# Key text added to a ``key=value`` context scan (enough for ``api_key=...``).
+_KEY_CONTEXT_CHARS = 64
+_MAX_TOOLS_PER_PLACEHOLDER = 16
 _MAX_KINDS_IN_MESSAGE = 10
 _PLACEHOLDER_RE = re.compile(r"<<[A-Z][A-Z_]*_\d+>>")
-# Provenance of placeholders minted from tool results, persisted next to the
-# mapping (``PII(restore="allowlisted")`` only). Never a real placeholder.
+_CANDIDATE_RE = re.compile(r"<<[^<>]{1,128}>>")
+# Provenance of placeholders (``PII(restore="allowlisted")`` only), persisted
+# next to the mapping. Never a real placeholder.
 _ORIGINS_KEY = "__dendrux_origins__"
 RESTORE_SKIPPED_CODE = "pii_restore_skipped"
 
@@ -79,6 +87,30 @@ def _message_location(msg: Message, index: int | None) -> str:
         bits.append(f"tool_call_id={msg.call_id}")
     head = f"message {index}" if index is not None else "message"
     return f"{head} ({', '.join(bits)})"
+
+
+def _has_unscannable(findings: list[Finding]) -> bool:
+    return any(f.entity_type == UNSCANNABLE for f in findings)
+
+
+def _unscannable_outcome(
+    guardrail: Guardrail,
+    all_findings: list[Finding],
+    *,
+    where: str,
+    location: str = "",
+) -> str | None:
+    """Apply one guardrail's action to content it could not scan (fail closed).
+
+    Records a single ``UNSCANNABLE`` finding; returns the block error under
+    ``block`` and ``redact`` (nothing can be redacted in unscanned content),
+    None under ``warn``.
+    """
+    if not _has_unscannable(all_findings):
+        all_findings.append(_unscannable())
+    if guardrail.action in ("block", "redact"):
+        return _block_message(guardrail, [_unscannable()], where=where, location=location)
+    return None
 
 
 def _entity_of(placeholder: str) -> str:
@@ -129,6 +161,28 @@ class RestoreOutcome:
             "count": sum(self.skipped.values()),
             "code": RESTORE_SKIPPED_CODE,
         }
+
+
+@dataclass(frozen=True)
+class Origin:
+    """Where text came from, for ``restore="allowlisted"`` provenance.
+
+    ``trusted``: user, system and developer-supplied context. ``tool``: a tool
+    result (``name`` is the tool). ``model``: assistant output, which never
+    grants trust.
+    """
+
+    kind: Literal["trusted", "tool", "model"]
+    name: str | None = None
+
+
+TRUSTED = Origin("trusted")
+MODEL = Origin("model")
+
+
+def tool_origin(name: str) -> Origin:
+    """Origin of a tool result produced by the tool ``name``."""
+    return Origin("tool", name)
 
 
 class GuardrailEngine:
@@ -183,9 +237,14 @@ class GuardrailEngine:
                 self._counters[entity_type] = max(self._counters.get(entity_type, 0), n + 1)
         # ``restore="allowlisted"`` (any PII guardrail asking for it wins).
         self._allowlisted = any(getattr(g, "restore", "all") == "allowlisted" for g in guardrails)
-        # Placeholders minted from a tool result -> that tool's name. Tracked
-        # only under ``allowlisted``; absent means user/context origin.
-        self._origins: dict[str, str] = _load_origins(origins_raw, self._pii_mapping)
+        # Provenance, tracked only under ``allowlisted``. A placeholder may be
+        # restored into a tool only when it is trusted or that tool produced it;
+        # a placeholder with no record (legacy or corrupt state, or minted from
+        # model output) is restored nowhere until its origin is seen again.
+        self._trusted: set[str] = set()
+        self._tool_origins: dict[str, set[str]] = {}
+        if self._allowlisted:
+            self._load_origins(origins_raw)
         _note_restore_default(self._guardrails)
 
     @property
@@ -200,36 +259,68 @@ class GuardrailEngine:
         return f"<<{entity_type}_{n}>>"
 
     def _get_or_create_placeholder(
-        self, entity_type: str, real_value: str, origin: str | None = None
+        self, entity_type: str, real_value: str, origin: Origin = TRUSTED
     ) -> str:
         """Get existing placeholder for a value, or create a new one.
 
-        ``origin`` is the tool whose result the value came from (None for
-        user, system and assistant text). A value seen in non-tool text is
-        trusted from then on.
+        Under ``allowlisted`` every sighting records where the value came from:
+        trusted text trusts it, a tool result ties it to that tool, and model
+        output records nothing. Records only ever grow.
         """
-        if real_value in self._reverse:
-            placeholder = self._reverse[real_value]
-            if origin is None:
-                self._origins.pop(placeholder, None)
-            return placeholder
-        placeholder = self._next_placeholder(entity_type)
-        self._pii_mapping[placeholder] = real_value
-        self._reverse[real_value] = placeholder
-        if self._allowlisted and origin is not None:
-            self._origins[placeholder] = origin
+        placeholder = self._reverse.get(real_value)
+        if placeholder is None:
+            placeholder = self._next_placeholder(entity_type)
+            self._pii_mapping[placeholder] = real_value
+            self._reverse[real_value] = placeholder
+        if self._allowlisted:
+            self._record_origin(placeholder, origin)
         return placeholder
+
+    def _record_origin(self, placeholder: str, origin: Origin) -> None:
+        if origin.kind == "trusted":
+            self._trusted.add(placeholder)
+        elif origin.kind == "tool" and origin.name:
+            tools = self._tool_origins.setdefault(placeholder, set())
+            if len(tools) < _MAX_TOOLS_PER_PLACEHOLDER:
+                tools.add(origin.name)
+
+    def _load_origins(self, raw: object) -> None:
+        """Read persisted provenance defensively; anything unreadable is dropped.
+
+        Dropping is the restrictive direction: a placeholder without a record
+        is restored nowhere until a trusted or tool message mints it again.
+        """
+        if not isinstance(raw, str):
+            return
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(data, dict):
+            return
+        for placeholder, value in data.items():
+            if not isinstance(placeholder, str) or placeholder not in self._pii_mapping:
+                continue
+            if value is True:
+                self._trusted.add(placeholder)
+            elif isinstance(value, list):
+                tools = {t for t in value if isinstance(t, str) and t}
+                if tools:
+                    self._tool_origins[placeholder] = set(
+                        sorted(tools)[:_MAX_TOOLS_PER_PLACEHOLDER]
+                    )
 
     async def scan_incoming(
         self,
         text: str,
         *,
-        origin: str | None = None,
+        origin: Origin = TRUSTED,
         location: str = "",
     ) -> tuple[str, list[Finding], str | None]:
         """Scan text going to the LLM. Apply actions.
 
-        ``origin`` names the tool when the text is a tool result;
+        ``origin`` says where the text came from (a tool result, model output,
+        or trusted text) and feeds ``restore="allowlisted"`` provenance;
         ``location`` describes where the text sits (used in block errors).
 
         Returns:
@@ -242,24 +333,14 @@ class GuardrailEngine:
         oversize = len(text) > MAX_SCAN_CHARS
 
         for guardrail in self._text_guardrails:
-            if oversize:
-                finding = _unscannable()
-                if not all_findings:
-                    all_findings.append(finding)
-                if guardrail.action in ("block", "redact"):
-                    return (
-                        text,
-                        all_findings,
-                        _block_message(
-                            guardrail,
-                            [finding],
-                            where="text over the scan limit",
-                            location=location,
-                        ),
-                    )
+            findings = [] if oversize else _deoverlap(await guardrail.scan(text))
+            if oversize or _has_unscannable(findings):
+                block = _unscannable_outcome(
+                    guardrail, all_findings, where="text over the scan limit", location=location
+                )
+                if block is not None:
+                    return text, all_findings, block
                 continue
-
-            findings = _deoverlap(await guardrail.scan(text))
             if not findings:
                 continue
             all_findings.extend(findings)
@@ -272,7 +353,18 @@ class GuardrailEngine:
                 )
 
             if guardrail.action == "redact":
-                text = self._apply_redaction(text, findings, origin)
+                new_values = {f.text for f in findings if f.text not in self._reverse}
+                if len(self._pii_mapping) + len(new_values) > MAX_MAPPING_ENTRIES:
+                    block = _unscannable_outcome(
+                        guardrail,
+                        all_findings,
+                        where="text with too many distinct values to redact",
+                        location=location,
+                    )
+                    if block is not None:
+                        return text, all_findings, block
+                    continue
+                text = await self._redact(text, findings, origin)
             # warn: findings collected but text unchanged
 
         return text, all_findings, None
@@ -297,7 +389,12 @@ class GuardrailEngine:
 
         from dendrux.types import Role
 
-        origin = msg.name if msg.role == Role.TOOL else None
+        if msg.role == Role.TOOL:
+            origin = tool_origin(msg.name or "")
+        elif msg.role == Role.ASSISTANT:
+            origin = MODEL
+        else:
+            origin = TRUSTED
         location = _message_location(msg, index)
 
         if msg.parts is None:
@@ -349,19 +446,14 @@ class GuardrailEngine:
         oversize = len(text) > MAX_SCAN_CHARS
 
         for guardrail in self._text_guardrails:
-            if oversize:
-                finding = _unscannable()
-                if not all_findings:
-                    all_findings.append(finding)
-                if guardrail.action in ("block", "redact"):
-                    return (
-                        all_findings,
-                        _block_message(
-                            guardrail, [finding], where="LLM output over the scan limit"
-                        ),
-                    )
+            findings = [] if oversize else _deoverlap(await guardrail.scan(text))
+            if oversize or _has_unscannable(findings):
+                block = _unscannable_outcome(
+                    guardrail, all_findings, where="LLM output over the scan limit"
+                )
+                if block is not None:
+                    return all_findings, block
                 continue
-            findings = _deoverlap(await guardrail.scan(text))
             if findings:
                 all_findings.extend(findings)
                 if guardrail.action == "block":
@@ -381,18 +473,32 @@ class GuardrailEngine:
 
         return all_findings, None
 
-    def _apply_redaction(
-        self, text: str, findings: list[Finding], origin: str | None = None
-    ) -> str:
-        """Replace findings in text with placeholders. Right-to-left to preserve offsets.
+    async def _redact(self, text: str, findings: list[Finding], origin: Origin) -> str:
+        """Redact in a worker thread when the text is large (see ``_apply_redaction``)."""
+        if len(text) > THREAD_SCAN_THRESHOLD:
+            return await asyncio.to_thread(self._apply_redaction, text, findings, origin)
+        return self._apply_redaction(text, findings, origin)
+
+    def _apply_redaction(self, text: str, findings: list[Finding], origin: Origin = TRUSTED) -> str:
+        """Replace findings in text with placeholders in one linear pass.
 
         Findings must already be de-overlapped (done at scan level).
+        Placeholders are numbered right to left, as in 0.4.1.
         """
-        sorted_findings = sorted(findings, key=lambda f: f.start, reverse=True)
-        for finding in sorted_findings:
-            placeholder = self._get_or_create_placeholder(finding.entity_type, finding.text, origin)
-            text = text[: finding.start] + placeholder + text[finding.end :]
-        return text
+        ordered = sorted(findings, key=lambda f: f.start)
+        placeholders = [
+            self._get_or_create_placeholder(f.entity_type, f.text, origin)
+            for f in reversed(ordered)
+        ]
+        placeholders.reverse()
+        pieces: list[str] = []
+        pos = 0
+        for finding, placeholder in zip(ordered, placeholders, strict=True):
+            pieces.append(text[pos : finding.start])
+            pieces.append(placeholder)
+            pos = finding.end
+        pieces.append(text[pos:])
+        return "".join(pieces)
 
     def deanonymize(
         self, params: dict[str, Any], *, tool_def: ToolDef | None = None
@@ -440,11 +546,11 @@ class GuardrailEngine:
         else:
             return _deny_all
         tool_name = tool_def.name
-        origins = self._origins
+        trusted = self._trusted
+        tool_origins = self._tool_origins
 
         def allowed(placeholder: str) -> bool:
-            origin = origins.get(placeholder)
-            if origin is not None and origin != tool_name:
+            if placeholder not in trusted and tool_name not in tool_origins.get(placeholder, ()):
                 return False
             return entities is None or _entity_matches(_entity_of(placeholder), entities)
 
@@ -453,8 +559,11 @@ class GuardrailEngine:
     def get_pii_mapping(self) -> dict[str, str]:
         """Return the current pii_mapping for persistence."""
         mapping = dict(self._pii_mapping)
-        if self._origins:
-            mapping[_ORIGINS_KEY] = json.dumps(self._origins, sort_keys=True)
+        if self._allowlisted:
+            record: dict[str, Any] = {p: sorted(t) for p, t in self._tool_origins.items()}
+            record.update(dict.fromkeys(self._trusted, True))
+            if record:
+                mapping[_ORIGINS_KEY] = json.dumps(record, sort_keys=True)
         return mapping
 
     @property
@@ -467,25 +576,16 @@ def _deny_all(placeholder: str) -> bool:
 
 
 def _entity_matches(entity: str, allowed: frozenset[str]) -> bool:
-    """Exact entity type, or a leading word of it (``EMAIL`` covers ``EMAIL_ADDRESS``)."""
-    if entity in allowed:
-        return True
-    return any(entity.startswith(f"{name}_") for name in allowed)
+    """Exact entity type, or a leading word of it (``EMAIL`` covers ``EMAIL_ADDRESS``).
 
-
-def _load_origins(raw: object, mapping: dict[str, str]) -> dict[str, str]:
-    """Parse persisted provenance defensively; keep only known placeholders."""
-    if not isinstance(raw, str):
-        return {}
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {
-        k: v for k, v in data.items() if isinstance(v, str) and isinstance(k, str) and k in mapping
-    }
+    Case-insensitive, like the upper-case entity names themselves.
+    """
+    entity = entity.upper()
+    for name in allowed:
+        upper = name.upper()
+        if entity == upper or entity.startswith(f"{upper}_"):
+            return True
+    return False
 
 
 def has_placeholder(value: Any, _depth: int = 0) -> bool:
@@ -574,14 +674,20 @@ def _restore_value(
                 return mapping[value]
             _count_skip(skipped, value, 1)
             return value
-        result = value
-        for placeholder, real_value in mapping.items():
-            if placeholder in result:
-                if allowed is None or allowed(placeholder):
-                    result = result.replace(placeholder, real_value)
-                else:
-                    _count_skip(skipped, placeholder, result.count(placeholder))
-        return result
+        if "<<" not in value:
+            return value
+
+        def swap(match: re.Match[str]) -> str:
+            placeholder = match.group()
+            real_value = mapping.get(placeholder)
+            if real_value is None:
+                return placeholder
+            if allowed is None or allowed(placeholder):
+                return real_value
+            _count_skip(skipped, placeholder, 1)
+            return placeholder
+
+        return _CANDIDATE_RE.sub(swap, value)
     if isinstance(value, dict):
         return {
             k: _restore_value(v, mapping, allowed, skipped, _depth + 1) for k, v in value.items()
@@ -599,37 +705,80 @@ def _count_skip(skipped: dict[str, int] | None, placeholder: str, n: int) -> Non
 
 @dataclass
 class _Leaves:
-    """String leaves of a params tree, plus why the walk stopped early (if it did)."""
+    """Scannable strings of a params tree, plus why the walk stopped early (if it did).
 
-    items: list[tuple[str, str]] = field(default_factory=list)
+    Each item is ``(key, text, with_context)``: dict keys are leaves of their
+    own (``with_context`` False); values are scanned alone and as ``key=value``.
+    """
+
+    items: list[tuple[str, str, bool]] = field(default_factory=list)
     limit: str | None = None
 
 
+def _scalar_text(value: int | float) -> str | None:
+    """Text of a number for scanning, or None when it is absurdly long."""
+    try:
+        return str(value)
+    except ValueError:  # int with more digits than the interpreter will convert
+        return None
+
+
 def _collect_leaves(params: dict[str, Any]) -> _Leaves:
-    """Iteratively gather ``(key, string)`` leaves, bounded in depth, nodes and size."""
+    """Walk ``params`` lazily, bounded in depth, nodes and characters.
+
+    Nothing is expanded ahead of the budget: containers are iterated one
+    element at a time, every element (and every key) is counted as it is
+    reached, and the walk stops the moment a limit is hit.
+    """
     out = _Leaves()
-    stack: list[tuple[Any, str, int]] = [(v, k, 1) for k, v in reversed(list(params.items()))]
     nodes = 0
     chars = 0
+    # Frames: (iterator, is_dict, key for list items, depth of the frame's values).
+    stack: list[tuple[Any, bool, str, int]] = [(iter(params.items()), True, "", 1)]
     while stack:
-        value, key, depth = stack.pop()
-        if depth > _MAX_RECURSION_DEPTH:
-            out.limit = out.limit or "nesting depth"
+        it, is_dict, ctx_key, depth = stack[-1]
+        try:
+            item = next(it)
+        except StopIteration:
+            stack.pop()
             continue
+        if is_dict:
+            key, value = item
+            if not isinstance(key, str):
+                key = str(key)
+            chars += len(key)
+        else:
+            key, value = ctx_key, item
         nodes += 1
         if nodes > _MAX_SCAN_NODES:
             out.limit = out.limit or "node count"
             break
+        if chars > MAX_SCAN_CHARS:
+            out.limit = out.limit or "size"
+            break
+        if is_dict and key:
+            out.items.append((key, key, False))
         if isinstance(value, str):
-            chars += len(value)
+            text: str | None = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            text = _scalar_text(value)
+            if text is None:
+                out.limit = out.limit or "size"
+        else:
+            text = None
+        if text is not None:
+            chars += len(text)
             if chars > MAX_SCAN_CHARS:
                 out.limit = out.limit or "size"
                 break
-            out.items.append((key, value))
-        elif isinstance(value, dict):
-            stack.extend((v, k, depth + 1) for k, v in reversed(list(value.items())))
-        elif isinstance(value, list):
-            stack.extend((item, key, depth + 1) for item in reversed(value))
+            out.items.append((key, text, True))
+        elif isinstance(value, dict | list):
+            if depth + 1 > _MAX_RECURSION_DEPTH:
+                out.limit = out.limit or "nesting depth"
+            elif isinstance(value, dict):
+                stack.append((iter(value.items()), True, key, depth + 1))
+            else:
+                stack.append((iter(value), False, key, depth + 1))
     return out
 
 
@@ -645,28 +794,30 @@ async def _scan_params_for_findings(
     next scan_incoming. This walk is detection-only — needed here so
     ``action="block"`` can abort the run before side-effecting tools fire.
 
-    Params nested too deeply, with too many nodes, or too large are not
-    scanned past the limit: that yields an ``UNSCANNABLE`` finding which
-    blocks under ``block`` and ``redact`` (fail closed).
+    Keys, strings and numbers are scanned. Params nested too deeply, with
+    too many nodes, or too large are not scanned past the limit: that yields
+    an ``UNSCANNABLE`` finding which blocks under ``block`` and ``redact``
+    (fail closed).
 
     Returns (findings, block_error_or_none).
     """
     leaves = _collect_leaves(params)
     all_findings: list[Finding] = []
-    for key, value in leaves.items:
-        leaf_findings, block = await _scan_leaf_for_findings(value, key, guardrails, where=where)
+    for key, text, with_context in leaves.items:
+        leaf_findings, block = await _scan_leaf_for_findings(
+            text, key, guardrails, where=where, with_context=with_context
+        )
         all_findings.extend(leaf_findings)
         if block is not None:
             return all_findings, block
 
     if leaves.limit is not None:
-        finding = _unscannable()
-        all_findings.append(finding)
         for guardrail in guardrails:
-            if guardrail.action in ("block", "redact"):
-                return all_findings, _block_message(
-                    guardrail, [finding], where=f"{where}, over the {leaves.limit} limit"
-                )
+            block = _unscannable_outcome(
+                guardrail, all_findings, where=f"{where}, over the {leaves.limit} limit"
+            )
+            if block is not None:
+                return all_findings, block
 
     return all_findings, None
 
@@ -677,18 +828,27 @@ async def _scan_leaf_for_findings(
     guardrails: list[Guardrail],
     *,
     where: str = "tool call params",
+    with_context: bool = True,
 ) -> tuple[list[Finding], str | None]:
     """Detection-only scan of a single string leaf.
 
     Uses both value-only and ``key=value`` context scans so patterns like
-    GENERIC_API_KEY (which need the key name for detection) still fire.
+    GENERIC_API_KEY (which need the key name for detection) still fire. Only
+    the last characters of the key join the context string, so a long key
+    cannot multiply the scan cost.
     """
     all_findings: list[Finding] = []
-    key_prefix_len = len(key) + 1
+    key_tail = key[-_KEY_CONTEXT_CHARS:]
+    key_prefix_len = len(key_tail) + 1
 
     for guardrail in guardrails:
         value_findings = await guardrail.scan(value)
-        context_findings = await guardrail.scan(f"{key}={value}")
+        context_findings = await guardrail.scan(f"{key_tail}={value}") if with_context else []
+        if _has_unscannable(value_findings) or _has_unscannable(context_findings):
+            block = _unscannable_outcome(guardrail, all_findings, where=where)
+            if block is not None:
+                return all_findings, block
+            continue
 
         projected: list[Finding] = []
         for cf in context_findings:
