@@ -32,68 +32,54 @@ The revision has a tested downgrade. Roll the workers back to 0.4.1 first, then 
 
 [//]: # "VERIFY-0.5.0: there is no dendrux db downgrade command (cli/db.py has migrate and status only); confirm the supported downgrade invocation, the failure on shared keys, and that dendrux db check exists (T1, AGT-210)"
 
-## What you must change
+## Removed in 0.5.0
 
-### 1. `make_read_router` needs a tenant resolver
+`make_read_router` (`dendrux.http`) and the embedded dashboard (`dendrux.dashboard`,
+`packages/dashboard`, and the `dendrux dashboard` command) are removed in 0.5.0.
+The `http` extra is removed; install your web framework and server explicitly.
+Delete old mounts/imports and CLI token/host configuration. Dendrux is a library:
+developers build their own routes on RunStore.
 
-`tenant_resolver=` is now required. It tells the router which tenant the caller may read.
+| Old router endpoint | Replacement library call |
+| --- | --- |
+| GET /health | Your app's health check; no RunStore equivalent |
+| GET /runs | list_runs(tenant_id=..., limit=..., offset=...) and count_runs(tenant_id=...) |
+| GET /runs/{id} | get_run(id, tenant_id=...) |
+| GET /runs/{id}/events | get_events(id, tenant_id=..., after_sequence_index=..., limit=...) then get_event_view(id, event, tenant_id=...) |
+| GET /runs/{id}/events/stream | follow(id, tenant_id=..., after_sequence_index=...) |
+| GET /runs/{id}/llm-calls | get_llm_calls(id, tenant_id=..., limit=..., offset=...) |
+| GET /runs/{id}/tool-calls | get_tool_invocations(id, tenant_id=..., limit=..., offset=...) |
+| GET /runs/{id}/traces | get_traces(id, tenant_id=..., limit=..., offset=...) |
+| GET /runs/{id}/pauses | get_pause_page(id, tenant_id=..., limit=...) for pairs plus truncation; get_pending(id, tenant_id=...) for current actionable state |
 
-```python
-from dendrux import UNSCOPED
-from dendrux.http import make_read_router
+Return one 404 for missing and foreign runs. Authenticate with headers and verify
+user-level run ownership as well as tenant scope. Enforce approval roles server-side.
+Clamp limits/offsets and expose incomplete pages; raw store records are not safe
+browser DTOs. Keep traces, provider bodies, arbitrary output, metadata and PII
+mappings server-side. Current client-tool params can contain real personal data.
+If `args_hidden=True`, stop and resolve on the server; never approve empty arguments.
 
-# Multi-tenant: a FastAPI dependency that returns the caller's tenant.
-async def tenant_resolver(user=Depends(current_user)) -> str:
-    return user.org_id
+For SSE you now own Last-Event-ID parsing, reconnects, 204 drained-terminal responses,
+503 capacity handling, redaction, disconnect cleanup and network-send deadlines.
+The feed's maximum duration bounds iteration, not blocked sends. Always call
+`follow.aclose()` in `finally`. Never put bearer tokens in URLs or pipe
+`agent.stream()` directly to a browser. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
-app.include_router(
-    make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver),
-    prefix="/api",
-)
+**Observability migration.** The embedded dashboard's normalized historical timeline
+and operator UI have no drop-in replacement. Use RunStore reads plus your own tracing:
+page events, inspect pending state and bounded pause pairs/tool/LLM reads, and build
+any timeline projection with explicit bounds and truncation. Connect
+`OpenTelemetryNotifier` to your app's tracing. See the working
+[operator inspection recipe](/docs/recipes/observability).
 
-# Single-tenant app: say so explicitly.
-app.include_router(
-    make_read_router(store=store, authorize=authorize, tenant_resolver=UNSCOPED),
-    prefix="/api",
-)
-```
+### Tenant scope and redaction on your routes
 
-- The resolver returns a non-empty `str` (that tenant only), `None` (untenanted runs only) or `UNSCOPED` (every tenant). Anything else is a 500. The router fails closed.
-- A run outside the caller's scope returns the same 404 as a run that does not exist.
-- The `?tenant_id=` query parameter on `GET /runs` is honoured only when the resolver returned `UNSCOPED` (an admin narrowing the view). For everyone else it is ignored.
-- A resolver that returns `UNSCOPED` is an all-tenant reader. Give it only to your own operators.
-- The resolver must return a plain value. Do not use `yield` in it.
-
-See [make_read_router](/docs/reference/read-router) and [Multi-tenancy](/docs/architecture/multi-tenancy).
-
-### 2. Read responses hide payloads unless you opt in
-
-`make_read_router(include_payloads=False)` is the default. Responses from `/runs/*`, `/events`, SSE and `/pauses` no longer carry:
-
-- the provider request and response,
-- raw traces, tool results and server-tool parameters,
-- the system prompt in `run.started`,
-- the arguments of past pauses,
-- the PII mapping.
-
-**The active pause stays actionable.** While a run is paused, its pending arguments remain visible by default: the parameters of a pending client-tool call, and the arguments in an approval or input request. They are the instruction to the client, so hiding them would break client tools and approval screens. This covers `run.paused`, `/pauses` and `RunStore.get_pending`. Approval and input views show the arguments as the model sent them, which is placeholder form when PII redaction is on.
-
-Pass `include_payloads=True` for a trusted internal viewer. Counts, statuses, timings, token usage and event types are always returned.
-
-> **Recommended: build your own read routes.** `make_read_router` stays in 0.5 and is frozen: no new features, and no deprecation warning. Its hardening now lives in `RunStore` as `get_pending` (what a run is waiting on) and `follow` (a hardened live feed), which your own routes can call. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
-
-### 3. The dashboard needs a token off loopback
-
-`dendrux dashboard` still opens without a token when bound to `127.0.0.1`. Bound to anything else it requires one, sets no `Access-Control-Allow-Origin: *`, and checks the `Host` header.
-
-```bash
-export DENDRUX_DASHBOARD_TOKEN="$(openssl rand -hex 32)"
-dendrux dashboard --host 0.0.0.0 --allow-origin https://ops.example.com
-```
-
-Prefer the environment variable; `--token` works but warns because arguments are visible in process listings.
-
-[//]: # "VERIFY-0.5.0: T5 owns the dashboard; confirm flag names --host --token --allow-origin and the env var DENDRUX_DASHBOARD_TOKEN"
+Pass `tenant_id=` on every Agent and RunStore call. `get_pending` and `follow`
+require an explicit scope; older reads default to all tenants. `None` means
+untenanted runs only and `UNSCOPED` is an explicit all-tenant operator view.
+`get_event_view` and `follow` hide historical payloads by default, while keeping
+active client calls actionable. Approval/input arguments use recorded model values
+or fail closed. This does not make every RunStore read a redacted wire response.
 
 ### 4. Dollar budgets need a price
 
@@ -166,7 +152,7 @@ See [Tools](/docs/reference/tools).
 
 ### 9. `RunNotFoundError` takes a run id
 
-`dendrux.store.RunNotFoundError` is now the same class as `dendrux.errors.RunNotFoundError`, and its constructor takes a run id: `RunNotFoundError("01J...")`. One `except RunNotFoundError` catches it from `Agent`, `RunStore` and the read router. If you raised it yourself with a message, pass the id instead.
+`dendrux.store.RunNotFoundError` is now the same class as `dendrux.errors.RunNotFoundError`, and its constructor takes a run id: `RunNotFoundError("01J...")`. One `except RunNotFoundError` catches it from `Agent`, `RunStore`. If you raised it yourself with a message, pass the id instead.
 
 ### 10. `retry()` and `submit_*` raise `RunNotFoundError` for foreign runs
 
@@ -236,7 +222,7 @@ See [Guardrails](/docs/architecture/guardrails).
 - `GET /runs/{id}/llm-calls` pages 50 by default (200 at most).
 - `started_after` and `started_before` need a timezone (RFC 3339); a naive datetime is a 422. `offset` is capped at 10,000.
 
-See [HTTP API surface](/docs/reference/http-api) and [Mount the read router](/docs/recipes/mount-read-router).
+See [HTTP integration](/docs/reference/http-api) and [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 [//]: # "VERIFY-0.5.0: T1 owns SSE; confirm the end frame name, 204 on drained terminal runs, follow=true, 503 when full, and the llm-calls paging numbers"
 
@@ -296,7 +282,7 @@ To silence a warning, make the choice explicit. For example, `Budget(max_tokens=
 ## Checklist
 
 - [ ] `dendrux db migrate`, then `dendrux db check`
-- [ ] `tenant_resolver=` on every `make_read_router`
+- [ ] Replace removed mounts with app-owned routes and explicit tenant scope
 - [ ] `include_payloads=True` only where a trusted viewer needs raw payloads
 - [ ] A price for every model under a dollar budget
 - [ ] `except ProviderError` where you caught SDK exceptions
@@ -305,7 +291,7 @@ To silence a warning, make the choice explicit. For example, `Budget(max_tokens=
 - [ ] `Limits(...)` if your tool results or inputs are legitimately larger than 1 MiB
 - [ ] `tenant_id=` on `list_runs` calls that passed `None` meaning "all"
 - [ ] Custom `StateStore` updated
-- [ ] Dashboard token set if it listens off loopback
+- [ ] Operator inspection and tracing configured in your application
 - [ ] Tests run with `-W default` and every `FutureWarning` and `DeprecationWarning` answered
 
 ## Where this fits
@@ -313,4 +299,4 @@ To silence a warning, make the choice explicit. For example, `Budget(max_tokens=
 - [Multi-tenancy](/docs/architecture/multi-tenancy): scoping reads and writes by tenant.
 - [Handling provider errors](/docs/recipes/handling-provider-errors): the typed error taxonomy.
 - [Erasing a tenant's data](/docs/recipes/erasing-tenant-data): the manual recipe until 0.6.
-- [make_read_router](/docs/reference/read-router) and [HTTP API surface](/docs/reference/http-api): the read surface in full.
+- [HTTP integration](/docs/reference/http-api): the library and transport boundary.

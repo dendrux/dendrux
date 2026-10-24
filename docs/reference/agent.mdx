@@ -181,7 +181,7 @@ if result.truncated:
     ...  # raise max_tokens, or ask the model to continue
 ```
 
-When streaming, the `RUN_COMPLETED` event has the same `event.stop_reason` and `event.truncated`. The `run.completed` event in the store (and over `make_read_router` SSE) carries `stop_reason` and `truncated`. Dendrux does not continue a truncated answer automatically. Anthropic's `model_context_window_exceeded` counts as `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers).
+When streaming, the `RUN_COMPLETED` event has the same `event.stop_reason` and `event.truncated`. The `run.completed` event in the store (and over `RunStore.follow`) carries `stop_reason` and `truncated`. Dendrux does not continue a truncated answer automatically. Anthropic's `model_context_window_exceeded` counts as `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers).
 
 With `output_type`, a final answer that fails validation raises `StructuredOutputValidationError` instead. It carries `usage`, `model` and `stop_reason` for the rejected call, which is still recorded and priced; the run row's own totals stay at 0, so read the cost from `RunStore.get_subtree(run_id).usage`. See [Structured output](/docs/architecture/loops#when-validation-fails).
 

@@ -11,12 +11,13 @@ The short answer: **Dendrux owns run state and the audit trail. You own everythi
 
 ## The two databases
 
-<Mermaid chart={`flowchart LR
+```mermaid
+flowchart LR
     subgraph App["Your app database (you own this)"]
         users["users"]
         chats["chats"]
         messages["messages"]
-        links["dendrux_run_id<br/>column or link table"]
+        links["dendrux_run_id · column or link table"]
     end
     subgraph Dx["Dendrux database (Dendrux owns this)"]
         runs[("agent_runs")]
@@ -27,7 +28,8 @@ The short answer: **Dendrux owns run state and the audit trail. You own everythi
     end
     messages --- links
     links -. "run_id + metadata.thread_id" .-> runs
-`} />
+
+```
 
 Your tables hold product truth: who the user is, which conversations exist, what each message says, what the UI renders. Dendrux's [six tables](/docs/architecture/state-persistence) hold execution truth: every LLM call, every tool invocation, the ordered event log, and the pause state needed to resume. The two meet at a single point: the **run ID** that your turn records (a column on the message or a row in a link table), plus the `metadata.thread_id` you stamp on every run.
 
@@ -105,7 +107,7 @@ The mistakes below all come from blurring the boundary. Avoid them:
 - **Do not duplicate `tool_calls` into your `messages` table.** Tool invocations, their params, and results already live in Dendrux. If your UI needs to show "called the refund tool," read it from `RunStore.get_tool_invocations(run_id)`, do not re-persist it.
 - **Do not store raw provider payloads in your app DB** unless you have a specific product reason. The full Anthropic/OpenAI request and response are already preserved verbatim in `llm_interactions`. Copying them into your tables just duplicates a large audit record you do not own.
 - **Do not query `react_traces` as your user-facing transcript.** That table is the message history Dendrux ships to the model, in model-shaped form (tool roles, placeholder PII, internal ordering). Your transcript is your own `messages` rows, which you control and can render exactly as the user should see them.
-- **Do not write to any Dendrux table.** It is append-only and owned by the runtime. Read through `RunStore` or the read router.
+- **Do not write to any Dendrux table.** It is append-only and owned by the runtime. Read through `RunStore` through your own routes.
 
 ## Dendrux does not reconstruct your conversation
 
@@ -260,7 +262,7 @@ Isolation between tenants is the separate `tenant_id=` argument on `run()` and e
 When you need Dendrux's execution data (for a cost view, a debug panel, a per-thread inspector), reach for the public read surface rather than writing SQL against the tables:
 
 - **`RunStore`** for programmatic reads: `list_runs(metadata_filter=...)`, `get_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pauses`.
-- **[`make_read_router`](/docs/recipes/mount-read-router)** to expose those same reads over HTTP and SSE for a frontend.
+- **[Developer-owned routes](/docs/recipes/build-your-own-read-routes)** to expose those same reads over HTTP and SSE for a frontend.
 
 Direct table queries are reasonable only for advanced internal debugging. For anything your product depends on, use the APIs: they are the stable contract, the schema is not.
 
@@ -268,4 +270,4 @@ Direct table queries are reasonable only for advanced internal debugging. For an
 
 - Architecture: [State persistence](/docs/architecture/state-persistence) explains what each of Dendrux's six tables holds.
 - Recipes: [Chatbot threads](/docs/recipes/chatbot-threads) for `history=`, `ChatMessage`, and `metadata_filter` queries.
-- Recipes: [Mount the read router](/docs/recipes/mount-read-router) to serve run data to your frontend.
+- Recipes: [Build your own read routes](/docs/recipes/build-your-own-read-routes) to serve run data to your frontend.

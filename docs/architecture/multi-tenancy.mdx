@@ -1,11 +1,11 @@
 ---
 title: Multi-tenancy
-description: How Dendrux scopes runs, reads, writes and idempotency keys by tenant. The three scope values, strict tenancy, the read router's tenant resolver, and what a foreign run looks like to a caller.
+description: How Dendrux scopes runs, reads, writes and idempotency keys by tenant. The three scope values, strict tenancy, the application tenant resolution, and what a foreign run looks like to a caller.
 ---
 
 # Multi-tenancy
 
-A run can belong to a tenant (an organisation, a workspace, a customer). Dendrux stores that as `agent_runs.tenant_id` and uses it to keep tenants apart on three surfaces: reads (`RunStore` and the read router), writes (`run`, `submit_*`, `cancel_run` and friends) and idempotency keys. Dendrux does not authenticate anyone. Your app decides who the caller is and passes the tenant in.
+A run can belong to a tenant (an organisation, a workspace, a customer). Dendrux stores that as `agent_runs.tenant_id` and uses it to keep tenants apart on three surfaces: reads (`RunStore`), writes (`run`, `submit_*`, `cancel_run` and friends) and idempotency keys. Dendrux does not authenticate anyone. Your app decides who the caller is and passes the tenant in.
 
 ## Three scope values
 
@@ -45,33 +45,13 @@ if detail is None:
     raise HTTPException(404)
 ```
 
-## Reads over HTTP: the tenant resolver
+## Reads over HTTP
 
-`make_read_router` needs a `tenant_resolver`, a FastAPI dependency that returns the caller's scope. It runs on every route except `/health`, after `authorize`.
-
-```python
-from fastapi import Depends
-from dendrux import UNSCOPED
-from dendrux.http import make_read_router
-
-async def tenant_resolver(user=Depends(current_user)):
-    if user.is_operator:
-        return UNSCOPED
-    return user.org_id                    # a plain str
-
-router = make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver)
-```
-
-- Return a non-empty `str`, `None` or `UNSCOPED`. Any other value (including an empty string) is a 500: the router fails closed rather than guess.
-- A single-tenant app passes `tenant_resolver=UNSCOPED` instead of a function. The router uses a constant.
-- A foreign run and a missing run give the identical 404 body.
-- `GET /runs?tenant_id=acme` is honoured only when the resolver returned `UNSCOPED`, so an operator can narrow the view. For a tenant-scoped caller the parameter is ignored.
-- A resolver that returns `UNSCOPED` makes that caller an all-tenant reader. It is the right value for your own support staff and the wrong one for customers.
-- The resolver must return a plain value. A dependency that uses `yield` is not supported.
-
-[//]: # "VERIFY-0.5.0: T1 implements the resolver; confirm the 500 on invalid values, the identical 404 body and that ?tenant_id= is ignored (not 403) for scoped callers"
-
-Read responses also hide payloads by default. See [include_payloads](/docs/reference/read-router#payloads). If you write your own read routes, `get_pending` and `follow` take the same scope; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+Your application authenticates the actor and resolves their tenant from a header
+credential, then verifies user-level run ownership. Pass that tenant explicitly to
+every RunStore read and Agent write. Tenant membership alone does not authorize a
+user to inspect every run in the tenant. Use the same missing/foreign 404 response.
+See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 ## Writes: `tenant_id=` on every entry point
 
@@ -138,6 +118,6 @@ Dendrux 0.5 does not ship a tenant erasure API; it is the first priority for 0.6
 
 ## Where this fits
 
-- [make_read_router](/docs/reference/read-router): the resolver and `include_payloads`.
+- [Build your own read routes](/docs/recipes/build-your-own-read-routes): the resolver and `include_payloads`.
 - [RunStore](/docs/reference/run-store): the read methods and their scope.
 - [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).

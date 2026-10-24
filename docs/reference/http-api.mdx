@@ -1,245 +1,42 @@
 ---
-title: HTTP API surface
-description: Every HTTP endpoint dendrux exposes through make_read_router, every SSE event type a client can receive, and every agent method you wrap in your own write routes. All parameters, all payloads, all exceptions.
+title: HTTP integration
+description: Build application routes on Agent and RunStore, with your authentication, ownership and response schemas.
 ---
 
-# HTTP API surface
-
-Dendrux is a library. It does not run a server for you. You import `make_read_router`, pass it to `app.include_router(...)`, and you own the rest (auth, prefix, CORS, TLS, deploy). For write-side actions (submit tool results, submit input, submit approval, cancel) you wrap `Agent` methods in your own routes.
-
-This page is the full inventory: read endpoints, the SSE stream, the agent write methods, the event types that land on the stream, and the stable exceptions to catch. Everything below is lifted from the code in `dendrux/http/read_router.py`, `dendrux/store/__init__.py`, `dendrux/agent.py`, `dendrux/errors.py`, and `dendrux/types.py`.
-
-## Mounting the read router
-
-```python
-from fastapi import FastAPI, Depends, HTTPException
-from dendrux.http import make_read_router
-from dendrux.store import RunStore
-
-app = FastAPI()
-
-async def authorize(request: Request) -> None:
-    token = request.headers.get("authorization")
-    if token != f"Bearer {EXPECTED_TOKEN}":
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-async def tenant_resolver(request: Request) -> str:
-    return request.state.tenant_id
-
-store = RunStore.from_database_url("postgresql+asyncpg://...")
-router = make_read_router(store=store, authorize=authorize, tenant_resolver=tenant_resolver)
-app.include_router(router, prefix="/dendrux")
-```
-
-`authorize` runs on every route except `/health`. Raise `HTTPException` inside to deny; return any value (ignored) to allow. The factory does not interpret your return value or impose an auth shape.
-
-`tenant_resolver` is required and also runs on every route except `/health`. It returns the caller's scope: a non-empty `str` (that tenant), `None` (untenanted runs only) or `UNSCOPED` (every tenant). A single-tenant app passes `tenant_resolver=UNSCOPED` (`from dendrux import UNSCOPED`). A run outside the scope gets the same 404 as a missing run. See [make_read_router](/docs/reference/read-router) and [Multi-tenancy](/docs/architecture/multi-tenancy).
-
-> **This router is frozen in 0.5.** It gets no new features and no deprecation warning. The recommended way to serve reads is your own routes over `RunStore.get_pending` and `RunStore.follow`; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
-
-Other options: `include_payloads=False` (default) hides raw payloads, `sse_max_connections=500` and `sse_max_duration_s=900` bound the SSE endpoint.
-
-### Payloads hidden by default
-
-With `include_payloads=False`, responses from `/runs/*`, `/events`, SSE and `/pauses` leave out: the provider request and response, raw trace content, raw tool parameters and results, the system prompt in `run.started`, the arguments of past pauses and the PII mapping. The **active pause's** arguments stay visible by default (pending client-tool calls, approval and input requests), in `run.paused`, `/pauses` and `RunStore.get_pending`. Everything below describes the shapes with `include_payloads=True`; with the default, those fields are absent.
-
-## Read endpoints
-
-All routes are read-only. All pagination uses exclusive cursors or limit/offset. The router returns JSON bodies serialized from frozen dataclasses defined in `dendrux/store/__init__.py`.
-
-### `GET /health`
-
-Unauthenticated. For Kubernetes probes and load balancers.
-
-Response: `{"status": "ok"}`
-
-### `GET /runs`
-
-List runs with SQL-side filtering and pagination.
-
-Query parameters:
-
-| Name | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `status` | `list[str]` (repeatable) | all | Filter by `RunStatus` values. Repeat for OR: `?status=running&status=waiting_approval`. |
-| `agent_name` | `str` | all | Exact-match agent name. |
-| `parent_run_id` | `str` | all | Return only child runs of this parent. |
-| `tenant_id` | `str` | caller's scope | Narrows the list. Honoured only when the tenant resolver returned `UNSCOPED`; ignored for a scoped caller. |
-| `started_after` | RFC 3339 datetime | none | Inclusive lower bound on `created_at`. Needs a timezone (a naive datetime is a 422); normalised to UTC. |
-| `started_before` | RFC 3339 datetime | none | Exclusive upper bound on `created_at`. Same rules. |
-| `limit` | `int` 1-1000 | 50 | Page size. |
-| `offset` | `int` 0-10000 | 0 | Rows to skip. Over 10,000 is a 422. |
-
-Response (each item also carries `tenant_id`):
-
-```json
-{
-  "items": [
-    {
-      "run_id": "01HXYZ...",
-      "agent_name": "calculator",
-      "status": "success",
-      "created_at": "2026-04-18T12:00:00Z",
-      "updated_at": "2026-04-18T12:00:04Z",
-      "iteration_count": 2,
-      "total_input_tokens": 120,
-      "total_output_tokens": 48,
-      "total_cache_read_tokens": 7706,
-      "total_cache_creation_tokens": 0,
-      "total_cost_usd": 0.0012,
-      "model": "claude-haiku-4-5",
-      "parent_run_id": null,
-      "delegation_level": 0
-    }
-  ],
-  "total": 1,
-  "limit": 50,
-  "offset": 0
-}
-```
-
-### `GET /runs/{run_id}`
-
-Single run detail. Returns the same summary fields plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (true while a cancel has been requested but the run has not yet reached a terminal status), `tenant_id` and `error_info` (the typed provider failure that ended the run, or `null`).
-
-Errors: `404` if not found or outside the caller's scope (the same body for both).
-
-### `GET /runs/{run_id}/events`
-
-Paginated durable event log (polling variant).
-
-Query parameters:
-
-| Name | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `after` | `int` | none | Exclusive cursor. Pass the previous batch's last `sequence_index`. |
-| `limit` | `int` 1-1000 | 100 | Page size. |
-
-Response:
-
-```json
-{
-  "items": [
-    {
-      "sequence_index": 4,
-      "iteration_index": 1,
-      "event_type": "llm.completed",
-      "correlation_id": null,
-      "data": {"input_tokens": 9, "output_tokens": 18, "model": "claude-haiku-4-5", "has_tool_calls": true},
-      "created_at": "2026-04-18T12:00:01Z"
-    }
-  ],
-  "next_cursor": 4
-}
-```
-
-Empty-batch rule: `next_cursor` echoes your input `after` when the page is empty. That means "nothing new yet," not "end of stream." Do not reset the cursor to null on empty batches; you will miss future events.
-
-### `GET /runs/{run_id}/events/stream`
-
-Server-Sent Events. Reads from `run_events` by polling. Connections watching the same run in one process share one polling query and fan out in process (at most one poller per run, torn down when its last client leaves), so database load follows the number of watched runs, not the number of open connections.
-
-Cursor resolution (first match wins):
-
-1. `Last-Event-ID` header (SSE reconnect convention).
-2. `?after=N` query param.
-3. `None` (stream from the beginning of the log).
-
-A malformed `Last-Event-ID` falls back silently to `?after=N`. Reverse proxies sometimes inject garbage on reconnect; treating that as a 500 would break reconnection.
-
-Response headers:
-
-```
-Content-Type: text/event-stream
-Cache-Control: no-cache
-X-Accel-Buffering: no
-```
-
-Frame format:
-
-```
-id: 5
-event: message
-data: {"sequence_index": 5, "iteration_index": 1, "event_type": "run.paused", "correlation_id": null, "timestamp": "2026-04-18T12:00:02Z", "data": {...}}
-
-```
-
-Every frame uses `event: message`. The dendrux event type lives inside the JSON under `event_type`, so a generic `EventSource` client does not need to pre-enroll every dendrux event name.
-
-Heartbeat: `: keepalive\n\n` every 15s of idleness. Prevents nginx (default 60s `proxy_read_timeout`) from closing the connection.
-
-Poll cadence: 0.5s when events are flowing, backing off to 2s when idle, one query per watched run. Budget about one query per second per watched run, and consider a separate small engine for the router when you serve many viewers. Postgres `LISTEN/NOTIFY` push is planned for 0.6.
-
-Limits: at most `sse_max_connections` (default 500) concurrent connections per router, which is per process; the next connection gets `503`. A connection lasts at most `sse_max_duration_s` (default 900) and then closes so the client reconnects with its cursor. The tenant resolver and `authorize` run again on every reconnect.
-
-Termination: when the run status is terminal and every event has been sent, the server writes an `event: end` frame (its data is `{"reason", "cursor"}`) and closes. Reconnecting to a finished, drained run returns `204` with no body. Add `?follow=true` to keep the stream open after the run finishes (the 0.4 behaviour). If the client drops, the generator ends on the next sleep and the connection releases.
-
-[//]: # "VERIFY-0.5.0: T1 owns SSE; confirm the end frame, 204, follow=true, 503 and the poll backoff numbers"
-
-Reconnect pattern from a browser:
-
-```javascript
-const es = new EventSource("/dendrux/runs/01HXYZ/events/stream?after=5", {
-  withCredentials: true
-});
-es.addEventListener("message", (e) => {
-  const frame = JSON.parse(e.data);
-  // e.lastEventId is frame.sequence_index, automatically sent back on reconnect
-  handle(frame);
-});
-```
-
-### `GET /runs/{run_id}/llm-calls`
-
-LLM round-trips recorded during the run.
-
-Query parameters:
-
-| Name | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `iteration` | `int` | all | Filter to one iteration index. |
-| `limit` | `int` 1-200 | 50 | Page size. |
-| `offset` | `int` >= 0 | 0 | Rows to skip. |
-
-Response items carry `iteration`, `provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_usd`, `duration_ms`, `provider_request`, `provider_response`, `created_at`. `provider_request` and `provider_response` are raw adapter-boundary JSON; treat as opaque. Both are only returned with `include_payloads=True`.
-
-### `GET /runs/{run_id}/tool-calls`
-
-Server tools plus submitted client and approval tools. Denied tools are not in this table (see [Access control](/docs/architecture/access-control)).
-
-Query parameters: same shape as `/llm-calls`.
-
-Response items: `iteration`, `tool_name`, `tool_call_id`, `provider_tool_call_id`, `target` (`server` / `client`), `params`, `result`, `success`, `error`, `duration_ms`, `created_at`.
-
-### `GET /runs/{run_id}/traces`
-
-Full conversation trace (user, assistant, tool messages) in `order_index` order.
-
-Query parameters: `limit`, `offset`.
-
-Response items: `role`, `content`, `order_index`, `meta`, `created_at`. With `include_payloads=False` `content` is not returned. Otherwise it is always the raw stored value — DB is ground truth. PII guardrails redact at the LLM-call boundary only; replay against `agent_runs.pii_mapping` to render the LLM-eye view.
-
-### `GET /runs/{run_id}/pauses`
-
-Pause/resume cycles derived from `run_events`. Never reads `AgentRun.pause_data` (that column is execution state — it can include a `pii_mapping` with raw values for continuity across pause/resume — and is cleared on finalize).
-
-Response items:
-
-```json
-{
-  "pause_sequence_index": 5,
-  "pause_at": "2026-04-18T12:00:02Z",
-  "resume_sequence_index": 8,
-  "resume_at": "2026-04-18T12:00:30Z",
-  "reason": "waiting_client_tool",
-  "pause_id": "01HXYZ...",
-  "pending_tool_calls": [{"id": "...", "name": "read_file", "target": "client", "params": {...}}],
-  "submitted_results": [{"name": "read_file", "call_id": "...", "payload": "...", "success": true}],
-  "user_input": null
-}
-```
-
-An unpaired `run.paused` at the end of the log represents an active pause (`resume_sequence_index` is `null`). `pause_id` is `null` for pauses recorded before 0.5.0. Pass it as `expected_pause_id=` to a `submit_*` call to reject a stale submit. With `include_payloads=False` the parameters and submitted payloads are omitted.
+# HTTP integration
+
+Dendrux exposes Python library methods. Your application defines every HTTP route,
+request and response schema, authentication policy, ownership check, rate limit,
+network timeout and deployment choice. There is no packaged HTTP endpoint contract.
+
+A minimal application uses these routes (names are your choice):
+
+| App route | Python method |
+| --- | --- |
+| POST /chat | Agent.run(input, tenant_id=tenant) |
+| POST /runs/{id}/tool-results | Agent.submit_tool_results(id, results, tenant_id=tenant) |
+| POST /runs/{id}/approvals | Agent.submit_approval(id, approved=decision, tenant_id=tenant) |
+| GET /runs/{id}/pending | RunStore.get_pending(id, tenant_id=tenant) |
+| Optional GET /runs/{id}/live | RunStore.follow(id, tenant_id=tenant) |
+
+See [Client tools](/docs/recipes/client-tools) and the runnable examples
+`03_client_tools` and `17_full_stack_app` for start, submit and pending routes.
+[Build your own read routes](/docs/recipes/build-your-own-read-routes) covers
+header authentication, safe event views, reconnects and transport deadlines.
+
+Every read and write must authenticate the actor, authorize access to that run
+within the tenant, and pass `tenant_id`. Tenant scope alone is not user ownership.
+Approval routes must additionally enforce the actor's approval authority.
+
+Use an allowlisted browser DTO such as `run_id`, `status` and an answer explicitly
+intended for that actor. Exclude result metadata, steps, traces, arbitrary output,
+provider payloads and PII mappings. Pending client-tool params can contain real
+personal data and need the same ownership checks as writes. Client outputs are
+assertions by the client; UX hooks cannot prove tool execution or human approval.
+
+A request waiting on `agent.run` can time out before returning a run ID; cancellation
+of that coroutine can cancel the run. Persist an app request ID and own execution
+and recovery outside the request lifecycle if your application requires it.
 
 ## SSE event inventory
 
@@ -380,128 +177,6 @@ A cancel that arrives after the run's last checkpoint does not stop a run that t
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`.
 
-### Minimal write-route wrappers
-
-A sample follows. In a multi-tenant service, derive the caller's tenant from authentication and pass it to every write method: `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream`, `request_pause`, `submit_note` and `cancel_run`. Omitting `tenant_id` is unscoped by default, while explicit `tenant_id=None` means untenanted runs only; with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`, and `UNSCOPED` is the explicit operator value. A run outside the tenant raises `RunNotFoundError` before anything is written. The sample below also uses `owned_run`, a dependency that checks the run belongs to the caller's tenant before any route touches it, which is a cheap way to guard every route in one place. Passing `tenant_id=` to the submit calls themselves (for example `agent.submit_tool_results(run_id, results, tenant_id=tenant_id)`) gives the same guarantee at the call.
-
-```python
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
-from dendrux.errors import (
-    InvalidToolResultError,
-    PauseStatusMismatchError,
-    PersistenceNotConfiguredError,
-    RunAlreadyClaimedError,
-    RunAlreadyTerminalError,
-    RunNotFoundError,
-    RunNotPausedError,
-)
-from dendrux import ApprovalDecision
-from dendrux.types import ToolResult
-
-def tenant_of(request: Request) -> str:
-    """Your auth layer: the tenant of the authenticated caller."""
-    return request.state.tenant_id
-
-async def owned_run(run_id: str, tenant_id: str = Depends(tenant_of)) -> str:
-    """Ownership check for every route."""
-    if await store.get_run(run_id, tenant_id=tenant_id) is None:   # out of scope = missing
-        raise HTTPException(404, "run not found")
-    return run_id
-
-writes = APIRouter(dependencies=[Depends(authorize)])
-
-class ToolResultBody(BaseModel):
-    name: str
-    call_id: str
-    payload: str
-    success: bool = True
-    error: str | None = None
-    duration_ms: int = 0
-
-@writes.post("/runs/{run_id}/tool-results")
-async def submit_tool_results(results: list[ToolResultBody], run_id: str = Depends(owned_run)):
-    try:
-        result = await agent.submit_tool_results(
-            run_id, [ToolResult(**r.model_dump()) for r in results]
-        )
-    except RunNotFoundError:
-        raise HTTPException(404, "run not found")
-    except InvalidToolResultError as e:
-        raise HTTPException(400, str(e))
-    except (RunNotPausedError, PauseStatusMismatchError,
-            RunAlreadyClaimedError, RunAlreadyTerminalError) as e:
-        raise HTTPException(409, str(e))
-    except PersistenceNotConfiguredError:
-        raise HTTPException(500, "persistence not configured")
-    return {"status": result.status.value, "answer": result.answer}
-
-@writes.post("/runs/{run_id}/input")
-async def submit_input(body: dict, run_id: str = Depends(owned_run)):
-    # (same try/except shape)
-    result = await agent.submit_input(run_id, body["text"])
-    return {"status": result.status.value, "answer": result.answer}
-
-@writes.post("/runs/{run_id}/approval")
-async def submit_approval(body: dict, run_id: str = Depends(owned_run)):
-    # Pass expected_pause_id (from the run.paused event or PausePair) so a stale client cannot approve a newer pause.
-    # Whole batch: {"approved": true}. Per call: {"decisions": {"<call_id>": {"approved": false, "reason": "..."}}}
-    if "decisions" in body:
-        decisions = {
-            call_id: ApprovalDecision(approved=d["approved"], reason=d.get("reason"))
-            for call_id, d in body["decisions"].items()
-        }
-        result = await agent.submit_approval(run_id, decisions=decisions)
-    else:
-        result = await agent.submit_approval(
-            run_id,
-            approved=body["approved"],
-            rejection_reason=body.get("rejection_reason"),
-        )
-    return {"status": result.status.value, "answer": result.answer}
-
-@writes.post("/runs/{run_id}/pause")
-async def request_pause(
-    body: dict | None = None,
-    run_id: str = Depends(owned_run),
-    tenant_id: str = Depends(tenant_of),
-):
-    outcome = await agent.request_pause(
-        run_id, tenant_id=tenant_id, reason=(body or {}).get("reason")
-    )
-    return {"status": outcome.status_after.value, "affected": outcome.affected}
-
-@writes.post("/runs/{run_id}/resume")
-async def resume(run_id: str = Depends(owned_run)):
-    result = await agent.submit_resume(run_id)
-    return {"status": result.status.value, "answer": result.answer}
-
-@writes.post("/runs/{run_id}/notes")
-async def add_note(
-    body: dict,
-    run_id: str = Depends(owned_run),
-    tenant_id: str = Depends(tenant_of),
-):
-    note_id = await agent.submit_note(
-        run_id, body["text"], metadata=body.get("metadata"), tenant_id=tenant_id
-    )
-    return {"note_id": note_id}
-
-@writes.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str = Depends(owned_run), tenant_id: str = Depends(tenant_of)):
-    try:
-        result = await agent.cancel_run(run_id, tenant_id=tenant_id)
-    except RunNotFoundError:
-        raise HTTPException(404, "run not found")
-    except PersistenceNotConfiguredError:
-        raise HTTPException(500, "persistence not configured")
-    return {"status": result.status.value}
-
-app.include_router(writes, prefix="/dendrux")
-```
-
-That is the full write surface. No hidden endpoints, no middleware magic.
-
 ## Exceptions
 
 From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whatever fits your API.
@@ -549,24 +224,16 @@ async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
 store = RunStore.from_engine(engine)
 ```
 
-Streaming via the Python API (if you do not want SSE):
 
-```python
-from dendrux.store import RunStore, RunNotFoundError
-
-async with RunStore.from_database_url("...") as store:
-    async for event in store.stream_events(run_id, after_sequence_index=5):
-        if event.event_type in {"run.completed", "run.error", "run.cancelled"}:
-            break
-```
-
-`stream_events` raises `RunNotFoundError` before the first yield if the run does not exist. Default poll interval is 0.5s, matching the SSE route. Caller decides when to stop (`break` out of the loop or call `aclose()` on the generator).
+Use `follow` for redacted, bounded live events and always close the follower.
+Do not return `agent.stream()` directly to a browser: disconnecting cancels it.
+Raw `get_events`, traces and provider reads need application-specific projection
+before crossing a browser boundary. For contextual event redaction use
+`await store.get_event_view(run_id, event, tenant_id=tenant)`.
 
 ## Where this fits
 
-- Read endpoints and SSE: `dendrux/http/read_router.py`, mounted via `make_read_router(store=, authorize=, tenant_resolver=)`.
-- Read types: `dendrux/store/__init__.py` (`RunStore`, `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`).
-- Write-side agent methods: `dendrux/agent.py` (`submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `request_pause`, `submit_note`, `cancel_run`).
-- Exceptions: `dendrux/errors.py`.
-- Event type enum: `dendrux/types.py` (`GovernanceEventType`, `RunStatus`).
-- Lifecycle event strings: `dendrux/runtime/runner.py` and `dendrux/runtime/persistence.py`.
+- [RunStore](/docs/reference/run-store): library reads, pagination and record types.
+- [Build your own read routes](/docs/recipes/build-your-own-read-routes): transport recipe.
+- [Errors](/docs/reference/errors): stable exceptions.
+- [Upgrading](/docs/upgrading-to-0.5.0): endpoint migration table.

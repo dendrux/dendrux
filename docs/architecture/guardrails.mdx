@@ -321,7 +321,7 @@ governance events:
 
 Two `guardrail.detected` events, one for the incoming user message and one for the outgoing assistant reply (which echoed the ticket back). No `guardrail.redacted`, no `guardrail.blocked`, an empty `pii_mapping`. The text is unchanged; the log records that it was seen.
 
-This action is the right choice when you want a signal that something matched without changing the flow. A dashboard can count `guardrail.detected` events by entity type across runs to get a usage heat-map.
+This action is the right choice when you want a signal that something matched without changing the flow. A operator UI can count `guardrail.detected` events by entity type across runs to get a usage heat-map.
 
 ## Incoming and outgoing are both scanned — with different jobs
 
@@ -331,7 +331,7 @@ The **incoming scan** happens before the messages list is handed to `provider.co
 
 The **outgoing scan** happens after `provider.complete()` returns, on the assistant's response and any tool-call params. It is detection-only: findings are recorded, `guardrail.detected` is emitted, and a `block` action still terminates the run. It never mutates what gets persisted. The next iteration's incoming scan is where placeholders get applied for the following LLM call.
 
-This split is deliberate: the DB is ground truth. Dashboards, traces, and the developer's own systems see the raw value; only the provider API wire carries placeholders.
+This split is deliberate: the DB is ground truth. inspection tools, traces, and the developer's own systems see the raw value; only the provider API wire carries placeholders.
 
 A run that enters `waiting_approval` and later resumes will scan again on the next iteration (the history being replayed is the raw transcript). The `pii_mapping` is stable across scans so the same replacement token is reused, and there is no double-redaction.
 

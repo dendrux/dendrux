@@ -211,7 +211,7 @@ class StopOnBudget:
     async def on_tool_completed(self, *a, **k): pass
 ```
 
-**Out-of-process, via the read router or SSE.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
+**Out-of-process, via RunStore.follow.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
 
 ## Where this fits
 

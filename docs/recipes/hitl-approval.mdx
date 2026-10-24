@@ -45,11 +45,11 @@ print(first.run_id)
 
 Status comes back as `waiting_approval`. The run row in `agent_runs` is in that status, the pending tool call is recorded in `pause_data`, and a `approval.requested` event has landed in `run_events` with the tool name and `correlation_id` set to the call id.
 
-The refund function has not been invoked. You can verify this in your code or in the dashboard — `tool_calls` is empty for the run.
+The refund function has not been invoked. You can verify this in your code or in your inspection tools — `tool_calls` is empty for the run.
 
 ## Approving
 
-Pull the run by id (typically from the dashboard, an alert, or a queue), and ship the decision back:
+Pull the run by id (typically from the operator UI, an alert, or a queue), and ship the decision back:
 
 ```python
 result = await agent.submit_approval(first.run_id, approved=True)

@@ -113,7 +113,7 @@ patterns=[
 ]
 ```
 
-For RAG agents, prefer `action="warn"` initially. Run for a week, look at the `guardrail.detected` events in the dashboard, and tighten to `block` only on the patterns that fire exclusively on real attacks.
+For RAG agents, prefer `action="warn"` initially. Run for a week, look at the `guardrail.detected` events in your inspection tools, and tighten to `block` only on the patterns that fire exclusively on real attacks.
 
 ### Code-execution / sandboxed-tool agents
 
@@ -232,7 +232,7 @@ Since 0.5.0 a block never copies the matched text into the error, the event or t
 
 [//]: # "VERIFY-0.5.0: T3 owns the block message format and the findings/location field names; replace the example strings with the real output"
 
-The dashboard renders this as a red chip in the Safety panel with the entity type and the iteration where it fired.
+The operator UI renders this as a red chip in the Safety panel with the entity type and the iteration where it fired.
 
 ## What's coming in v2
 

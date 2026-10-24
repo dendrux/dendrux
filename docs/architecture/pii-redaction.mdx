@@ -45,11 +45,11 @@ tool_calls (proof of side effect):
   send_email  params={"to": "jane.doe@example.com", "body": "..."}
 ```
 
-The DB stores ground truth. The `pii_mapping` column is the audit key that lets a dashboard reconstruct what the LLM saw at any point.
+The DB stores ground truth. The `pii_mapping` column is the audit key that lets an app-owned operator UI reconstruct what the LLM saw at any point.
 
 ## Where the redaction boundary actually sits
 
-The core invariant: **redaction applies to the provider API wire, not to the database**. The LLM is the only untrusted boundary. Everything else — the DB, the dashboard, traces, logs — is inside the developer's infrastructure.
+The core invariant: **redaction applies to the provider API wire, not to the database**. Backend storage, traces and logs still need access controls. A browser is a separate trust boundary: authenticate the actor, authorize run ownership, and project an allowlisted response. Never send PII mappings or raw backend records to a general browser client. Client-tool params may intentionally carry real personal data to the authorized actor.
 
 | Location | What is stored | Why |
 | --- | --- | --- |
@@ -108,7 +108,7 @@ Three invariants this mapping enforces:
 
 1. **Stable tokens.** If the same email appears in two different messages, the same `<<EMAIL_ADDRESS_1>>` token is used both times. The guardrail engine checks the reverse index before minting a new placeholder.
 2. **Pause-safe.** On resume, the runner reads `pii_mapping` off the row and reinitializes the guardrail engine with it. A second-iteration scan picks up the same placeholder for the same email, so the LLM never sees a redaction jitter between pause and resume.
-3. **Audit-replayable.** With raw history in `react_traces` and the mapping on the run row, a dashboard can render every event in two views: LLM-eye (apply the mapping) and ground-truth (raw). The mapping is the key that links them.
+3. **Audit-replayable.** With raw history in `react_traces` and the mapping on the run row, an app-owned operator UI can render every event in two views: LLM-eye (apply the mapping) and ground-truth (raw). The mapping is the key that links them.
 
 From `dendrux/runtime/runner.py`:
 
@@ -159,7 +159,7 @@ run = await store.get_run(result.run_id)
 run.answer               # "Nice to meet you, <<PERSON_1>>!" — DB row, audit
 ```
 
-Two consumers, two views, one mapping. The dashboard renders the persisted (placeholder-faithful) version because it is an operator/audit surface; the dev's app gets the deanonymized version because it is a user-facing surface. Apply `run.pii_mapping` in reverse yourself if you ever need the user-facing view from a re-loaded run.
+Two consumers, two views, one mapping. Your operator/audit UI can render the persisted (placeholder-faithful) version; the dev's app gets the deanonymized version because it is a user-facing surface. Apply `run.pii_mapping` in reverse yourself if you ever need the user-facing view from a re-loaded run.
 
 If the LLM hallucinates a placeholder that was never minted (`<<PERSON_99>>`), it passes through unchanged and the runner emits a `guardrail.unmapped_placeholder` event so the leak is visible in the timeline.
 
@@ -174,7 +174,7 @@ PII()                       # regex, default
 PII(engine="presidio")      # NLP-backed; requires dendrux[presidio]
 ```
 
-Entity names are canonical to Presidio's vocabulary across both engines, so dashboards and tests see one set of names regardless of backend. The `pii_mapping`, deanonymize behavior, pause/resume continuity, and governance events are identical.
+Entity names are canonical to Presidio's vocabulary across both engines, so inspection tools and tests see one set of names regardless of backend. The `pii_mapping`, deanonymize behavior, pause/resume continuity, and governance events are identical.
 
 Presidio's recall comes with statistical false positives — its `PERSON` recognizer can flag tool names or other non-PII tokens in prompt text. This is benign when the misclassified token is not something the LLM needs to reason about as a concrete string, which fits most prompts. When it matters, use the regex engine or stack both via the hybrid pattern.
 

@@ -254,7 +254,7 @@ By default image bytes live in the Dendrux database, in a table of content-addre
 
 The tenant scope is `t:<tenant_id>` or `-` when a run has no tenant. The same bytes uploaded under two tenants are two rows; one tenant can never read another's image, and a missing image and another tenant's image raise the same `BlobNotFoundError`. Identical bytes inside one tenant are stored once however many times they are used.
 
-**Reading an image back.** `RunStore.read_image(run_id, sha256, tenant_id=...)` returns the verified bytes only if that run references the blob, which is the call to put behind your own auth when you serve thumbnails. `agent.blobs.read(ref_or_sha256, tenant_id=...)` and `RunStore(...).blobs` read without a run. Dendrux ships no image route in `make_read_router`; serving images is your app's decision. Each read re-checks length, SHA-256, media type and dimensions and raises `BlobIntegrityError` on a mismatch.
+**Reading an image back.** `RunStore.read_image(run_id, sha256, tenant_id=...)` returns the verified bytes only if that run references the blob, which is the call to put behind your own auth when you serve thumbnails. `agent.blobs.read(ref_or_sha256, tenant_id=...)` and `RunStore(...).blobs` read without a run. Serving images is your app's decision. Each read re-checks length, SHA-256, media type and dimensions and raises `BlobIntegrityError` on a mismatch.
 
 **A heavier store.** For high volume, keep bytes in object storage and only metadata in the database. Implement the three-method `BlobStore` protocol and pass it to the Agent (and to every `RunStore` that reads or purges):
 

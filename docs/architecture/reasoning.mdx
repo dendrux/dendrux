@@ -5,7 +5,7 @@ description: Turn on extended thinking for Anthropic and OpenAI with one switch,
 
 # Reasoning and thinking
 
-Modern Anthropic and OpenAI models can spend extra tokens "thinking" before they answer. dendrux exposes this as a small, uniform set of controls that work the same way across both vendors, and it threads the resulting reasoning — token counts and, where the vendor returns it, the summary text — through the same run-result, persistence, streaming, and dashboard rails as everything else.
+Modern Anthropic and OpenAI models can spend extra tokens "thinking" before they answer. dendrux exposes this as a small, uniform set of controls that work the same way across both vendors, and it threads the resulting reasoning — token counts and, where the vendor returns it, the summary text — through the same run-result, persistence, streaming, and operator UI rails as everything else.
 
 It is **off by default**. Every existing app keeps its exact behavior until you opt in. Everything below is read from the Dendrux source.
 
@@ -78,7 +78,7 @@ async for event in agent.stream("…"):
 | `LLMCall.reasoning` | per LLM call | summary text for that call, if returned |
 | `RunDetail.total_reasoning_tokens` | per run | summed across the run |
 
-These are backed by three nullable columns added without breaking the schema — `llm_interactions.reasoning_tokens`, `token_usage.reasoning_tokens`, and `agent_runs.total_reasoning_tokens` (see [State persistence](/docs/architecture/state-persistence)). The [dashboard](/docs/recipes/observability) surfaces the same numbers: a run-header total, a per-call stat, and the summary text in the payload inspector.
+These are backed by three nullable columns added without breaking the schema — `llm_interactions.reasoning_tokens`, `token_usage.reasoning_tokens`, and `agent_runs.total_reasoning_tokens` (see [State persistence](/docs/architecture/state-persistence)). Your [inspection tools](/docs/recipes/observability) can present run totals, per-call stats and summary text from RunStore reads.
 
 ## Reasoning across tool calls
 

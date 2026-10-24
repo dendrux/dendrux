@@ -253,7 +253,7 @@ Cancellation is cooperative in both directions. A cancel (or pause) that arrives
 
 ### Paused runs show their spend
 
-When a run pauses, its running totals (`total_*` tokens and `total_cost_usd`) are written to the row at the same time. Before 0.3.0 a paused run could read zero until it finished; now `RunStore.get_run` and the dashboard show what it has spent so far.
+When a run pauses, its running totals (`total_*` tokens and `total_cost_usd`) are written to the row at the same time. Before 0.3.0 a paused run could read zero until it finished; now `RunStore.get_run` and your app can display what it has spent so far.
 
 ### SingleCall
 
@@ -266,7 +266,7 @@ The alternative to persist-and-exit is to keep the run in memory and block the c
 1. The human who has to approve is not on the same server that started the run.
 2. The server restarts while waiting.
 3. The pause lasts longer than an HTTP request, a worker lease, or a connection timeout.
-4. The app wants to read the paused state from a dashboard or a separate API.
+4. The app wants to read the paused state from an app-owned operator UI or a separate API.
 
 Persist-and-exit solves all four at once. The `agent_runs` row is the handoff token, `pause_data` carries what the runner needs, `run_events` gives readers the timeline, and the CAS on the status column keeps concurrent resumers honest.
 

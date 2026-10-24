@@ -86,6 +86,6 @@ result.replay
 #               warnings=["run 01J…: reasoning dropped (seed changed since the run was created)"])
 ```
 
-`result.replay` is `None` when `runs=` was not used. The same summary, plus the knobs, is stored in `agent_runs.meta["dendrux.replay"]` and surfaced on `RunStore.list_runs()` / `get_run()` as `RunSummary.replay` / `RunDetail.replay`; the dashboard run list carries `continued_from`. Warnings are also logged on the `dendrux.runtime.replay` logger.
+`result.replay` is `None` when `runs=` was not used. The same summary, plus the knobs, is stored in `agent_runs.meta["dendrux.replay"]` and surfaced on `RunStore.list_runs()` / `get_run()` as `RunSummary.replay` / `RunDetail.replay`; your app can display the source run IDs from that summary. Warnings are also logged on the `dendrux.runtime.replay` logger.
 
 A runnable walkthrough printing per-turn cache reads and writes is in `examples/34_run_replay.py`.

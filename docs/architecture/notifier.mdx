@@ -5,7 +5,7 @@ description: The pluggable side-channel hook for observing a run as it happens, 
 
 # Notifier
 
-A notifier is an object you pass to `agent.run(...)` that gets called at every point where the loop mutates conversation history, completes an LLM call, finishes a tool, or emits a governance event. It is the official extension point for terminal output, metrics, logs, Slack/webhook fanout, real-time dashboards, and anything else that wants to watch a run without owning its durability.
+A notifier is an object you pass to `agent.run(...)` that gets called at every point where the loop mutates conversation history, completes an LLM call, finishes a tool, or emits a governance event. It is the official extension point for terminal output, metrics, logs, Slack/webhook fanout, real-time inspection tools, and anything else that wants to watch a run without owning its durability.
 
 Two rules apply everywhere: a notifier never blocks the run, and a notifier that raises never kills the run. Both are enforced by the framework, not by convention.
 
@@ -167,7 +167,7 @@ on_message_appended    iter=2 role=assistant
 on_run_finished        status=success
 ```
 
-Nine callbacks for a two-iteration run. `on_run_started` opens it, `on_run_finished` closes it, and the body is interleaved messages, LLM completions, and tool completions in the order the loop executed them. Everything a human dashboard or an OpenTelemetry tracer needs to render a live transcript is here.
+Nine callbacks for a two-iteration run. `on_run_started` opens it, `on_run_finished` closes it, and the body is interleaved messages, LLM completions, and tool completions in the order the loop executed them. Everything a human operator UI or an OpenTelemetry tracer needs to render a live transcript is here.
 
 ## Why both started and completed
 
@@ -177,7 +177,7 @@ A pure completion-only surface looks tidy but breaks down under three real condi
 
 1. **Provider exceptions never reach completion.** `provider.complete()` can raise — network blip, rate limit, malformed schema. With only `on_llm_call_completed`, the notifier never hears about that call. With `on_llm_call_started` and `on_llm_call_failed`, the notifier opens a span on start, marks it errored on failure, and the trace tells the truth.
 2. **Span timing is wrong without start.** OpenTelemetry and similar tracers want a real start time, not "completion minus duration." The lifecycle pair gives them one.
-3. **Some observers care about prefetch state.** A dashboard that highlights "LLM call in progress" needs to know the call started before it ends.
+3. **Some observers care about prefetch state.** A operator UI that highlights "LLM call in progress" needs to know the call started before it ends.
 
 The same logic applies to runs (`on_run_started` / `on_run_finished` / `on_run_failed`) and to tools (`on_tool_started` / `on_tool_completed`). Tool failures take a slightly different shape — the loop catches them and emits `on_tool_completed` with `ToolResult(success=False)` — because the loop already wraps every dispatch in error handling and there is nothing the notifier could do that the loop has not already done. LLM failures, by contrast, propagate, so the notifier needs an explicit failed hook.
 

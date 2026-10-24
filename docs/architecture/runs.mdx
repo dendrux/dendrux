@@ -63,9 +63,9 @@ The runtime checks the pause type before accepting a submission. Submitting an a
 
 A run is more than its status. Three things about it are persisted.
 
-**Steps** are the chronological record of what happened: each LLM turn, each tool call, each pause and resume. When you load a run from the database, you get its full step history. This is what powers the dashboard's run-detail view, and it's what gets shipped to the LLM as conversation context on every iteration.
+**Steps** are the chronological record of what happened: each LLM turn, each tool call, each pause and resume. When you load a run from the database, you get its full step history. This is what powers the operator UI's run-detail view, and it's what gets shipped to the LLM as conversation context on every iteration.
 
-**Events** are atomic moments emitted as the run progresses: `run.started`, `llm.completed`, `tool.completed`, `run.paused`, `run.resumed`, `run.completed`. Each event has a monotonic `sequence_index` so SSE clients can reconnect and ask "give me everything after sequence 47" without losing or duplicating events. Events drive the live dashboard and any custom UI you build.
+**Events** are atomic moments emitted as the run progresses: `run.started`, `llm.completed`, `tool.completed`, `run.paused`, `run.resumed`, `run.completed`. Each event has a monotonic `sequence_index` so SSE clients can reconnect and ask "give me everything after sequence 47" without losing or duplicating events. Events drive the live operator UI and any custom UI you build.
 
 **Pause data** is the small payload attached to a run when it pauses. (A `paused` run has none outstanding: its pending call list is empty, and resume simply continues the loop.) For `waiting_client_tool` it's the list of pending tool calls the LLM made. For `waiting_human_input` it's the question being shown to the human. For `waiting_approval` it's the action the agent wants to take. Pause data is what your write endpoint reads to know what to render to the user.
 
@@ -144,7 +144,7 @@ When an answer is truncated, Dendrux also logs a warning with the run id and mod
 Where else to read it:
 
 - **Streams.** The `RUN_COMPLETED` event has `event.stop_reason` and `event.truncated`, and the stream's final `RunResult` has the same values.
-- **Events.** The `run.completed` event data is `{"status", "stop_reason", "truncated"}`. Both new keys are always present; `stop_reason` is `null` on `max_iterations` or when the provider reported none. It reaches `RunStore.get_events` and `make_read_router` SSE.
+- **Events.** The `run.completed` event data is `{"status", "stop_reason", "truncated"}`. Both new keys are always present; `stop_reason` is `null` on `max_iterations` or when the provider reported none. It reaches `RunStore.get_events` and `RunStore.follow`.
 - **Traces.** Each `llm_interactions.semantic_response` includes the `stop_reason` of that call.
 - **`cancel_run`.** On a run that already succeeded, `cancel_run` returns the stored `stop_reason`.
 
