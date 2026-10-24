@@ -36,24 +36,32 @@ pool) so viewers cannot starve the agents' connection pool. Push
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import dataclasses
 import inspect
 import json
 import logging
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime  # noqa: TC003 — FastAPI resolves query-param types at runtime
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
+from dendrux.errors import RunNotFoundError
 from dendrux.runtime.state import MAX_LIST_OFFSET, UNSCOPED, _Unscoped
+from dendrux.store._follow import (
+    PAUSE_STATUSES,
+    EventFeed,
+    Follow,
+    FollowCapacityError,
+    FollowEnd,
+    FollowHeartbeat,
+    redact_event,
+    without_params,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from starlette.types import Receive, Scope, Send
 
@@ -72,27 +80,12 @@ _LLM_CALLS_LIMIT_MAX = 200
 # `proxy_read_timeout` is 60s, so anything well under that works.
 _SSE_HEARTBEAT_INTERVAL_S = 15.0
 
-# Idle polling of a watched run starts at _SSE_POLL_INTERVAL_S and doubles up
-# to _SSE_POLL_MAX_S; any new event resets it. Overridable in tests.
+# EventFeed tuning for the router's feed (read when the router's feed is
+# first used). Overridable in tests. See ``dendrux.store._follow``.
 _SSE_POLL_INTERVAL_S = 0.5
 _SSE_POLL_MAX_S = 2.0
-# While idle, the run's status is read on every Nth poll (and right after a
-# terminal-looking event), so a run finalized without an event still ends.
 _SSE_STATUS_EVERY = 4
-_SSE_BATCH = 100
-# Events buffered for one slow client before it is closed with a cursor
-# (it reconnects with Last-Event-ID and catches up from the database).
 _SSE_CLIENT_BUFFER = 1000
-# Longest a closing stream waits for its cancelled poller to finish.
-_SSE_POLLER_STOP_S = 5.0
-
-_TERMINAL_STATUSES = frozenset({"success", "error", "cancelled", "max_iterations"})
-_TERMINAL_EVENT_TYPES = frozenset({"run.completed", "run.error", "run.cancelled"})
-
-# Event-data keys hidden unless include_payloads=True.
-_HIDDEN_EVENT_KEYS = frozenset(
-    {"system_prompt", "provider_request", "provider_response", "pii_mapping"}
-)
 
 
 @dataclass(frozen=True)
@@ -224,7 +217,14 @@ def make_read_router(
         sse_max_connections=sse_max_connections,
         sse_max_duration_s=float(sse_max_duration_s),
     )
-    hub = _SseHub(store, config)
+    feed_holder: list[EventFeed] = []
+
+    def feed() -> EventFeed:
+        # Built on first use so the module tuning knobs can be patched in tests.
+        if not feed_holder:
+            feed_holder.append(_make_feed(store, config.sse_max_connections))
+        return feed_holder[0]
+
     resolver = config.tenant_dependency
     payloads = config.include_payloads
 
@@ -307,7 +307,14 @@ def make_read_router(
         # response means "nothing new yet," not "stream is over." A poller
         # that reset to null after an empty batch would miss future events.
         next_cursor = events[-1].sequence_index if events else after
-        return {"items": [_event_view(e, payloads) for e in events], "next_cursor": next_cursor}
+        active = None
+        if not payloads and any(e.event_type == "run.paused" for e in events):
+            active = await _active_pause_sequence(store, run_id, scope)
+        items = [
+            redact_event(e, include_payloads=payloads, active_pause=e.sequence_index == active)
+            for e in events
+        ]
+        return {"items": items, "next_cursor": next_cursor}
 
     @auth_router.get("/runs/{run_id}/events/stream")
     async def stream_events(
@@ -332,33 +339,31 @@ def make_read_router(
         ``end`` frame. A ``: keepalive`` comment is sent every
         ``_SSE_HEARTBEAT_INTERVAL_S`` seconds of idleness.
         """
-        run = await store.get_run(run_id, tenant_id=scope)
-        if run is None:
-            raise _not_found(run_id)
-
         cursor = _resolve_sse_cursor(request.headers.get("last-event-id"), after)
-        if not follow and run.status in _TERMINAL_STATUSES:
-            pending = await store.get_events(
-                run_id, after_sequence_index=cursor, limit=1, tenant_id=scope
-            )
-            if not pending:
-                return Response(status_code=204)
-
-        if not hub.try_acquire():
-            logger.warning(
-                "SSE connection limit reached: run_id=%s code=sse_connection_limit limit=%d",
-                run_id,
-                config.sse_max_connections,
-                extra={"run_id": run_id, "code": "sse_connection_limit"},
-            )
+        stream = feed().follow(
+            run_id,
+            tenant_id=scope,
+            after_sequence_index=cursor,
+            include_payloads=payloads,
+            until_terminal=not follow,
+            max_duration_s=config.sse_max_duration_s,
+        )
+        try:
+            await stream.start()
+        except RunNotFoundError:
+            raise _not_found(run_id) from None
+        except FollowCapacityError:
             raise HTTPException(
                 status_code=503,
                 detail="Too many open event streams. Retry shortly.",
                 headers={"Retry-After": "5"},
-            )
+            ) from None
+        if stream.drained_terminal:
+            await stream.aclose()
+            return Response(status_code=204)
         return _SseResponse(
-            hub.stream(run_id, cursor, follow=follow),
-            release=hub.release,
+            _sse_frames(stream),
+            close=stream.aclose,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -424,10 +429,13 @@ def make_read_router(
         if await store.get_run(run_id, tenant_id=scope) is None:
             raise _not_found(run_id)
         items = await store.get_pauses(run_id, tenant_id=scope)
-        if not payloads:
+        if not payloads and items:
+            active = await _active_pause_sequence(store, run_id, scope)
             items = [
-                dataclasses.replace(
-                    p, pending_tool_calls=[_without_params(c) for c in p.pending_tool_calls]
+                p
+                if p.pause_sequence_index == active and p.resume_sequence_index is None
+                else dataclasses.replace(
+                    p, pending_tool_calls=[without_params(c) for c in p.pending_tool_calls]
                 )
                 for p in items
             ]
@@ -438,35 +446,31 @@ def make_read_router(
 
 
 # ---------------------------------------------------------------------------
-# Payload redaction (include_payloads=False)
+# Helpers over the store primitives
 # ---------------------------------------------------------------------------
 
 
-def _without_params(call: Any) -> Any:
-    if not isinstance(call, dict):
-        return call
-    return {k: v for k, v in call.items() if k not in ("params", "arguments")}
+async def _active_pause_sequence(store: RunStore, run_id: str, scope: Any) -> int | None:
+    """Index of the ``run.paused`` event of the pause the run is in now, else None.
+
+    Only that pause's arguments stay visible without ``include_payloads``.
+    """
+    run = await store.get_run(run_id, tenant_id=scope)
+    if run is None or run.status not in PAUSE_STATUSES:
+        return None
+    return await store._latest_pause_sequence(run_id)
 
 
-def _redact_event_data(event_type: str, data: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Event data without raw payloads: the system prompt, provider bodies, tool arguments."""
-    if not data:
-        return data
-    out = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}
-    if event_type == "run.paused" and isinstance(out.get("pending_tool_calls"), list):
-        out["pending_tool_calls"] = [_without_params(c) for c in out["pending_tool_calls"]]
-    return out
-
-
-def _event_view(event: StoredEvent, include_payloads: bool) -> StoredEvent:
-    if include_payloads:
-        return event
-    return dataclasses.replace(event, data=_redact_event_data(event.event_type, event.data))
-
-
-# ---------------------------------------------------------------------------
-# SSE
-# ---------------------------------------------------------------------------
+def _make_feed(store: RunStore, max_followers: int) -> EventFeed:
+    return EventFeed(
+        store,
+        max_followers=max_followers,
+        poll_interval_s=_SSE_POLL_INTERVAL_S,
+        poll_max_s=_SSE_POLL_MAX_S,
+        heartbeat_s=_SSE_HEARTBEAT_INTERVAL_S,
+        buffer=_SSE_CLIENT_BUFFER,
+        status_every=_SSE_STATUS_EVERY,
+    )
 
 
 def _resolve_sse_cursor(last_event_id: str | None, after: int | None) -> int | None:
@@ -487,172 +491,35 @@ def _resolve_sse_cursor(last_event_id: str | None, after: int | None) -> int | N
 
 
 class _SseResponse(StreamingResponse):
-    """A streaming response that releases its connection slot however it ends."""
+    """A streaming response that closes its follow (freeing the slot) however it ends."""
 
-    def __init__(self, content: AsyncIterator[str], *, release: Callable[[], None], **kw: Any):
+    def __init__(
+        self,
+        content: AsyncIterator[str],
+        *,
+        close: Callable[[], Awaitable[None]],
+        **kw: Any,
+    ) -> None:
         super().__init__(content, **kw)
-        self._release = release
+        self._close = close
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._release()
+            await self._close()
 
 
-@dataclass(eq=False)
-class _Subscriber:
-    """One SSE client of a run feed: a bounded buffer plus a wake-up signal."""
-
-    follow: bool
-    buffer: deque[StoredEvent] = field(default_factory=deque)
-    wake: asyncio.Event = field(default_factory=asyncio.Event)
-    end_reason: str | None = None
-
-    def push(self, event: StoredEvent) -> bool:
-        if len(self.buffer) >= _SSE_CLIENT_BUFFER:
-            self.end("lagging")
-            return False
-        self.buffer.append(event)
-        self.wake.set()
-        return True
-
-    def end(self, reason: str) -> None:
-        if self.end_reason is None:
-            self.end_reason = reason
-        self.wake.set()
-
-
-class _RunFeed:
-    """The single poller of one run, shared by every SSE client watching it.
-
-    It polls events after ``head`` (the last index it published) and pushes
-    them to each subscriber. It stops when its last subscriber leaves, or
-    once the run is terminal and drained if no subscriber follows.
-    """
-
-    def __init__(self, hub: _SseHub, run_id: str, head: int | None) -> None:
-        self.hub = hub
-        self.run_id = run_id
-        self.head = head
-        self.subscribers: set[_Subscriber] = set()
-        self.terminal = False
-        self.task: asyncio.Task[None] | None = None
-
-    def add(self, sub: _Subscriber) -> int | None:
-        """Register ``sub``; return the head it must catch up to from the database."""
-        self.subscribers.add(sub)
-        if self.terminal and not sub.follow:
-            sub.end("terminal")
-        if self.task is None or self.task.done():
-            self.task = asyncio.get_running_loop().create_task(
-                self._poll(), name=f"dendrux-sse-feed:{self.run_id}"
-            )
-        return self.head
-
-    def remove(self, sub: _Subscriber) -> asyncio.Task[None] | None:
-        """Unregister ``sub``; return the poller task to await when it was the last client."""
-        self.subscribers.discard(sub)
-        if self.subscribers:
-            return None
-        self.hub.drop(self)
-        task, self.task = self.task, None
-        if task is not None and not task.done():
-            task.cancel()
-            return task
-        return None
-
-    def _publish(self, events: list[StoredEvent]) -> None:
-        for event in events:
-            for sub in list(self.subscribers):
-                sub.push(event)
-            self.head = event.sequence_index
-
-    def _end_non_followers(self) -> None:
-        for sub in list(self.subscribers):
-            if not sub.follow:
-                sub.end("terminal")
-
-    async def _fetch(self) -> list[StoredEvent]:
-        return await self.hub.store.get_events(
-            self.run_id, after_sequence_index=self.head, limit=_SSE_BATCH
-        )
-
-    async def _poll(self) -> None:
-        delay = _SSE_POLL_INTERVAL_S
-        idle_polls = 0
-        check_status = True
-        try:
-            while self.subscribers:
-                if self.terminal and not any(s.follow for s in self.subscribers):
-                    return
-                events = await self._fetch()
-                self._publish(events)
-                if len(events) == _SSE_BATCH:
-                    continue  # more may be buffered; keep draining
-                if events:
-                    delay, idle_polls = _SSE_POLL_INTERVAL_S, 0
-                    check_status = check_status or any(
-                        e.event_type in _TERMINAL_EVENT_TYPES for e in events
-                    )
-                else:
-                    idle_polls += 1
-                    check_status = check_status or idle_polls % _SSE_STATUS_EVERY == 0
-                if not self.terminal and check_status:
-                    check_status = False
-                    run = await self.hub.store.get_run(self.run_id)
-                    if run is None or run.status in _TERMINAL_STATUSES:
-                        # Events committed before the status flip: drain them first.
-                        while True:
-                            tail = await self._fetch()
-                            self._publish(tail)
-                            if len(tail) < _SSE_BATCH:
-                                break
-                        self.terminal = True
-                        self._end_non_followers()
-                        continue
-                await asyncio.sleep(delay)
-                if not events:
-                    delay = min(delay * 2, _SSE_POLL_MAX_S)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                "SSE feed failed: run_id=%s code=sse_feed_error",
-                self.run_id,
-                exc_info=True,
-                extra={"run_id": self.run_id, "code": "sse_feed_error"},
-            )
-            for sub in list(self.subscribers):
-                sub.end("error")
-
-
-class _SseHub:
-    """Per-router SSE state: the connection cap and one feed per watched run."""
-
-    def __init__(self, store: RunStore, config: _ReadRouterConfig) -> None:
-        self.store = store
-        self.config = config
-        self.open = 0
-        self.feeds: dict[str, _RunFeed] = {}
-
-    def try_acquire(self) -> bool:
-        if self.open >= self.config.sse_max_connections:
-            return False
-        self.open += 1
-        return True
-
-    def release(self) -> None:
-        self.open = max(0, self.open - 1)
-
-    def drop(self, feed: _RunFeed) -> None:
-        if self.feeds.get(feed.run_id) is feed:
-            del self.feeds[feed.run_id]
-
-    def stream(self, run_id: str, cursor: int | None, *, follow: bool) -> AsyncIterator[str]:
-        return _sse_event_generator(
-            self.store, run_id, cursor, config=self.config, hub=self, follow=follow
-        )
+async def _sse_frames(stream: Follow) -> AsyncIterator[str]:
+    """SSE frames for a follow: events, ``: keepalive`` comments, then ``event: end``."""
+    async for item in stream:
+        if isinstance(item, FollowEnd):
+            yield _format_end_frame(item.reason, item.cursor)
+            return
+        if isinstance(item, FollowHeartbeat):
+            yield ": keepalive\n\n"
+            continue
+        yield _format_sse_frame(item)
 
 
 async def _sse_event_generator(
@@ -660,103 +527,24 @@ async def _sse_event_generator(
     run_id: str,
     cursor: int | None,
     *,
-    config: _ReadRouterConfig | None = None,
-    hub: _SseHub | None = None,
     follow: bool = False,
+    include_payloads: bool = True,
+    max_duration_s: float | None = None,
 ) -> AsyncIterator[str]:
-    """Yield SSE frames for one client until the stream ends or the client leaves.
-
-    The client registers with the run's shared feed, then reads the events
-    between its cursor and the feed's head straight from the database (in
-    batches), then takes live events from the feed. No transaction is held
-    across a wait. Ends with an ``end`` frame (terminal and drained,
-    ``max_duration``, ``lagging`` or ``error``).
-    """
-    if config is None:
-        config = _ReadRouterConfig(
-            tenant_dependency=_unscoped_tenant,
-            include_payloads=True,
-            sse_max_connections=1,
-            sse_max_duration_s=float("inf"),
-        )
-    if hub is None:
-        hub = _SseHub(store, config)
-    feed = hub.feeds.get(run_id)
-    if feed is None:
-        head = await _current_head(store, run_id)
-        # Another client may have created the feed while we read the head.
-        feed = hub.feeds.get(run_id) or hub.feeds.setdefault(run_id, _RunFeed(hub, run_id, head))
-    sub = _Subscriber(follow=follow)
-    loop = asyncio.get_running_loop()
-    started = last_write = loop.time()
+    """SSE frames for one standalone follower (its own feed). Kept for tests and tooling."""
+    stream = _make_feed(store, 1).follow(
+        run_id,
+        tenant_id=UNSCOPED,
+        after_sequence_index=cursor,
+        include_payloads=include_payloads,
+        until_terminal=not follow,
+        max_duration_s=max_duration_s,
+    )
     try:
-        head = feed.add(sub)
-        if head is not None and (cursor is None or cursor < head):
-            while True:
-                batch = await store.get_events(
-                    run_id, after_sequence_index=cursor, limit=_SSE_BATCH
-                )
-                for ev in batch:
-                    if ev.sequence_index > head:
-                        break
-                    yield _format_sse_frame(ev, config.include_payloads)
-                    cursor = ev.sequence_index
-                if len(batch) < _SSE_BATCH or cursor is None or cursor >= head:
-                    break
-            last_write = loop.time()
-
-        while True:
-            while sub.buffer:
-                ev = sub.buffer.popleft()
-                if cursor is None or ev.sequence_index > cursor:
-                    yield _format_sse_frame(ev, config.include_payloads)
-                    cursor = ev.sequence_index
-                    last_write = loop.time()
-            if sub.end_reason is not None:
-                yield _format_end_frame(sub.end_reason, cursor)
-                return
-            now = loop.time()
-            if now - started >= config.sse_max_duration_s:
-                yield _format_end_frame("max_duration", cursor)
-                return
-            if now - last_write >= _SSE_HEARTBEAT_INTERVAL_S:
-                yield ": keepalive\n\n"
-                last_write = loop.time()
-                continue
-            timeout = min(
-                _SSE_HEARTBEAT_INTERVAL_S - (now - last_write),
-                config.sse_max_duration_s - (now - started),
-            )
-            sub.wake.clear()
-            if sub.buffer or sub.end_reason is not None:
-                continue
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(sub.wake.wait(), timeout=max(timeout, 0.0))
+        async for frame in _sse_frames(stream):
+            yield frame
     finally:
-        poller = feed.remove(sub)
-        if poller is not None:
-            # Let the cancelled poller finish (and return its connection) before
-            # the stream is reported closed: no task outlives its last client.
-            await asyncio.wait({poller}, timeout=_SSE_POLLER_STOP_S)
-
-
-async def _current_head(store: RunStore, run_id: str) -> int | None:
-    """The run's highest event index now (None when it has none), from the database.
-
-    A new feed starts here, never at a client-supplied cursor, so one
-    client's bogus ``Last-Event-ID`` cannot hide events from the others.
-    """
-    state = getattr(store, "_state", None)
-    next_index = getattr(state, "get_next_event_sequence", None)
-    if next_index is not None:
-        value = int(await next_index(run_id))
-        return value - 1 if value > 0 else None
-    head: int | None = None
-    while True:  # custom store fallback: page to the end
-        batch = await store.get_events(run_id, after_sequence_index=head, limit=_SSE_BATCH)
-        if not batch:
-            return head
-        head = batch[-1].sequence_index
+        await stream.aclose()
 
 
 def _rfc3339(value: datetime | None) -> str | None:
@@ -766,7 +554,7 @@ def _rfc3339(value: datetime | None) -> str | None:
     return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _format_sse_frame(event: StoredEvent, include_payloads: bool = True) -> str:
+def _format_sse_frame(event: StoredEvent) -> str:
     """Encode a StoredEvent as one SSE frame.
 
     Uses ``event: message`` (the SSE default) with ``event_type`` inside
@@ -774,14 +562,13 @@ def _format_sse_frame(event: StoredEvent, include_payloads: bool = True) -> str:
     name don't have to pre-enroll every Dendrux event type. ``timestamp``
     is RFC 3339 in UTC (``...Z``).
     """
-    data = event.data if include_payloads else _redact_event_data(event.event_type, event.data)
     payload = {
         "sequence_index": event.sequence_index,
         "iteration_index": event.iteration_index,
         "event_type": event.event_type,
         "correlation_id": event.correlation_id,
         "timestamp": _rfc3339(event.created_at),
-        "data": data,
+        "data": event.data,
     }
     return (
         f"id: {event.sequence_index}\nevent: message\ndata: {json.dumps(payload, default=str)}\n\n"

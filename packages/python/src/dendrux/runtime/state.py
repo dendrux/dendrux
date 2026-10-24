@@ -179,6 +179,38 @@ class RunControl:
     has_pending_notes: bool = False
 
 
+# Pause-state keys a pending read needs: everything but history, steps and usage.
+PAUSE_SUMMARY_KEYS = (
+    "agent_name",
+    "pending_tool_calls",
+    "pending_targets",
+    "approval_gates",
+    "pause_reason",
+    "pause_message",
+    "pause_id",
+    "budget_exceeded",
+)
+
+
+_PAUSE_SCALAR_KEYS = frozenset({"agent_name", "pause_reason", "pause_message", "pause_id"})
+
+
+@dataclass(frozen=True)
+class PauseSummary:
+    """The parts of a run's pause state that say what it waits for (no history).
+
+    ``pause`` holds :data:`PAUSE_SUMMARY_KEYS` from ``pause_data`` (missing keys
+    absent), ``last_step`` the last recorded step (its ``action`` carries a
+    clarification question), ``paused_event_sequence`` the index of the latest
+    ``run.paused`` event.
+    """
+
+    status: str
+    pause: dict[str, Any]
+    last_step: dict[str, Any] | None = None
+    paused_event_sequence: int | None = None
+
+
 @dataclass(frozen=True)
 class NoteRecord:
     """Lightweight read model for a ``run_inbox`` row."""
@@ -1988,6 +2020,63 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 return None
             return dict(row)  # type narrowing for mypy
 
+    async def get_pause_summary(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> PauseSummary | None:
+        """What a run waits for, in one bounded statement; None when missing or out of scope.
+
+        Only :data:`PAUSE_SUMMARY_KEYS` and the last step are extracted from
+        ``pause_data`` in SQL (``jsonb`` operators on Postgres, ``json_extract``
+        on SQLite), so the pause history never leaves the database.
+        """
+        from sqlalchemy import cast, func, literal_column, select
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        from dendrux.db.models import AgentRun, RunEvent
+
+        dialect = self._engine.dialect.name
+        parts: list[Any]
+        paused_seq = (
+            select(func.max(RunEvent.sequence_index))
+            .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+            .scalar_subquery()
+        )
+        if dialect == "postgresql":
+            doc = cast(AgentRun.pause_data, JSONB)
+            parts = [doc[key] for key in PAUSE_SUMMARY_KEYS] + [doc["steps"][-1]]
+        elif dialect == "sqlite":
+            parts = [func.json_extract(AgentRun.pause_data, f"$.{k}") for k in PAUSE_SUMMARY_KEYS]
+            parts.append(func.json_extract(AgentRun.pause_data, literal_column("'$.steps[#-1]'")))
+        else:
+            parts = [AgentRun.pause_data]
+        stmt = _apply_tenant_scope(
+            select(AgentRun.status, paused_seq, *parts).where(AgentRun.id == run_id), tenant_id
+        )
+        async with self._session_factory() as session:
+            row = (await session.execute(stmt)).first()
+        if row is None:
+            return None
+        status, seq, *values = row
+        if dialect not in ("postgresql", "sqlite"):
+            data = dict(values[0] or {})
+            steps = data.get("steps") or []
+            pause = {k: data[k] for k in PAUSE_SUMMARY_KEYS if k in data}
+            return PauseSummary(str(status), pause, steps[-1] if steps else None, seq)
+        if dialect == "sqlite":
+            # json_extract returns arrays/objects as JSON text and scalars as values.
+            keys = (*PAUSE_SUMMARY_KEYS, "steps")
+            decoded = [
+                _json_value(v) if k not in _PAUSE_SCALAR_KEYS else v
+                for k, v in zip(keys, values, strict=True)
+            ]
+        else:
+            decoded = list(values)
+        pause = {
+            k: v for k, v in zip(PAUSE_SUMMARY_KEYS, decoded[:-1], strict=True) if v is not None
+        }
+        last = decoded[-1]
+        return PauseSummary(str(status), pause, last if isinstance(last, dict) else None, seq)
+
     async def get_pii_mapping(
         self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
     ) -> dict[str, str] | None:
@@ -3117,6 +3206,16 @@ def _apply_tenant_scope(stmt: Any, tenant_id: TenantScope) -> Any:
     if tenant_id is None:
         return stmt.where(AgentRun.tenant_id.is_(None))
     return stmt.where(AgentRun.tenant_id == tenant_id)
+
+
+def _json_value(value: Any) -> Any:
+    """A SQLite ``json_extract`` array/object result (JSON text) decoded."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
 
 
 def _check_scope(tenant_id: object) -> None:

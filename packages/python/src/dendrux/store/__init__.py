@@ -40,9 +40,11 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+import warnings
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
 
+from dendrux._sentinel import _OmittedType
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.errors import BlobNotFoundError, RunNotFoundError
 from dendrux.media._ids import image_id
@@ -57,6 +59,15 @@ from dendrux.runtime.state import (
     _check_scope,
     _to_aware_utc,
     _Unscoped,
+)
+from dendrux.store._follow import (
+    EventFeed,
+    Follow,
+    FollowCapacityError,
+    FollowEnd,
+    FollowHeartbeat,
+    FollowItem,
+    redact_event,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
 
@@ -74,6 +85,8 @@ if TYPE_CHECKING:
 
 ERROR_INFO_META_KEY = "dendrux.error_info"
 """``agent_runs.meta`` key holding a provider failure's :class:`ErrorInfo` dict."""
+
+_OMITTED_TENANT = _OmittedType()
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +318,83 @@ class PausePair:
     pause_id: str | None = None
 
 
+PendingKind = Literal["client_tool", "approval", "input", "paused"]
+_KIND_BY_STATUS: dict[str, PendingKind] = {
+    "waiting_client_tool": "client_tool",
+    "waiting_approval": "approval",
+    "waiting_human_input": "input",
+    "paused": "paused",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PendingToolCall:
+    """One call the active pause waits on: a client tool to run, or a call to approve.
+
+    ``params`` are the arguments in the form the 0.4.1 ``run.paused`` event
+    and ``RunResult.meta["pause_state"]`` carry them, which is the form a
+    client tool receives: after guardrail de-anonymisation, so with
+    ``PII(restore="all")`` (the default) they hold real values, not
+    ``<<TYPE_N>>`` placeholders. ``target`` is ``"client"`` or ``"server"``.
+    ``approval`` is ``{"source": "static" | "hook", "reason": ...}`` for a
+    call waiting for approval, else None.
+    """
+
+    id: str
+    name: str
+    target: str | None
+    params: dict[str, Any]
+    approval: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPause:
+    """What a paused run is waiting for (``RunStore.get_pending``).
+
+    ``kind``: ``"client_tool"`` (run ``tool_calls`` and submit results),
+    ``"approval"`` (approve or reject ``tool_calls``), ``"input"`` (answer
+    ``question``, with suggested ``options``) or ``"paused"`` (a requested
+    or budget pause; see ``reason``, ``message``, ``budget_exceeded``).
+    ``pause_id`` identifies this pause (None until the runtime records one).
+    :meth:`to_dict` gives the ``run.paused`` event shape plus the extra fields.
+    """
+
+    run_id: str
+    status: str
+    kind: PendingKind
+    pause_id: str | None
+    tool_calls: list[PendingToolCall] = field(default_factory=list)
+    question: str | None = None
+    options: list[str] = field(default_factory=list)
+    reason: str | None = None
+    message: str | None = None
+    budget_exceeded: list[dict[str, Any]] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-ready dict in the ``run.paused`` shape (``pending_tool_calls`` etc.)."""
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "kind": self.kind,
+            "pause_id": self.pause_id,
+            "pending_tool_calls": [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "target": c.target,
+                    "params": c.params,
+                    "approval": c.approval,
+                }
+                for c in self.tool_calls
+            ],
+            "question": self.question,
+            "options": list(self.options),
+            "reason": self.reason,
+            "message": self.message,
+            "exceeded": self.budget_exceeded,
+        }
+
+
 # ---------------------------------------------------------------------------
 # RunStore — the facade
 # ---------------------------------------------------------------------------
@@ -389,6 +479,7 @@ class RunStore:
         self._state = state_store
         self._owned_engine: AsyncEngine | None = None
         self._blob_services = BlobServices.for_state_store(state_store, blob_store=blob_store)
+        self._event_feed: EventFeed | None = None
 
     @classmethod
     def from_engine(cls, engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore:
@@ -624,9 +715,18 @@ class RunStore:
         *,
         after_sequence_index: int | None = None,
         poll_interval_s: float = 0.5,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED_TENANT,
     ) -> AsyncIterator[StoredEvent]:
-        """Stream events as they land in the durable log.
+        """Stream raw events as they land in the durable log (0.4 behaviour).
+
+        .. warning::
+           Omitting ``tenant_id`` reads **any tenant's** run (it means
+           ``UNSCOPED``, kept so 0.4.1 callers do not break) and emits a
+           ``DeprecationWarning``. Pass ``tenant_id=`` explicitly.
+           For anything served to clients prefer :meth:`follow`: it shares one
+           poller per run, ends when the run is terminal, caps followers and
+           duration, and redacts payloads. This method does none of that; it
+           polls once per caller and never ends on its own.
 
         Raises :class:`RunNotFoundError` before the first yield if
         ``run_id`` does not exist or is outside ``tenant_id``. The caller
@@ -634,6 +734,9 @@ class RunStore:
         a terminal ``event_type`` or by calling ``aclose()`` on the returned
         generator. A run's tenant never changes, so the scope is checked once.
         """
+        if isinstance(tenant_id, _OmittedType):
+            _warn_stream_events_unscoped()
+            tenant_id = UNSCOPED
         run = await self._scoped_run(run_id, tenant_id)
         if run is None:
             raise RunNotFoundError(run_id)
@@ -799,6 +902,90 @@ class RunStore:
         )
         return _derive_pauses(rows or [])
 
+    async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
+        """What the run is waiting for now, or None when it is not paused.
+
+        ``tenant_id`` is required (keyword-only): a string or ``None`` scopes
+        the read, ``UNSCOPED`` reads any tenant and must be passed explicitly.
+        One bounded read on the built-in store: the pause history is never
+        loaded. Use it after a reload, a reconnect, a timed-out request or a
+        retried idempotent call to rebuild the client's form or tool call.
+        Arguments are in the form described on :class:`PendingToolCall`.
+
+        Raises:
+            RunNotFoundError: the run does not exist or is outside ``tenant_id``.
+        """
+        _check_scope(tenant_id)
+        getter = getattr(self._state, "get_pause_summary", None)
+        if getter is not None:
+            summary = await getter(run_id, tenant_id=tenant_id)
+            if summary is None:
+                raise RunNotFoundError(run_id)
+            status, pause, last_step = summary.status, summary.pause, summary.last_step
+        else:  # custom store: scope by lookup, then the full pause state
+            record = await self._scoped_run(run_id, tenant_id)
+            if record is None:
+                raise RunNotFoundError(run_id)
+            status = record.status
+            full = await self._state.get_pause_state(run_id) or {}
+            pause = dict(full)
+            steps = full.get("steps") or []
+            last_step = steps[-1] if steps else None
+        kind = _KIND_BY_STATUS.get(status)
+        if kind is None:
+            return None
+        return _pending_from(run_id, status, kind, pause, last_step)
+
+    def follow(
+        self,
+        run_id: str,
+        *,
+        tenant_id: TenantScope,
+        after_sequence_index: int | None = None,
+        include_payloads: bool = False,
+        until_terminal: bool = True,
+        max_duration_s: float | None = 900.0,
+    ) -> Follow:
+        """A hardened live feed of the run's events; see :meth:`EventFeed.follow`.
+
+        Uses this store's shared :class:`EventFeed` (one poller per watched
+        run, at most 500 followers; build your own ``EventFeed(store, ...)``
+        for other limits). ``tenant_id`` is required. Events pass through
+        :func:`redact_event`: with ``include_payloads=False`` the system
+        prompt, provider bodies and past pauses' arguments are hidden, while
+        the active pause's arguments stay visible. Ends with a
+        :class:`FollowEnd` (``"terminal"`` once the run finished and drained).
+
+        Example::
+
+            async with store.follow(run_id, tenant_id=tenant, after_sequence_index=cursor) as f:
+                async for item in f:
+                    if isinstance(item, FollowEnd):
+                        break
+                    if isinstance(item, FollowHeartbeat):
+                        continue
+                    send(item)
+        """
+        if self._event_feed is None:
+            self._event_feed = EventFeed(self)
+        return self._event_feed.follow(
+            run_id,
+            tenant_id=tenant_id,
+            after_sequence_index=after_sequence_index,
+            include_payloads=include_payloads,
+            until_terminal=until_terminal,
+            max_duration_s=max_duration_s,
+        )
+
+    async def _latest_pause_sequence(self, run_id: str) -> int | None:
+        """Index of the run's latest ``run.paused`` event (unscoped; callers scope first)."""
+        getter = getattr(self._state, "get_pause_summary", None)
+        if getter is not None:
+            summary = await getter(run_id)
+            return summary.paused_event_sequence if summary is not None else None
+        rows = await self._state.get_run_events(run_id, event_types=["run.paused"])
+        return rows[-1].sequence_index if rows else None
+
     # ------------------------------------------------------------------
     # Tenant scoping
     # ------------------------------------------------------------------
@@ -857,6 +1044,61 @@ def _run_to_summary(record: Any) -> RunSummary:
         total_reasoning_tokens=record.total_reasoning_tokens,
         replay=_replay_of(record),
         tenant_id=getattr(record, "tenant_id", None),
+    )
+
+
+def _warn_stream_events_unscoped() -> None:
+    # Deduplicated by ``warnings`` per caller location (the ``async for`` site).
+    warnings.warn(
+        "RunStore.stream_events() was called without tenant_id, so it reads any tenant's "
+        "run. Pass tenant_id= (a tenant, None for untenanted runs, or UNSCOPED for a trusted "
+        "all-tenant reader), and prefer RunStore.follow() for client-facing feeds.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _pending_from(
+    run_id: str,
+    status: str,
+    kind: PendingKind,
+    pause: dict[str, Any],
+    last_step: dict[str, Any] | None,
+) -> PendingPause:
+    targets = pause.get("pending_targets") or {}
+    gates = pause.get("approval_gates") or {}
+    calls = []
+    for tc in pause.get("pending_tool_calls") or []:
+        if not isinstance(tc, dict) or "id" not in tc:
+            continue
+        gate = gates.get(tc["id"]) if isinstance(gates, dict) else None
+        calls.append(
+            PendingToolCall(
+                id=str(tc["id"]),
+                name=str(tc.get("name", "")),
+                target=targets.get(tc["id"]) if isinstance(targets, dict) else None,
+                params=dict(tc.get("params") or {}),
+                approval=dict(gate) if isinstance(gate, dict) else None,
+            )
+        )
+    question: str | None = None
+    options: list[str] = []
+    action = (last_step or {}).get("action") if kind == "input" else None
+    if isinstance(action, dict) and action.get("type") == "clarification":
+        question = action.get("question")
+        options = [str(o) for o in action.get("options") or []]
+    exceeded = pause.get("budget_exceeded")
+    return PendingPause(
+        run_id=run_id,
+        status=status,
+        kind=kind,
+        pause_id=pause.get("pause_id") if isinstance(pause.get("pause_id"), str) else None,
+        tool_calls=calls,
+        question=question,
+        options=options,
+        reason=pause.get("pause_reason"),
+        message=pause.get("pause_message"),
+        budget_exceeded=exceeded if isinstance(exceeded, list) else None,
     )
 
 
@@ -1035,8 +1277,16 @@ def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
 
 
 __all__ = [
+    "EventFeed",
+    "Follow",
+    "FollowCapacityError",
+    "FollowEnd",
+    "FollowHeartbeat",
+    "FollowItem",
     "LLMCall",
     "PausePair",
+    "PendingPause",
+    "PendingToolCall",
     "RunDetail",
     "RunNote",
     "RunNotFoundError",
@@ -1050,4 +1300,5 @@ __all__ = [
     "ToolInvocation",
     "TraceEntry",
     "UNSCOPED",
+    "redact_event",
 ]

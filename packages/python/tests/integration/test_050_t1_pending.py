@@ -1,0 +1,276 @@
+"""0.5.0 T1 change round on the backend matrix (SQLite + Postgres).
+
+- ``RunStore.get_pending``: every pause kind, the bounded JSON extraction on
+  both dialects, and the fail-closed tenant scope.
+- B2 amendment: with the router defaults (``include_payloads=False``) the
+  client-tools flow and the approval flow still see the active pause's
+  arguments; past pauses and other payloads stay hidden.
+- ``RunStore.follow`` under concurrency: many followers of one run share one
+  poller and all receive every event.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from dendrux.errors import RunNotFoundError
+from dendrux.http import make_read_router
+from dendrux.store import UNSCOPED, EventFeed, FollowEnd, RunStore, StoredEvent
+from dendrux.types import ToolResult
+from tests.integration.test_tenant_run_control import _pause
+
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def run_store(engine: Any) -> RunStore:
+    return RunStore.from_engine(engine)
+
+
+async def _allow() -> None:
+    return None
+
+
+def _client(run_store: RunStore) -> AsyncClient:
+    app = FastAPI()
+    app.include_router(
+        make_read_router(store=run_store, authorize=_allow, tenant_resolver=UNSCOPED)
+    )
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
+
+
+# ---------------------------------------------------------------------------
+# get_pending
+# ---------------------------------------------------------------------------
+
+
+async def test_client_tool_pause(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("client", store, "acme")
+    pending = await run_store.get_pending(paused.run_id, tenant_id="acme")
+    assert pending is not None
+    assert (pending.kind, pending.status) == ("client_tool", "waiting_client_tool")
+    (call,) = pending.tool_calls
+    assert (call.name, call.target, call.params, call.approval) == (
+        "read_range",
+        "client",
+        {"sheet": "S1"},
+        None,
+    )
+    raw = await store.get_pause_state(paused.run_id)
+    assert call.id == raw["pending_tool_calls"][0]["id"]
+    assert pending.to_dict()["pending_tool_calls"][0]["params"] == {"sheet": "S1"}
+
+
+async def test_approval_pause_carries_args_and_gate(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("approval", store, None)
+    pending = await run_store.get_pending(paused.run_id, tenant_id=None)
+    assert pending is not None and pending.kind == "approval"
+    (call,) = pending.tool_calls
+    assert (call.name, call.params) == ("refund", {"order_id": 7})
+    assert call.approval is not None and call.approval == {
+        "source": "static",
+        "reason": "requires_approval",
+    }
+
+
+async def test_requested_pause_has_reason(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("paused", store, None)
+    pending = await run_store.get_pending(paused.run_id, tenant_id=UNSCOPED)
+    assert pending is not None
+    assert (pending.kind, pending.reason) == ("paused", "requested")
+
+
+async def test_input_pause_has_the_question(store: Any, run_store: RunStore) -> None:
+    await store.create_run("ri", "agent", tenant_id="t")
+    await store.pause_run(
+        "ri",
+        status="waiting_human_input",
+        pause_data={
+            "agent_name": "agent",
+            "pending_tool_calls": [],
+            "history": [{"role": "user", "content": "x" * 5000}],
+            "steps": [
+                {"reasoning": None, "action": {"type": "finish", "answer": "a"}},
+                {
+                    "reasoning": None,
+                    "action": {"type": "clarification", "question": "Which?", "options": ["A"]},
+                },
+            ],
+            "pause_message": "[note] brackets are kept",
+        },
+    )
+    pending = await run_store.get_pending("ri", tenant_id="t")
+    assert pending is not None
+    assert (pending.kind, pending.question, pending.options) == ("input", "Which?", ["A"])
+    assert pending.message == "[note] brackets are kept"
+
+
+async def test_not_paused_is_none(store: Any, run_store: RunStore) -> None:
+    await store.create_run("rr", "agent")
+    assert await run_store.get_pending("rr", tenant_id=None) is None
+    await store.finalize_run("rr", status="success")
+    assert await run_store.get_pending("rr", tenant_id=None) is None
+
+
+async def test_scope_fails_closed(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("client", store, "acme")
+    for tenant in ("other", None):
+        with pytest.raises(RunNotFoundError):
+            await run_store.get_pending(paused.run_id, tenant_id=tenant)
+    with pytest.raises(RunNotFoundError):
+        await run_store.get_pending("missing", tenant_id="acme")
+    with pytest.raises(ValueError, match="tenant_id"):
+        await run_store.get_pending(paused.run_id, tenant_id="")
+    with pytest.raises(TypeError):
+        await run_store.get_pending(paused.run_id)  # type: ignore[call-arg]
+
+
+async def test_pending_read_does_not_load_history(
+    store: Any, run_store: RunStore, engine: Any
+) -> None:
+    """One statement, and the pause history column is never selected whole."""
+    from sqlalchemy import event
+
+    paused = await _pause("client", store, None)
+    statements: list[str] = []
+
+    def capture(_c: Any, _cur: Any, statement: str, *_a: Any) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        await run_store.get_pending(paused.run_id, tenant_id=None)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert len(selects) == 1
+    assert "history" not in selects[0]
+
+
+# ---------------------------------------------------------------------------
+# B2 amendment: the default router still serves the client-tools and approval flows
+# ---------------------------------------------------------------------------
+
+
+def _sse_events(body: str) -> list[dict[str, Any]]:
+    out = []
+    for block in body.split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+        if "data" in lines and lines.get("event", "message") == "message":
+            out.append(json.loads(lines["data"]))
+    return out
+
+
+async def test_client_tools_flow_with_defaults(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("client", store, None)
+    run_id = paused.run_id
+    async with _client(run_store) as http:
+        events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
+        call = next(e for e in events if e["event_type"] == "run.paused")["data"][
+            "pending_tool_calls"
+        ][0]
+        assert call["params"] == {
+            "sheet": "S1"
+        }  # what executeLocally(call.name, call.params) needs
+        pauses = (await http.get(f"/runs/{run_id}/pauses")).json()["items"]
+        assert pauses[-1]["pending_tool_calls"][0]["params"] == {"sheet": "S1"}
+
+        result = await paused.agent.submit_tool_results(
+            run_id, [ToolResult(name="read_range", call_id=call["id"], payload='"rows"')]
+        )
+        assert result.status.value == "success"
+
+        # The pause is history now: its arguments are hidden again.
+        events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
+        past = next(e for e in events if e["event_type"] == "run.paused")
+        assert "params" not in past["data"]["pending_tool_calls"][0]
+        pauses = (await http.get(f"/runs/{run_id}/pauses")).json()["items"]
+        assert "params" not in pauses[-1]["pending_tool_calls"][0]
+        stream = (await http.get(f"/runs/{run_id}/events/stream")).text
+        paused_frame = next(e for e in _sse_events(stream) if e["event_type"] == "run.paused")
+        assert "params" not in paused_frame["data"]["pending_tool_calls"][0]
+
+
+async def test_approval_flow_with_defaults(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("approval", store, None)
+    run_id = paused.run_id
+    async with _client(run_store) as http:
+        events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
+        data = next(e for e in events if e["event_type"] == "run.paused")["data"]
+        assert data["status"] == "waiting_approval"
+        assert data["pending_tool_calls"][0]["params"] == {"order_id": 7}  # the human sees it
+    pending = await run_store.get_pending(run_id, tenant_id=UNSCOPED)
+    assert pending is not None and pending.tool_calls[0].params == {"order_id": 7}
+    result = await paused.agent.submit_approval(run_id, approved=True)
+    assert result.status.value == "success"
+
+
+async def test_active_pause_args_reach_a_live_sse_client(store: Any, run_store: RunStore) -> None:
+    paused = await _pause("client", store, None)
+    follow = run_store.follow(paused.run_id, tenant_id=None)
+    async with follow as f:
+        items = []
+        while True:
+            item = await asyncio.wait_for(anext(f), 10)
+            if isinstance(item, StoredEvent):
+                items.append(item)
+                if item.event_type == "run.paused":
+                    break
+    call = items[-1].data["pending_tool_calls"][0]
+    assert call["params"] == {"sheet": "S1"}
+
+
+# ---------------------------------------------------------------------------
+# follow under concurrency
+# ---------------------------------------------------------------------------
+
+
+async def test_many_followers_one_poller(store: Any, run_store: RunStore) -> None:
+    await store.create_run("r1", "agent", tenant_id="T")
+    feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.05, status_every=1)
+    polls = {"n": 0}
+    original = run_store.get_events
+
+    async def counting(run_id: str, **kw: Any) -> Any:
+        polls["n"] += 1
+        return await original(run_id, **kw)
+
+    run_store.get_events = counting  # type: ignore[method-assign]
+    n_followers, n_events = 60, 30
+
+    async def follower() -> list[Any]:
+        async with feed.follow("r1", tenant_id="T") as f:
+            return [item async for item in f]
+
+    tasks = [asyncio.create_task(follower()) for _ in range(n_followers)]
+    try:
+        async with asyncio.timeout(20):
+            while feed.followers < n_followers:
+                await asyncio.sleep(0.01)
+        assert feed.watched_runs == 1
+        before = polls["n"]
+        await asyncio.sleep(0.2)
+        assert polls["n"] - before < 60  # idle polling is per run, not per follower
+
+        async def writer(i: int) -> None:
+            await store.save_run_event("r1", event_type=f"e{i}")
+
+        await asyncio.gather(*(writer(i) for i in range(n_events)))
+        await store.finalize_run("r1", status="success")
+        results = await asyncio.wait_for(asyncio.gather(*tasks), 30)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for items in results:
+        assert [i.sequence_index for i in items if isinstance(i, StoredEvent)] == list(
+            range(n_events)
+        )
+        assert items[-1] == FollowEnd("terminal", n_events - 1)
+    assert feed.watched_runs == 0 and feed.followers == 0

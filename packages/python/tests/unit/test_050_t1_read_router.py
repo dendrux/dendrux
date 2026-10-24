@@ -5,7 +5,6 @@ D-006), bounded reads (D-058, D-121) and SSE close/caps/shared polling (D-057).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from typing import Any
 
@@ -369,127 +368,31 @@ class TestSseClose:
         assert '"event_type": "late"' in nxt
         await gen.aclose()
 
-    async def test_max_duration_ends_with_cursor(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        await state.save_run_event("r1", event_type="tick")
-        config = rr._ReadRouterConfig(
-            tenant_dependency=rr._unscoped_tenant,
-            include_payloads=True,
-            sse_max_connections=5,
-            sse_max_duration_s=0.1,
-        )
-        frames = [
-            f
-            async for f in rr._sse_event_generator(store, "r1", None, config=config)
-            if not f.startswith(":")
-        ]
-        assert _frames(frames[-1])[0] == ("end", {"reason": "max_duration", "cursor": 0})
-
-
-class TestSseSharing:
-    async def test_many_clients_share_one_poller(self, state: Any, store: RunStore) -> None:
-        await state.create_run("r1", "a")
-        hub = rr._SseHub(store, rr._ReadRouterConfig(rr._unscoped_tenant, True, 100, 60.0))
-        polls = {"n": 0}
-        original = store.get_events
-
-        async def counting(run_id: str, **kw: Any) -> Any:
-            polls["n"] += 1
-            return await original(run_id, **kw)
-
-        store.get_events = counting  # type: ignore[method-assign]
-        gens = [hub.stream("r1", None, follow=False) for _ in range(20)]
-        waiting = [asyncio.ensure_future(g.__anext__()) for g in gens]
-        await asyncio.sleep(0.15)
-        assert len(hub.feeds) == 1
-        assert polls["n"] < 30  # one poller, not twenty
-        await state.save_run_event("r1", event_type="hello")
-        frames = await asyncio.wait_for(asyncio.gather(*waiting), 5)
-        assert all('"event_type": "hello"' in f for f in frames)
-        for g in gens:
-            await g.aclose()
-        await asyncio.sleep(0)
-        assert hub.feeds == {}
-
-    async def test_late_joiner_catches_up_from_the_database(
-        self, state: Any, store: RunStore
-    ) -> None:
-        await state.create_run("r1", "a")
-        hub = rr._SseHub(store, rr._ReadRouterConfig(rr._unscoped_tenant, True, 100, 60.0))
-        first = hub.stream("r1", None, follow=False)
-        pending = asyncio.ensure_future(first.__anext__())
-        await asyncio.sleep(0.03)
-        for i in range(5):
-            await state.save_run_event("r1", event_type=f"e{i}")
-        await asyncio.wait_for(pending, 5)
-        await asyncio.sleep(0.05)
-        late = hub.stream("r1", None, follow=False)
-        got = [json.loads((await late.__anext__()).split("data: ", 1)[1])["sequence_index"]]
-        for _ in range(4):
-            got.append(json.loads((await late.__anext__()).split("data: ", 1)[1])["sequence_index"])
-        assert got == [0, 1, 2, 3, 4]
-        await first.aclose()
-        await late.aclose()
-
-    async def test_bogus_cursor_does_not_hide_events_from_others(
-        self, state: Any, store: RunStore
-    ) -> None:
-        await state.create_run("r1", "a")
-        hub = rr._SseHub(store, rr._ReadRouterConfig(rr._unscoped_tenant, True, 100, 60.0))
-        liar = hub.stream("r1", 10_000, follow=False)
-        liar_next = asyncio.ensure_future(liar.__anext__())
-        await asyncio.sleep(0.03)
-        honest = hub.stream("r1", None, follow=False)
-        honest_next = asyncio.ensure_future(honest.__anext__())
-        await asyncio.sleep(0.03)
-        await state.save_run_event("r1", event_type="real")
-        frame = await asyncio.wait_for(honest_next, 5)
-        assert '"event_type": "real"' in frame
-        liar_next.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await liar_next
-        await liar.aclose()
-        await honest.aclose()
-
-    async def test_lagging_client_is_closed_with_its_cursor(
-        self, state: Any, store: RunStore, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(rr, "_SSE_CLIENT_BUFFER", 2)
-        await state.create_run("r1", "a")
-        hub = rr._SseHub(store, rr._ReadRouterConfig(rr._unscoped_tenant, True, 100, 60.0))
-        slow = hub.stream("r1", None, follow=False)
-        first = asyncio.ensure_future(slow.__anext__())
-        await asyncio.sleep(0.03)
-        for i in range(6):
-            await state.save_run_event("r1", event_type=f"e{i}")
-        await asyncio.wait_for(first, 5)
-        rest = [f async for f in slow]
-        end = _frames(rest[-1])[0]
-        assert end[0] == "end" and end[1]["reason"] == "lagging"
-        assert isinstance(end[1]["cursor"], int)
-
 
 class TestSseConnectionCap:
     async def test_full_router_returns_503_and_releases_slots(
-        self, state: Any, store: RunStore
+        self, state: Any, store: RunStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         await state.create_run("r1", "a")
         await state.save_run_event("r1", event_type="run.completed")
         await state.finalize_run("r1", status="success")
-        router = make_read_router(
-            store=store, authorize=_allow, tenant_resolver=UNSCOPED, sse_max_connections=1
-        )
-        app = FastAPI()
-        app.include_router(router)
-        stream_route = next(r for r in router.routes if r.path.endswith("/events/stream"))
-        hub = stream_route.endpoint.__closure__  # the hub is shared by the routes
-        hub_obj = next(c.cell_contents for c in hub if isinstance(c.cell_contents, rr._SseHub))
-        assert hub_obj.try_acquire()  # someone holds the only slot
+        feeds: list[Any] = []
+        make = rr._make_feed
+
+        def capture(*args: Any, **kwargs: Any) -> Any:
+            feeds.append(make(*args, **kwargs))
+            return feeds[-1]
+
+        monkeypatch.setattr(rr, "_make_feed", capture)
+        app = _app(store, UNSCOPED, sse_max_connections=1)
         async with _client(app) as http:
+            assert (await http.get("/runs/r1/events/stream?after=-1")).status_code == 200
+            (feed,) = feeds
+            assert feed.max_followers == 1 and feed.followers == 0  # released after the stream
+            feed._acquire()  # someone holds the only slot
             resp = await http.get("/runs/r1/events/stream?after=-1")
             assert resp.status_code == 503
             assert resp.headers["retry-after"] == "5"
-            hub_obj.release()
-            ok = await http.get("/runs/r1/events/stream?after=-1")
-            assert ok.status_code == 200
-        assert hub_obj.open == 0  # the finished stream released its slot
+            feed._release()
+            assert (await http.get("/runs/r1/events/stream?after=-1")).status_code == 200
+        assert feed.followers == 0
