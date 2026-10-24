@@ -27,7 +27,7 @@ MAX_EXPIRY_DAYS = 90
 
 # Packages that must appear in the report as audited. Their absence means the
 # auditor looked at the wrong environment or silently skipped it.
-EXPECTED_AUDITED = frozenset({"alembic", "fastapi", "httpx", "pydantic", "sqlalchemy", "typer"})
+EXPECTED_AUDITED = frozenset({"alembic", "httpx", "pydantic", "sqlalchemy", "typer"})
 # The package under test may not be on PyPI yet (a pre-release version).
 SKIP_ALLOWED = frozenset({"dendrux"})
 

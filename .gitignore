@@ -58,13 +58,5 @@ scratch/
 examples/**/output/
 **/examples/**/output/
 
-# Dashboard (React build output). The committed build is what ships in the wheel
-# (pyproject lists it under hatch `artifacts`), so after a rebuild run
-# `git add -f packages/python/src/dendrux/dashboard/static` to stage the new
-# hashed files; CI fails the wheel check if index.html points at a missing one.
-node_modules/
-packages/python/src/dendrux/dashboard/static/*
-!packages/python/src/dendrux/dashboard/static/.gitkeep
-
 # Private notes (never commit)
 meeting-prep.md

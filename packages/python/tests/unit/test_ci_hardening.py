@@ -100,27 +100,12 @@ class TestWorkflows:
 
 
 class TestCodeQL:
-    def test_covers_python_actions_and_the_dashboard_frontend(self) -> None:
+    def test_covers_python_and_actions(self) -> None:
         job = _workflow("codeql.yml")["jobs"]["analyze"]
         assert set(job["strategy"]["matrix"]["language"]) == {
             "python",
             "actions",
-            "javascript-typescript",
         }
-
-
-class TestDashboardFrontendJob:
-    def test_frontend_is_linted_tested_and_its_committed_build_verified(self) -> None:
-        job = _workflow("ci.yml")["jobs"]["dashboard"]
-        runs = "\n".join(step.get("run", "") for step in job["steps"])
-        for command in ("npm ci", "npm run lint", "npm test", "npm run build"):
-            assert command in runs
-        assert "git diff --exit-code" in runs
-        assert "git ls-files" in runs
-
-    def test_frontend_test_suite_exists(self) -> None:
-        tests = list((REPO / "packages" / "dashboard" / "src").rglob("*.test.tsx"))
-        assert tests
 
 
 class TestPostgresRequirement:
@@ -194,7 +179,6 @@ class TestRelease:
         text = "\n".join(s.get("run", "") for s in _all_steps(_workflow("release.yml")))
         assert "merge-base --is-ancestor" in text
         assert "twine check --strict" in text
-        assert "check_wheel_dashboard.py" in text
 
     def test_only_version_tags_trigger_it(self) -> None:
         release = _workflow("release.yml")
@@ -206,8 +190,7 @@ class TestDependabot:
     def test_covers_pip_and_actions(self) -> None:
         config = yaml.safe_load((GITHUB / "dependabot.yml").read_text())
         ecosystems = {u["package-ecosystem"]: u for u in config["updates"]}
-        assert set(ecosystems) == {"pip", "npm", "github-actions"}
-        assert ecosystems["npm"]["directory"] == "/packages/dashboard"
+        assert set(ecosystems) == {"pip", "github-actions"}
         assert ecosystems["pip"]["directory"] == "/packages/python"
         assert ecosystems["github-actions"]["directory"] == "/"
 
@@ -216,15 +199,6 @@ class TestPackaging:
     @pytest.fixture(scope="class")
     def project(self) -> dict:
         return tomllib.loads(PYPROJECT.read_text())
-
-    def test_uvicorn_is_bounded(self, project: dict) -> None:
-        for extra in ("http",):
-            uvicorn = next(
-                d
-                for d in project["project"]["optional-dependencies"][extra]
-                if d.startswith("uvicorn")
-            )
-            assert "<" in uvicorn and ">=" in uvicorn
 
     def test_dev_tools_are_bounded_or_pinned(self, project: dict) -> None:
         for dep in project["project"]["optional-dependencies"]["dev"]:
@@ -240,19 +214,9 @@ class TestPackaging:
         rev = next(r["rev"] for r in pre_commit["repos"] if "ruff" in r["repo"])
         assert rev == f"v{pinned}"
 
-    def test_dashboard_build_is_a_hatch_artifact(self, project: dict) -> None:
-        targets = project["tool"]["hatch"]["build"]["targets"]
-        for target in ("wheel", "sdist"):
-            assert "src/dendrux/dashboard/static/**" in targets[target]["artifacts"]
-
     def test_cli_is_inside_the_coverage_gate(self, project: dict) -> None:
         omit = project["tool"]["coverage"]["run"]["omit"]
         assert not any("cli" in pattern for pattern in omit)
-
-    def test_gitignore_points_at_the_real_package_path(self) -> None:
-        text = (REPO / ".gitignore").read_text()
-        assert "src/dendrite/" not in text
-        assert "packages/python/src/dendrux/dashboard/static/*" in text
 
 
 class TestAuditGate:
@@ -425,7 +389,7 @@ class TestAuditGate:
         assert self._ev(audit, {"entries": [entry]}, status=1) == []
 
     def test_default_expected_set_covers_core_packages(self) -> None:
-        assert {"pydantic", "sqlalchemy", "httpx", "fastapi"} <= self.gate.EXPECTED_AUDITED
+        assert {"pydantic", "sqlalchemy", "httpx"} <= self.gate.EXPECTED_AUDITED
 
     def test_shipped_allowlist_is_valid_today(self) -> None:
         import json
@@ -476,71 +440,3 @@ class TestAuditGate:
         bad.write_text("not json")
         assert run(bad) == 1
         assert self.gate.main(["gate", str(clean)]) == 2
-
-
-class TestWheelDashboardCheck:
-    check = _load_script("check_wheel_dashboard") if GITHUB.is_dir() else None
-    S = "dendrux/dashboard/static/"
-
-    def test_consistent_build_passes(self) -> None:
-        html = '<script src="./assets/index-abc.js"></script><link href="./assets/i.css">'
-        names = {f"{self.S}index.html", f"{self.S}assets/index-abc.js", f"{self.S}assets/i.css"}
-        assert self.check.problems(names, html) == []
-
-    def test_reference_to_a_missing_asset_fails(self) -> None:
-        html = '<script src="./assets/index-new.js"></script>'
-        names = {f"{self.S}index.html", f"{self.S}assets/index-old.js"}
-        problems = self.check.problems(names, html)
-        assert len(problems) == 1
-        assert "index-new.js" in problems[0]
-
-    def test_missing_index_fails(self) -> None:
-        assert self.check.problems({"dendrux/__init__.py"}, None)
-
-    def test_index_without_assets_fails(self) -> None:
-        names = {f"{self.S}index.html"}
-        assert self.check.problems(names, "<html></html>")
-
-    def test_committed_build_is_consistent(self) -> None:
-        static = REPO / "packages" / "python" / "src" / "dendrux" / "dashboard" / "static"
-        names = {
-            f"{self.S}{p.relative_to(static).as_posix()}" for p in static.rglob("*") if p.is_file()
-        }
-        html = (static / "index.html").read_text()
-        assert self.check.problems(names, html) == []
-
-    def test_committed_file_missing_from_the_wheel_fails(self, tmp_path: Path) -> None:
-        static = tmp_path / "static"
-        (static / "assets").mkdir(parents=True)
-        (static / "index.html").write_text("x")
-        (static / "assets" / "lazy-chunk.js").write_text("x")
-        names = {f"{self.S}index.html"}
-        problems = self.check.missing_from_wheel(names, static)
-        assert problems == [f"{self.S}assets/lazy-chunk.js is committed but not in the wheel."]
-        assert (
-            self.check.missing_from_wheel(names | {f"{self.S}assets/lazy-chunk.js"}, static) == []
-        )
-
-    def test_real_static_dir_is_fully_in_a_wheel_listing(self) -> None:
-        static = REPO / "packages" / "python" / "src" / "dendrux" / "dashboard" / "static"
-        names = {
-            f"{self.S}{p.relative_to(static).as_posix()}" for p in static.rglob("*") if p.is_file()
-        }
-        assert self.check.missing_from_wheel(names, static) == []
-
-    def test_main_reads_a_wheel(self, tmp_path: Path) -> None:
-        import zipfile
-
-        wheel = tmp_path / "w.whl"
-        with zipfile.ZipFile(wheel, "w") as z:
-            z.writestr(f"{self.S}index.html", '<script src="./assets/a.js"></script>')
-            z.writestr(f"{self.S}assets/a.js", "1")
-        assert self.check.main(["check", str(wheel)]) == 0
-        with zipfile.ZipFile(wheel, "w") as z:
-            z.writestr(f"{self.S}index.html", '<script src="./assets/a.js"></script>')
-        assert self.check.main(["check", str(wheel)]) == 1
-        empty = tmp_path / "e.whl"
-        with zipfile.ZipFile(empty, "w") as z:
-            z.writestr("x", "1")
-        assert self.check.main(["check", str(empty)]) == 1
-        assert self.check.main(["check"]) == 2

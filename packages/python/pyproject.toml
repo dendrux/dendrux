@@ -35,7 +35,7 @@ dependencies = [
     # httpx is imported at module load on the core import path
     # (llm/_retry_telemetry.py, pulled in via loops). It must be a hard
     # dependency so `import dendrux` works without a provider extra — e.g.
-    # a read-only consumer using RunStore + make_read_router.
+    # a read-only consumer using RunStore.
     "httpx>=0.27,<1.0",
 ]
 
@@ -44,7 +44,6 @@ anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=1.50,<3.0"]
 # OpenRouter rides the OpenAI-compatible transport — alias for discoverability.
 openrouter = ["dendrux[openai]"]
-http = ["fastapi>=0.135,<1.0", "uvicorn[standard]>=0.30,<1.0"]
 # `db` is kept as an empty alias for backwards compatibility with anyone
 # who already depends on `dendrux[db]`. SQLAlchemy + aiosqlite + alembic
 # are now hard dependencies.
@@ -55,8 +54,10 @@ mcp = ["mcp>=2.2,<3.0", "httpx2>=2.9.1,<3.0", "httpcore2>=2.9.1,<3.0"]
 #   python -m spacy download en_core_web_lg
 presidio = ["presidio-analyzer>=2.2,<3"]
 otel = ["opentelemetry-api>=1.30,<2.0"]
-all = ["dendrux[anthropic,openai,http,postgres,mcp,presidio,otel]"]
+all = ["dendrux[anthropic,openai,postgres,mcp,presidio,otel]"]
 dev = [
+    "fastapi>=0.135,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
     "build>=1.4,<2.0",
     "pytest>=8.0,<10.0",
     "pytest-asyncio>=0.23,<2.0",
@@ -86,9 +87,6 @@ build-backend = "hatchling.build"
 packages = ["src/dendrux"]
 # Keep upload tooling compatible while Core Metadata 2.5 adoption is incomplete.
 core-metadata-version = "2.4"
-# The committed dashboard build ships in the wheel even if a .gitignore rule
-# matches it (the rule exists so a rebuild's stray files are not staged by accident).
-artifacts = ["src/dendrux/dashboard/static/**"]
 
 # Explicit allowlist so the sdist is deterministic: only these paths ship,
 # regardless of untracked working-tree files. Without it, hatchling's default
@@ -96,7 +94,6 @@ artifacts = ["src/dendrux/dashboard/static/**"]
 # output). The `output` exclude guards example runs that write in-tree.
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"
-artifacts = ["src/dendrux/dashboard/static/**"]
 include = [
     "src",
     "examples",
@@ -160,10 +157,6 @@ module = "alembic.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "fastapi.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = "uvicorn.*"
 ignore_missing_imports = true
 
@@ -174,14 +167,6 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "presidio_analyzer.*"
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "dendrux.dashboard.*"
-disallow_untyped_decorators = false
-
-[[tool.mypy.overrides]]
-module = "dendrux.http.*"
-disallow_untyped_decorators = false
 
 [[tool.mypy.overrides]]
 module = "dendrux.db.migrations.*"
