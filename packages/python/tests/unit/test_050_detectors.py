@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -221,6 +223,8 @@ class TestPhoneBoundaries:
             ("Call +1-555-123-4567 12345", "+1-555-123-4567"),
             ("Call +44 20 7946 0958 ext 12", "+44 20 7946 0958"),
             ("Call +1 (555) 123-4567 now", "+1 (555) 123-4567"),
+            ("Call +33 6 12 34 56 78", "+33 6 12 34 56 78"),
+            ("Call +49 30 123 45 67", "+49 30 123 45 67"),
         ],
     )
     async def test_exact_span(self, text: str, span: str) -> None:
@@ -277,13 +281,41 @@ class TestPresidioQueueIsBounded:
         await asyncio.gather(*tasks)
         scanner._executor.shutdown()
 
-    async def test_cancelled_waiters_release_their_slot(self) -> None:
-        scanner = self._scanner(0.1)
-        tasks = [asyncio.create_task(scanner.scan("x")) for _ in range(5)]
-        await asyncio.sleep(0.02)
-        for task in tasks[2:]:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.sleep(0.3)
+    async def test_cancelled_waiters_keep_retained_queue_bounded(self) -> None:
+        from dendrux.guardrails._pii import PRESIDIO_MAX_PENDING, _PresidioScanner
+        from dendrux.guardrails._protocol import UNSCANNABLE
+
+        gate = threading.Event()
+        started = threading.Event()
+
+        class Analyzer:
+            def analyze(self, text: str, language: str) -> list[object]:
+                started.set()
+                gate.wait(10)
+                return []
+
+        scanner = object.__new__(_PresidioScanner)
+        scanner._analyzer = Analyzer()
+        scanner._executor = ThreadPoolExecutor(max_workers=1)
+        scanner._pending = 0
+        scanner._pending_lock = threading.Lock()
+        running = asyncio.create_task(scanner.scan("running"))
+        try:
+            await asyncio.wait_for(asyncio.to_thread(started.wait, 2), 3)
+            assert started.is_set()
+            for i in range(64):
+                task = asyncio.create_task(scanner.scan(f"{i}" + "x" * 1024))
+                await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                assert scanner._pending <= PRESIDIO_MAX_PENDING
+                assert scanner._executor._work_queue.qsize() < PRESIDIO_MAX_PENDING
+            refused = await scanner.scan("one more")
+            assert [f.entity_type for f in refused] == [UNSCANNABLE]
+            assert scanner._pending == PRESIDIO_MAX_PENDING
+            assert scanner._executor._work_queue.qsize() == PRESIDIO_MAX_PENDING - 1
+        finally:
+            gate.set()
+            await running
+            scanner._executor.shutdown()
         assert scanner._pending == 0
-        scanner._executor.shutdown()

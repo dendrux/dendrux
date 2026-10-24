@@ -55,7 +55,7 @@ _DEFAULT_DETECTORS: list[Detector] = [
     # numbers, then a bare 10-digit run only right after a phone keyword.
     # Candidates are delimited by what follows (``(?!\d)``) and by a bounded
     # group count, so a number followed by an extension or another field is
-    # still found at its own boundary.
+    # still found at its own boundary. Five groups cover common EU formats.
     Detector(
         "PHONE_NUMBER",
         re.compile(r"(?<![\w+])\+[1-9]\d{7,14}(?!\d)"),
@@ -63,7 +63,7 @@ _DEFAULT_DETECTORS: list[Detector] = [
     ),
     Detector(
         "PHONE_NUMBER",
-        re.compile(r"(?<![\w+])\+\d{1,3}(?:[-.\s]?\(\d{1,4}\)|[-.\s]\d{1,4}){2,3}(?!\d)"),
+        re.compile(r"(?<![\w+])\+\d{1,3}(?:[-.\s]?\(\d{1,4}\)|[-.\s]\d{1,4}){2,5}(?!\d)"),
         validate=e164_digit_count,
         prefilter="+",
     ),
@@ -176,7 +176,10 @@ class _PresidioScanner:
             self._release(None)
             raise
         future.add_done_callback(self._release)
-        return await asyncio.wrap_future(future)
+        # Cancelling the waiter must not cancel a queued concurrent future:
+        # ThreadPoolExecutor retains that work item and its text until dequeue.
+        # Keep its reservation until the worker physically drains it.
+        return await asyncio.shield(asyncio.wrap_future(future))
 
 
 class PII:
