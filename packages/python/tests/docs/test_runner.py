@@ -62,7 +62,7 @@ async def test_docs_provider_calls_the_first_tool_then_answers() -> None:
         """Look it up."""
         return "x"
 
-    provider = DocsProvider(model="whatever", api_key="ignored")
+    provider = DocsProvider(model="whatever")
     first = await provider.complete([Message(role=Role.USER, content="hi")], [get_tool_def(lookup)])
     assert first.tool_calls and first.tool_calls[0].name == "lookup"
     assert first.tool_calls[0].params == {"order_id": 1, "note": "example"}
@@ -73,3 +73,58 @@ async def test_docs_provider_calls_the_first_tool_then_answers() -> None:
     assert not second.tool_calls
     assert second.text
     assert isinstance(first.tool_calls[0], ToolCall)
+
+
+class TestProviderMocksCheckTheRealConstructor:
+    """The docs mock must reject what the real provider constructor rejects."""
+
+    def _run(self, code: str) -> list[str]:
+        return run_page([_s(code)])
+
+    def test_a_valid_call_runs(self, docs_sandbox: None) -> None:
+        code = (
+            "from dendrux.llm.anthropic import AnthropicProvider\n"
+            "AnthropicProvider(model='claude-haiku-4-5', max_tokens=100)\n"
+        )
+        assert self._run(code) == []
+
+    def test_an_unknown_keyword_fails(self, docs_sandbox: None) -> None:
+        code = (
+            "from dendrux.llm.anthropic import AnthropicProvider\n"
+            "AnthropicProvider(model='claude-haiku-4-5', removed_option=True)\n"
+        )
+        failures = self._run(code)
+        assert failures and "removed_option" in failures[0]
+
+    def test_a_missing_required_model_fails(self, docs_sandbox: None) -> None:
+        for module, cls in (
+            ("anthropic", "AnthropicProvider"),
+            ("openai", "OpenAIProvider"),
+            ("openai_responses", "OpenAIResponsesProvider"),
+        ):
+            failures = self._run(f"from dendrux.llm.{module} import {cls}\n{cls}()\n")
+            assert failures and "model" in failures[0], cls
+
+    def test_discovery_only_construction_is_still_allowed(self, docs_sandbox: None) -> None:
+        code = (
+            "from dendrux.llm.openrouter import OpenRouterProvider\n"
+            "OpenRouterProvider(api_key='k')\n"
+        )
+        assert self._run(code) == []
+
+    def test_openrouter_forwards_extra_options_to_the_openai_provider(
+        self, docs_sandbox: None
+    ) -> None:
+        head = "from dendrux.llm.openrouter import OpenRouterProvider\n"
+        assert self._run(head + "OpenRouterProvider(model='m', max_tokens=10)\n") == []
+        bad = head + "OpenRouterProvider(model='m', nope=1)\n"
+        failures = self._run(bad)
+        assert failures and "nope" in failures[0]
+
+    def test_the_mock_still_answers_like_the_provider(self, docs_sandbox: None) -> None:
+        code = (
+            "from dendrux.llm.openai import OpenAIProvider\n"
+            "p = OpenAIProvider(model='gpt-x')\n"
+            "assert p.model == 'gpt-x'\n"
+        )
+        assert self._run(code) == []

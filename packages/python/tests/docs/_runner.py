@@ -6,6 +6,7 @@ import ast
 import asyncio
 import contextlib
 import importlib
+import inspect
 import signal
 import traceback
 from typing import TYPE_CHECKING, Any
@@ -42,7 +43,7 @@ class DocsProvider(MockLLM):
     answers with fixed text.
     """
 
-    def __init__(self, *args: Any, model: str = "mock-model", **kwargs: Any) -> None:
+    def __init__(self, *, model: str = "mock-model") -> None:
         super().__init__([], model=model)
 
     async def complete(  # type: ignore[override]
@@ -55,6 +56,58 @@ class DocsProvider(MockLLM):
             call = ToolCall(name=tools[0].name, params=_sample_args(tools[0]))
             return LLMResponse(tool_calls=[call], model=model)
         return LLMResponse(text="ok (docs mock reply)", model=model)
+
+
+def checked_provider_mock(real: type, forwards_to: type | None = None) -> type[DocsProvider]:
+    """A ``DocsProvider`` that accepts exactly the constructor calls ``real`` accepts.
+
+    The call is bound against the real signature, so an unknown keyword or a missing
+    required argument (``model``) fails as it would for a reader. ``forwards_to`` is the
+    class that receives a ``**kwargs`` passthrough (OpenRouter forwards to the OpenAI
+    provider); those names are checked against it.
+    """
+    signature = inspect.signature(real)
+    var_keyword = next(
+        (p.name for p in signature.parameters.values() if p.kind is p.VAR_KEYWORD), None
+    )
+    forwarded = inspect.signature(forwards_to).parameters if forwards_to else None
+
+    class _Checked(DocsProvider):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            bound = signature.bind(*args, **kwargs)
+            if var_keyword and forwarded is not None:
+                for name in bound.arguments.get(var_keyword, {}):
+                    if name not in forwarded:
+                        raise TypeError(
+                            f"{real.__name__}() got an unexpected keyword argument {name!r}"
+                        )
+            super().__init__(model=bound.arguments.get("model") or "mock-model")
+
+    _Checked.__name__ = _Checked.__qualname__ = real.__name__
+    return _Checked
+
+
+def provider_mocks() -> list[tuple[Any, str, type]]:
+    """(module, attribute, mock) for every provider class the docs construct."""
+    import dendrux.llm.anthropic as anthropic
+    import dendrux.llm.openai as openai
+    import dendrux.llm.openai_responses as openai_responses
+    import dendrux.llm.openrouter as openrouter
+
+    return [
+        (anthropic, "AnthropicProvider", checked_provider_mock(anthropic.AnthropicProvider)),
+        (openai, "OpenAIProvider", checked_provider_mock(openai.OpenAIProvider)),
+        (
+            openai_responses,
+            "OpenAIResponsesProvider",
+            checked_provider_mock(openai_responses.OpenAIResponsesProvider),
+        ),
+        (
+            openrouter,
+            "OpenRouterProvider",
+            checked_provider_mock(openrouter.OpenRouterProvider, openai.OpenAIProvider),
+        ),
+    ]
 
 
 @contextlib.contextmanager
