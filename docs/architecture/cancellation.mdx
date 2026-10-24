@@ -168,7 +168,7 @@ When `stream()` or `resume_stream()` starts driving the loop, the runner registe
 
 The runner persists that outcome exactly like any other terminal result: status `cancelled`, `answer` set to the partial text, and a `run.cancelled` event carrying `{"reason": "cancel_requested", "interrupted": true, "partial_output": true}`.
 
-[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 async with agent.stream("Write me a long essay") as stream:

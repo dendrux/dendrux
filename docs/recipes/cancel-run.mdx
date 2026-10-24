@@ -102,7 +102,7 @@ The returned `RunResult` is a receipt: `status` is still `running` and `meta["ca
 
 Since 0.3.0 a batch `run()` is interruptible too. If `agent.run(...)` is executing in this process and you call `cancel_run(run_id)` on the same `Agent` object, the in-flight model call or tool is cancelled and `run()` **returns** a result instead of raising:
 
-[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 task = asyncio.create_task(agent.run("Do the long thing"))

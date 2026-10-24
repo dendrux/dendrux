@@ -100,9 +100,9 @@ Providers now give up instead of hanging. Three keyword arguments exist on `Anth
 | `stream_idle_timeout` | 600 seconds | Longest gap between meaningful stream events. Keep-alive pings do not reset it |
 | `stream_total_timeout` | `None` | Optional cap on a whole stream |
 
-[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.llm.anthropic import AnthropicProvider
+
 AnthropicProvider(model="claude-sonnet-4-6", call_timeout=120, stream_idle_timeout=60)
 AnthropicProvider(model="claude-sonnet-4-6", call_timeout=None)   # no total deadline
 ```

@@ -75,9 +75,9 @@ guardrails=[
 
 The classic "override the policy" set. Strong anchors so they don't fire on legitimate phrasing.
 
-[//]: # "docs-test: skip - fragment: relies on `Pattern`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.guardrails import Pattern
+
 patterns=[
     # Instruction-override verbs combined with scope + target
     Pattern("INSTRUCTION_OVERRIDE",
@@ -99,9 +99,9 @@ patterns=[
 
 The biggest real-world risk: pages, emails, files, and search results that contain hidden instructions. These patterns target the containers attackers hide instructions in.
 
-[//]: # "docs-test: skip - fragment: relies on `Pattern`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.guardrails import Pattern
+
 patterns=[
     # System-prompt extraction attempts
     Pattern("SYSTEM_PROMPT_LEAK",
@@ -127,9 +127,9 @@ For RAG agents, prefer `action="warn"` initially. Run for a week, look at the `g
 
 Agents with shell access, code interpreters, or destructive APIs. Pair these patterns with `require_approval=[...]` on the tool itself for defense in depth.
 
-[//]: # "docs-test: skip - fragment: relies on `Pattern`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.guardrails import Pattern
+
 patterns=[
     # Model control tokens — no legitimate use in user or tool text
     Pattern("DELIMITER_INJECTION", r"<\|im_(start|end)\|>"),
@@ -149,7 +149,7 @@ patterns=[
 
 `PromptInjection` is one layer. Pair with the others for defense in depth:
 
-[//]: # "docs-test: skip - fragment: relies on `Budget`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 agent = Agent(

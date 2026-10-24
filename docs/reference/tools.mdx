@@ -227,9 +227,9 @@ If Anthropic still rejects a strict schema (its grammar compiler has size and re
 
 To turn strict mode off for a provider, pass `strict=False`:
 
-[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.llm.anthropic import AnthropicProvider
+
 provider = AnthropicProvider(model="claude-sonnet-4-6", strict=False)
 ```
 

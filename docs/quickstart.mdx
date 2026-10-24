@@ -29,17 +29,16 @@ Pick one of three patterns:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.llm.anthropic import AnthropicProvider
+
 provider = AnthropicProvider(model="claude-sonnet-4-6")  # picks up env var
 ```
 
 **B. Explicit argument.** Make the source of the key visible in code. Useful when you load it from a secrets manager.
 
-[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.llm.anthropic import AnthropicProvider
 import os
 provider = AnthropicProvider(
     model="claude-sonnet-4-6",
@@ -54,9 +53,8 @@ pip install python-dotenv
 echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 ```
 
-[//]: # "docs-test: skip - fragment: relies on `AnthropicProvider`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.llm.anthropic import AnthropicProvider
 from dotenv import load_dotenv
 load_dotenv()
 provider = AnthropicProvider(model="claude-sonnet-4-6")

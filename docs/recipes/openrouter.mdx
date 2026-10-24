@@ -57,7 +57,7 @@ dendrux also sends OpenRouter's `provider.require_parameters` routing flag by de
 
 The catalog is queryable as typed, immutable snapshots — no model needed, since discovery isn't tied to a chosen one. There are no filter kwargs either; every field is a filter axis, composed with plain Python:
 
-[//]: # "docs-test: skip - fragment: relies on `OpenRouterProvider`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - needs the live OpenRouter model catalog (list_models fetches over the network)"
 
 ```python
 async with OpenRouterProvider() as provider:   # discovery-only: no model required
@@ -103,7 +103,7 @@ What this unlocks: model-picker UIs that only offer models that will actually wo
 
 `OpenRouterModel` is a frozen dataclass of JSON-native fields, so it serializes without ceremony:
 
-[//]: # "docs-test: skip - fragment: relies on `OpenRouterProvider`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - needs the live OpenRouter model catalog (list_models fetches over the network)"
 
 ```python
 from dataclasses import asdict

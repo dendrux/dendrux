@@ -22,9 +22,9 @@ When you call `agent.run(input)`, the runner hands the request to the loop. The 
 
 The loop never touches provider-specific APIs or prompt formatting. That belongs to the strategy. The loop is pure orchestration: it owns the question "does the agent go around again?"
 
-[//]: # "docs-test: skip - fragment: relies on `ABC`, defined by setup shown elsewhere"
-
 ```python
+from abc import ABC
+
 class Loop(ABC):
     """Base class for agent execution loops.
 

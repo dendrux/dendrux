@@ -198,9 +198,9 @@ What happens when the answer is **no**:
 
 OpenRouter, OpenAI-compatible servers and other gateways word "this model has no image support" in their own ways. Dendrux recognises the OpenAI, OpenAI Responses and OpenRouter messages; a gateway that says it differently surfaces as `ProviderError` or `ImageRejectedError`, not `UnsupportedModalityError`. When you know a model cannot take images, say so up front and Dendrux never sends them:
 
-[//]: # "docs-test: skip - fragment: relies on `ImagePolicy`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.media import ImagePolicy
+
 ImagePolicy(capability_overrides={"my-gateway/text-model": "no"})
 ```
 

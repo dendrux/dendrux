@@ -102,9 +102,9 @@ async def shutdown():
 
 For a one-off script (not a pooled server) you can skip constructing the provider yourself:
 
-[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
-
 ```python
+from dendrux import Agent
+
 async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...") as agent:
     print((await agent.run("hi")).answer)
 ```

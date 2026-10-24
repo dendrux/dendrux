@@ -21,9 +21,10 @@ Every guardrail declares one of three actions at construction time. The action i
 
 The protocol that every guardrail must implement is tiny, from `dendrux/guardrails/_protocol.py`:
 
-[//]: # "docs-test: skip - fragment: relies on `runtime_checkable`, defined by setup shown elsewhere"
-
 ```python
+from typing import Literal, Protocol, runtime_checkable
+from dendrux.guardrails import Finding
+
 @runtime_checkable
 class Guardrail(Protocol):
     """Protocol for content guardrails.
@@ -49,7 +50,7 @@ Every guardrail is a `scan(text) -> list[Finding]`. The action belongs to the in
 
 ## PII: redact by default
 
-[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 from dendrux.guardrails import PII
@@ -86,7 +87,7 @@ The message the LLM actually saw had `<<EMAIL_ADDRESS_1>>` in place of the addre
 
 Defaults are not locked in. `PII(include_defaults=False)` disables them entirely, and `extra_patterns=[...]` adds your own:
 
-[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 from dendrux.guardrails import PII, Pattern
@@ -112,7 +113,7 @@ pip install dendrux[presidio]
 python -m spacy download en_core_web_lg
 ```
 
-[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 from dendrux.guardrails import PII
@@ -211,7 +212,7 @@ These are rare but real. If your agent does text-level reasoning over values tha
 
 The two engines are not exclusive — they are two instances of the same `PII()` class. Stack them:
 
-[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 from dendrux.guardrails import PII, Pattern
@@ -294,9 +295,9 @@ One row on `run_events`, one terminal status, no LLM call. The blocked error car
 
 Unlike `PII` and `SecretDetection`, **no default patterns ship**. Injection signatures are domain-specific: a pattern that protects a customer support agent breaks a security-research agent that summarizes jailbreak papers. The dev supplies `patterns=[...]`, and `redact` is intentionally not supported (no reversible value to deanonymize):
 
-[//]: # "docs-test: skip - fragment: relies on `PromptInjection`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.guardrails import Pattern, PromptInjection
+
 PromptInjection(
     action="block",     # block (default) | warn — no redact
     engine="regex",     # v1 only; classifier engine planned for v2
@@ -313,9 +314,9 @@ The [recipes page](/docs/recipes/prompt-injection-patterns) ships starter patter
 
 Sometimes you want visibility without redaction or blocking. `action="warn"` emits the detected event and leaves the text alone:
 
-[//]: # "docs-test: skip - fragment: relies on `PII`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.guardrails import PII, Pattern
+
 PII(
     action="warn",
     include_defaults=False,
@@ -367,7 +368,7 @@ Like every finding, it carries a kind, a count and a location, never the content
 
 The `guardrails=[...]` list is iterated in order. Every guardrail scans the same text. Findings are aggregated. The framework applies actions in priority order: any `block` wins immediately; otherwise any `redact` runs; `warn`-only entries only emit events.
 
-[//]: # "docs-test: skip - fragment: relies on `PromptInjection`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 agent = Agent(

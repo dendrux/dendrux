@@ -151,7 +151,7 @@ A budget pause is a `paused` run, so it resumes with `submit_resume(run_id)`. Re
 
 Current usage is read live, not from the pause snapshot, so spending by child runs since the pause counts. If the resuming `Agent` has no limit on a metric that was exceeded (or no budget at all), that metric is not checked. The gate does not look at `on_exceed`: a run that paused for the budget re-pauses until the limit is raised, even if the resuming agent now says `"warn"`.
 
-[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 # The budget pause

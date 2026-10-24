@@ -399,7 +399,7 @@ Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schem
 
 Stream events as they happen: token-by-token text, tool calls, lifecycle events:
 
-[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 # Full event stream

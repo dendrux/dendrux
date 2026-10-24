@@ -158,9 +158,9 @@ The official MCP Python SDK owns protocol framing, transport negotiation, and th
 
 This matches how connection pools are operated: a deployment with four workers and `max_connections=100` can hold up to 400 physical MCP connections in total, and each worker reports its own snapshot. The [RunStore](/docs/architecture/runs) remains the durable, cross-process record of what agents did; the runtime is the live, in-memory record of what connections are doing right now.
 
-[//]: # "docs-test: skip - fragment: relies on `MCPRuntime`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.mcp import MCPRuntime
+
 runtime = MCPRuntime(
     max_connections=100,       # physical connections across all tenants
     max_in_flight_calls=100,   # concurrently executing MCP tool calls
@@ -454,7 +454,7 @@ the recipe's logging section.
 
 `connection.tools()` returns the object an agent consumes. It selects and names tools without touching the network:
 
-[//]: # "docs-test: skip - fragment: relies on `connection`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 view = connection.tools(
@@ -486,7 +486,7 @@ Three more options control naming and how a view treats tools it cannot expose. 
 
 **`prefix=False`** exposes bare tool names. The prefix costs tokens, means nothing to the model, and counts against the 64-character limit. `namespace` remains the view's identity for governance events, telemetry, and `ToolDef.meta["namespace"]`:
 
-[//]: # "docs-test: skip - fragment: relies on `connection`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 view = connection.tools(namespace="gh", prefix=False)
@@ -561,8 +561,6 @@ connection = await runtime.rebind(
 
 ## Shutdown
 
-[//]: # "docs-test: skip - fragment: relies on `runtime`, defined by setup shown elsewhere"
-
 ```python
 await runtime.close()
 ```
@@ -575,8 +573,6 @@ Closing an *agent* never closes runtime connections — it only releases that ag
 
 The runtime answers "what is happening right now" without any storage. `snapshot()` is synchronous, thread-safe, and cheap — call it from a metrics scraper thread on an interval (poll it, don't spin on it):
 
-[//]: # "docs-test: skip - fragment: relies on `runtime`, defined by setup shown elsewhere"
-
 ```python
 snapshot = runtime.snapshot()
 snapshot.connections          # per-connection status, leases, active calls
@@ -588,9 +584,9 @@ snapshot.open_circuits        # identities currently failing fast
 
 For events — connections opening and closing, circuits opening, capacity rejections, tool call outcomes — pass an observer and bridge to Prometheus, OpenTelemetry, Datadog, or logs:
 
-[//]: # "docs-test: skip - fragment: relies on `MCPRuntime`, defined by setup shown elsewhere"
-
 ```python
+from dendrux.mcp import MCPRuntime
+
 class Metrics:
     def on_event(self, event) -> None:   # sync, fast, never raises into the runtime
         EVENT_COUNTER.labels(type(event).__name__).inc()

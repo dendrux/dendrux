@@ -185,7 +185,7 @@ clarification question.
 
 A successful `RunResult` has `stop_reason`, why the call that produced the final answer stopped (`end_turn`, `max_tokens`, `stop_sequence`, `content_filter`, `refusal`, `pause_turn`, `tool_use`, `other`, or `None` when the provider reported none). If the model hit its output-token limit while writing the answer, the run still ends `success`, but `result.truncated` is `True` and Dendrux logs a warning. Check it before you trust the answer:
 
-[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 result = await agent.run("Summarise this report")

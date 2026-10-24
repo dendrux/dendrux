@@ -78,7 +78,7 @@ The IAM policy needs `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on the
 
 Use the same store everywhere bytes are read, stored or purged: every `Agent`, every `RunStore`, every worker. Rows record that their bytes are external, not which store holds them, so a process configured without it cannot read them (`ImagePersistenceUnsupportedError`, `reason="blob_store_not_configured"`).
 
-[//]: # "docs-test: skip - fragment: relies on `S3BlobStore`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 from dendrux import Agent

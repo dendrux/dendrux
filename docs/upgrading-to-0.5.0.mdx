@@ -124,7 +124,7 @@ See [Handling provider errors](/docs/recipes/handling-provider-errors) and [Mode
 
 The implicit engine built from `DENDRUX_DATABASE_URL` is deprecated. An `Agent` with no `state_store=` or `database_url=` still resolves it, but warns once. The shared engine also guards against use from a second event loop and raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress".
 
-[//]: # "docs-test: skip - fragment: relies on `DATABASE_URL`, defined by setup shown elsewhere"
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 # once, at app startup
