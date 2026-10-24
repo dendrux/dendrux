@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from dendrux import tool_pool_stats
 from dendrux.agent import Agent
 from dendrux.errors import ProviderTimeoutError
 from dendrux.llm.mock import MockLLM
@@ -24,7 +25,7 @@ from dendrux.loops.react import ReActLoop, _execute_tool
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.tool import tool
 from dendrux.tools import _pool as pool_mod
-from dendrux.tools import build_tool_lookups, tool_pool_stats
+from dendrux.tools import build_tool_lookups
 from dendrux.tools._lookups import make_call_limiter
 from dendrux.tools._pool import ToolCallLimiter, _ToolPool
 from dendrux.types import LLMResponse, RunStatus, ToolCall

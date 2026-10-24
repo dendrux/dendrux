@@ -278,7 +278,7 @@ class TokenUsage(Base):
     """Per-LLM-call token counts and cost.
 
     One row per provider.complete() call — iteration-level granularity.
-    Powers cost dashboards and optimization decisions.
+    Powers cost inspection tools and optimization decisions.
     """
 
     __tablename__ = "token_usage"
@@ -362,7 +362,7 @@ class RunEvent(Base):
     Records durable timestamps for every lifecycle event in a run:
     started, LLM calls, tool calls, paused, resumed, completed, etc.
 
-    This table exists specifically so the dashboard can reconstruct
+    This table exists specifically so the operator UI can reconstruct
     exact pause/resume timing without inferring from mutable columns
     or cleared pause_data. Every event has an immutable created_at.
 
@@ -374,7 +374,7 @@ class RunEvent(Base):
     back to the tool_call_id, run.resumed to the original run.paused).
     This avoids ambiguity in multi-tool, multi-pause runs.
 
-    Privacy: dashboard renders only observable data from this table.
+    Privacy: operator UI renders only observable data from this table.
     pause_data (unredacted execution state) is never exposed here.
 
     Event types:

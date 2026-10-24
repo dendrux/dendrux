@@ -389,7 +389,8 @@ async def test_v030_schema_names_both_blob_tables(pg_url: str) -> None:
             await agent.run("hi")
         err = info.value
         assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs"}
-        assert set(err.missing_columns) == {"agent_runs.claim_epoch"} | _R1_INDEXES  # 0.5.0 R1
+        assert err.missing_columns == ("agent_runs.claim_epoch",)
+        assert set(err.missing_indexes) == _R1_INDEXES
         assert "dendrux_blobs" in str(err) and "dendrux_blob_refs" in str(err)
         assert "dendrux db migrate" in str(err)
 

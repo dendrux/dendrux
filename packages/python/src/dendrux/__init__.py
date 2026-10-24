@@ -49,6 +49,7 @@ from dendrux.runtime.state import UNSCOPED
 from dendrux.runtime.sweep import sweep
 from dendrux.skills import Skill, SkillExecutionRequest, SkillExecutionResult, SkillExecutor
 from dendrux.tool import tool
+from dendrux.tools import tool_pool_stats
 from dendrux.types import (
     ApprovalDecision,
     BeforeToolHook,
@@ -139,4 +140,5 @@ __all__ = [
     "run",
     "sweep",
     "tool",
+    "tool_pool_stats",
 ]
