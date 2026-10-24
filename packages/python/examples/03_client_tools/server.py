@@ -1,38 +1,61 @@
-"""Client-side tool pause/resume — agent with server + client tools.
+"""Developer-owned HTTP routes over Agent and RunStore.
 
-Demonstrates Dendrux's core differentiator: an agent that pauses when
-it needs a client-side tool, waits for the browser to execute it, then
-resumes reasoning.
-
-Run with:
-    ANTHROPIC_API_KEY=sk-... python examples/03_client_tools/server.py
-
-Then open http://localhost:8000
-
-For the observability dashboard, run in a separate terminal:
-    dendrux dashboard --open
-
-Dendrux provides:
-  - Pause/resume orchestration (``@tool(target="client")`` + ``agent.run``)
-  - DB-backed events + SSE (``make_read_router``)
-  - Race-safe resume methods (``agent.submit_tool_results``, ``agent.cancel_run``)
-
-The developer owns:
-  - HTTP routes for start/tool-results/cancel (below)
-  - Auth — this example uses a no-op dep; real apps plug in their user auth
-  - Request/response schemas (Pydantic models below)
-  - The HTML/JS client (``client.html``)
-
-Note: request-body Pydantic models live at module scope (not inside
-``create_demo_app``) so FastAPI can resolve their type annotations —
-with ``from __future__ import annotations`` enabled, nested-class
-annotations would otherwise stay as strings and FastAPI would treat
-them as query params.
+This single-user demo authenticates every API call with X-App-Token.
+The one demo actor owns the dedicated demo tenant. Production apps must
+resolve identity, tenant, run ownership and approval authority separately.
 """
 
-from pydantic import BaseModel
+import hmac
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from dendrux import Agent, tool
+from dendrux.db.models import Base
+from dendrux.errors import (
+    InvalidToolResultError,
+    PauseStatusMismatchError,
+    RunAlreadyClaimedError,
+    RunAlreadyTerminalError,
+    RunNotFoundError,
+    RunNotPausedError,
+)
+from dendrux.store import RunStore
+from dendrux.types import ToolResult
+
+Provider = Literal["anthropic", "openai"]
+TENANT = "demo-user"
+
+
+class ChatIn(BaseModel):
+    input: str = Field(min_length=1, max_length=10_000)
+    provider: Provider = "anthropic"
+
+
+class ToolResultItem(BaseModel):
+    tool_call_id: str
+    tool_name: str
+    payload: str = Field(max_length=100_000)
+
+
+class ToolResultsIn(BaseModel):
+    results: list[ToolResultItem] = Field(min_length=1, max_length=100)
+
+
+class ApprovalIn(BaseModel):
+    approved: bool
+    rejection_reason: str | None = Field(default=None, max_length=2000)
+
+
+def browser_result(result: Any) -> dict[str, Any]:
+    """Allowlist the response; answer is intended for this authenticated actor."""
+    return {"run_id": result.run_id, "status": result.status.value, "answer": result.answer}
 
 
 # -- Server tool: executes on the server, no pause --
@@ -57,131 +80,116 @@ async def read_excel_range(sheet: str, range: str) -> str:
     return ""
 
 
-# -- Dev-owned request-body schemas (module scope so FastAPI can resolve them) --
-class StartChatIn(BaseModel):
-    input: str
-
-
-class ToolResultItem(BaseModel):
-    tool_call_id: str
-    tool_name: str
-    payload: str  # JSON-encoded string
-
-
-class SubmitToolResultsIn(BaseModel):
-    results: list[ToolResultItem]
-
-
-def create_demo_app():  # type: ignore[no-untyped-def]
-    """Build the demo FastAPI application.
-
-    Wires ``make_read_router`` for reads + SSE and three hand-written
-    routes for ``/chat``, ``/tool-results``, and ``/cancel`` that delegate
-    to the agent's public methods.
-    """
-    import os
-    from pathlib import Path
-
-    from dotenv import load_dotenv
-    from fastapi import FastAPI
-    from fastapi.responses import FileResponse, JSONResponse
-
-    from dendrux.http import make_read_router
+def build_agents(database_url: str) -> dict[str, Agent]:
+    """Configure the spreadsheet agent with server and client tools."""
     from dendrux.llm.anthropic import AnthropicProvider
-    from dendrux.store import UNSCOPED, RunStore
-    from dendrux.types import ToolResult
 
-    load_dotenv(Path(__file__).resolve().parents[4] / ".env")
+    return {
+        "anthropic": Agent(
+            name="SpreadsheetAnalyst",
+            provider=AnthropicProvider(model="claude-sonnet-4-6"),
+            database_url=database_url,
+            tools=[lookup_price, read_excel_range],
+            prompt="Use lookup_price for prices and read_excel_range for spreadsheet data.",
+        )
+    }
 
-    db_path = Path.home() / ".dendrux" / "dendrux.db"
-    db_url = f"sqlite+aiosqlite:///{db_path}"
 
-    agent = Agent(
-        name="SpreadsheetAnalyst",
-        provider=AnthropicProvider(
-            model="claude-sonnet-4-6",
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
-        ),
-        database_url=db_url,
-        prompt=(
-            "You are a spreadsheet analyst. You can look up stock prices with "
-            "lookup_price (runs instantly on the server) and read data from the "
-            "user's Excel file with read_excel_range (runs on the client — you "
-            "must wait for the user to provide the data). "
-            "Always use the tools when the user asks about prices or spreadsheet data."
-        ),
-        tools=[lookup_price, read_excel_range],
-    )
+def create_demo_app(*, database_url: str | None = None) -> FastAPI:
+    """Build routes owned by this app, with a dedicated demo tenant."""
+    if database_url is None:
+        output = Path(__file__).parent / "output"
+        output.mkdir(exist_ok=True)
+        database_url = f"sqlite+aiosqlite:///{output / 'demo.db'}"
+    engine = create_async_engine(database_url)
+    store = RunStore.from_engine(engine)
+    agents = build_agents(database_url)
+    token = os.environ.get("DENDRUX_DEMO_TOKEN", "dev-secret-abc").encode()
+    # App-owned identity/provider association. Persist it in your app DB for
+    # recovery across server restarts; Dendrux does not own this association.
+    owners: dict[str, str] = {}
 
-    store = RunStore.from_database_url(db_url)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        try:
+            yield
+        finally:
+            for agent in agents.values():
+                await agent.close()
+            await store.close()
+            await engine.dispose()
 
-    app = FastAPI(title="Dendrux Client Tools Demo")
+    app = FastAPI(title="Dendrux developer routes demo", lifespan=lifespan)
 
-    # Dev-mode auth: no-op. Real apps plug in a user-session dependency
-    # here — the same dep would also be applied to the write routes below
-    # (e.g. ``Depends(require_user)``) so every route that touches a run
-    # enforces identity + ownership consistently.
-    async def allow_all() -> None:  # pragma: no cover — trivial demo dep
-        return None
+    async def caller(
+        x_app_token: Annotated[str | None, Header()] = None,
+    ) -> str:
+        if not token or not hmac.compare_digest((x_app_token or "").encode(), token):
+            raise HTTPException(401, "missing or invalid X-App-Token")
+        return TENANT
 
-    # Mount Dendrux's read router — it owns run listing, run detail, events,
-    # drill-downs, and the SSE stream (the hard transport piece).
-    app.include_router(
-        make_read_router(store=store, authorize=allow_all, tenant_resolver=UNSCOPED),
-        prefix="/api",
-    )
+    async def owned_run(run_id: str, tenant: Annotated[str, Depends(caller)]) -> str:
+        if run_id not in owners or await store.get_run(run_id, tenant_id=tenant) is None:
+            raise HTTPException(404, "run not found")
+        return owners[run_id]
 
-    # -- Static UI -----------------------------------------------------
-    client_html = Path(__file__).parent / "client.html"
+    async def conflict(_: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": type(exc).__name__})
+
+    for error in (
+        RunNotPausedError,
+        PauseStatusMismatchError,
+        RunAlreadyClaimedError,
+        RunAlreadyTerminalError,
+    ):
+        app.add_exception_handler(error, conflict)
+
+    @app.exception_handler(RunNotFoundError)
+    async def not_found(_: Request, exc: RunNotFoundError) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "run not found"})
+
+    @app.exception_handler(InvalidToolResultError)
+    async def invalid(_: Request, exc: InvalidToolResultError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": "invalid tool results"})
 
     @app.get("/")
     async def index() -> FileResponse:
-        return FileResponse(client_html, media_type="text/html")
-
-    # -- Dev-owned write routes ----------------------------------------
-    # Production apps add auth + ownership guards on every write route,
-    # e.g. ``user = Depends(require_user)`` in the signature plus an
-    # ownership check against the run's owner_id before calling the agent
-    # method. The demo below keeps the bodies minimal; the TODO(auth)
-    # markers show where that plumbing goes.
+        return FileResponse(Path(__file__).parent / "client.html")
 
     @app.post("/chat")
-    async def start_run(body: StartChatIn) -> JSONResponse:
-        # TODO(auth): add ``user = Depends(require_user)`` and stamp the
-        # authenticated identity onto the run (e.g. metadata={"owner_id": user.id}).
-        if not body.input:
-            return JSONResponse(status_code=400, content={"error": "input is required"})
-        result = await agent.run(body.input)
-        return JSONResponse(
-            content={
-                "run_id": result.run_id,
-                "status": result.status.value,
-                "answer": result.answer,
-            }
-        )
+    async def start(body: ChatIn, tenant: Annotated[str, Depends(caller)]) -> dict[str, Any]:
+        if body.provider not in agents:
+            raise HTTPException(400, "provider unavailable")
+        result = await agents[body.provider].run(body.input, tenant_id=tenant)
+        owners[result.run_id] = body.provider
+        return browser_result(result)
+
+    @app.get("/runs/{run_id}/pending")
+    async def pending(
+        run_id: str,
+        tenant: Annotated[str, Depends(caller)],
+        _: Annotated[str, Depends(owned_run)],
+    ) -> Any:
+        pause = await store.get_pending(run_id, tenant_id=tenant)
+        return pause.to_dict() if pause is not None else None
 
     @app.post("/runs/{run_id}/tool-results")
-    async def submit_tool_results(run_id: str, body: SubmitToolResultsIn) -> JSONResponse:
-        # TODO(auth): fetch run via store, verify ownership against the
-        # authenticated identity, return 404 on mismatch.
+    async def tool_results(
+        run_id: str,
+        body: ToolResultsIn,
+        tenant: Annotated[str, Depends(caller)],
+        provider: Annotated[str, Depends(owned_run)],
+    ) -> dict[str, Any]:
         results = [
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        result = await agent.submit_tool_results(run_id, results)
-        return JSONResponse(
-            content={
-                "run_id": result.run_id,
-                "status": result.status.value,
-                "answer": result.answer,
-            }
-        )
-
-    @app.delete("/runs/{run_id}")
-    async def cancel(run_id: str) -> JSONResponse:
-        # TODO(auth): same ownership check as /tool-results above.
-        result = await agent.cancel_run(run_id)
-        return JSONResponse(content={"run_id": result.run_id, "status": result.status.value})
+        # TODO: pass expected_pause_id when the run-integrity contract lands.
+        # Current Agent has no such argument; this demo has no stale-submit guarantee.
+        result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
+        return browser_result(result)
 
     return app
 
@@ -189,4 +197,4 @@ def create_demo_app():  # type: ignore[no-untyped-def]
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(create_demo_app(), host="0.0.0.0", port=8000)
+    uvicorn.run(create_demo_app(), host="127.0.0.1", port=8000)

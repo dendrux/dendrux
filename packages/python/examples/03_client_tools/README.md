@@ -1,94 +1,50 @@
-# Example 03: Client-Side Tool Pause/Resume
+# Example 03 — Client tools
 
-Demonstrates Dendrux's core differentiator — an agent that **pauses** when it needs a client-side tool, waits for the user to provide the result, then **resumes** reasoning.
-
-## Setup
+All HTTP routes and the browser UI belong to this application. Dendrux provides
+Agent methods and RunStore reads. The agent combines a server price tool and a client spreadsheet tool.
 
 ```bash
 cd packages/python
-pip install -e ".[dev,db,anthropic,http]"
-```
+pip install -e ".[dev,anthropic]" fastapi 'uvicorn[standard]'
+export ANTHROPIC_API_KEY=...
 
-Set your API key:
-
-```bash
-export ANTHROPIC_API_KEY=sk-...
-```
-
-## Run
-
-```bash
 python examples/03_client_tools/server.py
 ```
 
-Open http://localhost:8000 in your browser.
+Open http://localhost:8000. The default demo token is `dev-secret-abc`; set
+`DENDRUX_DEMO_TOKEN` and enter the new value in the browser to change it.
+Every API request sends `X-App-Token` as a header. Credentials never enter URLs.
+The token represents one actor who owns the dedicated `demo-user` tenant.
 
-## What to type
+| Route | Library call |
+| --- | --- |
+| POST /chat | Agent.run(..., tenant_id=...) |
+| POST /runs/{id}/tool-results | Agent.submit_tool_results(..., tenant_id=...) |
 
-The agent has two tools:
+| GET /runs/{id}/pending | RunStore.get_pending(..., tenant_id=...) |
 
-- **lookup_price** (server-side) — instant, no pause
-- **read_excel_range** (client-side) — agent pauses and waits for you
+The start and submit requests wait until a pause or terminal result. The client
+then fetches pending state to rebuild forms. It sends call IDs and names with
+tool results and stops if approval arguments have `args_hidden=True`. Only
+`run_id`, `status` and the answer intended for this actor leave the result DTO;
+metadata, traces, provider bodies, arbitrary output and PII mappings stay server-side.
+Client-tool params may contain real personal data. Tool outputs are client assertions.
 
-To see the pause/resume flow, use a prompt that triggers both:
+This demo omits a live route. For optional `RunStore.follow`, see
+[Build your own read routes](../../../../docs/recipes/build-your-own-read-routes.mdx).
+The feed's iteration deadline cannot bound blocked network sends: the HTTP
+transport needs its own send deadline and `finally: await follow.aclose()`.
+Do not stream `agent.stream()` directly to a browser: a disconnect cancels it.
 
-> Look up the AAPL stock price, then read cell A1 from my spreadsheet.
+Before production, implement real identity, user-level run ownership within each
+tenant, approval-role authorization, app audit records, rate limits and request
+budgets. UI callbacks are UX only. The in-memory run/provider association must move
+to your application DB to survive server restarts. Persist an app request ID before
+starting work; a request timeout before the first response may lose the run ID and
+cancellation may cancel the run. Own any background execution and recovery lifecycle.
 
-The agent will:
-
-1. Call `lookup_price("AAPL")` — executes instantly on the server.
-2. Call `read_excel_range(sheet="Sheet1", range="A1")` — **pauses**.
-3. The UI shows a form asking you to provide the result.
-4. Type any value (e.g. `Revenue: $394B`) and click Submit.
-5. The agent resumes with your data and generates a final answer.
-
-## Architecture
-
-Dendrux ships:
-
-- `make_read_router` → mounts reads + SSE at `/api/*`.
-- `agent.submit_tool_results(...)` + `agent.cancel_run(...)` → race-safe resume methods.
-
-The developer writes:
-
-- `POST /chat` → calls `agent.run(...)`.
-- `POST /runs/{id}/tool-results` → calls `agent.submit_tool_results(...)`.
-- `DELETE /runs/{id}` → calls `agent.cancel_run(...)`.
-- `client.html` → browser UI, `EventSource` on the SSE stream, dispatches on `event_type`.
-
-```
-Browser                    Server                     Agent
-  |                          |                          |
-  |-- POST /chat ----------> |-- agent.run() ---------> |
-  |                          |                          |-- LLM call
-  |                          |                          |-- lookup_price (server)
-  |                          |                          |-- read_excel_range -> PAUSE
-  | <-- {run_id, status} --- |                          |
-  |                          |                          |
-  |-- GET /api/runs/{id}/events/stream (SSE) -------->  |
-  | <-- run.paused (with pending_tool_calls) ---------- |
-  |                          |                          |
-  |-- POST /runs/{id}/tool-results ------------------>  |
-  |                          |-- agent.submit_tool_results(...) --> |
-  |                          |    (persist-first + CAS claim + resume)
-  | <-- 200 {status: success, answer: ...} ------------ |
-  | <-- run.completed (SSE)  |                          |
-```
-
-## Where each piece lives
-
-| Surface | Owner | File |
-|---|---|---|
-| `GET /api/runs/...` + SSE | Dendrux (`make_read_router`) | `dendrux/http/read_router.py` |
-| `POST /chat` | You | `server.py` |
-| `POST /runs/{id}/tool-results` | You | `server.py` |
-| `DELETE /runs/{id}` | You | `server.py` |
-| Browser UI | You | `client.html` |
-| Pause/resume orchestration | Dendrux | `agent.submit_tool_results` |
-| CAS + race-safety | Dendrux | `runtime/submit.py` |
-
-## If something looks wrong
-
-- If the agent doesn't pause, your prompt didn't trigger `read_excel_range`. Try: "read cell A1 from my spreadsheet."
-- If you see connection errors, make sure the server is running on port 8000.
-- This demo uses a no-op `authorize` dependency (no auth). Real apps plug in a user-session dep there.
+TODO integration: this branch's Agent does not yet accept `expected_pause_id`.
+There is no atomic stale-pause guarantee in this demo. Gate multi-tab approval and
+automatic retries on the run-integrity track; once it lands, require a non-null
+pause ID, pass it to the atomic submit check, and on conflict re-fetch pending and
+ask the actor again. Do not infer a safe decision from an old form.
