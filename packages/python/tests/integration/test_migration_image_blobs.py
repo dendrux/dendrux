@@ -84,10 +84,13 @@ async def _seed(conn: Any) -> None:
 
 
 async def _snapshot(conn: Any) -> list[Any]:
+    # 0.5.0 R1 adds agent_runs.claim_epoch above this revision; leave it out.
     out: list[Any] = []
     for table in ("agent_runs", "react_traces"):
         result = await conn.execute(text(f"SELECT * FROM {table} ORDER BY id"))
-        out.append([tuple(r) for r in result.all()])
+        out.append(
+            [tuple(v for k, v in r._mapping.items() if k != "claim_epoch") for r in result.all()]
+        )
     return out
 
 

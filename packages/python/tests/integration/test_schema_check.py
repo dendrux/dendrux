@@ -40,6 +40,8 @@ _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "
 # 0.2.0a23 shape: no run control (0.3.0) and no image blob tables (0.4.0).
 _MISSING = {"agent_runs.pause_requested", "run_inbox", "dendrux_blobs", "dendrux_blob_refs"}
 _MISSING_TABLES = {"run_inbox", "dendrux_blobs", "dendrux_blob_refs"}
+# A database migrated to an earlier revision also lacks 0.5.0's claim_epoch (R1).
+_MISSING_AT_PRIOR = _MISSING | {"agent_runs.claim_epoch"}
 RUN_CONTROL = "b5c6d7e8f9a0"  # 0.3.0 head: everything but the 0.4.0 image blob tables
 
 
@@ -157,7 +159,7 @@ async def test_agent_recovers_after_alembic_upgrade(pg_url: str) -> None:
     try:
         with pytest.raises(SchemaOutOfDateError) as info:
             await agent.run("hi")
-        assert set(info.value.missing) == _MISSING
+        assert set(info.value.missing) == _MISSING_AT_PRIOR
 
         await asyncio.to_thread(_alembic, pg_url, "head")
         # A failed init is not cached: the same agent works after migrating.
@@ -387,7 +389,7 @@ async def test_v030_schema_names_both_blob_tables(pg_url: str) -> None:
             await agent.run("hi")
         err = info.value
         assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs"}
-        assert err.missing_columns == ()
+        assert err.missing_columns == ("agent_runs.claim_epoch",)  # 0.5.0 R1
         assert "dendrux_blobs" in str(err) and "dendrux_blob_refs" in str(err)
         assert "dendrux db migrate" in str(err)
 
