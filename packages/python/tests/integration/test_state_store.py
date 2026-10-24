@@ -694,7 +694,7 @@ class TestPauseResume:
         await store.pause_run("run_cl", status="waiting_client_tool", pause_data={"x": 1})
 
         claimed = await store.claim_paused_run("run_cl", expected_status="waiting_client_tool")
-        assert claimed is True
+        assert claimed == 1
 
         record = await store.get_run("run_cl")
         assert record is not None
@@ -720,7 +720,7 @@ class TestPauseResume:
         await store.pause_run("run_dc", status="waiting_client_tool", pause_data={"x": 1})
 
         claimed1 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
-        assert claimed1 is True
+        assert claimed1 == 1
 
         # Second claim fails — status is now 'running', not 'waiting_client_tool'
         claimed2 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
@@ -786,7 +786,7 @@ class TestSubmitAndClaim:
                 ]
             },
         )
-        assert won is True
+        assert won == 1
 
         # Status transitioned to running
         record = await store.get_run("run_sac1")
@@ -813,7 +813,7 @@ class TestSubmitAndClaim:
             expected_status="waiting_client_tool",
             submitted_data={"submitted_tool_results": [{"call_id": "tc1"}]},
         )
-        assert won1 is True
+        assert won1 == 1
 
         won2 = await store.submit_and_claim(
             "run_sac2",
@@ -873,7 +873,7 @@ class TestSubmitAndClaim:
             expected_status="waiting_human_input",
             submitted_data={"submitted_user_input": "yes, proceed"},
         )
-        assert won is True
+        assert won == 1
 
         pause = await store.get_pause_state("run_sac6")
         assert pause is not None

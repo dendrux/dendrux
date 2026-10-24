@@ -102,7 +102,7 @@ class TestPauseStatePrimitives:
         await store.create_run("r1", "a")
         await store.try_pause_run("r1", status="paused", pause_data={"p": 1})
         await _set_row(store, "r1", pause_requested=True)  # stale flag
-        assert await store.claim_paused_run("r1", expected_status="paused") is True
+        assert await store.claim_paused_run("r1", expected_status="paused") == 1
         assert (await store.get_run("r1")).pause_requested is False
 
         await store.request_pause("r1")
@@ -501,8 +501,8 @@ class TestApprovalBarrier:
         waiting = await agent.run("go")
         original = store.claim_paused_run
 
-        async def claim_then_pause(run_id: str, *, expected_status: str) -> bool:
-            won = await original(run_id, expected_status=expected_status)
+        async def claim_then_pause(run_id: str, *, expected_status: str, **kwargs) -> int:
+            won = await original(run_id, expected_status=expected_status, **kwargs)
             if won:
                 await store.request_pause(run_id)
             return won
@@ -525,8 +525,8 @@ class TestApprovalBarrier:
         waiting = await agent.run("go")
         original = store.claim_paused_run
 
-        async def claim_then_cancel(run_id: str, *, expected_status: str) -> bool:
-            won = await original(run_id, expected_status=expected_status)
+        async def claim_then_cancel(run_id: str, *, expected_status: str, **kwargs) -> int:
+            won = await original(run_id, expected_status=expected_status, **kwargs)
             if won:
                 await store.request_cancel(run_id)
             return won

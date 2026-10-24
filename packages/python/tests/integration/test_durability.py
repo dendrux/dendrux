@@ -219,7 +219,7 @@ class TestClaimPausedRunDurability:
         with _FailOnceCommit():
             ok = await store.claim_paused_run("run1", expected_status="waiting_client_tool")
 
-        assert ok is True
+        assert ok == 1
         run = await store.get_run("run1")
         assert run.status == "running"
 
@@ -254,7 +254,7 @@ class TestSubmitAndClaimDurability:
                 submitted_data={"result": "done"},
             )
 
-        assert ok is True
+        assert ok == 1
         run = await store.get_run("run1")
         assert run.status == "running"
 
@@ -269,7 +269,7 @@ class TestSubmitAndClaimDurability:
                 submitted_data={"result": "done"},
             )
 
-        assert ok is True
+        assert ok == 1
 
     async def test_submit_and_claim_cas_miss_not_retried(self, store):
         """CAS miss on submit_and_claim returns False, not retried."""

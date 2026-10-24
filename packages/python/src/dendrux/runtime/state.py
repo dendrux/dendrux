@@ -18,7 +18,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, overload
+from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
 from dendrux.runtime.durability import retry_transient_db
@@ -177,6 +177,8 @@ class RunControl:
     cancel_requested: bool = False
     pause_requested: bool = False
     has_pending_notes: bool = False
+    claim_epoch: int | None = None
+    status: str | None = None
 
 
 # Pause-state keys a pending read needs: everything but history, steps and usage.
@@ -545,6 +547,7 @@ class StateStore(Protocol):
         total_usage: UsageStats | None = None,
         expected_current_status: str | None = None,
         pii_mapping: dict[str, str] | None = None,
+        claim_epoch: int | None = None,
     ) -> bool: ...
 
     async def finalize_run_if_status_in(
@@ -559,6 +562,7 @@ class StateStore(Protocol):
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
         failure_reason: str | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """Atomic CAS over a set of allowed current statuses.
 
@@ -616,6 +620,7 @@ class StateStore(Protocol):
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
         total_usage: UsageStats | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """Persist a pause with one CAS: only a RUNNING row without a pending cancel.
 
@@ -636,6 +641,7 @@ class StateStore(Protocol):
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
         total_usage: UsageStats | None = None,
+        claim_epoch: int | None = None,
     ) -> int | None:
         """``try_pause_run`` and the ``run.paused`` event in one transaction.
 
@@ -660,6 +666,7 @@ class StateStore(Protocol):
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
         failure_reason: str | None = None,
+        claim_epoch: int | None = None,
     ) -> int | None:
         """``finalize_run_if_status_in`` and its event in one transaction.
 
@@ -731,13 +738,21 @@ class StateStore(Protocol):
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
         total_usage: UsageStats | None = None,
+        claim_epoch: int | None = None,
     ) -> None: ...
 
     async def get_pause_state(self, run_id: str) -> dict[str, Any] | None: ...
 
     async def get_pii_mapping(self, run_id: str) -> dict[str, str] | None: ...
 
-    async def claim_paused_run(self, run_id: str, *, expected_status: str) -> bool: ...
+    async def claim_paused_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        expected_pause_id: str | None = None,
+        validate: Callable[[dict[str, Any]], None] | None = None,
+    ) -> int: ...
 
     async def submit_and_claim(
         self,
@@ -748,7 +763,7 @@ class StateStore(Protocol):
         validate: Callable[[dict[str, Any]], None] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> bool:
+    ) -> int:
         """Atomically save submitted data to pause_data and claim the run.
 
         Merges *submitted_data* into the existing pause_data blob and
@@ -1365,6 +1380,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         total_usage: UsageStats | None = None,
         expected_current_status: str | None = None,
         pii_mapping: dict[str, str] | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """Finalize a run. Returns True if the update was applied.
 
@@ -1415,11 +1431,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     )
                 else:
                     stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
+                if claim_epoch is not None:
+                    stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
                 result = await session.execute(stmt)
                 await session.commit()
                 return (
                     bool(result.rowcount and result.rowcount > 0)
-                    if expected_current_status
+                    if expected_current_status or claim_epoch is not None
                     else True
                 )
 
@@ -1437,6 +1455,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
         failure_reason: str | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """Atomic CAS finalize over multiple acceptable current statuses.
 
@@ -1459,6 +1478,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     total_usage=total_usage,
                     pii_mapping=pii_mapping,
                     failure_reason=failure_reason,
+                    claim_epoch=claim_epoch,
                 )
                 await session.commit()
                 return won
@@ -1479,6 +1499,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         total_usage: UsageStats | None = None,
         pii_mapping: dict[str, str] | None = None,
         failure_reason: str | None = None,
+        claim_epoch: int | None = None,
     ) -> int | None:
         """:meth:`finalize_run_if_status_in` plus its lifecycle event, in one transaction.
 
@@ -1501,6 +1522,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     total_usage=total_usage,
                     pii_mapping=pii_mapping,
                     failure_reason=failure_reason,
+                    claim_epoch=claim_epoch,
                 )
                 if not won:
                     await session.rollback()
@@ -1524,6 +1546,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         total_usage: UsageStats | None,
         pii_mapping: dict[str, str] | None,
         failure_reason: str | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         from sqlalchemy import update
 
@@ -1551,11 +1574,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         if failure_reason is not None:
             values["failure_reason"] = failure_reason
 
-        result: Any = await session.execute(
-            update(AgentRun)
-            .where(AgentRun.id == run_id, AgentRun.status.in_(allowed_current_statuses))
-            .values(**values)
+        stmt = update(AgentRun).where(
+            AgentRun.id == run_id, AgentRun.status.in_(allowed_current_statuses)
         )
+        if claim_epoch is not None:
+            stmt = stmt.where(AgentRun.claim_epoch == claim_epoch)
+        result: Any = await session.execute(stmt.values(**values))
         return bool(result.rowcount and result.rowcount > 0)
 
     async def request_cancel(self, run_id: str) -> bool:
@@ -1636,9 +1660,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         async def _attempt() -> RunControl:
             async with self._session_factory() as session:
-                stmt = select(AgentRun.cancel_requested, AgentRun.pause_requested, pending).where(
-                    AgentRun.id == run_id
-                )
+                stmt = select(
+                    AgentRun.cancel_requested,
+                    AgentRun.pause_requested,
+                    pending,
+                    AgentRun.claim_epoch,
+                    AgentRun.status,
+                ).where(AgentRun.id == run_id)
                 row = (await session.execute(stmt)).first()
                 if row is None:
                     return RunControl()
@@ -1646,6 +1674,8 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     cancel_requested=bool(row[0]),
                     pause_requested=bool(row[1]),
                     has_pending_notes=bool(row[2]),
+                    claim_epoch=row[3],
+                    status=row[4],
                 )
 
         return await retry_transient_db(_attempt, label="get_run_control", run_id=run_id)
@@ -1691,6 +1721,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
         total_usage: UsageStats | None = None,
+        claim_epoch: int | None = None,
     ) -> bool:
         """CAS pause: RUNNING and no pending cancel, else False (caller honors winner)."""
         from sqlalchemy import update
@@ -1716,6 +1747,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         AgentRun.id == run_id,
                         AgentRun.status == RunStatus.RUNNING.value,
                         AgentRun.cancel_requested.is_(False),
+                        *([AgentRun.claim_epoch == claim_epoch] if claim_epoch is not None else []),
                     )
                     .values(**values)
                 )
@@ -1734,6 +1766,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
         total_usage: UsageStats | None = None,
+        claim_epoch: int | None = None,
     ) -> int | None:
         """:meth:`try_pause_run` plus the ``run.paused`` event, in one transaction.
 
@@ -1765,6 +1798,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         AgentRun.id == run_id,
                         AgentRun.status == RunStatus.RUNNING.value,
                         AgentRun.cancel_requested.is_(False),
+                        *([AgentRun.claim_epoch == claim_epoch] if claim_epoch is not None else []),
                     )
                     .values(**values)
                 )
@@ -1982,6 +2016,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         iteration_count: int | None = None,
         pii_mapping: dict[str, str] | None = None,
         total_usage: UsageStats | None = None,
+        claim_epoch: int | None = None,
     ) -> None:
         """Persist pause state and set the paused status.
 
@@ -2005,6 +2040,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 if total_usage is not None:
                     values.update(_usage_totals(total_usage))
                 stmt = update(AgentRun).where(AgentRun.id == run_id).values(**values)
+                if claim_epoch is not None:
+                    stmt = stmt.where(
+                        AgentRun.claim_epoch == claim_epoch, AgentRun.status == "running"
+                    )
                 await session.execute(stmt)
                 await session.commit()
 
@@ -2211,30 +2250,77 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 return None
             return dict(row)
 
-    async def claim_paused_run(self, run_id: str, *, expected_status: str) -> bool:
+    async def claim_paused_run(
+        self,
+        run_id: str,
+        *,
+        expected_status: str,
+        expected_pause_id: str | None = None,
+        validate: Callable[[dict[str, Any]], None] | None = None,
+    ) -> int:
         """Atomically transition a paused run to RUNNING.
 
-        Returns True if the claim succeeded (run was in expected_status).
+        Returns the new claim epoch if the claim succeeded.
         Returns False if someone else already claimed it or status didn't match.
         Uses UPDATE ... WHERE status=? for atomicity — no race window.
         The claim clears ``pause_requested`` in the same statement, so a
         resumed PAUSED run does not immediately re-pause on a stale flag.
         """
-        from sqlalchemy import update
+        from sqlalchemy import select, update
 
         from dendrux.db.models import AgentRun
 
-        async def _attempt() -> bool:
+        async def _attempt() -> int:
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 stmt = (
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                    .values(status="running", pause_requested=False)
+                    .values(
+                        status="running",
+                        pause_requested=False,
+                        claim_epoch=AgentRun.claim_epoch + 1,
+                    )
                 )
                 result = await session.execute(stmt)
+                if result.rowcount:
+                    epoch = (
+                        await session.execute(
+                            select(AgentRun.claim_epoch).where(AgentRun.id == run_id)
+                        )
+                    ).scalar_one()
+                if result.rowcount and (validate is not None or expected_pause_id is not None):
+                    pause = (
+                        await session.execute(
+                            select(AgentRun.pause_data).where(AgentRun.id == run_id)
+                        )
+                    ).scalar_one_or_none()
+                    try:
+                        if expected_pause_id is not None:
+                            from dendrux.errors import PauseStatusMismatchError
+
+                            current_id = (pause or {}).get("pause_id")
+                            if current_id != expected_pause_id:
+                                logger.warning(
+                                    "Pause generation mismatch: run_id=%s code=pause_id_mismatch",
+                                    run_id,
+                                    extra={"run_id": run_id, "code": "pause_id_mismatch"},
+                                )
+                                raise PauseStatusMismatchError(
+                                    run_id,
+                                    RunStatus(expected_status),
+                                    RunStatus(expected_status),
+                                    expected_pause_id=expected_pause_id,
+                                    current_pause_id=current_id,
+                                    reason="pause_id",
+                                )
+                        if validate is not None:
+                            validate(pause or {})
+                    except BaseException:
+                        await session.rollback()
+                        raise
                 await session.commit()
-                return bool(result.rowcount and result.rowcount > 0)
+                return epoch if result.rowcount else False
 
         return await retry_transient_db(_attempt, label="claim_paused_run", run_id=run_id)
 
@@ -2247,7 +2333,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         validate: Callable[[dict[str, Any]], None] | None = None,
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
-    ) -> bool:
+    ) -> int:
         """Atomically save submitted data and claim the run.
 
         Implementation (one transaction):
@@ -2266,14 +2352,18 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         from dendrux.db.models import AgentRun
 
-        async def _attempt() -> bool:
+        async def _attempt() -> int:
             async with self._session_factory() as session:
                 # 1. Claim first — the CAS on status is the concurrency
                 # boundary. updated_at is filled by the model's onupdate hook.
                 claim = await session.execute(
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
-                    .values(status="running", pause_requested=False)
+                    .values(
+                        status="running",
+                        pause_requested=False,
+                        claim_epoch=AgentRun.claim_epoch + 1,
+                    )
                 )
                 if not claim.rowcount:
                     await session.rollback()
@@ -2306,10 +2396,35 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         blob_refs=blob_refs,
                         blob_refs_scope=blob_refs_scope,
                     )
+                epoch = (
+                    await session.execute(select(AgentRun.claim_epoch).where(AgentRun.id == run_id))
+                ).scalar_one()
                 await session.commit()
-                return True
+                return int(epoch)
 
         return await retry_transient_db(_attempt, label="submit_and_claim", run_id=run_id)
+
+    async def release_run_claim(self, run_id: str, *, status: str, claim_epoch: int) -> bool:
+        """Return an owned claim to its pause after post-claim validation fails."""
+        from sqlalchemy import update
+
+        from dendrux.db.models import AgentRun
+
+        async def attempt() -> bool:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_id,
+                        AgentRun.status == "running",
+                        AgentRun.claim_epoch == claim_epoch,
+                    )
+                    .values(status=status)
+                )
+                await session.commit()
+                return bool(result.rowcount)
+
+        return await retry_transient_db(attempt, label="release_run_claim", run_id=run_id)
 
     async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunRecord | None:
         """The run, or None when it does not exist or is outside ``tenant_id``.
@@ -2603,6 +2718,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     .where(AgentRun.id == row.id, AgentRun.status == "running")
                     .values(
                         status=case((flagged, "cancelled"), else_="error"),
+                        claim_epoch=AgentRun.claim_epoch + 1,
                         failure_reason=classification,
                         error=case((flagged, None), else_=f"Run swept as {classification}"),
                         cancel_requested=False,
@@ -2695,6 +2811,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     .where(AgentRun.id == row.id, AgentRun.status == previous_status)
                     .values(
                         status=AgentRunStatus.ERROR,
+                        claim_epoch=AgentRun.claim_epoch + 1,
                         failure_reason="abandoned_waiting",
                         cancel_requested=False,
                         pause_requested=False,
@@ -3550,3 +3667,80 @@ def validate_event_index(index: Any) -> None:
             RuntimeWarning,
             stacklevel=2,
         )
+
+
+class _ClaimedStateStore:
+    """Execution-local store view; only status writes and checkpoints are fenced.
+
+    Inserts remain compatible with 0.4 workers during rolling upgrades. Their
+    per-insert fencing is deferred to 0.6.
+    """
+
+    def __init__(self, store: StateStore, run_id: str, epoch: int) -> None:
+        self._store = store
+        self._run_id = run_id
+        self.claim_epoch = epoch
+
+    def __getattr__(self, name: str) -> Any:
+        import inspect
+
+        method = getattr(self._store, name)
+        if (
+            name
+            in {
+                "finalize_run",
+                "finalize_run_if_status_in",
+                "finalize_with_event",
+                "try_pause_run",
+                "pause_with_event",
+                "pause_run",
+            }
+            and method is not None
+            and "claim_epoch" in inspect.signature(method).parameters
+        ):
+
+            async def fenced(run_id: str, **kwargs: Any) -> Any:
+                result = await method(run_id, claim_epoch=self.claim_epoch, **kwargs)
+                if result is False or result is None:
+                    control = await read_run_control(self._store, run_id)
+                    if control.claim_epoch is not None and control.claim_epoch != self.claim_epoch:
+                        logger.warning(
+                            "Run fenced at status transition: run_id=%s code=run_fenced",
+                            run_id,
+                            extra={"run_id": run_id, "code": "run_fenced"},
+                        )
+                return result
+
+            return fenced
+        return method
+
+    async def get_run_control(self, run_id: str) -> RunControl:
+        control = await read_run_control(self._store, run_id)
+        if (
+            (isinstance(self._store, SQLAlchemyStateStore) and control.claim_epoch is None)
+            or (control.claim_epoch is not None and control.claim_epoch != self.claim_epoch)
+            or (control.status is not None and control.status != RunStatus.RUNNING.value)
+        ):
+            from dendrux.errors import RunFencedError
+
+            logger.warning(
+                "Run fenced: run_id=%s code=run_fenced",
+                run_id,
+                extra={"run_id": run_id, "code": "run_fenced"},
+            )
+            raise RunFencedError(run_id, claim_epoch=self.claim_epoch)
+        return control
+
+
+def claimed_store(store: StateStore, run_id: str, epoch: int | bool) -> StateStore:
+    """Bind a returned epoch; bool is the pre-0.5 custom-store claim contract."""
+    if type(epoch) is bool:
+        return store
+    if isinstance(store, _ClaimedStateStore):
+        store = store._store
+    return cast("StateStore", _ClaimedStateStore(store, run_id, epoch))
+
+
+def unclaimed_store(store: StateStore | None) -> StateStore | None:
+    """The shared store for identity-sensitive capabilities such as blob catalogs."""
+    return store._store if isinstance(store, _ClaimedStateStore) else store
