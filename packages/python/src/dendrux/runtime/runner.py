@@ -53,6 +53,7 @@ from dendrux.loops._helpers import (
     record_run_started,
 )
 from dendrux.loops.react import ReActLoop
+from dendrux.runtime._entry_checks import run_meta_checks
 from dendrux.runtime.context import (
     DelegationContext,
     StreamContext,
@@ -1435,6 +1436,7 @@ async def run(
                 if state_store is not None:
                     # Create the run record before the loop starts
                     # Merge loop type + depth limit into developer metadata
+                    run_meta_checks(agent, "run", tenant_id=tenant_id, metadata=metadata)
                     run_meta = dict(metadata) if metadata else {}
                     run_meta["dendrux.loop"] = type(resolved_loop).__name__
                     if skill_session.configured:
@@ -2221,6 +2223,7 @@ async def retry(
 
         _system_prompt = agent.get_system_prompt(loop=resolved_loop)
 
+        run_meta_checks(agent, "retry", tenant_id=tenant_id, metadata=metadata)
         run_meta = dict(metadata) if metadata else {}
         run_meta["dendrux.loop"] = type(resolved_loop).__name__
         if skill_session.configured:
@@ -2704,6 +2707,7 @@ def run_stream(
                 _shared["existing_run"] = False
 
             if store is not None:
+                run_meta_checks(agent, "stream", tenant_id=eff_tenant, metadata=metadata)
                 run_meta = dict(metadata) if metadata else {}
                 run_meta["dendrux.loop"] = type(resolved_loop).__name__
                 if skill_session.configured:

@@ -32,7 +32,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from dendrux._sentinel import _UnsetType
+from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
+from dendrux.runtime._entry_checks import entry_checks
 from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
         BeforeToolHook,
         Budget,
         ImageRef,
+        Limits,
         PauseOutcome,
         RunEvent,
         RunResult,
@@ -358,6 +360,10 @@ class Agent:
         before_tool: BeforeToolHook | None = ...,
         images: ImagePolicy | None = ...,
         blob_store: BlobStore | None = ...,
+        strict_tenancy: bool = ...,
+        limits: Limits | None = ...,
+        tool_threads: int = ...,
+        on_governance_change: Literal["warn", "raise"] = ...,
     ) -> None: ...
 
     @overload
@@ -389,6 +395,10 @@ class Agent:
         before_tool: BeforeToolHook | None = ...,
         images: ImagePolicy | None = ...,
         blob_store: BlobStore | None = ...,
+        strict_tenancy: bool = ...,
+        limits: Limits | None = ...,
+        tool_threads: int = ...,
+        on_governance_change: Literal["warn", "raise"] = ...,
     ) -> None: ...
 
     def __init__(
@@ -419,6 +429,10 @@ class Agent:
         before_tool: BeforeToolHook | None = None,
         images: ImagePolicy | None = None,
         blob_store: BlobStore | None = None,
+        strict_tenancy: bool = False,
+        limits: Limits | None = None,
+        tool_threads: int = 8,
+        on_governance_change: Literal["warn", "raise"] = "warn",
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -496,6 +510,32 @@ class Agent:
                 f"got {type(before_tool).__name__}."
             )
         self._before_tool: BeforeToolHook | None = before_tool
+
+        # --- Trust (0.5.0): stored here, enforced by the runtime checks ---
+        from dendrux.tools._lookups import make_call_limiter
+        from dendrux.types import Limits as _Limits
+
+        if not isinstance(strict_tenancy, bool):
+            raise ValueError(f"Agent '{self.name}' strict_tenancy must be a bool.")
+        if limits is not None and not isinstance(limits, _Limits):
+            raise ValueError(
+                f"Agent '{self.name}' limits must be a Limits instance, "
+                f"got {type(limits).__name__}."
+            )
+        if isinstance(tool_threads, bool) or not isinstance(tool_threads, int) or tool_threads < 1:
+            raise ValueError(
+                f"Agent '{self.name}' tool_threads must be a positive int, got {tool_threads!r}."
+            )
+        if on_governance_change not in ("warn", "raise"):
+            raise ValueError(
+                f"Agent '{self.name}' on_governance_change must be 'warn' or 'raise', "
+                f"got {on_governance_change!r}."
+            )
+        self._strict_tenancy: bool = strict_tenancy
+        self._limits: Limits | None = limits
+        self._tool_threads: int = tool_threads
+        self._on_governance_change: Literal["warn", "raise"] = on_governance_change
+        self._tool_call_limiter: Any = make_call_limiter(tool_threads)
 
         # --- Images ---
         from dendrux.media._policy import ImagePolicy as _ImagePolicy
@@ -1180,7 +1220,7 @@ class Agent:
         runs: list[str] | None = None,
         replay_last: int | Literal["all"] = 0,
         replay_reasoning: bool = True,
-        tenant_id: str | None = None,
+        tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
@@ -1286,6 +1326,16 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
+        tenant_id = entry_checks(
+            self,
+            "run",
+            tenant_id,
+            default_tenant=None,
+            metadata=metadata,
+            user_input=user_input,
+            history=history,
+            context=context,
+        )
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
@@ -1350,7 +1400,7 @@ class Agent:
         self,
         run_id: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
         **kwargs: Any,
@@ -1381,6 +1431,9 @@ class Agent:
                 source run is not terminal, or if the source run was
                 SingleCall.
         """
+        tenant_id = entry_checks(
+            self, "retry", tenant_id, default_tenant=None, run_id=run_id, metadata=metadata
+        )
         provider = self._require_provider()
         store = await self._resolve_state_store()
 
@@ -1410,7 +1463,7 @@ class Agent:
         tool_results: list[ToolResult] | None = None,
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Resume a paused run.
 
@@ -1440,6 +1493,15 @@ class Agent:
                 both args provided, or neither provided.
             RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
+        tenant_id = entry_checks(
+            self,
+            "resume",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            tool_results=tool_results,
+            user_input=user_input,
+        )
         # Validate args before any I/O
         provider = self._require_provider()
         if tool_results is not None and user_input is not None:
@@ -1492,7 +1554,7 @@ class Agent:
         results: list[ToolResult],
         *,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Submit client-side tool results and resume the paused run.
 
@@ -1526,6 +1588,14 @@ class Agent:
             RunAlreadyTerminalError: run already reached a terminal state.
             InvalidToolResultError: results don't match pending calls.
         """
+        tenant_id = entry_checks(
+            self,
+            "submit_tool_results",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            tool_results=results,
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
@@ -1578,7 +1648,7 @@ class Agent:
         text: UserContent,
         *,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Submit clarification input and resume the paused run.
 
@@ -1600,6 +1670,14 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_id = entry_checks(
+            self,
+            "submit_input",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            user_input=text,
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import claim_or_raise
@@ -1653,7 +1731,7 @@ class Agent:
         decisions: Mapping[str, ApprovalDecision] | None = None,
         rejection_reason: str | None = None,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Submit an approval decision for a run awaiting human approval.
 
@@ -1701,6 +1779,9 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_id = entry_checks(
+            self, "submit_approval", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
         from dendrux.runtime.submit import (
@@ -1825,7 +1906,7 @@ class Agent:
         run_id: str,
         *,
         cascade: bool = False,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Request cancellation for ``run_id``.
 
@@ -1899,6 +1980,9 @@ class Agent:
             RunNotFoundError: ``run_id`` does not exist (or is outside
                 ``tenant_id``).
         """
+        tenant_id = entry_checks(
+            self, "cancel_run", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+        )
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
 
         store = await self._resolve_state_store()
@@ -1993,7 +2077,7 @@ class Agent:
         run_id: str,
         *,
         cascade: bool = True,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
         reason: str | None = None,
     ) -> PauseOutcome:
         """Ask a running run to pause durably at its next checkpoint.
@@ -2048,6 +2132,9 @@ class Agent:
                 ``tenant_id``).
             ValueError: ``reason`` is not a string or is too long.
         """
+        tenant_id = entry_checks(
+            self, "request_pause", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+        )
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.types import PauseOutcome, RunStatus
 
@@ -2099,7 +2186,7 @@ class Agent:
         run_id: str,
         *,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Resume a PAUSED run and block until its next pause or terminal state.
 
@@ -2124,6 +2211,9 @@ class Agent:
             WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_id = entry_checks(
+            self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_paused_claim
         from dendrux.runtime.submit import claim_or_raise
@@ -2156,7 +2246,7 @@ class Agent:
         text: str,
         *,
         metadata: Any = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> str:
         """Leave a note for a non-terminal run; the model sees it at the next iteration.
 
@@ -2194,6 +2284,15 @@ class Agent:
                 ``tenant_id``).
             RunAlreadyTerminalError: the run already finished.
         """
+        tenant_id = entry_checks(
+            self,
+            "submit_note",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            note_text=text,
+            note_metadata=metadata,
+        )
         import json
 
         from dendrux.errors import (
@@ -2279,7 +2378,7 @@ class Agent:
         runs: list[str] | None = None,
         replay_last: int | Literal["all"] = 0,
         replay_reasoning: bool = True,
-        tenant_id: str | None = None,
+        tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
         idempotency_key: str | None = None,
@@ -2369,6 +2468,16 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
+        tenant_id = entry_checks(
+            self,
+            "stream",
+            tenant_id,
+            default_tenant=None,
+            metadata=metadata,
+            user_input=user_input,
+            history=history,
+            context=context,
+        )
         _validate_max_delegation_depth(max_delegation_depth)
 
         if self._guardrails:
@@ -2420,7 +2529,7 @@ class Agent:
         tool_results: list[ToolResult] | None = None,
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunStream:
         """Stream a resumed run as RunEvents.
 
@@ -2457,6 +2566,15 @@ class Agent:
                 event, when ``run_id`` is outside ``tenant_id``. The run is
                 left untouched (the stream's close-time cleanup is a no-op).
         """
+        tenant_id = entry_checks(
+            self,
+            "resume_stream",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            tool_results=tool_results,
+            user_input=user_input,
+        )
         if self._guardrails:
             raise ValueError(
                 "guardrails are not supported with resume_stream() in this version. "
@@ -2644,6 +2762,7 @@ class Agent:
             self.tools,
             mcp_executors=self._mcp_executors,
             mcp_tool_defs=self._discovered_tool_defs,
+            call_limiter=self._tool_call_limiter,
         )
 
         from dendrux.skills._session import SkillTool
