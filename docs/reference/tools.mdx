@@ -110,7 +110,7 @@ For a local `@tool`, each call goes through these steps in order, and a failure 
 
 Validation happens before the approval pause, so a person is never asked to approve a call that could not have run.
 
-**What your hooks, approvals and function all see is the same normalised JSON.** After coercion the arguments are dumped back to JSON (`model_dump(mode="json")`). `before_tool` receives that, the `approval.requested` event shows that, the stored `tool_calls` row and the pause state hold that, and your function is called with objects built from exactly that JSON. What a person approves is what runs.
+**What a reviewer sees, and what runs.** Your function is called with objects built from the coerced arguments, and `before_tool` receives real values in process. The approval view (`approval.requested` and any stored or displayed approval) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when PII redaction is on, before coercion, and without injected defaults. Coercion is deterministic, so the approved arguments decide what runs.
 
 ```python
 from pydantic import BaseModel, Field
@@ -133,7 +133,7 @@ Details:
 - MCP tools and client tools are not coerced: their arguments and results are unchanged from 0.4.
 - Tool schemas are part of the prompt, so adding constraint keywords can change a prompt-cache key once, on the first request after you upgrade.
 
-[//]: # "VERIFY-0.5.0: T4 owns validation and coercion; confirm the order of operations, the error wording rule and that normalised JSON reaches hooks, events, tool_calls rows, pause_data and the approval fingerprint"
+[//]: # "VERIFY-0.5.0: T4 owns validation and coercion; confirm the order of operations, the error wording rule, that the approval view is the model-sent form (exclude_unset) and that the approval fingerprint uses it"
 
 ## Timeouts and the thread pool
 

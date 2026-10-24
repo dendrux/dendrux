@@ -100,7 +100,9 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False,
 | `count_runs` | `int` | Same filters as `list_runs`, for pagination totals. |
 | `get_run` | `RunDetail` or `None` | One run's full anchor row. |
 | `get_events` | `StoredEvent` list | `after_sequence_index` is a strict `>` cursor (reconnect-safe). See [Event ordering](/docs/architecture/event-ordering). |
-| `stream_events` | async iterator | The same source SSE polls. |
+| `stream_events` | async iterator | Raw events, never ends on its own. Without `tenant_id` it reads any tenant's run and prints a `DeprecationWarning`; prefer `follow`. |
+| `get_pending` | `PendingPause` or `None` | What a paused run is waiting on. See [Pending and live reads](#pending-and-live-reads). |
+| `follow` | `Follow` (async iterator) | A hardened live feed. See [Pending and live reads](#pending-and-live-reads). |
 | `get_llm_calls` | `LLMCall` list | Per-LLM-call usage, cache, raw payloads. |
 | `get_tool_invocations` | `ToolInvocation` list | Per tool execution: params, result, success. |
 | `get_traces` | `TraceEntry` list | Conversation messages in order. |
@@ -108,6 +110,26 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False,
 | `get_pii_mapping` | `dict[str, str]` | Placeholder to real value. See [PII redaction](/docs/architecture/pii-redaction). |
 | `get_subtree` | `RunSubtree` | A run, its delegated descendants and live rolled-up usage. |
 | `get_notes` | `RunNote` list | Inbox notes submitted with `submit_note`, delivered or not. |
+
+### Pending and live reads
+
+Two calls exist to serve a frontend from your own routes. Both require an explicit `tenant_id` (a string, `None`, or `UNSCOPED`; leaving it out is a `TypeError`) and never fail open. The recipe is [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+```python
+async def get_pending(run_id: str, *, tenant_id: TenantScope) -> PendingPause | None
+
+def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | None = None,
+           include_payloads: bool = False, until_terminal: bool = True,
+           max_duration_s: float | None = 900.0) -> Follow
+```
+
+**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params` and `approval`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is one bounded read; the run's history is never loaded. `params` are the active pause's arguments, visible by default (the instruction to the client). It reports the run you ask about: for a run that delegated, list the tree with `get_subtree` and call `get_pending` for each waiting node.
+
+**`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. A shared poller serves every follower of a run in your process, at most 500 followers per store (`FollowCapacityError`, answer 503), 900 s per follow by default. Events pass through `redact_event`: with `include_payloads=False` the system prompt, provider bodies, the PII mapping and past pauses' arguments are removed, and the active pause's arguments stay.
+
+**`redact_event(event, *, include_payloads=False, active_pause=False)`** is the same filter as a function, for code that reads with `get_events`. All of these are importable from `dendrux.store` (`PendingPause`, `PendingToolCall`, `Follow`, `FollowEnd`, `FollowHeartbeat`, `FollowCapacityError`, `EventFeed`, `redact_event`).
+
+[//]: # "VERIFY-0.5.0: signatures and defaults are from T1 section 10 (worktree 050-t1); the pause_id field is None until T7 fills it"
 
 ### `get_subtree`
 

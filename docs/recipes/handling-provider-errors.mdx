@@ -101,6 +101,8 @@ AnthropicProvider(model="claude-sonnet-4-6", call_timeout=120, stream_idle_timeo
 AnthropicProvider(model="claude-sonnet-4-6", call_timeout=None)   # no total deadline
 ```
 
+> **`call_timeout=None` removes the cap on retries too.** The deadline is also what stops the SDK's own retries from re-running a call. With `None`, a slow or failing request can be retried by the SDK after it has already produced (and been billed for) output, so one logical call can be paid for more than once. Keep a deadline unless you have a reason not to; the network read timeout is still set a little above the longest deadline.
+
 When a deadline fires the call is abandoned and not retried again, and you get `ProviderTimeoutError`. The network read timeout is always set a little above the longest deadline, so a stalled connection cannot hang for hours even with `call_timeout=None`.
 
 The old `timeout=` argument still works as a shorthand that sets both `call_timeout` and `stream_idle_timeout`, and prints a `DeprecationWarning`.

@@ -337,7 +337,7 @@ A run that enters `waiting_approval` and later resumes will scan again on the ne
 
 ## Content that cannot be scanned fails closed
 
-If a guardrail cannot examine some content (it is nested too deeply, or larger than the scanner's limit), it reports an `unscannable` finding instead of silently letting the content through. What happens next follows the action:
+If a guardrail cannot examine some content (it is nested too deeply, larger than the scanner's limit, has more than 20,000 distinct values to redact in one run, or arrives while 16 Presidio scans are already running), it reports an `unscannable` finding instead of silently letting the content through. What happens next follows the action:
 
 | Action | `unscannable` content |
 | --- | --- |

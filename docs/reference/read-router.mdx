@@ -7,6 +7,8 @@ description: The factory that returns a mountable FastAPI read router over RunSt
 
 `make_read_router` builds a read-only FastAPI `APIRouter` over a [`RunStore`](/docs/reference/run-store). Mount it into your app and you get the full read surface (list, detail, events, SSE, drill-downs) with one auth dependency and one tenant resolver.
 
+> **Frozen in 0.5.** The router stays and works, but it gets no new features, and it is not deprecated. Whether to deprecate it is decided in 0.6, from how it is used. For anything beyond a quick dashboard, build your own read routes on `RunStore.get_pending` and `RunStore.follow`; the router is a thin wrapper over the same calls. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
 ```python
 from dendrux.http import make_read_router
 ```
@@ -100,10 +102,12 @@ By default the router does not return raw payloads. With `include_payloads=False
 | --- | --- |
 | Provider request and response | `/llm-calls` |
 | Raw traces | `/traces` |
-| Tool parameters and results | `/tool-calls`, `tool.completed` and other events |
+| Tool results and server-tool parameters | `/tool-calls` and other events |
 | The system prompt | `run.started` event data |
-| Tool parameters in `approval.requested` | events and SSE (the placeholder form is shown, because it is what a reviewer approves) |
+| Arguments of **past** pauses | `run.paused` events and `/pauses` |
 | The PII mapping | run detail and `/pauses` |
+
+**Not hidden: the active pause.** While a run is paused, the pending arguments stay visible by default: the parameters of a pending client-tool call, and the arguments of an approval or input request. They are what the client must act on. This covers `run.paused` on `/events`, SSE and follow, the last unresumed pair on `/pauses`, and `RunStore.get_pending`. Approval and input requests show the arguments as the model sent them (placeholder form when PII redaction is on).
 
 This applies to `/runs/*`, `/events`, SSE and `/pauses`. Statuses, counts, timings, token usage, costs and event types are always returned. Set `include_payloads=True` for a trusted internal viewer, behind the strongest `authorize` you have.
 
@@ -114,7 +118,7 @@ This applies to `/runs/*`, `/events`, SSE and `/pauses`. Statuses, counts, timin
 | Method + path | Returns |
 | --- | --- |
 | `GET /health` | `{"status": "ok"}` (unauthenticated, for probes) |
-| `GET /runs` | Filtered, paginated run list (`offset` at most 10,000) |
+| `GET /runs` | Filtered, paginated run list (`offset` at most 10,000; larger is a 422) |
 | `GET /runs/{run_id}` | One run's detail (404 if unknown or out of scope) |
 | `GET /runs/{run_id}/events` | Paginated event log (`?after=N` cursor) |
 | `GET /runs/{run_id}/events/stream` | Server-Sent Events stream |

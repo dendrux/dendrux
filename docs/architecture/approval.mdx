@@ -145,9 +145,9 @@ Pass exactly one of `approved=` or `decisions=`; passing both or neither raises 
 
 ## What the reviewer approves is what runs
 
-For a local `@tool`, the arguments shown in `approval.requested` are the validated, coerced and normalised JSON (see [How arguments are checked](/docs/reference/tools#how-arguments-are-checked)), in placeholder form when a PII guardrail redacted them. The function receives objects built from exactly that JSON, and the pause state stores the same thing, so the approved call cannot differ from the one displayed. The call is validated before the pause: an invalid call is returned to the model, never put in front of a person.
+The approval view (`approval.requested`, and any approval view that is stored or shown) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when a PII guardrail redacted them, before any coercion, and without defaults Dendrux filled in. Execution uses the coerced real values (see [How arguments are checked](/docs/reference/tools#how-arguments-are-checked)). Coercion is deterministic, so the arguments a person approves still decide what runs. `before_tool` hooks receive real values in process, as before. The call is validated before the pause: an invalid call is returned to the model, never put in front of a person.
 
-The read router leaves `approval.requested` parameters visible even with `include_payloads=False`, because they are the thing being approved. Everything else payload-like stays hidden.
+The active pause's arguments stay visible by default, in `run.paused`, `/pauses` and `RunStore.get_pending`, because they are the thing being approved. In your own approval screen, load them with `get_pending` (see [Build your own read routes](/docs/recipes/build-your-own-read-routes)); everything else payload-like stays hidden unless you opt in.
 
 ## Approving the right pause
 

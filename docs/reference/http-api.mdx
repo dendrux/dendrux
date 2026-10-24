@@ -35,11 +35,13 @@ app.include_router(router, prefix="/dendrux")
 
 `tenant_resolver` is required and also runs on every route except `/health`. It returns the caller's scope: a non-empty `str` (that tenant), `None` (untenanted runs only) or `UNSCOPED` (every tenant). A single-tenant app passes `tenant_resolver=UNSCOPED` (`from dendrux import UNSCOPED`). A run outside the scope gets the same 404 as a missing run. See [make_read_router](/docs/reference/read-router) and [Multi-tenancy](/docs/architecture/multi-tenancy).
 
+> **This router is frozen in 0.5.** It gets no new features and no deprecation warning. The recommended way to serve reads is your own routes over `RunStore.get_pending` and `RunStore.follow`; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
 Other options: `include_payloads=False` (default) hides raw payloads, `sse_max_connections=500` and `sse_max_duration_s=900` bound the SSE endpoint.
 
 ### Payloads hidden by default
 
-With `include_payloads=False`, responses from `/runs/*`, `/events`, SSE and `/pauses` leave out: the provider request and response, raw trace content, raw tool parameters and results, the system prompt in `run.started`, tool parameters in `approval.requested` (the placeholder form stays visible, since it is what a reviewer approves) and the PII mapping. Everything below describes the shapes with `include_payloads=True`; with the default, those fields are absent.
+With `include_payloads=False`, responses from `/runs/*`, `/events`, SSE and `/pauses` leave out: the provider request and response, raw trace content, raw tool parameters and results, the system prompt in `run.started`, the arguments of past pauses and the PII mapping. The **active pause's** arguments stay visible by default (pending client-tool calls, approval and input requests), in `run.paused`, `/pauses` and `RunStore.get_pending`. Everything below describes the shapes with `include_payloads=True`; with the default, those fields are absent.
 
 ## Read endpoints
 
@@ -66,7 +68,7 @@ Query parameters:
 | `started_after` | RFC 3339 datetime | none | Inclusive lower bound on `created_at`. Needs a timezone (a naive datetime is a 422); normalised to UTC. |
 | `started_before` | RFC 3339 datetime | none | Exclusive upper bound on `created_at`. Same rules. |
 | `limit` | `int` 1-1000 | 50 | Page size. |
-| `offset` | `int` 0-10000 | 0 | Rows to skip. |
+| `offset` | `int` 0-10000 | 0 | Rows to skip. Over 10,000 is a 422. |
 
 Response (each item also carries `tenant_id`):
 
@@ -170,7 +172,7 @@ Poll cadence: 0.5s when events are flowing, backing off to 2s when idle, one que
 
 Limits: at most `sse_max_connections` (default 500) concurrent connections per router, which is per process; the next connection gets `503`. A connection lasts at most `sse_max_duration_s` (default 900) and then closes so the client reconnects with its cursor. The tenant resolver and `authorize` run again on every reconnect.
 
-Termination: when the run status is terminal and every event has been sent, the server writes an `event: end` frame and closes. Reconnecting to a finished, drained run returns `204` with no body. Add `?follow=true` to keep the stream open after the run finishes (the 0.4 behaviour). If the client drops, the generator ends on the next sleep and the connection releases.
+Termination: when the run status is terminal and every event has been sent, the server writes an `event: end` frame (its data is `{"reason", "cursor"}`) and closes. Reconnecting to a finished, drained run returns `204` with no body. Add `?follow=true` to keep the stream open after the run finishes (the 0.4 behaviour). If the client drops, the generator ends on the next sleep and the connection releases.
 
 [//]: # "VERIFY-0.5.0: T1 owns SSE; confirm the end frame, 204, follow=true, 503 and the poll backoff numbers"
 

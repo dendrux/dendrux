@@ -71,7 +71,7 @@ router = make_read_router(store=store, authorize=authorize, tenant_resolver=tena
 
 [//]: # "VERIFY-0.5.0: T1 implements the resolver; confirm the 500 on invalid values, the identical 404 body and that ?tenant_id= is ignored (not 403) for scoped callers"
 
-Read responses also hide payloads by default. See [include_payloads](/docs/reference/read-router#payloads).
+Read responses also hide payloads by default. See [include_payloads](/docs/reference/read-router#payloads). If you write your own read routes, `get_pending` and `follow` take the same scope; see [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 ## Writes: `tenant_id=` on every entry point
 
@@ -99,10 +99,10 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 
 - `TenantScopeRequiredError` is a `ValueError`. It names the operation, not the data.
 - Delegated child runs inherit their parent's tenant and never raise.
-- Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `DeprecationWarning` once per process when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
+- Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `FutureWarning` when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
 - It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
 
-[//]: # "VERIFY-0.5.0: T1 fills in resolve_tenant; confirm the delegated-child inheritance and the DeprecationWarning text when strict_tenancy is not chosen"
+[//]: # "VERIFY-0.5.0: T1 fills in resolve_tenant; confirm the delegated-child inheritance and the FutureWarning text when strict_tenancy is not chosen"
 
 ### Metadata
 

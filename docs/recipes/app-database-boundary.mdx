@@ -231,7 +231,7 @@ Run this once after every deploy of the integration, in staging first:
 
 1. **App migrations.** Apply your own schema changes.
 2. **Dendrux migrations.** Run `dendrux db migrate`, then `dendrux db check` (exit code 0 means current). A Postgres database that was not migrated fails at startup with `SchemaOutOfDateError`.
-3. **Start the app.** Check the log for `DeprecationWarning`s about 0.6 defaults.
+3. **Start the app.** Check the log for `FutureWarning`s about 0.6 defaults.
 4. **Create a chat** in your UI or API.
 5. **Send a message** and wait for the answer. Send a second message that depends on the first, to prove `history=` works.
 6. **Inspect your transcript.** Your `messages` rows should hold the user text and the assistant answer, and the turn row should hold the `dendrux_run_id`.

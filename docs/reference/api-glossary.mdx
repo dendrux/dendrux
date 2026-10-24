@@ -84,7 +84,10 @@ The guide is [Images](/docs/recipes/images).
 | Symbol | Import | What it is |
 | --- | --- | --- |
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
-| `make_read_router` | `from dendrux.http import make_read_router` | Mountable FastAPI read router; needs `tenant_resolver=`. See [make_read_router](/docs/reference/read-router). |
+| `make_read_router` | `from dendrux.http import make_read_router` | Mountable FastAPI read router; needs `tenant_resolver=`. Frozen in 0.5 (no new features, not deprecated). See [make_read_router](/docs/reference/read-router). |
+| `PendingPause` / `PendingToolCall` | `from dendrux.store import PendingPause, PendingToolCall` | What a paused run waits on, from `RunStore.get_pending`. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). |
+| `Follow` / `FollowEnd` / `FollowHeartbeat` / `FollowCapacityError` / `EventFeed` | `from dendrux.store import ...` | The hardened live feed behind `RunStore.follow`. |
+| `redact_event` | `from dendrux.store import redact_event` | What a reader without payload access may see of an event. |
 
 `RunStore` read methods return these record types (all from `dendrux.store`): `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`, plus `RunSubtree`, `SubtreeNode`, `RunUsage` (from `get_subtree`) and `RunNote` (from `get_notes`). Fields are documented on the [RunStore](/docs/reference/run-store) page.
 

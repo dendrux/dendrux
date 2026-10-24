@@ -59,7 +59,7 @@ All the arguments:
 | `max_cost_usd` | Dollar cap. Positive number, or `None`. | `None` |
 | `warn_at` | Fractions of each limit at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
 | `on_exceed` | `"warn"`, `"pause"` or `"cancel"`. | `"warn"` |
-| `count_cache_tokens` | `True` counts cache read and cache write tokens in the token total. `False` keeps the 0.4 count (fresh input plus output). `None` means "not chosen": the 0.4 count, plus a `DeprecationWarning` when `max_tokens` is set. | `None` |
+| `count_cache_tokens` | `True` counts cache read and cache write tokens in the token total. `False` keeps the 0.4 count (fresh input plus output). `None` means "not chosen": the 0.4 count, plus a `FutureWarning` when `max_tokens` is set. | `None` |
 | `include_children` | Count delegated descendant runs' usage. | `True` |
 
 At least one of `max_tokens` and `max_cost_usd` is required; `Budget()` raises `ValueError`. So does a non-positive limit, a `warn_at` fraction outside `(0, 1)`, or an unknown `on_exceed`.
@@ -70,7 +70,7 @@ By default tokens are `input_tokens + output_tokens`, summed over the LLM calls.
 
 With `Budget(count_cache_tokens=True)` the total is `input + output + cache_read + cache_write` tokens, which matches what the context window and most provider rate limits count. If you opt in, expect budgets to trip sooner on agents with large cached prompts, and raise `max_tokens` to match.
 
-In 0.5 the default stays the 0.4 count and a token budget without an explicit `count_cache_tokens` prints a `DeprecationWarning` once per process. In 0.6 counting cache tokens becomes the default. Choose explicitly now:
+In 0.5 the default stays the 0.4 count and a token budget without an explicit `count_cache_tokens` prints a `FutureWarning`. In 0.6 counting cache tokens becomes the default. Choose explicitly now:
 
 ```python
 Budget(max_tokens=200_000, count_cache_tokens=True)    # the 0.6 behaviour
@@ -87,7 +87,7 @@ The dollar limit is where caching always shows up: cost is what the provider rep
 
 **It is checked up front.** If the agent's model has neither, `Budget(max_cost_usd=...)` raises `BudgetConfigurationError` when the `Agent` is built, and again when a run starts for the model actually used (a per-call `model=` override can change it). A dollar budget that could never fire is a configuration error, not a silent no-op. Fix it by adding a `PriceTable` entry for the model you request (globs such as `"gpt-5*"` work), or by using a provider that reports cost.
 
-Vendors often return a dated snapshot id (`claude-haiku-4-5-20251001`) rather than the alias you asked for. Pricing looks up the returned model first and falls back to the model you requested, so a table entry for the alias still prices the call.
+Vendors often return a dated snapshot id (`claude-haiku-4-5-20251001`) rather than the alias you asked for. Pricing looks for an exact match on the returned model, then an exact match on the requested model, then a glob on the returned model, then a glob on the requested model, so a table entry for the alias still prices the call (see [Cost and pricing](/docs/architecture/pricing)). A cost the provider marks unknown is never filled in from the table.
 
 Within a run, a call can still be **unpriced** (a model that is not in the table, or a provider that stopped reporting cost). What happens depends on `on_exceed`:
 

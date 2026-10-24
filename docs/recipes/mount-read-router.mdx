@@ -5,6 +5,8 @@ description: Stand up dendrux's read-only HTTP surface — runs, events, drill-d
 
 # Mounting the read router
 
+> **Prefer your own routes.** `make_read_router` is frozen in 0.5 (no new features, not deprecated). For production UIs, build your own read routes on `RunStore.get_pending` and `RunStore.follow`: [Build your own read routes](/docs/recipes/build-your-own-read-routes). This recipe is for when the ready-made router is enough.
+
 Dendrux ships one factory, `make_read_router`, that returns a FastAPI `APIRouter` covering every read endpoint a dashboard or monitor needs: list runs, fetch a run, page through events, stream events as SSE, drill into LLM calls, tool calls, traces, and pause/resume cycles. You mount it into your app, supply an authorize dependency and a tenant resolver, and that is the entire setup.
 
 This recipe shows the mount, the responses each endpoint returns (captured from a real run), and the patterns you will reach for when wiring this into your own app.

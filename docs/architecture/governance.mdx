@@ -194,9 +194,9 @@ Agent(..., on_governance_change="warn")    # default in 0.5: emit governance.cha
 Agent(..., on_governance_change="raise")   # raise GovernanceMismatchError; the run stays paused
 ```
 
-`governance.changed` names the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `DeprecationWarning` once per process if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
+`governance.changed` names the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `FutureWarning` if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
 
-[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the DeprecationWarning against the merged code"
+[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the FutureWarning against the merged code"
 
 ## Why one pipeline instead of four subsystems
 

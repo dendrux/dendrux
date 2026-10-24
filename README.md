@@ -33,14 +33,15 @@
 0.5.0 ("Trust") makes Dendrux safe by default for multi-tenant, production use. Read the [upgrade guide](docs/upgrading-to-0.5.0.mdx) before you deploy: run `dendrux db migrate`, then roll your workers (rolling deploys are supported).
 
 - **Tenant-scoped reads.** `make_read_router(..., tenant_resolver=...)` is now required: a dependency that returns the caller's tenant, or `UNSCOPED` for a single-tenant app. Every `RunStore` read takes `tenant_id=`, a run in another tenant looks exactly like a missing one, and idempotency keys are per tenant. Opt into `Agent(strict_tenancy=True)` to make forgetting `tenant_id=` an error. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
-- **Payloads hidden by default.** The read router leaves out provider requests and responses, raw tool data, the system prompt and the PII mapping unless you pass `include_payloads=True`. SSE streams close when a run finishes, share one poller per run and are bounded in number and duration.
+- **Payloads hidden by default.** The read router leaves out provider requests and responses, raw tool data, the system prompt and the PII mapping unless you pass `include_payloads=True`; the active pause's arguments stay visible so client tools and approval screens keep working.
+- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. `make_read_router` stays, frozen. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx).
 - **No more silent provider failures.** Every failed request is a typed `ProviderError` (`.category`, `.retryable`, `.safe_message`); empty streams, refusals and failed Responses calls end the run `error` with `RunResult.error_info` instead of an empty `success`. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](docs/recipes/handling-provider-errors.mdx).
 - **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
 - **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
 - **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. The default is unchanged. See [PII restore](docs/architecture/pii-restore.mdx).
 - **Run integrity.** Pauses carry a `pause_id` so a stale submit is rejected (`expected_pause_id=`), claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
 - **Secure dashboard.** `dendrux dashboard` needs a token (`DENDRUX_DASHBOARD_TOKEN`) when it listens off loopback.
-- **Migration.** Run `dendrux db migrate` (revision `d7e8f9a0b1c2`). Several defaults flip in 0.6; 0.5 prints a `DeprecationWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
+- **Migration.** Run `dendrux db migrate` (revision `d7e8f9a0b1c2`). Several defaults flip in 0.6; 0.5 prints a `FutureWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
 
 ## What's new in 0.4.1
 
@@ -345,8 +346,7 @@ async def read_excel_range(sheet: str, range: str) -> str:
     """Read cells from the user's spreadsheet."""
     return ""
 
-# Dendrux ships reads + SSE. You wire the writes around agent methods.
-from dendrux.http import make_read_router
+# Dendrux gives you the reads as library calls. You own the routes.
 from dendrux.store import RunStore
 from dendrux.types import ToolResult
 from pydantic import BaseModel
@@ -361,13 +361,11 @@ class ResultsBody(BaseModel):
 
 store = RunStore.from_database_url(db_url)
 
-async def tenant_of(user=Depends(require_user)) -> str:
-    return user.org_id          # the caller's tenant; single-tenant apps pass UNSCOPED instead
-
-app.include_router(
-    make_read_router(store=store, authorize=require_user, tenant_resolver=tenant_of),  # or UNSCOPED
-    prefix="/api",
-)
+@app.get("/runs/{run_id}/pending")
+async def pending(run_id: str, user=Depends(require_user)):
+    # What is the run waiting on? The tenant is required; a foreign run is a 404.
+    pause = await store.get_pending(run_id, tenant_id=user.org_id)   # or UNSCOPED
+    return pause.to_dict() if pause is not None else None
 
 @app.post("/runs/{run_id}/tool-results")
 async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
@@ -380,7 +378,7 @@ async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
     return await agent.submit_tool_results(run_id, results, tenant_id=user.org_id)
 ```
 
-Pause/resume orchestration, CAS-safe claim, and SSE transport are Dendrux's job. Auth, schema, error shape, and framework choice are yours.
+Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add live updates with `RunStore.follow` if you want them (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
 
 ### 🔀 Streaming
 
