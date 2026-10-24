@@ -15,6 +15,8 @@ from dendrux.mcp._errors import (
     MCPAuthenticationError,
     MCPAuthorizationRequired,
     MCPDestinationDeniedError,
+    MCPResultTooLargeError,
+    MCPSessionExpiredError,
     MCPToolCallError,
 )
 from dendrux.mcp._result import error_text, has_image_blocks, normalize_mcp_result
@@ -288,7 +290,13 @@ def create_mcp_executor(
         # would otherwise reach the run store and the model's context window.
         if isinstance(
             failure,
-            (MCPAuthenticationError, MCPAuthorizationRequired, MCPDestinationDeniedError),
+            (
+                MCPAuthenticationError,
+                MCPAuthorizationRequired,
+                MCPDestinationDeniedError,
+                MCPResultTooLargeError,
+                MCPSessionExpiredError,
+            ),
         ):
             raise failure from None
         detail = (

@@ -28,7 +28,6 @@ from dendrux.mcp._errors import (
     MCPCircuitOpenError,
     MCPConnectionCapacityError,
     MCPConnectionEvictingError,
-    MCPConnectionLostError,
     MCPCredentialError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
@@ -4126,13 +4125,12 @@ class TestBrokenConnectionRecovery:
             assert await fresh.fn["github__write"](value=2) == "write:ok"
             assert len(_InstrumentedAdapter.instances) == 2
 
-            # The first Agent's view is still bound to the dead transport:
-            # its retained executor fails typed, and nothing was ever sent.
-            with pytest.raises(MCPConnectionLostError) as excinfo:
-                await lookups.fn["github__write"](value=3)
-            assert excinfo.value.identity == (None, "github-1")
-            assert not isinstance(excinfo.value, MCPToolCallError)
+            # The first Agent's view was bound to the dead transport: its
+            # retained executor moves to the live connection and succeeds,
+            # and nothing more was ever sent on the broken one.
+            assert await lookups.fn["github__write"](value=3) == "write:ok"
             assert broken.call_tool_calls == 1
+            assert len(_InstrumentedAdapter.instances) == 2
 
             await first.close()
             await second.close()
@@ -4388,14 +4386,19 @@ class TestBrokenConnectionRecovery:
             await _wait_until(lambda: len(runtime._call_queue) == 1)
 
             _InstrumentedAdapter.call_error = BrokenPipeError("pipe closed")
+            # Hold the replacement connection until the error is cleared.
+            _InstrumentedAdapter.connect_gate = asyncio.Event()
             gate.set()
 
             with pytest.raises(MCPOutcomeUnknownError):
                 await busy
-            # Well inside the 5s wait budget: the fence wakes the queue.
-            with pytest.raises(MCPConnectionLostError):
-                await asyncio.wait_for(queued, timeout=1.0)
+            _InstrumentedAdapter.call_error = None
+            _InstrumentedAdapter.connect_gate.set()
+            # The queued call never reached the broken transport, so it is
+            # retried once on a replacement connection.
+            assert await asyncio.wait_for(queued, timeout=1.0) == "write:ok"
             assert adapter.call_tool_calls == 1
+            assert _InstrumentedAdapter.instances[1].call_tool_calls == 1
             await agent.close()
 
     @pytest.mark.asyncio

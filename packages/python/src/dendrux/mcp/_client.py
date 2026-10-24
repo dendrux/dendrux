@@ -16,7 +16,7 @@ from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKMCPError
-from mcp.types import CONNECTION_CLOSED
+from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
 from dendrux.mcp._challenge import parse_auth_challenge
 from dendrux.mcp._errors import (
@@ -25,8 +25,10 @@ from dendrux.mcp._errors import (
     MCPConnectionError,
     MCPDestinationDeniedError,
     MCPOrigin,
+    MCPResultTooLargeError,
+    MCPSessionExpiredError,
 )
-from dendrux.mcp._http import create_http_client
+from dendrux.mcp._http import CappedResponseStream, create_http_client, wire_cap
 from dendrux.mcp._source import (
     exception_class_name,
     safe_source_exception_detail,
@@ -148,6 +150,21 @@ class _ToolHTTPAttempt:
     status: int | None = None
     destination: MCPOrigin | None = None
     challenge: MCPAuthChallenge | None = None
+    # The tools/call POST carried an Mcp-Session-Id header.
+    session_sent: bool = False
+    # Byte cap on the tools/call response body, and the stream enforcing it.
+    read_cap: int | None = None
+    capped: CappedResponseStream | None = None
+
+
+def _is_session_rejection(exc: BaseException) -> bool:
+    """A JSON-RPC ``INVALID_REQUEST`` naming the session (SDK or server text)."""
+    return any(
+        isinstance(node, SDKMCPError)
+        and node.code == INVALID_REQUEST
+        and "session" in str(node.message).lower()
+        for node in _iter_error_tree(exc)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,11 +282,18 @@ class MCPClientAdapter:
             return
         attempt.destination = _diagnostic_origin(request.url)
         attempt.status = response.status_code
+        attempt.session_sent = bool(request.headers.get("mcp-session-id"))
         attempt.challenge = (
             parse_auth_challenge(response)
             if response.status_code in _AUTH_REJECTION_STATUSES
             else None
         )
+        if attempt.read_cap is not None:
+            # Stop reading an oversized result before it is all in memory.
+            capped = CappedResponseStream(response.stream, attempt.read_cap)
+            response.stream = capped
+            if attempt.capped is None or not attempt.capped.exceeded:
+                attempt.capped = capped
 
     async def _open(self) -> BaseException | None:
         """Open the transport, returning a detached safe failure if needed."""
@@ -458,8 +482,15 @@ class MCPClientAdapter:
         return error
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Send one ``tools/call``; typed failures for the cases callers act on.
+
+        Raises :class:`MCPSessionExpiredError` when the POST itself got HTTP
+        404 for a session-carrying request (not executed), and
+        :class:`MCPResultTooLargeError` when the response body passed the
+        read cap (see :func:`dendrux.mcp._http.wire_cap`).
+        """
         client = self._require_client()
-        attempt = _ToolHTTPAttempt(self, name)
+        attempt = _ToolHTTPAttempt(self, name, read_cap=wire_cap(self.source.max_result_bytes))
         token = _tool_http_attempt.set(attempt)
         try:
             return await client.call_tool(
@@ -471,6 +502,18 @@ class MCPClientAdapter:
             failure = exc
         finally:
             _tool_http_attempt.reset(token)
+        if attempt.capped is not None and attempt.capped.exceeded:
+            too_large = MCPResultTooLargeError(
+                f"MCP tool result exceeded the read limit of {attempt.capped.limit} bytes; "
+                "the response was not read further."
+            )
+            too_large.size = attempt.capped.read
+            raise too_large
+        if attempt.status == 404 and attempt.session_sent and _is_session_rejection(failure):
+            raise MCPSessionExpiredError(
+                f"MCP source '{self.source.name}' no longer knows this session (HTTP 404); "
+                "the call was not executed."
+            )
         if attempt.status in _AUTH_REJECTION_STATUSES:
             error = MCPAuthenticationError(
                 f"MCP source '{self.source.name}' rejected tool-call credentials "
