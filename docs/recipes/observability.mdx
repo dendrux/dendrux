@@ -147,6 +147,10 @@ Serves a small React UI plus a read-only HTTP API. It reads `run_events`, `agent
 
 The dashboard is a reference *consumer* of dendrux's public read APIs — it has no privileged access. Everything it does, your own UI can do too.
 
+**Access.** Bound to loopback (`127.0.0.1`, the default) it opens without a token, for local development. Bound to any other address it requires one: set `DENDRUX_DASHBOARD_TOKEN` (preferred) or pass `--token` (which warns, because command-line arguments show up in process listings). It sends no `Access-Control-Allow-Origin: *`; name the origins that may call it with `--allow-origin`, and it checks the `Host` header. The dashboard shows raw payloads and every tenant's runs, so treat its token like a database credential. See [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0#3-the-dashboard-needs-a-token-off-loopback).
+
+[//]: # "VERIFY-0.5.0: T5 owns the dashboard; confirm env var name, flags and loopback exemption"
+
 ### RunStore + make_read_router — programmatic + HTTP
 
 `RunStore` is the typed Python facade. `make_read_router(store)` is the same surface exposed as a mountable FastAPI router.
@@ -161,7 +165,7 @@ async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
         # build your billing rollup, custom export, alerting check, etc.
 ```
 
-For HTTP exposure, the [Mounting the read router recipe](/docs/recipes/mount-read-router) shows the full mount with auth, plus every endpoint's response shape.
+For HTTP exposure, the [Mounting the read router recipe](/docs/recipes/mount-read-router) shows the full mount with auth and a tenant resolver, plus every endpoint's response shape. The router hides raw payloads (provider requests, tool data, the system prompt) unless you pass `include_payloads=True`.
 
 ## Recommended composition
 
@@ -190,9 +194,13 @@ Then expose the read side to your team:
 from dendrux.http import make_read_router
 
 app.include_router(
-    make_read_router(store=RunStore.from_database_url(os.environ["DATABASE_URL"])),
+    make_read_router(
+        store=RunStore.from_database_url(os.environ["DATABASE_URL"]),
+        authorize=authorize,                  # who may call the API
+        tenant_resolver=tenant_resolver,      # which tenant's runs they see (or UNSCOPED)
+        include_payloads=False,               # default: raw prompts and tool data stay hidden
+    ),
     prefix="/api/dendrux",
-    dependencies=[Depends(authorize)],
 )
 ```
 

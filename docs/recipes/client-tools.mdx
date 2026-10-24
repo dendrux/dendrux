@@ -139,10 +139,16 @@ class SubmitToolResultsIn(BaseModel):
 app = FastAPI()
 store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
 
+from dendrux import UNSCOPED
+
 async def authorize() -> None:
     return None  # plug your auth here
 
-app.include_router(make_read_router(store=store, authorize=authorize), prefix="/api")
+# Single-tenant demo. In a multi-tenant app pass a dependency that returns the caller's tenant.
+app.include_router(
+    make_read_router(store=store, authorize=authorize, tenant_resolver=UNSCOPED),
+    prefix="/api",
+)
 
 @app.post("/chat")
 async def start(body: StartChatIn) -> JSONResponse:
@@ -172,7 +178,7 @@ async def cancel(run_id: str) -> JSONResponse:
     return JSONResponse({"run_id": result.run_id, "status": result.status.value})
 ```
 
-Three routes, three agent methods. No middleware. The read router handles list/detail/events/SSE; you write the actions because every team's auth and request shape is different. See [HTTP API surface](/docs/reference/http-api) for the full reference.
+Three routes, three agent methods. No middleware. The read router handles list/detail/events/SSE (and needs a `tenant_resolver`; `UNSCOPED` is right for a single-tenant app, see [Multi-tenancy](/docs/architecture/multi-tenancy)); you write the actions because every team's auth and request shape is different. See [HTTP API surface](/docs/reference/http-api) for the full reference.
 
 ## The client side
 
@@ -237,6 +243,10 @@ async function executeLocally(name, params) {
 - **Persistence is required.** Client tools rely on the run being safely pausable across requests, processes, and crashes. No DB means no client tools.
 - **Whole batch pauses.** If the LLM emits four tool calls and any one is a client tool, the batch waits. Server tools that ran before the pause are still recorded and their results are kept; the rest of the batch sits in `pause_data` until the client returns.
 - **Submit must cover every pending call.** `submit_tool_results` raises `InvalidToolResultError` on missing or unknown ids. No partial claim. Decide what to do with a call you cannot fulfill before submitting.
+- **Read the pending call from your own code.** `RunStore.get_pauses(run_id)` (or `RunResult` from the call that paused) gives the pending calls with their dendrux ids and parameters, including for client tools, and is the supported way to find the `call_id` you submit against. The read router hides tool parameters unless `include_payloads=True`, so a browser that must execute a client tool should receive the call from a route you write (passing the caller's `tenant_id=` to `get_pauses`), not from the router's `/pauses` or SSE frames. Send the `pause_id` along with it and pass it back as `expected_pause_id=` when you submit.
+
+[//]: # "VERIFY-0.5.0: spec section 2 lists raw tool params as hidden by default but is silent on pending client-tool calls in run.paused and /pauses. Confirm with T1 whether client-tool parameters stay visible (the way approval.requested params do); if they do, replace this note"
+
 - **Cancel works at any time.** `agent.cancel_run(run_id)` on a `waiting_client_tool` run finalizes it as `CANCELLED` atomically. The client should treat a `run.cancelled` SSE frame as the end of the conversation.
 
 ## Where this fits

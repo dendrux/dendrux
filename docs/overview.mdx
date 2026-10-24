@@ -16,8 +16,8 @@ That's the whole library. The rest of these docs explain how it does that and ho
 - An `Agent` you can call with `await agent.run(input)`.
 - Pause and resume across processes. State lives in your database, not in memory.
 - Four governance layers (PII redaction, access control, guardrails, approval) that you turn on per agent, not per call.
-- A built-in dashboard for inspecting runs, steps, events, and pause data.
-- A FastAPI router (`make_read_router`) for read endpoints and Server-Sent Events. You write your own write endpoints; they're a few lines each.
+- A built-in dashboard for inspecting runs, steps, events, and pause data. It needs a token when it listens on anything but loopback.
+- A FastAPI router (`make_read_router`) for read endpoints and Server-Sent Events, scoped per tenant by a resolver you supply and hiding raw payloads by default. You write your own write endpoints; they're a few lines each.
 
 ## What dendrux does *not* do
 
@@ -54,6 +54,8 @@ Everything in dendrux serves one of these. Each has a front-door page:
 **[Architecture](/docs/architecture/runs)**: how dendrux works under the hood, once you've felt the loop.
 
 **[Recipes](/docs/recipes/hitl-approval)**: task-shaped guides for human-in-the-loop approval, browser-side tools, cancelling a run, mounting the read router, and per-thread chatbot observability.
+
+**[Upgrading to 0.5.0](/docs/upgrading-to-0.5.0)**: the migration step, the rolling-deploy rules and a note for every behaviour change.
 
 **[Building a product?](/docs/recipes/app-database-boundary)** Read [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary): which data lives in your database vs Dendrux's, a minimal ChatGPT-style schema, and the request lifecycle for one chat turn.
 
