@@ -123,6 +123,13 @@ class TestApprovalPlaceholders:
             created_at=None,
         )
         for payloads in (False, True):
+            for status in ("waiting_approval", "waiting_human_input"):
+                unchecked = dataclasses.replace(ev, data={**ev.data, "status": status})
+                hidden_without_mapping = redact_event(
+                    unchecked, include_payloads=payloads, active_pause=True
+                )
+                call = hidden_without_mapping.data["pending_tool_calls"][0]
+                assert call["params"] is None and call["args_hidden"] is True
             hidden = redact_event(
                 ev, include_payloads=payloads, active_pause=True, pii_mapping=mapping
             )

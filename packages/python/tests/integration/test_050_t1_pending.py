@@ -21,7 +21,7 @@ from httpx import ASGITransport, AsyncClient
 
 from dendrux.errors import RunNotFoundError
 from dendrux.http import make_read_router
-from dendrux.store import UNSCOPED, EventFeed, FollowEnd, RunStore, StoredEvent
+from dendrux.store import UNSCOPED, EventFeed, FollowEnd, RunStore, StoredEvent, redact_event
 from dendrux.types import ToolResult
 from tests.integration.test_tenant_run_control import _pause
 
@@ -72,7 +72,7 @@ async def test_approval_pause_carries_args_and_gate(store: Any, run_store: RunSt
     pending = await run_store.get_pending(paused.run_id, tenant_id=None)
     assert pending is not None and pending.kind == "approval"
     (call,) = pending.tool_calls
-    assert (call.name, call.params) == ("refund", {"order_id": 7})
+    assert (call.name, call.params, call.args_hidden) == ("refund", None, True)
     assert call.approval is not None and call.approval == {
         "source": "static",
         "reason": "requires_approval",
@@ -204,9 +204,11 @@ async def test_approval_flow_with_defaults(store: Any, run_store: RunStore) -> N
         events = (await http.get(f"/runs/{run_id}/events")).json()["items"]
         data = next(e for e in events if e["event_type"] == "run.paused")["data"]
         assert data["status"] == "waiting_approval"
-        assert data["pending_tool_calls"][0]["params"] == {"order_id": 7}  # the human sees it
+        assert data["pending_tool_calls"][0]["params"] is None
+        assert data["pending_tool_calls"][0]["args_hidden"] is True
     pending = await run_store.get_pending(run_id, tenant_id=UNSCOPED)
-    assert pending is not None and pending.tool_calls[0].params == {"order_id": 7}
+    assert pending is not None and pending.tool_calls[0].params is None
+    assert pending.tool_calls[0].args_hidden is True
     result = await paused.agent.submit_approval(run_id, approved=True)
     assert result.status.value == "success"
 
@@ -327,6 +329,27 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
     # The stored pause holds the de-anonymised value (that is what will execute).
     assert (await store.get_pause_state(run_id))["pending_tool_calls"][0]["params"]["to"] == real
 
+    # Developer-owned read route recipe: get_events -> redact_event(active_pause=True).
+    raw_events = await run_store.get_events(run_id, tenant_id="acme")
+    raw_pause = next(event for event in raw_events if event.event_type == "run.paused")
+    assert real in json.dumps(raw_pause.data)
+    recipe_view = redact_event(raw_pause, active_pause=True)
+    assert recipe_view.data["pending_tool_calls"][0]["params"] is None
+    assert recipe_view.data["pending_tool_calls"][0]["args_hidden"] is True
+    assert real not in json.dumps(recipe_view.data)
+    for include_payloads in (False, True):
+        direct = redact_event(raw_pause, active_pause=True, include_payloads=include_payloads)
+        assert direct.data["pending_tool_calls"][0]["params"] is None
+        assert direct.data["pending_tool_calls"][0]["args_hidden"] is True
+        assert real not in json.dumps(direct.data)
+        scoped = await run_store.get_event_view(
+            run_id, raw_pause, tenant_id="acme", include_payloads=include_payloads
+        )
+        assert scoped.data["pending_tool_calls"][0]["params"] == {"to": "<<EMAIL_ADDRESS_1>>"}
+        assert real not in json.dumps(scoped.data)
+        with pytest.raises(RunNotFoundError):
+            await run_store.get_event_view(run_id, raw_pause, tenant_id="other")
+
     pending = await run_store.get_pending(run_id, tenant_id="acme")
     assert pending is not None
     assert pending.tool_calls[0].params == {"to": "<<EMAIL_ADDRESS_1>>"}
@@ -409,13 +432,7 @@ async def test_pause_display_uses_recorded_args_on_every_path(
     )
     await store.save_run_event("display", event_type="run.paused", data={"status": status, **pause})
     pending = await run_store.get_pending("display", tenant_id="T")
-    expected = (
-        execution
-        if status == "waiting_client_tool" or not (mapped or recorded)
-        else model
-        if recorded
-        else None
-    )
+    expected = execution if status == "waiting_client_tool" else model if recorded else None
     assert pending.tool_calls[0].params == expected
     assert pending.tool_calls[0].args_hidden == (expected is None)
     for payloads in (False, True):

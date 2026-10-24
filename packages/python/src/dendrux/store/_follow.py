@@ -99,7 +99,6 @@ _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
 
 def approval_calls(
     calls: Any,
-    pii_mapping: Mapping[str, str] | None,
     approval_params: Mapping[str, dict[str, Any]] | None,
 ) -> Any:
     """Use recorded model arguments; never infer them from execution values."""
@@ -115,7 +114,7 @@ def approval_calls(
         if params is not None:
             shown.pop("arguments", None)
             shown["params"] = params
-        elif pii_mapping:
+        else:
             shown.pop("arguments", None)
             shown.update(params=None, args_hidden=True)
         result.append(shown)
@@ -133,17 +132,17 @@ def redact_event(
     """The event as a reader may see it (B2 and the approval-arguments rule).
 
     In every mode, the arguments of an **approval or input** ``run.paused``
-    use ``approval.requested.params``, exactly as the model sent them. Approvers
-    never sees de-anonymised values. Client-tool pauses keep the 0.4.1 form.
+    use ``approval.requested.params``, exactly as the model sent them. Without
+    those arguments, ``params`` is hidden. Client-tool pauses keep the 0.4.1 form.
 
     With ``include_payloads=True`` nothing else changes. Otherwise:
 
     - the system prompt (``run.started``), provider request and response
       bodies and any ``pii_mapping`` are removed from ``data``;
     - in ``run.paused``, each pending call's ``params`` are removed **unless**
-      ``active_pause`` is true. The active pause's arguments are an
-      instruction to the client (run this tool, approve this call), so they
-      stay visible; a past pause's arguments are history and are hidden.
+      ``active_pause`` is true. Active client-tool arguments remain visible;
+      active approval/input arguments require recorded model-sent params.
+      A past pause's arguments are history and are hidden.
 
     Tool results and server-tool arguments never appear in event data; read
     them with ``RunStore.get_tool_invocations`` (trusted readers only).
@@ -156,9 +155,7 @@ def redact_event(
         and data.get("status") in _PLACEHOLDER_PAUSES
         and isinstance(data.get("pending_tool_calls"), list)
     ):
-        data["pending_tool_calls"] = approval_calls(
-            data["pending_tool_calls"], pii_mapping, approval_params
-        )
+        data["pending_tool_calls"] = approval_calls(data["pending_tool_calls"], approval_params)
     if include_payloads:
         return dataclasses.replace(event, data=data) if data != event.data else event
     data = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}

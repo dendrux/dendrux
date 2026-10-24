@@ -340,8 +340,8 @@ class PendingToolCall:
     de-anonymisation, so with ``PII(restore="all")`` (the default) they hold
     real values. For an **approval** pause, the placeholder form the model
     sent (``<<EMAIL_ADDRESS_1>>``), never de-anonymised values: that is what a
-    human approves. If a PII mapping exists but recorded model arguments
-    are unavailable, ``params`` is None and ``args_hidden`` is True.
+    human approves. If recorded model arguments are unavailable, ``params``
+    is None and ``args_hidden`` is True.
     ``target`` is ``"client"`` or ``"server"``.
     ``approval`` is ``{"source": "static" | "hook", "reason": ...}`` for a
     call waiting for approval, else None.
@@ -982,7 +982,6 @@ class RunStore:
             if summary is None:
                 raise RunNotFoundError(run_id)
             status, pause, last_step = summary.status, summary.pause, summary.last_step
-            mapping = summary.pii_mapping
         else:  # custom store: scope by lookup, then the full pause state
             record = await self._scoped_run(run_id, tenant_id)
             if record is None:
@@ -992,7 +991,6 @@ class RunStore:
             pause = dict(full)
             steps = full.get("steps") or []
             last_step = steps[-1] if steps else None
-            mapping = await self._state.get_pii_mapping(run_id)
         kind = _KIND_BY_STATUS.get(status)
         if kind is None:
             return None
@@ -1001,9 +999,7 @@ class RunStore:
             params = await self._approval_params(run_id, seq, tenant_id)
             pause = {
                 **pause,
-                "pending_tool_calls": approval_calls(
-                    pause.get("pending_tool_calls"), mapping, params
-                ),
+                "pending_tool_calls": approval_calls(pause.get("pending_tool_calls"), params),
             }
         return _pending_from(run_id, status, kind, pause, last_step)
 
@@ -1111,6 +1107,25 @@ class RunStore:
             active_pause=bool(active_pause),
             pii_mapping=mapping,
             approval_params=params,
+        )
+
+    async def get_event_view(
+        self,
+        run_id: str,
+        event: StoredEvent,
+        *,
+        tenant_id: TenantScope,
+        include_payloads: bool = False,
+    ) -> StoredEvent:
+        """Return a scoped event view with recorded approval arguments when available.
+
+        For the active approval or input pause, missing model-sent arguments
+        are hidden even when the stored execution arguments contain real values.
+        """
+        if await self._status(run_id, tenant_id) is None:
+            raise RunNotFoundError(run_id)
+        return await self._event_view(
+            run_id, event, tenant_id=tenant_id, include_payloads=include_payloads
         )
 
     # ------------------------------------------------------------------
