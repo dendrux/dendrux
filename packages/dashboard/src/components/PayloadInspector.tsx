@@ -29,9 +29,17 @@ interface PayloadInspectorProps {
   messages: Record<string, TraceMessage[]>;
   systemPrompt?: string | null;
   onClose?: () => void;
+  /** Which LLM-call view opens first (tests and deep links); defaults to semantic. */
+  defaultView?: "semantic" | "provider";
 }
 
-export function PayloadInspector({ runId, messages, systemPrompt, onClose }: PayloadInspectorProps) {
+export function PayloadInspector({
+  runId,
+  messages,
+  systemPrompt,
+  onClose,
+  defaultView = "semantic",
+}: PayloadInspectorProps) {
   const { selectedNode, selectedIteration, clearSelection } = useDashboardStore();
   const handleClose = onClose ?? clearSelection;
 
@@ -74,6 +82,7 @@ export function PayloadInspector({ runId, messages, systemPrompt, onClose }: Pay
               runId={runId}
               systemPrompt={systemPrompt}
               iterMessages={iterMessages}
+              defaultView={defaultView}
             />
           </motion.div>
         </AnimatePresence>
@@ -88,15 +97,16 @@ export function PayloadInspector({ runId, messages, systemPrompt, onClose }: Pay
 }
 
 /** Type-specific inspector. */
-function NodeInspector({ node, runId, systemPrompt, iterMessages }: {
+function NodeInspector({ node, runId, systemPrompt, iterMessages, defaultView }: {
   node: TimelineNode;
   runId: string;
   systemPrompt?: string | null;
   iterMessages?: TraceMessage[];
+  defaultView: "semantic" | "provider";
 }) {
   switch (node.type) {
     case "tool_call": return <ToolCallInspector node={node as ToolCallNode} iterMessages={iterMessages} />;
-    case "llm_call": return <LLMCallInspector node={node as LLMCallNode} runId={runId} systemPrompt={systemPrompt} iterMessages={iterMessages} />;
+    case "llm_call": return <LLMCallInspector node={node as LLMCallNode} runId={runId} systemPrompt={systemPrompt} iterMessages={iterMessages} defaultView={defaultView} />;
     case "pause_segment": return <PauseInspector node={node as PauseSegmentNode} />;
     case "run_started": return <RunStartedInspector node={node as RunStartedNode} />;
     case "error": return <ErrorInspector node={node as ErrorNode} />;
@@ -109,14 +119,15 @@ function NodeInspector({ node, runId, systemPrompt, iterMessages }: {
 // LLM Call — the most important inspector. Shows the full context.
 // -------------------------------------------------------------------
 
-function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
+function LLMCallInspector({ node, runId, systemPrompt, iterMessages, defaultView }: {
   node: LLMCallNode;
   runId: string;
   systemPrompt?: string | null;
   iterMessages?: TraceMessage[];
+  defaultView: "semantic" | "provider";
 }) {
   type ViewMode = "semantic" | "provider";
-  const [viewMode, setViewMode] = useState<ViewMode>("semantic");
+  const [viewMode, setViewMode] = useState<ViewMode>(defaultView);
 
   // Fetch evidence layer data (llm_interactions)
   const { data: llmCallsData } = useQuery({
@@ -185,11 +196,7 @@ function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
             </Collapsible>
           </>
         ) : (
-          <div className="p-8 text-center">
-            <span className="material-symbols-outlined text-3xl text-white/10 mb-3 block">cloud_off</span>
-            <p className="text-text-muted text-sm">No provider payload data for this call.</p>
-            <p className="text-text-muted text-xs mt-1">Run the agent again to capture payloads.</p>
-          </div>
+          <ProviderEmptyState loaded={llmCallsData?.incomplete ? llmCallsData.llm_calls.length : null} />
         )
       ) : (
         /* ---- SEMANTIC VIEW — Dendrux's normalized payloads ---- */
@@ -245,6 +252,34 @@ function LLMCallInspector({ node, runId, systemPrompt, iterMessages }: {
         </>
       )}
     </>
+  );
+}
+
+/**
+ * Empty provider view. `loaded` is the number of calls loaded when the dashboard stopped
+ * before the end of the run (the payload exists but was not fetched), or null when the
+ * run really has no payload for this call.
+ */
+export function ProviderEmptyState({ loaded }: { loaded: number | null }) {
+  if (loaded != null) {
+    return (
+      <div className="p-8 text-center">
+        <span className="material-symbols-outlined text-3xl text-white/10 mb-3 block">inventory_2</span>
+        <p className="text-text-muted text-sm">
+          This call's payload is stored, but outside the range the dashboard loaded.
+        </p>
+        <p className="text-text-muted text-xs mt-1">
+          Only the first {loaded} LLM calls of this run are loaded.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="p-8 text-center">
+      <span className="material-symbols-outlined text-3xl text-white/10 mb-3 block">cloud_off</span>
+      <p className="text-text-muted text-sm">No provider payload data for this call.</p>
+      <p className="text-text-muted text-xs mt-1">Run the agent again to capture payloads.</p>
+    </div>
   );
 }
 
