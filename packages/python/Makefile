@@ -15,6 +15,7 @@ crap:
 	python tools/crap_ratchet.py check --coverage coverage.json
 
 # Public API breaks against the last release tag (needs `git fetch --tags`).
+# Fails on any break without a migration-note B-item.
 api-check:
 	python tools/api_breaks.py
 

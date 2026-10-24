@@ -11,6 +11,8 @@ import pytest
 
 from tools import api_breaks as ab
 
+COMMITTED_ALLOWLIST = Path(__file__).resolve().parents[2] / "tools" / "api_break_allowlist.json"
+
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
@@ -74,7 +76,7 @@ def _entry(
     return ab.AllowEntry(kind=kind, paths=paths, param=param, b_item=b_item, note=note)
 
 
-KNOWN = [f"B{i}" for i in range(1, 20)]
+KNOWN = [f"B{i}" for i in range(1, 21)]
 
 
 def _allowlist_file(tmp_path: Path, entries: list[dict[str, Any]]) -> Path:
@@ -137,8 +139,23 @@ class TestAllowlist:
             ab.load_allowlist(_allowlist_file(tmp_path, [bad]))
 
     def test_committed_allowlist_is_valid(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "tools" / "api_break_allowlist.json"
-        assert ab.load_allowlist(path)
+        assert ab.load_allowlist(COMMITTED_ALLOWLIST)
+
+    def test_committed_allowlist_has_no_gaps(self) -> None:
+        assert [e for e in ab.load_allowlist(COMMITTED_ALLOWLIST) if e.b_item is None] == []
+
+    def test_the_removals_are_documented_by_b20(self) -> None:
+        by_path = {p: e for e in ab.load_allowlist(COMMITTED_ALLOWLIST) for p in e.paths}
+        for removed in (
+            "dendrux.http",
+            "dendrux.dashboard",
+            "dendrux.cli.main.dashboard",
+            "dendrux.cli.traces.app",
+        ):
+            assert by_path[removed].b_item == "B20", removed
+        data = json.loads(COMMITTED_ALLOWLIST.read_text())
+        assert "B20" in data["known_b_items"]
+        assert "suggest B20" not in COMMITTED_ALLOWLIST.read_text()
 
 
 class TestClassify:
@@ -212,10 +229,19 @@ class TestMain:
         allow = _allowlist_file(tmp_path, [])
         assert self._run(repo, allow) == 1
 
-    def test_strict_fails_on_unmapped_gaps(self, repo: Path, tmp_path: Path) -> None:
+    def test_unmapped_gaps_fail_by_default(self, repo: Path, tmp_path: Path) -> None:
         allow = self._full_allowlist(tmp_path, gap=True)
-        assert self._run(repo, allow) == 0
-        assert self._run(repo, allow, "--strict") == 1
+        assert self._run(repo, allow) == 1
+
+    def test_allow_gaps_is_an_explicit_informational_mode(
+        self, repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        allow = self._full_allowlist(tmp_path, gap=True)
+        assert self._run(repo, allow, "--allow-gaps") == 0
+        assert "GAP" in capsys.readouterr().out
+
+    def test_allow_gaps_still_fails_on_unlisted_breaks(self, repo: Path, tmp_path: Path) -> None:
+        assert self._run(repo, _allowlist_file(tmp_path, []), "--allow-gaps") == 1
 
     def test_report_names_each_break(
         self, repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]

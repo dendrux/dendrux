@@ -2,13 +2,14 @@
 
 Every break griffe finds must be listed in ``tools/api_break_allowlist.json`` with the
 migration-note B-item (spec section 2) that documents it. A break with no B-item can be
-listed as a *gap* (``"b_item": null`` plus a ``"gap"`` reason): it passes the normal check
-but is reported loudly, and ``--strict`` (use it at release time) fails on any gap.
+listed as a *gap* (``"b_item": null`` plus a ``"gap"`` reason) so it is visible, but the
+check fails on it: CI and ``make api-check`` accept no unmapped break. ``--allow-gaps`` is
+an informational mode that lists gaps without failing on them; do not use it in CI.
 
 Run locally (from packages/python)::
 
     python tools/api_breaks.py                   # the CI check
-    python tools/api_breaks.py --strict          # release gate: no unmapped breaks
+    python tools/api_breaks.py --allow-gaps      # informational: list unmapped breaks
     python tools/api_breaks.py --report breaks.md
 
 Needs the comparison tag in the clone (``git fetch --tags``; CI checks out full history).
@@ -152,7 +153,7 @@ def format_report(result: Classification, against: str) -> str:
         lines.append(f"\nDocumented ({len(result.mapped)}):")
         lines.extend(f"  {e.b_item}  {_line(b)}" for b, e in result.mapped)
     if result.gaps:
-        lines.append(f"\nGAP: allowed but not documented by any B-item ({len(result.gaps)}):")
+        lines.append(f"\nGAP: not documented by any B-item ({len(result.gaps)}):")
         lines.extend(f"  {_line(b)}  -- {e.note}" for b, e in result.gaps)
     if result.unlisted:
         lines.append(f"\nUNLISTED: new breaks, not in the allowlist ({len(result.unlisted)}):")
@@ -172,7 +173,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--search-path", default=DEFAULT_SEARCH_PATH)
     parser.add_argument("--against", default=DEFAULT_AGAINST, help="git ref of the last release")
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
-    parser.add_argument("--strict", action="store_true", help="also fail on unmapped gaps")
+    parser.add_argument(
+        "--allow-gaps",
+        action="store_true",
+        help="informational: list breaks that have no B-item without failing on them",
+    )
     parser.add_argument("--report", type=Path, help="write the report to this file too")
     return parser
 
@@ -194,8 +199,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nFAIL: {len(result.unlisted)} break(s) are not in {args.allowlist.name}.")
         print("Document each in the migration notes, then add it with its B-item.")
         return 1
-    if args.strict and result.gaps:
-        print(f"\nFAIL (--strict): {len(result.gaps)} break(s) have no migration-note B-item.")
+    if result.gaps and not args.allow_gaps:
+        print(f"\nFAIL: {len(result.gaps)} break(s) have no migration-note B-item.")
+        print("Add the B-item to the spec's migration notes and the allowlist.")
         return 1
     print("\nAPI break check ok")
     return 0

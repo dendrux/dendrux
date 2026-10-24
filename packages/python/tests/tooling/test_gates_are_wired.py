@@ -54,7 +54,16 @@ def test_a_job_compares_the_public_api_with_the_last_release() -> None:
         s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout")
     )
     assert checkout["with"]["fetch-depth"] == 0, "the release tag must be in the clone"
-    assert any("tools/api_breaks.py" in s.get("run", "") for s in job["steps"])
+    runs = [s["run"] for s in job["steps"] if "tools/api_breaks.py" in s.get("run", "")]
+    assert runs
+    assert not any("--allow-gaps" in run for run in runs), "CI must not tolerate unmapped breaks"
+
+
+def test_make_api_check_does_not_tolerate_unmapped_breaks() -> None:
+    makefile = (PKG / "Makefile").read_text()
+    recipe = makefile.split("api-check:", 1)[1].split("\n\n", 1)[0]
+    assert "tools/api_breaks.py" in recipe
+    assert "--allow-gaps" not in recipe
 
 
 def test_make_ci_runs_every_gate() -> None:
