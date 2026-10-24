@@ -7,11 +7,12 @@ actionable :class:`~dendrux.errors.SchemaOutOfDateError`.
 
 It inspects the live tables and columns and verifies that every table and
 column in ``Base.metadata`` is present, by exact name. On Postgres it also
-verifies, by name in ``pg_indexes``, every named index and unique constraint
+verifies named index definitions and valid/ready catalog flags, plus unique
+constraint names
 the models declare (for example the tenant-scoped idempotency index added in
 0.5.0), so a database that was not migrated fails at startup instead of
 running without the constraint. It does not compare column types,
-nullability, defaults or index definitions. It deliberately ignores Alembic's
+nullability or defaults. It deliberately ignores Alembic's
 version table (apps may create the schema themselves) and extra tables,
 columns and indexes. It never writes or issues DDL. SQLite is skipped: it
 upgrades itself in place (:mod:`dendrux.db._sqlite_sync`).
@@ -27,7 +28,7 @@ import os
 import weakref
 from typing import TYPE_CHECKING
 
-from sqlalchemy import UniqueConstraint, inspect, text
+from sqlalchemy import UniqueConstraint, inspect
 from sqlalchemy.exc import DBAPIError
 
 from dendrux.db.models import Base
@@ -123,14 +124,23 @@ def compare_indexes(actual: Collection[str], tables: Collection[str]) -> list[st
 
 def read_actual_indexes(sync_conn: Connection) -> set[str]:
     """Index names (``pg_indexes``) on the model tables in the current schema. Postgres only."""
-    rows = sync_conn.execute(
-        text(
-            "SELECT indexname FROM pg_indexes "
-            "WHERE schemaname = current_schema() AND tablename = ANY(:tables)"
-        ),
-        {"tables": sorted(Base.metadata.tables)},
-    )
-    return {row[0] for row in rows}
+    from sqlalchemy.schema import CreateIndex
+
+    from dendrux.db._index_check import _canonical, read_pg_indexes
+
+    entries = read_pg_indexes(sync_conn, tables=sorted(Base.metadata.tables))
+    names = {name for name, entry in entries.items() if entry[2]}
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            name = str(index.name)
+            entry = entries.get(name)
+            if entry is not None and (
+                entry[0] != table.name
+                or _canonical(entry[1])
+                != _canonical(str(CreateIndex(index).compile(dialect=sync_conn.dialect)))
+            ):
+                names.discard(name)
+    return names
 
 
 def was_verified(engine: AsyncEngine) -> bool:
@@ -143,8 +153,8 @@ async def ensure_schema_current(engine: AsyncEngine) -> None:
 
     A no-op on SQLite and when ``DENDRUX_SKIP_SCHEMA_CHECK=1``. Read-only: one
     connection, a table listing, one batched column listing and, on Postgres,
-    one ``pg_indexes`` read. It verifies presence by name only; column types,
-    defaults and index definitions are not compared. Missing indexes are
+    index catalog reads. Named model indexes must match their definitions and
+    be valid and ready; column types and defaults are not compared. Missing indexes are
     listed in ``SchemaOutOfDateError.missing_columns`` as
     ``"table.index (index)"``. If the
     catalog read fails with a database error (such as insufficient

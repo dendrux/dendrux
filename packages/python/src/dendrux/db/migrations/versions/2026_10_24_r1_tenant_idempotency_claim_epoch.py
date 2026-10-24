@@ -42,6 +42,8 @@ from typing import Union
 from alembic import op
 import sqlalchemy as sa
 
+from dendrux.db._index_check import require_index
+
 revision: str = "d7e8f9a0b1c2"
 down_revision: Union[str, None] = "c6d7e8f9a0b1"
 branch_labels: Union[str, tuple[str, ...], None] = None
@@ -86,6 +88,13 @@ def upgrade() -> None:
             ),
         )
     op.execute(_TENANT_KEY_INDEX)
+    require_index(
+        op.get_bind(), "uq_agent_runs_tenant_idempotency_key", "agent_runs", _TENANT_KEY_INDEX
+    )
+    op.execute(_TENANT_CREATED_INDEX)
+    require_index(
+        op.get_bind(), "ix_agent_runs_tenant_id_created_at", "agent_runs", _TENANT_CREATED_INDEX
+    )
     op.execute("DROP INDEX IF EXISTS ix_agent_runs_idempotency_key")
     if op.get_bind().dialect.name == "postgresql":
         op.execute(
@@ -106,6 +115,7 @@ def downgrade() -> None:
             "WHERE ...) and run the downgrade again."
         )
     op.execute(_GLOBAL_KEY_INDEX)
+    require_index(op.get_bind(), "ix_agent_runs_idempotency_key", "agent_runs", _GLOBAL_KEY_INDEX)
     op.execute("DROP INDEX IF EXISTS uq_agent_runs_tenant_idempotency_key")
     op.execute("DROP INDEX IF EXISTS ix_agent_runs_tenant_id_created_at")
     if _has_column("agent_runs", "claim_epoch"):

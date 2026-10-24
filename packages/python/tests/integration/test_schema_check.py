@@ -1,7 +1,7 @@
 """Schema-currency check on Postgres: a database behind the models fails fast.
 
-Uses its own database (``<name>_schema_test``, derived from
-``DENDRUX_TEST_PG_URL``) because it builds deliberately out-of-date schemas.
+Uses a temporary schema inside ``DENDRUX_TEST_PG_URL`` for deliberately
+out-of-date schemas; it never connects to a second database.
 Skipped when that variable is unset. SQLite is covered at the end: it upgrades
 itself and must never raise ``SchemaOutOfDateError``.
 """
@@ -9,10 +9,8 @@ itself and must never raise ``SchemaOutOfDateError``.
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse, urlunparse
 
 import pytest
 import pytest_asyncio
@@ -32,6 +30,13 @@ from dendrux.types import LLMResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+from tests.integration._migration_schema import (
+    migration_schema,
+)
+from tests.integration._migration_schema import (
+    test_database_url as _schema_pg_url,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,44 +65,17 @@ def _alembic(url: str, rev: str) -> None:
     command.upgrade(cfg, rev)
 
 
-def _schema_pg_url() -> str | None:
-    raw = os.environ.get("DENDRUX_TEST_PG_URL")
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    name = parsed.path.lstrip("/").removesuffix("_test") + "_schema_test"
-    return urlunparse(parsed._replace(path=f"/{name}"))
-
-
 @pytest_asyncio.fixture
 async def pg_url(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
     url = _schema_pg_url()
     if url is None:
         pytest.skip("DENDRUX_TEST_PG_URL not set")
-    name = urlparse(url).path.lstrip("/")
-    assert name.endswith("_schema_test")
     monkeypatch.delenv("DENDRUX_SKIP_SCHEMA_CHECK", raising=False)
-
-    maintenance = create_async_engine(
-        urlunparse(urlparse(url)._replace(path="/postgres")),
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-    )
-    async with maintenance.connect() as conn:
-        exists = (
-            await conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name})
-        ).first()
-        if exists is None:
-            await conn.execute(text(f'CREATE DATABASE "{name}"'))
-    await maintenance.dispose()
-
-    admin = create_async_engine(url, poolclass=NullPool)
-    async with admin.begin() as conn:
-        await conn.execute(text("DROP SCHEMA public CASCADE"))
-        await conn.execute(text("CREATE SCHEMA public"))
-    await admin.dispose()
-    yield url
-    await db_session.reset_engine()
+    async with migration_schema(url, "schema_check"):
+        try:
+            yield url
+        finally:
+            await db_session.reset_engine()
 
 
 def _admin(url: str) -> AsyncEngine:

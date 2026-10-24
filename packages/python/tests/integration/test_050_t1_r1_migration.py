@@ -2,8 +2,7 @@
 startup checks: the ``pg_indexes`` schema check, ``dendrux db check`` and the
 shared engine's event-loop guard.
 
-Uses its own database (``<name>_r1mig_test``, derived from
-``DENDRUX_TEST_PG_URL``, dropped at the end); skipped when that is unset.
+Uses a temporary schema inside ``DENDRUX_TEST_PG_URL``; skipped when unset.
 """
 
 from __future__ import annotations
@@ -13,17 +12,17 @@ import datetime as dt
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import NullPool
 
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.errors import SchemaOutOfDateError
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.types import IdempotencyConflictError
+from tests.integration._migration_schema import migration_schema
+from tests.integration._migration_schema import test_database_url as _db_url
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,37 +31,15 @@ HEAD = "d7e8f9a0b1c2"
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 
-def _db_url() -> str | None:
-    raw = os.environ.get("DENDRUX_TEST_PG_URL")
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    name = parsed.path.lstrip("/").removesuffix("_test") + "_r1mig_test"
-    return urlunparse(parsed._replace(path=f"/{name}"))
-
-
 def _alembic(url: str, op: str, rev: str) -> None:
     from alembic import command
     from alembic.config import Config
 
-    assert urlparse(url).path.endswith("_r1mig_test")
+    assert urlparse(url).path.endswith("_test")
     cfg = Config()
     cfg.set_main_option("script_location", str(_MIGRATIONS))
     cfg.set_main_option("sqlalchemy.url", url)
     getattr(command, op)(cfg, rev)
-
-
-async def _maintenance(url: str, sql: str) -> None:
-    eng = create_async_engine(
-        urlunparse(urlparse(url)._replace(path="/postgres")),
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-    )
-    try:
-        async with eng.connect() as conn:
-            await conn.execute(text(sql))
-    finally:
-        await eng.dispose()
 
 
 @pytest.fixture
@@ -70,21 +47,17 @@ async def pg() -> Any:
     url = _db_url()
     if url is None:
         pytest.skip("DENDRUX_TEST_PG_URL not set")
-    name = urlparse(url).path.lstrip("/")
-    await _maintenance(url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-    await _maintenance(url, f'CREATE DATABASE "{name}"')
-    engine = create_async_engine(url, poolclass=NullPool)
-    try:
+    async with migration_schema(url, "t1_r1_migration") as engine:
         yield url, engine
-    finally:
-        await engine.dispose()
-        await _maintenance(url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
 async def _indexes(engine: Any) -> dict[str, str]:
     async with engine.connect() as conn:
         rows = await conn.execute(
-            text("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'agent_runs'")
+            text(
+                "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'agent_runs' AND "
+                "schemaname = current_schema()"
+            )
         )
         return {r[0]: r[1] for r in rows}
 
@@ -228,3 +201,59 @@ async def test_shared_engine_refuses_another_event_loop(pg: Any) -> None:
             await asyncio.to_thread(other_loop)
     finally:
         await session.reset_engine()
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        "INDEX {name} ON agent_runs (coalesce(tenant_id, ''), idempotency_key) WHERE "
+        "idempotency_key IS NOT NULL",
+        "UNIQUE INDEX {name} ON agent_runs (tenant_id, idempotency_key) WHERE idempotency_key "
+        "IS NOT NULL",
+        "UNIQUE INDEX {name} ON agent_runs (coalesce(tenant_id, 'x'), idempotency_key) WHERE "
+        "idempotency_key IS NOT NULL",
+        "UNIQUE INDEX {name} ON agent_runs (coalesce(tenant_id, ''), idempotency_key) WHERE "
+        "tenant_id IS NOT NULL",
+    ],
+)
+async def test_upgrade_rejects_wrong_prebuilt_index(pg: Any, parts: str) -> None:
+    url, engine = pg
+    await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("CREATE " + parts.format(name="uq_agent_runs_tenant_idempotency_key"))
+        )
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        await asyncio.to_thread(_alembic, url, "upgrade", "head")
+    assert "ix_agent_runs_idempotency_key" in await _indexes(engine)
+
+
+async def test_startup_rejects_invalid_concurrent_index(pg: Any) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    url, engine = pg
+    await asyncio.to_thread(_alembic, url, "upgrade", "head")
+    await _seed(engine)
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(text("DROP INDEX uq_agent_runs_tenant_idempotency_key"))
+        await conn.execute(text("UPDATE agent_runs SET idempotency_key='same', tenant_id='A'"))
+        with pytest.raises(IntegrityError):
+            await conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX CONCURRENTLY uq_agent_runs_tenant_idempotency_key "
+                    "ON agent_runs (coalesce(tenant_id, ''), idempotency_key) WHERE "
+                    "idempotency_key IS NOT NULL"
+                )
+            )
+        valid = (
+            await conn.execute(
+                text(
+                    "SELECT indisvalid FROM pg_index WHERE indexrelid = "
+                    "'uq_agent_runs_tenant_idempotency_key'::regclass"
+                )
+            )
+        ).scalar_one()
+        assert not valid
+    with pytest.raises(SchemaOutOfDateError):
+        await ensure_schema_current(engine)

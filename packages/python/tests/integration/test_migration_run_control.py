@@ -2,7 +2,7 @@
 
 Postgres runs the real Alembic chain: upgrade to the prior revision, insert
 rows, upgrade to head, check, downgrade, upgrade again. It uses its own
-database (``<name>_migrate_test``, derived from ``DENDRUX_TEST_PG_URL``) and
+schema inside ``DENDRUX_TEST_PG_URL`` and
 is skipped when that variable is unset.
 
 SQLite cannot run the full chain (earlier revisions ALTER constraints), so it
@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import pytest
 from sqlalchemy import inspect, text
@@ -26,6 +24,8 @@ from sqlalchemy.pool import NullPool
 
 from dendrux.db.models import Base
 from dendrux.runtime.state import SQLAlchemyStateStore
+from tests.integration._migration_schema import migration_schema
+from tests.integration._migration_schema import test_database_url as _migrate_pg_url
 
 pytestmark = pytest.mark.asyncio
 
@@ -43,15 +43,6 @@ def _alembic(url: str, op: str, rev: str) -> None:
     cfg.set_main_option("script_location", str(_MIGRATIONS))
     cfg.set_main_option("sqlalchemy.url", url)
     getattr(command, op)(cfg, rev)
-
-
-def _migrate_pg_url() -> str | None:
-    raw = os.environ.get("DENDRUX_TEST_PG_URL")
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    name = parsed.path.lstrip("/").removesuffix("_test") + "_migrate_test"
-    return urlunparse(parsed._replace(path=f"/{name}"))
 
 
 async def _seed_prior_rows(conn: Any) -> None:
@@ -147,27 +138,7 @@ async def test_postgres_upgrade_downgrade_on_populated_db() -> None:
     url = _migrate_pg_url()
     if url is None:
         pytest.skip("DENDRUX_TEST_PG_URL not set")
-    name = urlparse(url).path.lstrip("/")
-    assert name.endswith("_migrate_test")
-
-    maintenance = create_async_engine(
-        urlunparse(urlparse(url)._replace(path="/postgres")),
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-    )
-    async with maintenance.connect() as conn:
-        exists = (
-            await conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name})
-        ).first()
-        if exists is None:
-            await conn.execute(text(f'CREATE DATABASE "{name}"'))
-    await maintenance.dispose()
-
-    engine = create_async_engine(url, poolclass=NullPool)
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text("DROP SCHEMA public CASCADE"))
-            await conn.execute(text("CREATE SCHEMA public"))
+    async with migration_schema(url, "control_migration") as engine:
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         async with engine.begin() as conn:
             await _seed_prior_rows(conn)
@@ -185,8 +156,6 @@ async def test_postgres_upgrade_downgrade_on_populated_db() -> None:
                 await conn.execute(text("SELECT version_num FROM alembic_version"))
             ).scalar_one()
             assert version == HEAD
-    finally:
-        await engine.dispose()
 
 
 async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:

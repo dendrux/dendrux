@@ -207,3 +207,119 @@ class TestDbCheckCli:
         result = self._invoke()
         assert result.exit_code == 2
         assert "hunter2" not in result.output
+
+
+class TestR1ReplacementGuard:
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            "CREATE INDEX uq_agent_runs_tenant_idempotency_key ON agent_runs "
+            "(coalesce(tenant_id, ''), idempotency_key) WHERE idempotency_key IS NOT NULL",
+            "CREATE UNIQUE INDEX uq_agent_runs_tenant_idempotency_key ON agent_runs "
+            "(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
+            "CREATE UNIQUE INDEX uq_agent_runs_tenant_idempotency_key ON agent_runs "
+            "(coalesce(tenant_id, 'wrong'), idempotency_key) WHERE idempotency_key IS NOT NULL",
+            "CREATE UNIQUE INDEX uq_agent_runs_tenant_idempotency_key ON agent_runs "
+            "(coalesce(tenant_id, ''), idempotency_key) WHERE tenant_id IS NOT NULL",
+        ],
+    )
+    def test_wrong_replacement_retains_global_unique(self, definition: str) -> None:
+        import importlib
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+        from sqlalchemy import text
+
+        migration = importlib.import_module(
+            "dendrux.db.migrations.versions.2026_10_24_r1_tenant_idempotency_claim_epoch"
+        )
+        eng = create_engine("sqlite://")
+        try:
+            with eng.begin() as conn:
+                Base.metadata.create_all(conn)
+                conn.execute(text("DROP INDEX uq_agent_runs_tenant_idempotency_key"))
+                conn.execute(text(migration._GLOBAL_KEY_INDEX))
+                conn.execute(text(definition))
+                with (
+                    Operations.context(MigrationContext.configure(conn)),
+                    pytest.raises(RuntimeError, match="unexpected definition"),
+                ):
+                    migration.upgrade()
+                assert (
+                    conn.execute(
+                        text(
+                            "SELECT 1 FROM sqlite_master WHERE name = "
+                            "'ix_agent_runs_idempotency_key'"
+                        )
+                    ).scalar()
+                    == 1
+                )
+        finally:
+            eng.dispose()
+
+    def test_idempotency_and_wrong_downgrade_replacement(self) -> None:
+        import importlib
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+        from sqlalchemy import text
+
+        migration = importlib.import_module(
+            "dendrux.db.migrations.versions.2026_10_24_r1_tenant_idempotency_claim_epoch"
+        )
+        eng = create_engine("sqlite://")
+        try:
+            with eng.begin() as conn:
+                Base.metadata.create_all(conn)
+                with Operations.context(MigrationContext.configure(conn)):
+                    migration.upgrade()
+                    migration.upgrade()
+                    conn.execute(
+                        text(
+                            "CREATE INDEX ix_agent_runs_idempotency_key ON agent_runs "
+                            "(idempotency_key)"
+                        )
+                    )
+                    with pytest.raises(RuntimeError, match="unexpected definition"):
+                        migration.downgrade()
+                    assert (
+                        conn.execute(
+                            text(
+                                "SELECT 1 FROM sqlite_master WHERE name = "
+                                "'uq_agent_runs_tenant_idempotency_key'"
+                            )
+                        ).scalar()
+                        == 1
+                    )
+                    conn.execute(text("DROP INDEX ix_agent_runs_idempotency_key"))
+                    migration.downgrade()
+                    migration.downgrade()
+                    migration.upgrade()
+        finally:
+            eng.dispose()
+
+
+def test_sqlite_expression_ddl_is_stable() -> None:
+    from sqlalchemy.dialects import sqlite
+    from sqlalchemy.schema import CreateIndex
+
+    index = next(i for i in AgentRun.__table__.indexes if i.name == TENANT_IDEMPOTENCY_INDEX)
+    assert str(CreateIndex(index).compile(dialect=sqlite.dialect())) == (
+        "CREATE UNIQUE INDEX uq_agent_runs_tenant_idempotency_key "
+        "ON agent_runs (coalesce(tenant_id, ''), idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL"
+    )
+
+
+def test_index_comparison_preserves_literals_and_expression_structure() -> None:
+    from dendrux.db._index_check import _canonical
+
+    base = "CREATE UNIQUE INDEX x ON t (coalesce(tenant_id, ''), idempotency_key)"
+    assert _canonical(base) != _canonical(base.replace("''", "'IF NOT EXISTS'"))
+    assert _canonical(base) != _canonical(base.replace("''", "' '"))
+    assert _canonical(base.replace("''", "'A'")) != _canonical(base.replace("''", "'a'"))
+    assert _canonical(base) != _canonical(
+        base.replace(
+            "coalesce(tenant_id, ''), idempotency_key", "coalesce((tenant_id, ''), idempotency_key)"
+        )
+    )
