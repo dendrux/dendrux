@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { TruncationNotice } from "@/components/TruncationNotice";
 import { fetchRuns } from "@/lib/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { formatTokens, formatCost, formatRelativeTime } from "@/lib/format";
@@ -125,6 +126,13 @@ export function RunsList() {
         />
         <span className="text-xs text-text-muted ml-auto" />
       </div>
+
+      {data && data.total > rawRuns.length && (
+        <TruncationNotice>
+          Showing the {rawRuns.length} most recent of {data.total} runs. Filter by status or agent
+          to narrow the list.
+        </TruncationNotice>
+      )}
 
       {/* Table */}
       <div className="overflow-x-auto">

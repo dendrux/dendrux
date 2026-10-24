@@ -670,14 +670,29 @@ class TestNormalizerInitEvents:
             async def get_run(self, run_id: str) -> _Run | None:
                 return self._run if self._run and self._run.id == run_id else None
 
-            async def get_run_events(self, run_id: str) -> list[_Event]:
-                return self._events
+            async def get_run_events(
+                self,
+                run_id: str,
+                *,
+                after_sequence_index: int | None = None,
+                limit: int | None = None,
+            ) -> list[_Event]:
+                rows = self._events
+                if after_sequence_index is not None:
+                    rows = [e for e in rows if e.sequence_index > after_sequence_index]
+                return rows if limit is None else rows[:limit]
 
-            async def get_traces(self, run_id: str) -> list[Any]:
-                return self._traces
+            async def get_traces(
+                self, run_id: str, *, limit: int | None = None, offset: int = 0
+            ) -> list[Any]:
+                rows = self._traces[offset:]
+                return rows if limit is None else rows[:limit]
 
-            async def get_tool_calls(self, run_id: str) -> list[Any]:
-                return self._tool_calls
+            async def get_tool_calls(
+                self, run_id: str, *, limit: int | None = None, offset: int = 0
+            ) -> list[Any]:
+                rows = self._tool_calls[offset:]
+                return rows if limit is None else rows[:limit]
 
         store = MockStore(
             _run=_Run(id="r1", agent_name="A", status="success"),

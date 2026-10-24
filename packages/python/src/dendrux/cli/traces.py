@@ -6,24 +6,31 @@ import asyncio
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-app = typer.Typer(name="traces", help="Inspect traces for a run.", invoke_without_command=True)
+from dendrux._redact import mask_database_urls_in
+
+MAX_ROWS = 1000
+
 console = Console()
 
 
-@app.callback(invoke_without_command=True)
 def show_traces(
     run_id: str = typer.Argument(..., help="Run ID to inspect."),
     tool_calls: bool = typer.Option(False, "--tools", "-t", help="Also show tool call records."),
+    limit: int = typer.Option(
+        200, "--limit", "-n", help=f"Maximum rows per section (at most {MAX_ROWS})."
+    ),
 ) -> None:
     """Show the conversation trace for an agent run."""
-    asyncio.run(_show_traces(run_id, tool_calls))
+    asyncio.run(_show_traces(run_id, tool_calls, limit))
 
 
-async def _show_traces(run_id: str, show_tool_calls: bool) -> None:
+async def _show_traces(run_id: str, show_tool_calls: bool, limit: int = 200) -> None:
+    limit = max(1, min(limit, MAX_ROWS))
     try:
         from dendrux.db.session import get_engine, reset_engine
         from dendrux.runtime.state import SQLAlchemyStateStore
@@ -34,7 +41,9 @@ async def _show_traces(run_id: str, show_tool_calls: bool) -> None:
     try:
         engine = await get_engine()
     except Exception as e:
-        console.print(f"[red]Cannot connect to database:[/red] {e}")
+        console.print(
+            f"[red]Cannot connect to database:[/red] {escape(mask_database_urls_in(str(e)))}"
+        )
         raise typer.Exit(1) from None
 
     store = SQLAlchemyStateStore(engine)
@@ -43,21 +52,26 @@ async def _show_traces(run_id: str, show_tool_calls: bool) -> None:
         # Fetch run info
         run = await store.get_run(run_id)
         if run is None:
-            console.print(f"[red]Run not found:[/red] {run_id}")
+            console.print(f"[red]Run not found:[/red] {escape(run_id)}")
             raise typer.Exit(1)
 
         # Print run header
         console.print(
             Panel(
-                f"[bold]{run.agent_name}[/bold]  •  {run.status}  •  "
-                f"{run.iteration_count} iterations  •  model: {run.model or '—'}",
-                title=f"Run {run.id}",
+                f"[bold]{escape(run.agent_name)}[/bold]  •  {escape(run.status)}  •  "
+                f"{run.iteration_count} iterations  •  model: {escape(run.model or '—')}",
+                title=f"Run {escape(run.id)}",
                 border_style="cyan",
             )
         )
 
         # Fetch and display traces
-        traces = await store.get_traces(run_id)
+        traces = await store.get_traces(run_id, limit=limit)
+        # Probe one row past the page in a separate read: the store clamps
+        # ``limit`` to 1000, so asking for limit + 1 cannot detect overflow at the maximum.
+        more_traces = len(traces) == limit and bool(
+            await store.get_traces(run_id, limit=1, offset=limit)
+        )
         if not traces:
             console.print("[dim]No traces recorded.[/dim]")
         else:
@@ -76,12 +90,17 @@ async def _show_traces(run_id: str, show_tool_calls: bool) -> None:
                     content = content[:500] + f"\n… ({len(trace.content)} chars total)"
 
                 console.print(header)
-                console.print(content)
+                console.print(content, markup=False, highlight=False)
                 console.print()
+            if more_traces:
+                console.print(f"[dim]… more traces not shown (limit {limit}).[/dim]")
 
         # Optionally show tool calls
         if show_tool_calls:
-            records = await store.get_tool_calls(run_id)
+            records = await store.get_tool_calls(run_id, limit=limit)
+            more_calls = len(records) == limit and bool(
+                await store.get_tool_calls(run_id, limit=1, offset=limit)
+            )
             if not records:
                 console.print("[dim]No tool calls recorded.[/dim]")
             else:
@@ -96,13 +115,15 @@ async def _show_traces(run_id: str, show_tool_calls: bool) -> None:
                     success_str = "[green]✓[/green]" if r.success else "[red]✗[/red]"
                     duration = f"{r.duration_ms}ms" if r.duration_ms else "—"
                     table.add_row(
-                        r.tool_name,
+                        escape(r.tool_name),
                         success_str,
                         duration,
                         str(r.iteration_index) if r.iteration_index is not None else "—",
-                        r.error_message or "",
+                        escape(r.error_message or ""),
                     )
 
                 console.print(table)
+                if more_calls:
+                    console.print(f"[dim]… more tool calls not shown (limit {limit}).[/dim]")
     finally:
         await reset_engine()

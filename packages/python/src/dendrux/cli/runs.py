@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-app = typer.Typer(name="runs", help="Query agent runs.", invoke_without_command=True)
+from dendrux._redact import mask_database_urls_in
+
+app = typer.Typer(
+    name="runs",
+    help="Query agent runs.",
+    invoke_without_command=True,
+    pretty_exceptions_show_locals=False,
+)
 console = Console()
 
 
@@ -34,16 +43,21 @@ async def _list_runs(limit: int, offset: int, status: str | None, tenant_id: str
     try:
         engine = await get_engine()
     except Exception as e:
-        console.print(f"[red]Cannot connect to database:[/red] {e}")
+        console.print(
+            f"[red]Cannot connect to database:[/red] {escape(mask_database_urls_in(str(e)))}"
+        )
         raise typer.Exit(1) from None
 
     try:
         store = SQLAlchemyStateStore(engine)
+        # No --tenant means every tenant: omit the argument (the store's default
+        # scope) instead of passing None, which means "untenanted runs only".
+        scope: dict[str, Any] = {} if tenant_id is None else {"tenant_id": tenant_id}
         runs = await store.list_runs(
-            limit=min(limit, 1000),
+            limit=max(1, min(limit, 1000)),
             offset=max(0, offset),
-            tenant_id=tenant_id,
             status=status,
+            **scope,
         )
     finally:
         await reset_engine()
@@ -75,8 +89,8 @@ async def _list_runs(limit: int, offset: int, status: str | None, tenant_id: str
         created = str(run.created_at)[:19] if run.created_at else "—"
 
         table.add_row(
-            run.id,
-            run.agent_name,
+            escape(run.id),
+            escape(run.agent_name),
             f"[{status_style}]{run.status}[/{status_style}]",
             str(run.iteration_count),
             f"{total_tokens:,}" if total_tokens else "—",

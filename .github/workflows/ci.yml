@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: the jobs only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python:
     name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/python
@@ -28,7 +37,9 @@ jobs:
       # Postgres backend matrix — integration tests parametrize across
       # [sqlite, postgres] via the DENDRUX_TEST_PG_URL env var. Without
       # this service the PG branch is skipped (locally fine, in CI not
-      # acceptable — that's how the original tz-naive bug shipped).
+      # acceptable — that's how the original tz-naive bug shipped). The
+      # "Require the Postgres backend" and "Test" steps below fail the job if
+      # the variable goes missing or any test is skipped for lack of it.
       postgres:
         image: postgres:16-alpine
         env:
@@ -47,11 +58,15 @@ jobs:
       DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
 
       - name: Install dependencies
         run: pip install -e ".[dev,all]"
@@ -70,8 +85,71 @@ jobs:
       - name: Type check
         run: mypy src/dendrux/
 
+      - name: Require the Postgres backend
+        shell: bash
+        run: |
+          if [ -z "${DENDRUX_TEST_PG_URL:-}" ]; then
+            echo "::error::DENDRUX_TEST_PG_URL is not set; the Postgres test matrix would be skipped silently."
+            exit 1
+          fi
+
       - name: Test
-        run: pytest tests/ -v --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80
+        shell: bash
+        run: |
+          pytest tests/ -v -rs --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80 | tee pytest.log
+          if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
+            echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
+            exit 1
+          fi
 
       - name: Build and smoke-test distributions
         run: python scripts/mcp_distribution_smoke.py
+
+      - name: Check the dashboard assets ship in the wheel
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m build --wheel --outdir "$RUNNER_TEMP/wheel" .
+          python ../../.github/scripts/check_wheel_dashboard.py "$RUNNER_TEMP"/wheel/*.whl src/dendrux/dashboard/static
+
+  dashboard:
+    name: dashboard frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/dashboard
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/dashboard/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Frontend lint
+        run: npm run lint
+
+      - name: Frontend tests
+        run: npm test
+
+      # The built dashboard is committed and shipped in the wheel. Rebuilding must
+      # reproduce it exactly, so a source change without a rebuild fails here.
+      - name: Committed build matches the source
+        shell: bash
+        run: |
+          npm run build
+          cd ../python
+          git diff --exit-code --stat -- src/dendrux/dashboard/static
+          tracked="$(git ls-files src/dendrux/dashboard/static | sort)"
+          present="$(find src/dendrux/dashboard/static -type f | sort)"
+          if [ "$tracked" != "$present" ]; then
+            echo "::error::the build output and the committed files differ (new hashed files need git add -f)."
+            diff <(echo "$tracked") <(echo "$present") || true
+            exit 1
+          fi

@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import type { DelegationInfo } from "@/lib/types";
 import { formatTokens, formatCost } from "@/lib/format";
 import { StatusBadge } from "./StatusBadge";
+import { TruncationNotice } from "./TruncationNotice";
 
 interface DelegationPanelProps {
   delegation: DelegationInfo;
@@ -18,6 +19,13 @@ export function DelegationPanel({ delegation }: DelegationPanelProps) {
 
   return (
     <div className="border-b border-border-soft/50">
+      {delegation.truncated && (
+        <TruncationNotice>
+          This delegation tree is very large, so only a bounded part is shown: the first{" "}
+          {children.length} children and the nearest ancestors. Subtree totals are lower bounds.
+        </TruncationNotice>
+      )}
+
       {/* Ancestry breadcrumb */}
       {ancestry.length > 0 && (
         <div className="px-4 sm:px-8 py-2 flex items-center gap-1 text-xs text-text-muted overflow-x-auto">
