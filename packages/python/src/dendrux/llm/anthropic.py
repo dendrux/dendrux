@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -22,15 +23,13 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Literal
 
 import anthropic
-import httpx
 
+from dendrux.errors import ProviderError
 from dendrux.llm._helpers import (
     build_call_index,
     build_tool_call,
-    connection_error,
     replayable_reasoning_blocks,
     resolve_tool_message_call,
-    timeout_error,
 )
 from dendrux.llm._images import (
     WireImageRegistry,
@@ -41,14 +40,25 @@ from dendrux.llm._images import (
     normalize_base_url,
     sanitize_vendor_message,
     sdk_image_request_error,
-    transport_image_error,
 )
-from dendrux.llm._retry_telemetry import (
-    begin_call_attempt_tracking,
-    call_attempt_tracking,
-    end_call_attempt_tracking,
-    make_telemetry_http_client,
+from dendrux.llm._resilience import (
+    DEFAULT_CALL_TIMEOUT,
+    DEFAULT_STREAM_IDLE_TIMEOUT,
+    TIMEOUT_UNSET,
+    LoopClients,
+    StreamClock,
+    WireRequest,
+    call_with_timeout,
+    logs_provider_errors,
+    logs_provider_stream_errors,
+    make_http_client,
+    map_sdk_error,
+    refusal_error,
+    resolve_deadlines,
+    retry_unstarted_stream,
+    stream_incomplete,
 )
+from dendrux.llm._retry_telemetry import call_attempt_tracking
 from dendrux.llm._schema import (
     ANTHROPIC_STRICT_MAX_OPTIONAL,
     ANTHROPIC_STRICT_MAX_TOOLS,
@@ -70,12 +80,17 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator
+
+    import httpx
 
     from dendrux.llm.base import ImageSupport
     from dendrux.types import Message, ToolDef
 
 logger = logging.getLogger(__name__)
+
+# Provider name on typed errors.
+_PROVIDER = "anthropic"
 
 _STRUCTURED_TOOL_NAME = "structured_output"
 _STRUCTURED_TOOL_DESCRIPTION = "Return your response in this exact format."
@@ -244,10 +259,13 @@ class AnthropicProvider(LLMProvider):
         effort: str | None = None,
         show_thinking: bool = True,
         thinking_budget: int | None = None,
-        timeout: float = 120.0,
+        timeout: Any = TIMEOUT_UNSET,
         max_retries: int = 3,
         cache_ttl: Literal["5m", "1h"] | None = None,
         strict: bool = True,
+        call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
+        stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
+        stream_total_timeout: float | None = None,
     ) -> None:
         """Create an Anthropic provider.
 
@@ -266,8 +284,11 @@ class AnthropicProvider(LLMProvider):
             thinking_budget: Force legacy manual thinking with a fixed
                 ``budget_tokens`` (older models / precise cost). Default None
                 → adaptive thinking.
-            timeout: HTTP request timeout in seconds.
-            max_retries: Number of automatic retries on transient errors.
+            timeout: Deprecated shorthand: sets both ``call_timeout`` and
+                ``stream_idle_timeout`` (with a ``DeprecationWarning``).
+            max_retries: Number of automatic SDK retries on transient errors
+                (connection resets, 408/409/429/5xx). They all count against
+                ``call_timeout``.
             cache_ttl: Anthropic prompt-cache TTL. ``None`` (default) omits the
                 field so Anthropic uses its 5-minute default. Set ``"1h"`` for
                 long-running workflows where iterations span more than 5 minutes
@@ -281,16 +302,40 @@ class AnthropicProvider(LLMProvider):
                 0.4.0. Anthropic caches strict schemas server-side for up to 24
                 hours (see its data-retention notes), so keep sensitive data
                 such as PHI out of schemas or pass ``False``.
+            call_timeout: Wall-clock limit in seconds for one non-streaming
+                call, SDK retries included. When it fires the call is
+                abandoned and never retried (``ProviderTimeoutError``).
+                ``None`` turns it off.
+            stream_idle_timeout: Maximum gap in seconds between meaningful
+                stream events (``ping`` does not count), and before the first
+                one. ``None`` turns it off.
+            stream_total_timeout: Wall-clock limit in seconds for a whole
+                stream. ``None`` (default) means no limit.
         """
         if api_key is None and not os.getenv("ANTHROPIC_API_KEY"):
             raise ValueError(
                 "AnthropicProvider needs an API key. "
                 "Pass api_key='sk-...' or set the ANTHROPIC_API_KEY environment variable."
             )
+        self._deadlines = resolve_deadlines(
+            "AnthropicProvider",
+            timeout=timeout,
+            call_timeout=call_timeout,
+            stream_idle_timeout=stream_idle_timeout,
+            stream_total_timeout=stream_total_timeout,
+        )
+        deadlines = self._deadlines
+
+        def new_http() -> httpx.AsyncClient:
+            return make_http_client(anthropic, deadlines)
+
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key,
-            http_client=make_telemetry_http_client(httpx.Timeout(timeout, connect=10.0)),
+            http_client=new_http(),
             max_retries=max_retries,
+        )
+        self._clients: LoopClients[anthropic.AsyncAnthropic] = LoopClients(
+            new_http, lambda client, http: client.copy(http_client=http)
         )
         self._model = model
         self._max_tokens = max_tokens
@@ -299,7 +344,6 @@ class AnthropicProvider(LLMProvider):
         self._effort = effort
         self._show_thinking = show_thinking
         self._thinking_budget = thinking_budget
-        self._timeout = timeout
         self._cache_ttl = cache_ttl
         self._strict = strict
 
@@ -313,7 +357,15 @@ class AnthropicProvider(LLMProvider):
 
     async def close(self) -> None:
         """Close the underlying HTTP client and release connections."""
-        await self._client.close()
+        # Close only what belongs to the running loop: after a loop change the
+        # home transport is first rebuilt, never awaited across loops.
+        current = self._clients.resolve(self._client)
+        self._clients.pop_current_loop_extra()
+        await current.close()
+
+    def _sdk(self) -> anthropic.AsyncAnthropic:
+        """The SDK client for the running event loop (rebuilt after a loop change)."""
+        return self._clients.resolve(self._client)
 
     # ------------------------------------------------------------------
     # Image input (0.4.0)
@@ -514,6 +566,7 @@ class AnthropicProvider(LLMProvider):
         if effort is not None:
             api_kwargs["output_config"] = {"effort": _normalize_effort(effort)}
 
+    @logs_provider_errors
     async def complete(
         self,
         messages: list[Message],
@@ -534,83 +587,94 @@ class AnthropicProvider(LLMProvider):
         is keyed by byte-stable prefix and ``cache_control`` markers, not
         by an explicit cache key.
 
-        When output_schema is provided, injects a synthetic tool with the
-        schema and forces tool_choice. The tool is sent with ``strict: true``
-        (schema normalized for Anthropic strict mode) when the schema allows
-        it, otherwise exactly as before, non-strict. The tool_use response is
-        extracted and normalized into LLMResponse.text as a JSON string, with
-        tool_calls set to None (preserving the SingleCall invariant).
+        When output_schema is provided without thinking, injects a synthetic
+        tool with the schema and forces tool_choice. The tool is sent with
+        ``strict: true`` (schema normalized for Anthropic strict mode) when
+        the schema allows it, otherwise exactly as before, non-strict. The
+        tool_use response is extracted and normalized into LLMResponse.text
+        as a JSON string, with tool_calls set to None (preserving the
+        SingleCall invariant). With thinking on (which rejects a forced
+        tool_choice) the schema goes in ``output_config.format`` instead and
+        the JSON answer comes back as text.
 
         If a request carrying strict entries gets a 400, it is retried once with
         every strict entry sent exactly as in 0.4.0; ``provider_request``
         records the request that succeeded. A second failure, any non-400
         error, and errors on requests without strict entries are raised
-        unchanged.
+        as typed :class:`~dendrux.errors.ProviderError` subclasses (the SDK
+        exception on ``__cause__``).
+
+        The whole call, SDK retries included, is bounded by ``call_timeout``.
+        A refusal (``stop_reason="refusal"``) raises
+        :class:`~dendrux.errors.ModelRefusalError`.
         """
         registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
             messages, tools, kwargs, registry=registry
         )
+        model = api_kwargs["model"]
 
-        # Structured output: inject synthetic tool + forced tool_choice
-        is_structured = output_schema is not None
-        if output_schema is not None:
-            api_kwargs["tools"] = [
-                self._structured_output_tool(output_schema, model=api_kwargs["model"])
-            ]
+        structured: Literal["tool", "format"] | None = None
+        if output_schema is not None and "thinking" in api_kwargs:
+            self._apply_output_format(api_kwargs, captured_request, output_schema)
+            structured = "format"
+        elif output_schema is not None:
+            # Structured output: inject synthetic tool + forced tool_choice
+            api_kwargs["tools"] = [self._structured_output_tool(output_schema, model=model)]
             api_kwargs["tool_choice"] = {"type": "tool", "name": _STRUCTURED_TOOL_NAME}
             # Update captured_request so evidence reflects the actual API call
             captured_request["tools"] = api_kwargs["tools"]
             captured_request["tool_choice"] = api_kwargs["tool_choice"]
+            structured = "tool"
 
         legacy = (
             [self._structured_output_payload(output_schema)]
-            if output_schema is not None
+            if structured == "tool" and output_schema is not None
             else [self._legacy_tool(td) for td in tools or []]
         )
+        request = WireRequest(api_kwargs, captured_request, registry, legacy)
+        del api_kwargs, captured_request, legacy
+        client = self._sdk()
 
         # Image-bearing requests never chain SDK errors (they carry the request
         # body): the typed error is built in the handler, raised after it.
         failure: Exception | None = None
         try:
-            response = await self._create_with_strict_fallback(api_kwargs, captured_request, legacy)
-        except anthropic.APITimeoutError:
-            if not registry.has_images:
-                raise timeout_error("AnthropicProvider", self._timeout) from None
-            failure = transport_image_error(
-                "timeout",
-                provider_name="anthropic",
-                model=api_kwargs["model"],
-                hint=str(timeout_error("AnthropicProvider", self._timeout)),
+            response = await call_with_timeout(
+                functools.partial(self._create_with_strict_fallback, client, request),
+                deadlines=self._deadlines,
+                provider=_PROVIDER,
+                model=model,
             )
-        except anthropic.APIConnectionError as exc:
-            if not registry.has_images:
-                raise connection_error("Anthropic API", self._model, exc) from exc
-            failure = transport_image_error(
-                "connection", provider_name="anthropic", model=api_kwargs["model"]
-            )
-        except anthropic.APIError as exc:
-            if not registry.has_images:
+        except ProviderError:
+            raise
+        except Exception as exc:
+            mapped = self._map_failure(exc, request.registry, model, streaming=False)
+            if mapped is None:
                 raise
-            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
+            if not request.registry.has_images:
+                raise mapped from exc
+            failure = mapped
         if failure is not None:
             # Frame locals reach tracebacks (and error trackers): drop the
-            # request kwargs and registry, which hold the base64 payloads.
-            del api_kwargs, registry
+            # request and registry, which hold the base64 payloads.
+            del request, registry
             raise failure
 
-        if is_structured:
+        self._raise_on_refusal(response, model)
+        if structured == "tool":
             llm_response = self._normalize_structured_response(response)
         else:
             llm_response = self._normalize_response(response)
 
         # Attach adapter-boundary payloads for evidence layer
-        llm_response.provider_request = captured_request
-        llm_response.model = captured_request["model"]
+        llm_response.provider_request = request.captured_request
+        llm_response.model = model
         llm_response.provider_response = response.model_dump()
 
         return llm_response
 
+    @logs_provider_stream_errors
     async def complete_stream(
         self,
         messages: list[Message],
@@ -635,14 +699,45 @@ class AnthropicProvider(LLMProvider):
 
         A 400 when the stream opens (before any event) on a request carrying
         strict entries is retried once without strict, as in ``complete``.
+
+        A stream that ends without its terminal event raises
+        :class:`~dendrux.errors.ProviderStreamIncompleteError`; it is retried
+        once only when nothing has been yielded yet. ``stream_idle_timeout``
+        bounds the gap between events (``ping`` does not count) and
+        ``stream_total_timeout`` the whole stream. Closing the generator
+        closes the upstream response.
         """
         registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
             messages, tools, kwargs, registry=registry
         )
+        request = WireRequest(
+            api_kwargs, captured_request, registry, [self._legacy_tool(td) for td in tools or []]
+        )
+        model = request.model
+        del api_kwargs, captured_request, registry
+        client = self._sdk()
+        clock = StreamClock(self._deadlines, provider=_PROVIDER, model=model)
+        # Closing this generator (aclose, cancel) closes the upstream response.
+        async with contextlib.aclosing(
+            retry_unstarted_stream(
+                functools.partial(self._stream_attempt, client, clock, request),
+                provider=_PROVIDER,
+                model=model,
+                run_id=run_id,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
-        legacy = [self._legacy_tool(td) for td in tools or []]
-
+    async def _stream_attempt(
+        self,
+        client: anthropic.AsyncAnthropic,
+        clock: StreamClock,
+        request: WireRequest,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """One streaming request: open, relay events, require the terminal event."""
+        model = request.model
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -651,6 +746,7 @@ class AnthropicProvider(LLMProvider):
         stream_reasoning_tokens: int | None = None
         # Fallback when the final message carries no stop_reason.
         stream_stop_reason: str | None = None
+        saw_stop = False
 
         # Per-block state for tool call assembly
         _current_tool_name: str | None = None
@@ -658,10 +754,18 @@ class AnthropicProvider(LLMProvider):
         _current_tool_json_parts: list[str] = []
 
         failure: Exception | None = None
-        attempt_token = begin_call_attempt_tracking()
+        final_message: Any = None
         try:
-            async with self._open_stream(api_kwargs, captured_request, legacy) as stream:
-                async for event in stream:
+            async with contextlib.AsyncExitStack() as stack:
+                stream = await clock.open(
+                    functools.partial(self._enter_stream, client, stack, request)
+                )
+                iterator = stream.__aiter__()
+                while True:
+                    try:
+                        event = await clock.step(iterator.__anext__())
+                    except StopAsyncIteration:
+                        break
                     if event.type == "content_block_start":
                         block = event.content_block
                         if block.type == "tool_use":
@@ -726,44 +830,40 @@ class AnthropicProvider(LLMProvider):
                         if captured is not None:
                             stream_reasoning_tokens = captured
 
-                # Get the final message for usage stats and provider response
-                final_message = await stream.get_final_message()
+                    elif event.type == "message_stop":
+                        saw_stop = True
 
-        except anthropic.APITimeoutError:
-            if not registry.has_images:
-                raise timeout_error("AnthropicProvider", self._timeout) from None
-            failure = transport_image_error(
-                "timeout",
-                provider_name="anthropic",
-                model=api_kwargs["model"],
-                hint=str(timeout_error("AnthropicProvider", self._timeout)),
-            )
-        except anthropic.APIConnectionError as exc:
-            if not registry.has_images:
-                raise connection_error("Anthropic API", self._model, exc, streaming=True) from exc
-            failure = transport_image_error(
-                "connection", provider_name="anthropic", model=api_kwargs["model"]
-            )
-        except anthropic.APIError as exc:
-            # Includes in-stream ``error`` events, which can follow deltas.
-            if not registry.has_images:
+                    # The SDK drops ``ping``: every event here is semantic.
+                    clock.mark_semantic()
+
+                # The final message carries usage and the provider response.
+                final_message = await self._final_message(clock, stream)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            mapped = self._map_failure(exc, request.registry, model, streaming=True)
+            if mapped is None:
                 raise
-            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
-        finally:
-            end_call_attempt_tracking(attempt_token)
+            if not request.registry.has_images:
+                raise mapped from exc
+            failure = mapped
         if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): drop the
-            # request kwargs and registry, which hold the base64 payloads.
-            del api_kwargs, registry
+            # Frame locals reach tracebacks (and error trackers): the request
+            # (with its base64 payloads) is never bound here.
             raise failure
+
+        final_stop = getattr(final_message, "stop_reason", None) if final_message else None
+        if final_message is None or not (saw_stop or stream_stop_reason or final_stop):
+            raise stream_incomplete(_PROVIDER, model)
+        stop_reason_raw = final_stop or stream_stop_reason
+        if stop_reason_raw == "refusal":
+            raise refusal_error(_PROVIDER, model, refusal_text="".join(text_parts))
 
         usage = self._usage_from_response(final_message.usage)
         if usage.reasoning_tokens is None and stream_reasoning_tokens is not None:
             usage.reasoning_tokens = stream_reasoning_tokens
         reasoning, reasoning_blocks = self._extract_reasoning(final_message.content)
-        stop_reason, raw_stop_reason = anthropic_stop_reason(
-            getattr(final_message, "stop_reason", None) or stream_stop_reason
-        )
+        stop_reason, raw_stop_reason = anthropic_stop_reason(stop_reason_raw)
 
         llm_response = LLMResponse(
             text="".join(text_parts) if text_parts else None,
@@ -775,11 +875,66 @@ class AnthropicProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = captured_request
-        llm_response.model = captured_request["model"]
+        llm_response.provider_request = request.captured_request
+        llm_response.model = model
         llm_response.provider_response = final_message.model_dump()
 
         yield StreamEvent(type=StreamEventType.DONE, raw=llm_response)
+
+    @staticmethod
+    async def _final_message(clock: StreamClock, stream: Any) -> Any:
+        """The accumulated message, or None when the stream carried no message."""
+        try:
+            return await clock.step(stream.get_final_message())
+        except AssertionError:
+            # The SDK asserts a snapshot exists; none means no message_start.
+            return None
+
+    def _map_failure(
+        self, exc: BaseException, registry: WireImageRegistry, model: str, *, streaming: bool
+    ) -> Exception | None:
+        """Typed error for a failed call, or None to re-raise ``exc`` unchanged."""
+        if (
+            registry.has_images
+            and isinstance(exc, anthropic.APIError)
+            and not isinstance(exc, anthropic.APIConnectionError)
+        ):
+            return self._image_error(exc, registry, model, streaming=streaming)
+        return map_sdk_error(
+            exc, sdk=anthropic, provider=_PROVIDER, model=model, streaming=streaming
+        )
+
+    @staticmethod
+    def _raise_on_refusal(response: Any, model: str) -> None:
+        if getattr(response, "stop_reason", None) != "refusal":
+            return
+        text = "".join(
+            getattr(block, "text", "") or ""
+            for block in getattr(response, "content", None) or []
+            if getattr(block, "type", None) == "text"
+        )
+        raise refusal_error(_PROVIDER, model, refusal_text=text)
+
+    def _apply_output_format(
+        self,
+        api_kwargs: dict[str, Any],
+        captured_request: dict[str, Any],
+        output_schema: dict[str, Any],
+    ) -> None:
+        """Send the schema as ``output_config.format`` (merged with any effort).
+
+        Used when thinking is on, which rejects the forced tool_choice of the
+        synthetic-tool path. The schema is adapted to Anthropic's strict
+        subset when it allows; otherwise it is sent as given.
+        """
+        schema, problem = prepare_anthropic_strict(output_schema)
+        if problem is not None:
+            logger.debug("Anthropic output_config.format sent with the given schema: %s", problem)
+            schema = output_schema
+        output_config = dict(api_kwargs.get("output_config") or {})
+        output_config["format"] = {"type": "json_schema", "schema": schema}
+        api_kwargs["output_config"] = output_config
+        captured_request["output_config"] = output_config
 
     # ------------------------------------------------------------------
     # Outbound conversions: Dendrux → Anthropic
@@ -1120,60 +1275,61 @@ class AnthropicProvider(LLMProvider):
         )
 
     async def _create_with_strict_fallback(
-        self,
-        api_kwargs: dict[str, Any],
-        captured_request: dict[str, Any],
-        legacy: list[dict[str, Any]],
+        self, client: anthropic.AsyncAnthropic, request: WireRequest
     ) -> Any:
         """``messages.create``, retried once without strict on a 400."""
         try:
             with call_attempt_tracking():
-                return await self._client.messages.create(**api_kwargs)
+                return await client.messages.create(**request.api_kwargs)
         except anthropic.APIError as exc:
-            failure = _strict_failure(exc, api_kwargs.get("tools"))
+            failure = _strict_failure(exc, request.api_kwargs.get("tools"))
             if failure is None:
                 raise
         # Retried outside the handler so a second failure never chains the first.
         message, points_at_strict = failure
         labels = self._revert_strict(
-            api_kwargs, captured_request, legacy, message, points_at_strict=points_at_strict
+            request.api_kwargs,
+            request.captured_request,
+            request.legacy,
+            message,
+            points_at_strict=points_at_strict,
         )
         with call_attempt_tracking():
-            response = await self._client.messages.create(**api_kwargs)
+            response = await client.messages.create(**request.api_kwargs)
         if not points_at_strict:
             self._warn_unmatched_fallback(labels, message)
         return response
 
-    @contextlib.asynccontextmanager
-    async def _open_stream(
+    async def _enter_stream(
         self,
-        api_kwargs: dict[str, Any],
-        captured_request: dict[str, Any],
-        legacy: list[dict[str, Any]],
-    ) -> AsyncIterator[Any]:
-        """``messages.stream`` entered, retried once without strict on a 400.
-        The request is made on enter, before any event exists."""
-        async with contextlib.AsyncExitStack() as stack:
+        client: anthropic.AsyncAnthropic,
+        stack: contextlib.AsyncExitStack,
+        request: WireRequest,
+    ) -> Any:
+        """``messages.stream`` entered on ``stack``, retried once without strict on a 400.
+
+        The request is made on enter, before any event exists.
+        """
+        with call_attempt_tracking():
             failure: tuple[str, bool] | None = None
             try:
-                stream = await stack.enter_async_context(self._client.messages.stream(**api_kwargs))
+                return await stack.enter_async_context(client.messages.stream(**request.api_kwargs))
             except anthropic.APIError as exc:
-                failure = _strict_failure(exc, api_kwargs.get("tools"))
+                failure = _strict_failure(exc, request.api_kwargs.get("tools"))
                 if failure is None:
                     raise
-            if failure is not None:
-                message, points_at_strict = failure
-                labels = self._revert_strict(
-                    api_kwargs,
-                    captured_request,
-                    legacy,
-                    message,
-                    points_at_strict=points_at_strict,
-                )
-                stream = await stack.enter_async_context(self._client.messages.stream(**api_kwargs))
-                if not points_at_strict:
-                    self._warn_unmatched_fallback(labels, message)
-            yield stream
+            message, points_at_strict = failure
+            labels = self._revert_strict(
+                request.api_kwargs,
+                request.captured_request,
+                request.legacy,
+                message,
+                points_at_strict=points_at_strict,
+            )
+            stream = await stack.enter_async_context(client.messages.stream(**request.api_kwargs))
+            if not points_at_strict:
+                self._warn_unmatched_fallback(labels, message)
+            return stream
 
     # ------------------------------------------------------------------
     # Inbound conversions: Anthropic → Dendrux

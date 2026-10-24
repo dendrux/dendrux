@@ -445,21 +445,25 @@ def anthropic_stream(turn: Turn, usage: Usage, index: int, model: str) -> _Anthr
 
 def _chat_usage(usage: Usage, *, openrouter: bool, index: int) -> Fake:
     details: dict[str, Any] = {"cached_tokens": usage.cache_read}
+    prompt = usage.prompt_total
     if openrouter:
         details["cache_write_tokens"] = usage.cache_write
+        # OpenRouter's prompt_tokens counts cache writes too (0.5.0 partitions
+        # them out of fresh input, D-127).
+        prompt += usage.cache_write
     extra: dict[str, Any] = {"cost": round(0.0001 * (index + 1), 6)} if openrouter else {}
     dump = {
-        "prompt_tokens": usage.prompt_total,
+        "prompt_tokens": prompt,
         "completion_tokens": usage.out,
-        "total_tokens": usage.prompt_total + usage.out,
+        "total_tokens": prompt + usage.out,
         "prompt_tokens_details": details,
         **extra,
     }
     return Fake(
         dump,
-        prompt_tokens=usage.prompt_total,
+        prompt_tokens=prompt,
         completion_tokens=usage.out,
-        total_tokens=usage.prompt_total + usage.out,
+        total_tokens=prompt + usage.out,
         prompt_tokens_details=Fake(**details),
         completion_tokens_details=None,
         **extra,
@@ -1694,6 +1698,29 @@ def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
     return row, None
 
 
+def _strip_050_cache_write_prompt(
+    table: str, row: dict[str, Any]
+) -> tuple[dict[str, Any], str | None]:
+    """Undo the realistic OpenRouter wire in a persisted ``provider_response``.
+
+    The fake OpenRouter wire counts cache writes in ``prompt_tokens`` (as the
+    real one does; the v0.3.0 goldens did not). 0.5.0 partitions the writes
+    out of fresh input (D-127), so the normalised usage still matches the
+    goldens; only the raw vendor dump differs, by exactly the writes.
+    """
+    response = row.get("provider_response") if table == "llm_interactions" else None
+    usage = response.get("usage") if isinstance(response, dict) else None
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    writes = details.get("cache_write_tokens") if isinstance(details, dict) else None
+    if not isinstance(writes, int) or not writes:
+        return row, None
+    prompt, total = usage.get("prompt_tokens"), usage.get("total_tokens")
+    if not isinstance(prompt, int) or not isinstance(total, int) or prompt < writes:
+        return row, f"provider_response.usage: prompt_tokens {prompt!r} lacks the cache writes"
+    usage = {**usage, "prompt_tokens": prompt - writes, "total_tokens": total - writes}
+    return {**row, "provider_response": {**response, "usage": usage}}, None
+
+
 def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None:
     """None when identical. New nullable columns in ``actual`` must be NULL (R-02/P-06).
 
@@ -1710,6 +1737,9 @@ def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None
             if problem:
                 return f"{table}[{i}]: {problem}"
             a, problem = _strip_050_additions(table, a)
+            if problem:
+                return f"{table}[{i}]: {problem}"
+            a, problem = _strip_050_cache_write_prompt(table, a)
             if problem:
                 return f"{table}[{i}]: {problem}"
             for col in e:

@@ -14,7 +14,6 @@ Text-only requests never touch anything in this module.
 from __future__ import annotations
 
 import base64
-import contextlib
 import re
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -22,7 +21,6 @@ from urllib.parse import urlsplit
 from dendrux.errors import (
     ContextLengthExceededError,
     ImageRejectedError,
-    ProviderError,
     UnsupportedModalityError,
 )
 from dendrux.llm._helpers import (
@@ -31,6 +29,7 @@ from dendrux.llm._helpers import (
     classify_gateway_error,
     extract_error_path,
 )
+from dendrux.llm._resilience import error_from_fields
 from dendrux.types import ImagePart, TextPart
 
 if TYPE_CHECKING:
@@ -502,6 +501,7 @@ def image_request_error(
             status_code=status_code,
             provider_code=provider_code,
             model=model,
+            provider=provider_name,
         )
     if kind is GatewayErrorKind.IMAGE_UNSUPPORTED:
         provider.learn_image_unsupported(model)
@@ -529,12 +529,14 @@ def image_request_error(
             "Streaming request rejected by the endpoint. If it does not support "
             "streaming, use agent.run() instead."
         )
-    return ProviderError(
+    return error_from_fields(
         provider=provider_name,
         model=model,
         status_code=status_code,
-        provider_code=code,
+        code=code,
         error_type=error_type,
+        param=param,
+        vendor_text=message,
         message=sanitize_vendor_message(message, registry),
     )
 
@@ -560,32 +562,3 @@ def sdk_image_request_error(
         locate=locate,
         **facts,
     )
-
-
-def transport_image_error(
-    kind: Literal["timeout", "connection"],
-    *,
-    provider_name: str,
-    model: str,
-    hint: str | None = None,
-) -> ProviderError:
-    """Timeout / connection failure on an image-bearing request (no request attached).
-
-    ``hint`` is the v0.3.0 adapter message (e.g. the "Increase timeout: ..."
-    advice); it never contains request data.
-    """
-    default = (
-        "LLM request timed out." if kind == "timeout" else "Connection to the provider failed."
-    )
-    return ProviderError(
-        provider=provider_name, model=model, error_type=kind, message=hint or default
-    )
-
-
-async def close_stream_quietly(stream: Any) -> None:
-    """Release an SDK stream's connection after an in-stream error; never raises."""
-    close = getattr(stream, "close", None)
-    if close is None:
-        return
-    with contextlib.suppress(Exception):
-        await close()

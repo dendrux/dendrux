@@ -21,7 +21,7 @@ import pytest
 httpx = pytest.importorskip("httpx")
 openai = pytest.importorskip("openai", reason="openai extra not installed")
 
-from dendrux.errors import ContextLengthExceededError  # noqa: E402
+from dendrux.errors import ContextLengthExceededError, ProviderError  # noqa: E402
 from dendrux.llm._helpers import (  # noqa: E402
     CONTEXT_LENGTH_CODES,
     CONTEXT_LENGTH_STATUSES,
@@ -156,10 +156,12 @@ class TestContextLengthBatch:
     async def test_other_errors_unchanged(self, provider: OpenAIProvider, name: str) -> None:
         status, body = NOT_CONTEXT[name]
         _wire(provider, _json(status, body))
-        with pytest.raises(openai.APIStatusError) as info:
+        with pytest.raises(ProviderError) as info:
             await provider.complete(MESSAGES)
         assert not isinstance(info.value, ContextLengthExceededError)
         assert info.value.status_code == status
+        assert isinstance(info.value.__cause__, openai.APIStatusError)
+        assert PROMPT_SECRET not in str(info.value)
 
 
 class TestContextLengthStream:
@@ -186,10 +188,11 @@ class TestContextLengthStream:
     async def test_other_status_errors_unchanged(self, provider: OpenAIProvider, name: str) -> None:
         status, body = NOT_CONTEXT[name]
         _wire(provider, _json(status, body))
-        with pytest.raises(openai.APIStatusError) as info:
+        with pytest.raises(ProviderError) as info:
             await _drain(provider)
         assert not isinstance(info.value, ContextLengthExceededError)
         assert info.value.status_code == status
+        assert isinstance(info.value.__cause__, openai.APIStatusError)
 
     async def test_in_stream_error_event_with_context_code(self, provider: OpenAIProvider) -> None:
         _wire(
@@ -223,9 +226,12 @@ class TestContextLengthStream:
                 {"error": {"message": "upstream exploded", "type": "server_error", "code": "boom"}},
             ),
         )
-        with pytest.raises(openai.APIError) as info:
+        with pytest.raises(ProviderError) as info:
             await _drain(provider)
         assert not isinstance(info.value, ContextLengthExceededError)
+        assert info.value.category == "unavailable"
+        assert "upstream exploded" not in str(info.value)
+        assert isinstance(info.value.__cause__, openai.APIError)
 
 
 class TestFalsePositiveVetoes:
@@ -255,9 +261,10 @@ class TestFalsePositiveVetoes:
         fx = _FIXTURES["not_context"][name]
         for call in (provider.complete, lambda m: _drain_messages(provider)):
             _wire(provider, _json(fx["status"], fx["body"]))
-            with pytest.raises(openai.APIStatusError) as info:
+            with pytest.raises(ProviderError) as info:
                 await call(MESSAGES)
             assert not isinstance(info.value, ContextLengthExceededError)
+            assert isinstance(info.value.__cause__, openai.APIStatusError)
 
     def test_explicit_context_code_still_beats_veto_param(self) -> None:
         result = classify_gateway_error(
@@ -411,9 +418,11 @@ class TestStreamRejected:
         self, provider: OpenAIProvider, body: dict
     ) -> None:
         _wire(provider, _json(400, body))
-        with pytest.raises(openai.BadRequestError) as info:
+        with pytest.raises(ProviderError) as info:
             await _drain(provider)
         assert info.value.status_code == 400
+        assert info.value.category == "rejected"
+        assert isinstance(info.value.__cause__, openai.BadRequestError)
 
 
 # ---------------------------------------------------------------------------
@@ -510,8 +519,10 @@ class TestOpenRouterInherits:
 
     async def test_stream_unrelated_400_propagates(self, openrouter: OpenRouterProvider) -> None:
         _wire(openrouter, _json(400, {"error": {"message": "Invalid schema", "param": "tools"}}))
-        with pytest.raises(openai.BadRequestError):
+        with pytest.raises(ProviderError) as info:
             await _drain(openrouter)
+        assert info.value.provider == "openrouter"
+        assert isinstance(info.value.__cause__, openai.BadRequestError)
 
     async def test_stream_unsupported_still_not_implemented(
         self, openrouter: OpenRouterProvider

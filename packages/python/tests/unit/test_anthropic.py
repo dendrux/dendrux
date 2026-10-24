@@ -17,6 +17,7 @@ from anthropic.types import (
     Usage,
 )
 
+from dendrux.errors import ProviderTimeoutError, ProviderUnavailableError
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
@@ -853,15 +854,18 @@ class TestComplete:
 
 class TestProviderHardening:
     def test_client_has_timeout(self) -> None:
-        """F-07: Client should be constructed with a timeout."""
+        """The httpx read timeout sits 30 s above the largest call deadline."""
         provider = AnthropicProvider(api_key="sk-test", model="test")
-        assert provider._client.timeout.read == 120.0
+        assert provider._client.timeout.read == 630.0
         assert provider._client.timeout.connect == 10.0
 
     def test_custom_timeout(self) -> None:
-        """F-07: Custom timeout is forwarded to the client."""
-        provider = AnthropicProvider(api_key="sk-test", model="test", timeout=60.0)
-        assert provider._client.timeout.read == 60.0
+        """The deprecated ``timeout=`` sets both deadlines, and the read timeout follows."""
+        with pytest.warns(DeprecationWarning, match="timeout"):
+            provider = AnthropicProvider(api_key="sk-test", model="test", timeout=60.0)
+        assert provider._client.timeout.read == 90.0
+        assert provider._deadlines.call_timeout == 60.0
+        assert provider._deadlines.stream_idle_timeout == 60.0
 
     def test_client_has_retries(self) -> None:
         """F-08: Client should be constructed with retry support."""
@@ -1183,9 +1187,12 @@ class TestCompleteStream:
             side_effect=anthropic_mod.APITimeoutError(request=MagicMock())
         )
 
-        with pytest.raises(TimeoutError, match="timed out"):
+        with pytest.raises(ProviderTimeoutError, match="timed out") as info:
             async for _ in provider.complete_stream([Message(role=Role.USER, content="Hi")]):
                 pass
+        assert isinstance(info.value, TimeoutError)
+        assert info.value.timeout_reason == "stream_idle"
+        assert info.value.retryable is False
 
     async def test_malformed_tool_json_falls_back_to_empty_params(
         self, provider: AnthropicProvider
@@ -1271,23 +1278,27 @@ class TestBoundaryHardening:
         assert tool_end.tool_call.params == {}
 
     async def test_complete_connection_error_mapped(self, provider: AnthropicProvider) -> None:
-        """APIConnectionError → ConnectionError with model context."""
+        """APIConnectionError → ProviderUnavailableError (a ConnectionError), chained."""
         import anthropic
 
         provider._client.messages.create = AsyncMock(
             side_effect=anthropic.APIConnectionError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(ConnectionError, match="Connection to Anthropic API failed"):
+        with pytest.raises(ProviderUnavailableError, match="Could not reach") as info:
             await provider.complete([Message(role=Role.USER, content="Hi")])
+        assert isinstance(info.value, ConnectionError)
+        assert info.value.provider == "anthropic"
+        assert info.value.retryable is True
+        assert isinstance(info.value.__cause__, anthropic.APIConnectionError)
 
     async def test_stream_connection_error_mapped(self, provider: AnthropicProvider) -> None:
-        """Streaming APIConnectionError → ConnectionError with model context."""
+        """Streaming APIConnectionError → ProviderUnavailableError (a ConnectionError)."""
         import anthropic
 
         provider._client.messages.stream = MagicMock(
             side_effect=anthropic.APIConnectionError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(ConnectionError, match="Connection to Anthropic API"):
+        with pytest.raises(ProviderUnavailableError, match="Could not reach"):
             async for _ in provider.complete_stream([Message(role=Role.USER, content="Hi")]):
                 pass  # pragma: no cover
 
@@ -1463,6 +1474,8 @@ class TestThinkingNormalize:
 class _FakeFinalMessage:
     content: list
     usage: _FakeUsage
+    # A complete stream's snapshot carries its stop_reason (from message_delta).
+    stop_reason: str | None = "end_turn"
 
     def model_dump(self) -> dict:
         return {"id": "msg_fake", "type": "message"}
