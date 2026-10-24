@@ -7,6 +7,7 @@ from typing import Literal
 
 # Public error attributes are resolved at runtime by documentation tooling.
 from dendrux.mcp._credentials import MCPAuthKey  # noqa: TC001
+from dendrux.tools._limits import ToolResultTooLargeError
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -386,6 +387,20 @@ class MCPToolCallError(MCPError):
     connection_lost: bool = False
 
 
+class MCPSessionExpiredError(MCPToolCallError):
+    """The server answered ``tools/call`` with HTTP 404 for the call's session.
+
+    The MCP spec says a 404 to a request carrying ``Mcp-Session-Id`` means
+    the server no longer knows that session (it restarted, a load balancer
+    moved the client, or the session expired). The request was rejected
+    before the tool ran, so it was **not executed**. The managed runtime
+    fences the connection, opens a new session and retries the call once.
+    Stateless servers (no session id) never raise it.
+    """
+
+    connection_lost = True
+
+
 class MCPToolNotFoundError(MCPError):
     """``MCPConnection.call_tool`` named a tool the server does not list.
 
@@ -416,8 +431,11 @@ class MCPOutcomeUnknownError(MCPError):
     """
 
 
-class MCPResultTooLargeError(MCPError):
-    """An MCP result exceeded the configured output boundary."""
+class MCPResultTooLargeError(MCPError, ToolResultTooLargeError):
+    """An MCP result exceeded the configured output boundary.
+
+    In an Agent run the tool result becomes the ``size_limit`` error payload.
+    """
 
 
 class MCPToolNameCollisionError(ValueError):

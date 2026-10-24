@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from typing import Any
+
+from pydantic import BaseModel
 
 from dendrux import Agent, tool
 from dendrux.llm.mock import MockLLM
@@ -46,15 +49,14 @@ async def test_invalid_call_persisted_as_failed_invocation(store):
     assert "tool.completed" in events
 
 
-async def test_approval_resume_validates_before_executing(store):
+async def test_invalid_call_is_rejected_before_the_approval_pause(store):
     REFUNDS.clear()
     tc = ToolCall(name="refund", params={"orderid": 7}, provider_tool_call_id="t1")
     llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="acknowledged")])
     agent = _approval_agent(llm, store)
-    paused = await agent.run("refund 7")
-    assert paused.status == RunStatus.WAITING_APPROVAL
 
-    result = await agent.submit_approval(paused.run_id, approved=True)
+    # A malformed call never reaches a human: it fails before the pause.
+    result = await agent.run("refund 7")
 
     assert result.status == RunStatus.SUCCESS
     assert REFUNDS == []
@@ -68,6 +70,7 @@ async def test_approval_resume_validates_before_executing(store):
     assert inv.success is False
     events = [e.event_type for e in await store.get_run_events(result.run_id)]
     assert "tool.started" not in events
+    assert "approval.requested" not in events
 
 
 async def test_approval_resume_valid_call_still_executes(store):
@@ -178,3 +181,75 @@ async def test_parse_error_survives_client_tool_pause_and_resume(store):
     assert json.loads(tool_msgs[0].content)["code"] == "invalid_json"
     resumed = next(m for m in llm.call_history[1]["messages"] if m.tool_calls)
     assert resumed.tool_calls[0].parse_error == BAD_REFUND_ERROR
+
+
+class Order(BaseModel):
+    id: int
+    note: str | None = None
+
+
+ORDERS: list[Any] = []
+
+
+@tool(max_calls_per_run=1)
+async def refund_order(order: Order) -> str:
+    """Refund one order."""
+    ORDERS.append(order)
+    return f"refunded {order.id}"
+
+
+def _order_agent(llm: MockLLM, store) -> Agent:
+    return Agent(
+        provider=llm,
+        prompt="Support agent.",
+        tools=[refund_order],
+        require_approval=["refund_order"],
+        state_store=store,
+    )
+
+
+async def test_approved_call_runs_with_objects_built_from_the_approved_json(store):
+    ORDERS.clear()
+    tc = ToolCall(name="refund_order", params={"order": {"id": 7.0}}, provider_tool_call_id="t1")
+    llm = MockLLM([LLMResponse(tool_calls=[tc]), LLMResponse(text="processed")])
+    agent = _order_agent(llm, store)
+
+    paused = await agent.run("refund 7")
+    assert paused.status == RunStatus.WAITING_APPROVAL
+    # The persisted pause holds the normalised arguments: what the human sees.
+    pause_data = await store.get_pause_state(paused.run_id)
+    assert pause_data["pending_tool_calls"][0]["params"] == {"order": {"id": 7}}
+    requested = [
+        e.data
+        for e in await store.get_run_events(paused.run_id)
+        if e.event_type == "approval.requested"
+    ]
+    # The approval view is the call as the model sent it.
+    assert [d["params"] for d in requested] == [{"order": {"id": 7.0}}]
+
+    result = await agent.submit_approval(paused.run_id, approved=True)
+
+    assert result.status == RunStatus.SUCCESS
+    assert [Order(id=7)] == ORDERS
+    (inv,) = await RunStore(store).get_tool_invocations(result.run_id)
+    assert inv.params == {"order": {"id": 7}}
+    assert inv.success is True
+
+
+async def test_max_calls_rejects_extra_calls_before_the_approval_pause(store):
+    ORDERS.clear()
+    calls = [
+        ToolCall(name="refund_order", params={"order": {"id": n}}, provider_tool_call_id=f"t{n}")
+        for n in (1, 2, 3)
+    ]
+    llm = MockLLM([LLMResponse(tool_calls=calls), LLMResponse(text="done")])
+    agent = _order_agent(llm, store)
+
+    paused = await agent.run("refund three")
+
+    assert paused.status == RunStatus.WAITING_APPROVAL
+    pause_data = await store.get_pause_state(paused.run_id)
+    assert [c["params"]["order"]["id"] for c in pause_data["pending_tool_calls"]] == [1]
+    result = await agent.submit_approval(paused.run_id, approved=True)
+    assert result.status == RunStatus.SUCCESS
+    assert [Order(id=1)] == ORDERS

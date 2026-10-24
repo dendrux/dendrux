@@ -171,8 +171,9 @@ class TestTypes:
 
     def test_enum_membership(self) -> None:
         assert validate_tool_params(_td(SHOW_SCHEMA), {"kind": "chart"}) == []
+        # The constraint is named, the value never echoed.
         assert validate_tool_params(_td(SHOW_SCHEMA), {"kind": "pie"}) == [
-            'show argument \'kind\' must be one of "table", "chart", got "pie"'
+            'show argument \'kind\' must be one of "table", "chart"'
         ]
 
     def test_enum_does_not_confuse_bool_and_int(self) -> None:
@@ -288,10 +289,10 @@ class TestMessageAndResult:
         msg = format_invalid_params(_td({"type": "object", "properties": {}}), ["p"])
         assert msg == "p. Valid arguments: (none)."
 
-    def test_unserializable_enum_value_reported(self) -> None:
+    def test_unserializable_enum_value_reported_without_echo(self) -> None:
         schema = {"type": "object", "properties": {"v": {"enum": ["a"]}}}
         problems = validate_tool_params(_td(schema), {"v": object()})
-        assert len(problems) == 1 and "got <object object" in problems[0]
+        assert problems == ["show argument 'v' must be one of \"a\""]
 
     def test_decorated_tool_schema(self) -> None:
         @tool()

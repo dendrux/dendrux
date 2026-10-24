@@ -40,6 +40,7 @@ from dendrux.mcp._errors import (
     MCPOAuthRefreshError,
     MCPOutcomeUnknownError,
     MCPRuntimeClosedError,
+    MCPSessionExpiredError,
     MCPStaleConnectionError,
     MCPToolCallError,
     MCPToolNotFoundError,
@@ -558,32 +559,38 @@ class MCPConnection:
         deadline = asyncio.timeout(None if timeout is None else float(timeout))
         try:
             async with deadline:
-                entry = await runtime._lease(self)
-                try:
-                    if entry.adapter is not None:
-                        shown = _diagnostic_tool_name(entry.adapter.source, shown)
-                    original_tool = next(
-                        (tool for tool in entry.raw_tools if tool.name == name), None
-                    )
-                    if original_tool is None:
-                        raise MCPToolNotFoundError(shown)
-                    return await runtime._execute_call(
-                        self,
-                        entry,
-                        mcp_tool_name=name,
-                        original_tool=original_tool,
-                        qualified_name=shown,
-                        namespace=self.source.name,
-                        owner=object(),
-                        # The lease is held for the whole call and released
-                        # below, so no view can close underneath it.
-                        check_lease=lambda: None,
-                        # Public return shape unchanged: base64 image blocks inline.
-                        images="inline",
-                        params=params,
-                    )
-                finally:
-                    runtime._release(self.identity, entry)
+                for attempt in range(2):
+                    entry = await runtime._lease(self)
+                    try:
+                        if entry.adapter is not None:
+                            shown = _diagnostic_tool_name(entry.adapter.source, shown)
+                        original_tool = next(
+                            (tool for tool in entry.raw_tools if tool.name == name), None
+                        )
+                        if original_tool is None:
+                            raise MCPToolNotFoundError(shown)
+                        return await runtime._execute_call(
+                            self,
+                            entry,
+                            mcp_tool_name=name,
+                            original_tool=original_tool,
+                            qualified_name=shown,
+                            namespace=self.source.name,
+                            owner=object(),
+                            # The lease is held for the whole call and released
+                            # below, so no view can close underneath it.
+                            check_lease=lambda: None,
+                            # Public return shape unchanged: base64 image blocks inline.
+                            images="inline",
+                            params=params,
+                        )
+                    except (MCPConnectionLostError, MCPSessionExpiredError):
+                        # Never executed: lease a fresh connection, retry once.
+                        if attempt:
+                            raise
+                    finally:
+                        runtime._release(self.identity, entry)
+                raise AssertionError("unreachable")  # pragma: no cover
         except TimeoutError:
             if not deadline.expired():
                 raise
@@ -661,6 +668,8 @@ class _ViewToolSource(MCPServer):
         self._entry: _ConnectionEntry | None = None
         self._leased = False
         self._close_generation = 0
+        # Serialises moving this view's lease off a broken entry.
+        self._relink_lock = asyncio.Lock()
         # Queue ownership is per Agent view, not per physical connection. It
         # lets close() invalidate only this Agent's waiting calls when several
         # Agents share one entry.
@@ -719,28 +728,94 @@ class _ViewToolSource(MCPServer):
             mcp_tool_name, namespace=self.name, prefix=policy.prefix, rename=policy.rename
         )
 
-        def check_lease() -> None:
-            """Fail unless this view still holds this exact lease."""
-            if not self._leased or self._entry is not entry:
+        generation = self._close_generation
+
+        def inactive() -> MCPToolCallError:
+            return MCPToolCallError(
+                f"MCP tool view '{self.name}' is no longer active. "
+                "Create or discover tools from an active Agent before calling it."
+            )
+
+        def lease_check(bound: _ConnectionEntry) -> Callable[[], None]:
+            def check_lease() -> None:
+                """Fail unless this view still holds a lease on ``bound``."""
+                if not self._leased or self._close_generation != generation:
+                    raise inactive()
+                if self._entry is not bound:
+                    # The view moved to a replacement connection: never sent.
+                    raise MCPConnectionLostError(
+                        connection.identity,
+                        f"MCP connection {connection.identity!r} was replaced. This call "
+                        "was never sent, so retrying it is safe.",
+                    )
+
+            return check_lease
+
+        async def guarded_executor(**params: Any) -> Any:
+            # A call that provably never ran (a dead transport it never
+            # reached, or HTTP 404 for an expired session) moves this view to
+            # a fresh connection and is retried once. A call that may have
+            # reached the server is never retried.
+            for attempt in range(2):
+                if not self._leased or self._close_generation != generation:
+                    raise inactive()
+                current = self._entry
+                assert current is not None
+                if current.broken:
+                    current = await self._relink(current, generation)
+                try:
+                    return await connection.runtime._execute_call(
+                        connection,
+                        current,
+                        mcp_tool_name=mcp_tool_name,
+                        original_tool=original_tool,
+                        qualified_name=qualified_name,
+                        namespace=self.name,
+                        owner=self._call_owner,
+                        check_lease=lease_check(current),
+                        params=params,
+                    )
+                except (MCPConnectionLostError, MCPSessionExpiredError):
+                    if attempt:
+                        raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        return guarded_executor
+
+    async def _relink(self, broken: _ConnectionEntry, generation: int) -> _ConnectionEntry:
+        """Move this view's lease from a broken entry to a live one.
+
+        Concurrent callers converge: the first leases the replacement and the
+        rest reuse it. The old lease is released only after the new one is
+        held, so the identity is never left unleased mid-swap.
+        """
+        connection = self._view.connection
+        async with self._relink_lock:
+            if not self._leased or self._close_generation != generation:
                 raise MCPToolCallError(
                     f"MCP tool view '{self.name}' is no longer active. "
                     "Create or discover tools from an active Agent before calling it."
                 )
-
-        async def guarded_executor(**params: Any) -> Any:
-            return await connection.runtime._execute_call(
-                connection,
-                entry,
-                mcp_tool_name=mcp_tool_name,
-                original_tool=original_tool,
-                qualified_name=qualified_name,
-                namespace=self.name,
-                owner=self._call_owner,
-                check_lease=check_lease,
-                params=params,
+            current = self._entry
+            if current is not broken:
+                assert current is not None
+                return current
+            replacement = await connection.runtime._lease(connection)
+            if not self._leased or self._close_generation != generation:
+                # The Agent closed while we reconnected: hand the lease back.
+                connection.runtime._release(connection.identity, replacement)
+                raise MCPToolCallError(
+                    f"MCP tool view '{self.name}' is no longer active. "
+                    "Create or discover tools from an active Agent before calling it."
+                )
+            self._entry = replacement
+            connection.runtime._release(connection.identity, broken)
+            logger.info(
+                "MCP tool view '%s' moved to a new connection after a connection loss "
+                "(code=mcp_view_relinked)",
+                self.name,
             )
-
-        return guarded_executor
+            return replacement
 
     async def close(self) -> None:
         """Release this view's lease; the shared connection stays open."""
@@ -1167,12 +1242,18 @@ class MCPRuntime:
                         close = getattr(result, "close", None)
                         if callable(close):
                             close()
-                except BaseException:
-                    pass
+                except Exception as close_exc:
+                    logger.debug(
+                        "Disposing an MCP runtime observer's awaitable failed (%s).",
+                        type(close_exc).__name__,
+                    )
                 logger.warning(
                     "MCP runtime observer returned an awaitable handling %s; event dropped.",
                     type(event).__name__,
                 )
+        except (KeyboardInterrupt, SystemExit):
+            # Process-level signals are never telemetry failures.
+            raise
         except BaseException as exc:
             logger.warning(
                 "MCP runtime observer failed handling %s (%s); event dropped.",
@@ -2451,7 +2532,7 @@ class MCPRuntime:
             raise MCPConnectionLostError(
                 identity,
                 f"MCP connection {identity!r} lost its transport. This call was "
-                "never sent; acquire tools again to reconnect and retry safely.",
+                "never sent, so retrying it is safe.",
             )
         if self._entries.get(identity) is not entry or entry.adapter is None or entry.fenced:
             raise MCPStaleConnectionError(
@@ -2737,6 +2818,21 @@ class MCPRuntime:
                     if remaining:
                         raise asyncio.CancelledError from exc
                 raise unknown_outcome(interruption or "forced") from exc
+            if isinstance(exc, MCPSessionExpiredError):
+                # HTTP 404 for the session: the server rejected the request
+                # before running the tool, so the outcome is known (not run).
+                # Fence the entry so the caller can open a new session and
+                # retry once; calls still in flight on it are interrupted.
+                self._connection_lost(
+                    connection.identity,
+                    entry,
+                    reporting_permit=permit,
+                )
+                self._emit_call_terminal(
+                    permit,
+                    _failed_event(loop.time() - started_at, type(exc).__name__, instance_id),
+                )
+                raise
             if isinstance(exc, MCPToolCallError) and exc.connection_lost:
                 # The transport died underneath this call. The request may
                 # already have reached the server, so the outcome is
