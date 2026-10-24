@@ -22,6 +22,7 @@ from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.guardrails._pii import PII
 from dendrux.guardrails._prompt_injection import PromptInjection
 from dendrux.guardrails._protocol import (
+    UNSCANNABLE,
     Finding,
     Guardrail,
     ImageGuardrail,
@@ -31,6 +32,7 @@ from dendrux.guardrails._protocol import (
 from dendrux.guardrails._secrets import SecretDetection
 
 __all__ = [
+    "UNSCANNABLE",
     "Finding",
     "Guardrail",
     "GuardrailEngine",

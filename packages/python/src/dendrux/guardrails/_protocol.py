@@ -30,6 +30,15 @@ class Pattern:
     regex: str
 
 
+UNSCANNABLE = "UNSCANNABLE"
+"""Entity type of a finding the engine raises when content could not be scanned.
+
+Raised when text or tool-call params exceed the scan size or nesting limits.
+Under ``block`` and ``redact`` it blocks the run; under ``warn`` it is only
+reported (``guardrail.detected``).
+"""
+
+
 @dataclass(frozen=True)
 class Finding:
     """A single detection result from a guardrail scan.
@@ -42,14 +51,15 @@ class Finding:
         start: Character offset in the scanned text.
         end: Character offset (exclusive).
         score: Confidence score (0.0-1.0). Regex patterns use 1.0.
-        text: The matched text content.
+        text: The matched text content. Kept for redaction only; it is
+            excluded from ``repr`` and never copied into events, errors or logs.
     """
 
     entity_type: str
     start: int
     end: int
     score: float
-    text: str
+    text: str = field(repr=False)
 
 
 @runtime_checkable

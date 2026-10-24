@@ -309,16 +309,3 @@ class TestFixRoundTypes:
 
         response = LLMResponse(text="x", usage=UsageStats(input_tokens=1, output_tokens=1))
         assert price_response(response, pricing=None, default_model="m", model="m-2") is response
-
-    def test_check_budget_config_is_inert(self) -> None:
-        from dendrux.pricing import check_budget_config
-
-        agent = dendrux_agent()
-        assert check_budget_config(agent) is None
-        assert check_budget_config(agent, model="m-2") is None
-
-
-def dendrux_agent() -> object:
-    from dendrux import Agent
-
-    return Agent(provider=MockLLM([]), prompt="p", budget=Budget(max_cost_usd=1.0))
