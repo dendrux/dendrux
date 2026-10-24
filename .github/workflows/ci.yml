@@ -85,6 +85,9 @@ jobs:
       - name: Type check
         run: mypy src/dendrux/
 
+      - name: Architecture rules
+        run: lint-imports
+
       - name: Require the Postgres backend
         shell: bash
         run: |

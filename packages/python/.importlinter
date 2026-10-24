@@ -1,0 +1,98 @@
+# Architecture rules, checked by `lint-imports` (part of `make ci`).
+#
+# Imports used only for type checking are ignored: they never run, and pointing
+# upward for annotations (loops -> agent) is intended.
+#
+# The order below is the one the code follows today (checked against the real
+# import graph). A package on a lower line must not import one above it. Packages
+# joined by `:` may import each other; packages joined by `|` may not.
+[importlinter]
+root_package = dendrux
+include_external_packages = True
+exclude_type_checking_imports = True
+
+[importlinter:contract:layers]
+name = Dendrux layers: imports point down, never up
+type = layers
+containers = dendrux
+exhaustive = True
+layers =
+    cli | store | notifiers
+    agent
+    runtime
+    loops : skills
+    mcp
+    tool : tools
+    llm | guardrails
+    chat
+    pricing | context_blocks | strategies | media | db
+    types
+    errors | _sentinel | _redact
+ignore_imports =
+    # KNOWN VIOLATION: the retry telemetry helper in the provider layer reports
+    # governance events through the loop helpers, so llm reaches up into loops
+    # (a function-local import, line 164). It should take the notify/record
+    # callables as arguments instead. Remove this line when it does.
+    dendrux.llm._retry_telemetry -> dendrux.loops._helpers
+
+[importlinter:contract:no-persistence-below-the-runtime]
+name = Core layers know nothing about persistence or the runtime
+type = forbidden
+source_modules =
+    dendrux.types
+    dendrux.errors
+    dendrux.tool
+    dendrux.tools
+    dendrux.strategies
+    dendrux.guardrails
+    dendrux.context_blocks
+    dendrux.pricing
+    dendrux.chat
+    dendrux.llm
+    dendrux.mcp
+forbidden_modules =
+    dendrux.db
+    dendrux.runtime
+    sqlalchemy
+    alembic
+ignore_imports =
+    # KNOWN VIOLATION: same import as above; it pulls the runtime in through the loop helpers.
+    dendrux.llm._retry_telemetry -> dendrux.loops._helpers
+
+[importlinter:contract:provider-sdk-in-adapters]
+name = The Anthropic and OpenAI SDKs are imported only by their provider adapters
+type = forbidden
+source_modules = dendrux
+forbidden_modules =
+    anthropic
+    openai
+allow_indirect_imports = True
+ignore_imports =
+    dendrux.llm.anthropic -> anthropic
+    dendrux.llm.openai -> openai
+    dendrux.llm.openai_responses -> openai
+
+[importlinter:contract:mcp-sdk-in-mcp]
+name = The MCP SDK is imported only inside dendrux.mcp
+type = forbidden
+source_modules = dendrux
+forbidden_modules =
+    mcp
+    httpx2
+    httpcore2
+allow_indirect_imports = True
+ignore_imports =
+    dendrux.mcp -> mcp
+    dendrux.mcp.** -> mcp
+    dendrux.mcp.** -> httpx2
+    dendrux.mcp.** -> httpcore2
+
+[importlinter:contract:otel-in-notifiers]
+name = OpenTelemetry is imported only by the OTel notifier
+type = forbidden
+source_modules = dendrux
+forbidden_modules =
+    opentelemetry
+allow_indirect_imports = True
+ignore_imports =
+    dendrux.notifiers.otel -> opentelemetry
