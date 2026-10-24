@@ -67,6 +67,7 @@ dev = [
     "pytest-xdist>=3.5,<4.0",
     # Quality gates (see tools/ and .importlinter).
     "radon>=6.0,<7.0",
+    "griffe>=1.5,<3.0",
     # Keep in step with .pre-commit-config.yaml (rev: v0.15.17).
     "ruff==0.15.17",
     "mypy>=1.10,<2.0",

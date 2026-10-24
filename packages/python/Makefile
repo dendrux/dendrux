@@ -1,4 +1,4 @@
-.PHONY: test lint typecheck crap format package-smoke ci clean
+.PHONY: test lint typecheck crap api-check format package-smoke ci clean
 
 test:
 	pytest tests/ -v -n auto --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
@@ -14,6 +14,10 @@ typecheck:
 crap:
 	python tools/crap_ratchet.py check --coverage coverage.json
 
+# Public API breaks against the last release tag (needs `git fetch --tags`).
+api-check:
+	python tools/api_breaks.py
+
 format:
 	ruff format .
 	ruff check --fix .
@@ -21,7 +25,7 @@ format:
 package-smoke:
 	python scripts/mcp_distribution_smoke.py
 
-ci: lint typecheck test crap
+ci: lint typecheck test crap api-check
 
 clean:
 	rm -rf dist/ build/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage coverage.json

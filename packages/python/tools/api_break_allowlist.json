@@ -1,0 +1,139 @@
+{
+ "_comment": "Allowed public API breaks against the last release (v0.4.1). Each entry names the spec section 2 B-item whose migration note documents it. b_item null = a gap: allowed so CI passes, reported loudly, and rejected by `api_breaks.py --strict`.",
+ "known_b_items": [
+  "B1",
+  "B2",
+  "B3",
+  "B4",
+  "B5",
+  "B6",
+  "B7",
+  "B8",
+  "B9",
+  "B10",
+  "B11",
+  "B12",
+  "B13",
+  "B14",
+  "B15",
+  "B16",
+  "B17",
+  "B18",
+  "B19"
+ ],
+ "entries": [
+  {
+   "kind": "parameter-changed-default",
+   "paths": [
+    "dendrux.agent.Agent.run",
+    "dendrux.agent.Agent.retry",
+    "dendrux.agent.Agent.resume",
+    "dendrux.agent.Agent.submit_tool_results",
+    "dendrux.agent.Agent.submit_input",
+    "dendrux.agent.Agent.submit_approval",
+    "dendrux.agent.Agent.cancel_run",
+    "dendrux.agent.Agent.request_pause",
+    "dendrux.agent.Agent.submit_resume",
+    "dendrux.agent.Agent.submit_note",
+    "dendrux.agent.Agent.stream",
+    "dendrux.agent.Agent.resume_stream"
+   ],
+   "param": "tenant_id",
+   "b_item": "B19",
+   "note": "tenant_id now defaults to a sentinel so omitting it can warn (FutureWarning; strict_tenancy default flips in 0.6). Behaviour when omitted is unchanged in 0.5. Weak mapping: B19 names the warning, not the signature change."
+  },
+  {
+   "kind": "parameter-changed-default",
+   "paths": [
+    "dendrux.store.RunStore.list_runs",
+    "dendrux.store.RunStore.count_runs",
+    "dendrux.runtime.state.StateStore.list_runs",
+    "dendrux.runtime.state.StateStore.count_runs",
+    "dendrux.runtime.state.SQLAlchemyStateStore.list_runs",
+    "dendrux.runtime.state.SQLAlchemyStateStore.count_runs"
+   ],
+   "param": "tenant_id",
+   "b_item": "B11",
+   "note": "tenant_id defaults to UNSCOPED; None now means untenanted only."
+  },
+  {
+   "kind": "parameter-changed-default",
+   "paths": [
+    "dendrux.llm.anthropic.AnthropicProvider.__init__",
+    "dendrux.llm.openai.OpenAIProvider.__init__",
+    "dendrux.llm.openai_responses.OpenAIResponsesProvider.__init__"
+   ],
+   "param": "timeout",
+   "b_item": "B18",
+   "note": "timeout= default 120.0 became the TIMEOUT_UNSET sentinel: provider deadlines are now call_timeout / connect settings; passing timeout= is a deprecation. Weak mapping: B18 covers the new deadlines, B6/spec section 8 the deprecation."
+  },
+  {
+   "kind": "parameter-removed",
+   "paths": [
+    "dendrux.runtime.state.StateStore.save_run_event",
+    "dendrux.runtime.state.SQLAlchemyStateStore.save_run_event"
+   ],
+   "param": "sequence_index",
+   "b_item": "B15",
+   "note": "save_run_event no longer takes sequence_index; it allocates and returns it."
+  },
+  {
+   "kind": "parameter-removed",
+   "paths": [
+    "dendrux.runtime.persistence.PersistenceRecorder.__init__"
+   ],
+   "param": "event_sequencer",
+   "b_item": "B15",
+   "note": "event_sequencer removed together with EventSequencer. PersistenceRecorder is internal in practice, but griffe sees it as public."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.runtime.runner.EventSequencer"
+   ],
+   "b_item": "B15",
+   "note": "EventSequencer is removed."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.errors.ProviderError.provider",
+    "dendrux.errors.ProviderError.model",
+    "dendrux.errors.ProviderError.status_code",
+    "dendrux.errors.ProviderError.provider_code",
+    "dendrux.errors.ProviderError.error_type",
+    "dendrux.errors.ProviderError.message",
+    "dendrux.errors.ContextLengthExceededError.status_code",
+    "dendrux.errors.ContextLengthExceededError.provider_code",
+    "dendrux.errors.ContextLengthExceededError.model"
+   ],
+   "b_item": "B10",
+   "note": "Static-analysis artifact: the attributes still exist at runtime but are now set in ProviderError._set_provider_fields, so griffe no longer sees them. ContextLengthExceededError now subclasses ProviderError (B10). Fix in src: declare the attributes as class-level annotations."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.http"
+   ],
+   "b_item": null,
+   "gap": "make_read_router/dendrux.http removed by the later owner decision (spec section 8). Section 2 still describes B1/B2/B18 as router hardening, so the table has no removal item. docs/upgrading-to-0.5.0.mdx documents it; add a B-item (suggest B20) so the spec and notes agree."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.dashboard",
+    "dendrux.cli.main.dashboard"
+   ],
+   "b_item": null,
+   "gap": "Embedded dashboard and the `dendrux dashboard` command removed (spec section 8). B3 describes dashboard auth that no longer exists. Documented in docs/upgrading-to-0.5.0.mdx; add a B-item (suggest B20)."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.cli.traces.app"
+   ],
+   "b_item": null,
+   "gap": "Internal Typer sub-app removed; `dendrux traces RUN_ID` is now a plain command and still works (options may follow the run id). No migration note needed, but no B-item lists it."
+  }
+ ]
+}
