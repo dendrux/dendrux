@@ -336,7 +336,7 @@ async def test_cancelling_the_holder_and_waiters_keeps_the_lock_consistent(
             await asyncio.sleep(3600)
 
     async def writer(i: int) -> None:
-        await store.save_run_event("run-1", event_type="w", sequence_index=i)
+        await store.save_run_event("run-1", event_type=f"w{i}")
 
     held = asyncio.create_task(holder())
     await entered.wait()
@@ -351,7 +351,9 @@ async def test_cancelling_the_holder_and_waiters_keeps_the_lock_consistent(
     assert held.cancelled() and waiters[0].cancelled() and waiters[2].cancelled()
     assert waiters[1].exception() is None and waiters[3].exception() is None
     events = await store.get_run_events("run-1")
-    assert sorted(e.sequence_index for e in events) == [2, 4]  # held row rolled back
+    # The held row rolled back; the two surviving writers got the first two indexes.
+    assert sorted(e.event_type for e in events) == ["w2", "w4"]
+    assert sorted(e.sequence_index for e in events) == [0, 1]
     assert not _guards_for(memory_engine)
 
 

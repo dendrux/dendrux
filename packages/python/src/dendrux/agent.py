@@ -182,6 +182,26 @@ def _record_to_run_result(record: Any) -> RunResult:
     )
 
 
+def _warn_env_store_deprecated() -> None:
+    """B6 ``DeprecationWarning`` for the implicit DENDRUX_DATABASE_URL store.
+
+    Deduplicated by ``warnings`` per caller location; ``stacklevel`` points at
+    the code that called the Agent method (this function,
+    ``_resolve_state_store``, the Agent method).
+    """
+    import warnings
+
+    warnings.warn(
+        "Agent found no state_store or database_url and fell back to DENDRUX_DATABASE_URL. "
+        "This implicit store is deprecated and is removed in dendrux 0.6. Create one state "
+        "store per process (for example at app startup: "
+        "SQLAlchemyStateStore(create_async_engine(url))) and pass state_store= to every "
+        "Agent. Do not pass database_url= per request: each Agent would build its own pool.",
+        DeprecationWarning,
+        stacklevel=4,
+    )
+
+
 async def _verify_schema_initialized(engine: AsyncEngine, url: str) -> None:
     """Fail fast with setup guidance if a non-SQLite database has no tables.
 
@@ -1132,6 +1152,7 @@ class Agent:
         if env_url is not None:
             from dendrux.db.session import get_engine
 
+            _warn_env_store_deprecated()
             engine = await get_engine(env_url)
             if not was_verified(engine):
                 await _verify_schema_initialized(engine, env_url)
@@ -2078,12 +2099,11 @@ class Agent:
         # transaction (sequence allocated under the row lock) so it always
         # sorts after the runner's run.paused. Running-run cancel: the runner
         # emits run.cancelled at a checkpoint.
-        from dendrux.runtime.runner import EventSequencer, _transition_with_event
+        from dendrux.runtime.runner import _transition_with_event
 
         cancel_won = await _transition_with_event(
             store,
             run_id,
-            EventSequencer(initial=await store.get_next_event_sequence(run_id)),
             status=RunStatus.CANCELLED.value,
             allowed_current_statuses=[
                 RunStatus.WAITING_CLIENT_TOOL.value,

@@ -32,7 +32,7 @@ async def paused_client_run(store):
 
 
 @pytest.mark.parametrize("path", ["resume", "submit"])
-@pytest.mark.parametrize("failure", ["get_next_event_sequence", "finalize_run", "save_run_event"])
+@pytest.mark.parametrize("failure", ["finalize_run", "save_run_event"])
 async def test_cancel_preserves_exception_despite_store_failure(store, path, failure, caplog):
     a, run_id, results = await paused_client_run(store)
     entered = asyncio.Event()
@@ -57,16 +57,14 @@ async def test_cancel_preserves_exception_despite_store_failure(store, path, fai
             await task
         assert caught.value.args == ("original cancellation",)
 
-    # A failed sequence/event write must not prevent an otherwise healthy finalization.
+    # A failed event write must not prevent an otherwise healthy finalization.
     assert (await store.get_run(run_id)).status == (
         "running" if failure == "finalize_run" else "cancelled"
     )
     assert str(secondary) in caplog.text
 
 
-@pytest.mark.parametrize(
-    "failure", [None, "finalize_run", "get_next_event_sequence", "save_run_event", "on_run_failed"]
-)
+@pytest.mark.parametrize("failure", [None, "finalize_run", "save_run_event", "on_run_failed"])
 async def test_claimed_resume_preserves_error_and_notifies(store, failure, caplog):
     a, run_id, results = await paused_client_run(store)
     await store.submit_and_claim(

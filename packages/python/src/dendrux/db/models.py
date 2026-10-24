@@ -38,6 +38,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
+    literal_column,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -123,8 +125,9 @@ class AgentRun(Base):
     )
     failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
-    # Idempotency columns — duplicate run prevention
-    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    # Idempotency columns — duplicate run prevention. Unique per tenant through
+    # ``uq_agent_runs_tenant_idempotency_key`` (below the class), not globally.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     idempotency_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Cooperative cancellation flag — runner observes at checkpoints,
@@ -181,7 +184,26 @@ class AgentRun(Base):
         Index("ix_agent_runs_parent_run_id", "parent_run_id"),
         Index("ix_agent_runs_status", "status"),
         Index("ix_agent_runs_created_at", "created_at"),
+        Index("ix_agent_runs_retry_of_run_id", "retry_of_run_id"),
     )
+
+
+TENANT_IDEMPOTENCY_INDEX = "uq_agent_runs_tenant_idempotency_key"
+"""Unique ``(COALESCE(tenant_id, ''), idempotency_key)`` for keyed runs (R1, 0.5.0)."""
+
+# An idempotency key is unique within a tenant (untenanted runs share the ''
+# scope). Queries must spell the same expression, ``coalesce(tenant_id, '')``
+# with a literal, for the planner to use the index.
+Index(
+    TENANT_IDEMPOTENCY_INDEX,
+    func.coalesce(AgentRun.tenant_id, literal_column("''")),
+    AgentRun.idempotency_key,
+    unique=True,
+    postgresql_where=AgentRun.idempotency_key.isnot(None),
+    sqlite_where=AgentRun.idempotency_key.isnot(None),
+)
+# Tenant-scoped run listings, newest first (D-124).
+Index("ix_agent_runs_tenant_id_created_at", AgentRun.tenant_id, AgentRun.created_at.desc())
 
 
 class ReactTrace(Base):

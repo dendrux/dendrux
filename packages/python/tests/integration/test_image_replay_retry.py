@@ -89,7 +89,6 @@ async def test_retry_never_resends_rejected_tool_image(engine: Any) -> None:
     await store.save_run_event(
         source.run_id,
         event_type="image.rejected",
-        sequence_index=999,
         iteration_index=2,
         data={"image_id": "img_" + SHA[:12], "sha256": SHA, "tenant_scope": "-"},
     )

@@ -39,7 +39,6 @@ async def store_with_events():
         await store.save_run_event(
             run_id,
             event_type=f"test.event.{i}",
-            sequence_index=i,
             iteration_index=0,
             data={"index": i},
         )

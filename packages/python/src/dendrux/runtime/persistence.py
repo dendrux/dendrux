@@ -180,7 +180,6 @@ class PersistenceRecorder(BaseRecorder):
         provider_name: str | None = None,
         target_lookup: dict[str, ToolTarget] | None = None,
         initial_order_index: int = 0,
-        event_sequencer: Any | None = None,
         tenant_scope: str | None = None,
         provider: Any | None = None,
     ) -> None:
@@ -192,7 +191,6 @@ class PersistenceRecorder(BaseRecorder):
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
         self._order_index = initial_order_index
-        self._event_sequencer = event_sequencer
 
     def _edge_kwargs(self, edges: list[BlobEdge]) -> dict[str, Any]:
         """``blob_refs`` kwargs for a store write, only when there are edges."""
@@ -216,18 +214,23 @@ class PersistenceRecorder(BaseRecorder):
         data: dict[str, Any] | None = None,
         correlation_id: str | None = None,
     ) -> None:
-        """Record a durable run event. FAIL-CLOSED with retry."""
-        seq = self._event_sequencer.next() if self._event_sequencer else 0
+        """Record a durable run event. FAIL-CLOSED with retry.
+
+        The store allocates the sequence index in the insert.
+        """
 
         async def _write() -> None:
-            await self._store.save_run_event(
+            from dendrux.runtime.state import validate_event_index, validate_event_writer
+
+            validate_event_writer(self._store)
+            index = await self._store.save_run_event(
                 self._run_id,
                 event_type=event_type,
-                sequence_index=seq,
                 iteration_index=iteration,
                 correlation_id=correlation_id,
                 data=data,
             )
+            validate_event_index(index)
 
         await retry_critical(_write, label="save_run_event", run_id=self._run_id)
 

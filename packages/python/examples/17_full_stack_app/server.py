@@ -257,6 +257,14 @@ def create_demo_app() -> FastAPI:
         )
         return JSONResponse(_run_result_body(result))
 
+    @app.get("/runs/{run_id}/pending")
+    async def get_pending(run_id: str, _: Annotated[str, Depends(require_caller)]) -> JSONResponse:
+        # What the run waits for now, with the arguments to show or execute.
+        # Survives reloads and reconnects (read from the database). Single-tenant
+        # demo: a multi-tenant app passes the caller's tenant, never UNSCOPED.
+        pending = await store.get_pending(run_id, tenant_id=UNSCOPED)
+        return JSONResponse(pending.to_dict() if pending is not None else None)
+
     @app.delete("/runs/{run_id}")
     async def cancel_run(
         run_id: str,

@@ -314,8 +314,8 @@ class TestBeforeFilters:
         self, store, internal_store, session_factory
     ) -> None:
         await internal_store.create_run("r", "R")
-        for i, et in enumerate(["run.started", "llm.completed", "tool.completed", "llm.completed"]):
-            await internal_store.save_run_event("r", event_type=et, sequence_index=i)
+        for et in ["run.started", "llm.completed", "tool.completed", "llm.completed"]:
+            await internal_store.save_run_event("r", event_type=et)
         events = await store.get_events("r")
         base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
         # Event ids are not exposed publicly; stamp by sequence via a raw read.

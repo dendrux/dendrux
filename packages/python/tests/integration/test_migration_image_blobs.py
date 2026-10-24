@@ -1,8 +1,7 @@
 """Image-blob migration (c6d7e8f9a0b1) on a populated database: up, down, up.
 
-Postgres runs the real Alembic chain in a private database
-(``<name>_imgmig_test``, derived from ``DENDRUX_TEST_PG_URL``, dropped at the
-end); skipped when that variable is unset. SQLite checks this revision alone
+Postgres runs the real Alembic chain in a temporary schema inside
+``DENDRUX_TEST_PG_URL``; skipped when that variable is unset. SQLite checks this revision alone
 (it cannot run the full chain): the prior shape is ``create_all`` minus the
 blob tables, stamped at ``b5c6d7e8f9a0``.
 """
@@ -11,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import pytest
 from sqlalchemy import inspect, text
@@ -26,6 +23,12 @@ from dendrux.media import BlobEdge
 from dendrux.runtime._blob_catalog import BlobServices
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.store import RunStore
+from tests.integration._migration_schema import (
+    migration_schema,
+)
+from tests.integration._migration_schema import (
+    test_database_url as _private_pg_url,
+)
 from tests.unit.test_blob_catalog import make_png, store_png
 
 PRIOR = "b5c6d7e8f9a0"
@@ -41,15 +44,6 @@ def _alembic(url: str, op: str, rev: str) -> None:
     cfg.set_main_option("script_location", str(_MIGRATIONS))
     cfg.set_main_option("sqlalchemy.url", url)
     getattr(command, op)(cfg, rev)
-
-
-def _private_pg_url() -> str | None:
-    raw = os.environ.get("DENDRUX_TEST_PG_URL")
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    name = parsed.path.lstrip("/").removesuffix("_test") + "_imgmig_test"
-    return urlunparse(parsed._replace(path=f"/{name}"))
 
 
 async def _seed(conn: Any) -> None:
@@ -150,18 +144,7 @@ async def test_postgres_up_down_up_on_populated_db() -> None:
     url = _private_pg_url()
     if url is None:
         pytest.skip("DENDRUX_TEST_PG_URL not set")
-    name = urlparse(url).path.lstrip("/")
-    assert name.endswith("_imgmig_test")
-    maintenance = create_async_engine(
-        urlunparse(urlparse(url)._replace(path="/postgres")),
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-    )
-    async with maintenance.connect() as conn:
-        await conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
-        await conn.execute(text(f'CREATE DATABASE "{name}"'))
-    engine = create_async_engine(url, poolclass=NullPool)
-    try:
+    async with migration_schema(url, "image_migration") as engine:
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         async with engine.begin() as conn:
             await _seed(conn)
@@ -187,11 +170,6 @@ async def test_postgres_up_down_up_on_populated_db() -> None:
             blobs = (await conn.execute(text("SELECT count(*) FROM dendrux_blobs"))).scalar_one()
             assert blobs == 0
         await _check_head(engine, url)
-    finally:
-        await engine.dispose()
-        async with maintenance.connect() as conn:
-            await conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
-        await maintenance.dispose()
 
 
 async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
