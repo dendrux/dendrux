@@ -1,0 +1,4 @@
+{
+  "_comment": "Known advisories we accept for now. Every entry needs id (the advisory id or an alias), reason, and expires (YYYY-MM-DD, at most 90 days out). An expired entry fails the Security workflow until it is renewed with a fresh justification or removed.",
+  "entries": []
+}

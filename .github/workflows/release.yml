@@ -1,0 +1,88 @@
+name: Release
+
+# A `v*` tag pushed for a commit on main builds the distributions and checks
+# them. Publishing to PyPI uses trusted publishing (OIDC, no stored token)
+# through the `pypi` environment, whose required reviewer is the owner.
+#
+# The publish job stays off until the owner has (1) registered this workflow as
+# a trusted publisher on PyPI, (2) added the owner as required reviewer on the
+# `pypi` environment, and then (3) set the repository variable
+# PYPI_TRUSTED_PUBLISHING=true. Until then a tag only builds and checks.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag must be on main and match the package version
+        shell: bash
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main."
+            exit 1
+          fi
+          version="$(python3 - <<'PY'
+          import tomllib
+          with open("packages/python/pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          PY
+          )"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        working-directory: packages/python
+        run: |
+          pip install "build>=1.4,<2.0" "twine>=6.2,<7.0"
+          python -m build --outdir "$RUNNER_TEMP/dist" .
+
+      - name: Check
+        run: |
+          twine check --strict "$RUNNER_TEMP"/dist/*
+          python .github/scripts/check_wheel_dashboard.py "$RUNNER_TEMP"/dist/*.whl
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    if: ${{ vars.PYPI_TRUSTED_PUBLISHING == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/dendrux/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
