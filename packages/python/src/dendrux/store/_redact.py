@@ -40,6 +40,7 @@ from dendrux.runtime._pending import (
     unknown_tool_calls,
 )
 from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
+from dendrux.skills._session import NAMES as SKILL_TOOL_NAMES
 from dendrux.tools._limits import MAX_CALLS_CODE, SIZE_LIMIT_CODE
 from dendrux.tools._validate import (
     ARGUMENTS_NOT_STABLE_CODE,
@@ -135,7 +136,7 @@ class _Context:
     active: bool
     unknown_calls: frozenset[str] | None
     declared_tools: frozenset[str] | None = None
-    mcp_tools: frozenset[str] | None = None
+    tools: ToolEvidence | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +457,9 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "code": _enum(_RESTORE_CODES),
     },
     "guardrail.image_unscanned": {"count": _num},
+    # the run's declared non-MCP tool names (positive evidence for readers):
+    # redacted readers see only how many
+    "tools.declared": {},
     # skills/_session.py: names, revisions and paths are checked against the
     # developer's skills before they are written
     "skill.catalog_resolved": {
@@ -579,46 +583,98 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
 }
 
 
-def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context) -> None:
-    """Rules that need more than one field or the reader's context."""
-    kind = event.event_type
-    if kind == "run.paused" and ctx.active:
-        # The active pause's call ids and arguments, which a client acts on (B2).
+Special = Callable[["StoredEvent", dict[str, Any], dict[str, Any], _Context], None]
+
+
+def _active_paused(
+    event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+) -> None:
+    if ctx.active:  # the active pause's call ids, names and arguments a client acts on (B2)
         for call, original in zip(
             shown.get("pending_tool_calls", []), _dicts(raw.get("pending_tool_calls")), strict=False
         ):
             call.update({k: original[k] for k in ("id", "name", "params") if k in original})
-    elif kind == "approval.requested" and ctx.active:
+
+
+def _active_request(
+    event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+) -> None:
+    if ctx.active:
         shown.update({k: raw[k] for k in ("call_id", "tool_name", "params") if k in raw})
-    elif kind == "image.state":
-        for verdict in shown.get("guardrail_verdicts", []):
-            name = verdict.get("tool_name")
-            if name is not None and (ctx.declared_tools is None or name not in ctx.declared_tools):
-                verdict["tool_name"] = UNKNOWN_TOOL  # a strategy-built name, unverified
-    elif kind == "tool.completed":
-        if "code" in raw:
-            shown["code"] = (
-                raw["code"] if is_one_of(raw["code"], TOOL_RESULT_CODES) else UNKNOWN_CODE
-            )
-        if _unknown_tool(raw, event, ctx):
-            shown["tool_name"] = UNKNOWN_TOOL
-    elif kind == "skill.activation_failed" and "name" in raw:
-        declared = raw.get("reason") == "denied" and isinstance(raw.get("name"), str)
-        if not declared:  # a denied name is the developer's; any other is the model's
-            shown["name"] = UNKNOWN_SKILL
-    elif kind == "guardrail.unmapped_placeholder" and isinstance(raw.get("placeholders"), list):
-        shown["count"] = len(raw["placeholders"])
-    elif kind == "mcp.tools_skipped":
-        for item in shown.get("skipped", []):
-            if item.get("reason") != "unknown_tool":  # only then the developer's name
-                item.pop("tool", None)
-    if kind in TOOL_NAME_EVENTS:
-        _verify_tool_names(kind, shown, ctx)
 
 
-# Events that name tools, and where. An MCP server can supply a tool's name, so a
-# redacted reader sees a name only when the run's ``mcp.connected`` events show
-# it is not an MCP tool; without that evidence every name is hidden.
+def _image_names(
+    event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+) -> None:
+    for verdict in shown.get("guardrail_verdicts", []):
+        name = verdict.get("tool_name")
+        if name is not None and (ctx.declared_tools is None or name not in ctx.declared_tools):
+            verdict["tool_name"] = UNKNOWN_TOOL  # a strategy-built name, unverified
+
+
+def _tool_result(
+    event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+) -> None:
+    if "code" in raw:
+        shown["code"] = raw["code"] if is_one_of(raw["code"], TOOL_RESULT_CODES) else UNKNOWN_CODE
+    if _unknown_tool(raw, event, ctx):
+        shown["tool_name"] = UNKNOWN_TOOL
+
+
+def _skill_name(
+    event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+) -> None:
+    declared = raw.get("reason") == "denied" and isinstance(raw.get("name"), str)
+    if "name" in raw and not declared:  # a denied name is the developer's; others the model's
+        shown["name"] = UNKNOWN_SKILL
+
+
+def _count_of(key: str) -> Special:
+    def count(
+        event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+    ) -> None:
+        if isinstance(raw.get(key), list):
+            shown["count"] = len(raw[key])
+
+    return count
+
+
+def _skipped_names(
+    event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context
+) -> None:
+    for item in shown.get("skipped", []):
+        if item.get("reason") != "unknown_tool":  # only then the developer's name
+            item.pop("tool", None)
+
+
+_SPECIAL: dict[str, Special] = {
+    "run.paused": _active_paused,
+    "approval.requested": _active_request,
+    "image.state": _image_names,
+    "tool.completed": _tool_result,
+    "skill.activation_failed": _skill_name,
+    "guardrail.unmapped_placeholder": _count_of("placeholders"),
+    "tools.declared": _count_of("local_tool_names"),
+    "mcp.tools_skipped": _skipped_names,
+}
+
+
+def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context) -> None:
+    """Rules that need more than one field or the reader's context."""
+    rule = _SPECIAL.get(event.event_type)
+    if rule is not None:
+        rule(event, raw, shown, ctx)
+    if event.event_type in TOOL_NAME_EVENTS:
+        _verify_tool_names(event.event_type, shown, ctx)
+
+
+# Events that name tools, and where. A tool's name can come from an MCP server
+# (or a custom provider or strategy), so a redacted reader sees a name only with
+# positive evidence that it is a developer-declared, non-MCP tool: one of
+# Dendrux's own tool names, or a name the run recorded in ``tools.declared``.
+# Anything else is "<mcp_tool>" when the run's ``mcp.connected`` records list
+# it, and "<unknown_tool>" otherwise (missing or partial records, custom
+# stores, older runs, standalone ``redact_event``).
 _TOOL_NAME_PATHS: dict[str, tuple[str | None, str]] = {
     "tool.completed": (None, "tool_name"),
     "approval.requested": (None, "tool_name"),
@@ -633,14 +689,29 @@ _TOOL_NAME_PATHS: dict[str, tuple[str | None, str]] = {
     "image.state": ("guardrail_verdicts", "tool_name"),
 }
 TOOL_NAME_EVENTS = frozenset(_TOOL_NAME_PATHS)
+DENDRUX_TOOL_NAMES = SKILL_TOOL_NAMES
+"""Tool names Dendrux itself defines (skills); reserved, so never an MCP tool's."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolEvidence:
+    """What the run's records prove about tool names (each None when unknown)."""
+
+    local: frozenset[str] | None
+    mcp: frozenset[str] | None
 
 
 def _shown_tool_name(name: Any, ctx: _Context) -> Any:
     if not isinstance(name, str) or name in (UNKNOWN_TOOL, MCP_TOOL):
         return name
-    if ctx.mcp_tools is None:
-        return UNKNOWN_TOOL  # no evidence about the run's MCP tools: fail closed
-    return MCP_TOOL if name in ctx.mcp_tools else name
+    if name in DENDRUX_TOOL_NAMES:
+        return name
+    tools = ctx.tools
+    if tools is not None and tools.mcp is not None and name in tools.mcp:
+        return MCP_TOOL
+    if tools is not None and tools.local is not None and name in tools.local:
+        return name  # positively declared, non-MCP (collisions are rejected at build)
+    return UNKNOWN_TOOL
 
 
 def _verify_tool_names(kind: str, shown: dict[str, Any], ctx: _Context) -> None:
@@ -742,7 +813,7 @@ def _redact(
     approval_params: Mapping[str, dict[str, Any]] | None,
     unknown_calls: frozenset[str] | None,
     declared_tools: frozenset[str] | None = None,
-    mcp_tools: frozenset[str] | None = None,
+    tools: ToolEvidence | None = None,
 ) -> StoredEvent:
     if include_payloads is True:
         return _trusted(event, approval_params)
@@ -758,7 +829,7 @@ def _redact(
         active=active_pause is True,
         unknown_calls=unknown_calls,
         declared_tools=declared_tools,
-        mcp_tools=mcp_tools,
+        tools=tools,
     )
     shown = _apply(schema, data)
     _special(event, data, shown, context)  # the original event: its ids are evidence
@@ -901,7 +972,7 @@ async def view_with(
     past: PastParams,
     unknown_calls: frozenset[str] | None = None,
     declared_tools: frozenset[str] | None = None,
-    mcp_tools: frozenset[str] | None = None,
+    tools: ToolEvidence | None = None,
 ) -> StoredEvent:
     """``event`` as a reader sees it, given the run's active pause ``view``."""
     data = data_of(event)
@@ -927,29 +998,42 @@ async def view_with(
         approval_params=params,
         unknown_calls=unknown_calls,
         declared_tools=declared_tools,
-        mcp_tools=mcp_tools,
+        tools=tools,
     )
 
 
-def needs_mcp_tools(event: StoredEvent, include_payloads: bool) -> bool:
-    """A redacted event that names tools: the run's MCP tool names decide what shows."""
+def needs_tool_evidence(event: StoredEvent, include_payloads: bool) -> bool:
+    """A redacted event that names tools: the run's tool records decide what shows."""
     return not include_payloads and event.event_type in TOOL_NAME_EVENTS
 
 
-async def read_mcp_tools(store: Any, run_id: str, tenant_id: TenantScope) -> frozenset[str] | None:
-    """Exposed MCP tool names from the run's ``mcp.connected`` events (one page
-    of at most 1000; None when the page overflows)."""
+_TOOL_EVIDENCE_EVENTS = ["tools.declared", "mcp.connected"]
+TOOL_EVIDENCE_EVENTS = frozenset(_TOOL_EVIDENCE_EVENTS)
+
+
+async def read_tool_evidence(store: Any, run_id: str, tenant_id: TenantScope) -> ToolEvidence:
+    """Declared local and MCP tool names from the run's ``tools.declared`` and
+    ``mcp.connected`` records (one page of at most 1000). A full page may be
+    partial, so it proves nothing (both None). A run with no ``tools.declared``
+    record has no local evidence (None): its names stay hidden."""
     rows = await store.get_events(
-        run_id, event_types=["mcp.connected"], limit=_PAGE, tenant_id=tenant_id
+        run_id, event_types=_TOOL_EVIDENCE_EVENTS, limit=_PAGE, tenant_id=tenant_id
     )
     if len(rows) >= _PAGE:
-        return None
-    names: set[str] = set()
+        return ToolEvidence(None, None)
+    found: dict[str, set[str]] = {}
     for row in rows:
-        listed = data_of(row).get("tool_names")
+        key = "local_tool_names" if row.event_type == "tools.declared" else "tool_names"
+        listed = data_of(row).get(key)
+        names = found.setdefault(row.event_type, set())
         if isinstance(listed, list):
             names.update(n for n in listed if isinstance(n, str))
-    return frozenset(names)
+    local = found.get("tools.declared")
+    mcp = found.get("mcp.connected")
+    return ToolEvidence(
+        frozenset(local) if local is not None else None,
+        frozenset(mcp) if mcp is not None else None,
+    )
 
 
 def needs_declared_tools(event: StoredEvent, include_payloads: bool) -> bool:

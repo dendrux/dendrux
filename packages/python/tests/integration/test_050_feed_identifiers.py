@@ -54,6 +54,11 @@ async def test_unknown_tool_name_is_a_placeholder(store: Any, engine: Any) -> No
     agent = Agent(provider=llm, prompt="t", state_store=store, tools=[flaky], strict_tenancy=False)
     result = await agent.run("go", tenant_id="A")
     assert result.status.value == "success"
+    # Positive evidence that "flaky" is declared (the writer seam proposed in
+    # round 6; written here by hand). The model's invented name is not in it.
+    await store.save_run_event(
+        result.run_id, event_type="tools.declared", data={"local_tool_names": ["flaky"]}
+    )
     run_store = RunStore.from_engine(engine)
     events = await _follow(run_store, result.run_id)
     completed = [e.data for e in events if e.event_type == "tool.completed"]

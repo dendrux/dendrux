@@ -596,8 +596,9 @@ class TestGetPauses:
         assert pause.resume_at is not None
         # Redacted by default since 0.5.0: a past pause's call ids are hidden
         # (a custom provider may choose them); trusted readers see them.
-        assert pause.pending_tool_calls == [{"name": "read_file", "target": "client"}]
-        assert pause.submitted_results == [{"name": "read_file", "success": True}]
+        # ...and a tool name shows only with positive evidence (round 6).
+        assert pause.pending_tool_calls == [{"name": "<unknown_tool>", "target": "client"}]
+        assert pause.submitted_results == [{"name": "<unknown_tool>", "success": True}]
         (trusted,) = await store.get_pauses("r1", include_payloads=True)
         assert trusted.pending_tool_calls == [
             {"id": "tc_1", "name": "read_file", "target": "client"}

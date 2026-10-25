@@ -43,15 +43,17 @@ from dendrux.runtime._pending import (
 from dendrux.store._redact import (
     PAUSE_CHANGING_EVENTS,
     PAUSE_VIEW_EVENTS,
+    TOOL_EVIDENCE_EVENTS,
     PastParams,
     PauseView,
+    ToolEvidence,
     _redact,
     needs_declared_tools,
-    needs_mcp_tools,
+    needs_tool_evidence,
     needs_unknown_calls,
     read_declared_tools,
-    read_mcp_tools,
     read_pause_view,
+    read_tool_evidence,
     read_unknown_calls,
     view_with,
 )
@@ -183,17 +185,17 @@ class _RunFeed:
         self._view_lock = asyncio.Lock()
         self._unknown: tuple[int, frozenset[str] | None] | None = None
         self._declared: tuple[int, frozenset[str] | None] | None = None
-        self._mcp: tuple[int, frozenset[str] | None] | None = None
+        self._tools: tuple[int, ToolEvidence] | None = None
 
     def _observe(self, event: StoredEvent) -> None:
-        """Drop cached reads a newer event may have changed (the pause, MCP tools)."""
-        mcp = self._mcp
+        """Drop cached reads a newer event may have changed (the pause, tool records)."""
+        tools = self._tools
         if (
-            mcp is not None
-            and event.event_type == "mcp.connected"
-            and event.sequence_index > mcp[0]
+            tools is not None
+            and event.event_type in TOOL_EVIDENCE_EVENTS
+            and event.sequence_index > tools[0]
         ):
-            self._mcp = None
+            self._tools = None
         view = self._view
         if (
             view is not None
@@ -235,16 +237,16 @@ class _RunFeed:
         self._unknown = (through, ids)
         return ids
 
-    async def mcp_tools(self, seq: int, tenant_id: TenantScope) -> frozenset[str] | None:
-        """The run's MCP tool names, read once and again only after a newer
-        ``mcp.connected`` event (the poller publishes it before later events)."""
-        cached = self._mcp
+    async def tool_evidence(self, seq: int, tenant_id: TenantScope) -> ToolEvidence:
+        """The run's tool records, read once and again only after a newer
+        ``tools.declared`` / ``mcp.connected`` event (published before later events)."""
+        cached = self._tools
         if cached is not None:
             return cached[1]
         through = max(seq, self.head if self.head is not None else -1)
-        names = await read_mcp_tools(self.owner.store, self.run_id, tenant_id)
-        self._mcp = (through, names)
-        return names
+        evidence = await read_tool_evidence(self.owner.store, self.run_id, tenant_id)
+        self._tools = (through, evidence)
+        return evidence
 
     async def declared_tools(self, seq: int, tenant_id: TenantScope) -> frozenset[str] | None:
         """Tool names the run recorded for declared calls, read once per newer event."""
@@ -784,13 +786,14 @@ async def _feed_view(
             approval_params=None,
             unknown_calls=None,
         )
-    unknown = declared = mcp = None
+    unknown = declared = None
+    tools: ToolEvidence | None = None
     if needs_unknown_calls(event, include_payloads):
         unknown = await feed.unknown_calls(event.sequence_index, tenant_id)
     if needs_declared_tools(event, include_payloads):
         declared = await feed.declared_tools(event.sequence_index, tenant_id)
-    if needs_mcp_tools(event, include_payloads):
-        mcp = await feed.mcp_tools(event.sequence_index, tenant_id)
+    if needs_tool_evidence(event, include_payloads):
+        tools = await feed.tool_evidence(event.sequence_index, tenant_id)
     view = PauseView(event.sequence_index, None, {})
     if event.event_type in PAUSE_VIEW_EVENTS:
         view = await feed.pause_view(event.sequence_index, tenant_id)
@@ -804,7 +807,7 @@ async def _feed_view(
         past=past,
         unknown_calls=unknown,
         declared_tools=declared,
-        mcp_tools=mcp,
+        tools=tools,
     )
 
 

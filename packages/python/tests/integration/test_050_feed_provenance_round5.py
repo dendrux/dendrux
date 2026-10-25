@@ -170,3 +170,68 @@ async def test_builtin_provider_set_matches_the_adapters() -> None:
     for name in ("anthropic.py", "openai.py", "openai_responses.py", "openrouter.py"):
         labels |= set(pattern.findall((llm / name).read_text()))
     assert labels and labels <= BUILTIN_PROVIDERS, labels - BUILTIN_PROVIDERS
+
+
+# ---------------------------------------------------------------------------
+# Round 6: positive evidence only. A missing or partial MCP record never makes
+# a tool name safe to show.
+# ---------------------------------------------------------------------------
+
+
+async def _tool_run(store: Any, run_id: str, name: str, *, connected: bool) -> None:
+    await store.create_run(run_id, "a", tenant_id="A")
+    if connected:
+        await store.save_run_event(
+            run_id,
+            event_type="mcp.connected",
+            data={"source_name": "srv", "namespace": "srv", "tool_count": 1, "tool_names": [name]},
+        )
+    await store.save_run_event(
+        run_id, event_type="tool.completed", data={"tool_name": name, "success": True}
+    )
+    await store.finalize_run(run_id, status="success")
+
+
+async def test_custom_store_that_omits_mcp_records_shows_no_name(engine: Any) -> None:
+    from dendrux.runtime.state import SQLAlchemyStateStore
+
+    class OmittingStore(SQLAlchemyStateStore):
+        async def get_run_events(self, run_id: str, **kw: Any) -> Any:
+            rows = await super().get_run_events(run_id, **kw)
+            return [r for r in rows if r.event_type != "mcp.connected"]
+
+    state = OmittingStore(engine)
+    name = f"mcp__{SECRET}"
+    await _tool_run(state, "rc".ljust(26, "0"), name, connected=True)
+    run_store = RunStore(state)
+    (completed,) = await run_store.get_events("rc".ljust(26, "0"), tenant_id="A")
+    view = await run_store.get_event_view("rc".ljust(26, "0"), completed, tenant_id="A")
+    assert view.data["tool_name"] == "<unknown_tool>"
+    events = await _follow(run_store, "rc".ljust(26, "0"))
+    assert SECRET not in json.dumps([e.data for e in events])
+
+
+async def test_older_run_without_records_shows_no_name(store: Any, engine: Any) -> None:
+    await _tool_run(store, "ro".ljust(26, "0"), SECRET, connected=False)
+    run_store = RunStore.from_engine(engine)
+    (completed,) = await run_store.get_events("ro".ljust(26, "0"), tenant_id="A")
+    view = await run_store.get_event_view("ro".ljust(26, "0"), completed, tenant_id="A")
+    assert view.data["tool_name"] == "<unknown_tool>"
+
+
+async def test_declared_local_tools_are_positive_evidence(store: Any, engine: Any) -> None:
+    run_id = "rd".ljust(26, "0")
+    await store.create_run(run_id, "a", tenant_id="A")
+    await store.save_run_event(
+        run_id, event_type="tools.declared", data={"local_tool_names": ["lookup"]}
+    )
+    for name in ("lookup", "use_skill", "other"):
+        await store.save_run_event(
+            run_id, event_type="tool.completed", data={"tool_name": name, "success": True}
+        )
+    await store.finalize_run(run_id, status="success")
+    run_store = RunStore.from_engine(engine)
+    events = await _follow(run_store, run_id)
+    declared, *completed = events
+    assert declared.data == {"count": 1}
+    assert [e.data["tool_name"] for e in completed] == ["lookup", "use_skill", "<unknown_tool>"]

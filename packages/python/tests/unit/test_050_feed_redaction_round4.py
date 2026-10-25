@@ -139,11 +139,15 @@ async def test_image_verdict_tool_name_checked_against_recorded_calls(stores: An
         {"sha256": "ab" * 32, "action": "block", "tool_name": "screenshot"},
         {"sha256": "cd" * 32, "action": "block", "tool_name": SECRET},
     ]
+    # Positive evidence that "screenshot" is a declared, non-MCP tool (round 6).
+    await state.save_run_event(
+        "r1", event_type="tools.declared", data={"local_tool_names": ["screenshot", SECRET]}
+    )
     await state.save_run_event(
         "r1", event_type="image.state", data={"guardrail_verdicts": verdicts}
     )
     await state.finalize_run("r1", status="success")
-    (raw,) = await store.get_events("r1", tenant_id="T")
+    _, raw = await store.get_events("r1", tenant_id="T")
     view = await store.get_event_view("r1", raw, tenant_id="T")
     names = [v["tool_name"] for v in view.data["guardrail_verdicts"]]
     assert names == ["screenshot", "<unknown_tool>"]
@@ -151,4 +155,4 @@ async def test_image_verdict_tool_name_checked_against_recorded_calls(stores: An
     async with feed.follow("r1", tenant_id="T", max_duration_s=5.0) as f:
         items = [i async for i in f if not isinstance(i, (FollowEnd, FollowHeartbeat))]
     await feed.aclose()
-    assert [v["tool_name"] for v in items[0].data["guardrail_verdicts"]] == names
+    assert [v["tool_name"] for v in items[1].data["guardrail_verdicts"]] == names
