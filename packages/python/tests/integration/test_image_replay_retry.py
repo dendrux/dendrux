@@ -158,7 +158,9 @@ async def _approval_scenario(engine: Any, approval: bool) -> tuple[list[Any], di
     agent = _agent(store, provider, images=policy, **extra)
     paused = await agent.run("go")
     while paused.status == RunStatus.WAITING_APPROVAL:
-        paused = await agent.submit_approval(paused.run_id, approved=True)
+        paused = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
     assert paused.status == RunStatus.WAITING_CLIENT_TOOL
     client_pause = await store.get_pause_state(paused.run_id)
     call_id = client_pause["pending_tool_calls"][0]["id"]

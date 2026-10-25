@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from dendrux.runtime.state import SweepResult
+from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
 if TYPE_CHECKING:
     from datetime import timedelta
@@ -83,6 +83,7 @@ async def sweep(
         ValueError: If both or neither of database_url/state_store provided.
     """
     _validate_source(database_url, state_store, database_options)
+    _validate_thresholds(stale_running, abandoned_waiting)
     if stale_running is None and abandoned_waiting is None:
         return SweepResult(stale_running=[])
 
@@ -122,6 +123,12 @@ async def sweep(
     finally:
         if engine is not None:
             await engine.dispose()
+
+
+def _validate_thresholds(*thresholds: timedelta | None) -> None:
+    for threshold in thresholds:
+        if threshold is not None:
+            _validate_sweep_age(threshold)
 
 
 def _validate_source(

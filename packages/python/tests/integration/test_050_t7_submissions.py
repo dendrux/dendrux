@@ -33,7 +33,7 @@ async def test_every_submit_validates_pause_generation(store, entry):
             on_governance_change="warn",
         )
         paused = await a.run("go")
-        call = paused.meta["pause_state"].pending_tool_calls[0]
+        call = paused.pending.tool_calls[0]
         kwargs = (
             {"decisions": {call.id: ApprovalDecision.approve()}}
             if entry == "decisions"
@@ -110,9 +110,9 @@ async def test_oversized_plain_text_is_capped_before_transform(store):
     paused = await a.run("go")
     result = await a.submit_tool_results(paused.run_id, [result_for(paused, "{" * 1000)])
     assert result.status == RunStatus.SUCCESS
-    assert len(seen) == 1 and len(seen[0].result) < 1000
+    assert not seen
     messages = [m for m in a.provider.messages[-1] if m.role.value == "tool"]
-    assert json.loads(messages[-1].content) is None
+    assert json.loads(messages[-1].content)["code"] == "size_limit"
 
 
 async def test_failed_transform_does_not_claim_or_expose_payload(store):

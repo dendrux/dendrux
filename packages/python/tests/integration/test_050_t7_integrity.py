@@ -47,7 +47,7 @@ def agent(store, responses, **kwargs):
 
 
 def result_for(paused, payload='"ok"'):
-    call = paused.meta["pause_state"].pending_tool_calls[0]
+    call = paused.pending.tool_calls[0]
     return ToolResult(name=call.name, call_id=call.id, payload=payload)
 
 
@@ -71,11 +71,22 @@ async def test_duplicate_resume_stream_cannot_finalize_owner(store):
     a = agent(store, llm)
     paused = await a.run("go")
     results = [result_for(paused)]
-    owner = asyncio.create_task(consume(a.resume_stream(paused.run_id, tool_results=results)))
+    owner = asyncio.create_task(
+        consume(
+            a.resume_stream(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
+        )
+    )
     try:
         await asyncio.wait_for(llm.entered.wait(), 5)
         losers = await asyncio.gather(
-            *[consume(a.resume_stream(paused.run_id, tool_results=results)) for _ in range(8)]
+            *[
+                consume(
+                    a.resume_stream(
+                        paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+                    )
+                )
+                for _ in range(8)
+            ]
         )
         assert all(result.status == RunStatus.ERROR for result, _ in losers)
         assert (await store.get_run(paused.run_id)).status == "running"
@@ -274,26 +285,36 @@ async def test_client_results_validate_identity_and_preserve_text_before_claim(s
     ]
     if bad == "duplicate":
         results = [good, good]
-    if bad in {"json", "nan"}:
+    if bad == "json":
         if entry == "submit":
             result = await a.submit_tool_results(paused.run_id, results)
         elif entry == "resume":
-            result = await a.resume(paused.run_id, tool_results=results)
+            result = await a.resume(
+                paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+            )
         else:
-            result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
+            result, _ = await consume(
+                a.resume_stream(
+                    paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+                )
+            )
         assert result.status == RunStatus.SUCCESS
         message = next(m for m in a.provider.messages[-1] if m.role.value == "tool")
         assert message.content == ("{" if bad == "json" else "NaN")
         return
     if entry == "resume_stream":
-        result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
+        result, _ = await consume(
+            a.resume_stream(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
+        )
         assert result.status == RunStatus.ERROR
     else:
         with pytest.raises(InvalidToolResultError):
             if entry == "submit":
                 await a.submit_tool_results(paused.run_id, results)
             else:
-                await a.resume(paused.run_id, tool_results=results)
+                await a.resume(
+                    paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+                )
     assert (await store.get_run(paused.run_id)).status == "waiting_client_tool"
     assert await epoch_of(store, paused.run_id) == 0
 
@@ -313,14 +334,17 @@ async def test_client_result_cap_then_transform(store, entry):
     if entry == "submit":
         result = await a.submit_tool_results(paused.run_id, results)
     elif entry == "resume":
-        result = await a.resume(paused.run_id, tool_results=results)
+        result = await a.resume(
+            paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+        )
     else:
-        result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
+        result, _ = await consume(
+            a.resume_stream(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
+        )
     assert result.status == RunStatus.SUCCESS
-    assert len(seen) == 1 and len(seen[0].result) < 2000
-    assert seen[0].tool_name == "client_read"
+    assert not seen
     messages = [m for m in llm.messages[-1] if m.role.value == "tool"]
-    assert messages[-1].content == '"transformed"'
+    assert json.loads(messages[-1].content)["code"] == "size_limit"
 
 
 @pytest.mark.parametrize("mode", ["warn", "raise"])
@@ -340,19 +364,23 @@ async def test_governance_change_is_visible_or_preserves_pause(store, mode, entr
     )
     results = [result_for(paused)]
     if entry == "resume_stream":
-        result, _ = await consume(b.resume_stream(paused.run_id, tool_results=results))
+        result, _ = await consume(
+            b.resume_stream(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
+        )
     elif mode == "raise":
         with pytest.raises(GovernanceMismatchError):
             if entry == "submit":
                 await b.submit_tool_results(paused.run_id, results)
             else:
-                await b.resume(paused.run_id, tool_results=results)
+                await b.resume(
+                    paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+                )
         result = None
     else:
         result = await (
             b.submit_tool_results(paused.run_id, results)
             if entry == "submit"
-            else b.resume(paused.run_id, tool_results=results)
+            else b.resume(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
         )
     if mode == "raise":
         assert (await store.get_run(paused.run_id)).status == "waiting_client_tool"
@@ -377,7 +405,9 @@ async def test_legacy_governance_is_skipped_and_logged(store, caplog):
     await store.pause_run(paused.run_id, status="waiting_client_tool", pause_data=raw)
     caplog.set_level("INFO")
     assert (
-        await a.resume(paused.run_id, tool_results=[result_for(paused)])
+        await a.resume(
+            paused.run_id, tool_results=[result_for(paused)], expected_pause_id=paused.pause_id
+        )
     ).status == RunStatus.SUCCESS
     assert "code=governance_legacy" in caplog.text
 
@@ -430,9 +460,9 @@ async def test_approved_tools_recheck_current_deny_and_call_cap(store, entry, po
             paused.run_id, approved=True, expected_pause_id=paused.pause_id
         )
     elif entry == "resume":
-        result = await b.resume(paused.run_id)
+        result = await b.resume(paused.run_id, expected_pause_id=paused.pause_id)
     else:
-        result, _ = await consume(b.resume_stream(paused.run_id))
+        result, _ = await consume(b.resume_stream(paused.run_id, expected_pause_id=paused.pause_id))
     assert result.status == RunStatus.SUCCESS
     assert effects == ([] if policy == "deny" else ["current"])
 
@@ -447,7 +477,9 @@ async def test_anyio_cancelled_stream_persists_cancelled(store, entry):
     a = agent(store, llm)
     if entry == "resume_stream":
         paused = await a.run("go")
-        stream = a.resume_stream(paused.run_id, tool_results=[result_for(paused)])
+        stream = a.resume_stream(
+            paused.run_id, tool_results=[result_for(paused)], expected_pause_id=paused.pause_id
+        )
     else:
         stream = a.stream("go")
     with anyio.CancelScope() as scope:

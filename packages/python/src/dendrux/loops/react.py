@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
+from dendrux.llm._evidence import RejectedArguments, persistable_call, persistable_response
 from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
@@ -654,6 +655,25 @@ async def _init_loop_state(
         warnings=[],
         image_view=image_view_state if image_view_state is not None else ImageViewState(),
     )
+
+
+def _persistable_argument_validator(validator: Any) -> Any:
+    from functools import wraps
+
+    @wraps(validator)
+    def validate(tc: ToolCall, *args: Any, **kwargs: Any) -> Any:
+        from dendrux.tools._validate import invalid_params_result
+
+        if isinstance(tc, RejectedArguments):
+            return invalid_params_result(
+                tc, "Tool arguments must contain persistable text and JSON."
+            )
+        return validator(tc, *args, **kwargs)
+
+    return validate
+
+
+prepare_tool_call = _persistable_argument_validator(prepare_tool_call)
 
 
 async def _process_tool_calls(
@@ -1702,6 +1722,7 @@ class ReActLoop(Loop):
                     )
             prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
+            response = persistable_response(response)
             response = price_response(
                 response,
                 pricing=agent.pricing,
@@ -2251,7 +2272,7 @@ class ReActLoop(Loop):
                                 visible_deltas += 1
                                 yield RunEvent(
                                     type=RunEventType.TOOL_USE_END,
-                                    tool_call=event.tool_call,
+                                    tool_call=persistable_call(event.tool_call),
                                     tool_name=event.tool_name,
                                     tool_call_id=event.tool_call_id,
                                     iteration=iteration,
@@ -2396,6 +2417,7 @@ class ReActLoop(Loop):
             assert llm_response is not None
             prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
+            llm_response = persistable_response(llm_response)
             llm_response = price_response(
                 llm_response,
                 pricing=agent.pricing,
@@ -2871,6 +2893,7 @@ def _unknown_tool_result(tool_call: ToolCall, lookups: ToolLookups) -> ToolResul
         payload=json.dumps({"error": message}, ensure_ascii=False),
         success=False,
         error=message,
+        meta={"code": "unknown_tool"},
     )
 
 

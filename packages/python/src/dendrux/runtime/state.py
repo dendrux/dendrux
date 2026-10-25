@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
-from dendrux.runtime.durability import retry_transient_db
+from dendrux.runtime.durability import retry_transient_db, safe_database_operations
 from dendrux.types import (
     CreateRunResult,
     IdempotencyConflictError,
@@ -125,13 +125,15 @@ def _require_aware_utc(name: str, value: _dt.datetime | None) -> None:
     """
     if value is None:
         return
-    if value.tzinfo is None:
+    if not _is_aware_datetime(value):
         raise ValueError(
-            f"{name!s} must be a timezone-aware datetime (e.g. "
-            f"datetime.now(UTC)); got naive {value!r}. Dendrux compares "
-            f"against TIMESTAMPTZ columns and naive inputs produce "
-            f"backend-dependent results."
+            f"{name} must be a timezone-aware datetime (e.g. datetime.now(UTC)); "
+            "Dendrux compares TIMESTAMPTZ columns."
         )
+
+
+def _is_aware_datetime(value: Any) -> bool:
+    return isinstance(value, _dt.datetime) and value.tzinfo is not None
 
 
 @dataclass
@@ -183,6 +185,11 @@ class RunControl:
 
 
 # Pause-state keys a pending read needs: everything but history, steps and usage.
+def _validate_sweep_age(value: timedelta) -> None:
+    if not isinstance(value, _dt.timedelta) or value < _dt.timedelta(0):
+        raise ValueError("sweep age must be a non-negative timedelta")
+
+
 PAUSE_SUMMARY_KEYS = (
     "agent_name",
     "pending_tool_calls",
@@ -955,6 +962,7 @@ class _SerializedSessionFactory:
 
     def __init__(self, engine: AsyncEngine, factory: Callable[[], AsyncSession]) -> None:
         self._engine = engine
+        engine.sync_engine.hide_parameters = True
         self._factory = factory
 
     @asynccontextmanager
@@ -983,6 +991,105 @@ def _status_values(status: Any, *, initial: bool = False) -> dict[str, Any]:
     }
 
 
+def _check_create_identifiers(
+    run_id: str,
+    agent_name: str,
+    tenant_id: str | None,
+    idempotency_key: str | None,
+    model: str | None,
+) -> None:
+    from dendrux.types import _validate_identifier
+
+    _validate_identifier(run_id, "run_id", maximum=26)
+    _validate_identifier(agent_name, "agent_name")
+    for name, optional in (
+        ("tenant_id", tenant_id),
+        ("idempotency_key", idempotency_key),
+        ("model", model),
+    ):
+        if optional is not None:
+            _validate_identifier(optional, name)
+
+
+_PERSISTED_VALUE_FIELDS = frozenset(
+    {
+        "content",
+        "params",
+        "result_payload",
+        "error_message",
+        "meta",
+        "patch",
+        "pause_data",
+        "submitted_data",
+        "event_data",
+        "data",
+        "text",
+        "metadata",
+        "reason",
+        "answer",
+        "error",
+        "pii_mapping",
+        "error_info",
+        "failure_reason",
+        "semantic_request",
+        "semantic_response",
+        "provider_request",
+        "provider_response",
+        "guardrail_findings",
+    }
+)
+
+
+def _validated_store_write(method: Any) -> Any:
+    from functools import wraps
+    from inspect import signature
+
+    sig = signature(method)
+
+    @wraps(method)
+    async def write(*args: Any, **kwargs: Any) -> Any:
+        from dendrux.types import _validate_persistable
+
+        values = sig.bind(*args, **kwargs).arguments
+        for name in _PERSISTED_VALUE_FIELDS.intersection(values):
+            _validate_persistable(values[name], name)
+        return await method(*args, **kwargs)
+
+    return write
+
+
+def _validated_store_writes(cls: Any) -> Any:
+    for name, method in list(vars(cls).items()):
+        if name.startswith(
+            (
+                "save_",
+                "create_",
+                "finalize_",
+                "pause_",
+                "try_pause_",
+                "submit_",
+                "add_note",
+                "update_run_meta",
+                "request_pause",
+            )
+        ):
+            setattr(cls, name, _validated_store_write(method))
+    return cls
+
+
+def _readable_json_document(column: Any) -> Any:
+    from sqlalchemy import JSON, Text, cast, func
+
+    # Older plain-JSON columns can contain escaped NUL. Preserve escaped
+    # backslashes while replacing only an active NUL escape before extraction.
+    cleaned = func.regexp_replace(
+        cast(column, Text), r"((?:^|[^\\])(?:\\\\)*)\\u0000", r"\1\\ufffd", "g"
+    )
+    return cast(cleaned, JSON)
+
+
+@safe_database_operations
+@_validated_store_writes
 class SQLAlchemyStateStore(SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
@@ -1040,6 +1147,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         blob_refs: Sequence[BlobEdge] | None = None,
         blob_refs_scope: str | None = None,
     ) -> CreateRunResult:
+        from dendrux.types import _validate_persistable
+
+        _check_create_identifiers(run_id, agent_name, tenant_id, idempotency_key, model)
+        _validate_persistable(meta, "metadata")
+        _validate_persistable(input_data, "input")
         import datetime as _dt
 
         from sqlalchemy.exc import IntegrityError
@@ -2233,7 +2345,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         result: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
         for data in rows:
-            data = data or {}
+            data = _approval_event_object(data)
             call_id = data.get("call_id")
             if isinstance(call_id, str) and call_id not in seen:
                 seen.add(call_id)
@@ -2250,8 +2362,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         ``pause_data`` in SQL (``jsonb`` operators on Postgres, ``json_extract``
         on SQLite), so the pause history never leaves the database.
         """
-        from sqlalchemy import cast, func, literal_column, select
-        from sqlalchemy.dialects.postgresql import JSONB
+        from sqlalchemy import func, literal_column, select
 
         from dendrux.db.models import AgentRun, RunEvent
 
@@ -2263,7 +2374,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             .scalar_subquery()
         )
         if dialect == "postgresql":
-            doc = cast(AgentRun.pause_data, JSONB)
+            doc = _readable_json_document(AgentRun.pause_data)
             parts = [doc[key] for key in PAUSE_SUMMARY_KEYS] + [doc["steps"][-1]]
         elif dialect == "sqlite":
             parts = [func.json_extract(AgentRun.pause_data, f"$.{k}") for k in PAUSE_SUMMARY_KEYS]
@@ -2821,6 +2932,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
                 raise ValueError(f"{name} must be between 1 and {ceiling}")
+        _validate_sweep_age(older_than)
         now = _dt.datetime.now(_dt.UTC)
         cutoff = now - older_than
         age = (
@@ -2910,6 +3022,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                 **_status_values(new_status),
                                 claim_epoch=AgentRun.claim_epoch + 1,
                                 failure_reason=reason,
+                                pause_data=None,
                                 error=f"Run swept as {reason}"
                                 if waiting
                                 else case((flagged, None), else_=f"Run swept as {reason}"),
@@ -3493,7 +3606,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         from sqlalchemy import func
 
         from dendrux.db.models import AgentRun
+        from dendrux.types import _validate_persistable
 
+        _validate_persistable(metadata_filter, "metadata_filter")
         for key in metadata_filter:
             if not isinstance(key, str) or not self._METADATA_KEY_RE.match(key):
                 raise ValueError(
@@ -3503,15 +3618,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         dialect = self._engine.dialect.name
         if dialect == "postgresql":
-            # Cast to JSONB so we can use the ``@>`` containment operator
-            # (the underlying column is plain ``JSON`` for SQLite parity).
-            # One predicate covers all keys, and the value is bound as a
-            # JSON literal, so any JSON-serializable scalar works without
-            # per-type coercion.
             from sqlalchemy import cast
             from sqlalchemy.dialects.postgresql import JSONB
 
-            return stmt.where(cast(AgentRun.meta, JSONB).contains(cast(metadata_filter, JSONB)))
+            return stmt.where(_jsonb_or_null(AgentRun.meta).contains(cast(metadata_filter, JSONB)))
 
         # SQLite (and other backends): per-key json_extract equality.
         # json_extract returns native types, so equality works naturally
@@ -3520,6 +3630,39 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         for key, value in metadata_filter.items():
             stmt = stmt.where(func.json_extract(AgentRun.meta, f"$.{key}") == value)
         return stmt
+
+
+def _approval_event_object(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _jsonb_or_null(column: Any) -> Any:
+    """``column::jsonb``, or NULL for a stored document ``jsonb`` cannot hold.
+
+    The ``json`` column accepts ``\\u0000`` and unpaired surrogate escapes;
+    converting such a row raises and fails the whole statement, so one row
+    would break a scan for every tenant. The text is checked first: escaped
+    backslashes and valid surrogate pairs are removed, and any ``\\u0000`` or
+    surrogate escape left means the row is not convertible (it matches no
+    filter). Rows without any ``\\u`` escape skip the check.
+    """
+    from sqlalchemy import Text, case, cast, func
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    raw = cast(column, Text)
+    no_backslash_pairs = func.regexp_replace(raw, r"\\\\", "", "g")
+    no_pairs = func.regexp_replace(
+        no_backslash_pairs,
+        r"\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}",
+        "",
+        "g",
+    )
+    unconvertible = no_pairs.op("~")(r"\\u(0000|[dD][89a-fA-F])")
+    return case(
+        (func.strpos(raw, "\\u") == 0, cast(column, JSONB)),
+        (~unconvertible, cast(column, JSONB)),
+        else_=None,
+    )
 
 
 async def read_run_control(store: Any, run_id: str) -> RunControl:
@@ -3673,8 +3816,7 @@ def _check_scope(tenant_id: object) -> None:
         return
     if not isinstance(tenant_id, str) or not tenant_id:
         raise ValueError(
-            "tenant_id must be a non-empty str, None (untenanted runs) or UNSCOPED (all), "
-            f"got {tenant_id!r}."
+            "tenant_id must be a non-empty str, None (untenanted runs) or UNSCOPED (all)."
         )
 
 

@@ -131,7 +131,9 @@ async def test_applied_on_approval_resume_path(db_store, run_store) -> None:
     paused = await agent.run("go")
     assert paused.status == RunStatus.WAITING_APPROVAL
 
-    result = await agent.submit_approval(paused.run_id, approved=True)
+    result = await agent.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
     assert result.status == RunStatus.SUCCESS
 
     expected = {"result_id": "r-get_rows", "rows": [{"x": 0}]}

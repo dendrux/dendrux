@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
+from dendrux.llm._evidence import persistable_response
 from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
@@ -524,6 +525,7 @@ class SingleCall(Loop):
 
         prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
+        response = persistable_response(response)
         response = price_response(
             response,
             pricing=agent.pricing,
@@ -978,6 +980,7 @@ class SingleCall(Loop):
         assert llm_response is not None
         prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
+        llm_response = persistable_response(llm_response)
         llm_response = price_response(
             llm_response,
             pricing=agent.pricing,

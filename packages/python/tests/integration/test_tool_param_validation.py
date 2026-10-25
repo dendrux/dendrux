@@ -80,7 +80,9 @@ async def test_approval_resume_valid_call_still_executes(store):
     agent = _approval_agent(llm, store)
     paused = await agent.run("refund 7")
 
-    result = await agent.submit_approval(paused.run_id, approved=True)
+    result = await agent.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
 
     assert result.answer == "processed"
     assert REFUNDS == [7]
@@ -140,7 +142,9 @@ async def test_approval_resume_rejects_malformed_pending_call(store):
     pause_data["pending_tool_calls"][0]["parse_error"] = "Expecting value at char 14"
     await store.pause_run(paused.run_id, status=paused.status.value, pause_data=pause_data)
 
-    result = await agent.submit_approval(paused.run_id, approved=True)
+    result = await agent.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
 
     assert result.status == RunStatus.SUCCESS
     assert REFUNDS == []
@@ -227,7 +231,9 @@ async def test_approved_call_runs_with_objects_built_from_the_approved_json(stor
     # The approval view is the call as the model sent it.
     assert [d["params"] for d in requested] == [{"order": {"id": 7.0}}]
 
-    result = await agent.submit_approval(paused.run_id, approved=True)
+    result = await agent.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
 
     assert result.status == RunStatus.SUCCESS
     assert [Order(id=7)] == ORDERS
@@ -250,6 +256,8 @@ async def test_max_calls_rejects_extra_calls_before_the_approval_pause(store):
     assert paused.status == RunStatus.WAITING_APPROVAL
     pause_data = await store.get_pause_state(paused.run_id)
     assert [c["params"]["order"]["id"] for c in pause_data["pending_tool_calls"]] == [1]
-    result = await agent.submit_approval(paused.run_id, approved=True)
+    result = await agent.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
     assert result.status == RunStatus.SUCCESS
     assert [Order(id=1)] == ORDERS

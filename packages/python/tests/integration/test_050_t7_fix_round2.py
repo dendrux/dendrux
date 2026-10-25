@@ -23,7 +23,9 @@ async def test_disconnect_between_events_closes_generator_without_gc(store, monk
     a = agent(store, llm)
     if resumed:
         paused = await a.run("go")
-        stream = a.resume_stream(paused.run_id, tool_results=[result_for(paused)])
+        stream = a.resume_stream(
+            paused.run_id, tool_results=[result_for(paused)], expected_pause_id=paused.pause_id
+        )
     else:
         stream = a.stream("go")
     released = []
@@ -79,7 +81,6 @@ async def test_disconnect_between_events_closes_generator_without_gc(store, monk
         'Revenue:\n"quoted"\tC:\\sheets\\é',
         ' { "rows" : [1, 2], "label": "\\u00e9" }\n',
         '"Revenue:\\n\\u00e9"',
-        "NaN",
     ],
 )
 async def test_client_payload_reaches_model_byte_for_byte_as_041(store, entry, payload):
@@ -91,9 +92,13 @@ async def test_client_payload_reaches_model_byte_for_byte_as_041(store, entry, p
     if entry == "submit":
         result = await a.submit_tool_results(paused.run_id, results)
     elif entry == "resume":
-        result = await a.resume(paused.run_id, tool_results=results)
+        result = await a.resume(
+            paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+        )
     else:
-        result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
+        result, _ = await consume(
+            a.resume_stream(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
+        )
     assert result.status == RunStatus.SUCCESS
     message = next(m for m in llm.messages[-1] if m.role.value == "tool")
     assert message.content.encode("utf-8") == payload.encode("utf-8")

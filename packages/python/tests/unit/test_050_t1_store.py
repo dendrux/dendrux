@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from dendrux import Agent, tool
 from dendrux.db._sqlite_sync import create_sqlite_schema
 from dendrux.db.models import Base
-from dendrux.errors import NoteLimitExceededError, RunNotFoundError
+from dendrux.errors import NoteLimitExceededError, PersistenceError, RunNotFoundError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.state import UNSCOPED, SQLAlchemyStateStore
 from dendrux.store import RunStore
@@ -167,14 +167,13 @@ class TestTenantIdempotency:
             await eng.dispose()
 
     async def test_unrelated_integrity_error_is_not_classified(self, state: Any) -> None:
-        from sqlalchemy.exc import IntegrityError
 
         await state.create_run("dup", "a")
-        with pytest.raises(IntegrityError):
+        with pytest.raises(PersistenceError):
             await state.create_run("dup", "a", idempotency_key="k", idempotency_fingerprint="f")
 
     async def test_store_rejects_empty_tenant(self, state: Any) -> None:
-        with pytest.raises(ValueError, match="non-empty"):
+        with pytest.raises(ValueError, match="invalid_identifier"):
             await state.create_run("r1", "a", tenant_id="")
 
     def test_violation_classifier(self) -> None:

@@ -44,7 +44,10 @@
     "dendrux.agent.Agent.submit_resume",
     "dendrux.agent.Agent.submit_note",
     "dendrux.agent.Agent.stream",
-    "dendrux.agent.Agent.resume_stream"
+    "dendrux.agent.Agent.resume_stream",
+    "dendrux.runtime.runner.run",
+    "dendrux.runtime.runner.retry",
+    "dendrux.runtime.runner.run_stream"
    ],
    "param": "tenant_id",
    "b_item": "B19",

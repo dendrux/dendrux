@@ -426,7 +426,7 @@ class TestPre03Store:
 
         waiting = await agent.run("read")
         assert waiting.status == RunStatus.WAITING_CLIENT_TOOL
-        call_id = waiting.meta["pause_state"].pending_tool_calls[0].id
+        call_id = waiting.pending.tool_calls[0].id
         done = await agent.submit_tool_results(
             waiting.run_id, [ToolResult(name="client_read", call_id=call_id, payload='"x"')]
         )
@@ -434,7 +434,11 @@ class TestPre03Store:
 
         approval = await agent.run("refund")
         assert approval.status == RunStatus.WAITING_APPROVAL
-        assert (await agent.submit_approval(approval.run_id, approved=True)).answer == "refunded"
+        assert (
+            await agent.submit_approval(
+                approval.run_id, approved=True, expected_pause_id=approval.pause_id
+            )
+        ).answer == "refunded"
 
         to_cancel = await agent.run("read again")
         cancelled = await agent.cancel_run(to_cancel.run_id)

@@ -1081,11 +1081,13 @@ class Limits:
 
 @dataclass(frozen=True)
 class ErrorInfo:
-    """Structured, safe description of a provider failure that ended a run.
+    """Structured, safe description of a provider or persistence failure.
 
-    Built from a :class:`dendrux.errors.ProviderError`. Every field is a code,
-    number or name: ``safe_message`` is the error's fixed template, never
-    vendor text. Persisted under ``agent_runs.meta["dendrux.error_info"]``.
+    Provider fields come from :class:`dendrux.errors.ProviderError`.
+    Database failures use ``category="persistence_error"`` and omit provider
+    fields. Every field is a code, number or name: ``safe_message`` is a
+    fixed template, never vendor text or SQL. Persisted under
+    ``agent_runs.meta["dendrux.error_info"]``.
 
     Attributes:
         category: The error's ``category`` (``"rate_limit"``, ``"timeout"``, ...).
@@ -2166,3 +2168,62 @@ def _history_fingerprint_entry(m: Message) -> dict[str, Any]:
     if m.parts is not None:
         entry["parts"] = parts_digest(m.parts)
     return entry
+
+
+class InputValidationError(ValueError):
+    """A client value cannot be safely accepted or persisted.
+
+    ``field`` names a fixed API field, never an input dictionary key or value.
+    ``code`` is a stable rejection category, suitable for client error handling.
+    """
+
+    def __init__(self, field: str, code: str = "invalid_input") -> None:
+        self.field = field
+        self.code = code
+        super().__init__(f"{field} rejected ({code}).")
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        return type(self), (self.field, self.code)
+
+
+def _validate_persistable(value: Any, field: str = "input") -> None:
+    """Bounded JSON walk; reject text PostgreSQL cannot store, without echoing it."""
+    import math
+
+    stack = [(value, 0)]
+    visited = 0
+    while stack:
+        item, depth = stack.pop()
+        visited += 1
+        if depth > 32 or visited + len(stack) > 10000:
+            raise InputValidationError(field, "structure_limit")
+        if isinstance(item, str):
+            if "\x00" in item:
+                raise InputValidationError(field, "invalid_text")
+            try:
+                for start in range(0, len(item), 65536):
+                    item[start : start + 65536].encode("utf-8")
+            except UnicodeError:
+                raise InputValidationError(field, "invalid_text") from None
+        elif isinstance(item, dict):
+            if len(item) > 5000:
+                raise InputValidationError(field, "structure_limit")
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise InputValidationError(field, "invalid_json")
+                stack.extend(((key, depth + 1), (child, depth + 1)))
+        elif isinstance(item, (list, tuple)):
+            if len(item) > 10000:
+                raise InputValidationError(field, "structure_limit")
+            stack.extend((child, depth + 1) for child in item)
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise InputValidationError(field, "nonfinite_json")
+        elif item is not None and not isinstance(item, (bool, int)):
+            raise InputValidationError(field, "invalid_json")
+
+
+def _validate_identifier(value: Any, field: str, *, maximum: int = 255) -> None:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise InputValidationError(field, "invalid_identifier")
+    _validate_persistable(value, field)

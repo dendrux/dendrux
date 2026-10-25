@@ -25,7 +25,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
-from dendrux._sentinel import _UnsetType
+from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.chat import (
     history_has_images,
     normalize_chat_history,
@@ -53,7 +53,7 @@ from dendrux.loops._helpers import (
     record_run_started,
 )
 from dendrux.loops.react import ReActLoop
-from dendrux.runtime._entry_checks import runner_entry_checks
+from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
 from dendrux.runtime.context import (
     DelegationContext,
     StreamContext,
@@ -90,7 +90,8 @@ from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
     claim_paused_validated,
     governance_snapshot,
-    prepare_client_results,
+    legacy_approval_denial,
+    prepare_resume_results,
     report_governance_change,
     submission_validator,
     validate_result_names,
@@ -505,19 +506,52 @@ def _partial_answer(shared: dict[str, Any]) -> str | None:
 
 
 def _provider_error_info(exc: Exception) -> ErrorInfo | None:
-    from dendrux.errors import ProviderError
+    from dendrux.errors import ProviderError, _database_failure_in
 
-    return ErrorInfo.from_error(exc) if isinstance(exc, ProviderError) else None
+    return (
+        ErrorInfo.from_error(exc)
+        if isinstance(exc, ProviderError)
+        else _database_error_info(exc, _database_failure_in(exc))
+    )
+
+
+def _database_error_info(exc: Exception, failed: bool) -> ErrorInfo | None:
+    from dendrux.errors import PersistenceError
+
+    if not failed:
+        return None
+    return ErrorInfo(
+        category="persistence_error",
+        retryable=getattr(exc, "retryable", False) is True,
+        safe_message=PersistenceError.safe_message,
+        error_type="PersistenceError",
+    )
 
 
 def _safe_error(exc: Exception) -> str:
     info = _provider_error_info(exc)
-    return info.safe_message if info else str(exc)
+    return info.safe_message if info else _nonprovider_error(exc)
+
+
+def _nonprovider_error(exc: Exception) -> str:
+    from dendrux.errors import PersistenceError, _database_failure_in
+
+    return PersistenceError.safe_message if _database_failure_in(exc) else str(exc)
 
 
 def _error_payload(exc: Exception) -> dict[str, Any]:
     info = _provider_error_info(exc)
-    return {"error": _safe_error(exc)[:500], **({"error_info": info.to_dict()} if info else {})}
+    return {
+        "error": _safe_error(exc)[:500],
+        **({"error_info": info.to_dict()} if info else {}),
+        **_database_error_code(exc),
+    }
+
+
+def _database_error_code(exc: Exception) -> dict[str, Any]:
+    from dendrux.errors import _database_failure_in
+
+    return {"code": "persistence_error"} if _database_failure_in(exc) else {}
 
 
 def _error_store_kwargs(store: StateStore, exc: Exception) -> dict[str, Any]:
@@ -535,6 +569,7 @@ def _error_info_from_meta(meta: dict[str, Any] | None) -> ErrorInfo | None:
 
 def _public_meta(meta: dict[str, Any]) -> dict[str, Any]:
     result = dict(meta)
+    result.pop("pause_state", None)
     mapping = result.get("pii_mapping")
     if isinstance(mapping, dict):
         result["pii_mapping"] = {k: v for k, v in mapping.items() if k != "__dendrux_origins__"}
@@ -1395,7 +1430,7 @@ async def run(
     strategy: Strategy | None = None,
     loop: Loop | None = None,
     state_store: StateStore | None = None,
-    tenant_id: str | None = None,
+    tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
@@ -1448,6 +1483,7 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
+    tenant_id = resolve_runner_tenant(agent, "run", tenant_id)
     skill_session = SkillSession.prepare(
         agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
     )
@@ -1465,6 +1501,8 @@ async def run(
             metadata=metadata,
             user_input=user_input,
             provider_kwargs=kwargs,
+            idempotency_key=idempotency_key,
+            provider=provider,
         )
 
         resolved_strategy = strategy or NativeToolCalling()
@@ -2278,7 +2316,7 @@ async def retry(
     state_store: StateStore,
     strategy: Strategy | None = None,
     loop: Loop | None = None,
-    tenant_id: str | None = None,
+    tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
     **kwargs: Any,
@@ -2320,16 +2358,22 @@ async def retry(
     """
     # 1. Validate source run is terminal. A missing run and another tenant's
     # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
+    tenant_id = resolve_runner_tenant(agent, "retry", tenant_id)
     from dendrux.errors import RunNotFoundError
 
+    tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
+    runner_entry_checks(
+        agent,
+        "retry",
+        tenant_id=tenant_id,
+        metadata=metadata,
+        provider_kwargs=kwargs,
+        provider=provider,
+    )
     source_run = await state_store.get_run(original_run_id)
     if source_run is None:
         raise RunNotFoundError(original_run_id)
 
-    tenant_id = resolve_child_tenant(get_delegation_context(), tenant_id)
-    runner_entry_checks(
-        agent, "retry", tenant_id=tenant_id, metadata=metadata, provider_kwargs=kwargs
-    )
     if source_run.tenant_id != tenant_id:
         raise RunNotFoundError(original_run_id)
     explicit = (source_run.meta or {}).get(META_KEY, {}).get("explicit", [])
@@ -2704,7 +2748,7 @@ def run_stream(
     loop: Loop | None = None,
     state_store: StateStore | None = None,
     state_store_resolver: Callable[[], Any] | None = None,
-    tenant_id: str | None = None,
+    tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
@@ -2737,6 +2781,7 @@ def run_stream(
     # Full resolution (parent context, clamping) happens inside _generate()
     # because parent_ctx requires async state_store resolution first.
     # But validation of the raw input can fail fast here.
+    tenant_id = resolve_runner_tenant(agent, "stream", tenant_id)
     if (
         not isinstance(max_delegation_depth, _UnsetType)
         and max_delegation_depth is not None
@@ -2828,6 +2873,8 @@ def run_stream(
                 metadata=metadata,
                 user_input=entry_user_input,
                 provider_kwargs=provider_kwargs,
+                idempotency_key=idempotency_key,
+                provider=provider,
             )
             _shared["existing_run"] = False
 
@@ -4265,6 +4312,13 @@ async def _check_claim(store: StateStore, run_id: str) -> None:
         await getter(run_id)
 
 
+def _canonicalize_legacy_denials(
+    status: str, run_id: str, raw: dict[str, Any], results: list[ToolResult] | None
+) -> None:
+    if status == RunStatus.WAITING_APPROVAL.value and results is not None:
+        results[:] = legacy_approval_denial(run_id, PauseState.from_dict(raw), results)
+
+
 async def _claim_resume(
     store: StateStore,
     run_id: str,
@@ -4299,6 +4353,7 @@ async def _claim_resume(
         ),
     )
     for status in allowed:
+        _canonicalize_legacy_denials(status, run_id, raw, results)
         epoch = await claim_paused_validated(
             store,
             run_id,
@@ -4442,8 +4497,8 @@ async def _resume_core(
         if tool_results is not None:
             validate_result_names(run_id, pause_state, tool_results, json_payload=_skip_claim)
             if not _skip_claim:
-                tool_results = await prepare_client_results(
-                    agent, run_id, pause_state, tool_results
+                tool_results = await prepare_resume_results(
+                    agent, state_store, run_id, pause_state, tool_results
                 )
 
         # 2a. Images: ingest before the claim; typed errors leave the run waiting.
@@ -4847,8 +4902,8 @@ def resume_stream(
 
             if stream_results is not None:
                 validate_result_names(run_id, pause_state, stream_results, json_payload=False)
-                stream_results = await prepare_client_results(
-                    agent, run_id, pause_state, stream_results
+                stream_results = await prepare_resume_results(
+                    agent, store, run_id, pause_state, stream_results
                 )
 
             # 4. Determine expected status and claim

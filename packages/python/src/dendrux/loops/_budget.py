@@ -115,6 +115,20 @@ class _Usage:
     known_cost_usd: float
     unpriced_calls: int
 
+    def observe(self, measured: _Usage, local: _Usage, previous: _Usage) -> _Usage:
+        """Keep known spend plus subsequent local growth through read failures."""
+        return _Usage(
+            max(measured.tokens, self.tokens + max(0, local.tokens - previous.tokens)),
+            max(
+                measured.known_cost_usd,
+                self.known_cost_usd + max(0.0, local.known_cost_usd - previous.known_cost_usd),
+            ),
+            max(
+                measured.unpriced_calls,
+                self.unpriced_calls + max(0, local.unpriced_calls - previous.unpriced_calls),
+            ),
+        )
+
 
 class BudgetTracker:
     """Per-loop budget state: fired keys, in-memory spend and the usage source.
@@ -152,6 +166,8 @@ class BudgetTracker:
         self._ack_unpriced = carry.unpriced_calls if carry and COST_USD in carry.gate else 0
         # Highest unpriced-call count measured (rollup includes children).
         self._seen_unpriced = 0
+        self._floor = _Usage(0, 0.0, 0)
+        self._last_local = _Usage(0, 0.0, 0)
         self._fresh = fresh
         self._first_checkpoint = True
         # Breaches from the latest post-response evaluation (None: none yet).
@@ -265,6 +281,8 @@ class BudgetTracker:
                     "Live budget usage read failed for run %s; using in-memory usage",
                     self._run_id,
                 )
+        measured = self._floor.observe(measured, local, self._last_local)
+        self._floor, self._last_local = measured, local
         self._seen_unpriced = max(self._seen_unpriced, measured.unpriced_calls)
         return measured
 

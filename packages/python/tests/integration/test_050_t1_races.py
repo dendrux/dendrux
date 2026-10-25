@@ -138,8 +138,25 @@ async def test_note_cap_race_with_finalize(store: SQLAlchemyStateStore) -> None:
 async def test_hot_queries_can_use_their_indexes(engine: Any) -> None:
     if engine.dialect.name != "postgresql":
         pytest.skip("EXPLAIN plans are checked on Postgres")
-    async with engine.connect() as conn:
-        await conn.execute(text("SET enable_seqscan = off"))
+    async with engine.begin() as conn:
+        # This is index capability, independent of cost estimates or stale statistics.
+        await conn.execute(text("SET LOCAL enable_seqscan = off"))
+        await conn.execute(text("SET LOCAL enable_indexscan = on"))
+        await conn.execute(text("SET LOCAL enable_bitmapscan = off"))
+        await conn.execute(text("SET LOCAL enable_sort = off"))
+        indexes = set(
+            (
+                await conn.execute(
+                    text("SELECT indexname FROM pg_indexes WHERE schemaname=current_schema()")
+                )
+            ).scalars()
+        )
+        assert {
+            "uq_agent_runs_tenant_idempotency_key",
+            "ix_agent_runs_tenant_id_created_at",
+            "ix_run_events_agent_run_id_seq",
+            "ix_run_inbox_run_pending",
+        } <= indexes
 
         async def plan(sql: str, **params: Any) -> str:
             rows = await conn.execute(text(f"EXPLAIN {sql}"), params)

@@ -150,7 +150,10 @@ async def test_approval_route_stops_on_hidden_args_and_requires_auth(tmp_path, m
                 await client.post(url, headers=headers, json={"approved": True})
             ).status_code == 409
             assert executed == []
-        result = await client.post(url, headers=headers, json={"approved": True})
+        reviewed = (await client.get(f"/runs/{body['run_id']}/pending", headers=headers)).json()
+        result = await client.post(
+            url, headers=headers, json={"approved": True, "expected_pause_id": reviewed["pause_id"]}
+        )
         assert result.status_code == 200
         assert result.json()["status"] == "success"
         assert executed == [7]

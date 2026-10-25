@@ -117,6 +117,7 @@ class TestEntryChecksFireOncePerEntryPoint:
             "history": None,
             "context": None,
             "provider_kwargs": {"model": "m-2", "temperature": 0},
+            "idempotency_key": None,
         }
 
     async def test_submit_approval_fields(self, calls: dict[str, list[Any]]) -> None:
@@ -189,7 +190,12 @@ class TestRunnerEntrySeam:
                 ("tenant", "run", "t", {"k": 1}),
                 ("limit", "run", "t", {"k": 1}),
             ]
-            assert runner_calls[0][4] == {"user_input": "hi", "provider_kwargs": {}}
+            assert runner_calls[0][4] == {
+                "user_input": "hi",
+                "provider_kwargs": {},
+                "idempotency_key": None,
+                "provider": agent.provider,
+            }
             runner_calls.clear()
 
             async with agent.stream("again", tenant_id="t", metadata={"s": 2}) as stream:
@@ -199,7 +205,12 @@ class TestRunnerEntrySeam:
                 ("tenant", "stream", "t", {"s": 2}),
                 ("limit", "stream", "t", {"s": 2}),
             ]
-            assert runner_calls[0][4] == {"user_input": "again", "provider_kwargs": {}}
+            assert runner_calls[0][4] == {
+                "user_input": "again",
+                "provider_kwargs": {},
+                "idempotency_key": None,
+                "provider": agent.provider,
+            }
             runner_calls.clear()
 
             retried = await agent.retry(first.run_id, tenant_id="t", metadata={"r": 3})
@@ -311,7 +322,7 @@ class TestBudgetConfigSeam:
         monkeypatch.setattr(_limit_checks, "check_entry", lambda *a, **k: None)
         with pytest.raises(Exception):  # noqa: B017 - fails later, on missing persistence/run
             await call(agent)
-        assert seen == ["m-2"]
+        assert seen == (["m-2", "m-2"] if entry == "run" else ["m-2"])
 
     def test_stream_entry_uses_provider_model_when_not_overridden(
         self, monkeypatch: pytest.MonkeyPatch

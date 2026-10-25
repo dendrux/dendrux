@@ -42,6 +42,7 @@ def engine_options(url: str | URL, supplied: dict[str, Any] | None = None) -> di
     options.update(incoming)
     if connect:
         options["connect_args"] = connect
+    options["hide_parameters"] = True
     return options
 
 

@@ -180,7 +180,12 @@ async def test_approval_flow_with_defaults(store: Any, run_store: RunStore) -> N
     pending = await run_store.get_pending(paused.run_id, tenant_id=None)
     assert pending.tool_calls[0].params == {"order_id": 7}
     assert not pending.tool_calls[0].args_hidden
-    result = await paused.agent.submit_approval(paused.run_id, approved=True, tenant_id=None)
+    result = await paused.agent.submit_approval(
+        paused.run_id,
+        approved=True,
+        tenant_id=None,
+        expected_pause_id=(await store.get_pause_state(paused.run_id))["pause_id"],
+    )
     assert result.status.value == "success"
 
 
@@ -355,14 +360,23 @@ async def test_pii_approval_pause_never_shows_real_values(store: Any, run_store:
     assert pending.tool_calls[0].params == {"to": "<<EMAIL_ADDRESS_1>>"}
     assert real not in json.dumps(pending.to_dict())
 
-    follow = run_store.follow(run_id, tenant_id="acme", max_duration_s=0.5)
-    async with follow as f:
-        items = [item async for item in f]
-    shown = [i for i in items if isinstance(i, StoredEvent)]
+    follow = run_store.follow(run_id, tenant_id="acme")
+    shown = []
+    async with asyncio.timeout(20), follow as f:
+        async for item in f:
+            if isinstance(item, StoredEvent):
+                shown.append(item)
+                if item.event_type == "run.paused":
+                    break
     assert any(i.event_type == "run.paused" for i in shown)
     assert real not in json.dumps([i.data for i in shown])
 
-    result = await agent.submit_approval(run_id, approved=True, tenant_id="acme")
+    result = await agent.submit_approval(
+        run_id,
+        approved=True,
+        tenant_id="acme",
+        expected_pause_id=(await store.get_pause_state(run_id))["pause_id"],
+    )
     assert result.status.value == "success"
     assert received == [real]  # the approved tool still receives the real value
 

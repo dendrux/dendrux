@@ -24,7 +24,7 @@ from dendrux._sentinel import _OmittedType
 from dendrux.errors import TenantScopeRequiredError
 from dendrux.runtime.context import get_delegation_context
 from dendrux.runtime.state import _Unscoped
-from dendrux.types import Limits
+from dendrux.types import Limits, _validate_identifier, _validate_persistable
 
 if TYPE_CHECKING:
     from dendrux.agent import Agent
@@ -98,11 +98,21 @@ def check_entry(agent: Agent, entry: EntryPoint, *, tenant_id: TenantScope, **fi
     (submit_approval), ``note_text``, ``note_metadata``.
     """
     _check_tenant_value(entry, tenant_id, new_run=entry in _NEW_RUN_ENTRIES)
+    _check_entry_fields(fields)
     limit = _metadata_limit(agent)
     if entry in _NEW_RUN_ENTRIES:
         check_run_metadata(fields.get("metadata"), limit=limit, entry=entry)
     if entry == "submit_note":
         _check_size(fields.get("note_metadata"), limit=limit, entry=entry, what="note metadata")
+
+
+def _check_entry_fields(fields: dict[str, Any]) -> None:
+    if fields.get("run_id") is not None:
+        _validate_identifier(fields["run_id"], "run_id", maximum=26)
+    if fields.get("idempotency_key") is not None:
+        _validate_identifier(fields["idempotency_key"], "idempotency_key")
+    for field in ("rejection_reason", "note_text", "note_metadata", "reason"):
+        _validate_persistable(fields.get(field), field)
 
 
 def check_runner_entry(
@@ -121,7 +131,13 @@ def check_runner_entry(
     stream), ``provider_kwargs``.
     """
     _check_tenant_value(entry, tenant_id, new_run=True)
+    _check_optional_identifier(fields.get("idempotency_key"), "idempotency_key")
     check_run_metadata(metadata, limit=_metadata_limit(agent), entry=entry)
+
+
+def _check_optional_identifier(value: Any, name: str) -> None:
+    if value is not None:
+        _validate_identifier(value, name)
 
 
 def check_run_metadata(metadata: Any, *, limit: int, entry: str = "run") -> None:
@@ -141,8 +157,9 @@ def check_run_metadata(metadata: Any, *, limit: int, entry: str = "run") -> None
         )
         raise ValueError(
             f"metadata keys starting with {RESERVED_METADATA_PREFIX!r} are reserved for "
-            f"dendrux: {', '.join(reserved)}. Rename them."
+            f"dendrux (count={len(reserved)}). Rename them."
         )
+    _validate_persistable(metadata, "metadata")
     _check_size(metadata, limit=limit, entry=entry, what="metadata")
 
 
@@ -159,6 +176,7 @@ def _check_tenant_value(entry: str, tenant_id: object, *, new_run: bool) -> None
             f"{entry}(): tenant_id='' is not a tenant. Pass a non-empty string, "
             "or None for untenanted runs."
         )
+    _validate_identifier(tenant_id, "tenant_id")
 
 
 def _metadata_limit(agent: Agent) -> int:

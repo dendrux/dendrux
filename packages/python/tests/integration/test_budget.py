@@ -567,7 +567,9 @@ class TestBudgetResume:
         assert waiting.status == RunStatus.WAITING_APPROVAL
         assert (await _pause_state(store, waiting.run_id)).budget_fired == [("tokens", 0.5)]
 
-        done = await agent.submit_approval(waiting.run_id, approved=True)
+        done = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert done.status == RunStatus.SUCCESS
         fractions = [
             e.data["fraction"] for e in await _events(store, waiting.run_id, "budget.threshold")
@@ -647,7 +649,9 @@ class TestBudgetPrecedence:
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_APPROVAL
 
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert ran.n == 1
         assert result.status == RunStatus.PAUSED
         assert llm.calls == 1
@@ -955,7 +959,9 @@ class TestLegacyAccounting:
         )
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_APPROVAL
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert result.status == RunStatus.PAUSED
         # The unpriced refund call stops the run; the priced part is carried.
         assert result.meta["budget_exceeded"] == [

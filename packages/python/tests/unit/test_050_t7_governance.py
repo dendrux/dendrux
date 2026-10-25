@@ -84,4 +84,4 @@ async def test_ephemeral_batch_and_stream_pauses_have_generation_ids():
         else:
             result = await a.run("go")
         assert result.pause_id and len(result.pause_id) == 26
-        assert result.meta["pause_state"].pause_id == result.pause_id
+        assert result.pending.pause_id == result.pause_id

@@ -1090,15 +1090,54 @@ class TestDeadlines:
             consumer.cancel()
             await asyncio.gather(consumer, return_exceptions=True)
 
-    async def test_consumer_time_is_not_counted(self) -> None:
+    async def test_consumer_time_is_not_counted(
+        self, monkeypatch, controlled_deadlines, deadline_arms
+    ) -> None:
+        from types import SimpleNamespace
+
+        virtual_now = [0.0]
+        opened = []
+        initialize = _resilience.StreamClock.__init__
+
+        def observe_clock(clock, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            before = loop.time()
+            initialize(clock, *args, **kwargs)
+            after = loop.time()
+            opened.append((before, after))
+            virtual_now[0] = after
+            clock._loop = SimpleNamespace(time=lambda: virtual_now[0])
+
+        monkeypatch.setattr(_resilience.StreamClock, "__init__", observe_clock)
         provider = chat_provider(stream_idle_timeout=0.2)
         body = sse((None, c_chunk("a")), (None, c_chunk("b")), (None, c_chunk(finish="stop")))
         wire(provider, stream_handler([body]))
-        texts = []
-        async for event in provider.complete_stream(USER):
-            texts.append(event.text)
-            await asyncio.sleep(0.3)  # a slow consumer
-        assert texts[:2] == ["a", "b"]
+        stream = provider.complete_stream(USER)
+        try:
+            async with asyncio.timeout(20):
+                for index, text in enumerate(("a", "b")):
+                    event = await anext(stream)
+                    assert event.text == text
+                    assert deadline_arms, "the upstream pull must have an armed idle deadline"
+                    when = deadline_arms[-1][1]
+                    if index == 0:
+                        before, after = opened[0]
+                        assert before + 0.2 <= when <= after + 0.2
+                    else:
+                        assert when == pytest.approx(virtual_now[0] + 0.2, rel=0, abs=1e-9), (
+                            "consumer time must be excluded before the next upstream pull"
+                        )
+                    armed = len(deadline_arms)
+                    virtual_now[0] += 10
+                    released = asyncio.Event()
+                    released.set()
+                    await released.wait()
+                    assert len(deadline_arms) == armed, "consumer work cannot pull upstream"
+                events = await drain(stream)
+                assert events[-1].raw.text == "ab"
+        finally:
+            await stream.aclose()
+            await provider.close()
 
     async def test_stream_total_timeout(self) -> None:
         provider = chat_provider(stream_idle_timeout=5, stream_total_timeout=0.3)

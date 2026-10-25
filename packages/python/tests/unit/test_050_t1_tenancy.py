@@ -257,7 +257,7 @@ class TestRunMetadata:
         ],
     )
     async def test_reserved_key_rejected(self, store: Any, call: Any) -> None:
-        with pytest.raises(ValueError, match=r"dendrux\.stop_reason"):
+        with pytest.raises(ValueError, match="reserved"):
             await call(_agent(store), {"dendrux.stop_reason": "forged", "app": 1})
         assert store.calls == []
 
@@ -316,7 +316,7 @@ class TestRunMetadata:
     def test_check_run_metadata_helper(self) -> None:
         _tenant_checks.check_run_metadata(None, limit=10)
         _tenant_checks.check_run_metadata({}, limit=10)
-        with pytest.raises(ValueError, match="JSON-serializable"):
+        with pytest.raises(ValueError, match="structure_limit"):
             cyclic: dict[str, Any] = {}
             cyclic["self"] = cyclic
             _tenant_checks.check_run_metadata(cyclic, limit=1000)

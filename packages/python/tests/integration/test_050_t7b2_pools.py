@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import json
+import uuid
 
 import pytest
 from sqlalchemy import text
@@ -13,6 +14,7 @@ from dendrux.db import session
 from dendrux.llm.mock import MockLLM
 from dendrux.store import RunStore
 from dendrux.types import LLMResponse
+from tests._helpers.pg_wait import wait_pg_count
 
 
 def agent(url, options=None):
@@ -268,13 +270,14 @@ async def test_process_exit_retires_pool_and_closes_pg_connections(engine):
         pytest.skip("Postgres process-exit cleanup")
     import sys
 
+    tag = "t7_exit_" + uuid.uuid4().hex
     code = r"""
 import asyncio, sys
 from dendrux import Agent
 from dendrux.llm.mock import MockLLM
 async def main():
     a = Agent(prompt="p", provider=MockLLM([]), database_url=sys.argv[1],
-              database_options=dict(connect_args=dict(server_settings=dict(application_name="dendrux_t7b2_exit"))))
+              database_options=dict(connect_args=dict(server_settings=dict(application_name=sys.argv[2]))))
     await a._resolve_state_store()
     print("ready", flush=True)
     await asyncio.to_thread(sys.stdin.readline)
@@ -285,37 +288,35 @@ asyncio.run(main())
         "-c",
         code,
         engine.url.render_as_string(hide_password=False),
+        tag,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
         assert await asyncio.wait_for(proc.stdout.readline(), 20) == b"ready\n"
-        async with engine.connect() as conn:
-            assert (
-                await conn.execute(
-                    text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE application_name='dendrux_t7b2_exit' "
-                        "AND datname=current_database()"
-                    )
+
+        async def count():
+            async with engine.connect() as conn:
+                return int(
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT count(*) FROM pg_stat_activity WHERE application_name=:tag "
+                                "AND datname=current_database()"
+                            ),
+                            {"tag": tag},
+                        )
+                    ).scalar_one()
                 )
-            ).scalar_one() == 1
+
+        await wait_pg_count(count, 1)
         proc.stdin.write(b"exit\n")
         await proc.stdin.drain()
         out, err = await asyncio.wait_for(proc.communicate(), 20)
         assert proc.returncode == 0, err.decode()
         assert b"exception was never retrieved" not in err.lower()
-        async with engine.connect() as conn:
-            assert (
-                await conn.execute(
-                    text(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE application_name='dendrux_t7b2_exit' "
-                        "AND datname=current_database()"
-                    )
-                )
-            ).scalar_one() == 0
+        await wait_pg_count(count, 0)
     finally:
         if proc.returncode is None:
             proc.terminate()

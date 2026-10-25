@@ -60,6 +60,17 @@ def _text_bytes(value: Any) -> int:
     return sum(len(item.encode("utf-8")) for item in items if isinstance(item, str))
 
 
+def _check_persistable_text(value: Any, field: str) -> None:
+    from dendrux.types import _validate_persistable
+
+    if isinstance(value, str) or value is None:
+        _validate_persistable(value, field)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, str):
+                _validate_persistable(item, field)
+
+
 def _check_text(
     agent: Agent,
     entry: str,
@@ -68,6 +79,7 @@ def _check_text(
     limit: int,
     run_id: Any,
 ) -> None:
+    _check_persistable_text(value, field)
     size = _text_bytes(value)
     if size <= limit:
         return

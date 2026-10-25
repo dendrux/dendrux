@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Literal, TypeAlias, get_args
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, get_args
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -208,6 +208,17 @@ class InvalidToolResultError(ValueError):
         self.run_id = run_id
         self.detail = detail
         super().__init__(f"Invalid tool results for run '{run_id}': {detail}")
+
+
+class PersistenceError(RuntimeError):
+    """A database operation failed; SQL, parameters and driver text are omitted."""
+
+    code = "persistence_error"
+    safe_message = "Database operation failed (persistence_error)."
+
+    def __init__(self, *, retryable: bool = False) -> None:
+        self.retryable = retryable
+        super().__init__(self.safe_message)
 
 
 class PersistenceNotConfiguredError(RuntimeError):
@@ -613,6 +624,16 @@ TIMEOUT_REASONS: tuple[str, ...] = get_args(TimeoutReason)
 _SAFE_PROVIDER_CODE = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
 
 
+def _safe_status_code(value: Any) -> int | None:
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+
+def _safe_identity(value: str | None) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 255:
+        return None
+    return value if re.fullmatch(r"[A-Za-z0-9_.:/@+\-]+", value) else None
+
+
 class ProviderError(_KwargsReduceMixin, RuntimeError):
     """A provider request failed.
 
@@ -684,11 +705,11 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
             raise ValueError(f"Unknown provider error category {resolved!r}.")
         if timeout_reason is not None and timeout_reason not in TIMEOUT_REASONS:
             raise ValueError(f"Unknown provider timeout reason {timeout_reason!r}.")
-        self.provider = provider
-        self.model = model
-        self.status_code = status_code
+        self.provider = _safe_identity(provider)
+        self.model = _safe_identity(model)
+        self.status_code = _safe_status_code(status_code)
         self.provider_code = provider_code
-        self.error_type = error_type
+        self.error_type = _safe_identity(error_type)
         self.message = message
         self.category: ProviderErrorCategory = resolved
         self.retryable: bool = self.default_retryable if retryable is None else bool(retryable)
@@ -698,7 +719,7 @@ class ProviderError(_KwargsReduceMixin, RuntimeError):
     def safe_provider_code(self) -> str | None:
         """``provider_code`` when it looks like a code (``[A-Za-z0-9_.:-]{1,64}``), else None."""
         code = self.provider_code
-        return code if isinstance(code, str) and _SAFE_PROVIDER_CODE.match(code) else None
+        return code if isinstance(code, str) and _SAFE_PROVIDER_CODE.fullmatch(code) else None
 
     @property
     def safe_message(self) -> str:
@@ -1088,6 +1109,52 @@ __all__ = [
 ]
 
 
+def provider_error_in(error: BaseException) -> ProviderError | None:
+    """Find a typed provider failure without formatting worker-group messages."""
+    pending = [error]
+    seen: set[int] = set()
+    for _ in range(1024):
+        if not pending:
+            return None
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ProviderError):
+            return current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions[:1024])
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif current.__context__ is not None:
+            pending.append(current.__context__)
+    # A diagnostic graph too large to inspect is never safe to format.
+    return ProviderError()
+
+
+def _database_failure_in(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    for _ in range(1024):
+        if not pending:
+            return False
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, PersistenceError) or any(
+            base.__module__.startswith("sqlalchemy.exc") for base in type(current).__mro__
+        ):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions[:1024])
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif current.__context__ is not None:
+            pending.append(current.__context__)
+    return True
+
+
 def safe_exception_info(
     error: BaseException | None = None,
 ) -> bool | tuple[type[BaseException], BaseException, TracebackType | None]:
@@ -1100,16 +1167,12 @@ def safe_exception_info(
     import sys
 
     error = error if error is not None else sys.exception()
-    current = error
-    seen: set[int] = set()
-    for _ in range(32):
-        if current is None:
-            return True
-        if isinstance(current, ProviderError) or id(current) in seen:
-            break
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    if error is None or isinstance(error, ProviderError):
+    if error is not None and _database_failure_in(error):
+        safe = PersistenceError()
+        return type(safe), safe, None
+    if error is None or provider_error_in(error) is None:
+        return True
+    if isinstance(error, (ProviderError, BaseExceptionGroup)):
         return False
     try:
         own = copy.copy(error)

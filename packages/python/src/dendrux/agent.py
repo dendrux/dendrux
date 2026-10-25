@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
-from dendrux.runtime._entry_checks import entry_checks
+from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
@@ -78,6 +78,33 @@ if TYPE_CHECKING:
     )
 
 _agent_logger = logging.getLogger(__name__)
+
+
+def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
+    from dendrux.types import _validate_identifier
+
+    try:
+        _validate_identifier(run_id, "run_id", maximum=26)
+        if tenant_id is not None:
+            _validate_identifier(tenant_id, "tenant_id")
+    except ValueError:
+        _agent_logger.warning(
+            "Invalid result read argument", extra={"code": "read_argument_invalid"}
+        )
+        raise ValueError(
+            "Invalid run_id." if not _valid_read_id(run_id) else "Invalid tenant_id."
+        ) from None
+
+
+def _valid_read_id(value: Any) -> bool:
+    from dendrux.types import _validate_identifier
+
+    try:
+        _validate_identifier(value, "run_id", maximum=26)
+    except ValueError:
+        return False
+    return True
+
 
 # Safety limit to prevent runaway LLM costs. Can be overridden per-agent
 # once the worker/config layer ships (Sprint 6).
@@ -1365,6 +1392,7 @@ class Agent:
             history=history,
             context=context,
             provider_kwargs=kwargs,
+            idempotency_key=idempotency_key,
         )
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
@@ -1613,7 +1641,8 @@ class Agent:
                 ``ToolResult.images`` are validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
-            expected_pause_id: Current pause generation; stale submissions are rejected.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1717,7 +1746,8 @@ class Agent:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
-            expected_pause_id: Current pause generation; stale submissions are rejected.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1832,7 +1862,8 @@ class Agent:
             approved: Whole-batch decision.
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
-            expected_pause_id: Current pause generation; stale submissions are rejected.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1845,6 +1876,7 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        require_boolean(approved, "approved", optional=True)
         tenant_id = entry_checks(
             self,
             "submit_approval",
@@ -1943,7 +1975,7 @@ class Agent:
                 )
                 return await task
 
-            if approved:
+            if approved is True:
                 epoch = await claim_or_raise(
                     store,
                     run_id,
@@ -2003,7 +2035,9 @@ class Agent:
             )
             return await task
 
-    async def get_result(self, run_id: str, *, tenant_id: str | None) -> RunResult:
+    async def get_result(
+        self, run_id: str, *, tenant_id: str | None, include_pii: bool = False
+    ) -> RunResult:
         """Read a persisted result in one explicit tenant scope, or raise not found.
 
         Never accepts UNSCOPED. Routes must separately authorize their actor's
@@ -2014,8 +2048,8 @@ class Agent:
         from dendrux.runtime._pending import _PendingReader
         from dendrux.runtime.runner import _cached_output, _public_meta
 
-        if tenant_id is not None and not isinstance(tenant_id, str):
-            raise ValueError("tenant_id must be a string or None")
+        _check_result_read_arguments(run_id, tenant_id)
+        require_boolean(include_pii, "include_pii")
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
@@ -2029,12 +2063,10 @@ class Agent:
         if record is None or record.agent_name != self.name:
             raise RunNotFoundError(run_id)
         result = _record_to_run_result(record)
-        result.meta.update(
-            _public_meta(
-                {"pii_mapping": await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}}
-            )
-        )
-        result.answer = deanonymize_text(record.answer, result.meta["pii_mapping"])[0]
+        mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
+        result.answer = deanonymize_text(record.answer, mapping)[0]
+        if include_pii:
+            result.meta.update(_public_meta({"pii_mapping": mapping}))
         if result.status.value == "success":
             result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
@@ -2120,6 +2152,7 @@ class Agent:
             RunNotFoundError: ``run_id`` does not exist (or is outside
                 ``tenant_id``).
         """
+        require_boolean(cascade, "cascade")
         tenant_id = entry_checks(
             self, "cancel_run", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
@@ -2271,8 +2304,9 @@ class Agent:
                 ``tenant_id``).
             ValueError: ``reason`` is not a string or is too long.
         """
+        require_boolean(cascade, "cascade")
         tenant_id = entry_checks(
-            self, "request_pause", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+            self, "request_pause", tenant_id, default_tenant=UNSCOPED, run_id=run_id, reason=reason
         )
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.types import PauseOutcome, RunStatus
@@ -2339,7 +2373,8 @@ class Agent:
 
         Args:
             run_id: A run in status ``PAUSED``.
-            expected_pause_id: Current pause generation; stale submissions are rejected.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``

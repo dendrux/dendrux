@@ -50,6 +50,7 @@ class ToolResultsIn(BaseModel):
 
 class ApprovalIn(BaseModel):
     approved: bool
+    expected_pause_id: str | None = Field(default=None, max_length=26)
     rejection_reason: str | None = Field(default=None, max_length=2000)
 
 
@@ -159,7 +160,6 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        # VERIFY-0.5.0: Confirm expected_pause_id support before adding pause-ID validation.
         result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
         return browser_result(result)
 
@@ -177,10 +177,11 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             raise HTTPException(409, "not waiting for approval")
         if any(call.args_hidden for call in pause.tool_calls):
             raise HTTPException(409, "approval arguments unavailable; resolve on the server")
-        # VERIFY-0.5.0: Confirm expected_pause_id support before adding pause-ID validation.
+        # Bind the decision to the pause generation reviewed by the client.
         result = await agents[provider].submit_approval(
             run_id,
             approved=body.approved,
+            expected_pause_id=body.expected_pause_id,
             rejection_reason=body.rejection_reason,
             tenant_id=tenant,
         )

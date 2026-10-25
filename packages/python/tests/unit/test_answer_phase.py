@@ -411,7 +411,9 @@ async def test_approval_resume_stream_tags_tool_results_and_keeps_commentary(sta
     assert paused.status == RunStatus.WAITING_APPROVAL
     assert paused.commentary == ["Needs sign-off."]
 
-    events = [e async for e in agent.resume_stream(paused.run_id)]
+    events = [
+        e async for e in agent.resume_stream(paused.run_id, expected_pause_id=paused.pause_id)
+    ]
     results = [e for e in events if e.type == RunEventType.TOOL_RESULT]
     assert [(e.iteration, e.phase) for e in results] == [(1, "commentary")]
     terminal = events[-1]

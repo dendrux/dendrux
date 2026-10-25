@@ -33,7 +33,7 @@ async def test_script_requested_once_across_approval(store):
     )
     paused = await a.run("input", activate_skills=["demo"])
     b = agent(store, [LLMResponse(text="done")])
-    await b.submit_approval(paused.run_id, approved=True)
+    await b.submit_approval(paused.run_id, approved=True, expected_pause_id=paused.pause_id)
     events = await store.get_run_events(paused.run_id)
     requested = [e for e in events if e.event_type == "skill.script_requested"]
     assert len(requested) == 1

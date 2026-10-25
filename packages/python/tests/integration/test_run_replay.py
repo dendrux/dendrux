@@ -165,7 +165,7 @@ class TestValidation:
         r0 = await _agent(store, mock).run("q", tenant_id="acme")
         with pytest.raises(ReplayRunError) as exc:
             await _agent(store, MockLLM([])).run("q", runs=[r0.run_id], tenant_id="other")
-        assert exc.value.reason == "tenant_mismatch"
+        assert exc.value.reason == "not_found"
         ok = await _agent(store, MockLLM([LLMResponse(text="b")])).run(
             "q", runs=[r0.run_id], tenant_id="acme"
         )

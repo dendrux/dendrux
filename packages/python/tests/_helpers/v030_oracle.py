@@ -1033,7 +1033,7 @@ def _strip_pause_versioned_fields(pause: dict[str, Any]) -> None:
     assert pause.pop("provider_kwargs", {}) == {}
 
 
-def result_view(result: Any) -> dict[str, Any]:
+def result_view(result: Any, persisted_pause: dict[str, Any] | None = None) -> dict[str, Any]:
     """Stable subset of RunResult (text-era fields) + pause JSON."""
     view: dict[str, Any] = {
         "run_id": result.run_id,
@@ -1046,8 +1046,11 @@ def result_view(result: Any) -> dict[str, Any]:
     }
     replay = getattr(result, "replay", None)
     view["replay"] = jsonable(replay) if replay is not None else None
-    pause = (result.meta or {}).get("pause_state")
-    view["pause_state"] = pause.to_dict() if pause is not None else None
+    from dendrux.types import PauseState
+
+    view["pause_state"] = (
+        PauseState.from_dict(persisted_pause).to_dict() if persisted_pause is not None else None
+    )
     if view["pause_state"] is not None:
         _strip_pause_versioned_fields(view["pause_state"])
         pause_id = view["pause_state"].pop("pause_id", None)
@@ -1138,13 +1141,25 @@ class Ctx:
     async def run(self, agent: Any, user_input: str, **kw: Any) -> RunOutcome:
         if self.mode == "batch":
             result = await agent.run(user_input, **kw)
-            return self._record("run", RunOutcome(result.run_id, result_view(result)))
+            return self._record(
+                "run",
+                RunOutcome(
+                    result.run_id,
+                    result_view(result, await self.store.get_pause_state(result.run_id)),
+                ),
+            )
         return self._record("run", await self._drain(agent.stream(user_input, **kw)))
 
     async def resume(self, agent: Any, run_id: str, **kw: Any) -> RunOutcome:
         if self.mode == "batch":
             result = await agent.resume(run_id, **kw)
-            return self._record("resume", RunOutcome(result.run_id, result_view(result)))
+            return self._record(
+                "resume",
+                RunOutcome(
+                    result.run_id,
+                    result_view(result, await self.store.get_pause_state(result.run_id)),
+                ),
+            )
         return self._record("resume", await self._drain(agent.resume_stream(run_id, **kw)))
 
     async def _drain(self, stream: Any) -> RunOutcome:
@@ -1157,7 +1172,9 @@ class Ctx:
                     final = event.run_result
         assert final is not None, "stream ended without a terminal run_result"
         return RunOutcome(
-            final.run_id, result_view(final), canonical_concurrent_tool_results(events)
+            final.run_id,
+            result_view(final, await self.store.get_pause_state(final.run_id)),
+            canonical_concurrent_tool_results(events),
         )
 
     def _record(self, kind: str, outcome: RunOutcome) -> RunOutcome:

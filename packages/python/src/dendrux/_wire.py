@@ -36,10 +36,10 @@ def _redacted(value: Any, mapping: Any) -> Any:
         parts.append(escaped)
     pattern_text = "|".join(parts)
     pattern = re.compile(pattern_text) if pattern_text else None
-    nodes = size = 0
+    nodes = size = scan_work = 0
 
     def copy(item: Any, depth: int = 0) -> Any:
-        nonlocal nodes, size
+        nonlocal nodes, size, scan_work
         nodes += 1
         if depth > 32 or nodes > 10000 or size > 1048576:
             raise ValueError("Wire value exceeds its display bound")
@@ -49,6 +49,7 @@ def _redacted(value: Any, mapping: Any) -> Any:
             size += len(item.encode("utf-8"))
             if size > 1048576:
                 raise ValueError("Wire text exceeds its display bound")
+            scan_work = _scan_budget(scan_work, len(item), len(replacements))
             return pattern.sub(lambda m: replacements[m.group(0)], item) if pattern else item
         if item is None or isinstance(item, bool):
             return item
@@ -79,6 +80,22 @@ def _redacted(value: Any, mapping: Any) -> Any:
         return None
 
 
+def _scan_budget(used: int, length: int, candidates: int) -> int:
+    used += length * candidates
+    if used > 2_000_000:
+        raise ValueError("Wire redaction exceeds its scan budget")
+    return used
+
+
+def _wire_answer(result: RunResult) -> Any:
+    if isinstance(result.answer, str) and result.status.value not in (
+        "waiting_approval",
+        "waiting_human_input",
+    ):
+        return _redacted(result.answer, None)
+    return None
+
+
 def _structured_output(output: Any) -> Any:
     """Only the explicit output_type model is a supported structured schema."""
     from pydantic import BaseModel
@@ -104,7 +121,7 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
         )
         if pending
         else None,
-        "answer": _redacted(result.answer, None) if isinstance(result.answer, str) else None,
+        "answer": _wire_answer(result),
         "output": _structured_output(result.output),
         "error_info": _redacted(result.error_info.to_dict(), mapping)
         if result.error_info
@@ -123,8 +140,8 @@ def _finite_float(value: str) -> float:
     return parsed
 
 
-def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
-    from dendrux.types import ImageRef, ToolResult
+def _tool_result_fields(data: Any, limits: Limits) -> tuple[Any, Any, Any, Any, Any]:
+    from dendrux.types import _validate_identifier, _validate_persistable
 
     allowed = {"name", "call_id", "payload", "success", "error", "duration_ms", "images"}
     if not isinstance(data, dict) or set(data) - allowed:
@@ -132,6 +149,9 @@ def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
     for key in ("name", "call_id", "payload"):
         if not isinstance(data.get(key), str) or (key != "payload" and not data[key].strip()):
             raise ValueError(f"Tool result {key} must be a nonempty string")
+    for field in ("name", "call_id"):
+        _validate_identifier(data[field], field)
+    _validate_persistable(data["payload"], "payload")
     success, error, duration = (
         data.get("success", True),
         data.get("error"),
@@ -139,13 +159,27 @@ def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
     )
     if not isinstance(success, bool) or (error is not None and not isinstance(error, str)):
         raise ValueError("Tool result success/error have invalid types")
-    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, int)
+        or not 0 <= duration <= 2147483647
+    ):
         raise ValueError("Tool result duration_ms must be a nonnegative integer")
     images = data.get("images", [])
     if not isinstance(images, list) or len(images) > 100:
         raise ValueError("Tool result images must be a bounded descriptor list")
     # Metadata cannot be used to bypass server-owned annotations or size caps.
     metadata = {k: v for k, v in data.items() if k != "payload"}
+    if error is not None and len(error) > limits.max_metadata_bytes:
+        raise ValueError("Tool result metadata exceeds its cap")
+    _validate_persistable(metadata, "tool_result")
+    return success, error, duration, images, metadata
+
+
+def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
+    from dendrux.types import ImageRef, ToolResult, _validate_persistable
+
+    success, error, duration, images, metadata = _tool_result_fields(data, limits)
     try:
         if len(json.dumps(metadata, allow_nan=False).encode()) > limits.max_metadata_bytes:
             raise ValueError("Tool result metadata exceeds its cap")
@@ -161,7 +195,10 @@ def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
             )
         # Legacy plain text is preserved byte-for-byte like submit_tool_results.
         with contextlib.suppress(json.JSONDecodeError):
-            json.loads(data["payload"], parse_constant=_invalid_constant, parse_float=_finite_float)
+            parsed = json.loads(
+                data["payload"], parse_constant=_invalid_constant, parse_float=_finite_float
+            )
+            _validate_persistable(parsed, "payload")
         refs = tuple(ImageRef.from_dict(image) for image in images)
     except (TypeError, UnicodeError, RecursionError, KeyError) as exc:
         raise ValueError("Tool result must contain valid JSON and image descriptors") from exc

@@ -76,7 +76,7 @@ el("submit").onclick = () => action(async () => {
 });
 for (const [id, approved] of [["approve", true], ["reject", false]]) {
   el(id).onclick = () => action(async () => showResult(await api(
-    `/runs/${encodeURIComponent(runId)}/approvals`, {approved},
+    `/runs/${encodeURIComponent(runId)}/approvals`, {approved, expected_pause_id: currentPause.pause_id},
   )));
 }
 </script>

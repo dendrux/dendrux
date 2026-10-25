@@ -219,7 +219,7 @@ class TestResume:
         assert len(store.paused_runs) == 1
 
         # Phase 2: resume with tool result
-        pending = result1.meta["pause_state"].pending_tool_calls
+        pending = result1.pending.tool_calls
         tool_result = ToolResult(
             name="read_range",
             call_id=pending[0].id,
@@ -252,7 +252,7 @@ class TestResume:
         # Clear tool_calls from the initial run to isolate resume's records
         store.tool_calls_saved.clear()
 
-        pending = r1.meta["pause_state"].pending_tool_calls
+        pending = r1.pending.tool_calls
         tr = ToolResult(
             name="read_range",
             call_id=pending[0].id,
@@ -348,7 +348,7 @@ class TestResume:
         assert r1.status == RunStatus.WAITING_CLIENT_TOOL
 
         # Phase 2: resume, then pause again on a second client tool call
-        pending1 = r1.meta["pause_state"].pending_tool_calls
+        pending1 = r1.pending.tool_calls
         tr1 = ToolResult(name="read_range", call_id=pending1[0].id, payload='"data1"', success=True)
         tc2 = ToolCall(name="read_range", params={"sheet": "S2"}, provider_tool_call_id="t2")
         llm2 = MockLLM([LLMResponse(tool_calls=[tc2])])
@@ -359,7 +359,7 @@ class TestResume:
         assert r2.status == RunStatus.WAITING_CLIENT_TOOL
 
         # Phase 3: resume second pause to completion
-        pending2 = r2.meta["pause_state"].pending_tool_calls
+        pending2 = r2.pending.tool_calls
         tr2 = ToolResult(name="read_range", call_id=pending2[0].id, payload='"data2"', success=True)
         llm3 = MockLLM([LLMResponse(text="Got both: data1 and data2")])
 
@@ -378,7 +378,7 @@ class TestResume:
         r1 = await run(agent, provider=llm1, user_input="Go", state_store=store)
         assert r1.iteration_count == 1
 
-        pending = r1.meta["pause_state"].pending_tool_calls
+        pending = r1.pending.tool_calls
         tr = ToolResult(name="read_range", call_id=pending[0].id, payload='"ok"', success=True)
         llm2 = MockLLM([LLMResponse(text="Done")])
 
@@ -395,7 +395,7 @@ class TestResume:
         r1 = await run(agent, provider=llm1, user_input="Go", state_store=store)
         assert len(r1.steps) == 1  # one step before pause
 
-        pending = r1.meta["pause_state"].pending_tool_calls
+        pending = r1.pending.tool_calls
         tr = ToolResult(name="read_range", call_id=pending[0].id, payload='"ok"', success=True)
         llm2 = MockLLM([LLMResponse(text="Done")])
 
@@ -462,7 +462,7 @@ class TestResume:
         assert await store.get_pause_state(r.run_id) is not None
 
         # Resume to completion
-        pending = r.meta["pause_state"].pending_tool_calls
+        pending = r.pending.tool_calls
         tr = ToolResult(name="read_range", call_id=pending[0].id, payload='"ok"', success=True)
         llm2 = MockLLM([LLMResponse(text="Done")])
         await resume(r.run_id, [tr], state_store=store, agent=agent, provider=llm2)
@@ -609,7 +609,7 @@ class TestAgentIdentityOnResume:
         agent_b = _make_agent(name="AgentB")
         tr = ToolResult(
             name="read_range",
-            call_id=r.meta["pause_state"].pending_tool_calls[0].id,
+            call_id=r.pending.tool_calls[0].id,
             payload='"data"',
         )
         with pytest.raises(ValueError, match="Agent name mismatch"):

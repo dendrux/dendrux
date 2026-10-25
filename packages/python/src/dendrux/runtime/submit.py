@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from dendrux.errors import (
     InvalidToolResultError,
@@ -136,6 +136,7 @@ async def validate_tool_results(
         await raise_for_non_paused_status(store, run_id)
 
     pause_state = PauseState.from_dict(raw_pause)
+    _check_result_identities(run_id, results)
     pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
     provided_counts = Counter(r.call_id for r in results)
     duplicates = sorted(k for k, v in provided_counts.items() if v > 1)
@@ -143,13 +144,13 @@ async def validate_tool_results(
 
     parts: list[str] = []
     if duplicates:
-        parts.append(f"duplicate call_ids={duplicates}")
+        parts.append(f"duplicate call id count={len(duplicates)}")
     missing = sorted(pending_ids - provided_ids)
     extra = sorted(provided_ids - pending_ids)
     if missing:
-        parts.append(f"missing call_ids={missing}")
+        parts.append(f"missing call id count={len(missing)}")
     if extra:
-        parts.append(f"unexpected call_ids={extra}")
+        parts.append(f"unexpected call id count={len(extra)}")
 
     if parts:
         raise _invalid_tool_result(run_id, "; ".join(parts))
@@ -162,6 +163,7 @@ def validate_result_names(
 ) -> None:
     """Bind result IDs/names and require a string payload; text is normalized later."""
 
+    _check_result_identities(run_id, results)
     pending = {call.id: call.name for call in pause.pending_tool_calls}
     if (
         len(results) != len(pending)
@@ -733,6 +735,11 @@ def approval_gates_of(
     }
 
 
+def _check_decisions_size(decisions: Mapping[Any, Any]) -> None:
+    if len(decisions) > 1000:
+        raise ValueError("decisions exceeds its count limit")
+
+
 def normalize_decisions(decisions: object) -> list[tuple[str, ApprovalDecision]]:
     """Type-check a public ``decisions`` mapping into ``(call_id, decision)`` pairs."""
     if not isinstance(decisions, Mapping):
@@ -740,8 +747,13 @@ def normalize_decisions(decisions: object) -> list[tuple[str, ApprovalDecision]]
             "decisions must be a mapping of tool call id to ApprovalDecision, "
             f"got {type(decisions).__name__}."
         )
+    from dendrux.runtime._entry_checks import require_boolean
+    from dendrux.types import _validate_identifier, _validate_persistable
+
+    _check_decisions_size(decisions)
     pairs: list[tuple[str, ApprovalDecision]] = []
     for call_id, decision in decisions.items():
+        _validate_identifier(call_id, "call_id")
         if not isinstance(call_id, str):
             raise ValueError(f"decisions keys must be tool call id strings, got {call_id!r}.")
         if not isinstance(decision, ApprovalDecision):
@@ -749,6 +761,8 @@ def normalize_decisions(decisions: object) -> list[tuple[str, ApprovalDecision]]
                 f"decisions[{call_id!r}] must be an ApprovalDecision, "
                 f"got {type(decision).__name__}."
             )
+        require_boolean(decision.approved, "approved")
+        _validate_persistable(decision.reason, "reason")
         pairs.append((call_id, decision))
     return pairs
 
@@ -1029,6 +1043,15 @@ async def report_governance_change(
     await store.save_run_event(run_id, event_type="governance.changed", data=change)
 
 
+def _require_approval_token(approval: bool, expected: str | None) -> None:
+    from dendrux.types import InputValidationError, _validate_identifier
+
+    if expected is not None:
+        _validate_identifier(expected, "expected_pause_id", maximum=26)
+    if approval and expected is None:
+        raise InputValidationError("expected_pause_id", "pause_id_required")
+
+
 def warn_missing_pause_id(
     agent: Agent,
     expected: str | None,
@@ -1037,11 +1060,10 @@ def warn_missing_pause_id(
     approval: bool = False,
     warning_location: _WarningLocation | None = None,
 ) -> None:
-    # A pre-0.5 pause has no token the caller could provide.
-    if pause_id is not None and expected is None and (agent._strict_tenancy or approval):
+    _require_approval_token(approval, expected)
+    if pause_id is not None and expected is None and agent._strict_tenancy:
         _warn_at_location(
-            "Pass expected_pause_id to bind this submission to its pause. "
-            "It is planned to be required in 0.6 for approvals.",
+            "Pass expected_pause_id to bind this submission to its pause.",
             warning_location,
         )
 
@@ -1058,20 +1080,10 @@ def _client_json_payload(payload: str) -> str:
 
 
 def _cap_client_result(result: ToolResult, limit: int) -> ToolResult:
-    """Preserve wire bytes; use the shared string truncator for oversized text."""
-    import json
-
+    """Apply the tool cap to an already validated client result."""
     from dendrux.tools import cap_tool_result
 
-    if len(result.payload.encode("utf-8")) <= limit:
-        return cap_tool_result(result, limit)
-    normalized = _client_json_payload(result.payload)
-    capped = cap_tool_result(replace(result, payload=normalized), limit)
-    if normalized != result.payload:
-        value = json.loads(capped.payload)
-        if isinstance(value, str):
-            capped = replace(capped, payload=value)
-    return capped
+    return cap_tool_result(result, limit)
 
 
 async def prepare_client_results(
@@ -1082,6 +1094,7 @@ async def prepare_client_results(
 
     from dendrux.loops.react import _apply_result_transform
 
+    results = _validated_client_results(agent, run_id, results)
     validate_result_names(run_id, pause, results, json_payload=False)
     try:
         capped = [
@@ -1121,6 +1134,76 @@ async def prepare_client_results(
                 result = replace(result, payload=payload)
             except Exception as exc:
                 raise _invalid_tool_result(run_id, "client tool result transform failed") from exc
+            result = _validated_client_results(agent, run_id, [result])[0]
             result = _cap_client_result(result, agent._limits.max_tool_result_bytes)
         prepared.append(result)
     return prepared
+
+
+def legacy_approval_denial(
+    run_id: str, pause: PauseState, results: list[ToolResult]
+) -> list[ToolResult]:
+    """Legacy rejection is a denial, never proof that server code executed."""
+    validate_result_names(run_id, pause, results, json_payload=False)
+    if any(result.success is not False for result in results):
+        raise _invalid_tool_result(run_id, "approval tool results must be failed denials")
+    return build_rejection_results(pause)
+
+
+async def prepare_resume_results(
+    agent: Agent, store: StateStore, run_id: str, pause: PauseState, results: list[ToolResult]
+) -> list[ToolResult]:
+    if await _resume_status(store, run_id) == RunStatus.WAITING_APPROVAL.value:
+        results = legacy_approval_denial(
+            run_id, pause, _validated_client_results(agent, run_id, results)
+        )
+    return await prepare_client_results(agent, run_id, pause, results)
+
+
+async def _resume_status(store: StateStore, run_id: str) -> str | None:
+    projected = getattr(store, "get_run_status", None)
+    if projected is not None:
+        return cast("str | None", await projected(run_id))
+    record = await store.get_run(run_id)
+    return record.status if record is not None else None
+
+
+def _check_result_identities(run_id: str, results: list[ToolResult]) -> None:
+    if not isinstance(results, list) or len(results) > 1000:
+        raise _invalid_tool_result(run_id, "tool results exceed the batch limit")
+    for result in results:
+        if not isinstance(result, ToolResult) or any(
+            not isinstance(value, str) or not value or len(value) > 255
+            for value in (result.name, result.call_id)
+        ):
+            raise _invalid_tool_result(run_id, "invalid tool result identity")
+
+
+def _validated_client_results(
+    agent: Agent, run_id: str, results: list[ToolResult]
+) -> list[ToolResult]:
+    _check_result_identities(run_id, results)
+    checked = []
+    total = 0
+    for result in results:
+        try:
+            if len(result.images) > 100:
+                raise ValueError("image count limit")
+            data = {
+                "name": result.name,
+                "call_id": result.call_id,
+                "payload": result.payload,
+                "success": result.success,
+                "error": result.error,
+                "duration_ms": result.duration_ms,
+            }
+            parsed = ToolResult.from_dict(data, limits=agent._limits)
+            total += len(parsed.payload.encode("utf-8"))
+            if total > agent._limits.max_input_bytes:
+                raise ValueError("batch limit")
+        except (ValueError, TypeError, RecursionError):
+            raise _invalid_tool_result(
+                run_id, "tool result fields violate the client boundary"
+            ) from None
+        checked.append(replace(parsed, images=result.images))
+    return checked

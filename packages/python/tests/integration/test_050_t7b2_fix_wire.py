@@ -69,7 +69,7 @@ async def test_get_result_filters_origins_and_its_own_projection_scope(store):
         await session.commit()
     a = Agent(name="scope", prompt="p", state_store=store, strict_tenancy=False)
     try:
-        result = await a.get_result("scoped", tenant_id="A")
+        result = await a.get_result("scoped", tenant_id="A", include_pii=True)
         assert result.meta["pii_mapping"] == {"<<EMAIL_1>>": "a@example.test"}
         assert await store._get_result_record("scoped", tenant_id="B") is None
         assert await store._get_result_record("scoped", tenant_id=None) is None

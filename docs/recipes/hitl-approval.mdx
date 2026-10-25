@@ -49,10 +49,12 @@ The refund function has not been invoked. You can verify this in your code or in
 
 ## Approving
 
-Pull the run by id (typically from your inspection tools, an alert, or a queue), and ship the decision back:
+Read the pending pause and send its pause_id with the approval so a stale decision cannot approve later work:
 
 ```python
-result = await agent.submit_approval(first.run_id, approved=True)
+result = await agent.submit_approval(
+    first.run_id, approved=True, expected_pause_id=first.pause_id
+)
 print(result.status.value)   # success
 print(result.answer)         # "I've successfully refunded order 42..."
 ```

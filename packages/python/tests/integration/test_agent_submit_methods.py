@@ -238,7 +238,9 @@ class TestSubmitApproval:
         paused = await agent.run("refund 7")
         assert paused.status == RunStatus.WAITING_APPROVAL
 
-        result = await agent.submit_approval(paused.run_id, approved=True)
+        result = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
         assert result.status == RunStatus.SUCCESS
         assert result.answer == "processed"
 

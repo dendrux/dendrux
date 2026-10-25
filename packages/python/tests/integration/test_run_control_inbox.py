@@ -138,14 +138,16 @@ class TestDelivery:
         assert (await store.get_notes(paused.run_id))[0].delivered_at is None
 
         if status == "waiting_client_tool":
-            call_id = paused.meta["pause_state"].pending_tool_calls[0].id
+            call_id = paused.pending.tool_calls[0].id
             result = await agent.submit_tool_results(
                 paused.run_id, [ToolResult(name="client_read", call_id=call_id, payload='"x"')]
             )
         elif status == "waiting_human_input":
             result = await agent.submit_input(paused.run_id, "EU")
         elif status == "waiting_approval":
-            result = await agent.submit_approval(paused.run_id, approved=True)
+            result = await agent.submit_approval(
+                paused.run_id, approved=True, expected_pause_id=paused.pause_id
+            )
         else:
             result = await agent.submit_resume(paused.run_id)
 
@@ -238,7 +240,7 @@ class TestConcurrency:
         assert sorted(n.id for n in stored) == sorted(ids)
         order = [n.text for n in stored]
 
-        call_id = waiting.meta["pause_state"].pending_tool_calls[0].id
+        call_id = waiting.pending.tool_calls[0].id
         result = await agent.submit_tool_results(
             waiting.run_id, [ToolResult(name="client_read", call_id=call_id, payload='"x"')]
         )

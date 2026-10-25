@@ -51,9 +51,9 @@ async def test_legacy_claim_signature_supports_submit_and_resume(entry):
     else:
         paused = await a.run("go")
         result = await (
-            a.submit_approval(paused.run_id, approved=True)
+            a.submit_approval(paused.run_id, approved=True, expected_pause_id=paused.pause_id)
             if entry == "approval"
-            else a.resume(paused.run_id)
+            else a.resume(paused.run_id, expected_pause_id=paused.pause_id)
         )
     assert result.status == RunStatus.SUCCESS
     assert effects == ([] if entry == "paused" else ["executed"])

@@ -89,9 +89,13 @@ async def test_plain_text_and_json_client_results_are_canonical_before_transform
     if entry == "submit":
         result = await a.submit_tool_results(paused.run_id, results)
     elif entry == "resume":
-        result = await a.resume(paused.run_id, tool_results=results)
+        result = await a.resume(
+            paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+        )
     else:
-        result, _ = await consume(a.resume_stream(paused.run_id, tool_results=results))
+        result, _ = await consume(
+            a.resume_stream(paused.run_id, tool_results=results, expected_pause_id=paused.pause_id)
+        )
     assert result.status == RunStatus.SUCCESS and seen == [value]
     message = next(m for m in llm.messages[-1] if m.role.value == "tool")
     assert json.loads(message.content) == {"received": value}
@@ -153,7 +157,12 @@ async def test_fenced_batch_lifecycle_closes_both_sinks(store, monkeypatch, entr
     recorder_finish.reset_mock()
     notifier = Lifecycle()
     action = (
-        a.resume(pause.run_id, tool_results=[result_for(pause)], notifier=notifier)
+        a.resume(
+            pause.run_id,
+            tool_results=[result_for(pause)],
+            notifier=notifier,
+            expected_pause_id=pause.pause_id,
+        )
         if resumed
         else a.retry(prior.run_id, notifier=notifier)
         if entry == "retry"
@@ -180,7 +189,9 @@ async def server() -> str:
 
 @pytest.mark.parametrize("entry", ["batch", "decisions", "resume", "resume_stream"])
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_approval_warning_only_when_pause_has_token(store, entry, legacy):
+async def test_approval_without_token_is_rejected_for_current_and_legacy_pauses(
+    store, entry, legacy
+):
     a = Agent(
         name="warning",
         prompt="p",
@@ -196,22 +207,27 @@ async def test_approval_warning_only_when_pause_has_token(store, entry, legacy):
         raw = await store.get_pause_state(paused.run_id)
         raw.pop("pause_id")
         await store.pause_run(paused.run_id, status="waiting_approval", pause_data=raw)
+    from dendrux.types import InputValidationError
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FutureWarning)
-        if entry == "batch":
-            await a.submit_approval(paused.run_id, approved=True)
-        elif entry == "decisions":
-            call = paused.meta["pause_state"].pending_tool_calls[0]
-            await a.submit_approval(paused.run_id, decisions={call.id: ApprovalDecision.approve()})
-        elif entry == "resume":
-            await a.resume(paused.run_id)
+        if entry == "resume_stream":
+            result, _ = await consume(a.resume_stream(paused.run_id))
+            assert result.status == RunStatus.ERROR
+            assert "pause_id_required" in result.error
         else:
-            await consume(a.resume_stream(paused.run_id))
-    token_warnings = [w for w in caught if "expected_pause_id" in str(w.message)]
-    assert len(token_warnings) == (0 if legacy else 1)
-    if token_warnings:
-        assert "planned to be required in 0.6" in str(token_warnings[0].message)
-        assert token_warnings[0].filename == __file__
+            with pytest.raises(InputValidationError):
+                if entry == "batch":
+                    await a.submit_approval(paused.run_id, approved=True)
+                elif entry == "decisions":
+                    call = paused.pending.tool_calls[0]
+                    await a.submit_approval(
+                        paused.run_id, decisions={call.id: ApprovalDecision.approve()}
+                    )
+                else:
+                    await a.resume(paused.run_id)
+    assert not [w for w in caught if "expected_pause_id" in str(w.message)]
+    assert (await store.get_run(paused.run_id)).status == "waiting_approval"
 
 
 @pytest.mark.parametrize("entry", ["submit", "resume", "resume_stream"])
@@ -316,7 +332,7 @@ async def test_example_09_plain_text_round_trip(store, monkeypatch):
 
 
 @pytest.mark.parametrize("entry", ["batch", "decisions", "resume", "resume_stream"])
-async def test_approval_warning_uses_normal_per_call_site_deduplication(store, entry):
+async def test_fenced_approval_never_warns_at_repeated_call_site(store, entry):
     a = Agent(
         name="dedup",
         prompt="p",
@@ -338,18 +354,22 @@ async def test_approval_warning_uses_normal_per_call_site_deduplication(store, e
         for _ in range(3):
             paused = await a.run("go")
             if entry == "batch":
-                await a.submit_approval(paused.run_id, approved=True)
-            elif entry == "decisions":
-                call = paused.meta["pause_state"].pending_tool_calls[0]
                 await a.submit_approval(
-                    paused.run_id, decisions={call.id: ApprovalDecision.approve()}
+                    paused.run_id, approved=True, expected_pause_id=paused.pause_id
+                )
+            elif entry == "decisions":
+                call = paused.pending.tool_calls[0]
+                await a.submit_approval(
+                    paused.run_id,
+                    decisions={call.id: ApprovalDecision.approve()},
+                    expected_pause_id=paused.pause_id,
                 )
             elif entry == "resume":
-                await a.resume(paused.run_id)
+                await a.resume(paused.run_id, expected_pause_id=paused.pause_id)
             else:
-                await consume(a.resume_stream(paused.run_id))
+                await consume(a.resume_stream(paused.run_id, expected_pause_id=paused.pause_id))
     token_warnings = [w for w in caught if "expected_pause_id" in str(w.message)]
-    assert len(token_warnings) == 1 and token_warnings[0].filename == __file__
+    assert not token_warnings
 
 
 @pytest.mark.parametrize(
@@ -461,7 +481,7 @@ async def test_client_dispatch_rechecks_lowered_cap(store):
         paused.run_id, approved=True, expected_pause_id=paused.pause_id
     )
     assert pending.status == RunStatus.WAITING_CLIENT_TOOL
-    assert len(pending.meta["pause_state"].pending_tool_calls) == 1
+    assert len(pending.pending.tool_calls) == 1
     assert (
         await b.submit_tool_results(paused.run_id, [result_for(pending, "rows")])
     ).status == RunStatus.SUCCESS
@@ -484,7 +504,13 @@ async def test_governance_warning_points_to_public_call_site(store, streaming):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FutureWarning)
         if streaming:
-            await consume(b.resume_stream(paused.run_id, tool_results=[result_for(paused)]))
+            await consume(
+                b.resume_stream(
+                    paused.run_id,
+                    tool_results=[result_for(paused)],
+                    expected_pause_id=paused.pause_id,
+                )
+            )
         else:
             await b.submit_tool_results(paused.run_id, [result_for(paused)])
     changed = [w for w in caught if "Changed governance" in str(w.message)]

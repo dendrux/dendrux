@@ -1173,7 +1173,11 @@ class TestApprovalCarry:
                 {"d": json.dumps(raw), "i": run_id},
             )
 
-        approved = await agent.submit_approval(run_id, approved=True)
+        approved = await agent.submit_approval(
+            run_id,
+            approved=True,
+            expected_pause_id=(await store.get_pause_state(run_id))["pause_id"],
+        )
         assert approved.status == RunStatus.WAITING_CLIENT_TOOL
         client_raw = await store.get_pause_state(run_id)
         assert client_raw["image_view"] == view.to_dict()

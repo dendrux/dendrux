@@ -489,7 +489,7 @@ class TestSweepAbandonedRuns:
         assert len(abandoned) == 1
         assert abandoned[0].data == {"failure_reason": "abandoned_waiting"}
 
-    async def test_pause_data_preserved(self, store):
+    async def test_pause_data_cleared(self, store):
         """Swept abandoned runs keep their pause_data for forensics."""
         old_time = dt.datetime.now(dt.UTC) - timedelta(hours=3)
         rid = await _create_run(store, status="waiting_client_tool", last_progress_at=old_time)
@@ -512,7 +512,7 @@ class TestSweepAbandonedRuns:
 
         # pause_data should still be there
         pause = await store.get_pause_state(rid)
-        assert pause == {"pending": ["tool1"]}
+        assert pause is None
 
     async def test_multiple_abandoned_runs(self, store):
         """Multiple abandoned runs are all swept."""

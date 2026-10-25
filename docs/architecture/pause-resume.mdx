@@ -85,8 +85,10 @@ async def main() -> None:
         paused = await agent.run("Refund order 42 using the refund tool.")
         print(paused.status.value)            # waiting_approval
 
-        # Later, elsewhere: only the run_id is needed to resume.
-        done = await agent.submit_approval(paused.run_id, approved=True)
+        # Later, send the pause generation that the approver reviewed.
+        done = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
         print(done.status.value)              # success
         print(done.answer)                    # "The refund has been successfully processed..."
 

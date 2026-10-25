@@ -15,14 +15,13 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux import Agent
 from dendrux.db import session as db_session
 from dendrux.db.models import Base
-from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
+from dendrux.errors import PersistenceError, SchemaNotInitializedError, SchemaOutOfDateError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.sweep import sweep
 from dendrux.store import RunStore
@@ -206,7 +205,7 @@ async def test_skip_env_var_bypasses_the_check(
     monkeypatch.setenv("DENDRUX_SKIP_SCHEMA_CHECK", "1")
     agent = _agent(pg_url)
     try:
-        with pytest.raises(DBAPIError) as info:
+        with pytest.raises(PersistenceError) as info:
             await agent.run("hi")
     finally:
         await agent.close()

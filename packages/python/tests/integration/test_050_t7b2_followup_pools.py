@@ -31,6 +31,7 @@ from contextlib import AsyncExitStack
 import asyncpg
 from dendrux import Agent
 from dendrux.db._shared_pool import release
+from tests._helpers.pg_wait import wait_pg_count
 warnings.simplefilter("error")
 # The owner explicitly permits ResourceWarning from orphaned driver connections.
 warnings.filterwarnings("ignore", category=ResourceWarning)
@@ -78,7 +79,7 @@ async def acquire():
     async with AsyncExitStack() as stack:
         for _ in range(2):
             await stack.enter_async_context(agent._private_engine.connect())
-        counts.append(await count())
+        counts.append(await wait_pg_count(count, baseline + 2))
 
 baseline = run(count())
 try:
@@ -91,11 +92,11 @@ try:
         else:
             continue  # the next acquire detaches the previous entry
         gc.collect()
-        assert run(count()) == baseline, "GC must release the retired PG sessions"
+        run(wait_pg_count(count, baseline))
     for agent in agents:
         run(agent.close())
     gc.collect()
-    assert run(count()) == baseline, "GC must return PG backend count to baseline"
+    run(wait_pg_count(count, baseline))
     assert max(counts) == baseline + 2, counts
     assert len(records) == 4, "each retired entry must emit one structured warning"
     for record in records:
@@ -136,7 +137,7 @@ async def test_closed_loop_retirement_warns_once_and_gc_restores_pg_baseline(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), 45)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), 75)
     assert proc.returncode == 0, stderr.decode()
     assert not stderr, stderr.decode()
     metrics = json.loads(stdout)

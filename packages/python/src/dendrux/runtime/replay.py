@@ -167,12 +167,8 @@ async def load_replay_runs(
     loaded: list[LoadedRun] = []
     for run_id in request.runs:
         record = await store.get_run(run_id)
-        if record is None:
+        if record is None or record.tenant_id != tenant_id:
             raise ReplayRunError(run_id, "not_found", "run not found")
-        if record.tenant_id != tenant_id:
-            raise ReplayRunError(
-                run_id, "tenant_mismatch", "it belongs to a different tenant than this call"
-            )
         if record.status not in _TERMINAL_STATUSES:
             raise ReplayRunError(
                 run_id,
