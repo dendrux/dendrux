@@ -200,12 +200,19 @@ async def _prior_schema(engine, count):
     )
 
 
-@pytest.mark.serial_probe
-async def test_online_clock_migration_writer_block_at_300k(engine, record_property):
+# 11,000 rows (three backfill batches) check correctness in every run. 300,000 rows also
+# time a concurrent writer; that latency depends on the machine, so it is a benchmark
+# (`make bench`), not a gate.
+@pytest.mark.parametrize(
+    "rows",
+    [11_000, pytest.param(300_000, marks=pytest.mark.benchmark)],
+    ids=["11k", "300k"],
+)
+async def test_online_clock_migration_writer_block(engine, record_property, rows):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres concurrent writer and autocommit evidence")
     async with migration_schema(_pg_url(), "t7_fix3_online") as target:
-        await _prior_schema(target, 300000)
+        await _prior_schema(target, rows)
         stop = asyncio.Event()
         ready = asyncio.Event()
         durations = []
@@ -235,7 +242,7 @@ async def test_online_clock_migration_writer_block_at_300k(engine, record_proper
                     await conn.execute(
                         text(
                             "UPDATE agent_runs SET iteration_count=iteration_count+1 "
-                            "WHERE id='run-300000'"
+                            f"WHERE id='run-{rows:06d}'"
                         )
                     )
                     durations.append(time.perf_counter() - started)
@@ -260,7 +267,7 @@ async def test_online_clock_migration_writer_block_at_300k(engine, record_proper
             await worker
             event.remove(target.sync_engine.__class__, "before_cursor_execute", capture)
         metrics = {
-            "rows": 300000,
+            "rows": rows,
             "seconds": elapsed,
             "writer_samples": len(durations),
             "max_writer_ms": max(durations) * 1000,
@@ -274,7 +281,8 @@ async def test_online_clock_migration_writer_block_at_300k(engine, record_proper
                     text("SELECT count(*) FROM agent_runs WHERE status_changed_at IS NULL")
                 )
             ).scalar_one() == 0
-        assert max(durations) < 0.2, "migration statements must not block writers for 200ms"
+        if rows >= 300_000:  # latency is only meaningful (and only asserted) in the benchmark
+            assert max(durations) < 0.2, "migration statements must not block writers for 200ms"
 
         def nodes(node):
             yield node

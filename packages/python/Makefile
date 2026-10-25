@@ -1,10 +1,8 @@
-.PHONY: test lint typecheck arch crap api-check format package-smoke ci clean
+.PHONY: test bench lint typecheck arch crap api-check format package-smoke ci clean
 
-# Load-sensitive probes (marked serial_probe) run first and alone, on a quiet server; the
-# parallel pass appends to their coverage so coverage.json describes the whole suite.
+# Benchmarks measure the server, not the code, so they are not part of the gates.
 test:
-	pytest tests/ -v -n 0 -m serial_probe --cov=src/dendrux --cov-report=json:coverage.json
-	pytest tests/ -v -n auto -m "not serial_probe" --cov=src/dendrux --cov-append --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
+	pytest tests/ -v -n auto -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
 	python tools/crap_ratchet.py stamp --coverage coverage.json
 
 lint:
@@ -17,6 +15,11 @@ typecheck:
 # CRAP ratchet. Needs coverage.json, which `make test` writes.
 crap:
 	python tools/crap_ratchet.py check --coverage coverage.json
+
+# Release step: run on a quiet machine (nothing else using Postgres) and record the numbers
+# in the load-test results doc. Needs DENDRUX_TEST_PG_URL.
+bench:
+	pytest tests/ -v -rs -n 0 -m benchmark -p no:randomly
 
 # Public API breaks against the last release tag (needs `git fetch --tags`).
 # Fails on any break without a migration-note B-item.

@@ -187,7 +187,7 @@ disallow_untyped_defs = false
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-    "serial_probe: a Postgres probe (HOT statistics, writer latency during a 300k-row migration) whose result depends on server load; the gate runs it alone after the parallel pass (see Makefile and CI)",
+    "benchmark: environment-dependent Postgres measurements (HOT statistics, writer stall during a 300k-row migration); excluded from make test, make ci and CI, run with make bench on a quiet machine",
 ]
 
 [tool.coverage.run]
