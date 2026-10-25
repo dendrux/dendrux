@@ -19,7 +19,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -34,6 +34,7 @@ from dendrux.db._sqlite_sync import create_sqlite_schema
 
 _engine: AsyncEngine | None = None
 _engine_url: str | None = None
+_engine_options_key: Any = None
 _session_factory: sessionmaker | None = None  # type: ignore[type-arg]
 _engine_lock = threading.Lock()
 _generation = 0
@@ -86,72 +87,78 @@ def _bind_to_current_loop(engine: AsyncEngine) -> None:
             return
         if current is not owner:
             raise RuntimeError(
-                "The shared dendrux database engine (from DENDRUX_DATABASE_URL) was created "
+                "The shared dendrux database engine was created "
                 "on a different event loop and cannot be used from this one. Create one "
                 "state store per process on the loop that serves requests and pass "
                 "state_store= to every Agent, or call dendrux.db.session.reset_engine() "
                 "before switching loops."
             )
 
+    # Pool checkout events run *after* pre-ping. Reject at the public Engine
+    # acquisition boundary, before the pool can ping, open or invalidate an
+    # asyncpg connection on the wrong loop. This also covers raw_connection
+    # and survives dispose(), which replaces the pool on this same Engine.
+    raw_connection = engine.sync_engine.raw_connection
+
+    def _checked_connection() -> Any:
+        _check_loop()
+        return raw_connection()
+
+    engine.sync_engine.raw_connection = _checked_connection  # type: ignore[method-assign]
     event.listen(engine.sync_engine, "checkout", _check_loop)
 
 
-async def get_engine(url: str | None = None) -> AsyncEngine:
-    """Get or create the async engine.
+async def _initialize_engine(engine: AsyncEngine) -> None:
+    if engine.dialect.name == "sqlite":
+        database = engine.url.database
+        if database and database != ":memory:" and not database.startswith("file:"):
+            Path(database).parent.mkdir(parents=True, exist_ok=True)
+        await create_sqlite_schema(engine)
+    else:
+        await ensure_schema_current(engine)
+    _bind_to_current_loop(engine)
 
-    For SQLite, auto-creates all tables on first call and upgrades an older
-    file in place. For Postgres, tables must exist via Alembic migrations.
 
-    A candidate engine is published only after its initialization succeeds
-    and only if ``reset_engine()`` has not run since it started. Concurrent
-    first callers each initialize a candidate (idempotent, serialized by
-    SQLite's write lock); one is published, the rest are disposed. A failed
-    initialization disposes its candidate and caches nothing.
+async def get_engine(
+    url: str | None = None, *, database_options: dict[str, Any] | None = None
+) -> AsyncEngine:
+    """Resolve the env-store singleton using the shared URL/options pool.
+
+    Defaults for non-SQLite pools are pre_ping=True and recycle=1800. The
+    singleton owns one registry reference until reset_engine or process exit.
+    Initialization is shared by all first callers and cancellation-safe.
     """
-    global _engine, _engine_url, _session_factory  # noqa: PLW0603
-    resolved_url = url or get_database_url()
+    global _engine, _engine_url, _session_factory, _engine_options_key
+    from dendrux.db._engine_options import engine_options, frozen_options, normalized_url
+    from dendrux.db._shared_pool import acquire, release
 
+    parsed = normalized_url(url or get_database_url())
+    resolved_url = parsed.render_as_string(hide_password=False)
+    options_key = frozen_options(engine_options(parsed, database_options))
     while True:
         with _engine_lock:
             ready = _published(resolved_url)
             generation = _generation
+            if ready is not None and _engine_options_key != options_key:
+                raise RuntimeError(
+                    "get_engine() database_options differ; call reset_engine() first"
+                )
         if ready is not None:
             return ready
-
-        # SQLite needs connect_args for async support
-        connect_args = {}
-        if resolved_url.startswith("sqlite"):
-            connect_args["check_same_thread"] = False
-
-        candidate = create_async_engine(
+        candidate = await acquire(
             resolved_url,
-            echo=False,
-            connect_args=connect_args,
+            database_options,
+            factory=create_async_engine,
+            initialize=_initialize_engine,
         )
-        try:
-            if resolved_url.startswith("sqlite"):
-                # Ensure the parent directory exists (e.g. ~/.dendrux/)
-                db_path = resolved_url.split("///", 1)[-1] if "///" in resolved_url else None
-                if db_path:
-                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-                await create_sqlite_schema(candidate)
-            else:
-                await ensure_schema_current(candidate)
-        except BaseException:
-            await candidate.dispose()
-            raise
-
-        _bind_to_current_loop(candidate)
         with _engine_lock:
             if _generation == generation and _engine is None:
-                _engine = candidate
-                _engine_url = resolved_url
+                _engine, _engine_url, _engine_options_key = candidate, resolved_url, options_key
                 _session_factory = sessionmaker(  # type: ignore[call-overload]
                     candidate, class_=AsyncSession, expire_on_commit=False
                 )
                 return candidate
-        # Reset ran or another caller published first: drop ours and look again.
-        await candidate.dispose()
+        await release(candidate)
 
 
 async def reset_engine() -> None:
@@ -160,16 +167,19 @@ async def reset_engine() -> None:
     Releases the lock before awaiting dispose() to avoid holding a
     synchronous lock across an async suspension point.
     """
-    global _engine, _engine_url, _session_factory, _generation  # noqa: PLW0603
+    global _engine, _engine_url, _session_factory, _generation, _engine_options_key  # noqa: PLW0603
     with _engine_lock:
         _generation += 1
         engine = _engine
         _engine = None
         _engine_url = None
+        _engine_options_key = None
         _session_factory = None
     # Dispose outside the lock — no deadlock risk
     if engine is not None:
-        await engine.dispose()
+        from dendrux.db._shared_pool import release
+
+        await release(engine)
 
 
 @asynccontextmanager

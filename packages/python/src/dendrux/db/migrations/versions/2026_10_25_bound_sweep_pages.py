@@ -44,11 +44,13 @@ def upgrade() -> None:
             if pg:
                 entry = read_pg_indexes(bind, tables=[table]).get(name)
                 if entry is not None and not entry[2]:
-                    op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+                    _exclusive_pg_step(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
             concurrent = " CONCURRENTLY" if pg else ""
-            op.execute(
-                f"CREATE INDEX{concurrent} IF NOT EXISTS {name} ON {table} ({keys}){predicate}"
-            )
+            statement = f"CREATE INDEX{concurrent} IF NOT EXISTS {name} ON {table} ({keys}){predicate}"
+            if pg:
+                _exclusive_pg_step(statement)
+            else:
+                op.execute(statement)
             expected_predicate = predicate
             if pg and predicate:
                 column, value = (
@@ -67,7 +69,7 @@ def upgrade() -> None:
 
 
 def _exclusive_pg_step(statement: str, *, transactional: bool = False) -> None:
-    """Bound lock acquisition without changing a downgrade's atomic boundary."""
+    """Bound DDL lock waits, including concurrent-index virtualxid waits."""
     bind = op.get_bind()
     previous = bind.execute(sa.text("SHOW lock_timeout")).scalar_one()
     try:
@@ -95,7 +97,7 @@ def _exclusive_pg_step(statement: str, *, transactional: bool = False) -> None:
         state = getattr(error.orig, "sqlstate", None) or getattr(error.orig, "pgcode", None)
         if state == "55P03":
             raise RuntimeError(
-                "Timed out acquiring the agent_runs migration lock after 5 seconds. "
+                "Timed out acquiring the Dendrux migration lock after 5 seconds. "
                 "Retry the migration operation after the blocking transaction finishes."
             ) from None
         raise
@@ -169,7 +171,10 @@ def downgrade() -> None:
     with op.get_context().autocommit_block() if pg else nullcontext():
         for name, _, _, _ in reversed(_INDEXES):
             concurrent = " CONCURRENTLY" if pg else ""
-            op.execute(f"DROP INDEX{concurrent} IF EXISTS {name}")
+            if pg:
+                _exclusive_pg_step(f"DROP INDEX{concurrent} IF EXISTS {name}")
+            else:
+                op.execute(f"DROP INDEX{concurrent} IF EXISTS {name}")
     if pg:
         _exclusive_pg_step("ALTER TABLE agent_runs DROP COLUMN status_changed_at", transactional=True)
     else:

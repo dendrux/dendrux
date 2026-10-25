@@ -195,7 +195,7 @@ def _warn_env_store_deprecated() -> None:
         "This implicit store is deprecated and is removed in dendrux 0.6. Create one state "
         "store per process (for example at app startup: "
         "SQLAlchemyStateStore(create_async_engine(url))) and pass state_store= to every "
-        "Agent. Do not pass database_url= per request: each Agent would build its own pool.",
+        "Agent. Explicit database_url Agents share a reference-counted pool per URL and options.",
         DeprecationWarning,
         stacklevel=4,
     )
@@ -500,7 +500,11 @@ class Agent:
             raise ValueError(
                 "database_url and state_store are mutually exclusive. Pass one or the other."
             )
-        if database_options is not None and database_url is None:
+        if (
+            database_options is not None
+            and database_url is None
+            and not os.environ.get("DENDRUX_DATABASE_URL")
+        ):
             raise ValueError("database_options requires database_url.")
 
         self._database_url = database_url
@@ -1104,12 +1108,12 @@ class Agent:
 
         Resolution order:
           1. Explicit state_store from constructor → returned as-is
-          2. database_url from constructor → private engine (agent-owned)
+          2. database_url from constructor → reference-counted shared engine
           3. DENDRUX_DATABASE_URL env var → shared global engine
           4. None (ephemeral mode)
 
         Ownership rule:
-          - Explicit database_url creates a private engine disposed by close().
+          - Explicit database_url acquires a shared reference released by close().
           - Env-var path uses the shared singleton from get_engine() — NOT
             owned by this agent, NOT disposed by close().
         """
@@ -1120,6 +1124,7 @@ class Agent:
             return self._lazy_store
 
         from dendrux.db._schema_check import was_verified
+        from dendrux.db._shared_pool import release
         from dendrux.runtime.state import SQLAlchemyStateStore
 
         if self._database_url is not None:
@@ -1130,7 +1135,7 @@ class Agent:
                 if not was_verified(engine):
                     await _verify_schema_initialized(engine, self._database_url)
             except BaseException:
-                await engine.dispose()
+                await release(engine)
                 raise
             with self._store_lock:
                 if self._store_generation != generation:
@@ -1141,7 +1146,7 @@ class Agent:
                     self._private_engine = engine
                     self._lazy_store = SQLAlchemyStateStore(engine)
                     return self._lazy_store
-            await engine.dispose()
+            await release(engine)
             if closed:
                 raise RuntimeError("Agent was closed while its database was initializing.")
             assert self._lazy_store is not None
@@ -1152,7 +1157,10 @@ class Agent:
             from dendrux.db.session import get_engine
 
             _warn_env_store_deprecated()
-            engine = await get_engine(env_url)
+            engine = await get_engine(
+                env_url,
+                **({"database_options": self._database_options} if self._database_options else {}),
+            )
             if not was_verified(engine):
                 await _verify_schema_initialized(engine, env_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
@@ -1161,44 +1169,10 @@ class Agent:
         return None
 
     async def _create_private_engine(self, url: str) -> AsyncEngine:
-        """Create an agent-owned engine from an explicit database_url.
+        """Acquire this Agent's reference to the shared URL/options engine."""
+        from dendrux.db._shared_pool import acquire
 
-        Unlike the global get_engine() singleton, this creates a fresh engine
-        per agent so multiple agents with different URLs can coexist.
-        database_options are applied here.
-        """
-        from pathlib import Path
-
-        from sqlalchemy.ext.asyncio import create_async_engine
-
-        from dendrux.db._schema_check import ensure_schema_current
-        from dendrux.db._sqlite_sync import create_sqlite_schema
-
-        connect_args: dict[str, Any] = {}
-        if url.startswith("sqlite"):
-            connect_args["check_same_thread"] = False
-
-        engine = create_async_engine(
-            url,
-            echo=False,
-            connect_args=connect_args,
-            **self._database_options,
-        )
-
-        try:
-            if url.startswith("sqlite"):
-                # Auto-create tables for SQLite (zero-config promise)
-                db_path = url.split("///", 1)[-1] if "///" in url else None
-                if db_path:
-                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-                await create_sqlite_schema(engine)
-            else:
-                await ensure_schema_current(engine)
-        except BaseException:
-            await engine.dispose()
-            raise
-
-        return engine
+        return await acquire(url, self._database_options)
 
     # ------------------------------------------------------------------
     # Runtime methods
@@ -2006,6 +1980,35 @@ class Agent:
                 ),
             )
             return await task
+
+    async def get_result(self, run_id: str, *, tenant_id: str | None) -> RunResult:
+        """Read a persisted result in one explicit tenant scope, or raise not found.
+
+        Never accepts UNSCOPED. Routes must separately authorize their actor's
+        access to this run. Pending arguments use RunStore.get_pending's view.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.store import RunStore
+
+        if tenant_id is not None and not isinstance(tenant_id, str):
+            raise ValueError("tenant_id must be a string or None")
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+        facade = RunStore(store)
+        projected = getattr(store, "_get_result_record", None)
+        record = (
+            await projected(run_id, tenant_id=tenant_id)
+            if projected is not None
+            else await facade._scoped_run(run_id, tenant_id)
+        )
+        if record is None or record.agent_name != self.name:
+            raise RunNotFoundError(run_id)
+        result = _record_to_run_result(record)
+        result.meta["pii_mapping"] = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
+        result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
+        result.pause_id = result.pending.pause_id if result.pending else None
+        return result
 
     async def cancel_run(
         self,
@@ -3119,7 +3122,7 @@ class Agent:
     async def close(self) -> None:
         """Close MCP sources, provider, and agent-owned engine.
 
-        Only disposes the private engine created from an explicit database_url.
+        Releases this Agent's shared engine reference for an explicit database_url.
         The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
         owned by this agent and is left untouched.
 
@@ -3147,7 +3150,9 @@ class Agent:
             if engine is not None:
                 self._lazy_store = None
         if engine is not None:
-            await engine.dispose()
+            from dendrux.db._shared_pool import release
+
+            await release(engine)
 
     async def __aenter__(self) -> Agent:
         return self

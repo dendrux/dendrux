@@ -20,8 +20,8 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from dendrux._redact import safe_exception_info
 from dendrux.pricing import price_usage
-from dendrux.runtime.context import safe_exception_info
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator

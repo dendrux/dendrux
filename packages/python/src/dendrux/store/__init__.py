@@ -497,7 +497,11 @@ class RunStore:
 
     @classmethod
     def from_database_url(
-        cls, database_url: str, *, blob_store: BlobStore | None = None
+        cls,
+        database_url: str,
+        *,
+        blob_store: BlobStore | None = None,
+        database_options: dict[str, Any] | None = None,
     ) -> RunStore:
         """Build a RunStore from a SQLAlchemy async URL.
 
@@ -510,7 +514,10 @@ class RunStore:
         """
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        engine = create_async_engine(database_url)
+        from dendrux.db._engine_options import engine_options, normalized_url
+
+        parsed = normalized_url(database_url)
+        engine = create_async_engine(parsed, **engine_options(parsed, database_options))
         store: Any = SQLAlchemyStateStore(engine)
         if database_url.startswith("sqlite"):
             store = _InitOnFirstUse(
@@ -1058,6 +1065,14 @@ class RunStore:
         if getter is not None:
             return cast("int | None", await getter(run_id, tenant_id=tenant_id))
         if await self._status(run_id, tenant_id) not in PAUSE_STATUSES:
+            return None
+        # Legacy readers without explicit filters cannot promise a bounded
+        # history read. Fail closed: approval/input params stay hidden.
+        try:
+            parameters = inspect.signature(self._state.get_run_events).parameters
+        except (TypeError, ValueError):
+            return None
+        if not {"limit", "event_types"} <= parameters.keys():
             return None
         # Bounded custom-store fallback. Unknown tail means no active exception.
         rows = await self._scoped_read(

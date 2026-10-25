@@ -25,6 +25,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
+from dendrux._redact import safe_exception_info
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import (
     history_has_images,
@@ -62,7 +63,6 @@ from dendrux.runtime.context import (
     reset_delegation_context,
     resolve_child_tenant,
     resolve_parent_link,
-    safe_exception_info,
     set_delegation_context,
 )
 from dendrux.runtime.replay import (
@@ -542,6 +542,53 @@ def _public_meta(meta: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _in_memory_pending(result: RunResult) -> Any:
+    """Project an ephemeral pause without ever serializing its history."""
+    from dendrux.store import _KIND_BY_STATUS, _pending_from
+    from dendrux.store._follow import approval_calls
+    from dendrux.types import Clarification
+
+    state = result.meta.get("pause_state")
+    kind = _KIND_BY_STATUS.get(result.status.value)
+    if state is None or kind is None:
+        return None
+    pause = {
+        "pause_id": state.pause_id,
+        "pending_tool_calls": [
+            {"id": c.id, "name": c.name, "params": c.params} for c in state.pending_tool_calls
+        ],
+        "pending_targets": state.pending_targets,
+        "approval_gates": state.approval_gates,
+        "pause_reason": state.pause_reason,
+        "pause_message": state.pause_message,
+        "budget_exceeded": state.budget_exceeded,
+    }
+    if kind in ("approval", "input"):
+        pause["pending_tool_calls"] = approval_calls(pause["pending_tool_calls"], None)
+    last = None
+    if state.steps and isinstance(state.steps[-1].action, Clarification):
+        action = state.steps[-1].action
+        last = {
+            "action": {
+                "type": "clarification",
+                "question": action.question,
+                "options": action.options,
+            }
+        }
+    return _pending_from(result.run_id, result.status.value, kind, pause, last)
+
+
+async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
+    if result.status in _PAUSE_STATUSES and record is not None:
+        from dendrux.store import RunStore
+
+        result.pending = await RunStore(store).get_pending(
+            result.run_id, tenant_id=getattr(record, "tenant_id", None)
+        )
+        result.pause_id = result.pending.pause_id if result.pending else None
+    return result
+
+
 def _ensure_pause_generation(
     result: RunResult, provider_kwargs: dict[str, Any] | None = None
 ) -> None:
@@ -556,6 +603,45 @@ def _ensure_pause_generation(
                 if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
             }
             result.pause_id = pause.pause_id
+            result.pending = _in_memory_pending(result)
+
+
+def _pause_event_data(result: RunResult, pause_state: PauseState) -> dict[str, Any]:
+    """Build the existing pause lifecycle event without changing its shape."""
+    paused_data: dict[str, Any] = {
+        "status": result.status.value,
+        "pause_id": pause_state.pause_id,
+        "pending_tool_calls": [
+            {
+                "id": tc.id,
+                "name": tc.name,
+                "target": pause_state.pending_targets.get(tc.id),
+                "params": tc.params,
+            }
+            for tc in pause_state.pending_tool_calls
+        ],
+    }
+    if pause_state.pause_reason is not None:
+        paused_data["reason"] = pause_state.pause_reason
+    if pause_state.pause_message:
+        paused_data["message"] = pause_state.pause_message[:500]
+    if pause_state.budget_exceeded:
+        paused_data["exceeded"] = pause_state.budget_exceeded
+    return paused_data
+
+
+def _terminal_failure_kwargs(state_store: StateStore, result: RunResult) -> dict[str, Any]:
+    """Keep guardrail reason support optional for legacy custom stores."""
+    failure_kwargs: dict[str, Any] = {}
+    base = unclaimed_store(state_store)
+    if (
+        base is not None
+        and result.status == RunStatus.ERROR
+        and result.meta.get("failure_reason") == "guardrail_blocked"
+        and _accepts_kwarg(base.finalize_run, "failure_reason")
+    ):
+        failure_kwargs["failure_reason"] = "guardrail_blocked"
+    return failure_kwargs
 
 
 async def _persist_loop_outcome(
@@ -606,6 +692,7 @@ async def _persist_loop_outcome(
             replay=result.replay,
             stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
             pause_id=result.pause_id if status in _PAUSE_STATUSES else None,
+            pending=result.pending if status in _PAUSE_STATUSES else None,
         )
 
     async def _persisted(status_if_missing: RunStatus) -> RunResult:
@@ -621,7 +708,7 @@ async def _persist_loop_outcome(
         if status not in _PAUSE_STATUSES:
             persisted.meta.pop("pause_state", None)
             await _attach_undelivered_notes(state_store, run_id, persisted)
-        return persisted
+        return await _attach_persisted_pending(state_store, persisted, record)
 
     async def _finalize_cancelled(
         allowed: list[str], payload: dict[str, Any], failure_reason: str | None = None
@@ -682,25 +769,7 @@ async def _persist_loop_outcome(
                 pause_state, pause_message=await _pause_request_message(state_store, run_id)
             )
             result.meta["pause_state"] = pause_state
-        paused_data: dict[str, Any] = {
-            "status": result.status.value,
-            "pause_id": pause_state.pause_id,
-            "pending_tool_calls": [
-                {
-                    "id": tc.id,
-                    "name": tc.name,
-                    "target": pause_state.pending_targets.get(tc.id),
-                    "params": tc.params,
-                }
-                for tc in pause_state.pending_tool_calls
-            ],
-        }
-        if pause_state.pause_reason is not None:
-            paused_data["reason"] = pause_state.pause_reason
-        if pause_state.pause_message:
-            paused_data["message"] = pause_state.pause_message[:500]
-        if pause_state.budget_exceeded:
-            paused_data["exceeded"] = pause_state.budget_exceeded
+        paused_data = _pause_event_data(result, pause_state)
         record = await state_store.get_run(run_id)
         pause_data = {**pause_state.to_dict(), "status": result.status.value}
         if record is not None and GOVERNANCE_KEY in (getattr(record, "meta", None) or {}):
@@ -730,21 +799,15 @@ async def _persist_loop_outcome(
         record = await state_store.get_run(run_id)
         if record is not None and record.status != result.status.value:
             return await _persisted(RunStatus(record.status))
-        return _wrap(status=result.status, won=True)
+        return await _attach_persisted_pending(
+            state_store, _wrap(status=result.status, won=True), record
+        )
 
     # Terminal: success / max_iterations / error. Cooperative cancellation:
     # a cancel requested after the last checkpoint does not override a run
     # that finished — its work and side effects happened.
     _run_pii = result.meta.get("pii_mapping")
-    failure_kwargs: dict[str, Any] = {}
-    base = unclaimed_store(state_store)
-    if (
-        base is not None
-        and result.status == RunStatus.ERROR
-        and result.meta.get("failure_reason") == "guardrail_blocked"
-        and _accepts_kwarg(base.finalize_run, "failure_reason")
-    ):
-        failure_kwargs["failure_reason"] = "guardrail_blocked"
+    failure_kwargs = _terminal_failure_kwargs(state_store, result)
     finalize_won = await state_store.finalize_run(
         run_id,
         status=result.status.value,
@@ -2121,7 +2184,7 @@ async def _build_cached_result(
 
     This is a *summary*, not a faithful replay of the original RunResult:
     - steps is always [] (AgentStep history is not persisted in recoverable form)
-    - meta is empty (developer meta is on the run row, not in RunResult.meta)
+    - developer meta is omitted; known PII is retained for safe wire projection
     - stop_reason is restored from ``meta[STOP_REASON_META_KEY]`` on SUCCESS
       (None for runs finished before 0.4.1)
     - usage is reconstructed from aggregate columns (total_input_tokens, etc.),
@@ -2157,7 +2220,7 @@ async def _build_cached_result(
                 output_type.__name__,
             )
 
-    return RunResult(
+    result = RunResult(
         run_id=run.id,
         status=RunStatus(run.status),
         answer=run.answer,
@@ -2182,6 +2245,11 @@ async def _build_cached_result(
             _stop_reason_from_meta(run.meta) if run.status == RunStatus.SUCCESS.value else None
         ),
     )
+
+    mapping = await state_store.get_pii_mapping(run_id)
+    if mapping:
+        result.meta = _public_meta({"pii_mapping": mapping})
+    return await _attach_persisted_pending(state_store, result, run)
 
 
 def _stop_reason_from_meta(meta: dict[str, Any] | None) -> StopReason | None:

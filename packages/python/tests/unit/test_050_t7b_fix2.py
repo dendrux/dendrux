@@ -238,6 +238,8 @@ def test_sweep_index_validation_error_does_not_claim_uniqueness(monkeypatch):
         lambda bind: SimpleNamespace(get_columns=lambda _: [{"name": "status_changed_at"}]),
     )
     monkeypatch.setattr(module, "_online_pg_clock", lambda: None)
+    # This wording unit test stubs DDL; real bounded waits have PG coverage.
+    monkeypatch.setattr(module, "_exclusive_pg_step", lambda statement: op.execute(statement))
     monkeypatch.setattr(module, "read_pg_indexes", lambda *args, **kw: {}, raising=False)
     with pytest.raises(RuntimeError) as caught:
         module.upgrade()

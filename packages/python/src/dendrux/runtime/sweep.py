@@ -40,6 +40,7 @@ async def sweep(
     abandoned_waiting: timedelta | None = None,
     batch_size: int = 100,
     max_runs: int = 10000,
+    database_options: dict[str, Any] | None = None,
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
 
@@ -87,6 +88,8 @@ async def sweep(
         )
     if database_url is None and state_store is None:
         raise ValueError("Either database_url or state_store is required.")
+    if database_options is not None and database_url is None:
+        raise ValueError("database_options requires database_url")
     if stale_running is None and abandoned_waiting is None:
         return SweepResult(stale_running=[])
 
@@ -97,7 +100,10 @@ async def sweep(
     engine = None
 
     if database_url is not None:
-        store, engine = await _create_temp_store(database_url)
+        store, engine = await _create_temp_store(
+            database_url,
+            **({"database_options": database_options} if database_options is not None else {}),
+        )
     else:
         assert state_store is not None
         store = state_store
@@ -127,6 +133,8 @@ async def sweep(
 
 async def _create_temp_store(
     database_url: str,
+    *,
+    database_options: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """Create a temporary StateStore + engine from a database URL.
 
@@ -139,19 +147,13 @@ async def _create_temp_store(
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
+    from dendrux.db._engine_options import engine_options, normalized_url
     from dendrux.db._schema_check import ensure_schema_current
     from dendrux.db._sqlite_sync import create_sqlite_schema
     from dendrux.runtime.state import SQLAlchemyStateStore
 
-    connect_args: dict[str, Any] = {}
-    if database_url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
-
-    engine = create_async_engine(
-        database_url,
-        echo=False,
-        connect_args=connect_args,
-    )
+    parsed = normalized_url(database_url)
+    engine = create_async_engine(parsed, **engine_options(parsed, database_options))
 
     try:
         if database_url.startswith("sqlite"):

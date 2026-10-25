@@ -29,10 +29,10 @@ import inspect
 import logging
 from typing import TYPE_CHECKING, Any
 
+from dendrux._redact import safe_exception_info
 from dendrux.errors import ImagePersistenceUnsupportedError
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
-from dendrux.runtime.context import safe_exception_info
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,

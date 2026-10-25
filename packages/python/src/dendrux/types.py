@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
     from dendrux.errors import ProviderError
     from dendrux.media import Image
+    from dendrux.store import PendingPause
 
 from ulid import ULID
 
@@ -560,6 +561,25 @@ class ToolResult:
             if isinstance(self.notes, (str, bytes)):
                 raise TypeError("ToolResult.notes must be a sequence of strings")
             object.__setattr__(self, "notes", tuple(self.notes))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], *, limits: Limits | None = None) -> ToolResult:
+        """Validate a client object; replace oversized payloads using B12 caps.
+
+        Only image references are accepted, never inline bytes or trusted meta.
+        """
+        from dendrux._wire import tool_result_from_dict
+
+        return tool_result_from_dict(data, limits or Limits())
+
+    @classmethod
+    def list_from_dict(
+        cls, data: list[dict[str, Any]], *, limits: Limits | None = None, max_results: int = 1000
+    ) -> list[ToolResult]:
+        """Validate unique results, bounded count and aggregate max_input_bytes."""
+        from dendrux._wire import tool_results_from_dict
+
+        return tool_results_from_dict(data, limits or Limits(), max_results)
 
 
 def tool_result_message(result: ToolResult) -> Message:
@@ -1197,6 +1217,20 @@ class RunResult:
     stop_reason: StopReason | None = None
     error_info: ErrorInfo | None = None
     pause_id: str | None = None
+
+    pending: PendingPause | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Version-1 browser DTO; excludes unrestricted output, traces and payloads.
+
+        Known PII is replaced with placeholders. This is not general serialization:
+        arbitrary ``output`` is represented by null. ``pending`` is the active pause,
+        with approval/input arguments from the recorded placeholder view. Client
+        arguments can be sensitive; routes must also authorize the actor and run.
+        """
+        from dendrux._wire import result_to_dict
+
+        return result_to_dict(self)
 
     @property
     def truncated(self) -> bool:

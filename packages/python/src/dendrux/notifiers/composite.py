@@ -9,8 +9,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from dendrux._redact import safe_exception_info
 from dendrux.loops.base import BaseNotifier, LoopNotifier
-from dendrux.runtime.context import safe_exception_info
 
 if TYPE_CHECKING:
     from dendrux.types import LLMResponse, Message, RunResult, ToolCall, ToolDef, ToolResult

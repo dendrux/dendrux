@@ -2499,6 +2499,51 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         return await retry_transient_db(attempt, label="release_run_claim", run_id=run_id)
 
+    async def _get_result_record(self, run_id: str, *, tenant_id: TenantScope) -> RunRecord | None:
+        """Project one browser-result record without prompts or pause history.
+
+        Private optimization; custom stores keep the existing scoped get_run
+        contract. All reads use the same tenant predicate as get_run.
+        """
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        stop_key = "dendrux.stop_reason"
+
+        fields = (
+            AgentRun.id,
+            AgentRun.agent_name,
+            AgentRun.status,
+            AgentRun.tenant_id,
+            AgentRun.iteration_count,
+            AgentRun.error,
+            AgentRun.cancel_requested,
+            AgentRun.total_input_tokens,
+            AgentRun.total_output_tokens,
+            AgentRun.total_cache_read_tokens,
+            AgentRun.total_cache_creation_tokens,
+            AgentRun.total_reasoning_tokens,
+            AgentRun.total_cost_usd,
+            AgentRun.output_data["answer"].as_string().label("answer"),
+            AgentRun.meta["dendrux.error_info"].label("error_info"),
+            AgentRun.meta[stop_key].as_string().label("stop_reason"),
+        )
+        stmt = _apply_tenant_scope(select(*fields).where(AgentRun.id == run_id), tenant_id)
+        async with self._session_factory() as session:
+            row = (await session.execute(stmt)).mappings().first()
+        if row is None:
+            return None
+        values = dict(row)
+        info, stop_reason = values.pop("error_info"), values.pop("stop_reason")
+        values["total_cost_usd"] = (
+            float(values["total_cost_usd"]) if values["total_cost_usd"] is not None else None
+        )
+        return RunRecord(
+            **values,
+            meta={"dendrux.error_info": info, stop_key: stop_reason},
+        )
+
     async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunRecord | None:
         """The run, or None when it does not exist or is outside ``tenant_id``.
 
@@ -2709,7 +2754,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     # ------------------------------------------------------------------
 
     async def touch_progress(self, run_id: str) -> None:
-        """Update last_progress_at to now. Lightweight single-column UPDATE."""
+        """Update progress only while running; paused/terminal rows are untouched."""
         import datetime as _dt
 
         from sqlalchemy import update
@@ -2719,7 +2764,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async with self._session_factory() as session:
             stmt = (
                 update(AgentRun)
-                .where(AgentRun.id == run_id)
+                .where(AgentRun.id == run_id, AgentRun.status == "running")
                 .values(last_progress_at=_dt.datetime.now(_dt.UTC))
             )
             await session.execute(stmt)

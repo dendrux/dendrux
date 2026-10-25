@@ -1,0 +1,86 @@
+# Scaling Dendrux workers
+
+Build the store once at worker startup and pass it to the agents that serve that worker. The application owns its store, shutdown sequence, authentication and run ownership checks. A tenant scope restricts a database read; the route must also authorize the signed-in actor.
+
+[//]: # "docs-test: skip - application lifecycle and an already migrated production database are required"
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+from dendrux import Agent
+from dendrux.runtime.state import SQLAlchemyStateStore
+from dendrux.store import RunStore
+
+engine = create_async_engine(
+    "postgresql+asyncpg://user:password@database/app",
+    pool_size=5,
+    max_overflow=0,
+    pool_timeout=10,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
+state = SQLAlchemyStateStore(engine)
+reads = RunStore.from_engine(engine)
+agent = Agent(
+    name="worker",
+    prompt="Help the user.",
+    provider="openai:gpt-4o-mini",
+    state_store=state,
+)
+# Start application requests here, then drain them before shutdown.
+await agent.close()
+await reads.close()
+await engine.dispose()
+```
+
+For applications that only need the runtime store, construct SQLAlchemyStateStore over one async engine and pass that state_store to Agent. RunStore.from_engine supplies the read facade over the same engine. The developer retains ownership of that engine and disposes it after all work and readers have stopped. Avoid holding a database session while awaiting an agent run, a tool, or a browser.
+
+## Pool sizing per worker
+
+Each worker process has its own pools. Budget the sum of pool_size plus max_overflow across all processes, readers, maintenance jobs and other applications against the database connection limit. Reserve headroom for migrations and operations. Choose a finite pool_timeout so overload waits briefly and fails visibly rather than building an unlimited connection backlog. A smaller dedicated reader pool can isolate viewer traffic from running agents.
+
+Agent with an explicit database_url shares one process-wide engine for the normalized URL and database_options. Concurrent first callers share initialization. Each initialized Agent holds one reference. Agent.close releases that reference; the last release disposes the engine. Different options deliberately select different pools. Close every Agent, including failed requests, and construct workers after forking. Async PostgreSQL pools belong to their creating event loop; using them on another loop is refused. Build one store per worker loop instead of calling asyncio.run per request.
+
+The legacy environment-variable engine owns its singleton reference until reset_engine or process exit. At process exit pools are retired synchronously and the operating system closes sockets; explicit awaited shutdown is the graceful path. A store created by RunStore.from_database_url owns its engine and must also be closed.
+
+## Managed database idle timeouts
+
+For non-SQLite URLs, the SDK defaults pool_pre_ping to True and pool_recycle to 1800 seconds. Pre-ping checks a connection at checkout and replaces disconnected idle connections. Recycling replaces old connections at checkout. Choose a recycle interval shorter than a managed database or proxy's idle cutoff. database_options can override either setting on Agent, RunStore.from_database_url, sweep and the environment engine.
+
+Pre-ping cannot recover an arbitrary transaction killed while it is executing. SDK persistence has bounded retries where safe; application tools with external side effects still need application-level idempotency. Apply database timeouts and monitor failures rather than retrying a whole run blindly.
+
+## PgBouncer transaction mode
+
+Disable both asyncpg statement caches in transaction mode. Keep runtime work transactional and avoid session-level SET, session advisory locks, temporary tables or LISTEN on a pooled runtime connection. The SDK uses transaction-level advisory locking for note insertion; that lock is released with the transaction.
+
+[//]: # "docs-test: skip - requires a configured external PgBouncer endpoint"
+```python
+options = dict(
+    pool_size=5,
+    max_overflow=0,
+    connect_args=dict(
+        statement_cache_size=0,
+        prepared_statement_cache_size=0,
+    ),
+)
+```
+
+Run dendrux db migrate once as a deploy job over a direct PostgreSQL session connection. Pod startup must not run a migration independently. The migration's session advisory lock and scoped lock_timeout settings are confined to this direct connection. Concurrent index operations have bounded lock waits and a timed-out invalid build is repaired on retry. Finish the migration before starting abandoned-waiting sweeps.
+
+## Sweep cadence
+
+Schedule sweep from developer-owned maintenance code at startup and at an interval appropriate to the application. Set stale_running beyond the longest legitimate gap between progress updates, including model calls and tools. Running tools can call heartbeat to report actual progress; progress writes affect running rows only.
+
+The single integer max_runs defaults to 10000 and has a ceiling of 100000 for each category. All waiting statuses share their waiting category's cap. Pages default to 100 projected rows and are capped at 1000. Fresh running rows and losing compare-and-swap attempts count against the candidate bound. Monitor the structured sweep_cap_reached warning, which includes category, cap and inspected count. Increase the bound or repeat maintenance when needed. There is no resumable cursor or return-level more-results field.
+
+Waiting abandonment checks both the status-transition clock and updated_at in its final atomic update, protecting pauses written by older workers. A recent metadata edit conservatively delays abandonment. Zombie tool threads cannot renew paused or terminal runs through heartbeat. Candidate scans remain indexed by status and transition time; heartbeat timestamps are not indexed, keeping progress writes eligible for PostgreSQL HOT updates.
+
+## Read replicas
+
+Read replicas are a developer-owned deployment choice. Keep claims, tool submissions, cancellation, migrations and sweeps on the writer. Replica lag can delay pending state and event visibility; a UI should not use a replica's stale pause as authority to submit a decision. Submissions must validate the current pause_id on the writer. Choose where authorized reads and follow polling run, how lag is monitored, and when the application routes a read back to the writer.
+
+## Browser result boundaries
+
+RunResult.to_dict is an allowlisted wire envelope with independent integer wire_version 1. It contains run_id, status, pending, answer, output and safe error_info. It never serializes prompts, traces, metadata, PII maps, tool payloads or image bytes. Unrestricted application output is null by default; expose any application-specific structured result through a separately authorized, explicit app schema.
+
+Known PII in display values is replaced with placeholders. Approval and human-input call arguments come from the recorded model-sent view used by RunStore.get_pending. Missing verified arguments are hidden; args_hidden requires server-side resolution, never approval of an empty object. Pending client-tool arguments may be sensitive, so authorize the actor as well as the tenant and run. Clients should reject unknown wire versions and tolerate additive fields within a supported version.
+
+ToolResult.from_dict validates names, call IDs, finite JSON and image references. Oversized untrusted wire payloads are replaced with the B12 size-limit result. ToolResult.list_from_dict rejects duplicate IDs, bounds count to 1000 by default, accepts max_results up to 10000 and bounds aggregate payload bytes by Limits.max_input_bytes. These parsers do not replace HTTP request-body limits or server-side pause/call-ID checks. Browser tool results remain client assertions.

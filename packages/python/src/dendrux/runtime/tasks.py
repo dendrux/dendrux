@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
-from dendrux.runtime.context import safe_exception_info
+from dendrux._redact import safe_exception_info
 
 logger = logging.getLogger(__name__)
 

@@ -1032,14 +1032,63 @@ class TestDeadlines:
         with pytest.raises(ProviderTimeoutError):
             await drain(provider.complete_stream(USER))
 
-    async def test_steady_events_keep_the_stream_alive(self) -> None:
+    async def test_steady_events_keep_the_stream_alive(
+        self, monkeypatch, controlled_deadlines, deadline_arms
+    ) -> None:
+        from types import SimpleNamespace
+
+        # Use real provider/SSE parsing but control the clock's elapsed time
+        # and deadline firing independently of CI worker scheduling.
+        virtual_now = [0.0]
+        opened = []
+        initialize = _resilience.StreamClock.__init__
+
+        def observe_clock(clock, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            before = loop.time()
+            initialize(clock, *args, **kwargs)
+            after = loop.time()
+            opened.append((before, after))
+            virtual_now[0] = after
+            clock._loop = SimpleNamespace(time=lambda: virtual_now[0])
+
+        monkeypatch.setattr(_resilience.StreamClock, "__init__", observe_clock)
         provider = chat_provider(stream_idle_timeout=0.3)
-        parts: list[bytes | float] = []
-        for i in range(6):
-            parts += [0.1, sse((None, c_chunk(str(i))))]
-        wire(provider, stream_handler([*parts, sse((None, c_chunk(finish="stop")))]))
-        events = await drain(provider.complete_stream(USER))
-        assert events[-1].raw.text == "012345"
+        requested = asyncio.Queue()
+        responses = asyncio.Queue()
+        parts = [sse((None, c_chunk(str(i)))) for i in range(6)]
+        parts.append(sse((None, c_chunk(finish="stop"))))
+
+        class GatedBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for i in range(len(parts)):
+                    requested.put_nowait(i)
+                    yield await responses.get()
+
+        wire(provider, lambda request: httpx.Response(200, stream=GatedBody()))
+        consumer = asyncio.create_task(drain(provider.complete_stream(USER)))
+        previous_deadline = None
+        try:
+            async with asyncio.timeout(20):
+                for i, part in enumerate(parts):
+                    assert await requested.get() == i
+                    assert deadline_arms, "an upstream pull must have an armed idle deadline"
+                    when = deadline_arms[-1][1]
+                    assert when is not None
+                    if i == 0:
+                        before, after = opened[0]
+                        assert before + 0.3 <= when <= after + 0.3
+                    else:
+                        assert when == pytest.approx(virtual_now[0] + 0.3, rel=0, abs=1e-9)
+                        assert when > previous_deadline, "every semantic delta must renew idle"
+                    previous_deadline = when
+                    virtual_now[0] += 0.1
+                    responses.put_nowait(part)
+                events = await consumer
+            assert events[-1].raw.text == "012345"
+        finally:
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
 
     async def test_consumer_time_is_not_counted(self) -> None:
         provider = chat_provider(stream_idle_timeout=0.2)
