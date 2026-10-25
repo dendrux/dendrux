@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux.tools._coerce import (
@@ -61,15 +62,17 @@ class MalformedToolSchemaError(ValueError):
 def schema_problem(schema: Any) -> str | None:
     """Why ``schema`` cannot be validated against, or ``None`` when it can.
 
-    Only shapes that would break validation count: the validator is tolerant
-    of everything else (unknown keywords, odd property schemas) by design.
+    The one shape checked is ``required``: when the key is present (even as
+    ``null``) it must be a list of argument names. The validator is tolerant
+    of everything else (unknown keywords, odd property schemas, unsupported
+    constructs) by design, and skips what it does not implement.
     """
     if not isinstance(schema, dict):
         return None
-    required = schema.get("required")
-    if required is not None and (
-        not isinstance(required, list) or not all(isinstance(r, str) for r in required)
-    ):
+    if "required" not in schema:
+        return None
+    required = schema["required"]
+    if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
         return "required must be a list of argument names"
     return None
 
@@ -79,6 +82,39 @@ class _Problem(NamedTuple):
 
     text: str
     value: Any = None
+
+
+# U+0000 cannot be stored in Postgres JSONB; a lone surrogate cannot be encoded as UTF-8.
+_UNPERSISTABLE = re.compile("[\x00\ud800-\udfff]")
+
+
+def has_unpersistable_text(value: Any) -> bool:
+    """Whether any string key or value, at any depth, holds U+0000 or a lone surrogate.
+
+    Iterative, so nesting depth cannot exhaust the stack.
+    """
+    stack: list[Any] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if _UNPERSISTABLE.search(node):
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+    return False
+
+
+def unpersistable_result(tool_call: ToolCall) -> ToolResult:
+    """The ``invalid_params`` failure for text that cannot be stored; it quotes nothing."""
+    message = (
+        f"An argument for `{tool_call.name}` contains a character that cannot be stored "
+        "(U+0000 or an unpaired surrogate), in a name or a value. The call was not made; "
+        "send it again without such characters."
+    )
+    return invalid_params_result(tool_call, message)
 
 
 def _unknown_names_problem(tool_name: str, unknown: list[Any]) -> _Problem:
@@ -213,11 +249,16 @@ def check_tool_call(
     A problem caused by one of ``placeholders`` (redacted PII the tool may
     not receive) is reported as ``code="pii_placeholder"``. A tool whose own
     argument schema cannot be validated against is refused with
-    ``code="invalid_tool_schema"`` instead of raising.
+    ``code="invalid_tool_schema"`` instead of raising. Params holding U+0000
+    or a lone surrogate (in any key or value, at any depth) are refused with
+    ``invalid_params`` for every tool, known or not, before anything runs or
+    pauses; the message quotes none of the content.
     """
     json_result = check_tool_json(tool_call)
     if json_result is not None:
         return json_result
+    if has_unpersistable_text(tool_call.params):
+        return unpersistable_result(tool_call)
     if tool_def is None:
         return None
     return _check_params(tool_call, tool_def, placeholders)

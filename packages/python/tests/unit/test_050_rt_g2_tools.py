@@ -380,3 +380,140 @@ class TestMalformedSchemaAtDiscovery:
         with pytest.raises(ValueError, match="malformed") as caught:
             self._build(strict=True)
         assert "bad" in str(caught.value)
+
+
+class TestRequiredPresenceIsTestedSeparatelyFromValue:
+    @pytest.mark.parametrize("required", [None, "x", 3, {"x": 1}, [None], ["x", 1]])
+    def test_a_present_but_malformed_required_is_a_typed_rejection(self, required: Any) -> None:
+        td = _td({"type": "object", "properties": {"x": {"type": "string"}}, "required": required})
+        result = check_tool_call(ToolCall("remote", {}), td)
+        assert result is not None
+        assert result.meta == {"code": "invalid_tool_schema"}
+        assert validate_tool_params(td, {}) == ["remote has a malformed argument schema"]
+
+    def test_an_absent_required_is_fine(self) -> None:
+        td = _td({"type": "object", "properties": {"x": {"type": "string"}}})
+        assert check_tool_call(ToolCall("remote", {}), td) is None
+
+
+class TestMalformedSchemaViews:
+    @pytest.mark.parametrize("bad", [None, [{}], "x"])
+    def test_both_views_reject_a_malformed_required(self, bad: Any) -> None:
+        from types import SimpleNamespace
+
+        from mcp.types import Tool
+
+        from dendrux.mcp import MCPInvalidToolSchemaError, error_code_for
+        from dendrux.mcp._server import build_mcp_tool_defs
+
+        source = SimpleNamespace(name="srv", transport="stdio", call_timeout=30.0)
+        tool_obj = Tool(
+            name="bad",
+            description="",
+            input_schema={"type": "object", "properties": {"x": {}}, "required": bad},
+        )
+        defs, skipped = build_mcp_tool_defs(
+            source=source,  # type: ignore[arg-type]
+            namespace="srv",
+            tools=[tool_obj],
+            connection_info=None,
+        )
+        assert defs == []
+        assert [s.reason for s in skipped] == ["invalid_schema"]
+        with pytest.raises(MCPInvalidToolSchemaError) as caught:
+            build_mcp_tool_defs(
+                source=source,  # type: ignore[arg-type]
+                namespace="srv",
+                tools=[tool_obj],
+                connection_info=None,
+                strict=True,
+            )
+        assert isinstance(caught.value, ValueError)
+        assert error_code_for(caught.value) == "invalid_tool_schema"
+
+    def test_a_bad_name_keeps_its_own_code(self) -> None:
+        from dendrux.mcp import error_code_for
+
+        assert error_code_for(ValueError("bad rename")) == "invalid_tool_names"
+
+
+NUL = "\x00"
+LONE_SURROGATE = "\ud800"
+CALLS: list[dict[str, Any]] = []
+
+
+@tool()
+def record(note: str, extra: dict[str, Any] | None = None) -> str:
+    """Record."""
+    CALLS.append({"note": note})
+    return "ok"
+
+
+def _assert_no_content_echo(result: ToolResult) -> None:
+    blob = json.dumps([result.payload, result.error, result.meta]).lower()
+    for needle in ("\\u0000", "\\ud800", "ud800", "u0000", "surrogate:"):
+        assert needle not in blob.replace("u+0000", "").replace("u+d800", "")
+
+
+class TestUnpersistableCharactersAreRejected:
+    @pytest.mark.parametrize("bad", [NUL, LONE_SURROGATE, f"a{NUL}b", f"x{LONE_SURROGATE}y"])
+    @pytest.mark.parametrize(
+        "params",
+        [
+            lambda bad: {"note": bad},
+            lambda bad: {"note": "ok", "extra": {"deep": [{"v": bad}]}},
+            lambda bad: {"note": "ok", "extra": {bad: 1}},
+            lambda bad: {"note": "ok", "extra": {"a": {"b": {f"k{bad}": "v"}}}},
+            lambda bad: {f"n{bad}": 1},
+            lambda bad: {"note": "ok", "extra": {"a": [[["z", bad]]]}},
+        ],
+    )
+    def test_rejected_before_anything_runs(self, bad: str, params: Any) -> None:
+        call = ToolCall("record", params(bad))
+        result = prepare_tool_call(call, get_tool_def(record), record)
+        assert isinstance(result, ToolResult)
+        assert result.success is False
+        assert result.meta == {"code": "invalid_params"}
+        assert json.loads(result.payload)["code"] == "invalid_params"
+        _assert_no_content_echo(result)
+        assert bad not in (result.error or "")
+        assert bad not in result.payload
+
+    def test_rejected_for_unknown_and_client_tools_too(self) -> None:
+        call = ToolCall("nope", {"a": [{"b": NUL}]})
+        result = check_tool_call(call, None)
+        assert result is not None
+        assert result.meta == {"code": "invalid_params"}
+        td = ToolDef(name="c", description="", parameters={"type": "object"})
+        assert check_tool_call(ToolCall("c", {NUL: 1}), td) is not None
+
+    def test_ordinary_unicode_is_fine(self) -> None:
+        call = ToolCall(
+            "record",
+            {"note": "café \U0001f600 😀".encode("utf-16", "surrogatepass").decode("utf-16")},
+        )
+        assert not isinstance(prepare_tool_call(call, get_tool_def(record), record), ToolResult)
+
+    async def test_the_tool_never_runs_and_the_model_gets_a_value_free_result(self) -> None:
+        from dendrux.agent import Agent
+        from dendrux.llm.mock import MockLLM
+        from dendrux.loops.base import BaseRecorder
+        from dendrux.loops.react import ReActLoop
+        from dendrux.strategies.native import NativeToolCalling
+        from dendrux.types import LLMResponse, Role
+
+        CALLS.clear()
+        call = ToolCall(name="record", params={"note": "ok", "extra": {"k": [NUL]}})
+        llm = MockLLM([LLMResponse(tool_calls=[call]), LLMResponse(text="done")])
+        agent = Agent(prompt="p", tools=[record], provider=llm)
+        await ReActLoop().run(
+            agent=agent,
+            provider=llm,
+            strategy=NativeToolCalling(),
+            user_input="go",
+            recorder=BaseRecorder(),
+        )
+        assert CALLS == []
+        (tool_msg,) = [m for m in llm.call_history[1]["messages"] if m.role == Role.TOOL]
+        assert json.loads(tool_msg.content)["code"] == "invalid_params"
+        assert "\\u0000" not in tool_msg.content
