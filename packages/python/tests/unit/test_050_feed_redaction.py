@@ -95,8 +95,8 @@ class TestRedactFreeText:
     def test_error_text_hidden_codes_kept(self) -> None:
         err = _event("run.error", {"error": SECRET, "error_info": {"category": "rate_limit"}})
         assert redact_event(err).data == {"error_info": {"category": "rate_limit"}}
-        mcp = _event("mcp.error", {"error": SECRET, "error_type": "E", "code": "mcp_x"})
-        assert redact_event(mcp).data == {"error_type": "E", "code": "mcp_x"}
+        mcp = _event("mcp.error", {"error": SECRET, "error_type": "E", "code": "connection_failed"})
+        assert redact_event(mcp).data == {"code": "connection_failed"}
 
     def test_image_descriptions_hidden(self) -> None:
         ev = _event(

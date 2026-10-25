@@ -17,11 +17,20 @@ import dataclasses
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 from dendrux import errors as _errors
 from dendrux.errors import PROVIDER_ERROR_CATEGORIES, TIMEOUT_REASONS, ProviderError
+from dendrux.guardrails._engine import RESTORE_SKIPPED_CODE
+from dendrux.guardrails._pii import _DEFAULT_DETECTORS as _PII_DETECTORS
+from dendrux.guardrails._protocol import UNSCANNABLE
+from dendrux.guardrails._secrets import _SECRET_DETECTORS
+from dendrux.loops._budget import BUDGET_EXCEEDED, COST_USD, TOKENS, UNPRICED_CALL
+from dendrux.loops._images import WARN_DROP_WITH_THINKING
 from dendrux.loops.react import _CLIENT_APPROVAL_REASON, _HOOK_ERROR_REASON
+from dendrux.media._ids import PlaceholderReason
+from dendrux.media._policy import Origin as ImageOrigin
+from dendrux.pricing import CostSource
 from dendrux.runtime._limit_checks import INPUT_SIZE_LIMIT_CODE
 from dendrux.runtime._pending import approval_calls, check_read_bool, unknown_tool_calls
 from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
@@ -32,6 +41,7 @@ from dendrux.tools._validate import (
     INVALID_PARAMS_CODE,
     PII_PLACEHOLDER_CODE,
 )
+from dendrux.types import BudgetAction, RunStatus, StopReason
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
@@ -77,8 +87,6 @@ PROVIDER_ERROR_TYPES = frozenset(
     for name, value in vars(_errors).items()
     if isinstance(value, type) and issubclass(value, ProviderError)
 )
-_CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,63}")
-_RETRY_AFTER = re.compile(r"\d{1,10}")
 
 
 def is_one_of(value: object, choices: Collection[str]) -> bool:
@@ -122,18 +130,80 @@ class _Context:
 
 _HIDE: Any = object()
 Check = Callable[[Any], Any]
-_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
-_HEX = re.compile(r"[0-9a-f]{8,128}")
-_PLACEHOLDER = re.compile(r"<<[A-Z][A-Z_]*_\d+>>")
-_PATH = re.compile(r"[A-Za-z0-9_./:-]{1,256}")
-_PARSE_ERROR = re.compile(r"[A-Za-z ',\\:]{1,80} at char \d{1,10}")
 UNKNOWN_CODE = "<unknown_code>"
 """Shown instead of a ``tool.completed`` code Dendrux does not produce."""
+CUSTOM_KIND = "<custom_kind>"
+"""Shown instead of a guardrail finding kind that is not one of Dendrux's built-in kinds."""
 
-
-def _code(value: Any) -> Any:
-    """A Dendrux constant code (an enum value written by Dendrux code)."""
-    return value if value is None or (isinstance(value, str) and _CODE.fullmatch(value)) else _HIDE
+# Enumerations of every constant a shown field may hold, each from its writer.
+# A shape check (regex, length) never makes a field safe: a value is shown
+# only when it is in one of these sets, or it is a number, a bool, an id
+# Dendrux generated, a digest Dendrux computed, or a developer-declared name
+# whose writer only ever copies it from configuration.
+_RUN_STATUSES = frozenset(s.value for s in RunStatus)
+_PAUSE_STATUSES = frozenset(
+    {"waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"}
+)
+_STOP_REASONS = frozenset(get_args(StopReason))
+_PAUSE_REASONS = frozenset({"requested", "budget"})  # react pause_reason
+_TARGETS = frozenset({"client", "server"})  # tool(target=...)
+_CANCEL_REASONS = frozenset(
+    {"cancel_requested", "task_cancelled", "stream_closed", BUDGET_EXCEEDED}
+)
+_FAILURE_REASONS = frozenset(
+    {"stale_running", "never_started", "abandoned_waiting", "guardrail_blocked", BUDGET_EXCEEDED}
+)
+_BUDGET_METRICS = frozenset({TOKENS, COST_USD})
+_BUDGET_REASONS = frozenset({"threshold_crossed", BUDGET_EXCEEDED, UNPRICED_CALL})
+_BUDGET_ACTIONS = frozenset(get_args(BudgetAction))
+_APPROVAL_SOURCES = frozenset({"static", "hook"})
+_DECISIONS = frozenset({"approved", "rejected", "mixed"})
+_CALL_DECISIONS = frozenset({"approved", "denied"})
+_COST_SOURCES = frozenset(get_args(CostSource))
+_PHASES = frozenset({"commentary", "final_answer"})
+_DIRECTIONS = frozenset({"incoming", "outgoing", "incoming_image"})
+_GUARDRAIL_CODES = frozenset({"guardrail_blocked"})
+_RESTORE_CODES = frozenset({RESTORE_SKIPPED_CODE})
+_VERDICT_ACTIONS = frozenset({"pass", "redact", "block", "warn"})
+_IMAGE_ORIGINS = frozenset(get_args(ImageOrigin))
+_PLACEHOLDER_REASONS = frozenset(get_args(PlaceholderReason))
+_IMAGE_WARNINGS = frozenset({WARN_DROP_WITH_THINKING})
+_SKILL_DELIVERY = frozenset({"inlined", "progressive"})
+_SKILL_ORIGINS = frozenset({"explicit", "inlined", "model"})
+_SKILL_FAILURES = frozenset({"timeout", "executor_unavailable", "invalid_result"})
+_SKILL_ACTIVATION = frozenset({"denied", "not_found"})
+_MCP_CODES = frozenset(
+    {
+        "authorization_required",
+        "authentication_failed",
+        "credential_error",
+        "destination_denied",
+        "circuit_open",
+        "capacity",
+        "connection_failed",
+        "connection_state",
+        "tool_name_collision",
+        "tool_not_found",
+        "invalid_tool_names",
+        "unknown",
+    }
+)  # mcp/_errors.error_code_for
+_MCP_FAILURE_MODES = frozenset({"strict", "best_effort"})  # mcp/_source.MCPFailureMode
+_MCP_AUTH_REASONS = frozenset(
+    {"not_signed_in", "expired", "revoked", "insufficient_scope", "resource_mismatch"}
+)  # mcp/_errors.MCPAuthorizationReason
+_MCP_SKIP_REASONS = frozenset({"name_unsafe", "duplicate_name", "unknown_tool"})
+_GOVERNANCE_PARTS = frozenset(
+    {"guardrails", "before_tool", "deny", "require_approval", "limits", "budget"}
+)  # runtime/submit.governance_snapshot
+BUILTIN_GUARDRAIL_KINDS = frozenset(
+    {d.name for d in _PII_DETECTORS} | {d.name for d in _SECRET_DETECTORS} | {UNSCANNABLE}
+)
+"""Finding kinds of Dendrux's built-in detectors; any other kind is shown as CUSTOM_KIND."""
+_MAX_RETRY_AFTER = 86_400
+_RETRY_AFTER = re.compile(r"\d{1,6}")
+_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+_HEX = re.compile(r"[0-9a-f]{8,128}")
 
 
 def _enum(choices: Collection[str]) -> Check:
@@ -149,24 +219,24 @@ def _bool(value: Any) -> Any:
     return value if value is None or isinstance(value, bool) else _HIDE
 
 
-def _ident(value: Any) -> Any:
-    """A Dendrux-generated id (run, call, pause, note, image) or a class name."""
+def _generated_id(value: Any) -> Any:
+    """An id Dendrux generated (run, call, pause, note, image id). Provenance: the
+    writer passes a ``generate_ulid()`` / ``image_id()`` value; the check only
+    rejects malformed rows."""
     return value if value is None or (isinstance(value, str) and _ID.fullmatch(value)) else _HIDE
 
 
-def _hex(value: Any) -> Any:
-    """A digest Dendrux computed."""
+def _digest(value: Any) -> Any:
+    """A digest Dendrux computed (sha256, governance and skill digests)."""
     return value if value is None or (isinstance(value, str) and _HEX.fullmatch(value)) else _HIDE
 
 
-def _name(value: Any) -> Any:
-    """A developer-declared identifier (agent, tool, skill, guardrail, entity kind, source)."""
+def _declared(value: Any) -> Any:
+    """A developer-declared identifier. Provenance: the writer copies it from the
+    developer's configuration, or only after checking it against that
+    configuration (a declared tool, skill, source or guardrail)."""
     ok = value is None or (isinstance(value, str) and 0 < len(value) <= 255)
     return value if ok else _HIDE
-
-
-def _matching(pattern: re.Pattern[str]) -> Check:
-    return lambda value: value if isinstance(value, str) and pattern.fullmatch(value) else _HIDE
 
 
 def _list(check: Check) -> Check:
@@ -182,16 +252,29 @@ def _obj(schema: dict[str, Check]) -> Check:
     return lambda value: _apply(schema, value) if isinstance(value, dict) else _HIDE
 
 
-def _counts(value: Any) -> Any:
-    """``{kind: count}`` with declared kinds and numeric counts."""
-    if not isinstance(value, dict):
-        return _HIDE
-    return {k: v for k, v in value.items() if _name(k) is not _HIDE and _num(v) is not _HIDE}
+def _kind(value: Any) -> str:
+    return value if is_one_of(value, BUILTIN_GUARDRAIL_KINDS) else CUSTOM_KIND
 
 
 def _kinds(value: Any) -> Any:
-    """Entity kinds as a list or a ``{kind: count}`` map."""
-    return _counts(value) if isinstance(value, dict) else _list(_name)(value)
+    """Finding kinds as a list or a ``{kind: count}`` map; custom kinds merged
+    into CUSTOM_KIND (their counts are summed)."""
+    if isinstance(value, dict):
+        merged: dict[str, Any] = {}
+        for key, count in value.items():
+            if _num(count) is not _HIDE and count is not None:
+                merged[_kind(key)] = merged.get(_kind(key), 0) + count
+        return merged
+    if isinstance(value, list):
+        return sorted({_kind(item) for item in value})
+    return _HIDE
+
+
+def _retry_after(value: Any) -> Any:
+    """The retry-after header only as a bounded whole number of seconds."""
+    if isinstance(value, str) and _RETRY_AFTER.fullmatch(value) and int(value) <= _MAX_RETRY_AFTER:
+        return int(value)
+    return _HIDE
 
 
 def _apply(schema: dict[str, Check], data: dict[str, Any]) -> dict[str, Any]:
@@ -203,108 +286,107 @@ def _apply(schema: dict[str, Check], data: dict[str, Any]) -> dict[str, Any]:
     return shown
 
 
-# Provenance of every shown field, by writer. "dendrux": a constant or
-# number Dendrux code writes; "declared": a name the developer configured;
-# "id": an id Dendrux generated. Everything else is hidden.
-_EXCEEDED = _obj({"metric": _code, "used": _num, "max": _num})  # dendrux (budget)
+_EXCEEDED = _obj({"metric": _enum(_BUDGET_METRICS), "used": _num, "max": _num})
 _ERROR_INFO = _obj(
     {
-        "category": _enum(PROVIDER_ERROR_CATEGORIES),  # dendrux enum
-        "retryable": _bool,  # dendrux
-        "error_type": _enum(PROVIDER_ERROR_TYPES),  # dendrux ProviderError class names
-        "provider": _name,  # declared: the adapter's provider name, never the vendor's text
-        "status_code": _num,  # number
-        "timeout_reason": _enum(TIMEOUT_REASONS),  # dendrux enum
-        # hidden: safe_message (embeds provider_code), model (vendor-reported),
-        # provider_code (vendor-supplied)
+        "category": _enum(PROVIDER_ERROR_CATEGORIES),
+        "retryable": _bool,
+        "error_type": _enum(PROVIDER_ERROR_TYPES),
+        "provider": _declared,  # the adapter's provider name (approved, round 2)
+        "status_code": _num,
+        "timeout_reason": _enum(TIMEOUT_REASONS),
+        # hidden: safe_message (embeds provider_code), model, provider_code
     }
 )
 _PENDING_CALL: dict[str, Check] = {
-    "id": _ident,
-    "name": _name,
-    "target": _code,
+    "id": _generated_id,
+    "name": _declared,  # a pending call is a declared tool (unknown tools never pause)
+    "target": _enum(_TARGETS),
     "args_hidden": _bool,
 }
 _SCHEMAS: dict[str, dict[str, Check]] = {
-    # runtime/runner.py: agent name (declared), retry_of (id); system_prompt hidden
-    "run.started": {"agent_name": _name, "retry_of": _ident},
-    # runner._pause_event_data: status/reason (dendrux), pause_id (id), pending calls
-    # (validated declared names, Dendrux ids); params only for the active pause;
+    # runtime/runner.py: Agent(name=...) and the retried run's id
+    "run.started": {"agent_name": _declared, "retry_of": _generated_id},
+    # runner._pause_event_data; params only for the active pause (in _special);
     # message (a person's request_pause reason) hidden
     "run.paused": {
-        "status": _code,
-        "pause_id": _ident,
-        "reason": _code,
+        "status": _enum(_PAUSE_STATUSES),
+        "pause_id": _generated_id,
+        "reason": _enum(_PAUSE_REASONS),
         "exceeded": _list(_EXCEEDED),
         "pending_tool_calls": _list(_obj(_PENDING_CALL)),
     },
-    # runner resume: resumed_from (dendrux), submitted_results (ids, names checked
-    # against the pause, bools, counts); user_input hidden
+    # runner resume; submitted names were checked against the pause's calls
     "run.resumed": {
-        "resumed_from": _code,
+        "resumed_from": _enum(_PAUSE_STATUSES),
         "image_count": _num,
         "submitted_results": _list(
-            _obj({"call_id": _ident, "name": _name, "success": _bool, "image_count": _num})
+            _obj(
+                {
+                    "call_id": _generated_id,
+                    "name": _declared,
+                    "success": _bool,
+                    "image_count": _num,
+                }
+            )
         ),
     },
-    # runner finish: status, stop_reason (normalized enum), truncated
-    "run.completed": {"status": _code, "stop_reason": _code, "truncated": _bool},
-    # runner error: error text hidden; error_info reduced to Dendrux fields
+    "run.completed": {
+        "status": _enum(_RUN_STATUSES),
+        "stop_reason": _enum(_STOP_REASONS),
+        "truncated": _bool,
+    },
     "run.error": {
-        "status": _code,
-        "stop_reason": _code,
+        "status": _enum(_RUN_STATUSES),
+        "stop_reason": _enum(_STOP_REASONS),
         "truncated": _bool,
         "error_info": _ERROR_INFO,
     },
-    # runner/state cancel paths: all dendrux constants and bools
     "run.cancelled": {
-        "reason": _code,
+        "reason": _enum(_CANCEL_REASONS),
         "interrupted": _bool,
         "partial_output": _bool,
         "exceeded": _list(_EXCEEDED),
-        "failure_reason": _code,
+        "failure_reason": _enum(_FAILURE_REASONS),
     },
-    "run.interrupted": {"failure_reason": _code},  # state sweep
-    "run.abandoned": {"failure_reason": _code},  # state sweep
-    # loops/react.py gates: tool (declared, unknown tools never gated), call id, source;
-    # reason only "requires_approval" (a hook's reason is hidden); params when active
+    "run.interrupted": {"failure_reason": _enum(_FAILURE_REASONS)},
+    "run.abandoned": {"failure_reason": _enum(_FAILURE_REASONS)},
+    # loops/react.py: gated calls are declared tools; params in _special
     "approval.requested": {
-        "tool_name": _name,
-        "call_id": _ident,
-        "source": _code,
+        "tool_name": _declared,
+        "call_id": _generated_id,
+        "source": _enum(_APPROVAL_SOURCES),
         "reason": _enum(_CONSTANT_APPROVAL_REASONS),
     },
-    # runner._decided_payload: decisions with Dendrux's constant denial reasons only
     "approval.decided": {
-        "decision": _code,
-        "run_id": _ident,
+        "decision": _enum(_DECISIONS),
+        "run_id": _generated_id,
         "decisions": _list(
             _obj(
                 {
-                    "call_id": _ident,
-                    "tool_name": _name,
-                    "decision": _code,
+                    "call_id": _generated_id,
+                    "tool_name": _declared,
+                    "decision": _enum(_CALL_DECISIONS),
                     "reason": _enum(_CONSTANT_DENIAL_REASONS),
                 }
             )
         ),
     },
-    # react policy paths: declared tool names (hooks run on declared tools), constants
+    # react policy paths: hooks run on declared tools; error_type (a class name) hidden
     "policy.denied": {
-        "tool_name": _name,
-        "call_id": _ident,
-        "source": _code,
+        "tool_name": _declared,
+        "call_id": _generated_id,
+        "source": _enum(_APPROVAL_SOURCES),
         "reason": _enum(_CONSTANT_DENIAL_REASONS),
     },
-    "policy.substituted": {"tool_name": _name, "call_id": _ident},
-    "policy.hook_error": {"tool_name": _name, "call_id": _ident, "error_type": _ident},
+    "policy.substituted": {"tool_name": _declared, "call_id": _generated_id},
+    "policy.hook_error": {"tool_name": _declared, "call_id": _generated_id},
     "policy.hook_warning": {
-        "tool_name": _name,
-        "call_id": _ident,
+        "tool_name": _declared,
+        "call_id": _generated_id,
         "warning": _enum({_CLIENT_APPROVAL_REASON}),
     },
-    # runtime/persistence.py: usage numbers, Dendrux cost source and phase;
-    # model hidden (the provider reports it)
+    # runtime/persistence.py: numbers and enumerations; model hidden
     "llm.completed": {
         "input_tokens": _num,
         "output_tokens": _num,
@@ -312,158 +394,172 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "cache_creation_input_tokens": _num,
         "reasoning_tokens": _num,
         "cost_usd": _num,
-        "cost_source": _code,
+        "cost_source": _enum(_COST_SOURCES),
         "usage_reported": _bool,
         "has_tool_calls": _bool,
-        "phase": _enum({"commentary", "final_answer"}),
+        "phase": _enum(_PHASES),
     },
     "llm.failed": {
         "error_info": _ERROR_INFO,
         "timeout_reason": _enum(TIMEOUT_REASONS),
         "duration_ms": _num,
     },
-    # persistence.on_tool_completed: name decided in _tool_completed, code enumerated
+    # persistence: tool_name and code decided in _special; parse_error hidden
+    # (a provider adapter may set it), raw_length kept
     "tool.completed": {
-        "tool_name": _name,
-        "target": _code,
+        "tool_name": _declared,
+        "target": _enum(_TARGETS),
         "success": _bool,
         "duration_ms": _num,
         "zombie_threads": _num,
         "raw_length": _num,
         "image_count": _num,
-        "parse_error": _matching(_PARSE_ERROR),  # json decoder message and offset
     },
-    # llm/_retry_telemetry.py: numbers; endpoint is the configured base URL's path;
-    # retry_after only as digits (the header is vendor text)
-    "provider.retry": {
-        "status_code": _num,
-        "attempt": _num,
-        "endpoint": _matching(_PATH),
-        "retry_after": _matching(_RETRY_AFTER),
+    # llm/_retry_telemetry.py: endpoint (request path) hidden; retry_after a number
+    "provider.retry": {"status_code": _num, "attempt": _num, "retry_after": _retry_after},
+    # guardrail paths: kinds are a scanner's output, so only built-in kinds are named
+    "guardrail.blocked": {
+        "direction": _enum(_DIRECTIONS),
+        "code": _enum(_GUARDRAIL_CODES),
+        "kinds": _kinds,
+        "counts": _kinds,
     },
-    # react guardrail paths: direction/code (dendrux), kinds and counts (declared
-    # entity kinds); error and location hidden (they embed provider call ids)
-    "guardrail.blocked": {"direction": _code, "code": _code, "kinds": _kinds, "counts": _counts},
-    "guardrail.detected": {"direction": _code, "findings_count": _num, "entities": _kinds},
-    "guardrail.redacted": {"direction": _code, "entities": _kinds},
-    # runner: placeholders are tokens of Dendrux's placeholder grammar only
-    "guardrail.unmapped_placeholder": {"placeholders": _list(_matching(_PLACEHOLDER))},
+    "guardrail.detected": {
+        "direction": _enum(_DIRECTIONS),
+        "findings_count": _num,
+        "entities": _kinds,
+    },
+    "guardrail.redacted": {"direction": _enum(_DIRECTIONS), "entities": _kinds},
+    # runner: placeholder-shaped tokens the model wrote: only their count (in _special)
+    "guardrail.unmapped_placeholder": {},
     "guardrail.restore_skipped": {
-        "tool_name": _name,
-        "call_id": _ident,
+        "tool_name": _declared,
+        "call_id": _generated_id,
         "entities": _kinds,
         "count": _num,
-        "code": _code,
+        "code": _enum(_RESTORE_CODES),
     },
     "guardrail.image_unscanned": {"count": _num},
-    # skills/_session.py: names, revisions and paths validated against declared skills
+    # skills/_session.py: names, revisions and paths are checked against the
+    # developer's skills before they are written
     "skill.catalog_resolved": {
-        "delivery": _code,
-        "skills": _list(_obj({"name": _name, "revision": _name, "digest": _hex})),
-        "denied": _list(_name),
+        "delivery": _enum(_SKILL_DELIVERY),
+        "skills": _list(_obj({"name": _declared, "revision": _declared, "digest": _digest})),
+        "denied": _list(_declared),
     },
-    "skill.activated": {"name": _name, "digest": _hex, "origin": _code},
-    "skill.activation_failed": {"name": _name, "reason": _enum({"denied", "not_found"})},
-    "skill.resource_read": {"name": _name, "path": _name, "chars": _num, "truncated": _bool},
-    "skill.script_requested": {"name": _name, "path": _name, "argc": _num},
+    "skill.activated": {"name": _declared, "digest": _digest, "origin": _enum(_SKILL_ORIGINS)},
+    "skill.activation_failed": {"name": _declared, "reason": _enum(_SKILL_ACTIVATION)},
+    "skill.resource_read": {
+        "name": _declared,
+        "path": _declared,
+        "chars": _num,
+        "truncated": _bool,
+    },
+    "skill.script_requested": {"name": _declared, "path": _declared, "argc": _num},
     "skill.script_completed": {
-        "name": _name,
-        "path": _name,
+        "name": _declared,
+        "path": _declared,
         "exit_code": _num,
         "duration_ms": _num,
         "stdout_chars": _num,
         "stderr_chars": _num,
         "truncated": _bool,
     },
-    "skill.script_failed": {"name": _name, "path": _name, "error_type": _ident},
-    # runtime/runner.py MCP: source names (declared); exposed tool names passed the
-    # safe-name check and are the run's declared tool set; error text hidden
+    "skill.script_failed": {
+        "name": _declared,
+        "path": _declared,
+        "error_type": _enum(_SKILL_FAILURES),
+    },
+    # runtime/runner.py MCP: source names are configuration; exposed tool names
+    # are the run's tool set (approved, round 2); error text and class hidden
     "mcp.connected": {
-        "source_name": _name,
-        "namespace": _name,
+        "source_name": _declared,
+        "namespace": _declared,
         "tool_count": _num,
-        "tool_names": _list(_name),
+        "tool_names": _list(_declared),
     },
     "mcp.error": {
-        "source_name": _name,
-        "namespace": _name,
-        "error_type": _ident,
-        "code": _code,
-        "failure_mode": _code,
-        "reason": _code,
+        "source_name": _declared,
+        "namespace": _declared,
+        "code": _enum(_MCP_CODES),
+        "failure_mode": _enum(_MCP_FAILURE_MODES),
+        "reason": _enum(_MCP_AUTH_REASONS),
     },
     "mcp.tools_skipped": {
         "skipped": _list(
             _obj(
                 {
-                    "source_name": _name,
-                    "namespace": _name,
-                    "tool": _name,
-                    "reason": _enum({"name_unsafe", "duplicate_name", "unknown_tool"}),
+                    "source_name": _declared,
+                    "namespace": _declared,
+                    "tool": _declared,  # kept only for unknown_tool (_special)
+                    "reason": _enum(_MCP_SKIP_REASONS),
                 }
             )
         )
     },
-    # loops/_budget.py: metric names and reasons (dendrux), numbers
+    # loops/_budget.py
     "budget.unpriced": {
-        "metric": _code,
+        "metric": _enum(_BUDGET_METRICS),
         "used": _num,
         "max": _num,
         "unpriced_calls": _num,
         "known_cost_usd": _num,
     },
     "budget.threshold": {
-        "metric": _code,
+        "metric": _enum(_BUDGET_METRICS),
         "fraction": _num,
         "used": _num,
         "max": _num,
-        "reason": _code,
+        "reason": _enum(_BUDGET_REASONS),
     },
     "budget.exceeded": {
-        "metric": _code,
+        "metric": _enum(_BUDGET_METRICS),
         "used": _num,
         "max": _num,
-        "reason": _code,
-        "action": _code,
+        "reason": _enum(_BUDGET_REASONS),
+        "action": _enum(_BUDGET_ACTIONS),
     },
-    # runtime/submit.py: digests and governance part names (dendrux)
+    # runtime/submit.py
     "governance.changed": {
-        "expected_digest": _hex,
-        "actual_digest": _hex,
-        "changed": _list(_code),
+        "expected_digest": _digest,
+        "actual_digest": _digest,
+        "changed": _list(_enum(_GOVERNANCE_PARTS)),
     },
-    "inbox.delivered": {"note_id": _ident},  # react: note id
-    # loops/_images.py: ids, digests, the run's tenant scope, numbers; model hidden
-    # (the provider reports it)
+    "inbox.delivered": {"note_id": _generated_id},
+    # loops/_images.py: model hidden; tenant_scope is the run's own (approved)
     "image.rejected": {
-        "image_id": _ident,
-        "sha256": _hex,
-        "tenant_scope": _name,
-        "provider": _name,
+        "image_id": _generated_id,
+        "sha256": _digest,
+        "tenant_scope": _declared,
+        "provider": _declared,
         "status_code": _num,
         "located": _bool,
         "retried": _bool,
     },
     "image.view_changed": {"epoch": _num, "dropped_through": _num, "visible": _num},
-    "image.degraded": {"reason": _code, "count": _num, "slots": _list(_num)},
-    "image.warning": {"warning": _code},
+    "image.degraded": {
+        "reason": _enum(_PLACEHOLDER_REASONS),
+        "count": _num,
+        "slots": _list(_num),
+    },
+    "image.warning": {"warning": _enum(_IMAGE_WARNINGS)},
     "image.state": {
-        "tenant_scope": _name,
-        "described": _list(_obj({"sha256": _hex})),  # describer text hidden
+        "tenant_scope": _declared,
+        "described": _list(_obj({"sha256": _digest})),
         "guardrail_verdicts": _list(
             _obj(
                 {
-                    "sha256": _hex,
-                    "guardrail_id": _name,
-                    "guardrail_version": _name,
-                    "origin": _code,
-                    "tool_name": _name,
-                    "action": _code,
+                    "sha256": _digest,
+                    "guardrail_id": _declared,
+                    "guardrail_version": _declared,
+                    "origin": _enum(_IMAGE_ORIGINS),
+                    "tool_name": _declared,
+                    "action": _enum(_VERDICT_ACTIONS),
                     "entities": _kinds,
                 }
             )
         ),
-        "placeholders": _list(_obj({"slot": _num, "reason": _code})),
+        "placeholders": _list(_obj({"slot": _num, "reason": _enum(_PLACEHOLDER_REASONS)})),
     },
 }
 
@@ -490,6 +586,8 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
         declared = raw.get("reason") == "denied" and isinstance(raw.get("name"), str)
         if not declared:  # a denied name is the developer's; any other is the model's
             shown["name"] = UNKNOWN_SKILL
+    elif kind == "guardrail.unmapped_placeholder" and isinstance(raw.get("placeholders"), list):
+        shown["count"] = len(raw["placeholders"])
     elif kind == "mcp.tools_skipped":
         for item in shown.get("skipped", []):
             if item.get("reason") != "unknown_tool":  # only then the developer's name
@@ -569,10 +667,10 @@ def _redact(
     approval_params: Mapping[str, dict[str, Any]] | None,
     unknown_calls: frozenset[str] | None,
 ) -> StoredEvent:
+    if not isinstance(event.data, dict):  # malformed or empty row: nothing to show
+        return event if include_payloads is True else dataclasses.replace(event, data={})
     if not event.data:
         return event
-    if not isinstance(event.data, dict):  # malformed row: nothing to show
-        return event if include_payloads is True else dataclasses.replace(event, data={})
     data = dict(event.data)
     if (
         event.event_type == "run.paused"

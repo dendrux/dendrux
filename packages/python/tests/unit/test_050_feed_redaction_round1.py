@@ -105,7 +105,7 @@ def test_mcp_and_vendor_text_hidden() -> None:
     assert skipped["skipped"][1]["tool"] == "dev_name"
     retry = _shown("provider.retry", {"status_code": 429, "retry_after": SECRET, "attempt": 1})
     assert "retry_after" not in retry
-    assert _shown("provider.retry", {"retry_after": "12"})["retry_after"] == "12"
+    assert _shown("provider.retry", {"retry_after": "12"})["retry_after"] == 12
 
 
 @pytest.mark.parametrize(
