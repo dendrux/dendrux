@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 from dendrux._sentinel import _UnsetType
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime._pending import approval_calls as approval_calls
-from dendrux.runtime.state import _check_scope
+from dendrux.runtime._pending import check_read_int, check_read_scope, check_run_id
 from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
 
 if TYPE_CHECKING:
@@ -552,7 +552,9 @@ class EventFeed:
         terminal and every event was delivered; ``False`` keeps following.
         ``max_duration_s=None`` removes the time limit.
         """
-        _check_scope(tenant_id)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
+        check_read_int("after_sequence_index", after_sequence_index)
         if max_duration_s is not None and not max_duration_s > 0:
             raise ValueError("max_duration_s must be positive or None.")
         return Follow(

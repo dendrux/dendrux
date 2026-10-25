@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -180,6 +182,110 @@ def approval_calls(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Read-argument validation. Ids, cursors and filters often come straight from
+# a URL: a bad one is a ValueError with a fixed message (never the value, never
+# a driver error with SQL text), logged with a stable code.
+# ---------------------------------------------------------------------------
+
+MAX_READ_ID_CHARS = 255
+"""Longest run id, tenant id or name accepted by a read (the id columns' width)."""
+MAX_READ_FILTER_ITEMS = 100
+"""Most entries in a read's list filter (``event_types``, ``status``)."""
+MAX_METADATA_FILTER_KEYS = 32
+_INT32 = (-(2**31), 2**31 - 1)
+_INT64 = (-(2**63), 2**63 - 1)
+_METADATA_KEY = re.compile(r"[A-Za-z0-9_\-]{1,128}")
+
+
+def _invalid(argument: str, problem: str) -> ValueError:
+    logger.warning(
+        "invalid read argument: argument=%s code=read_argument_invalid",
+        argument,
+        extra={"code": "read_argument_invalid", "argument": argument},
+    )
+    return ValueError(f"{argument} {problem}")
+
+
+def check_read_text(argument: str, value: object, *, max_chars: int = MAX_READ_ID_CHARS) -> str:
+    """A non-empty str of at most ``max_chars`` that a database can store."""
+    if not isinstance(value, str) or not value:
+        raise _invalid(argument, "must be a non-empty str.")
+    if len(value) > max_chars:
+        raise _invalid(argument, f"must be at most {max_chars} characters.")
+    if "\x00" in value:
+        raise _invalid(argument, "must not contain U+0000.")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _invalid(argument, "must not contain unpaired surrogates.") from None
+    return value
+
+
+def check_run_id(run_id: object) -> str:
+    return check_read_text("run_id", run_id)
+
+
+def check_read_scope(tenant_id: object) -> None:
+    """``_check_scope`` plus the id rules for a string tenant."""
+    _check_scope(tenant_id)
+    if isinstance(tenant_id, str):
+        check_read_text("tenant_id", tenant_id)
+
+
+def check_read_int(
+    argument: str, value: object, *, wide: bool = False, optional: bool = True
+) -> None:
+    """An int (not bool) that fits the column: int32, or int64 when ``wide``.
+
+    None passes when ``optional``.
+    """
+    if value is None and optional:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _invalid(argument, "must be an int or None.")
+    low, high = _INT64 if wide else _INT32
+    if not low <= value <= high:
+        raise _invalid(argument, f"must be between {low} and {high}.")
+
+
+def check_read_names(argument: str, values: object, *, allow_str: bool = False) -> None:
+    """None, or a list or tuple of at most MAX_READ_FILTER_ITEMS valid strings."""
+    if values is None:
+        return
+    if allow_str and isinstance(values, str):
+        check_read_text(argument, values)
+        return
+    if not isinstance(values, (list, tuple)):
+        raise _invalid(argument, "must be a list of str or None.")
+    if len(values) > MAX_READ_FILTER_ITEMS:
+        raise _invalid(argument, f"must have at most {MAX_READ_FILTER_ITEMS} entries.")
+    for value in values:
+        check_read_text(argument, value)
+
+
+def check_metadata_filter(metadata_filter: object) -> None:
+    """None, or a dict of top-level keys to scalar JSON values (the documented contract)."""
+    if metadata_filter is None:
+        return
+    if not isinstance(metadata_filter, dict):
+        raise _invalid("metadata_filter", "must be a dict or None.")
+    if len(metadata_filter) > MAX_METADATA_FILTER_KEYS:
+        raise _invalid("metadata_filter", f"must have at most {MAX_METADATA_FILTER_KEYS} keys.")
+    for key, value in metadata_filter.items():
+        if not isinstance(key, str) or not _METADATA_KEY.fullmatch(key):
+            raise _invalid("metadata_filter", "keys must match [A-Za-z0-9_-]{1,128}.")
+        if isinstance(value, str):
+            check_read_text("metadata_filter", value, max_chars=4096)
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise _invalid("metadata_filter", "values must be finite numbers.")
+        elif isinstance(value, int) and not isinstance(value, bool):
+            check_read_int("metadata_filter", value, wide=True)
+        elif value is not None and not isinstance(value, bool):
+            raise _invalid("metadata_filter", "values must be str, int, float, bool or None.")
+
+
 def _is_postgres_store(state: Any) -> bool:
     engine = getattr(state, "_engine", None)
     dialect = getattr(getattr(engine, "dialect", None), "name", None)
@@ -322,7 +428,8 @@ class _PendingReader:
         Raises:
             RunNotFoundError: the run does not exist or is outside ``tenant_id``.
         """
-        _check_scope(tenant_id)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         getter = getattr(self._state, "get_pause_summary", None)
         if getter is not None:
             if _is_postgres_store(self._state):
@@ -354,6 +461,8 @@ class _PendingReader:
         return _pending_from(run_id, status, kind, pause, last_step)
 
     async def _status(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> str | None:
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         getter = getattr(self._state, "get_run_status", None)
         if getter is not None:
             return cast("str | None", await getter(run_id, tenant_id=tenant_id))
@@ -398,7 +507,8 @@ class _PendingReader:
 
     async def _scoped_run(self, run_id: str, tenant_id: TenantScope) -> Any:
         """The run record within ``tenant_id``, or None (missing and foreign alike)."""
-        _check_scope(tenant_id)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         if isinstance(tenant_id, _Unscoped):
             return await self._state.get_run(run_id)
         getter = self._state.get_run
@@ -416,7 +526,8 @@ class _PendingReader:
         query. A custom store's method without ``tenant_id`` gets a run
         lookup first (a run's tenant never changes, so this cannot race).
         """
-        _check_scope(tenant_id)
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         if isinstance(tenant_id, _Unscoped):
             return await method(run_id, **kwargs)
         if _accepts_tenant(method):

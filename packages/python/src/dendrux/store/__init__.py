@@ -41,6 +41,7 @@ import asyncio
 import dataclasses
 import functools
 import inspect
+import re
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -68,6 +69,12 @@ from dendrux.runtime._pending import (
 )
 from dendrux.runtime._pending import (
     _PendingReader,
+    check_metadata_filter,
+    check_read_int,
+    check_read_names,
+    check_read_scope,
+    check_read_text,
+    check_run_id,
 )
 from dendrux.runtime.state import (
     MAX_LIST_OFFSET,
@@ -75,7 +82,6 @@ from dendrux.runtime.state import (
     SQLAlchemyStateStore,
     StateStore,
     TenantScope,
-    _check_scope,
     _to_aware_utc,
     _Unscoped,
 )
@@ -497,11 +503,15 @@ class RunStore:
                 image is not live (absence and mismatch are indistinguishable).
             BlobIntegrityError: the stored bytes failed verification.
         """
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         services = self._blob_services
         accessor = services.accessor
         catalog = services.catalog
+        if not isinstance(sha256, str) or not _SHA256.fullmatch(sha256):
+            raise BlobNotFoundError(image_id(""))  # no image can have this digest
         record = await self._state.get_run(run_id)
-        missing = BlobNotFoundError(image_id(sha256 if isinstance(sha256, str) else ""))
+        missing = BlobNotFoundError(image_id(sha256))
         if record is None or (
             not isinstance(tenant_id, _Unscoped) and record.tenant_id != tenant_id
         ):
@@ -556,9 +566,11 @@ class RunStore:
         passes this to ``agent.run(..., metadata=...)``). The canonical
         chatbot pattern is ``metadata_filter={"thread_id": "..."}``;
         keys are restricted to ``[A-Za-z0-9_-]+``, nested paths are not
-        supported.
+        supported, and values must be scalars (str, int, float, bool or None).
         """
-        _check_scope(tenant_id)
+        _check_list_filters(tenant_id, status, agent_name, parent_run_id, metadata_filter)
+        check_read_int("limit", limit, wide=True, optional=False)
+        check_read_int("offset", offset, wide=True, optional=False)
         if offset > MAX_LIST_OFFSET:
             raise ValueError(f"offset must be at most {MAX_LIST_OFFSET}, got {offset}.")
         records = await self._state.list_runs(
@@ -586,7 +598,7 @@ class RunStore:
         metadata_filter: dict[str, Any] | None = None,
     ) -> int:
         """Count runs matching the same filters as ``list_runs``."""
-        _check_scope(tenant_id)
+        _check_list_filters(tenant_id, status, agent_name, parent_run_id, metadata_filter)
         return await self._state.count_runs(
             tenant_id=tenant_id,
             status=status,
@@ -623,6 +635,9 @@ class RunStore:
         timezone-aware upper bound on ``created_at``. Empty when the run is
         outside ``tenant_id``.
         """
+        check_read_int("after_sequence_index", after_sequence_index)
+        check_read_int("limit", limit, wide=True)
+        check_read_names("event_types", event_types)
         rows = await self._scoped_read(
             self._state.get_run_events,
             run_id,
@@ -656,6 +671,8 @@ class RunStore:
         """
         from dendrux.runtime.state import require_store_method
 
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         record = await require_store_method(self._state, "get_subtree")(run_id, tenant_id=tenant_id)
         if record is None:
             raise RunNotFoundError(run_id)
@@ -698,6 +715,7 @@ class RunStore:
         if isinstance(tenant_id, _OmittedType):
             _warn_stream_events_unscoped()
             tenant_id = UNSCOPED
+        check_read_int("after_sequence_index", after_sequence_index)
         run = await self._scoped_run(run_id, tenant_id)
         if run is None:
             raise RunNotFoundError(run_id)
@@ -734,6 +752,7 @@ class RunStore:
         pagination into SQL. ``before`` is an exclusive, timezone-aware
         upper bound on ``created_at``. Empty when the run is outside
         ``tenant_id``."""
+        _check_page(iteration, limit, offset)
         rows = await self._scoped_read(
             self._state.get_llm_interactions,
             run_id,
@@ -759,6 +778,7 @@ class RunStore:
         pagination into SQL. ``before`` is an exclusive, timezone-aware
         upper bound on ``created_at``. Empty when the run is outside
         ``tenant_id``."""
+        _check_page(iteration, limit, offset)
         rows = await self._scoped_read(
             self._state.get_tool_calls,
             run_id,
@@ -781,6 +801,7 @@ class RunStore:
         """Return the conversation trace (user / assistant / tool messages)
         for a run, ordered by ``order_index``. ``limit``/``offset`` push
         pagination into SQL. Empty when the run is outside ``tenant_id``."""
+        _check_page(None, limit, offset)
         rows = await self._scoped_read(
             self._state.get_traces, run_id, tenant_id, limit=limit, offset=offset
         )
@@ -819,6 +840,8 @@ class RunStore:
         """
         from dendrux.runtime.state import _Unscoped, require_store_method
 
+        check_run_id(run_id)
+        check_read_scope(tenant_id)
         get_notes = require_store_method(self._state, "get_notes")
         if not isinstance(tenant_id, _Unscoped):
             record = await self._state.get_run(run_id)
@@ -1049,6 +1072,32 @@ class RunStore:
 # ---------------------------------------------------------------------------
 # Runtime -> public type converters
 # ---------------------------------------------------------------------------
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _check_list_filters(
+    tenant_id: object,
+    status: object,
+    agent_name: object,
+    parent_run_id: object,
+    metadata_filter: object,
+) -> None:
+    """Validate ``list_runs`` / ``count_runs`` filters before any query."""
+    check_read_scope(tenant_id)
+    check_read_names("status", status, allow_str=True)
+    if agent_name is not None:
+        check_read_text("agent_name", agent_name)
+    if parent_run_id is not None:
+        check_read_text("parent_run_id", parent_run_id)
+    check_metadata_filter(metadata_filter)
+
+
+def _check_page(iteration: object, limit: object, offset: object) -> None:
+    check_read_int("iteration", iteration)
+    check_read_int("limit", limit, wide=True)
+    check_read_int("offset", offset, wide=True, optional=False)
 
 
 def _run_to_summary(record: Any) -> RunSummary:
