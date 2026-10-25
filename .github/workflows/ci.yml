@@ -105,6 +105,11 @@ jobs:
             exit 1
           fi
 
+      # Tie coverage.json to the source it measured; the ratchet rejects a stale report.
+      - name: Record coverage source digests
+        if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        run: python tools/crap_ratchet.py stamp --coverage coverage.json
+
       # Coverage is the same on every leg, so one leg judges it.
       - name: CRAP ratchet
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'

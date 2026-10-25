@@ -48,6 +48,17 @@ def test_the_python_job_checks_architecture_and_crap() -> None:
     assert "if" in crap, "run the ratchet on one matrix leg only"
 
 
+def test_coverage_is_stamped_with_source_digests_before_the_ratchet_runs() -> None:
+    names = list(_steps("python"))
+    stamp = _steps("python")["Record coverage source digests"]
+    assert "tools/crap_ratchet.py stamp" in stamp["run"]
+    assert names.index("Record coverage source digests") < names.index("CRAP ratchet")
+    assert names.index("Test") < names.index("Record coverage source digests")
+    makefile = (PKG / "Makefile").read_text()
+    test_recipe = makefile.split("\ntest:", 1)[1].split("\n\n", 1)[0]
+    assert "tools/crap_ratchet.py stamp" in test_recipe
+
+
 def test_a_job_compares_the_public_api_with_the_last_release() -> None:
     job = _jobs()["api-compat"]
     checkout = next(

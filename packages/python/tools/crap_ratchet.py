@@ -19,6 +19,7 @@ Rules enforced by ``check``:
 Run locally (from packages/python)::
 
     pytest tests --cov=src/dendrux --cov-report=json:coverage.json
+    python tools/crap_ratchet.py stamp --coverage coverage.json   # right after the tests
     python tools/crap_ratchet.py check --coverage coverage.json
     python tools/crap_ratchet.py update --coverage coverage.json   # after improving scores
     python tools/crap_ratchet.py update --allow-regress ...        # waive; listed as WAIVED
@@ -231,12 +232,46 @@ def _check_report_matches_source(rel: str, line_count: int, lines: set[int]) -> 
     return None
 
 
+def _digest_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def sidecar_path(coverage_path: Path) -> Path:
+    """Where the source digests for ``coverage_path`` live."""
+    return coverage_path.with_name(coverage_path.name + ".sources.json")
+
+
+def write_source_digests(coverage_path: Path, repo_root: Path) -> dict[str, str]:
+    """Record a SHA-256 of every source file the report covers, as it is right now.
+
+    Run straight after the tests (``make test`` and CI do), so the digests describe the
+    source that was measured. ``check`` then refuses a report whose source has changed.
+    """
+    files = json.loads(coverage_path.read_text()).get("files", {})
+    digests = {
+        rel: _digest_file(repo_root / rel) for rel in sorted(files) if (repo_root / rel).is_file()
+    }
+    sidecar_path(coverage_path).write_text(json.dumps({"files": digests}, indent=1) + "\n")
+    return digests
+
+
+def load_source_digests(coverage_path: Path) -> dict[str, str]:
+    data = json.loads(sidecar_path(coverage_path).read_text())
+    digests: dict[str, str] = data["files"]
+    return digests
+
+
 def collect_scores(
-    src_root: Path, repo_root: Path, coverage: dict[str, Any]
+    src_root: Path,
+    repo_root: Path,
+    coverage: dict[str, Any],
+    digests: dict[str, str] | None = None,
 ) -> dict[str, FunctionScore]:
     """Score every function under ``src_root``; keys are ``relpath::Qual.name``.
 
     Raises ``CoverageDataError`` when the report is missing evidence for any function.
+    With ``digests`` (relative path to SHA-256 of the source when it was measured) it also
+    refuses a file edited since: line numbers alone cannot show that a report is stale.
     """
     files = coverage.get("files", {})
     scores: dict[str, FunctionScore] = {}
@@ -253,6 +288,14 @@ def collect_scores(
         if cov is None:
             problems.append(f"{rel}: not in the coverage report")
             continue
+        if digests is not None:
+            recorded = digests.get(rel)
+            if recorded is None:
+                problems.append(f"{rel}: no recorded source digest")
+                continue
+            if recorded != _digest_file(path):
+                problems.append(f"{rel}: source changed since the coverage report was measured")
+                continue
         executed = set(cov.get("executed_lines", []))
         missing = set(cov.get("missing_lines", []))
         excluded = set(cov.get("excluded_lines", []))
@@ -395,7 +438,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("command", choices=["check", "update", "report"])
+    parser.add_argument("command", choices=["check", "update", "report", "stamp"])
     parser.add_argument("--coverage", type=Path, default=Path("coverage.json"))
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--src", type=Path, default=DEFAULT_SRC)
@@ -420,9 +463,26 @@ def main(argv: list[str] | None = None) -> int:
     if not args.coverage.exists():
         print(f"coverage file not found: {args.coverage}", file=sys.stderr)
         return 2
+    if args.command == "stamp":
+        stamped = write_source_digests(args.coverage, args.repo_root.resolve())
+        print(f"recorded source digests for {len(stamped)} files: {sidecar_path(args.coverage)}")
+        return 0
     coverage = json.loads(args.coverage.read_text())
+    if not sidecar_path(args.coverage).exists():
+        print(
+            f"no source digests next to {args.coverage}; run "
+            f"'python tools/crap_ratchet.py stamp --coverage {args.coverage}' right after the "
+            "tests (make test does this)",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        scores = collect_scores(args.src.resolve(), args.repo_root.resolve(), coverage)
+        scores = collect_scores(
+            args.src.resolve(),
+            args.repo_root.resolve(),
+            coverage,
+            load_source_digests(args.coverage),
+        )
     except CoverageDataError as exc:
         print("cannot score: the coverage report is missing evidence", file=sys.stderr)
         for problem in exc.problems:

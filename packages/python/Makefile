@@ -2,6 +2,7 @@
 
 test:
 	pytest tests/ -v -n auto --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
+	python tools/crap_ratchet.py stamp --coverage coverage.json
 
 lint:
 	ruff check .

@@ -77,6 +77,12 @@ def _cov(
     return {"files": {path: entry}}
 
 
+def _write_cov(root: Path, cov: Path, data: dict[str, Any]) -> None:
+    """Write a coverage report and the source-digest sidecar that `make test` records."""
+    cov.write_text(json.dumps(data))
+    cr.write_source_digests(cov, root)
+
+
 def _all_executed(source: str, path: str = "src/pkg/mod.py") -> dict[str, Any]:
     """Coverage in which every statement line ran: for tests about keys and complexity."""
     lines = sorted(
@@ -270,10 +276,10 @@ class TestNestedClasses:
         cov = root / "coverage.json"
         base = root / "baseline.json"
         common = ["--src", str(pkg), "--repo-root", str(root), "--coverage", str(cov)]
-        cov.write_text(json.dumps(_all_executed("def factory():\n    return 1\n")))
+        _write_cov(root, cov, _all_executed("def factory():\n    return 1\n"))
         assert cr.main(["update", *common, "--baseline", str(base)]) == 0
         (pkg / "mod.py").write_text(self.FACTORY)
-        cov.write_text(json.dumps(_all_executed(self.FACTORY)))
+        _write_cov(root, cov, _all_executed(self.FACTORY))
         assert cr.main(["check", *common, "--baseline", str(base)]) == 1
 
 
@@ -313,7 +319,7 @@ class TestMissingCoverageEvidence:
     ) -> None:
         pkg, root = _write_pkg(tmp_path)
         cov = root / "coverage.json"
-        cov.write_text(json.dumps({"files": {}}))
+        _write_cov(root, cov, {"files": {}})
         rc = cr.main(["check", "--src", str(pkg), "--repo-root", str(root), "--coverage", str(cov)])
         assert rc == 2
         assert "mod.py" in capsys.readouterr().err
@@ -344,6 +350,33 @@ class TestStaleOrPartialCoverage:
         scores = cr.collect_scores(pkg, root, _cov([1, 4, 8, 9], []))
         assert scores["src/pkg/mod.py::f"].coverage == 1.0
 
+    def test_a_stale_real_report_for_an_expanded_expression_fails(self, tmp_path: Path) -> None:
+        small = "def risky(a, b, c, d, e, f):\n    return f\n"
+        pkg, root = _write_pkg(tmp_path, small)
+        (pkg / "__init__.py").write_text("")
+        report = _run_under_coverage(root, "import pkg.mod\npkg.mod.risky(1, 2, 3, 4, 5, 6)\n")
+        cov = root / "coverage.json"
+        cov.write_text(json.dumps(report))
+        cr.write_source_digests(cov, root)
+        digests = cr.load_source_digests(cov)
+        # same statement lines, a far riskier body, no fresh measurement
+        expanded = (
+            "def risky(a, b, c, d, e, f):\n"
+            "    return (\n        a or\n        b or\n        c or\n        d or\n"
+            "        e or\n        f\n    )\n"
+        )
+        (pkg / "mod.py").write_text(expanded)
+        # the statement-line check alone is fooled: this is the bypass
+        stale = cr.collect_scores(pkg, root, report)["src/pkg/mod.py::risky"]
+        assert stale.complexity == 6 and stale.crap == pytest.approx(6.0)
+        with pytest.raises(cr.CoverageDataError, match="changed since"):
+            cr.collect_scores(pkg, root, report, digests)
+        # a fresh import-only report for the expanded source fails the threshold
+        fresh = _run_under_coverage(root, "import pkg.mod\n")
+        score = cr.collect_scores(pkg, root, fresh)["src/pkg/mod.py::risky"]
+        assert score.crap == pytest.approx(cr.crap(6, 0.0))
+        assert [v.kind for v in cr.compare({score.key: score}, {})] == ["new-over-threshold"]
+
     def test_a_stale_real_report_for_an_expanded_function_fails(self, tmp_path: Path) -> None:
         small = "def risky(a, b, c, d, e, f):\n    return f\n"
         pkg, root = _write_pkg(tmp_path, small)
@@ -358,6 +391,60 @@ class TestStaleOrPartialCoverage:
         )
         with pytest.raises(cr.CoverageDataError, match="risky"):
             cr.collect_scores(pkg, root, report)
+
+
+class TestReportIsTiedToTheMeasuredSource:
+    def test_a_matching_sidecar_is_accepted(self, tmp_path: Path) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        cov = root / "coverage.json"
+        _write_cov(root, cov, _all_executed(SRC))
+        digests = cr.load_source_digests(cov)
+        assert "src/pkg/mod.py" in digests
+        assert cr.collect_scores(pkg, root, json.loads(cov.read_text()), digests)
+
+    def test_source_edited_after_the_report_was_measured_is_rejected(self, tmp_path: Path) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        cov = root / "coverage.json"
+        _write_cov(root, cov, _all_executed(SRC))
+        digests = cr.load_source_digests(cov)
+        (pkg / "mod.py").write_text(SRC.replace("return 1", "return 11"))
+        with pytest.raises(cr.CoverageDataError, match=r"src/pkg/mod\.py.*changed since"):
+            cr.collect_scores(pkg, root, json.loads(cov.read_text()), digests)
+
+    def test_a_file_with_no_recorded_digest_is_rejected(self, tmp_path: Path) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        with pytest.raises(cr.CoverageDataError, match=r"no recorded source digest"):
+            cr.collect_scores(pkg, root, _all_executed(SRC), {})
+
+    def test_the_cli_needs_the_sidecar(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        cov = root / "coverage.json"
+        cov.write_text(json.dumps(_all_executed(SRC)))  # no stamp
+        rc = cr.main(
+            ["report", "--src", str(pkg), "--repo-root", str(root), "--coverage", str(cov)]
+        )
+        assert rc == 2
+        assert "stamp" in capsys.readouterr().err
+
+    def test_the_cli_rejects_a_stale_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        cov = root / "coverage.json"
+        _write_cov(root, cov, _all_executed(SRC))
+        (pkg / "mod.py").write_text(SRC + "\n# edited\n")
+        argv = ["--src", str(pkg), "--repo-root", str(root), "--coverage", str(cov)]
+        assert cr.main(["report", *argv]) == 2
+        assert "changed since" in capsys.readouterr().err
+
+    def test_stamp_command_writes_the_sidecar(self, tmp_path: Path) -> None:
+        pkg, root = _write_pkg(tmp_path)
+        cov = root / "coverage.json"
+        cov.write_text(json.dumps(_all_executed(SRC)))
+        assert cr.main(["stamp", "--repo-root", str(root), "--coverage", str(cov)]) == 0
+        assert cr.load_source_digests(cov)["src/pkg/mod.py"]
 
 
 def _run_under_coverage(root: Path, driver: str) -> dict[str, Any]:
@@ -548,12 +635,12 @@ class TestBaseline:
     ) -> None:
         pkg, root = _write_pkg(tmp_path)
         cov = root / "coverage.json"
-        cov.write_text(json.dumps(_all_executed(SRC)))
+        _write_cov(root, cov, _all_executed(SRC))
         base = root / "baseline.json"
         common = ["--src", str(pkg), "--repo-root", str(root), "--coverage", str(cov)]
         assert cr.main(["update", *common, "--baseline", str(base)]) == 0
         lost = _all_executed(SRC)["files"]["src/pkg/mod.py"]["executed_lines"]
-        cov.write_text(json.dumps(_cov([], lost)))
+        _write_cov(root, cov, _cov([], lost))
         capsys.readouterr()
         assert cr.main(["update", *common, "--baseline", str(base)]) == 1
         assert cr.main(["update", *common, "--baseline", str(base), "--allow-regress"]) == 2
@@ -592,7 +679,7 @@ class TestCli:
     def _setup(self, tmp_path: Path) -> tuple[Path, Path, Path]:
         pkg, root = _write_pkg(tmp_path)
         cov = root / "coverage.json"
-        cov.write_text(json.dumps(_all_executed(SRC)))
+        _write_cov(root, cov, _all_executed(SRC))
         return pkg, root, cov
 
     def test_update_then_check_passes_and_regression_fails(
@@ -605,7 +692,7 @@ class TestCli:
         assert cr.main(["check", *common, "--baseline", str(base)]) == 0
         # lose all coverage: branchy's score rises above its baseline
         lost = _all_executed(SRC)["files"]["src/pkg/mod.py"]["executed_lines"]
-        cov.write_text(json.dumps(_cov([], lost)))
+        _write_cov(root, cov, _cov([], lost))
         assert cr.main(["check", *common, "--baseline", str(base)]) == 1
         out = capsys.readouterr().out
         assert "branchy" in out
