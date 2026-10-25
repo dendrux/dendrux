@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.docs._runner import dotenv_stubs, provider_mocks
+from tests.docs._runner import dotenv_stubs, otel_globals_isolated, provider_mocks
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -31,7 +31,8 @@ def docs_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
         monkeypatch.setattr(module, name, stub)
     for module, name, mock in provider_mocks():
         monkeypatch.setattr(module, name, mock)
-    yield
+    with otel_globals_isolated():
+        yield
     from dendrux.db.session import reset_engine
 
     asyncio.run(reset_engine())

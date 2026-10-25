@@ -7,6 +7,8 @@ import asyncio
 import contextlib
 import importlib
 import inspect
+import io
+import os
 import signal
 import traceback
 from typing import TYPE_CHECKING, Any
@@ -96,18 +98,42 @@ def _stub(value: Any) -> Any:
 
 
 def dotenv_stubs() -> list[tuple[Any, str, Any]]:
-    """(module, attribute, stub) so no snippet can search for or read a ``.env`` file.
+    """(owner, attribute, replacement) cutting python-dotenv off from the file system.
 
-    python-dotenv walks up from the caller's directory to the first ``.env`` it finds, which
-    a scratch working directory does not prevent. Returns nothing when it is not installed.
+    Two layers. The public names (``load_dotenv`` and friends) are replaced for snippets
+    that import them after setup. The boundary underneath is replaced too, so a reference
+    bound earlier, a helper's own import or the ``DotEnv`` class cannot discover, open or
+    write a file either: discovery walks nothing, ``DotEnv`` reads only a stream it was
+    given, and ``rewrite`` (``set_key`` / ``unset_key``) refuses. Returns nothing when
+    python-dotenv is not installed.
     """
     try:
         import dotenv
         import dotenv.main
     except ImportError:
         return []
+
+    @contextlib.contextmanager
+    def get_stream(self: Any) -> Iterator[Any]:
+        yield self.stream if self.stream is not None else io.StringIO("")
+
+    def rewrite(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("dotenv files cannot be written in the docs sandbox")
+
+    def walk_to_root(_path: str) -> Iterator[str]:
+        return iter(())
+
     stubs = {"load_dotenv": _stub(False), "find_dotenv": _stub(""), "dotenv_values": _stub(dict)}
-    return [(module, name, stubs[name]) for module in (dotenv, dotenv.main) for name in stubs]
+    patches: list[tuple[Any, str, Any]] = [
+        (module, name, stubs[name]) for module in (dotenv, dotenv.main) for name in stubs
+    ]
+    patches += [
+        (dotenv.main.DotEnv, "_get_stream", get_stream),
+        (dotenv.main, "_walk_to_root", walk_to_root),
+        (dotenv.main, "_is_file_or_fifo", lambda _path: False),
+        (dotenv.main, "rewrite", rewrite),
+    ]
+    return patches
 
 
 def provider_mocks() -> list[tuple[Any, str, type]]:
@@ -194,6 +220,52 @@ def check_static(snippet: Snippet) -> str | None:
     return None
 
 
+@contextlib.contextmanager
+def environment_restored() -> Iterator[None]:
+    """Put ``os.environ`` back exactly as it was, whatever the code inside did to it."""
+    before = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(before)
+
+
+# (module, provider attribute, set-once attribute) for each OpenTelemetry process global.
+_OTEL_GLOBALS = (
+    ("opentelemetry.trace", "_TRACER_PROVIDER", "_TRACER_PROVIDER_SET_ONCE"),
+    ("opentelemetry.metrics._internal", "_METER_PROVIDER", "_METER_PROVIDER_SET_ONCE"),
+    ("opentelemetry._logs._internal", "_LOGGER_PROVIDER", "_LOGGER_PROVIDER_SET_ONCE"),
+)
+
+
+@contextlib.contextmanager
+def otel_globals_isolated() -> Iterator[None]:
+    """Run with unset OpenTelemetry providers; restore the real ones, set-once flag included.
+
+    ``set_tracer_provider`` and its siblings succeed once per process. A docs page that
+    calls one would otherwise decide whether a later test file can install its own.
+    """
+    saved: list[tuple[Any, str, Any, Any, Any]] = []
+    for module_name, provider_attr, once_attr in _OTEL_GLOBALS:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        once = getattr(module, once_attr, None)
+        if once is None or not hasattr(once, "_done"):
+            continue
+        saved.append((module, provider_attr, getattr(module, provider_attr), once, once._done))
+        setattr(module, provider_attr, None)
+        once._done = False
+    try:
+        yield
+    finally:
+        for module, provider_attr, provider, once, done in saved:
+            setattr(module, provider_attr, provider)
+            once._done = done
+
+
 def run_page(snippets: list[Snippet]) -> list[str]:
     """Run a page's blocks in order, sharing one namespace. Returns failure messages."""
     namespace: dict[str, Any] = {"__name__": "__docs__"}
@@ -205,7 +277,8 @@ def run_page(snippets: list[Snippet]) -> list[str]:
                 failures.append(problem)
             continue
         try:
-            run_snippet(snippet, namespace)
+            with environment_restored():
+                run_snippet(snippet, namespace)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 raise
