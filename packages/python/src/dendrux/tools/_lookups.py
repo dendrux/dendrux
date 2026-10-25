@@ -33,16 +33,18 @@ class ToolLookups(NamedTuple):
     call_limiter: Any = None
 
 
-def make_call_limiter(tool_threads: int) -> Any:
+def make_call_limiter(tool_threads: int, *, max_waiters: int | None = None) -> Any:
     """Build the per-Agent tool call limiter for ``Agent(tool_threads=...)``.
 
     It caps the Agent's concurrently running sync tool calls on the shared
     tool pool (see :mod:`dendrux.tools._pool`). It is thread-safe and not
-    bound to an event loop.
+    bound to an event loop. At most ``max_waiters`` calls wait for a slot
+    (default 256, or ``DENDRUX_TOOL_QUEUE_LIMIT``); more are refused with
+    :class:`~dendrux.tools._pool.ToolQueueFullError`.
     """
     from dendrux.tools._pool import ToolCallLimiter
 
-    return ToolCallLimiter(tool_threads)
+    return ToolCallLimiter(tool_threads, max_waiters=max_waiters)
 
 
 def build_tool_lookups(

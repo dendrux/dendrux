@@ -49,10 +49,24 @@ TOOL_THREADS_ENV = "DENDRUX_TOOL_THREADS"
 # queued call is an awaiting tool call, already bounded by the per-Agent
 # limiters; this is the process-wide backstop.
 MAX_QUEUED_CALLS = 1024
+# Calls one Agent's limiter lets wait for a free slot; further calls are
+# refused at once. Override per process with ``DENDRUX_TOOL_QUEUE_LIMIT`` or
+# per limiter with ``ToolCallLimiter(max_waiters=...)``.
+DEFAULT_MAX_QUEUED_PER_AGENT = 256
+QUEUE_LIMIT_ENV = "DENDRUX_TOOL_QUEUE_LIMIT"
 
 
 class ToolPoolSaturatedError(RuntimeError):
     """The pool's queue is full; the call was not started."""
+
+
+class ToolQueueFullError(ToolPoolSaturatedError):
+    """An Agent's tool limiter has no free slot and its waiting queue is full.
+
+    The call was not started and is safe to retry. A subclass of
+    :class:`ToolPoolSaturatedError`, so it is reported with the same
+    ``tool_pool_saturated`` result.
+    """
 
 
 class ToolPoolStats(NamedTuple):
@@ -191,6 +205,26 @@ def _configured_threads() -> int:
     return value
 
 
+def _configured_queue_limit() -> int:
+    raw = os.environ.get(QUEUE_LIMIT_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MAX_QUEUED_PER_AGENT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(f"{QUEUE_LIMIT_ENV} must be a non-negative integer.")
+    return value
+
+
+def _check_max_waiters(value: object) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"max_waiters must be a non-negative int, got {value!r}.")
+
+
 def get_pool() -> _ToolPool:
     """The process-wide pool, created on first use."""
     global _pool
@@ -249,10 +283,19 @@ class ToolCallLimiter:
     Thread-safe and not bound to an event loop, so one Agent can be used from
     several loops. A slot is released when the tool's thread finishes, not
     when its caller gives up, so hung calls keep holding their Agent's slots.
+
+    At most ``max_waiters`` calls wait for a slot (default
+    ``DENDRUX_TOOL_QUEUE_LIMIT``, else 256); past that :meth:`acquire` raises
+    :class:`ToolQueueFullError` instead of queueing, so a flood cannot grow
+    the queue without bound.
     """
 
-    def __init__(self, slots: int) -> None:
+    def __init__(self, slots: int, *, max_waiters: int | None = None) -> None:
+        _check_max_waiters(max_waiters)
         self.slots = slots
+        # Resolved on first use (see ``max_waiters``), so building an Agent
+        # never depends on the environment.
+        self._max_waiters = max_waiters
         # The owning Agent's caps; bound at its entry checks (see
         # runtime._limit_checks). Until then the default caps apply.
         self.limits = Limits()
@@ -260,6 +303,19 @@ class ToolCallLimiter:
         self._available = slots
         self._waiters: deque[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = deque()
         _limiters.add(self)
+
+    @property
+    def max_waiters(self) -> int:
+        """How many calls may wait for a slot (the constructor value, else the environment's)."""
+        if self._max_waiters is None:
+            self._max_waiters = _configured_queue_limit()
+        return self._max_waiters
+
+    def _ensure_room(self) -> None:
+        """Raise :class:`ToolQueueFullError` when no more calls may wait (lock held)."""
+        limit = self.max_waiters
+        if len(self._waiters) >= limit:
+            raise ToolQueueFullError(f"The tool limiter's queue is full ({limit} waiting).")
 
     def _reset(self) -> None:
         """Full capacity, no waiters (a forked child's fresh state)."""
@@ -278,6 +334,7 @@ class ToolCallLimiter:
             if self._available > 0 and not self._waiters:
                 self._available -= 1
                 return
+            self._ensure_room()
             waiter: asyncio.Future[None] = loop.create_future()
             self._waiters.append((loop, waiter))
         try:
