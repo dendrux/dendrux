@@ -49,13 +49,19 @@
   "complexity": 13,
   "coverage": 1.0,
   "crap": 13.0,
-  "digest": "cccb80b3a619"
+  "digest": "348e2f50c467"
  },
  "src/dendrux/_wire.py::_redacted.<locals>.copy": {
   "complexity": 20,
-  "coverage": 0.9615,
+  "coverage": 0.963,
   "crap": 20.02,
-  "digest": "57ee54d83e5e"
+  "digest": "6b809c9fa518"
+ },
+ "src/dendrux/_wire.py::_scan_budget": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "6d262299443c"
  },
  "src/dendrux/_wire.py::_structured_output": {
   "complexity": 3,
@@ -63,17 +69,29 @@
   "crap": 3.21,
   "digest": "5063acd78ca6"
  },
- "src/dendrux/_wire.py::result_to_dict": {
-  "complexity": 6,
+ "src/dendrux/_wire.py::_tool_result_fields": {
+  "complexity": 20,
+  "coverage": 0.9565,
+  "crap": 20.03,
+  "digest": "5469ba08ac2a"
+ },
+ "src/dendrux/_wire.py::_wire_answer": {
+  "complexity": 3,
   "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "4ca16554c6ad"
+  "crap": 3.0,
+  "digest": "4c1022b3b095"
+ },
+ "src/dendrux/_wire.py::result_to_dict": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "c7b932cbc261"
  },
  "src/dendrux/_wire.py::tool_result_from_dict": {
-  "complexity": 21,
-  "coverage": 0.8929,
-  "crap": 21.54,
-  "digest": "2eae1dee956d"
+  "complexity": 5,
+  "coverage": 0.8667,
+  "crap": 5.06,
+  "digest": "5f3fb30c3ff9"
  },
  "src/dendrux/_wire.py::tool_results_from_dict": {
   "complexity": 9,
@@ -119,8 +137,8 @@
  },
  "src/dendrux/agent.py::Agent._cancel_one": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 1.0,
+  "crap": 4.0,
   "digest": "b0e14f435a61"
  },
  "src/dendrux/agent.py::Agent._configure_images": {
@@ -161,8 +179,8 @@
  },
  "src/dendrux/agent.py::Agent._ensure_discovered": {
   "complexity": 20,
-  "coverage": 0.9464,
-  "crap": 20.06,
+  "coverage": 0.9643,
+  "crap": 20.02,
   "digest": "36d8d5d22c29"
  },
  "src/dendrux/agent.py::Agent._ensure_skills_loaded": {
@@ -209,8 +227,8 @@
  },
  "src/dendrux/agent.py::Agent._resolve_state_store": {
   "complexity": 12,
-  "coverage": 0.9231,
-  "crap": 12.07,
+  "coverage": 0.9487,
+  "crap": 12.02,
   "digest": "4b354e035af5"
  },
  "src/dendrux/agent.py::Agent._tenant_checked_stream": {
@@ -269,9 +287,9 @@
  },
  "src/dendrux/agent.py::Agent.cancel_run": {
   "complexity": 14,
-  "coverage": 0.9231,
-  "crap": 14.09,
-  "digest": "b9398899cce9"
+  "coverage": 0.925,
+  "crap": 14.08,
+  "digest": "b4c9bcf21214"
  },
  "src/dendrux/agent.py::Agent.close": {
   "complexity": 6,
@@ -292,10 +310,10 @@
   "digest": "01bcab99058b"
  },
  "src/dendrux/agent.py::Agent.get_result": {
-  "complexity": 10,
-  "coverage": 0.95,
-  "crap": 10.01,
-  "digest": "c5b3ff36c275"
+  "complexity": 9,
+  "coverage": 0.9583,
+  "crap": 9.01,
+  "digest": "f1c7ec66cc90"
  },
  "src/dendrux/agent.py::Agent.get_system_prompt": {
   "complexity": 8,
@@ -367,7 +385,7 @@
   "complexity": 15,
   "coverage": 1.0,
   "crap": 15.0,
-  "digest": "fb7d97ae4f9c"
+  "digest": "d815435416f4"
  },
  "src/dendrux/agent.py::Agent.require_approval": {
   "complexity": 1,
@@ -395,9 +413,9 @@
  },
  "src/dendrux/agent.py::Agent.run": {
   "complexity": 8,
-  "coverage": 0.9,
-  "crap": 8.06,
-  "digest": "ea88a0ceb7ef"
+  "coverage": 0.95,
+  "crap": 8.01,
+  "digest": "3518d31330f6"
  },
  "src/dendrux/agent.py::Agent.stream": {
   "complexity": 4,
@@ -407,9 +425,9 @@
  },
  "src/dendrux/agent.py::Agent.submit_approval": {
   "complexity": 14,
-  "coverage": 0.9592,
-  "crap": 14.01,
-  "digest": "d986ad5b99c7"
+  "coverage": 0.94,
+  "crap": 14.04,
+  "digest": "2ec537cbd0f5"
  },
  "src/dendrux/agent.py::Agent.submit_approval.<locals>.same_pause_generation": {
   "complexity": 1,
@@ -419,14 +437,14 @@
  },
  "src/dendrux/agent.py::Agent.submit_input": {
   "complexity": 3,
-  "coverage": 1.0,
+  "coverage": 0.9583,
   "crap": 3.0,
   "digest": "b1826f8f12c8"
  },
  "src/dendrux/agent.py::Agent.submit_note": {
   "complexity": 12,
-  "coverage": 1.0,
-  "crap": 12.0,
+  "coverage": 0.9333,
+  "crap": 12.04,
   "digest": "17d7eda3e4be"
  },
  "src/dendrux/agent.py::Agent.submit_resume": {
@@ -455,8 +473,8 @@
  },
  "src/dendrux/agent.py::_AgentBlobs._target": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
+  "coverage": 1.0,
+  "crap": 3.0,
   "digest": "48a837d02030"
  },
  "src/dendrux/agent.py::_AgentBlobs.collect_garbage": {
@@ -512,8 +530,8 @@
  },
  "src/dendrux/agent.py::_build_provider_from_spec": {
   "complexity": 7,
-  "coverage": 0.7778,
-  "crap": 7.54,
+  "coverage": 0.8889,
+  "crap": 7.07,
   "digest": "9984c7d70261"
  },
  "src/dendrux/agent.py::_cascade_order": {
@@ -521,6 +539,12 @@
   "coverage": 1.0,
   "crap": 4.0,
   "digest": "368015dd3009"
+ },
+ "src/dendrux/agent.py::_check_result_read_arguments": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "35bb78e69b59"
  },
  "src/dendrux/agent.py::_get_env_engine": {
   "complexity": 2,
@@ -551,6 +575,12 @@
   "coverage": 1.0,
   "crap": 3.0,
   "digest": "5b0ba4ac46c4"
+ },
+ "src/dendrux/agent.py::_valid_read_id": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "ef3c4e2ae6d5"
  },
  "src/dendrux/agent.py::_validate_max_delegation_depth": {
   "complexity": 5,
@@ -764,7 +794,7 @@
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "1b0894b41e80"
+  "digest": "80cb464888a8"
  },
  "src/dendrux/db/_engine_options.py::frozen_options": {
   "complexity": 8,
@@ -822,8 +852,8 @@
  },
  "src/dendrux/db/_pool_guard.py::close_fully": {
   "complexity": 6,
-  "coverage": 0.9167,
-  "crap": 6.02,
+  "coverage": 1.0,
+  "crap": 6.0,
   "digest": "8819ad6bbacd"
  },
  "src/dendrux/db/_pool_guard.py::serialized": {
@@ -892,23 +922,29 @@
   "crap": 1.0,
   "digest": "8df68924cc0d"
  },
+ "src/dendrux/db/_shared_pool.py::_Entry.can_retire": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "c5fc13b9c71b"
+ },
+ "src/dendrux/db/_shared_pool.py::_dispose_entry": {
+  "complexity": 3,
+  "coverage": 0.75,
+  "crap": 3.14,
+  "digest": "5138b412e7ef"
+ },
  "src/dendrux/db/_shared_pool.py::_initialize": {
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
   "digest": "1f1b172ddde6"
  },
- "src/dendrux/db/_shared_pool.py::_loop_lifetime": {
-  "complexity": 6,
+ "src/dendrux/db/_shared_pool.py::_prepare": {
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "08fc7fe14b0b"
- },
- "src/dendrux/db/_shared_pool.py::_reaped": {
-  "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "45a901c5ef62"
+  "crap": 2.0,
+  "digest": "59cb12377865"
  },
  "src/dendrux/db/_shared_pool.py::_retire_at_exit": {
   "complexity": 2,
@@ -924,21 +960,15 @@
  },
  "src/dendrux/db/_shared_pool.py::acquire": {
   "complexity": 11,
-  "coverage": 0.9667,
-  "crap": 11.0,
-  "digest": "14eca8f1362f"
+  "coverage": 0.963,
+  "crap": 11.01,
+  "digest": "b8cdae1ee6aa"
  },
  "src/dendrux/db/_shared_pool.py::release": {
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "31dae27aba73"
- },
- "src/dendrux/db/_shared_pool.py::release.<locals>.dispose": {
-  "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
-  "digest": "184a58c2f872"
+  "digest": "efe738ada4c5"
  },
  "src/dendrux/db/_sqlite_sync.py::_add_column": {
   "complexity": 6,
@@ -1292,6 +1322,12 @@
   "crap": 3.0,
   "digest": "a6c43ec95b81"
  },
+ "src/dendrux/errors.py::PersistenceError.__init__": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "c55ac989cbfb"
+ },
  "src/dendrux/errors.py::PersistenceNotConfiguredError.__init__": {
   "complexity": 1,
   "coverage": 1.0,
@@ -1308,7 +1344,7 @@
   "complexity": 6,
   "coverage": 1.0,
   "crap": 6.0,
-  "digest": "c223749e5a4e"
+  "digest": "469345aeac11"
  },
  "src/dendrux/errors.py::ProviderError.safe_message": {
   "complexity": 4,
@@ -1320,7 +1356,7 @@
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "43472b1b3f4d"
+  "digest": "40ae6e78d52f"
  },
  "src/dendrux/errors.py::ProviderRateLimitError.__init__": {
   "complexity": 1,
@@ -1412,6 +1448,12 @@
   "crap": 2.0,
   "digest": "a9f0b13359d1"
  },
+ "src/dendrux/errors.py::_database_failure_in": {
+  "complexity": 10,
+  "coverage": 0.9444,
+  "crap": 10.02,
+  "digest": "e4461c29d442"
+ },
  "src/dendrux/errors.py::_rebuild_context_length_error": {
   "complexity": 1,
   "coverage": 1.0,
@@ -1424,11 +1466,29 @@
   "crap": 1.0,
   "digest": "515d6a433fcc"
  },
- "src/dendrux/errors.py::safe_exception_info": {
-  "complexity": 12,
+ "src/dendrux/errors.py::_safe_identity": {
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 12.0,
-  "digest": "397c5a0afa8a"
+  "crap": 4.0,
+  "digest": "dc6951e659d9"
+ },
+ "src/dendrux/errors.py::_safe_status_code": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "732d16280e9c"
+ },
+ "src/dendrux/errors.py::provider_error_in": {
+  "complexity": 8,
+  "coverage": 0.8889,
+  "crap": 8.09,
+  "digest": "884ec5c4bcba"
+ },
+ "src/dendrux/errors.py::safe_exception_info": {
+  "complexity": 10,
+  "coverage": 1.0,
+  "crap": 10.0,
+  "digest": "4aaebb949fb2"
  },
  "src/dendrux/guardrails/_detectors.py::_drop_nested": {
   "complexity": 3,
@@ -1847,6 +1907,18 @@
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
    "rule": "worse"
   }
+ },
+ "src/dendrux/llm/_evidence.py::persistable_call": {
+  "complexity": 3,
+  "coverage": 0.8571,
+  "crap": 3.03,
+  "digest": "ca7f3cba0394"
+ },
+ "src/dendrux/llm/_evidence.py::persistable_response": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "c234635b7f0e"
  },
  "src/dendrux/llm/_helpers.py::_body_field": {
   "complexity": 3,
@@ -2951,6 +3023,12 @@
   "crap": 1.0,
   "digest": "ea7dd3d05446"
  },
+ "src/dendrux/llm/base.py::LLMProvider.__init_subclass__": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "447c4fb1beb7"
+ },
  "src/dendrux/llm/base.py::LLMProvider.close": {
   "complexity": 1,
   "coverage": 1.0,
@@ -3022,6 +3100,36 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "e4e113b83509"
+ },
+ "src/dendrux/llm/base.py::_close_typed_stream": {
+  "complexity": 3,
+  "coverage": 0.875,
+  "crap": 3.02,
+  "digest": "19e39fd451b8"
+ },
+ "src/dendrux/llm/base.py::_typed_complete": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "89a1b0742eea"
+ },
+ "src/dendrux/llm/base.py::_typed_complete.<locals>.complete": {
+  "complexity": 3,
+  "coverage": 0.875,
+  "crap": 3.02,
+  "digest": "65860e332015"
+ },
+ "src/dendrux/llm/base.py::_typed_stream": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "b6b77ee1f378"
+ },
+ "src/dendrux/llm/base.py::_typed_stream.<locals>.stream": {
+  "complexity": 4,
+  "coverage": 0.6364,
+  "crap": 4.77,
+  "digest": "0da19f30eeab"
  },
  "src/dendrux/llm/mock.py::MockLLM.__init__": {
   "complexity": 2,
@@ -3687,7 +3795,7 @@
   "complexity": 15,
   "coverage": 1.0,
   "crap": 15.0,
-  "digest": "aaed62b068b2",
+  "digest": "5d6c170d8f89",
   "waived": {
    "date": "2026-10-25",
    "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
@@ -3704,7 +3812,7 @@
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "7dec8ebcf5f2"
+  "digest": "1153400b9701"
  },
  "src/dendrux/loops/_budget.py::BudgetTracker._pick_reader": {
   "complexity": 7,
@@ -3758,6 +3866,12 @@
   "coverage": 1.0,
   "crap": 4.0,
   "digest": "c489549edb30"
+ },
+ "src/dendrux/loops/_budget.py::_Usage.observe": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "d0baf11e8fc4"
  },
  "src/dendrux/loops/_budget.py::breach_payload": {
   "complexity": 2,
@@ -4504,12 +4618,12 @@
  },
  "src/dendrux/loops/react.py::ReActLoop.run": {
   "complexity": 55,
-  "coverage": 0.9931,
-  "crap": 55.0,
-  "digest": "96336375bfd8",
+  "coverage": 0.9863,
+  "crap": 55.01,
+  "digest": "01d31f068a46",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
    "rule": "changed-over-threshold"
   }
  },
@@ -4521,13 +4635,13 @@
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream": {
   "complexity": 57,
-  "coverage": 0.9156,
-  "crap": 58.95,
-  "digest": "d7600a842e77",
+  "coverage": 0.9161,
+  "crap": 58.92,
+  "digest": "9ef102deaa6b",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
-   "rule": "worse"
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
+   "rule": "changed-over-threshold"
   }
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream.<locals>._control_reader": {
@@ -4639,8 +4753,8 @@
  },
  "src/dendrux/loops/react.py::_contains_image": {
   "complexity": 7,
-  "coverage": 0.8889,
-  "crap": 7.07,
+  "coverage": 1.0,
+  "crap": 7.0,
   "digest": "c9a973c1e4b5"
  },
  "src/dendrux/loops/react.py::_control_stop_result": {
@@ -4663,8 +4777,8 @@
  },
  "src/dendrux/loops/react.py::_execute_parallel_group": {
   "complexity": 17,
-  "coverage": 0.931,
-  "crap": 17.09,
+  "coverage": 0.9655,
+  "crap": 17.01,
   "digest": "2873265560dc"
  },
  "src/dendrux/loops/react.py::_execute_record_notify": {
@@ -4757,6 +4871,18 @@
   "crap": 7.0,
   "digest": "9cfebf96eea8"
  },
+ "src/dendrux/loops/react.py::_persistable_argument_validator": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "4c165319cea0"
+ },
+ "src/dendrux/loops/react.py::_persistable_argument_validator.<locals>.validate": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "43410c592226"
+ },
  "src/dendrux/loops/react.py::_process_tool_calls": {
   "complexity": 47,
   "coverage": 1.0,
@@ -4795,8 +4921,8 @@
  },
  "src/dendrux/loops/react.py::_referenced_images.<locals>.walk": {
   "complexity": 9,
-  "coverage": 1.0,
-  "crap": 9.0,
+  "coverage": 0.9091,
+  "crap": 9.06,
   "digest": "403b36df63aa"
  },
  "src/dendrux/loops/react.py::_restore_params": {
@@ -4845,27 +4971,27 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "bf67866870d2"
+  "digest": "94dc14109ce0"
  },
  "src/dendrux/loops/single.py::SingleCall.run": {
   "complexity": 47,
-  "coverage": 0.9262,
-  "crap": 47.89,
-  "digest": "829b88fa3965",
+  "coverage": 0.9268,
+  "crap": 47.87,
+  "digest": "255f3e8d0325",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
    "rule": "changed-over-threshold"
   }
  },
  "src/dendrux/loops/single.py::SingleCall.run_stream": {
   "complexity": 34,
-  "coverage": 0.9252,
-  "crap": 34.48,
-  "digest": "d2dc34ee556b",
+  "coverage": 0.9259,
+  "crap": 34.47,
+  "digest": "0b660e05a212",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
    "rule": "changed-over-threshold"
   }
  },
@@ -8826,8 +8952,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.get_current": {
   "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
+  "coverage": 0.9167,
+  "crap": 4.01,
   "digest": "263ac03bc8c3"
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.get_row": {
@@ -9108,17 +9234,41 @@
    "rule": "worse"
   }
  },
+ "src/dendrux/runtime/_entry_checks.py::_BudgetView.__init__": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "77e00a0e1f84"
+ },
+ "src/dendrux/runtime/_entry_checks.py::check_runner_budget": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "8d66fac55a17"
+ },
  "src/dendrux/runtime/_entry_checks.py::entry_checks": {
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
   "digest": "19adb1ff0e28"
  },
+ "src/dendrux/runtime/_entry_checks.py::require_boolean": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "5b1b25b2a968"
+ },
+ "src/dendrux/runtime/_entry_checks.py::resolve_runner_tenant": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "4165c5dcd43f"
+ },
  "src/dendrux/runtime/_entry_checks.py::runner_entry_checks": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "eaf0393c91ad"
+  "digest": "164fdbd5d8d0"
  },
  "src/dendrux/runtime/_limit_checks.py::_bind_limits": {
   "complexity": 3,
@@ -9126,11 +9276,17 @@
   "crap": 3.0,
   "digest": "fff2f5eb0f43"
  },
+ "src/dendrux/runtime/_limit_checks.py::_check_persistable_text": {
+  "complexity": 6,
+  "coverage": 1.0,
+  "crap": 6.0,
+  "digest": "a73bbeb62707"
+ },
  "src/dendrux/runtime/_limit_checks.py::_check_text": {
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "c2b67db3995d"
+  "digest": "a99e0ecf7c28"
  },
  "src/dendrux/runtime/_limit_checks.py::_limits": {
   "complexity": 2,
@@ -9228,17 +9384,29 @@
   "crap": 6.01,
   "digest": "e0efd439cf49"
  },
- "src/dendrux/runtime/_tenant_checks.py::_check_size": {
+ "src/dendrux/runtime/_tenant_checks.py::_check_entry_fields": {
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
+  "digest": "9240c6edd325"
+ },
+ "src/dendrux/runtime/_tenant_checks.py::_check_optional_identifier": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "b68ffb358077"
+ },
+ "src/dendrux/runtime/_tenant_checks.py::_check_size": {
+  "complexity": 4,
+  "coverage": 0.7778,
+  "crap": 4.18,
   "digest": "d67864f94ec0"
  },
  "src/dendrux/runtime/_tenant_checks.py::_check_tenant_value": {
   "complexity": 7,
   "coverage": 1.0,
   "crap": 7.0,
-  "digest": "4f732897d6e1"
+  "digest": "89a4c3a2a65c"
  },
  "src/dendrux/runtime/_tenant_checks.py::_metadata_limit": {
   "complexity": 2,
@@ -9256,19 +9424,19 @@
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "0e62cd381d21"
+  "digest": "72ce54fce419"
  },
  "src/dendrux/runtime/_tenant_checks.py::check_run_metadata": {
   "complexity": 7,
   "coverage": 1.0,
   "crap": 7.0,
-  "digest": "8cd6dd6c504c"
+  "digest": "17590516a76b"
  },
  "src/dendrux/runtime/_tenant_checks.py::check_runner_entry": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "6c0f5b2913c8"
+  "digest": "a15d7fd92cb8"
  },
  "src/dendrux/runtime/_tenant_checks.py::resolve_tenant": {
   "complexity": 6,
@@ -9393,7 +9561,25 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "835d14b437e5"
+  "digest": "8ee62e3dd686"
+ },
+ "src/dendrux/runtime/durability.py::_is_transient_driver_error": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "7e189013a391"
+ },
+ "src/dendrux/runtime/durability.py::_safe_database_call": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "8001e68fd4ee"
+ },
+ "src/dendrux/runtime/durability.py::_safe_database_call.<locals>.call": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "8fbce3079825"
  },
  "src/dendrux/runtime/durability.py::_sqlstate": {
   "complexity": 6,
@@ -9402,10 +9588,10 @@
   "digest": "4d5faf9922f2"
  },
  "src/dendrux/runtime/durability.py::is_transient_db_error": {
-  "complexity": 3,
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "3b5fd7be555f"
+  "crap": 2.0,
+  "digest": "fb468dc89c32"
  },
  "src/dendrux/runtime/durability.py::retry_critical": {
   "complexity": 1,
@@ -9414,10 +9600,16 @@
   "digest": "f14909f42258"
  },
  "src/dendrux/runtime/durability.py::retry_transient_db": {
-  "complexity": 7,
-  "coverage": 0.9333,
-  "crap": 7.01,
-  "digest": "fc940311b060"
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "180de84c45a8"
+ },
+ "src/dendrux/runtime/durability.py::safe_database_operations": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "29514e1c8413"
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.__init__": {
   "complexity": 2,
@@ -9710,7 +9902,7 @@
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "50570d6d6a71"
+  "digest": "d518af5a8b34"
  },
  "src/dendrux/runtime/replay.py::parts_to_dicts": {
   "complexity": 2,
@@ -9849,6 +10041,12 @@
   "crap": 4.25,
   "digest": "8384fdeb1aeb"
  },
+ "src/dendrux/runtime/runner.py::_canonicalize_legacy_denials": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "83e992b64b0c"
+ },
  "src/dendrux/runtime/runner.py::_carry_budget_fields": {
   "complexity": 1,
   "coverage": 1.0,
@@ -9875,15 +10073,27 @@
  },
  "src/dendrux/runtime/runner.py::_claim_resume": {
   "complexity": 12,
-  "coverage": 0.8,
-  "crap": 13.15,
-  "digest": "9563b3519501"
+  "coverage": 0.8095,
+  "crap": 13.0,
+  "digest": "b3116996f945"
  },
  "src/dendrux/runtime/runner.py::_closing_loop_stream": {
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
   "digest": "dad28363b244"
+ },
+ "src/dendrux/runtime/runner.py::_database_error_code": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "66f6ff810e14"
+ },
+ "src/dendrux/runtime/runner.py::_database_error_info": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "8cc1382be8d9"
  },
  "src/dendrux/runtime/runner.py::_decided_payload": {
   "complexity": 9,
@@ -9948,7 +10158,7 @@
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
-  "digest": "4ab42adb585e"
+  "digest": "d169907f7b1e"
  },
  "src/dendrux/runtime/runner.py::_error_store_kwargs": {
   "complexity": 4,
@@ -10036,8 +10246,8 @@
  },
  "src/dendrux/runtime/runner.py::_input_edge_kwargs": {
   "complexity": 4,
-  "coverage": 1.0,
-  "crap": 4.0,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "b9f92456c471"
  },
  "src/dendrux/runtime/runner.py::_live_edges": {
@@ -10057,6 +10267,12 @@
   "coverage": 1.0,
   "crap": 5.0,
   "digest": "4226601ed925"
+ },
+ "src/dendrux/runtime/runner.py::_nonprovider_error": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "ac40313c2f66"
  },
  "src/dendrux/runtime/runner.py::_owned_claim_view": {
   "complexity": 5,
@@ -10096,7 +10312,7 @@
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome": {
   "complexity": 25,
-  "coverage": 1.0,
+  "coverage": 0.9815,
   "crap": 25.0,
   "digest": "c49543230320"
  },
@@ -10139,13 +10355,13 @@
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
-  "digest": "6c4eab9526af"
+  "digest": "e08229474872"
  },
  "src/dendrux/runtime/runner.py::_public_meta": {
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "4d19d57ef350"
+  "digest": "44b6114226f1"
  },
  "src/dendrux/runtime/runner.py::_raise_resume_claim_failure": {
   "complexity": 6,
@@ -10155,8 +10371,8 @@
  },
  "src/dendrux/runtime/runner.py::_record_stop_reason": {
   "complexity": 3,
-  "coverage": 0.7143,
-  "crap": 3.21,
+  "coverage": 1.0,
+  "crap": 3.0,
   "digest": "6b075e978a0c",
   "waived": {
    "date": "2026-10-25",
@@ -10246,11 +10462,11 @@
   "complexity": 59,
   "coverage": 0.9542,
   "crap": 59.33,
-  "digest": "849413f734ab",
+  "digest": "09114f743613",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
-   "rule": "worse"
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
+   "rule": "changed-over-threshold"
   }
  },
  "src/dendrux/runtime/runner.py::_resume_core.<locals>.persist_cancellation": {
@@ -10275,7 +10491,7 @@
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
-  "digest": "65ba6880a06b"
+  "digest": "d221304ad4fb"
  },
  "src/dendrux/runtime/runner.py::_same_pause": {
   "complexity": 1,
@@ -10321,8 +10537,8 @@
  },
  "src/dendrux/runtime/runner.py::_start_image_view": {
   "complexity": 8,
-  "coverage": 0.8889,
-  "crap": 8.09,
+  "coverage": 1.0,
+  "crap": 8.0,
   "digest": "c66316318d70"
  },
  "src/dendrux/runtime/runner.py::_stop_reason_from_meta": {
@@ -10449,7 +10665,7 @@
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "85849fd8cbea"
+  "digest": "c81a731796ee"
  },
  "src/dendrux/runtime/runner.py::resume_stream.<locals>._cleanup": {
   "complexity": 12,
@@ -10461,11 +10677,11 @@
   "complexity": 45,
   "coverage": 0.9487,
   "crap": 45.27,
-  "digest": "8f9f3cdd46d0",
+  "digest": "6cb2eaedf324",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
-   "rule": "worse"
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
+   "rule": "changed-over-threshold"
   }
  },
  "src/dendrux/runtime/runner.py::resume_with_input": {
@@ -10476,23 +10692,23 @@
  },
  "src/dendrux/runtime/runner.py::retry": {
   "complexity": 55,
-  "coverage": 0.9524,
-  "crap": 55.33,
-  "digest": "95970c018f34",
+  "coverage": 0.9606,
+  "crap": 55.18,
+  "digest": "36e810959778",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
    "rule": "changed-over-threshold"
   }
  },
  "src/dendrux/runtime/runner.py::run": {
   "complexity": 84,
-  "coverage": 0.9686,
-  "crap": 84.22,
-  "digest": "1c1cadeddb09",
+  "coverage": 0.9792,
+  "crap": 84.06,
+  "digest": "3d06352a6c2e",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
    "rule": "changed-over-threshold"
   }
  },
@@ -10500,7 +10716,7 @@
   "complexity": 14,
   "coverage": 1.0,
   "crap": 14.0,
-  "digest": "77d48f89bb3e"
+  "digest": "823ef8ec6447"
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._cleanup": {
   "complexity": 12,
@@ -10512,10 +10728,10 @@
   "complexity": 61,
   "coverage": 0.9451,
   "crap": 61.61,
-  "digest": "36328e37d603",
+  "digest": "e55336961a0e",
   "waived": {
-   "date": "2026-10-25",
-   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "date": "2026-10-26",
+   "reason": "Security boundary fixes (0.5.0) had to edit these pre-existing hotspots; scores unchanged within tolerance; refactor tracked in AGT-234",
    "rule": "changed-over-threshold"
   }
  },
@@ -10529,7 +10745,7 @@
   "complexity": 6,
   "coverage": 1.0,
   "crap": 6.0,
-  "digest": "8df112953fdb"
+  "digest": "79c37c8e8e71"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._apply_run_filters": {
   "complexity": 9,
@@ -10565,7 +10781,7 @@
   "complexity": 28,
   "coverage": 1.0,
   "crap": 28.0,
-  "digest": "cb19b182533b"
+  "digest": "4d000943061a"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._traverse_subtree_bfs": {
   "complexity": 13,
@@ -10629,9 +10845,9 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.create_run": {
   "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "24eefc46de79"
+  "coverage": 0.9375,
+  "crap": 5.01,
+  "digest": "9a6cdfad1768"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.create_run.<locals>._attempt": {
   "complexity": 7,
@@ -10647,8 +10863,8 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.finalize_run.<locals>._attempt": {
   "complexity": 16,
-  "coverage": 1.0,
-  "crap": 16.0,
+  "coverage": 0.9655,
+  "crap": 16.01,
   "digest": "6eab1ac1607f",
   "waived": {
    "date": "2026-10-25",
@@ -10687,10 +10903,10 @@
   "digest": "7338599f2809"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.get_approval_params": {
-  "complexity": 6,
+  "complexity": 5,
   "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "f76a91e77110"
+  "crap": 5.0,
+  "digest": "d21a805b7f3a"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.get_delegation_info": {
   "complexity": 22,
@@ -10736,9 +10952,9 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.get_pause_summary": {
   "complexity": 19,
-  "coverage": 0.8438,
-  "crap": 20.38,
-  "digest": "d7e17cf6ec59"
+  "coverage": 0.8387,
+  "crap": 20.51,
+  "digest": "a73fbc7271c1"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.get_pii_mapping": {
   "complexity": 2,
@@ -11271,7 +11487,7 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "4e4f82c3d3af"
+  "digest": "3ea5cf70e838"
  },
  "src/dendrux/runtime/state.py::_Unscoped.__repr__": {
   "complexity": 1,
@@ -11290,6 +11506,18 @@
   "crap": 3.0,
   "digest": "b1450995a6b8"
  },
+ "src/dendrux/runtime/state.py::_approval_event_object": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "9bb36dd12a99"
+ },
+ "src/dendrux/runtime/state.py::_check_create_identifiers": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "87d7d8e87c2a"
+ },
  "src/dendrux/runtime/state.py::_check_offset": {
   "complexity": 2,
   "coverage": 1.0,
@@ -11300,7 +11528,7 @@
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "64f67327b6c0"
+  "digest": "e4d79027b1ab"
  },
  "src/dendrux/runtime/state.py::_extract_status": {
   "complexity": 2,
@@ -11332,6 +11560,12 @@
   "crap": 1.0,
   "digest": "208e73f9cc61"
  },
+ "src/dendrux/runtime/state.py::_is_aware_datetime": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "feb347a5eeb0"
+ },
  "src/dendrux/runtime/state.py::_is_idempotency_violation": {
   "complexity": 3,
   "coverage": 1.0,
@@ -11344,11 +11578,23 @@
   "crap": 3.33,
   "digest": "6dee05bd1240"
  },
+ "src/dendrux/runtime/state.py::_jsonb_or_null": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "17153fcceba4"
+ },
+ "src/dendrux/runtime/state.py::_readable_json_document": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "6e64910b52e6"
+ },
  "src/dendrux/runtime/state.py::_require_aware_utc": {
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "3d0337f3f62e"
+  "digest": "37b1f47d8100"
  },
  "src/dendrux/runtime/state.py::_run_in_scope": {
   "complexity": 2,
@@ -11379,6 +11625,30 @@
   "coverage": 1.0,
   "crap": 4.0,
   "digest": "ff4800444828"
+ },
+ "src/dendrux/runtime/state.py::_validate_sweep_age": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "c50163c0ac29"
+ },
+ "src/dendrux/runtime/state.py::_validated_store_write": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "265aa502e00b"
+ },
+ "src/dendrux/runtime/state.py::_validated_store_write.<locals>.write": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "a184b0086eee"
+ },
+ "src/dendrux/runtime/state.py::_validated_store_writes": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "e4f781ba2622"
  },
  "src/dendrux/runtime/state.py::claimed_store": {
   "complexity": 3,
@@ -11428,10 +11698,22 @@
   }
  },
  "src/dendrux/runtime/submit.py::_cap_client_result": {
-  "complexity": 4,
+  "complexity": 1,
   "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "10fe35e0572a"
+  "crap": 1.0,
+  "digest": "f184b48a7c07"
+ },
+ "src/dendrux/runtime/submit.py::_check_decisions_size": {
+  "complexity": 2,
+  "coverage": 0.5,
+  "crap": 2.5,
+  "digest": "8dc577a0f19c"
+ },
+ "src/dendrux/runtime/submit.py::_check_result_identities": {
+  "complexity": 9,
+  "coverage": 0.8,
+  "crap": 9.65,
+  "digest": "7f7c382e603e"
  },
  "src/dendrux/runtime/submit.py::_claim_validation_support": {
   "complexity": 3,
@@ -11468,11 +11750,29 @@
   "crap": 1.0,
   "digest": "b4f1a46085ec"
  },
+ "src/dendrux/runtime/submit.py::_require_approval_token": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "80b72b52f84a"
+ },
+ "src/dendrux/runtime/submit.py::_resume_status": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "c30c417a8100"
+ },
  "src/dendrux/runtime/submit.py::_user_warning_stacklevel": {
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
   "digest": "31da67d68b02"
+ },
+ "src/dendrux/runtime/submit.py::_validated_client_results": {
+  "complexity": 5,
+  "coverage": 1.0,
+  "crap": 5.0,
+  "digest": "dd604d8d7f49"
  },
  "src/dendrux/runtime/submit.py::_warn_at_location": {
   "complexity": 2,
@@ -11517,8 +11817,8 @@
  },
  "src/dendrux/runtime/submit.py::claim_paused_validated": {
   "complexity": 10,
-  "coverage": 0.7812,
-  "crap": 11.05,
+  "coverage": 0.8125,
+  "crap": 10.66,
   "digest": "c920c7984f67"
  },
  "src/dendrux/runtime/submit.py::deserialize_decisions": {
@@ -11593,6 +11893,12 @@
   "crap": 5.0,
   "digest": "0b734cadc1d9"
  },
+ "src/dendrux/runtime/submit.py::legacy_approval_denial": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "f41e63e92884"
+ },
  "src/dendrux/runtime/submit.py::merge_user_items": {
   "complexity": 3,
   "coverage": 1.0,
@@ -11601,9 +11907,9 @@
  },
  "src/dendrux/runtime/submit.py::normalize_decisions": {
   "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "7a0f36f8eb2a"
+  "coverage": 0.9375,
+  "crap": 5.01,
+  "digest": "49d126b6532e"
  },
  "src/dendrux/runtime/submit.py::parts_edges": {
   "complexity": 3,
@@ -11631,9 +11937,15 @@
  },
  "src/dendrux/runtime/submit.py::prepare_client_results": {
   "complexity": 11,
-  "coverage": 0.9231,
-  "crap": 11.06,
-  "digest": "c8327cb1e48e"
+  "coverage": 0.9286,
+  "crap": 11.04,
+  "digest": "116da3fa0b44"
+ },
+ "src/dendrux/runtime/submit.py::prepare_resume_results": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "16f4996f4622"
  },
  "src/dendrux/runtime/submit.py::raise_for_non_paused_status": {
   "complexity": 3,
@@ -11691,21 +12003,21 @@
  },
  "src/dendrux/runtime/submit.py::validate_result_names": {
   "complexity": 10,
-  "coverage": 0.875,
-  "crap": 10.2,
-  "digest": "8f57a49fe277"
+  "coverage": 0.8889,
+  "crap": 10.14,
+  "digest": "8256a3eb36c1"
  },
  "src/dendrux/runtime/submit.py::validate_tool_results": {
   "complexity": 10,
   "coverage": 1.0,
   "crap": 10.0,
-  "digest": "55f8e5e70258"
+  "digest": "edc1bb67e6c9"
  },
  "src/dendrux/runtime/submit.py::warn_missing_pause_id": {
-  "complexity": 5,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "970a71c47d4e"
+  "crap": 4.0,
+  "digest": "17b37ef89896"
  },
  "src/dendrux/runtime/sweep.py::_create_temp_store": {
   "complexity": 6,
@@ -11719,11 +12031,17 @@
   "crap": 7.23,
   "digest": "2fcec282d3e4"
  },
+ "src/dendrux/runtime/sweep.py::_validate_thresholds": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "1f76d6f49f4f"
+ },
  "src/dendrux/runtime/sweep.py::sweep": {
   "complexity": 15,
   "coverage": 1.0,
   "crap": 15.0,
-  "digest": "d65ba7c40687",
+  "digest": "6b8e451fe257",
   "waived": {
    "date": "2026-10-25",
    "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
@@ -13540,6 +13858,18 @@
   "crap": 6.0,
   "digest": "61052b73cdba"
  },
+ "src/dendrux/types.py::InputValidationError.__init__": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "a2538b06b692"
+ },
+ "src/dendrux/types.py::InputValidationError.__reduce__": {
+  "complexity": 1,
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "33072caaa3a7"
+ },
  "src/dendrux/types.py::Limits.__post_init__": {
   "complexity": 5,
   "coverage": 1.0,
@@ -13825,6 +14155,18 @@
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "fa075f215596"
+ },
+ "src/dendrux/types.py::_validate_identifier": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "fd3fabe4ff86"
+ },
+ "src/dendrux/types.py::_validate_persistable": {
+  "complexity": 19,
+  "coverage": 0.875,
+  "crap": 19.71,
+  "digest": "5c824a743fad"
  },
  "src/dendrux/types.py::compute_idempotency_fingerprint": {
   "complexity": 9,
