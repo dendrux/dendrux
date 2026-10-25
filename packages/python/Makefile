@@ -34,4 +34,4 @@ package-smoke:
 ci: lint typecheck arch test crap api-check
 
 clean:
-	rm -rf dist/ build/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage coverage.json
+	rm -rf dist/ build/ *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage coverage.json coverage.json.sources.json
