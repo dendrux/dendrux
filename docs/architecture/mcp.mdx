@@ -585,13 +585,19 @@ snapshot.open_circuits        # identities currently failing fast
 For events — connections opening and closing, circuits opening, capacity rejections, tool call outcomes — pass an observer and bridge to Prometheus, OpenTelemetry, Datadog, or logs:
 
 ```python
+from collections import Counter
+
 from dendrux.mcp import MCPRuntime
+
+events = Counter()   # stand-in for your Prometheus, OpenTelemetry or StatsD counter
 
 class Metrics:
     def on_event(self, event) -> None:   # sync, fast, never raises into the runtime
-        EVENT_COUNTER.labels(type(event).__name__).inc()
+        events[type(event).__name__] += 1
 
 runtime = MCPRuntime(observer=Metrics())
+await runtime.close()
+assert events["MCPRuntimeShutdownCompleted"] == 1   # closing is observable
 ```
 
 Events are immutable, typed, and value-free by construction: identities, class names, counts, and durations — never credentials, URLs, tool arguments, results, or error text. Observer exceptions are swallowed and logged without detail; telemetry can never break MCP work.
