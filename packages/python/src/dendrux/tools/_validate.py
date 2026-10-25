@@ -20,7 +20,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux.tools._coerce import (
@@ -29,7 +28,7 @@ from dendrux.tools._coerce import (
     get_args_spec,
     normalize_arguments,
 )
-from dendrux.types import ToolDef, ToolResult
+from dendrux.types import InputValidationError, ToolDef, ToolResult, _validate_persistable
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -155,35 +154,11 @@ class _Problem(NamedTuple):
     value: Any = None
 
 
-# U+0000 cannot be stored in Postgres JSONB; a lone surrogate cannot be encoded as UTF-8.
-_UNPERSISTABLE = re.compile("[\x00\ud800-\udfff]")
-
-
-def has_unpersistable_text(value: Any) -> bool:
-    """Whether any string key or value, at any depth, holds U+0000 or a lone surrogate.
-
-    Iterative, so nesting depth cannot exhaust the stack.
-    """
-    stack: list[Any] = [value]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, str):
-            if _UNPERSISTABLE.search(node):
-                return True
-        elif isinstance(node, dict):
-            stack.extend(node.keys())
-            stack.extend(node.values())
-        elif isinstance(node, (list, tuple)):
-            stack.extend(node)
-    return False
-
-
 def unpersistable_result(tool_call: ToolCall) -> ToolResult:
-    """The ``invalid_params`` failure for text that cannot be stored; it quotes nothing."""
+    """The ``invalid_params`` failure for unpersistable JSON; it quotes no content."""
     message = (
-        f"An argument for `{tool_call.name}` contains a character that cannot be stored "
-        "(U+0000 or an unpaired surrogate), in a name or a value. The call was not made; "
-        "send it again without such characters."
+        f"Arguments for `{tool_call.name}` must be bounded finite JSON with persistable "
+        "text. The call was not made; send it again with valid arguments."
     )
     return invalid_params_result(tool_call, message)
 
@@ -321,14 +296,17 @@ def check_tool_call(
     not receive) is reported as ``code="pii_placeholder"``. A tool whose own
     argument schema cannot be validated against is refused with
     ``code="invalid_tool_schema"`` instead of raising. Params holding U+0000
-    or a lone surrogate (in any key or value, at any depth) are refused with
-    ``invalid_params`` for every tool, known or not, before anything runs or
-    pauses; the message quotes none of the content.
+    or a lone surrogate (in any key or value), nonfinite numbers, or structures
+    exceeding the shared persistence limits are refused with ``invalid_params``
+    for every tool, known or not, before anything runs or pauses; the message
+    quotes none of the content.
     """
     json_result = check_tool_json(tool_call)
     if json_result is not None:
         return json_result
-    if has_unpersistable_text(tool_call.params):
+    try:
+        _validate_persistable(tool_call.params, "params")
+    except InputValidationError:
         return unpersistable_result(tool_call)
     if tool_def is None:
         return None

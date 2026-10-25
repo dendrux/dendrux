@@ -3,6 +3,7 @@
 import pytest
 
 from dendrux.errors import ProviderTimeoutError
+from dendrux.llm._calls import stream_call
 from dendrux.llm.mock import MockLLM
 
 
@@ -23,5 +24,5 @@ async def test_grouped_stream_close_failure_is_typed():
 
     provider = Provider([])
     with pytest.raises(ProviderTimeoutError):
-        async for _ in provider.complete_stream([]):
+        async for _ in stream_call(provider, []):
             pass

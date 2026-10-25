@@ -1654,13 +1654,47 @@ def _row_dict(row: Any) -> dict[str, Any]:
     return {k: jsonable(v) if not isinstance(v, datetime) else "<ts>" for k, v in dict(row).items()}
 
 
+def _legacy_run_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate the additive declaration event before projecting the older oracle.
+
+    Subtract only removed positions; preserve unrelated sequence gaps and order.
+    Called before identity normalization so new event IDs cannot rename old IDs.
+    """
+    removed: dict[str, int] = {}
+    legacy = []
+    for event in events:
+        run_id = event["agent_run_id"]
+        if event.get("event_type") == "tools.declared":
+            data = event.get("data")
+            assert isinstance(data, dict) and set(data) == {"local_tool_names"}, (
+                "invalid tools.declared"
+            )
+            names = data["local_tool_names"]
+            assert isinstance(names, list) and len(names) <= 1000, "invalid tools.declared"
+            assert all(
+                isinstance(name, str) and len(name) <= 64 and name.isidentifier() for name in names
+            ), "invalid tools.declared"
+            assert names == sorted(set(names)), "invalid tools.declared"
+            assert event.get("iteration_index") == 0, "invalid tools.declared"
+            removed[run_id] = removed.get(run_id, 0) + 1
+        else:
+            legacy.append(
+                {
+                    **event,
+                    "sequence_index": event["sequence_index"] - removed.get(run_id, 0),
+                }
+            )
+    return legacy
+
+
 def normalise_rows(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     """Normalise a ``dump_rows`` result; golden-visible tables only (see compare_rows)."""
     norm = Normalizer()
     out: dict[str, Any] = {}
     for name in ROW_TABLES:
         projected = []
-        for row in rows[name]:
+        source_rows = _legacy_run_events(rows[name]) if name == "run_events" else rows[name]
+        for row in source_rows:
             row, problem = _strip_050_additions(name, row)
             assert problem is None, problem
             projected.append(row)

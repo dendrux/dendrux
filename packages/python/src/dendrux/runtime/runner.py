@@ -238,6 +238,27 @@ async def _emit_init_governance_event(
     await notify_governance(notifier, run_id, event_type, 0, data)
 
 
+def _local_tool_names(agent: Agent) -> list[str]:
+    """Bound code-declared names; discovery/provider catalogs are never authority."""
+    from itertools import islice
+
+    from dendrux.tool import get_tool_def
+
+    names = (get_tool_def(fn).name for fn in islice(agent.tools, 1000))
+    return sorted({name for name in names if len(name) <= 64 and name.isidentifier()})
+
+
+async def _emit_declared_tools(
+    agent: Agent,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+) -> None:
+    await _emit_init_governance_event(
+        recorder, notifier, run_id, "tools.declared", {"local_tool_names": _local_tool_names(agent)}
+    )
+
+
 async def _emit_init_events(
     agent: Agent,
     recorder: LoopRecorder | None,
@@ -263,6 +284,7 @@ async def _emit_init_events(
     Discovery failures are wrapped in _MCPDiscoveryError so callers
     can distinguish them from skill emission failures.
     """
+    await _emit_declared_tools(agent, recorder, notifier, run_id)
     session = current(agent) or SkillSession.prepare(agent, loop=resolved_loop)
     session.run_id = run_id
 
@@ -3584,6 +3606,7 @@ async def _prepare_resume(
     # fires them inside its own try/except so a failure during replay still
     # pairs with on_run_failed. See _replay_resume_injected_history below.
 
+    await _emit_declared_tools(agent, recorder, extra_notifier, run_id)
     return _ResumeContext(
         history=history,
         recorder=recorder,

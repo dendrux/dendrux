@@ -22,7 +22,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from dendrux.runtime._blob_catalog import SQLBlobCatalog, write_blob_refs
-from dendrux.runtime.durability import retry_transient_db, safe_database_operations
+from dendrux.runtime.durability import (
+    _safe_database_call,
+    retry_transient_db,
+    safe_database_operations,
+)
 from dendrux.types import (
     CreateRunResult,
     IdempotencyConflictError,
@@ -2610,6 +2614,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         return await retry_transient_db(attempt, label="release_run_claim", run_id=run_id)
 
+    @_safe_database_call
     async def _get_result_record(self, run_id: str, *, tenant_id: TenantScope) -> RunRecord | None:
         """Project one browser-result record without prompts or pause history.
 

@@ -53,4 +53,6 @@ def test_many_pii_literals_cannot_amplify_a_large_wire_argument(monkeypatch, rec
     start = time.perf_counter()
     wire = result.to_dict()
     record_property("wire_seconds", time.perf_counter() - start)
-    assert wire["pending"] is None, "an unscannable display must fail closed"
+    assert wire["pending"]["pause_id"] == "p"
+    assert wire["pending"]["pending_tool_calls"][0]["params"] is None
+    assert wire["pending"]["pending_tool_calls"][0]["args_hidden"] is True

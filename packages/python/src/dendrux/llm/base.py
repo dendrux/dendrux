@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal
 
 from dendrux.types import ProviderCapabilities, StreamEvent, StreamEventType
@@ -26,54 +25,6 @@ ImageCapabilitySource = Literal["capability", "catalog", "adapter"]
 # is enough.
 _LEARNED_LOCK = threading.Lock()
 _LEARNED_ATTR = "_dendrux_learned_image_no"
-
-
-def _typed_complete(method: Any) -> Any:
-    @wraps(method)
-    async def complete(*args: Any, **kwargs: Any) -> Any:
-        from dendrux.errors import provider_error_in
-
-        try:
-            return await method(*args, **kwargs)
-        except ExceptionGroup as group:
-            failure = provider_error_in(group)
-            if failure is not None:
-                raise failure from None
-            raise
-
-    return complete
-
-
-def _typed_stream(method: Any) -> Any:
-    @wraps(method)
-    async def stream(*args: Any, **kwargs: Any) -> AsyncGenerator[StreamEvent, None]:
-        from dendrux.errors import provider_error_in
-
-        source = method(*args, **kwargs)
-        try:
-            async for event in source:
-                yield event
-        except ExceptionGroup as group:
-            failure = provider_error_in(group)
-            if failure is not None:
-                raise failure from None
-            raise
-        finally:
-            await _close_typed_stream(source)
-
-    return stream
-
-
-async def _close_typed_stream(source: Any) -> None:
-    from dendrux.errors import provider_error_in
-
-    try:
-        await source.aclose()
-    except ExceptionGroup as group:
-        failure = provider_error_in(group)
-        if failure is not None:
-            raise failure from None
-        raise
 
 
 class LLMProvider(ABC):
@@ -96,12 +47,6 @@ class LLMProvider(ABC):
                 # call your LLM API here
                 ...
     """
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        for name, wrapper in (("complete", _typed_complete), ("complete_stream", _typed_stream)):
-            if name in cls.__dict__:
-                setattr(cls, name, wrapper(cls.__dict__[name]))
 
     capabilities: ProviderCapabilities = ProviderCapabilities()
 

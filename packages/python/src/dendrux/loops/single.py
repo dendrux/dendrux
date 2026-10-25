@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
+from dendrux.llm._calls import complete_call, stream_call
 from dendrux.llm._evidence import persistable_response
 from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetTracker
@@ -439,7 +440,8 @@ class SingleCall(Loop):
                             **_pkw,
                         )
                     else:
-                        response = await provider.complete(
+                        response = await complete_call(
+                            provider,
                             prepared.wire,
                             tools=None,
                             run_id=resolved_run_id,
@@ -806,7 +808,8 @@ class SingleCall(Loop):
         t0 = time.monotonic()
         llm_response: LLMResponse | None = None
         provider_stream = telemetry_stream(
-            provider.complete_stream(
+            stream_call(
+                provider,
                 prepared.wire,
                 tools=None,
                 run_id=resolved_run_id,
@@ -933,7 +936,8 @@ class SingleCall(Loop):
                 )
                 t0 = time.monotonic()
                 provider_stream = telemetry_stream(
-                    provider.complete_stream(
+                    stream_call(
+                        provider,
                         prepared.wire,
                         tools=None,
                         run_id=resolved_run_id,

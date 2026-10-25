@@ -210,8 +210,10 @@ class TestEmitInitEvents:
         notifier = RecordingNotifier()
         await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
-        assert len(notifier.governance_events) == 1
-        assert notifier.governance_events[0][0] == GovernanceEventType.SKILL_CATALOG_RESOLVED
+        assert [event[0] for event in notifier.governance_events] == [
+            "tools.declared",
+            GovernanceEventType.SKILL_CATALOG_RESOLVED,
+        ]
 
     async def test_no_skills_no_events(self) -> None:
         """Agent without skills emits no skill events."""
@@ -224,7 +226,9 @@ class TestEmitInitEvents:
         notifier = RecordingNotifier()
         await _emit_init_events(agent, recorder, notifier, "test-run-id")
 
-        assert len(recorder.governance_events) == 0
+        assert recorder.governance_events == [
+            ("tools.declared", 0, {"local_tool_names": ["dummy_tool"]}, None)
+        ]
 
     async def test_recorder_none_ok(self) -> None:
         """Works when recorder is None (no persistence)."""
@@ -243,7 +247,10 @@ class TestEmitInitEvents:
         await _emit_init_events(agent, None, notifier, "test-run-id")
 
         # Notifier still gets events even without persistence
-        assert len(notifier.governance_events) == 1
+        assert [event[0] for event in notifier.governance_events] == [
+            "tools.declared",
+            GovernanceEventType.SKILL_CATALOG_RESOLVED,
+        ]
 
     async def test_notifier_none_ok(self) -> None:
         """Works when notifier is None."""
@@ -261,7 +268,10 @@ class TestEmitInitEvents:
         recorder = RecordingRecorder()
         await _emit_init_events(agent, recorder, None, "test-run-id")
 
-        assert len(recorder.governance_events) == 1
+        assert [event[0] for event in recorder.governance_events] == [
+            "tools.declared",
+            GovernanceEventType.SKILL_CATALOG_RESOLVED,
+        ]
 
     async def test_mcp_connected_events(self) -> None:
         """MCP source discovery emits mcp.connected grouped by source_name."""

@@ -1002,16 +1002,59 @@ class TestDeadlines:
         wire(provider, slowish)
         assert (await provider.complete(USER)).text == "ok"
 
-    async def test_stream_idle_fires_after_first_delta(self) -> None:
+    async def test_stream_idle_fires_after_first_delta(
+        self, monkeypatch, controlled_deadlines, deadline_arms
+    ) -> None:
+        from types import SimpleNamespace
+
+        virtual_now = [0.0]
+        opened = []
+        initialize = _resilience.StreamClock.__init__
+
+        def observe_clock(clock, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            before = loop.time()
+            initialize(clock, *args, **kwargs)
+            after = loop.time()
+            opened.append((before, after))
+            virtual_now[0] = after
+            clock._loop = SimpleNamespace(time=lambda: virtual_now[0])
+
+        monkeypatch.setattr(_resilience.StreamClock, "__init__", observe_clock)
         provider = anthropic_provider(stream_idle_timeout=0.2)
-        w = wire(provider, stream_handler([a_start() + a_text("a"), 2.0, a_end()]))
+        waiting = asyncio.Event()
+
+        class GatedBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield a_start() + a_text("a")
+                waiting.set()
+                await asyncio.Event().wait()
+
+        w = wire(provider, lambda request: httpx.Response(200, stream=GatedBody()))
         events: list[StreamEvent] = []
-        with pytest.raises(ProviderTimeoutError) as info:
+
+        async def consume():
             async for event in provider.complete_stream(USER):
                 events.append(event)
-        assert info.value.timeout_reason == "stream_idle"
-        assert [e.text for e in events if e.type == StreamEventType.TEXT_DELTA] == ["a"]
-        assert len(w.requests) == 1
+
+        consumer = asyncio.create_task(consume())
+        try:
+            async with asyncio.timeout(20):
+                await waiting.wait()
+                assert [e.text for e in events if e.type == StreamEventType.TEXT_DELTA] == ["a"]
+                assert deadline_arms, "the stalled post-delta pull must have an armed deadline"
+                before, after = opened[0]
+                assert before + 0.2 <= deadline_arms[0][1] <= after + 0.2
+                assert deadline_arms[-1][1] == pytest.approx(virtual_now[0] + 0.2, rel=0, abs=1e-9)
+                controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
+                with pytest.raises(ProviderTimeoutError) as info:
+                    await consumer
+            assert info.value.timeout_reason == "stream_idle"
+            assert len(w.requests) == 1
+        finally:
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            await provider.close()
 
     async def test_anthropic_ping_does_not_reset_idle(self) -> None:
         provider = anthropic_provider(stream_idle_timeout=0.3)

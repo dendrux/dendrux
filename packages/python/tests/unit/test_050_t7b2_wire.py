@@ -107,7 +107,9 @@ def test_wire_rejects_unserializable_integer_in_client_params():
     # Application-created params can bypass the JSON decoder's integer bound.
     # DTO construction must fail closed rather than returning unserializable JSON.
     wire = result.to_dict()
-    assert wire["pending"] is None
+    assert wire["pending"]["pause_id"] == "P"
+    assert wire["pending"]["pending_tool_calls"][0]["params"] is None
+    assert wire["pending"]["pending_tool_calls"][0]["args_hidden"] is True
     json.dumps(wire)
 
 
@@ -170,7 +172,7 @@ def test_wire_mapping_bound_is_checked_before_allocating_a_regex(monkeypatch):
         meta={"pii_mapping": {"<<DATA_1>>": "x" * 65537}},
     )
     monkeypatch.setattr(wire.re, "escape", must_not_escape_oversize)
-    assert result.to_dict()["pending"] is None
+    assert result.to_dict()["pending"]["pause_id"] == "P"
 
 
 @pytest.mark.parametrize("bound", ["depth", "nodes", "chars", "utf8", "unicode"])
@@ -194,9 +196,11 @@ def test_wire_display_limits_fail_closed(bound):
         "P",
         [PendingToolCall("C", "read", "client", {"value": value})],
     )
-    assert (
-        RunResult("R", RunStatus.WAITING_CLIENT_TOOL, pending=pending).to_dict()["pending"] is None
-    )
+    display = RunResult("R", RunStatus.WAITING_CLIENT_TOOL, pending=pending).to_dict()["pending"]
+    assert display["pause_id"] == "P"
+    assert display["pending_tool_calls"] == [
+        dict(id="C", name="read", target="client", params=None, approval=None, args_hidden=True)
+    ]
 
 
 def test_wire_only_copies_finite_json_values():
@@ -238,12 +242,11 @@ def test_wire_only_copies_finite_json_values():
     ],
 )
 def test_wire_aggregate_mapping_budget_fails_closed(mapping):
-    assert (
-        RunResult(
-            "R",
-            RunStatus.WAITING_APPROVAL,
-            pending=PendingPause("R", "waiting_approval", "approval", "P"),
-            meta={"pii_mapping": mapping},
-        ).to_dict()["pending"]
-        is None
-    )
+    display = RunResult(
+        "R",
+        RunStatus.WAITING_APPROVAL,
+        pending=PendingPause("R", "waiting_approval", "approval", "P"),
+        meta={"pii_mapping": mapping},
+    ).to_dict()["pending"]
+    assert display["pause_id"] == "P"
+    assert display["pending_tool_calls"] == []

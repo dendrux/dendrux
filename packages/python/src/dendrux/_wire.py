@@ -108,6 +108,38 @@ def _structured_output(output: Any) -> Any:
         return None
 
 
+def _pending_wire(pending: Any, mapping: Any) -> Any:
+    projected = _redacted(
+        pending.to_dict(), mapping if pending.kind in ("approval", "input") else None
+    )
+    if projected is not None:
+        return projected
+    # Keep the protocol identity when the argument display exceeds its budget.
+    # Do not scan the rejected arguments or expose unverified display text.
+    return {
+        "run_id": pending.run_id,
+        "status": pending.status,
+        "kind": pending.kind,
+        "pause_id": pending.pause_id,
+        "pending_tool_calls": [
+            {
+                "id": call.id,
+                "name": call.name,
+                "target": call.target,
+                "params": None,
+                "approval": None,
+                "args_hidden": True,
+            }
+            for call in pending.tool_calls
+        ],
+        "question": "[content hidden]" if pending.question is not None else None,
+        "options": [],
+        "reason": None,
+        "message": None,
+        "exceeded": None,
+    }
+
+
 def result_to_dict(result: RunResult) -> dict[str, Any]:
     """Browser DTO, deliberately independent of dataclass/package versions."""
     mapping = result.meta.get("pii_mapping")
@@ -116,11 +148,7 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
         "wire_version": WIRE_VERSION,
         "run_id": result.run_id,
         "status": result.status.value,
-        "pending": _redacted(
-            pending.to_dict(), mapping if pending.kind in ("approval", "input") else None
-        )
-        if pending
-        else None,
+        "pending": _pending_wire(pending, mapping) if pending else None,
         "answer": _wire_answer(result),
         "output": _structured_output(result.output),
         "error_info": _redacted(result.error_info.to_dict(), mapping)

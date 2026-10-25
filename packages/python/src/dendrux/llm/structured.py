@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from dendrux.llm._calls import complete_call
 from dendrux.types import StructuredOutputValidationError
 
 if TYPE_CHECKING:
@@ -61,7 +62,8 @@ async def structured_complete(
 
     schema = output_type.model_json_schema()
 
-    response = await provider.complete(
+    response = await complete_call(
+        provider,
         messages,
         tools=None,
         output_schema=schema,
