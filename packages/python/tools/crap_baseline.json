@@ -16,14 +16,22 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "e040f928ef94",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/_sentinel.py::_UnsetType.__repr__": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "9d43aad09223",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/agent.py::Agent.__aenter__": {
   "complexity": 1,
@@ -384,7 +392,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "a8a92ede746a",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/agent.py::_AgentBlobs.purge": {
   "complexity": 1,
@@ -403,7 +415,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "0055f53f36c4",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/agent.py::_blob_services_factory": {
   "complexity": 1,
@@ -548,14 +564,22 @@
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "a942c2a2774d",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/cli/db.py::status": {
   "complexity": 2,
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "6022d3f86782",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/cli/main.py::_register_subcommands": {
   "complexity": 1,
@@ -691,8 +715,8 @@
  },
  "src/dendrux/db/_pool_guard.py::close_fully": {
   "complexity": 6,
-  "coverage": 0.9167,
-  "crap": 6.02,
+  "coverage": 1.0,
+  "crap": 6.0,
   "digest": "8819ad6bbacd"
  },
  "src/dendrux/db/_pool_guard.py::serialized": {
@@ -973,8 +997,8 @@
  },
  "src/dendrux/db/session.py::get_session": {
   "complexity": 7,
-  "coverage": 0.5,
-  "crap": 13.12,
+  "coverage": 0.8636,
+  "crap": 7.12,
   "digest": "ff445534174c"
  },
  "src/dendrux/db/session.py::reset_engine": {
@@ -1324,7 +1348,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "646b8f0b0ba2",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/guardrails/_engine.py::GuardrailEngine.restore_mode": {
   "complexity": 2,
@@ -1619,7 +1647,11 @@
   "coverage": 0.375,
   "crap": 14.79,
   "digest": "0b21735274ff",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/_helpers.py::_body_field": {
   "complexity": 3,
@@ -1980,7 +2012,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "bc7dce8e48f8",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/_resilience.py::_check_seconds": {
   "complexity": 6,
@@ -2785,14 +2821,22 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "903225e2017d",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.__aexit__": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "ea7dd3d05446",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/openai.py::OpenAIProvider.__init__": {
   "complexity": 3,
@@ -2979,14 +3023,22 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "0ec424697ffd",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.__aexit__": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "ea7dd3d05446",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.__init__": {
   "complexity": 8,
@@ -3101,7 +3153,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "5f5f33de554e",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/openai_responses.py::OpenAIResponsesProvider.complete": {
   "complexity": 7,
@@ -3318,7 +3374,11 @@
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "24c3fc10bc50",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/llm/openrouter.py::_get_catalog": {
   "complexity": 3,
@@ -3505,7 +3565,11 @@
   "coverage": 0.5,
   "crap": 6.0,
   "digest": "f7cac78ee80d",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_helpers.py::notify_llm": {
   "complexity": 4,
@@ -3518,14 +3582,22 @@
   "coverage": 0.5,
   "crap": 6.0,
   "digest": "e94fd27b4433",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_helpers.py::notify_llm_started": {
   "complexity": 4,
   "coverage": 0.5,
   "crap": 6.0,
   "digest": "ab0abc6fd978",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_helpers.py::notify_message": {
   "complexity": 4,
@@ -3556,14 +3628,22 @@
   "coverage": 0.5,
   "crap": 6.0,
   "digest": "0a5d69b579b4",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_helpers.py::notify_tool_started": {
   "complexity": 4,
   "coverage": 0.5,
   "crap": 6.0,
   "digest": "51ab56b8cec7",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_helpers.py::price_response": {
   "complexity": 3,
@@ -3876,7 +3956,11 @@
   "coverage": 0.3333,
   "crap": 16.67,
   "digest": "0beb57618b24",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_images.py::rejection_candidates": {
   "complexity": 18,
@@ -4027,7 +4111,11 @@
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "59a78814d936",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/base.py::LoopNotifier.on_governance_event": {
   "complexity": 1,
@@ -4169,8 +4257,8 @@
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream": {
   "complexity": 57,
-  "coverage": 0.9172,
-  "crap": 58.84,
+  "coverage": 0.9236,
+  "crap": 58.45,
   "digest": "e3ca4bca2495"
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream.<locals>._control_reader": {
@@ -4646,7 +4734,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "de0bc2f554e8",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_client.py::MCPClientAdapter.list_tools": {
   "complexity": 4,
@@ -4809,14 +4901,22 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "044939872171",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_host.py::MCPHost.__aexit__": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "ea7dd3d05446",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_host.py::MCPHost.__init__": {
   "complexity": 8,
@@ -4889,14 +4989,22 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "3692500291a0",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_host.py::_HostedMCPServer.last_error#2": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "1f61b6a98bf9",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_http.py::CappedResponseStream.__aiter__": {
   "complexity": 3,
@@ -5425,7 +5533,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "6e366b6a40cf",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_oauth.py::_OAuthCredentialProvider.on_auth_rejected": {
   "complexity": 1,
@@ -5528,7 +5640,11 @@
   "coverage": 0.6667,
   "crap": 5.93,
   "digest": "9d17e1ef7395",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_oauth.py::_usable": {
   "complexity": 1,
@@ -5649,7 +5765,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "9cd02038f7c7",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_observability.py::MCPOAuthRefreshFailed.__repr__": {
   "complexity": 1,
@@ -5680,7 +5800,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "9cd02038f7c7",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_observability.py::MCPRuntimeObserver.on_event": {
   "complexity": 1,
@@ -5717,7 +5841,11 @@
   "coverage": 0.25,
   "crap": 10.75,
   "digest": "5eabaa9fd34d",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_result.py::_normalize_with_parts": {
   "complexity": 7,
@@ -6660,7 +6788,11 @@
   "coverage": 0.7556,
   "crap": 59.09,
   "digest": "971742101167",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/mcp/_source.py::MCPSource.http": {
   "complexity": 2,
@@ -6919,14 +7051,22 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "8a78aa67339a",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/media/_fetch.py::_PinnedBackend.sleep": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "af8aa4580091",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/media/_fetch.py::_PinnedTransport.__init__": {
   "complexity": 1,
@@ -6993,7 +7133,11 @@
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "135e03de9a90",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/media/_fetch.py::fetch_url": {
   "complexity": 15,
@@ -7480,28 +7624,44 @@
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "010ea7239a89",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_completed": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "84618c4e4a43",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_failed": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "15a30df87f7a",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_started": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "72d9076c04f6",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_message_appended": {
   "complexity": 3,
@@ -7514,35 +7674,55 @@
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "abc498d1141b",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_run_finished": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "7b38b56a0f63",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_run_started": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "84fc456facf2",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_tool_completed": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "e959f26f0d60",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_tool_started": {
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "bccd317afd39",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.__init__": {
   "complexity": 1,
@@ -7555,7 +7735,11 @@
   "coverage": 0.3448,
   "crap": 98.28,
   "digest": "a91f7cc8c702",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_llm_call_completed": {
   "complexity": 9,
@@ -7568,14 +7752,22 @@
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "4e4a60367449",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_llm_call_started": {
   "complexity": 1,
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "ac8e2918a6cd",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_message_appended": {
   "complexity": 5,
@@ -7588,21 +7780,33 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "ffbe9df81b2b",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_run_finished": {
   "complexity": 2,
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "f5fa58ff894b",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_run_started": {
   "complexity": 5,
   "coverage": 0.0,
   "crap": 30.0,
   "digest": "6e2101c19363",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_tool_completed": {
   "complexity": 7,
@@ -7615,21 +7819,33 @@
   "coverage": 0.0,
   "crap": 12.0,
   "digest": "c34239d69035",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.print_summary": {
   "complexity": 13,
   "coverage": 0.0,
   "crap": 182.0,
   "digest": "6c35619cdbba",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::_format_params": {
   "complexity": 5,
   "coverage": 0.0,
   "crap": 30.0,
   "digest": "3978790684c3",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/console.py::_truncate": {
   "complexity": 2,
@@ -7648,7 +7864,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "66aaed027ded",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier._child_context": {
   "complexity": 2,
@@ -7727,7 +7947,11 @@
   "coverage": 0.4444,
   "crap": 9.29,
   "digest": "ac4401747b7b",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/otel.py::_to_attr_value": {
   "complexity": 3,
@@ -7884,7 +8108,11 @@
   "coverage": 0.5,
   "crap": 4.12,
   "digest": "31afd2101303",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_blob_catalog.py::CatalogBlobAccessor._collect": {
   "complexity": 9,
@@ -8002,8 +8230,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog._cas": {
   "complexity": 5,
-  "coverage": 0.875,
-  "crap": 5.05,
+  "coverage": 1.0,
+  "crap": 5.0,
   "digest": "dc502eef03fa"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog._drop_edge": {
@@ -8032,8 +8260,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.adopt_pending": {
   "complexity": 1,
-  "coverage": 0.3333,
-  "crap": 1.3,
+  "coverage": 1.0,
+  "crap": 1.0,
   "digest": "e443e26c48ce"
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.blob_references": {
@@ -8113,7 +8341,11 @@
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "2cba0a10acb4",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_blob_catalog.py::InMemoryBlobCatalog.mark_purging_row": {
   "complexity": 2,
@@ -8192,7 +8424,11 @@
   "coverage": 0.6667,
   "crap": 5.93,
   "digest": "8f870c8fc785",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.add_blob_refs": {
   "complexity": 2,
@@ -8250,8 +8486,8 @@
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.get_current": {
   "complexity": 4,
-  "coverage": 0.9167,
-  "crap": 4.01,
+  "coverage": 1.0,
+  "crap": 4.0,
   "digest": "263ac03bc8c3"
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.get_row": {
@@ -8289,7 +8525,11 @@
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "2cba0a10acb4",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_blob_catalog.py::SQLBlobCatalog.mark_purging_row": {
   "complexity": 2,
@@ -8434,7 +8674,11 @@
   "coverage": 0.4444,
   "crap": 6.74,
   "digest": "ca5ac29f280e",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_blob_catalog.py::_marker_for_b64": {
   "complexity": 2,
@@ -8447,7 +8691,11 @@
   "coverage": 0.5,
   "crap": 6.0,
   "digest": "e3cee5b741f3",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_blob_catalog.py::_py_now": {
   "complexity": 1,
@@ -8514,7 +8762,11 @@
   "coverage": 0.9153,
   "crap": 34.7,
   "digest": "5a30a91e8d6f",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_entry_checks.py::entry_checks": {
   "complexity": 4,
@@ -8617,7 +8869,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "fb480394ad66",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/context.py::DelegationDepthExceededError.__init__": {
   "complexity": 1,
@@ -9140,7 +9396,11 @@
   "coverage": 0.5833,
   "crap": 12.63,
   "digest": "5ae6358a3d36",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::_carry_budget_fields": {
   "complexity": 1,
@@ -9771,7 +10031,11 @@
   "coverage": 0.0,
   "crap": 42.0,
   "digest": "0d501b529e4b",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.add_note": {
   "complexity": 4,
@@ -10456,7 +10720,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "17d02857ca82",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/state.py::_apply_tenant_scope": {
   "complexity": 3,
@@ -10589,7 +10857,11 @@
   "coverage": 0.4,
   "crap": 4.94,
   "digest": "bc8ea1ee1900",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/submit.py::_cap_client_result": {
   "complexity": 4,
@@ -10620,7 +10892,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "5ba050c3c470",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/submit.py::_invalid_tool_result": {
   "complexity": 1,
@@ -10669,7 +10945,11 @@
   "coverage": 0.6486,
   "crap": 24.76,
   "digest": "c017db334416",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/submit.py::claim_paused_validated": {
   "complexity": 10,
@@ -11054,7 +11334,11 @@
   "coverage": 0.75,
   "crap": 9.0,
   "digest": "66ef17d22a4d",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/skills/_fs.py::_read_fd": {
   "complexity": 3,
@@ -11475,7 +11759,11 @@
   "coverage": 0.3333,
   "crap": 16.67,
   "digest": "64ff1c137462",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/store/__init__.py::RunStore._approval_params": {
   "complexity": 3,
@@ -11896,7 +12184,11 @@
   "coverage": 0.0,
   "crap": 2.0,
   "digest": "2c459b1d12c7",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/store/_follow.py::_Follower.end": {
   "complexity": 2,
@@ -11957,7 +12249,11 @@
   "coverage": 0.4545,
   "crap": 9.06,
   "digest": "18fc270544c7",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/store/_follow.py::approval_calls": {
   "complexity": 6,
@@ -12096,7 +12392,11 @@
   "coverage": 0.6,
   "crap": 8.3,
   "digest": "c61b93e95187",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/tool.py::_normalize_receives_pii": {
   "complexity": 7,
@@ -12235,7 +12535,11 @@
   "coverage": 0.4444,
   "crap": 22.89,
   "digest": "84b805077d65",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/tools/_coerce.py::get_args_spec": {
   "complexity": 2,
@@ -12434,7 +12738,11 @@
   "coverage": 0.0,
   "crap": 6.0,
   "digest": "ad6febc37490",
-  "waived": "worse"
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
+   "rule": "worse"
+  }
  },
  "src/dendrux/tools/_pool.py::get_pool": {
   "complexity": 3,

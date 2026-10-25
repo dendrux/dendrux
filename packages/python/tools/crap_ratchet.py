@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
 import hashlib
 import json
 import sys
@@ -171,21 +172,51 @@ def _own_lines(node: _FunctionNode) -> set[int]:
     return own
 
 
+def _needs_measurement(stmt: ast.stmt) -> bool:
+    """False for statements coverage.py never reports: bare constants (docstrings, ``...``),
+    ``global``/``nonlocal`` and annotations without a value."""
+    if isinstance(stmt, ast.Expr):
+        return not isinstance(stmt.value, ast.Constant)
+    if isinstance(stmt, ast.Global | ast.Nonlocal):
+        return False
+    return not (isinstance(stmt, ast.AnnAssign) and stmt.value is None)
+
+
+def _unaccounted_lines(node: _FunctionNode, known: set[int]) -> list[int]:
+    """Body statements of ``node`` (not of nested functions) the report says nothing about.
+
+    A stale or partial report, for example one taken before the function grew, leaves
+    the added statements unmentioned; scoring only the surviving lines would hide them.
+    """
+    own = _own_lines(node)
+    return sorted(
+        {
+            stmt.lineno
+            for stmt in ast.walk(node)
+            if isinstance(stmt, ast.stmt)
+            and stmt.lineno in own
+            and _needs_measurement(stmt)
+            and stmt.lineno not in known
+        }
+    )
+
+
 def _body_coverage(
     node: _FunctionNode, executed: set[int], missing: set[int], excluded: set[int]
-) -> tuple[float, bool]:
-    """(coverage fraction, measured). ``measured`` is False when statements have no data."""
+) -> tuple[float, list[int]]:
+    """(coverage fraction, body statement lines the report does not mention)."""
     if not _has_statements(node):
-        return 1.0, True
+        return 1.0, []
     if node.body[0].lineno <= node.lineno:
         # The body shares the def line, which runs at import: execution cannot be seen.
-        return 0.0, True
+        return 0.0, []
+    unaccounted = _unaccounted_lines(node, executed | missing | excluded)
+    if unaccounted:
+        return 0.0, unaccounted
     own = _own_lines(node)
     ran = len(own & executed)
     unrun = len(own & (missing | excluded))
-    if ran + unrun == 0:
-        return 0.0, False
-    return ran / (ran + unrun), True
+    return (ran / (ran + unrun) if ran + unrun else 1.0), []
 
 
 def _iter_sources(src_root: Path) -> list[Path]:
@@ -235,9 +266,12 @@ def collect_scores(
             seen[qual] = seen.get(qual, 0) + 1
             suffix = "" if seen[qual] == 1 else f"#{seen[qual]}"
             key = f"{rel}::{qual}{suffix}"
-            fraction, measured = _body_coverage(node, executed, missing, excluded)
-            if not measured:
-                problems.append(f"{key}: body has statements but no coverage measurements")
+            fraction, unaccounted = _body_coverage(node, executed, missing, excluded)
+            if unaccounted:
+                lines = ", ".join(str(n) for n in unaccounted)
+                problems.append(
+                    f"{key}: statements at line(s) {lines} are not in the coverage report"
+                )
                 continue
             complexity = _complexity(node)
             scores[key] = FunctionScore(
@@ -315,19 +349,29 @@ def build_baseline(
     allow_regress: bool = False,
     threshold: float = DEFAULT_THRESHOLD,
     tolerance: float = DEFAULT_TOLERANCE,
+    reason: str | None = None,
+    today: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Baseline for ``scores``. Refuses to record any rule violation unless told to.
 
-    With ``allow_regress`` the violations are waived and each affected entry carries
-    ``"waived": <rule>`` until the next update rewrites it, so the exception shows up in
-    the baseline diff.
+    With ``allow_regress`` (which needs a ``reason``) the violations are waived. Each
+    affected entry records ``"waived": {"rule", "reason", "date"}``. Provenance of an
+    earlier waiver is carried forward by later updates, so a routine refresh cannot erase
+    who accepted what and why.
     """
     violations = waived_violations(scores, previous, threshold, tolerance)
     if violations and not allow_regress:
         raise ValueError("; ".join(f"{v.key}: {v.message}" for v in violations))
+    if allow_regress and not (reason and reason.strip()):
+        raise ValueError("--allow-regress needs a reason (--reason TEXT) that is recorded")
+    date = today or datetime.date.today().isoformat()
     baseline = {key: _entry(score) for key, score in sorted(scores.items())}
+    for key, entry in baseline.items():
+        earlier = previous.get(key, {}).get("waived")
+        if earlier:
+            entry["waived"] = earlier
     for v in violations:
-        baseline[v.key]["waived"] = v.kind
+        baseline[v.key]["waived"] = {"rule": v.kind, "reason": (reason or "").strip(), "date": date}
     return baseline
 
 
@@ -360,6 +404,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument(
+        "--reason",
+        help="update --allow-regress: why the violations are accepted; recorded with the date",
+    )
+    parser.add_argument(
         "--allow-regress",
         action="store_true",
         help="update: waive rule violations; each is listed as WAIVED and marked in the baseline",
@@ -386,18 +434,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         return 0
     if args.command == "update":
+        if args.allow_regress and not (args.reason and args.reason.strip()):
+            print(
+                "refusing to update the baseline: --allow-regress needs --reason", file=sys.stderr
+            )
+            return 2
+        previous = baseline or {}
         try:
             new = build_baseline(
-                scores, baseline or {}, args.allow_regress, args.threshold, args.tolerance
+                scores,
+                previous,
+                args.allow_regress,
+                args.threshold,
+                args.tolerance,
+                reason=args.reason,
             )
         except ValueError as exc:
             print(f"refusing to update the baseline: {exc}", file=sys.stderr)
             return 1
-        waived = [(key, entry["waived"]) for key, entry in new.items() if "waived" in entry]
-        for key, kind in waived:
-            print(f"WAIVED {kind}: {key}")
+        waived = [key for key, entry in new.items() if "waived" in entry]
+        fresh = [k for k in waived if new[k]["waived"] != previous.get(k, {}).get("waived")]
+        for key in fresh:
+            info = new[key]["waived"]
+            print(f"WAIVED {info['rule']}: {key} ({info['reason']}, {info['date']})")
         args.baseline.write_text(json.dumps(new, indent=1, sort_keys=True) + "\n")
-        print(f"baseline written: {len(new)} functions, {len(waived)} waived")
+        print(
+            f"baseline written: {len(new)} functions, {len(fresh)} newly waived, "
+            f"{len(waived)} carrying a waiver"
+        )
         return 0
     if baseline is None:
         print(f"baseline not found: {args.baseline} (run 'update' first)", file=sys.stderr)

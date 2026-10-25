@@ -319,6 +319,47 @@ class TestMissingCoverageEvidence:
         assert "mod.py" in capsys.readouterr().err
 
 
+class TestStaleOrPartialCoverage:
+    def test_statements_the_report_does_not_mention_fail(self, tmp_path: Path) -> None:
+        source = "def f(x):\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c + x\n"
+        pkg, root = _write_pkg(tmp_path, source)
+        # only the first body statement was measured; lines 3-5 are new or unreported
+        with pytest.raises(
+            cr.CoverageDataError,
+            match=r"f: statements at line\(s\) 3, 4, 5 are not in the coverage report",
+        ):
+            cr.collect_scores(pkg, root, _cov([1, 2], []))
+
+    def test_lines_that_have_no_statement_need_no_data(self, tmp_path: Path) -> None:
+        source = (
+            "counter = 0\n\n\n"
+            "def f(x):\n"
+            '    """doc"""\n'
+            "    global counter\n"
+            "    y: int\n"
+            "    counter = x\n"
+            "    return counter\n"
+        )
+        pkg, root = _write_pkg(tmp_path, source)
+        scores = cr.collect_scores(pkg, root, _cov([1, 4, 8, 9], []))
+        assert scores["src/pkg/mod.py::f"].coverage == 1.0
+
+    def test_a_stale_real_report_for_an_expanded_function_fails(self, tmp_path: Path) -> None:
+        small = "def risky(a, b, c, d, e, f):\n    return f\n"
+        pkg, root = _write_pkg(tmp_path, small)
+        (pkg / "__init__.py").write_text("")
+        report = _run_under_coverage(root, "import pkg.mod\npkg.mod.risky(1, 2, 3, 4, 5, 6)\n")
+        assert cr.collect_scores(pkg, root, report)["src/pkg/mod.py::risky"].coverage == 1.0
+        (pkg / "mod.py").write_text(
+            "def risky(a, b, c, d, e, f):\n"
+            "    if a or b or c or d or e:\n"
+            "        return 1\n"
+            "    return 0\n"
+        )
+        with pytest.raises(cr.CoverageDataError, match="risky"):
+            cr.collect_scores(pkg, root, report)
+
+
 def _run_under_coverage(root: Path, driver: str) -> dict[str, Any]:
     """Run ``driver`` under a real coverage.py and return its JSON report."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("COV_", "COVERAGE_"))}
@@ -439,7 +480,9 @@ class TestBaseline:
         worse = _score("a.py::f", 10, 0.1)
         with pytest.raises(ValueError, match=r"a\.py::f"):
             cr.build_baseline({worse.key: worse}, _base(old))
-        out = cr.build_baseline({worse.key: worse}, _base(old), allow_regress=True)
+        out = cr.build_baseline(
+            {worse.key: worse}, _base(old), allow_regress=True, reason="measurement change"
+        )
         assert out["a.py::f"]["coverage"] == pytest.approx(0.1)
 
     def test_update_refuses_new_function_over_threshold(self) -> None:
@@ -456,11 +499,49 @@ class TestBaseline:
         with pytest.raises(ValueError, match=r"a\.py::f"):
             cr.build_baseline({edited.key: edited}, _base(old))
 
-    def test_allow_regress_waives_and_marks_the_entry(self) -> None:
+    def test_allow_regress_records_rule_reason_and_date(self) -> None:
         old = _score("a.py::f", 40, 1.0, digest="old")
         edited = _score("a.py::f", 40, 1.0, digest="new")
-        out = cr.build_baseline({edited.key: edited}, _base(old), allow_regress=True)
-        assert out["a.py::f"]["waived"] == "changed-over-threshold"
+        out = cr.build_baseline(
+            {edited.key: edited},
+            _base(old),
+            allow_regress=True,
+            reason="split planned in AGT-1",
+            today="2026-10-25",
+        )
+        assert out["a.py::f"]["waived"] == {
+            "rule": "changed-over-threshold",
+            "reason": "split planned in AGT-1",
+            "date": "2026-10-25",
+        }
+
+    def test_allow_regress_needs_a_reason(self) -> None:
+        old = _score("a.py::f", 40, 1.0, digest="old")
+        edited = _score("a.py::f", 40, 1.0, digest="new")
+        for reason in (None, "", "   "):
+            with pytest.raises(ValueError, match="reason"):
+                cr.build_baseline(
+                    {edited.key: edited}, _base(old), allow_regress=True, reason=reason
+                )
+
+    def test_a_plain_update_keeps_the_waiver_provenance(self) -> None:
+        waived = {"rule": "worse", "reason": "rebaseline", "date": "2026-10-25"}
+        old = _score("a.py::f", 10, 0.5)
+        previous = _base(old)
+        previous["a.py::f"]["waived"] = waived
+        better = _score("a.py::f", 10, 0.9)
+        out = cr.build_baseline({better.key: better}, previous)
+        assert out["a.py::f"]["waived"] == waived
+        assert out["a.py::f"]["coverage"] == pytest.approx(0.9)
+
+    def test_a_new_waiver_replaces_the_old_provenance(self) -> None:
+        previous = _base(_score("a.py::f", 10, 0.9))
+        previous["a.py::f"]["waived"] = {"rule": "worse", "reason": "old", "date": "2026-01-01"}
+        worse = _score("a.py::f", 10, 0.1)
+        out = cr.build_baseline(
+            {worse.key: worse}, previous, allow_regress=True, reason="new", today="2026-10-25"
+        )
+        assert out["a.py::f"]["waived"]["reason"] == "new"
 
     def test_the_cli_lists_every_waived_violation(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -475,9 +556,15 @@ class TestBaseline:
         cov.write_text(json.dumps(_cov([], lost)))
         capsys.readouterr()
         assert cr.main(["update", *common, "--baseline", str(base)]) == 1
-        assert cr.main(["update", *common, "--baseline", str(base), "--allow-regress"]) == 0
+        assert cr.main(["update", *common, "--baseline", str(base), "--allow-regress"]) == 2
+        assert "reason" in capsys.readouterr().err
+        argv = ["update", *common, "--baseline", str(base), "--allow-regress"]
+        assert cr.main([*argv, "--reason", "coverage lost on purpose"]) == 0
         out = capsys.readouterr().out
-        assert "WAIVED" in out and "branchy" in out
+        assert "WAIVED" in out and "branchy" in out and "coverage lost on purpose" in out
+        entry = json.loads(base.read_text())["src/pkg/mod.py::branchy"]
+        assert entry["waived"]["reason"] == "coverage lost on purpose"
+        assert entry["waived"]["date"]
 
     def test_committed_baseline_is_well_formed(self) -> None:
         path = Path(__file__).resolve().parents[2] / "tools" / "crap_baseline.json"
@@ -486,6 +573,9 @@ class TestBaseline:
         for key, entry in data.items():
             assert "::" in key
             assert set(entry) - {"waived"} == {"complexity", "coverage", "crap", "digest"}
+            if "waived" in entry:
+                assert set(entry["waived"]) == {"rule", "reason", "date"}, key
+                assert all(entry["waived"].values()), key
 
 
 class TestReport:
