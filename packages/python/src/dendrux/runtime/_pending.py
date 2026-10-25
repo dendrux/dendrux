@@ -430,24 +430,7 @@ class _PendingReader:
         """
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        getter = getattr(self._state, "get_pause_summary", None)
-        if getter is not None:
-            if _is_postgres_store(self._state):
-                summary = await _pg_pause_summary(self._state, run_id, tenant_id)
-            else:
-                summary = await getter(run_id, tenant_id=tenant_id)
-            if summary is None:
-                raise RunNotFoundError(run_id)
-            status, pause, last_step = summary.status, summary.pause, summary.last_step
-        else:  # custom store: scope by lookup, then the full pause state
-            record = await self._scoped_run(run_id, tenant_id)
-            if record is None:
-                raise RunNotFoundError(run_id)
-            status = record.status
-            full = await self._state.get_pause_state(run_id) or {}
-            pause = dict(full)
-            steps = full.get("steps") or []
-            last_step = steps[-1] if steps else None
+        status, pause, last_step = await self._summary(run_id, tenant_id)
         kind = _KIND_BY_STATUS.get(status)
         if kind is None:
             return None
@@ -459,6 +442,26 @@ class _PendingReader:
                 "pending_tool_calls": approval_calls(pause.get("pending_tool_calls"), params),
             }
         return _pending_from(run_id, status, kind, pause, last_step)
+
+    async def _summary(
+        self, run_id: str, tenant_id: TenantScope
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+        """Status, pause keys and last step; raises RunNotFoundError when out of scope."""
+        getter = getattr(self._state, "get_pause_summary", None)
+        if getter is None:  # custom store: scope by lookup, then the full pause state
+            record = await self._scoped_run(run_id, tenant_id)
+            if record is None:
+                raise RunNotFoundError(run_id)
+            full = await self._state.get_pause_state(run_id) or {}
+            steps = full.get("steps") or []
+            return record.status, dict(full), steps[-1] if steps else None
+        if _is_postgres_store(self._state):
+            summary = await _pg_pause_summary(self._state, run_id, tenant_id)
+        else:
+            summary = await getter(run_id, tenant_id=tenant_id)
+        if summary is None:
+            raise RunNotFoundError(run_id)
+        return summary.status, summary.pause, summary.last_step
 
     async def _status(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> str | None:
         check_run_id(run_id)

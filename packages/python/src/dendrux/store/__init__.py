@@ -508,10 +508,8 @@ class RunStore:
         services = self._blob_services
         accessor = services.accessor
         catalog = services.catalog
-        if not isinstance(sha256, str) or not _SHA256.fullmatch(sha256):
-            raise BlobNotFoundError(image_id(""))  # no image can have this digest
+        missing = BlobNotFoundError(image_id(_image_digest(sha256)))
         record = await self._state.get_run(run_id)
-        missing = BlobNotFoundError(image_id(sha256))
         if record is None or (
             not isinstance(tenant_id, _Unscoped) and record.tenant_id != tenant_id
         ):
@@ -937,13 +935,7 @@ class RunStore:
                 tenant_id=tenant_id,
                 include_payloads=include_payloads,
             )
-            items.append(
-                dataclasses.replace(
-                    pair,
-                    pending_tool_calls=(view.data or {})["pending_tool_calls"],
-                    user_input=pair.user_input if include_payloads else None,
-                )
-            )
+            items.append(_pair_view(pair, view, include_payloads))
         return items, truncated
 
     async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
@@ -1075,6 +1067,21 @@ class RunStore:
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _image_digest(sha256: object) -> str:
+    """``sha256`` when it is a digest; otherwise no image can match it."""
+    if isinstance(sha256, str) and _SHA256.fullmatch(sha256):
+        return sha256
+    raise BlobNotFoundError(image_id(""))
+
+
+def _pair_view(pair: PausePair, view: StoredEvent, include_payloads: bool) -> PausePair:
+    """``pair`` with its redacted pending calls; a person's answer only with payloads."""
+    shown = (view.data or {})["pending_tool_calls"]
+    if include_payloads:
+        return dataclasses.replace(pair, pending_tool_calls=shown)
+    return dataclasses.replace(pair, pending_tool_calls=shown, user_input=None)
 
 
 def _check_list_filters(

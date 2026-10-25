@@ -170,3 +170,17 @@ async def test_event_reads_survive_unconvertible_event_data(store: Any, engine: 
     assert seen[1].data["pending_tool_calls"][0]["params"] == {"q": "a\x00b"}
     pairs, _ = await run_store.get_pause_page(run_id, tenant_id="A")
     assert len(pairs) == 1
+
+
+async def test_one_conversion_summary_matches_the_state_store(store: Any, engine: Any) -> None:
+    """The reader's Postgres statement returns what the state store's summary returns."""
+    from dendrux.runtime._pending import _pg_pause_summary, _whole_pause_summary
+
+    if engine.dialect.name != "postgresql":
+        pytest.skip("Postgres statement")
+    _, run_id = await _paused(store)
+    expected = await store.get_pause_summary(run_id, tenant_id="A")
+    assert await _pg_pause_summary(store, run_id, "A") == expected
+    assert await _whole_pause_summary(store, run_id, "A") == expected
+    assert await _pg_pause_summary(store, run_id, "B") is None
+    assert await _whole_pause_summary(store, run_id, "B") is None
