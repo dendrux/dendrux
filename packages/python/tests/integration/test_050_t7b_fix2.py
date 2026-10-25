@@ -329,8 +329,9 @@ async def test_hot_updates_recover_with_four_tools_per_run(store, engine, record
     assert metrics["99f3ac7b"]["hot_updates"] == 0
     # Page packing and pool scheduling vary by a few rows. The catalog test
     # above enforces exact eligibility; this statistical check rejects lost HOT
-    # while allowing one percentage point of packing noise on 3000 updates.
-    assert metrics["fixed"]["hot_pct"] >= metrics["9391133f"]["hot_pct"] - 1, metrics
+    # (the old layout scores 0%) while allowing five percentage points of noise on 3000
+    # updates: repeated serial runs differ from the baseline layout by up to ~1.2 points.
+    assert metrics["fixed"]["hot_pct"] >= metrics["9391133f"]["hot_pct"] - 5, metrics
     assert metrics["fixed"]["index_bytes"] < metrics["99f3ac7b"]["index_bytes"], metrics
 
 
