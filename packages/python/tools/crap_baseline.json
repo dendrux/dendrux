@@ -161,14 +161,14 @@
  },
  "src/dendrux/agent.py::Agent._validate": {
   "complexity": 43,
-  "coverage": 0.9831,
-  "crap": 43.01,
+  "coverage": 1.0,
+  "crap": 43.0,
   "digest": "5bd2d837066c"
  },
  "src/dendrux/agent.py::Agent._validate_governance_names": {
   "complexity": 10,
-  "coverage": 0.875,
-  "crap": 10.2,
+  "coverage": 0.8125,
+  "crap": 10.66,
   "digest": "24ca8ab7e559"
  },
  "src/dendrux/agent.py::Agent._validate_skill_contents": {
@@ -323,14 +323,14 @@
  },
  "src/dendrux/agent.py::Agent.stream": {
   "complexity": 4,
-  "coverage": 0.9286,
-  "crap": 4.01,
+  "coverage": 0.8571,
+  "crap": 4.05,
   "digest": "938b22744010"
  },
  "src/dendrux/agent.py::Agent.submit_approval": {
   "complexity": 14,
-  "coverage": 0.9592,
-  "crap": 14.01,
+  "coverage": 0.9388,
+  "crap": 14.04,
   "digest": "d986ad5b99c7"
  },
  "src/dendrux/agent.py::Agent.submit_approval.<locals>.same_pause_generation": {
@@ -383,9 +383,14 @@
  },
  "src/dendrux/agent.py::_AgentBlobs.collect_garbage": {
   "complexity": 1,
-  "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "3011d590717a"
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "3011d590717a",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/agent.py::_AgentBlobs.info": {
   "complexity": 1,
@@ -449,7 +454,7 @@
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
-  "digest": "9d01a06c35b5"
+  "digest": "74d7c506e29f"
  },
  "src/dendrux/agent.py::_require_run_in_scope": {
   "complexity": 3,
@@ -715,8 +720,8 @@
  },
  "src/dendrux/db/_pool_guard.py::close_fully": {
   "complexity": 6,
-  "coverage": 1.0,
-  "crap": 6.0,
+  "coverage": 0.9167,
+  "crap": 6.02,
   "digest": "8819ad6bbacd"
  },
  "src/dendrux/db/_pool_guard.py::serialized": {
@@ -786,10 +791,15 @@
   "digest": "8df68924cc0d"
  },
  "src/dendrux/db/_sqlite_sync.py::_add_column": {
-  "complexity": 4,
+  "complexity": 6,
   "coverage": 1.0,
-  "crap": 4.0,
-  "digest": "b09aff622580"
+  "crap": 6.0,
+  "digest": "b83cc4a2e1d7",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/db/_sqlite_sync.py::_apply": {
   "complexity": 6,
@@ -857,6 +867,12 @@
   "crap": 3.0,
   "digest": "21452e42165a"
  },
+ "src/dendrux/db/_sqlite_sync.py::_is_status_clock": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "acb5f7cf4040"
+ },
  "src/dendrux/db/_sqlite_sync.py::_normalize_sql": {
   "complexity": 1,
   "coverage": 1.0,
@@ -870,10 +886,15 @@
   "digest": "7d5bce476a8c"
  },
  "src/dendrux/db/_sqlite_sync.py::_raise_if_unsafe": {
-  "complexity": 6,
+  "complexity": 7,
   "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "a0e4f02e6049"
+  "crap": 7.0,
+  "digest": "8cfdb7f12112",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/db/_sqlite_sync.py::_reconcile_exact": {
   "complexity": 5,
@@ -2124,7 +2145,7 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "d6af8ca68a32"
+  "digest": "3ccf443bc62e"
  },
  "src/dendrux/llm/_resilience.py::map_sdk_error": {
   "complexity": 8,
@@ -2180,6 +2201,42 @@
   "crap": 6.0,
   "digest": "445707ec65f9"
  },
+ "src/dendrux/llm/_retry_telemetry.py::TelemetryStream.__anext__": {
+  "complexity": 3,
+  "coverage": 0.875,
+  "crap": 3.02,
+  "digest": "0f60c8b3ca5e"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::TelemetryStream.__init__": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "ada77b4a4ba0"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::TelemetryStream._binding": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "8d31afc030db"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::TelemetryStream.aclose": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "335e6e879ff2"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::TelemetryStream.asend": {
+  "complexity": 1,
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "50930865ac6d"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::TelemetryStream.athrow": {
+  "complexity": 1,
+  "coverage": 0.0,
+  "crap": 2.0,
+  "digest": "f80055e5e894"
+ },
  "src/dendrux/llm/_retry_telemetry.py::_on_response": {
   "complexity": 14,
   "coverage": 0.8182,
@@ -2208,13 +2265,25 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "6e8bc7301c2b"
+  "digest": "3c6ad4c6342c"
  },
  "src/dendrux/llm/_retry_telemetry.py::telemetry_context": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
   "digest": "d597f14d155f"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::telemetry_event_hooks": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "7b736038a773"
+ },
+ "src/dendrux/llm/_retry_telemetry.py::telemetry_stream": {
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "70ad57de3dff"
  },
  "src/dendrux/llm/_schema.py::_anthropic_children": {
   "complexity": 5,
@@ -3441,10 +3510,15 @@
   "digest": "478325401de6"
  },
  "src/dendrux/loops/_budget.py::BudgetTracker.__init__": {
-  "complexity": 13,
+  "complexity": 15,
   "coverage": 1.0,
-  "crap": 13.0,
-  "digest": "96c002bff250"
+  "crap": 15.0,
+  "digest": "aaed62b068b2",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_budget.py::BudgetTracker._emit": {
   "complexity": 1,
@@ -3453,10 +3527,10 @@
   "digest": "705007d9db70"
  },
  "src/dendrux/loops/_budget.py::BudgetTracker._measure": {
-  "complexity": 8,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "12a46667d5c6"
+  "crap": 4.0,
+  "digest": "7dec8ebcf5f2"
  },
  "src/dendrux/loops/_budget.py::BudgetTracker._pick_reader": {
   "complexity": 7,
@@ -3470,6 +3544,12 @@
   "crap": 12.0,
   "digest": "fb723a08b44e"
  },
+ "src/dendrux/loops/_budget.py::BudgetTracker._tokens": {
+  "complexity": 7,
+  "coverage": 1.0,
+  "crap": 7.0,
+  "digest": "5c8e6dd4ead1"
+ },
  "src/dendrux/loops/_budget.py::BudgetTracker.action": {
   "complexity": 3,
   "coverage": 1.0,
@@ -3477,10 +3557,15 @@
   "digest": "702a7dc0818c"
  },
  "src/dendrux/loops/_budget.py::BudgetTracker.add_response": {
-  "complexity": 2,
+  "complexity": 3,
   "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "2e7ad24fad62"
+  "crap": 3.0,
+  "digest": "2b2b239e665c",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/_budget.py::BudgetTracker.checkpoint": {
   "complexity": 10,
@@ -3564,7 +3649,7 @@
   "complexity": 4,
   "coverage": 0.5,
   "crap": 6.0,
-  "digest": "f7cac78ee80d",
+  "digest": "ee4cd440dbc3",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -3575,13 +3660,13 @@
   "complexity": 4,
   "coverage": 0.625,
   "crap": 4.84,
-  "digest": "d1d15fd8ef54"
+  "digest": "c4406b234831"
  },
  "src/dendrux/loops/_helpers.py::notify_llm_failed": {
   "complexity": 4,
-  "coverage": 0.5,
-  "crap": 6.0,
-  "digest": "e94fd27b4433",
+  "coverage": 0.875,
+  "crap": 4.03,
+  "digest": "e8b0b907fc19",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -3592,7 +3677,7 @@
   "complexity": 4,
   "coverage": 0.5,
   "crap": 6.0,
-  "digest": "ab0abc6fd978",
+  "digest": "3a2995e93ae9",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -3603,31 +3688,31 @@
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "f57b0e49c766"
+  "digest": "e44ed359adbc"
  },
  "src/dendrux/loops/_helpers.py::notify_run_failed": {
   "complexity": 4,
   "coverage": 0.875,
   "crap": 4.03,
-  "digest": "2551c201e4ff"
+  "digest": "18239a028e3b"
  },
  "src/dendrux/loops/_helpers.py::notify_run_finished": {
   "complexity": 4,
   "coverage": 0.625,
   "crap": 4.84,
-  "digest": "c4c2d8dfd206"
+  "digest": "9b32eb3a6ebc"
  },
  "src/dendrux/loops/_helpers.py::notify_run_started": {
   "complexity": 4,
   "coverage": 0.625,
   "crap": 4.84,
-  "digest": "f1e17b2d4bba"
+  "digest": "0520dc45f97e"
  },
  "src/dendrux/loops/_helpers.py::notify_tool": {
   "complexity": 4,
   "coverage": 0.5,
   "crap": 6.0,
-  "digest": "0a5d69b579b4",
+  "digest": "cb98d7d77725",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -3638,7 +3723,7 @@
   "complexity": 4,
   "coverage": 0.5,
   "crap": 6.0,
-  "digest": "51ab56b8cec7",
+  "digest": "040a750b5ad8",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -4241,13 +4326,18 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "1ba2534a1974"
+  "digest": "269d0d573ec0"
  },
  "src/dendrux/loops/react.py::ReActLoop.run": {
   "complexity": 55,
-  "coverage": 0.931,
-  "crap": 55.99,
-  "digest": "70090d473139"
+  "coverage": 0.9931,
+  "crap": 55.0,
+  "digest": "96336375bfd8",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "changed-over-threshold"
+  }
  },
  "src/dendrux/loops/react.py::ReActLoop.run.<locals>._control_reader": {
   "complexity": 2,
@@ -4257,9 +4347,14 @@
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream": {
   "complexity": 57,
-  "coverage": 0.9236,
-  "crap": 58.45,
-  "digest": "e3ca4bca2495"
+  "coverage": 0.9156,
+  "crap": 58.95,
+  "digest": "d7600a842e77",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/react.py::ReActLoop.run_stream.<locals>._control_reader": {
   "complexity": 4,
@@ -4268,10 +4363,15 @@
   "digest": "f952f086ca97"
  },
  "src/dendrux/loops/react.py::_accumulate_usage": {
-  "complexity": 15,
+  "complexity": 16,
   "coverage": 1.0,
-  "crap": 15.0,
-  "digest": "e38b7c0da2dd"
+  "crap": 16.0,
+  "digest": "33f29b773457",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/react.py::_append_assistant": {
   "complexity": 4,
@@ -4314,6 +4414,12 @@
   "coverage": 1.0,
   "crap": 2.0,
   "digest": "2b2be4e6b291"
+ },
+ "src/dendrux/loops/react.py::_blocked_data": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "9655ae0defba"
  },
  "src/dendrux/loops/react.py::_budget_cancel_result": {
   "complexity": 1,
@@ -4359,8 +4465,8 @@
  },
  "src/dendrux/loops/react.py::_contains_image": {
   "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
+  "coverage": 0.8889,
+  "crap": 7.07,
   "digest": "c9a973c1e4b5"
  },
  "src/dendrux/loops/react.py::_control_stop_result": {
@@ -4383,8 +4489,8 @@
  },
  "src/dendrux/loops/react.py::_execute_parallel_group": {
   "complexity": 17,
-  "coverage": 0.9655,
-  "crap": 17.01,
+  "coverage": 0.931,
+  "crap": 17.09,
   "digest": "2873265560dc"
  },
  "src/dendrux/loops/react.py::_execute_record_notify": {
@@ -4411,6 +4517,12 @@
   "crap": 4.0,
   "digest": "4306359a86c5"
  },
+ "src/dendrux/loops/react.py::_image_block_data": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "1d01d848f221"
+ },
  "src/dendrux/loops/react.py::_image_policy": {
   "complexity": 3,
   "coverage": 1.0,
@@ -4423,10 +4535,16 @@
   "crap": 2.0,
   "digest": "394c2a2311df"
  },
+ "src/dendrux/loops/react.py::_incoming_location": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "75ad5736e7f8"
+ },
  "src/dendrux/loops/react.py::_ingest_mcp_images": {
   "complexity": 6,
-  "coverage": 0.9091,
-  "crap": 6.03,
+  "coverage": 1.0,
+  "crap": 6.0,
   "digest": "68f5ed7a2d8d"
  },
  "src/dendrux/loops/react.py::_ingest_tool_images": {
@@ -4503,8 +4621,8 @@
  },
  "src/dendrux/loops/react.py::_referenced_images.<locals>.walk": {
   "complexity": 9,
-  "coverage": 0.9091,
-  "crap": 9.06,
+  "coverage": 1.0,
+  "crap": 9.0,
   "digest": "403b36df63aa"
  },
  "src/dendrux/loops/react.py::_restore_params": {
@@ -4557,21 +4675,36 @@
  },
  "src/dendrux/loops/single.py::SingleCall.run": {
   "complexity": 47,
-  "coverage": 0.8197,
-  "crap": 59.95,
-  "digest": "b5d601f723be"
+  "coverage": 0.9262,
+  "crap": 47.89,
+  "digest": "829b88fa3965",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "changed-over-threshold"
+  }
  },
  "src/dendrux/loops/single.py::SingleCall.run_stream": {
   "complexity": 34,
-  "coverage": 0.9273,
-  "crap": 34.44,
-  "digest": "69485adc5079"
+  "coverage": 0.9252,
+  "crap": 34.48,
+  "digest": "d2dc34ee556b",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "changed-over-threshold"
+  }
  },
  "src/dendrux/loops/single.py::_call_usage": {
-  "complexity": 1,
+  "complexity": 3,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "1694ade4e0dc"
+  "crap": 3.0,
+  "digest": "54e90650427b",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/single.py::_cancel_reader": {
   "complexity": 1,
@@ -4581,9 +4714,14 @@
  },
  "src/dendrux/loops/single.py::_cancel_reader.<locals>.read": {
   "complexity": 5,
-  "coverage": 1.0,
-  "crap": 5.0,
-  "digest": "d7563c7d5712"
+  "coverage": 0.6667,
+  "crap": 5.93,
+  "digest": "d7563c7d5712",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/single.py::_image_site": {
   "complexity": 3,
@@ -7333,8 +7471,8 @@
  },
  "src/dendrux/media/_ingest.py::_store_blob": {
   "complexity": 23,
-  "coverage": 0.9464,
-  "crap": 23.08,
+  "coverage": 0.9286,
+  "crap": 23.19,
   "digest": "6e8974ef94c0"
  },
  "src/dendrux/media/_ingest.py::_validate_bytes": {
@@ -7623,7 +7761,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "010ea7239a89",
+  "digest": "550dadb83105",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7634,7 +7772,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "84618c4e4a43",
+  "digest": "1859031bc474",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7643,9 +7781,9 @@
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_llm_call_failed": {
   "complexity": 3,
-  "coverage": 0.0,
-  "crap": 12.0,
-  "digest": "15a30df87f7a",
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "1786cd95ac55",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7656,7 +7794,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "72d9076c04f6",
+  "digest": "2c20ba552ff8",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7667,13 +7805,13 @@
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "9720632e0d00"
+  "digest": "b54b1efa1819"
  },
  "src/dendrux/notifiers/composite.py::CompositeNotifier.on_run_failed": {
   "complexity": 3,
-  "coverage": 0.0,
-  "crap": 12.0,
-  "digest": "abc498d1141b",
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "ef2de309d14d",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7684,7 +7822,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "7b38b56a0f63",
+  "digest": "672d19063b3c",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7695,7 +7833,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "84fc456facf2",
+  "digest": "a828cc41ee9f",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7706,7 +7844,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "e959f26f0d60",
+  "digest": "b22c36ce623d",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7717,7 +7855,7 @@
   "complexity": 3,
   "coverage": 0.0,
   "crap": 12.0,
-  "digest": "bccd317afd39",
+  "digest": "dcab50c5be89",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7749,9 +7887,9 @@
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_llm_call_failed": {
   "complexity": 2,
-  "coverage": 0.0,
-  "crap": 6.0,
-  "digest": "4e4a60367449",
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "930d923ba16a",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7777,9 +7915,9 @@
  },
  "src/dendrux/notifiers/console.py::ConsoleNotifier.on_run_failed": {
   "complexity": 1,
-  "coverage": 0.0,
-  "crap": 2.0,
-  "digest": "ffbe9df81b2b",
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "85b5ec1ad30f",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -7836,6 +7974,12 @@
    "rule": "worse"
   }
  },
+ "src/dendrux/notifiers/console.py::_error_message": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "b0700e24c52f"
+ },
  "src/dendrux/notifiers/console.py::_format_params": {
   "complexity": 5,
   "coverage": 0.0,
@@ -7877,10 +8021,15 @@
   "digest": "887fd3ead729"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier._close_orphan_children": {
-  "complexity": 14,
-  "coverage": 0.75,
-  "crap": 17.06,
-  "digest": "9cc45d30b5af"
+  "complexity": 16,
+  "coverage": 0.7812,
+  "crap": 18.68,
+  "digest": "2757e46d6797",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier._set_image_attributes": {
   "complexity": 9,
@@ -7892,55 +8041,60 @@
   "complexity": 5,
   "coverage": 0.75,
   "crap": 5.39,
-  "digest": "d1c3d5cb1567"
+  "digest": "283863f766c4"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_llm_call_completed": {
   "complexity": 8,
   "coverage": 0.9444,
   "crap": 8.01,
-  "digest": "a884a36725cf"
+  "digest": "4e34550c2c25"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_llm_call_failed": {
   "complexity": 4,
-  "coverage": 0.7273,
-  "crap": 4.32,
-  "digest": "d00b1d5dd4ee"
+  "coverage": 0.7,
+  "crap": 4.43,
+  "digest": "43af6e9cd71f"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_llm_call_started": {
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "dda31a954ce5"
+  "digest": "8fa41f010fdc"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_run_failed": {
   "complexity": 4,
-  "coverage": 0.7692,
-  "crap": 4.2,
-  "digest": "64d8aa1a0e33"
+  "coverage": 0.75,
+  "crap": 4.25,
+  "digest": "4e61bc8330f7"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_run_finished": {
-  "complexity": 3,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "5a4507f47a3e"
+  "crap": 4.0,
+  "digest": "1a15bf8e7317",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_run_started": {
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "f3ee2d368931"
+  "digest": "b3f8f6e31e22"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_tool_completed": {
   "complexity": 5,
   "coverage": 0.9231,
   "crap": 5.01,
-  "digest": "ce9b0430936d"
+  "digest": "02904263717e"
  },
  "src/dendrux/notifiers/otel.py::OpenTelemetryNotifier.on_tool_started": {
   "complexity": 4,
   "coverage": 0.7778,
   "crap": 4.18,
-  "digest": "acc376dad83d"
+  "digest": "c44935cb5d1f"
  },
  "src/dendrux/notifiers/otel.py::_image_family": {
   "complexity": 5,
@@ -7952,6 +8106,18 @@
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
    "rule": "worse"
   }
+ },
+ "src/dendrux/notifiers/otel.py::_set_error_info": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "2f011b3c658b"
+ },
+ "src/dendrux/notifiers/otel.py::_set_span_error": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "83fcf4736b19"
  },
  "src/dendrux/notifiers/otel.py::_to_attr_value": {
   "complexity": 3,
@@ -8866,8 +9032,8 @@
  },
  "src/dendrux/runtime/context.py::DelegationContext.__hash__": {
   "complexity": 1,
-  "coverage": 0.0,
-  "crap": 2.0,
+  "coverage": 1.0,
+  "crap": 1.0,
   "digest": "fb480394ad66",
   "waived": {
    "date": "2026-10-25",
@@ -8971,6 +9137,12 @@
   "crap": 9.0,
   "digest": "37e37dcc78b9"
  },
+ "src/dendrux/runtime/context.py::safe_exception_info": {
+  "complexity": 12,
+  "coverage": 1.0,
+  "crap": 12.0,
+  "digest": "5e7a843fca2c"
+ },
  "src/dendrux/runtime/context.py::set_delegation_context": {
   "complexity": 1,
   "coverage": 1.0,
@@ -9045,9 +9217,27 @@
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_llm_call_completed": {
   "complexity": 27,
-  "coverage": 0.9167,
-  "crap": 27.42,
-  "digest": "ce7c66d48b1d"
+  "coverage": 0.9091,
+  "crap": 27.55,
+  "digest": "e7e464b93d83"
+ },
+ "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_llm_call_completed.<locals>._write_interaction": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "568db3ff09c5"
+ },
+ "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_llm_call_completed.<locals>._write_usage": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "03194820f56a"
+ },
+ "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_llm_call_failed": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "1381229316aa"
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_message_appended": {
   "complexity": 11,
@@ -9062,10 +9252,15 @@
   "digest": "6d675b7bbb92"
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_tool_completed": {
-  "complexity": 9,
+  "complexity": 11,
   "coverage": 1.0,
-  "crap": 9.0,
-  "digest": "89c8f724826a"
+  "crap": 11.0,
+  "digest": "bd4edb3f7b1e",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/persistence.py::PersistenceRecorder.on_tool_completed.<locals>._write_tool": {
   "complexity": 1,
@@ -9077,7 +9272,7 @@
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
-  "digest": "fbb4c739c155"
+  "digest": "036cc40b11b2"
  },
  "src/dendrux/runtime/persistence.py::_serialize_message": {
   "complexity": 8,
@@ -9377,7 +9572,7 @@
   "complexity": 5,
   "coverage": 0.7,
   "crap": 5.68,
-  "digest": "88618abba334"
+  "digest": "0e790a235889"
  },
  "src/dendrux/runtime/runner.py::_barrier_pause_result": {
   "complexity": 13,
@@ -9395,7 +9590,7 @@
   "complexity": 8,
   "coverage": 0.5833,
   "crap": 12.63,
-  "digest": "5ae6358a3d36",
+  "digest": "68e3b2cc73cd",
   "waived": {
    "date": "2026-10-25",
    "reason": "rebaseline: coverage now credits only a function's own body (the def line no longer counts); no source change",
@@ -9436,7 +9631,7 @@
   "complexity": 2,
   "coverage": 1.0,
   "crap": 2.0,
-  "digest": "12284632b837"
+  "digest": "dad28363b244"
  },
  "src/dendrux/runtime/runner.py::_decided_payload": {
   "complexity": 9,
@@ -9460,7 +9655,7 @@
   "complexity": 3,
   "coverage": 0.6667,
   "crap": 3.33,
-  "digest": "02c56ffc7b1c"
+  "digest": "88f710311144"
  },
  "src/dendrux/runtime/runner.py::_emit_init_events": {
   "complexity": 18,
@@ -9481,10 +9676,33 @@
   "digest": "63c8c33319af"
  },
  "src/dendrux/runtime/runner.py::_ensure_pause_generation": {
+  "complexity": 7,
+  "coverage": 1.0,
+  "crap": 7.0,
+  "digest": "12f20c3ffe5c",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
+ },
+ "src/dendrux/runtime/runner.py::_error_info_from_meta": {
+  "complexity": 3,
+  "coverage": 1.0,
+  "crap": 3.0,
+  "digest": "6429638f580c"
+ },
+ "src/dendrux/runtime/runner.py::_error_payload": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "4ab42adb585e"
+ },
+ "src/dendrux/runtime/runner.py::_error_store_kwargs": {
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "6e15d92997d9"
+  "digest": "7053ec8f5639"
  },
  "src/dendrux/runtime/runner.py::_execute_approved_tools": {
   "complexity": 38,
@@ -9506,8 +9724,8 @@
  },
  "src/dendrux/runtime/runner.py::_idempotent_hit_after_image_error": {
   "complexity": 26,
-  "coverage": 0.8,
-  "crap": 31.41,
+  "coverage": 0.9429,
+  "crap": 26.13,
   "digest": "8619a0c5dfcb"
  },
  "src/dendrux/runtime/runner.py::_image_loop_kwargs": {
@@ -9596,9 +9814,9 @@
  },
  "src/dendrux/runtime/runner.py::_pause_request_message": {
   "complexity": 6,
-  "coverage": 0.6667,
-  "crap": 7.33,
-  "digest": "f9de6ae53b8d"
+  "coverage": 0.7778,
+  "crap": 6.4,
+  "digest": "67d0c52852ac"
  },
  "src/dendrux/runtime/runner.py::_pause_with_event": {
   "complexity": 7,
@@ -9613,10 +9831,15 @@
   "digest": "ce99045b247e"
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome": {
-  "complexity": 27,
-  "coverage": 0.9828,
-  "crap": 27.0,
-  "digest": "e51d715c57d7"
+  "complexity": 33,
+  "coverage": 1.0,
+  "crap": 33.0,
+  "digest": "a1fde1ac0bd2",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome.<locals>._finalize_cancelled": {
   "complexity": 2,
@@ -9628,25 +9851,42 @@
   "complexity": 4,
   "coverage": 1.0,
   "crap": 4.0,
-  "digest": "4ce7688adf60"
+  "digest": "d8c772cec668"
  },
  "src/dendrux/runtime/runner.py::_persist_loop_outcome.<locals>._wrap": {
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "8e7c0e6a68b0"
+  "digest": "7dbab349689b"
  },
  "src/dendrux/runtime/runner.py::_persist_task_cancellation": {
-  "complexity": 7,
-  "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "3ad1a6932b52"
+  "complexity": 8,
+  "coverage": 0.9444,
+  "crap": 8.01,
+  "digest": "9e27899af929",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::_prepare_resume": {
   "complexity": 17,
   "coverage": 1.0,
   "crap": 17.0,
   "digest": "593cae371afb"
+ },
+ "src/dendrux/runtime/runner.py::_provider_error_info": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "6c4eab9526af"
+ },
+ "src/dendrux/runtime/runner.py::_public_meta": {
+  "complexity": 4,
+  "coverage": 1.0,
+  "crap": 4.0,
+  "digest": "4d19d57ef350"
  },
  "src/dendrux/runtime/runner.py::_raise_resume_claim_failure": {
   "complexity": 6,
@@ -9656,9 +9896,14 @@
  },
  "src/dendrux/runtime/runner.py::_record_stop_reason": {
   "complexity": 3,
-  "coverage": 0.8571,
-  "crap": 3.03,
-  "digest": "f5dc60d25f1f"
+  "coverage": 0.5714,
+  "crap": 3.71,
+  "digest": "6b075e978a0c",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::_record_user_trace": {
   "complexity": 1,
@@ -9692,9 +9937,9 @@
  },
  "src/dendrux/runtime/runner.py::_release_memory_edges": {
   "complexity": 3,
-  "coverage": 0.8333,
-  "crap": 3.04,
-  "digest": "e765d840dd62"
+  "coverage": 0.6667,
+  "crap": 3.33,
+  "digest": "5279c8a00ec8"
  },
  "src/dendrux/runtime/runner.py::_replay_from_meta": {
   "complexity": 3,
@@ -9739,16 +9984,21 @@
   "digest": "3807991fe3e5"
  },
  "src/dendrux/runtime/runner.py::_resume_core": {
-  "complexity": 52,
-  "coverage": 0.9355,
-  "crap": 52.73,
-  "digest": "edd87b4a321b"
+  "complexity": 59,
+  "coverage": 0.9542,
+  "crap": 59.33,
+  "digest": "849413f734ab",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::_resume_core.<locals>.persist_cancellation": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "6c73368101ec"
+  "digest": "aabc563ed190"
  },
  "src/dendrux/runtime/runner.py::_resume_image_view": {
   "complexity": 3,
@@ -9761,6 +10011,12 @@
   "coverage": 1.0,
   "crap": 3.0,
   "digest": "bc11786a93e8"
+ },
+ "src/dendrux/runtime/runner.py::_safe_error": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "65ba6880a06b"
  },
  "src/dendrux/runtime/runner.py::_same_pause": {
   "complexity": 1,
@@ -9776,8 +10032,8 @@
  },
  "src/dendrux/runtime/runner.py::_seed_edges": {
   "complexity": 4,
-  "coverage": 0.9,
-  "crap": 4.02,
+  "coverage": 1.0,
+  "crap": 4.0,
   "digest": "1c535471c2ff"
  },
  "src/dendrux/runtime/runner.py::_shielded_cleanup": {
@@ -9806,8 +10062,8 @@
  },
  "src/dendrux/runtime/runner.py::_start_image_view": {
   "complexity": 8,
-  "coverage": 1.0,
-  "crap": 8.0,
+  "coverage": 0.8889,
+  "crap": 8.09,
   "digest": "c66316318d70"
  },
  "src/dendrux/runtime/runner.py::_stop_reason_from_meta": {
@@ -9872,8 +10128,8 @@
  },
  "src/dendrux/runtime/runner.py::_write_edges": {
   "complexity": 4,
-  "coverage": 0.6667,
-  "crap": 4.59,
+  "coverage": 1.0,
+  "crap": 4.0,
   "digest": "b84514d6805c"
  },
  "src/dendrux/runtime/runner.py::ingest_submitted_tool_images": {
@@ -9928,19 +10184,24 @@
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "f31cfa072d88"
+  "digest": "85849fd8cbea"
  },
  "src/dendrux/runtime/runner.py::resume_stream.<locals>._cleanup": {
   "complexity": 12,
-  "coverage": 0.7742,
-  "crap": 13.66,
-  "digest": "7004e6633fa2"
+  "coverage": 0.9091,
+  "crap": 12.11,
+  "digest": "8d92d393d57a"
  },
  "src/dendrux/runtime/runner.py::resume_stream.<locals>._generate": {
-  "complexity": 44,
-  "coverage": 0.9316,
-  "crap": 44.62,
-  "digest": "b2f380a4fd5f"
+  "complexity": 45,
+  "coverage": 0.9487,
+  "crap": 45.27,
+  "digest": "8f9f3cdd46d0",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/runner.py::resume_with_input": {
   "complexity": 1,
@@ -9950,33 +10211,48 @@
  },
  "src/dendrux/runtime/runner.py::retry": {
   "complexity": 55,
-  "coverage": 0.881,
-  "crap": 60.1,
-  "digest": "8f2530c01649"
+  "coverage": 0.9524,
+  "crap": 55.33,
+  "digest": "95970c018f34",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "changed-over-threshold"
+  }
  },
  "src/dendrux/runtime/runner.py::run": {
   "complexity": 84,
-  "coverage": 0.9632,
-  "crap": 84.35,
-  "digest": "686ce79555e9"
+  "coverage": 0.9791,
+  "crap": 84.06,
+  "digest": "1c1cadeddb09",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "changed-over-threshold"
+  }
  },
  "src/dendrux/runtime/runner.py::run_stream": {
   "complexity": 14,
   "coverage": 1.0,
   "crap": 14.0,
-  "digest": "a315d24471a3"
+  "digest": "77d48f89bb3e"
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._cleanup": {
   "complexity": 12,
-  "coverage": 0.8,
-  "crap": 13.15,
-  "digest": "7ac39d5b2234"
+  "coverage": 0.9375,
+  "crap": 12.04,
+  "digest": "78ccac377aa3"
  },
  "src/dendrux/runtime/runner.py::run_stream.<locals>._generate": {
-  "complexity": 60,
-  "coverage": 0.9321,
-  "crap": 61.13,
-  "digest": "0900c88f9e11"
+  "complexity": 61,
+  "coverage": 0.9512,
+  "crap": 61.43,
+  "digest": "36328e37d603",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "changed-over-threshold"
+  }
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.__init__": {
   "complexity": 2,
@@ -10006,13 +10282,19 @@
   "complexity": 10,
   "coverage": 0.9,
   "crap": 10.1,
-  "digest": "279e71304d63"
+  "digest": "79eb8e69c313"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._check_idempotency": {
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
   "digest": "f10330e14b58"
+ },
+ "src/dendrux/runtime/state.py::SQLAlchemyStateStore._sweep_runs": {
+  "complexity": 28,
+  "coverage": 1.0,
+  "crap": 28.0,
+  "digest": "cb19b182533b"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore._traverse_subtree_bfs": {
   "complexity": 13,
@@ -10059,13 +10341,13 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "0e1c2cd70858"
+  "digest": "fbb85d138910"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.claim_paused_run.<locals>._attempt": {
   "complexity": 12,
   "coverage": 1.0,
   "crap": 12.0,
-  "digest": "cbd24d8c3171"
+  "digest": "55fa7fc4b9ce"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.count_pauses_per_run": {
   "complexity": 3,
@@ -10083,25 +10365,30 @@
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "375e8308b473"
+  "digest": "24eefc46de79"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.create_run.<locals>._attempt": {
   "complexity": 7,
   "coverage": 1.0,
   "crap": 7.0,
-  "digest": "8d65548156aa"
+  "digest": "28a36797ecab"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.finalize_run": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "a3710ecca968"
+  "digest": "7c3575ec5dd5"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.finalize_run.<locals>._attempt": {
-  "complexity": 12,
+  "complexity": 16,
   "coverage": 1.0,
-  "crap": 12.0,
-  "digest": "0cb6dd0fffb9"
+  "crap": 16.0,
+  "digest": "6eab1ac1607f",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.finalize_run_if_status_in": {
   "complexity": 1,
@@ -10261,8 +10548,8 @@
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.mark_notes_delivered": {
   "complexity": 2,
-  "coverage": 1.0,
-  "crap": 2.0,
+  "coverage": 0.8571,
+  "crap": 2.01,
   "digest": "8b176a85f589"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.mark_notes_delivered.<locals>._attempt": {
@@ -10275,37 +10562,37 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "229a9e5bd147"
+  "digest": "78f7998d38cb"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.pause_run.<locals>._attempt": {
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
-  "digest": "15730519685b"
+  "digest": "c02bd1341e4b"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.pause_with_event": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "e1f863bd0c57"
+  "digest": "a1d617eb7044"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.pause_with_event.<locals>._attempt": {
   "complexity": 7,
   "coverage": 1.0,
   "crap": 7.0,
-  "digest": "7e4f26626a3d"
+  "digest": "ba2dc1d00950"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.release_run_claim": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "9b008a9f7e11"
+  "digest": "d816357008b5"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.release_run_claim.<locals>.attempt": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "6d763f0b23af"
+  "digest": "848f2025c076"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.request_cancel": {
   "complexity": 1,
@@ -10362,10 +10649,15 @@
   "digest": "d4631b224651"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.save_usage": {
-  "complexity": 1,
+  "complexity": 5,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "dc93a8f515f9"
+  "crap": 5.0,
+  "digest": "06f2bd294c04",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.store_identity": {
   "complexity": 1,
@@ -10377,13 +10669,13 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "663eb2a3c67b"
+  "digest": "ad849c5b1192"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.submit_and_claim.<locals>._attempt": {
   "complexity": 6,
   "coverage": 1.0,
   "crap": 6.0,
-  "digest": "168338f3a7a2"
+  "digest": "a68406feab70"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.subtree_usage": {
   "complexity": 2,
@@ -10392,16 +10684,16 @@
   "digest": "4749a8e3fb4f"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.sweep_abandoned_runs": {
-  "complexity": 4,
-  "coverage": 0.9583,
-  "crap": 4.0,
-  "digest": "53516aa45bd1"
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "2055bd627505"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.sweep_stale_runs": {
-  "complexity": 10,
-  "coverage": 0.9697,
-  "crap": 10.0,
-  "digest": "0510791e7f8c"
+  "complexity": 1,
+  "coverage": 1.0,
+  "crap": 1.0,
+  "digest": "d0393ab84863"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.touch_progress": {
   "complexity": 1,
@@ -10413,25 +10705,25 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "c7d3e2730b56"
+  "digest": "c1fcce58d9fc"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.try_pause_run.<locals>._attempt": {
   "complexity": 6,
   "coverage": 0.8182,
   "crap": 6.22,
-  "digest": "9590b634f79a"
+  "digest": "7eac0bb2b2a3"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.update_run_meta": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "c7eec8d6f651"
+  "digest": "23e6f15abf9a"
  },
  "src/dendrux/runtime/state.py::SQLAlchemyStateStore.update_run_meta.<locals>._attempt": {
   "complexity": 3,
   "coverage": 0.8333,
   "crap": 3.04,
-  "digest": "e6a2e52d0a06"
+  "digest": "d6f7d47f577d"
  },
  "src/dendrux/runtime/state.py::StateStore.add_note": {
   "complexity": 1,
@@ -10461,7 +10753,7 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "1d27303ba616"
+  "digest": "ab76b30c26a8"
  },
  "src/dendrux/runtime/state.py::StateStore.finalize_run_if_status_in": {
   "complexity": 1,
@@ -10623,7 +10915,7 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "57f4cec6a6b4"
+  "digest": "f6f3ac960116"
  },
  "src/dendrux/runtime/state.py::StateStore.submit_and_claim": {
   "complexity": 1,
@@ -10641,13 +10933,13 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "36c4fbd31864"
+  "digest": "ec26a2d72787"
  },
  "src/dendrux/runtime/state.py::StateStore.sweep_stale_runs": {
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "e39bb41a9bfc"
+  "digest": "445913777c3a"
  },
  "src/dendrux/runtime/state.py::StateStore.touch_progress": {
   "complexity": 1,
@@ -10803,6 +11095,12 @@
   "coverage": 1.0,
   "crap": 4.0,
   "digest": "9f13d0ae2e21"
+ },
+ "src/dendrux/runtime/state.py::_status_values": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "d5ed7e90ca09"
  },
  "src/dendrux/runtime/state.py::_to_aware_utc": {
   "complexity": 3,
@@ -11150,10 +11448,15 @@
   "digest": "55c9d2ed86be"
  },
  "src/dendrux/runtime/sweep.py::sweep": {
-  "complexity": 12,
+  "complexity": 18,
   "coverage": 1.0,
-  "crap": 12.0,
-  "digest": "5abd49abf422"
+  "crap": 18.0,
+  "digest": "99f1d2bdf0df",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/tasks.py::RunTaskManager.__init__": {
   "complexity": 1,
@@ -11171,13 +11474,18 @@
   "complexity": 3,
   "coverage": 1.0,
   "crap": 3.0,
-  "digest": "aa447ee68325"
+  "digest": "8a4a65167822"
  },
  "src/dendrux/runtime/tasks.py::RunTaskManager.cancel": {
-  "complexity": 7,
+  "complexity": 8,
   "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "1e9e13d19478"
+  "crap": 8.0,
+  "digest": "033c1762839b",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/tasks.py::RunTaskManager.has_interrupt": {
   "complexity": 1,
@@ -11219,13 +11527,19 @@
   "complexity": 1,
   "coverage": 1.0,
   "crap": 1.0,
-  "digest": "1cf5d44debba"
+  "digest": "3f17041c5da6"
  },
  "src/dendrux/runtime/tasks.py::RunTaskManager.take_interrupt": {
   "complexity": 5,
   "coverage": 1.0,
   "crap": 5.0,
   "digest": "116b40b254d1"
+ },
+ "src/dendrux/runtime/tasks.py::_retrieve_exception": {
+  "complexity": 2,
+  "coverage": 1.0,
+  "crap": 2.0,
+  "digest": "a8839b462d56"
  },
  "src/dendrux/skills/_digest.py::_update_files": {
   "complexity": 4,
@@ -13015,16 +13329,26 @@
   "digest": "a035bfebf9f8"
  },
  "src/dendrux/types.py::PauseState.from_dict": {
-  "complexity": 9,
+  "complexity": 13,
   "coverage": 1.0,
-  "crap": 9.0,
-  "digest": "601a85882666"
+  "crap": 13.0,
+  "digest": "32d4ea523468",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/types.py::PauseState.to_dict": {
-  "complexity": 18,
-  "coverage": 0.9355,
-  "crap": 18.09,
-  "digest": "a88a622652cd"
+  "complexity": 20,
+  "coverage": 0.9375,
+  "crap": 20.1,
+  "digest": "df90c4e89bbc",
+  "waived": {
+   "date": "2026-10-25",
+   "reason": "T7b-1 merge (feat/0.5.0 14f4151a): edited hot loop/runner functions and 24 small score rises from new runtime code; to be refactored, not accepted as the target",
+   "rule": "worse"
+  }
  },
  "src/dendrux/types.py::ReplaySummary.from_dict": {
   "complexity": 6,
@@ -13166,14 +13490,14 @@
  },
  "src/dendrux/types.py::_action_from_dict": {
   "complexity": 4,
-  "coverage": 0.875,
-  "crap": 4.03,
+  "coverage": 1.0,
+  "crap": 4.0,
   "digest": "6ff844d24877"
  },
  "src/dendrux/types.py::_action_to_dict": {
   "complexity": 4,
-  "coverage": 0.8571,
-  "crap": 4.05,
+  "coverage": 1.0,
+  "crap": 4.0,
   "digest": "923f03285124"
  },
  "src/dendrux/types.py::_history_fingerprint_entry": {
