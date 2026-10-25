@@ -230,7 +230,7 @@ class TestFinalizerContention:
 
     async def test_cancel_vs_abandoned_sweep_one_transition(self, store) -> None:
         run_id = await _paused_run(store)
-        await _set_row(store, run_id, updated_at=dt.datetime(2000, 1, 1, tzinfo=dt.UTC))
+        await _set_row(store, run_id, status_changed_at=dt.datetime(2000, 1, 1, tzinfo=dt.UTC))
         await asyncio.gather(
             _other(store).cancel_run(run_id),
             store.sweep_abandoned_runs(older_than=dt.timedelta(minutes=1)),

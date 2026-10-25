@@ -114,6 +114,7 @@ async def test_sweep_projection_uses_status_index(store, engine, monkeypatch, re
                         "last_progress_at": now if (i // 8) % 4 == 0 else old,
                         "created_at": old,
                         "updated_at": now if (i // 8) % 4 == 0 else old,
+                        "status_changed_at": now if (i // 8) % 4 == 0 else old,
                     }
                     for i in range(base, base + 500)
                 ],
@@ -181,8 +182,8 @@ async def test_sweep_projection_uses_status_index(store, engine, monkeypatch, re
         assert scans and all(
             n.get("Actual Rows", 0) + n.get("Rows Removed by Filter", 0) <= 101 for n in scans
         ), "each sweep page must read a bounded candidate range"
-        assert any(n.get("Index Name") == "ix_run_events_run_type" for n in all_nodes), (
-            "classification must use a run-and-type lookup, not all started events"
+        assert any(n.get("Index Name") == "ix_run_events_started" for n in all_nodes), (
+            "classification must use the partial started-event lookup, not all started events"
         )
         print("sweep_plan", category, json.dumps(plan, default=str))
     assert set(captured) == {(status,) for status in statuses[:5]}, (

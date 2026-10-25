@@ -964,6 +964,20 @@ class _SerializedSessionFactory:
                 await close_fully(session.close)
 
 
+def _status_values(status: Any, *, initial: bool = False) -> dict[str, Any]:
+    from sqlalchemy import case
+
+    from dendrux.db.models import AgentRun
+
+    now = _dt.datetime.now(_dt.UTC)
+    return {
+        "status": status,
+        "status_changed_at": now
+        if initial
+        else case((AgentRun.status != status, now), else_=AgentRun.status_changed_at),
+    }
+
+
 class SQLAlchemyStateStore(SQLBlobCatalog):
     """Default StateStore implementation using SQLAlchemy async.
 
@@ -1044,7 +1058,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 run = AgentRun(
                     id=run_id,
                     agent_name=agent_name,
-                    status=AgentRunStatus.RUNNING,
+                    **_status_values(AgentRunStatus.RUNNING, initial=True),
                     input_data=input_data,
                     model=model,
                     strategy=strategy,
@@ -1436,7 +1450,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
-                    "status": status,
+                    **_status_values(status),
                 }
                 if iteration_count is not None:
                     values["iteration_count"] = iteration_count
@@ -1604,7 +1618,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         # updated_at is filled by the model's onupdate hook (Python aware-UTC).
         values: dict[str, Any] = {
-            "status": status,
+            **_status_values(status),
             "pause_data": None,
             "cancel_requested": False,
             "pause_requested": False,
@@ -1783,7 +1797,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async def _attempt() -> bool:
             async with self._session_factory() as session:
                 values: dict[str, Any] = {
-                    "status": status,
+                    **_status_values(status),
                     "pause_data": pause_data,
                     "pause_requested": False,
                 }
@@ -1834,7 +1848,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         async def _attempt() -> int | None:
             async with self._session_factory() as session:
                 values: dict[str, Any] = {
-                    "status": status,
+                    **_status_values(status),
                     "pause_data": pause_data,
                     "pause_requested": False,
                 }
@@ -2082,7 +2096,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             async with self._session_factory() as session:
                 # updated_at is filled by the model's onupdate hook (Python aware-UTC).
                 values: dict[str, Any] = {
-                    "status": status,
+                    **_status_values(status),
                     "pause_data": pause_data,
                 }
                 if iteration_count is not None:
@@ -2329,7 +2343,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
                     .values(
-                        status="running",
+                        **_status_values("running"),
                         last_progress_at=_dt.datetime.now(_dt.UTC),
                         pause_requested=False,
                         claim_epoch=AgentRun.claim_epoch + 1,
@@ -2413,7 +2427,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                     update(AgentRun)
                     .where(AgentRun.id == run_id, AgentRun.status == expected_status)
                     .values(
-                        status="running",
+                        **_status_values("running"),
                         last_progress_at=_dt.datetime.now(_dt.UTC),
                         pause_requested=False,
                         claim_epoch=AgentRun.claim_epoch + 1,
@@ -2473,7 +2487,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         AgentRun.status == "running",
                         AgentRun.claim_epoch == claim_epoch,
                     )
-                    .values(status=status)
+                    .values(**_status_values(status))
                 )
                 await session.commit()
                 return bool(result.rowcount)
@@ -2738,7 +2752,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         batch_size: int,
         max_runs: int,
     ) -> list[SweptRun]:
-        from sqlalchemy import case, func, select, tuple_, update
+        from sqlalchemy import case, func, literal_column, select, tuple_, update
 
         from dendrux.db.models import AgentRun, RunEvent
 
@@ -2751,7 +2765,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         now = _dt.datetime.now(_dt.UTC)
         cutoff = now - older_than
         age = (
-            AgentRun.updated_at
+            AgentRun.status_changed_at
             if waiting
             else func.coalesce(AgentRun.last_progress_at, AgentRun.created_at)
         )
@@ -2763,7 +2777,10 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         # A scalar LIMIT subquery prevents a hashed scan of every started event.
         started = (
             select(RunEvent.id)
-            .where(RunEvent.agent_run_id == AgentRun.id, RunEvent.event_type == "run.started")
+            .where(
+                RunEvent.agent_run_id == AgentRun.id,
+                RunEvent.event_type == literal_column("'run.started'"),
+            )
             .limit(1)
             .correlate(AgentRun)
             .scalar_subquery()
@@ -2771,31 +2788,45 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         swept: list[SweptRun] = []
         visited = 0
         for status_filter in statuses:
-            after: tuple[_dt.datetime, str] | None = None
+            after: tuple[_dt.datetime, str] | str | None = None
             while visited < max_runs:
-                statement = (
-                    select(
-                        AgentRun.id,
-                        AgentRun.agent_name,
-                        AgentRun.status,
-                        AgentRun.last_progress_at,
-                        AgentRun.iteration_count,
-                        started.label("started"),
-                        age.label("sweep_age"),
-                    )
-                    .where(AgentRun.status == status_filter, age < cutoff)
-                    .order_by(age, AgentRun.id)
-                    .limit(min(batch_size, max_runs - visited))
-                )
-                if after is not None:
-                    statement = statement.where(tuple_(age, AgentRun.id) > after)
+                statement = select(
+                    AgentRun.id,
+                    AgentRun.agent_name,
+                    AgentRun.status,
+                    AgentRun.last_progress_at,
+                    AgentRun.iteration_count,
+                    started.label("started"),
+                    age.label("sweep_age"),
+                ).limit(min(batch_size, max_runs - visited))
+                if waiting:
+                    statement = statement.where(
+                        AgentRun.status == status_filter, age < cutoff
+                    ).order_by(age, AgentRun.id)
+                    if after is not None:
+                        statement = statement.where(tuple_(age, AgentRun.id) > after)
+                else:
+                    # Equal range bounds preserve the (status, id) ordering in
+                    # the planner. Equality alone lets it prefer the primary key
+                    # and filter through terminal history on every page.
+                    statement = statement.where(
+                        AgentRun.status.between(status_filter, status_filter)
+                    ).order_by(AgentRun.status, AgentRun.id)
+                    if after is not None:
+                        statement = statement.where(
+                            tuple_(AgentRun.status, AgentRun.id) > (status_filter, after)
+                        )
                 async with self._session_factory() as session:
                     rows = (await session.execute(statement)).all()
                 if not rows:
                     break
                 visited += len(rows)
-                after = (rows[-1].sweep_age, rows[-1].id)
+                after = (rows[-1].sweep_age, rows[-1].id) if waiting else rows[-1].id
                 for row in rows:
+                    # Running rows are bounded by live concurrency. Count every
+                    # inspected row against the work cap, including fresh ones.
+                    if not waiting and _to_aware_utc(row.sweep_age) >= cutoff:
+                        continue
                     reason = (
                         "abandoned_waiting"
                         if waiting
@@ -2812,7 +2843,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                                 AgentRun.id == row.id, AgentRun.status == row.status, age < cutoff
                             )
                             .values(
-                                status=new_status,
+                                **_status_values(new_status),
                                 claim_epoch=AgentRun.claim_epoch + 1,
                                 failure_reason=reason,
                                 error=f"Run swept as {reason}"

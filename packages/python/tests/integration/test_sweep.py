@@ -365,13 +365,13 @@ class TestSweepAbandonedRuns:
     """Tests for StateStore.sweep_abandoned_runs()."""
 
     async def test_old_waiting_client_tool_is_swept(self, store):
-        """A WAITING_CLIENT_TOOL row with old updated_at is swept."""
+        """A WAITING_CLIENT_TOOL row with old status_changed_at is swept."""
         old_time = dt.datetime.now(dt.UTC) - timedelta(hours=3)
         rid = await _create_run(store, status="waiting_client_tool", last_progress_at=old_time)
 
-        # Force updated_at to be old
+        # Force status_changed_at to be old
         async with store._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+            stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
             await session.execute(stmt)
             await session.commit()
 
@@ -387,12 +387,12 @@ class TestSweepAbandonedRuns:
         assert run.failure_reason == "abandoned_waiting"
 
     async def test_old_waiting_human_input_is_swept(self, store):
-        """A WAITING_HUMAN_INPUT row with old updated_at is swept."""
+        """A WAITING_HUMAN_INPUT row with old status_changed_at is swept."""
         old_time = dt.datetime.now(dt.UTC) - timedelta(hours=3)
         rid = await _create_run(store, status="waiting_human_input", last_progress_at=old_time)
 
         async with store._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+            stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
             await session.execute(stmt)
             await session.commit()
 
@@ -402,7 +402,7 @@ class TestSweepAbandonedRuns:
         assert swept[0].previous_status == "waiting_human_input"
 
     async def test_fresh_waiting_not_swept(self, store):
-        """A WAITING row with recent updated_at is NOT swept."""
+        """A WAITING row with recent status_changed_at is NOT swept."""
         rid = await _create_run(store, status="waiting_client_tool")
 
         swept = await store.sweep_abandoned_runs(older_than=timedelta(hours=2))
@@ -417,8 +417,8 @@ class TestSweepAbandonedRuns:
         await _create_run(store, status="waiting_approval", last_progress_at=old_time)
 
         async with store._session_factory() as session:
-            # Force updated_at to be old for all runs
-            stmt = update(AgentRun).values(updated_at=old_time)
+            # Force status_changed_at to be old for all runs
+            stmt = update(AgentRun).values(status_changed_at=old_time)
             await session.execute(stmt)
             await session.commit()
 
@@ -432,7 +432,7 @@ class TestSweepAbandonedRuns:
         rid = await _create_run(store, last_progress_at=old_time)
 
         async with store._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+            stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
             await session.execute(stmt)
             await session.commit()
 
@@ -445,7 +445,7 @@ class TestSweepAbandonedRuns:
         for status in ["success", "error", "cancelled", "max_iterations"]:
             rid = await _create_run(store, status=status, last_progress_at=old_time)
             async with store._session_factory() as session:
-                stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+                stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
                 await session.execute(stmt)
                 await session.commit()
 
@@ -458,7 +458,7 @@ class TestSweepAbandonedRuns:
         rid = await _create_run(store, status="waiting_client_tool", last_progress_at=old_time)
 
         async with store._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+            stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
             await session.execute(stmt)
             await session.commit()
 
@@ -474,14 +474,14 @@ class TestSweepAbandonedRuns:
         old_time = dt.datetime.now(dt.UTC) - timedelta(hours=3)
         rid = await _create_run(store, status="waiting_client_tool", last_progress_at=old_time)
 
-        # Set pause_data and force old updated_at
+        # Set pause_data and force old status_changed_at
         async with store._session_factory() as session:
             stmt = (
                 update(AgentRun)
                 .where(AgentRun.id == rid)
                 .values(
                     pause_data={"pending": ["tool1"]},
-                    updated_at=old_time,
+                    status_changed_at=old_time,
                 )
             )
             await session.execute(stmt)
@@ -500,7 +500,7 @@ class TestSweepAbandonedRuns:
         for status in ["waiting_client_tool", "waiting_human_input", "waiting_client_tool"]:
             rid = await _create_run(store, status=status, last_progress_at=old_time)
             async with store._session_factory() as session:
-                stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+                stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
                 await session.execute(stmt)
                 await session.commit()
             rids.append(rid)
@@ -523,7 +523,7 @@ class TestSweepPublicAPIAbandoned:
         rid = await _create_run(store, status="waiting_client_tool", last_progress_at=old_time)
 
         async with store._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == rid).values(updated_at=old_time)
+            stmt = update(AgentRun).where(AgentRun.id == rid).values(status_changed_at=old_time)
             await session.execute(stmt)
             await session.commit()
 
@@ -548,7 +548,9 @@ class TestSweepPublicAPIAbandoned:
         # Create an abandoned waiting run
         wait_rid = await _create_run(store, status="waiting_client_tool", last_progress_at=old_time)
         async with store._session_factory() as session:
-            stmt = update(AgentRun).where(AgentRun.id == wait_rid).values(updated_at=old_time)
+            stmt = (
+                update(AgentRun).where(AgentRun.id == wait_rid).values(status_changed_at=old_time)
+            )
             await session.execute(stmt)
             await session.commit()
 

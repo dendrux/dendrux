@@ -23,13 +23,14 @@ against what the database actually has, so an interrupted older upgrade heals.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Column as _Column
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import UniqueConstraint, literal
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.schema import CreateColumn, CreateIndex, DefaultClause
 from sqlalchemy.sql.elements import False_, Null, TextClause, True_
@@ -308,7 +309,11 @@ def _raise_if_unsafe(conn: Connection) -> None:
     for table in _existing_model_tables(conn):
         db_columns = _column_names(conn, table)
         for column in table.columns:
-            reason = _unsafe_reason(column) if column.name.lower() not in db_columns else None
+            reason = (
+                _unsafe_reason(column)
+                if column.name.lower() not in db_columns and not _is_status_clock(table, column)
+                else None
+            )
             if reason is not None:
                 unsafe.append(f"{table.name}.{column.name} ({reason})")
     if unsafe:
@@ -319,8 +324,26 @@ def _raise_if_unsafe(conn: Connection) -> None:
         )
 
 
+def _is_status_clock(table: Table, column: Column[Any]) -> bool:
+    return table.name == "agent_runs" and column.name == "status_changed_at"
+
+
 def _add_column(conn: Connection, table: Table, column: Column[Any]) -> None:
-    spec = str(CreateColumn(column).compile(dialect=conn.dialect))
+    status_clock = _is_status_clock(table, column)
+    ddl_column = column
+    if status_clock:
+        # SQLite permits only a constant default on ADD COLUMN. New SDK inserts
+        # always set this clock explicitly; existing rows inherit their last
+        # recorded update, under the same write lock and transaction as the DDL.
+        clock_default = str(
+            literal(dt.datetime.now(dt.UTC), type_=column.type).compile(
+                dialect=conn.dialect, compile_kwargs={"literal_binds": True}
+            )
+        )
+        ddl_column = _Column(
+            column.name, column.type, nullable=False, server_default=TextClause(clock_default)
+        )
+    spec = str(CreateColumn(ddl_column).compile(dialect=conn.dialect))
     for fk in column.foreign_keys:
         target = fk.column
         spec += f" REFERENCES {_quote(conn, target.table.name)} ({_quote(conn, target.name)})"
@@ -328,6 +351,11 @@ def _add_column(conn: Connection, table: Table, column: Column[Any]) -> None:
             spec += f" ON DELETE {fk.ondelete}"
     try:
         conn.exec_driver_sql(f"ALTER TABLE {_quote(conn, table.name)} ADD COLUMN {spec}")
+        if status_clock:
+            conn.exec_driver_sql(
+                "UPDATE agent_runs SET status_changed_at = "
+                f"COALESCE(updated_at, created_at, {clock_default})"
+            )
     except OperationalError as exc:
         raise SqliteSchemaSyncError(
             f"Could not add column {table.name}.{column.name} to the existing SQLite "

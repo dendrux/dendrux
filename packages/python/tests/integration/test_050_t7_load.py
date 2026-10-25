@@ -89,7 +89,7 @@ async def test_fifty_resume_submit_races_on_ten_runs(store, engine, record_prope
     print("resume_contention", engine.dialect.name, json.dumps(metrics))
 
 
-async def test_claim_predicate_uses_primary_key(engine, record_property):
+async def test_claim_predicate_uses_run_id_index(engine, record_property):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres planner assertion")
     async with engine.begin() as connection:
@@ -111,6 +111,12 @@ async def test_claim_predicate_uses_primary_key(engine, record_property):
             .scalars()
             .all()
         )
-    assert any("Index Scan" in line and "agent_runs_pkey" in line for line in plan)
+    assert any(
+        "Index Scan" in line
+        and any(name in line for name in ("agent_runs_pkey", "ix_agent_runs_sweep_running"))
+        for line in plan
+    ), plan
+    assert any("Index Cond:" in line and "plan-500" in line for line in plan), plan
+    assert not any("Seq Scan" in line for line in plan), plan
     record_property("claim_plan", "\n".join(plan))
     print("claim_plan", "\n".join(plan))

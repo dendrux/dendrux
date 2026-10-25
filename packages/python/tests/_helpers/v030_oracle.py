@@ -1706,6 +1706,8 @@ def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
     """
     row = dict(row)
     if table == "agent_runs":
+        if "status_changed_at" in row and row.pop("status_changed_at") != "<ts>":
+            return row, "agent_runs.status_changed_at: expected a non-null timestamp"
         if "claim_epoch" in row:
             epoch = row.pop("claim_epoch")
             if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
@@ -1766,7 +1768,7 @@ def _strip_050_cache_write_prompt(
 def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None:
     """None when identical. New nullable columns in ``actual`` must be NULL (R-02/P-06).
 
-    The 0.4.1 stop-reason keys and the 0.5.0 ``claim_epoch`` column are
+    The 0.4.1 stop-reason keys and the 0.5.0 integrity columns are
     validated and then ignored (see :func:`_strip_041_additions` and
     :func:`_strip_050_additions`).
     """

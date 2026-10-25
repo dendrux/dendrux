@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.errors import ProviderError
 from dendrux.loops.base import BaseNotifier
+from dendrux.runtime.context import safe_exception_info
 from dendrux.types import ErrorInfo
 
 if TYPE_CHECKING:
@@ -497,5 +498,9 @@ def _set_span_error(span: Any, error: BaseException) -> None:
     if isinstance(error, ProviderError):
         _set_error_info(span, ErrorInfo.from_error(error))
     else:
-        span.record_exception(error)
+        diagnostic = safe_exception_info(error)
+        if diagnostic is True:
+            span.record_exception(error)
+        elif diagnostic is not False:
+            span.record_exception(diagnostic[1])
         span.set_status(Status(StatusCode.ERROR, str(error)))

@@ -199,9 +199,9 @@ async def test_sweep_index_migration_roundtrip(engine, tmp_path):
     from tests.integration.test_migration_run_control import _alembic
 
     names = {
-        "ix_agent_runs_sweep_progress",
+        "ix_agent_runs_sweep_running",
         "ix_agent_runs_sweep_waiting",
-        "ix_run_events_run_type",
+        "ix_run_events_started",
     }
 
     @asynccontextmanager

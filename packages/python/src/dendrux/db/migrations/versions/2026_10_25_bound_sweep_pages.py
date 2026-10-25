@@ -1,8 +1,7 @@
-"""Bound maintenance pages by status, age and id; index event classification.
+"""Bound maintenance pages without indexing heartbeat columns.
 
-Postgres builds/drops concurrently on the direct migration connection. If an
-interrupted build leaves an invalid index, verification refuses to continue;
-repair that index before retrying. SQLite uses ordinary transactional DDL.
+Postgres builds/drops concurrently on the direct migration connection and
+repairs invalid interrupted builds. SQLite uses ordinary transactional DDL.
 
 Revision ID: e8f9a0b1c2d3
 Revises: d7e8f9a0b1c2
@@ -10,9 +9,10 @@ Revises: d7e8f9a0b1c2
 
 from contextlib import nullcontext
 
+import sqlalchemy as sa
 from alembic import op
 
-from dendrux.db._index_check import require_index
+from dendrux.db._index_check import index_matches, read_pg_indexes
 
 revision = "e8f9a0b1c2d3"
 down_revision = "d7e8f9a0b1c2"
@@ -20,24 +20,90 @@ branch_labels = None
 depends_on = None
 
 _INDEXES = (
-    ("ix_agent_runs_sweep_progress", "agent_runs", "status, coalesce(last_progress_at, created_at), id"),
-    ("ix_agent_runs_sweep_waiting", "agent_runs", "status, updated_at, id"),
-    ("ix_run_events_run_type", "run_events", "agent_run_id, event_type"),
+    ("ix_agent_runs_sweep_running", "agent_runs", "status, id", ""),
+    ("ix_agent_runs_sweep_waiting", "agent_runs", "status, status_changed_at, id", ""),
+    ("ix_run_events_started", "run_events", "agent_run_id", " WHERE event_type = 'run.started'"),
 )
 
 
 def upgrade() -> None:
-    pg = op.get_bind().dialect.name == "postgresql"
+    bind = op.get_bind()
+    pg = bind.dialect.name == "postgresql"
+    columns = {c["name"] for c in sa.inspect(bind).get_columns("agent_runs")}
+    if "status_changed_at" not in columns:
+        op.add_column("agent_runs", sa.Column("status_changed_at", sa.DateTime(timezone=True)))
+    op.execute(
+        "UPDATE agent_runs SET status_changed_at = updated_at WHERE status_changed_at IS NULL"
+    )
+    _alter_clock(drop=False)
     with op.get_context().autocommit_block() if pg else nullcontext():
-        for name, table, keys in _INDEXES:
+        for name, table, keys, predicate in _INDEXES:
+            if pg:
+                entry = read_pg_indexes(bind, tables=[table]).get(name)
+                if entry is not None and not entry[2]:
+                    op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
             concurrent = " CONCURRENTLY" if pg else ""
-            op.execute(f"CREATE INDEX{concurrent} IF NOT EXISTS {name} ON {table} ({keys})")
-            require_index(op.get_bind(), name, table, f"CREATE INDEX {name} ON {table} ({keys})")
+            op.execute(
+                f"CREATE INDEX{concurrent} IF NOT EXISTS {name} ON {table} ({keys}){predicate}"
+            )
+            expected_predicate = predicate
+            if pg and predicate:
+                column, value = (
+                    ("event_type", "run.started")
+                    if table == "run_events"
+                    else ("status", "running")
+                )
+                expected_predicate = f" WHERE (({column})::text = '{value}'::text)"
+            if not index_matches(
+                bind, name, table, f"CREATE INDEX {name} ON {table} ({keys}){expected_predicate}"
+            ):
+                raise RuntimeError(
+                    f"Index {name} has an unexpected definition or is not ready. "
+                    "Rebuild it with the migration's exact definition before retrying."
+                )
 
 
 def downgrade() -> None:
     pg = op.get_bind().dialect.name == "postgresql"
     with op.get_context().autocommit_block() if pg else nullcontext():
-        for name, _, _ in reversed(_INDEXES):
+        for name, _, _, _ in reversed(_INDEXES):
             concurrent = " CONCURRENTLY" if pg else ""
             op.execute(f"DROP INDEX{concurrent} IF EXISTS {name}")
+    _alter_clock(drop=True)
+
+
+def _alter_clock(*, drop: bool) -> None:
+    bind = op.get_bind()
+    # Alembic's SQLite reflection omits expression indexes. Preserve those
+    # definitions across the table rebuild required for nullability changes.
+    indexes = {}
+    if bind.dialect.name == "sqlite":
+        indexes = dict(
+            bind.execute(
+                sa.text(
+                    "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='agent_runs' AND sql IS NOT NULL"
+                )
+            ).all()
+        )
+    with op.batch_alter_table("agent_runs") as batch:
+        if drop:
+            batch.drop_column("status_changed_at")
+        else:
+            batch.alter_column(
+                "status_changed_at",
+                existing_type=sa.DateTime(timezone=True),
+                nullable=False,
+                server_default=sa.func.now(),
+            )
+    if indexes:
+        retained = set(
+            bind.execute(
+                sa.text(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='agent_runs'"
+                )
+            ).scalars()
+        )
+        for name, ddl in indexes.items():
+            if name not in retained:
+                op.execute(ddl)

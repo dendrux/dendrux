@@ -368,7 +368,7 @@ async def test_sweep_update_rechecks_staleness(store, monkeypatch, waiting):
         await session.execute(
             update(AgentRun)
             .where(AgentRun.id == "refreshed")
-            .values(last_progress_at=old, updated_at=old, created_at=old)
+            .values(last_progress_at=old, updated_at=old, created_at=old, status_changed_at=old)
         )
         await session.commit()
     original = AsyncSession.execute
@@ -383,7 +383,9 @@ async def test_sweep_update_rechecks_staleness(store, monkeypatch, waiting):
                 update(AgentRun)
                 .where(AgentRun.id == "refreshed")
                 .values(
-                    last_progress_at=dt.datetime.now(dt.UTC), updated_at=dt.datetime.now(dt.UTC)
+                    last_progress_at=dt.datetime.now(dt.UTC),
+                    updated_at=dt.datetime.now(dt.UTC),
+                    status_changed_at=dt.datetime.now(dt.UTC) if waiting else old,
                 ),
             )
         return await original(session, statement, *args, **kwargs)
@@ -467,7 +469,7 @@ async def test_postgres_concurrent_sweeps_cannot_revoke_refreshed_run(
         await session.execute(
             update(AgentRun)
             .where(AgentRun.id == "live")
-            .values(created_at=old, updated_at=old, last_progress_at=old)
+            .values(created_at=old, updated_at=old, last_progress_at=old, status_changed_at=old)
         )
         await session.commit()
     selected, refreshed = asyncio.Event(), asyncio.Event()
@@ -493,7 +495,11 @@ async def test_postgres_concurrent_sweeps_cannot_revoke_refreshed_run(
     tasks = [asyncio.create_task(method(dt.timedelta(hours=1))) for _ in range(8)]
     try:
         await asyncio.wait_for(selected.wait(), 10)
-        await store.touch_progress("live")
+        if waiting:
+            epoch = await store.claim_paused_run("live", expected_status="paused")
+            assert await store.release_run_claim("live", status="paused", claim_epoch=epoch)
+        else:
+            await store.touch_progress("live")
     finally:
         refreshed.set()
         outcomes = await asyncio.wait_for(asyncio.gather(*tasks), 10)

@@ -60,12 +60,14 @@ async def sweep(
             is still executing may collide with the sweep's event.
         abandoned_waiting: Threshold for abandoned WAITING detection.
             WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, WAITING_APPROVAL and
-            PAUSED runs with no state change beyond this duration are
+            PAUSED runs whose status has not changed beyond this duration are
             swept. If None, no abandoned-waiting sweep is performed.
 
         batch_size: Candidate rows per projected page (default 100, maximum 1000).
         max_runs: Candidates inspected per category (default 1000, maximum 10000).
-            Repeat sweep to drain more work; returned lists never exceed this cap.
+            Fresh running rows also count toward this cap. Set it at least as
+            high as live running concurrency. Repeat sweep to drain abandoned
+            waiting work; returned lists never exceed this cap.
 
     Returns:
         SweepResult with lists of swept runs by category.

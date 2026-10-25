@@ -918,24 +918,50 @@ class TestDeadlineConfig:
             )
 
 
+@pytest.fixture
+def controlled_deadlines(monkeypatch):
+    from types import SimpleNamespace
+
+    timers = []
+
+    def controlled_timeout(_when):
+        timer = asyncio.timeout_at(None)
+        timers.append(timer)
+        return timer
+
+    controlled_asyncio = SimpleNamespace(**{k: getattr(asyncio, k) for k in dir(asyncio)})
+    controlled_asyncio.timeout_at = controlled_timeout
+    monkeypatch.setattr(_resilience, "asyncio", controlled_asyncio)
+    return timers
+
+
 class TestDeadlines:
     @pytest.mark.parametrize("make", [anthropic_provider, chat_provider, responses_provider])
-    async def test_call_timeout_abandons_without_retry(self, make: Callable[..., Any]) -> None:
+    async def test_call_timeout_abandons_without_retry(
+        self, make: Callable[..., Any], controlled_deadlines
+    ) -> None:
         provider = make(call_timeout=0.2, max_retries=3)
+        entered = asyncio.Event()
 
         async def slow(request: httpx.Request) -> httpx.Response:
-            await asyncio.sleep(5)
-            return httpx.Response(200, json={})
+            entered.set()
+            await asyncio.Event().wait()
+            return httpx.Response(200, json={})  # pragma: no cover
 
         w = wire(provider, slow)
-        started = time.monotonic()
-        with pytest.raises(ProviderTimeoutError, match="call_timeout=0.2s") as info:
-            await provider.complete(USER)
-        assert time.monotonic() - started < 2
-        assert info.value.timeout_reason == "call_deadline"
-        assert info.value.retryable is False
-        assert info.value.__cause__ is None
-        assert len(w.requests) == 1
+        call = asyncio.create_task(provider.complete(USER))
+        try:
+            await asyncio.wait_for(entered.wait(), 20)
+            controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
+            with pytest.raises(ProviderTimeoutError, match="call_timeout=0.2s") as info:
+                await asyncio.wait_for(call, 20)
+            assert info.value.timeout_reason == "call_deadline"
+            assert info.value.retryable is False
+            assert info.value.__cause__ is None
+            assert len(w.requests) == 1
+        finally:
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
 
     async def test_deadline_during_429_backoff_keeps_rate_limit(self) -> None:
         provider = anthropic_provider(call_timeout=0.3, max_retries=2)
@@ -1026,12 +1052,32 @@ class TestDeadlines:
             await drain(provider.complete_stream(USER))
         assert info.value.timeout_reason == "stream_total"
 
-    async def test_idle_timeout_is_not_retried_before_first_yield(self) -> None:
+    async def test_idle_timeout_is_not_retried_before_first_yield(
+        self, controlled_deadlines
+    ) -> None:
         provider = responses_provider(stream_idle_timeout=0.2)
-        w = wire(provider, stream_handler([2.0, sse((None, r_completed()))]))
-        with pytest.raises(ProviderTimeoutError):
-            await drain(provider.complete_stream(USER))
-        assert len(w.requests) == 1
+        reading = asyncio.Event()
+        # Arm the real deadline only after the upstream body is read; SDK
+        # startup and a busy CI worker must not consume the intended idle gap.
+
+        class WaitingBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                reading.set()
+                await asyncio.Event().wait()
+                yield b""  # pragma: no cover
+
+        w = wire(provider, lambda request: httpx.Response(200, stream=WaitingBody()))
+        consumer = asyncio.create_task(drain(provider.complete_stream(USER)))
+        try:
+            await asyncio.wait_for(reading.wait(), 20)
+            controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
+            with pytest.raises(ProviderTimeoutError) as info:
+                await asyncio.wait_for(consumer, 20)
+            assert info.value.timeout_reason == "stream_idle"
+            assert len(w.requests) == 1
+        finally:
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------

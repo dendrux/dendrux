@@ -83,7 +83,14 @@ async def _snapshot(conn: Any) -> list[Any]:
     for table in ("agent_runs", "react_traces"):
         result = await conn.execute(text(f"SELECT * FROM {table} ORDER BY id"))
         out.append(
-            [tuple(v for k, v in r._mapping.items() if k != "claim_epoch") for r in result.all()]
+            [
+                tuple(
+                    v
+                    for k, v in r._mapping.items()
+                    if k not in {"claim_epoch", "status_changed_at"}
+                )
+                for r in result.all()
+            ]
         )
     return out
 

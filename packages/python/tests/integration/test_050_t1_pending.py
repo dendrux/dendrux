@@ -204,18 +204,45 @@ async def test_active_pause_args_reach_a_live_sse_client(store: Any, run_store: 
 # ---------------------------------------------------------------------------
 
 
-async def test_many_followers_one_poller(store: Any, run_store: RunStore) -> None:
+async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkeypatch) -> None:
     await store.create_run("r1", "agent", tenant_id="T")
     feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.05, status_every=1)
+    from dendrux.store import _follow
+
+    n_followers, n_events = 60, 30
+    release_head = asyncio.Event()
+    slots_ready, registered, polled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_acquire, original_add = feed._acquire, _follow._RunFeed.add
+
+    def acquire():
+        original_acquire()
+        if feed.followers == n_followers:
+            slots_ready.set()
+
+    def add(run_feed, follower):
+        head = original_add(run_feed, follower)
+        if len(run_feed.followers) == n_followers:
+            registered.set()
+        return head
+
+    monkeypatch.setattr(feed, "_acquire", acquire)
+    monkeypatch.setattr(_follow._RunFeed, "add", add)
+    original_head = _follow._current_head
+
+    async def slow_head(*args):
+        await release_head.wait()
+        return await original_head(*args)
+
+    monkeypatch.setattr(_follow, "_current_head", slow_head)
     polls = {"n": 0}
     original = run_store.get_events
 
     async def counting(run_id: str, **kw: Any) -> Any:
         polls["n"] += 1
+        polled.set()
         return await original(run_id, **kw)
 
     run_store.get_events = counting  # type: ignore[method-assign]
-    n_followers, n_events = 60, 30
 
     async def follower() -> list[Any]:
         async with feed.follow("r1", tenant_id="T") as f:
@@ -224,8 +251,12 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore) -> Non
     tasks = [asyncio.create_task(follower()) for _ in range(n_followers)]
     try:
         async with asyncio.timeout(20):
-            while feed.followers < n_followers:
-                await asyncio.sleep(0.01)
+            await slots_ready.wait()
+            # Occupied slots precede the DB head read and installed poller.
+            assert feed.watched_runs == 0
+            release_head.set()
+            await registered.wait()
+            await polled.wait()
         assert feed.watched_runs == 1
         before = polls["n"]
         await asyncio.sleep(0.2)
@@ -238,6 +269,7 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore) -> Non
         await store.finalize_run("r1", status="success")
         results = await asyncio.wait_for(asyncio.gather(*tasks), 30)
     finally:
+        release_head.set()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -417,10 +449,16 @@ async def test_pause_display_uses_recorded_args_on_every_path(
         assert pair_call.get("args_hidden", False) == (expected is None)
         if expected is None:
             assert call["args_hidden"] is True
-        async with run_store.follow(
-            "display", tenant_id="T", include_payloads=payloads, max_duration_s=0.1
-        ) as follow:
-            shown = [item async for item in follow if isinstance(item, StoredEvent)]
+        shown = []
+        async with (
+            asyncio.timeout(20),
+            run_store.follow("display", tenant_id="T", include_payloads=payloads) as follow,
+        ):
+            async for item in follow:
+                if isinstance(item, StoredEvent):
+                    shown.append(item)
+                    if item.sequence_index == events[-1].sequence_index:
+                        break
         assert shown[-1].event_type == "run.paused"
         assert shown[-1].data["pending_tool_calls"][0]["params"] == expected
 
