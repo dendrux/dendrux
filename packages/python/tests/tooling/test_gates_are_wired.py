@@ -85,7 +85,7 @@ def test_make_ci_runs_every_gate() -> None:
     assert "-n auto" in makefile
 
 
-def test_load_sensitive_probes_run_serially_after_the_parallel_pass() -> None:
+def test_load_sensitive_probes_run_serially_before_the_parallel_pass() -> None:
     """The HOT statistics probe and the 300k-row writer-block probe measure server behaviour
     that depends on how many sessions share the server; under `-n auto` they failed in
     some full runs and not alone."""
@@ -106,4 +106,6 @@ def test_load_sensitive_probes_run_serially_after_the_parallel_pass() -> None:
         assert '-m "not serial_probe"' in text
         assert "-m serial_probe" in text
         assert "--cov-append" in text
-        assert text.index('-m "not serial_probe"') < text.index("-m serial_probe")
+        # on a quiet server: after the parallel pass its checkpoints and autovacuum stall writers
+        assert text.index("-m serial_probe") < text.index('-m "not serial_probe"')
+        assert "--cov-fail-under=80" in text.split('-m "not serial_probe"')[1]

@@ -99,9 +99,9 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          # Load-sensitive probes (serial_probe) run alone after the parallel pass.
-          pytest tests/ -v -rs -n auto -m "not serial_probe" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80 | tee pytest.log
-          pytest tests/ -v -rs -n 0 -m serial_probe --cov=src/dendrux --cov-append --cov-report=json:coverage.json | tee -a pytest.log
+          # Load-sensitive probes (serial_probe) run first and alone, on a quiet server.
+          pytest tests/ -v -rs -n 0 -m serial_probe --cov=src/dendrux --cov-report=json:coverage.json | tee pytest.log
+          pytest tests/ -v -rs -n auto -m "not serial_probe" --cov=src/dendrux --cov-append --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80 | tee -a pytest.log
           if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
             echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
             exit 1
