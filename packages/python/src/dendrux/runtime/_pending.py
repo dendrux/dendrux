@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -10,7 +11,17 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 from dendrux.errors import RunNotFoundError
-from dendrux.runtime.state import UNSCOPED, TenantScope, _check_scope, _Unscoped
+from dendrux.runtime.state import (
+    PAUSE_SUMMARY_KEYS,
+    UNSCOPED,
+    PauseSummary,
+    TenantScope,
+    _apply_tenant_scope,
+    _check_scope,
+    _Unscoped,
+)
+
+logger = logging.getLogger(__name__)
 
 PAUSE_STATUSES = frozenset(
     {"paused", "waiting_approval", "waiting_client_tool", "waiting_human_input"}
@@ -169,6 +180,121 @@ def approval_calls(
     return result
 
 
+def _is_postgres_store(state: Any) -> bool:
+    engine = getattr(state, "_engine", None)
+    dialect = getattr(getattr(engine, "dialect", None), "name", None)
+    return dialect == "postgresql" and getattr(state, "_session_factory", None) is not None
+
+
+def _unconvertible_json(exc: BaseException) -> bool:
+    """A Postgres data error raised while converting stored JSON (U+0000, a lone surrogate)."""
+    orig = getattr(exc, "orig", None)
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return isinstance(code, str) and code in ("22P02", "22P05")
+
+
+async def _pg_pause_summary(state: Any, run_id: str, tenant_id: TenantScope) -> PauseSummary | None:
+    """What a run waits for, in one bounded statement on Postgres.
+
+    ``pause_data`` is converted to ``jsonb`` once, in a subquery the planner
+    cannot inline (``OFFSET 0``), and the summary keys and last step are read
+    from that one value. A stored document ``jsonb`` cannot hold (U+0000 or a
+    lone surrogate, which the ``json`` column accepts) makes the conversion
+    fail; that run is then read whole and summarised in Python, so one bad
+    row never breaks a read.
+    """
+    from sqlalchemy import cast, func, select
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.exc import DBAPIError
+
+    from dendrux.db.models import AgentRun, RunEvent
+
+    paused_seq = (
+        select(func.max(RunEvent.sequence_index))
+        .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+        .scalar_subquery()
+    )
+    row_stmt = _apply_tenant_scope(
+        select(
+            AgentRun.status.label("status"),
+            paused_seq.label("seq"),
+            AgentRun.pii_mapping.label("pii"),
+            cast(AgentRun.pause_data, JSONB).label("doc"),
+        ).where(AgentRun.id == run_id),
+        tenant_id,
+    )
+    inner = row_stmt.offset(0).subquery()
+    doc = inner.c.doc
+    stmt = select(
+        inner.c.status,
+        inner.c.seq,
+        inner.c.pii,
+        *[doc[key] for key in PAUSE_SUMMARY_KEYS],
+        doc["steps"][-1],
+    )
+    try:
+        async with state._session_factory() as session:
+            row = (await session.execute(stmt)).first()
+    except DBAPIError as exc:
+        if not _unconvertible_json(exc):
+            raise
+        logger.warning(
+            "pause state is not convertible to jsonb; read whole: "
+            "run_id=%s code=pause_data_not_jsonb",
+            run_id,
+            extra={"run_id": run_id, "code": "pause_data_not_jsonb"},
+        )
+        return await _whole_pause_summary(state, run_id, tenant_id)
+    if row is None:
+        return None
+    status, seq, mapping, *values = row
+    pause = {k: v for k, v in zip(PAUSE_SUMMARY_KEYS, values[:-1], strict=True) if v is not None}
+    last = values[-1]
+    return PauseSummary(
+        str(status),
+        pause,
+        last if isinstance(last, dict) else None,
+        seq,
+        dict(mapping) if isinstance(mapping, dict) else None,
+    )
+
+
+async def _whole_pause_summary(
+    state: Any, run_id: str, tenant_id: TenantScope
+) -> PauseSummary | None:
+    """The summary from the whole ``pause_data`` document, decoded by the driver."""
+    from sqlalchemy import func, select
+
+    from dendrux.db.models import AgentRun, RunEvent
+
+    paused_seq = (
+        select(func.max(RunEvent.sequence_index))
+        .where(RunEvent.agent_run_id == run_id, RunEvent.event_type == "run.paused")
+        .scalar_subquery()
+    )
+    stmt = _apply_tenant_scope(
+        select(AgentRun.status, paused_seq, AgentRun.pii_mapping, AgentRun.pause_data).where(
+            AgentRun.id == run_id
+        ),
+        tenant_id,
+    )
+    async with state._session_factory() as session:
+        row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    status, seq, mapping, data = row
+    data = data if isinstance(data, dict) else {}
+    steps = data.get("steps")
+    last = steps[-1] if isinstance(steps, list) and steps else None
+    return PauseSummary(
+        str(status),
+        {k: data[k] for k in PAUSE_SUMMARY_KEYS if k in data and data[k] is not None},
+        last if isinstance(last, dict) else None,
+        seq,
+        dict(mapping) if isinstance(mapping, dict) else None,
+    )
+
+
 def _accepts_tenant(method: Any) -> bool:
     """Require an explicit scope parameter; **kwargs may silently swallow it."""
     try:
@@ -199,7 +325,10 @@ class _PendingReader:
         _check_scope(tenant_id)
         getter = getattr(self._state, "get_pause_summary", None)
         if getter is not None:
-            summary = await getter(run_id, tenant_id=tenant_id)
+            if _is_postgres_store(self._state):
+                summary = await _pg_pause_summary(self._state, run_id, tenant_id)
+            else:
+                summary = await getter(run_id, tenant_id=tenant_id)
             if summary is None:
                 raise RunNotFoundError(run_id)
             status, pause, last_step = summary.status, summary.pause, summary.last_step
