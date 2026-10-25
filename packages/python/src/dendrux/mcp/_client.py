@@ -171,9 +171,20 @@ def _is_session_rejection(exc: BaseException) -> bool:
 
 @dataclass
 class _PageWalk:
-    """Pages fetched so far by one ``tools/list`` walk."""
+    """What one ``tools/list`` walk has retained so far."""
 
     pages: int = 0
+    tools: int = 0
+    wire_bytes: int = 0
+
+
+@dataclass
+class _DiscoveryRead:
+    """The byte cap on the ``tools/list`` response being read, and the stream enforcing it."""
+
+    adapter: MCPClientAdapter
+    read_cap: int
+    capped: CappedResponseStream | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +199,9 @@ class _Rejection:
 _tool_http_attempt: ContextVar[_ToolHTTPAttempt | None] = ContextVar(
     "mcp_tool_http_attempt", default=None
 )
+_discovery_read: ContextVar[_DiscoveryRead | None] = ContextVar("mcp_discovery_read", default=None)
+# Longest page cursor accepted (cursors are short opaque tokens).
+MAX_CURSOR_CHARS = 4096
 
 
 class MCPClientAdapter:
@@ -275,6 +289,7 @@ class MCPClientAdapter:
                     self._last_redirect_target = _diagnostic_origin(
                         response.request.url.join(location)
                     )
+        self._cap_discovery_response(response)
         attempt = _tool_http_attempt.get()
         if attempt is None or attempt.adapter is not self:
             return
@@ -303,6 +318,24 @@ class MCPClientAdapter:
             response.stream = capped
             if attempt.capped is None or not attempt.capped.exceeded:
                 attempt.capped = capped
+
+    def _cap_discovery_response(self, response: Any) -> None:
+        """Stop reading a ``tools/list`` response body at the discovery byte cap."""
+        read = _discovery_read.get()
+        if read is None or read.adapter is not self or read.capped is not None:
+            return
+        request = response.request
+        try:
+            body = json.loads(request.content)
+        except (ValueError, httpx2.RequestNotRead):
+            return
+        if (
+            request.method == "POST"
+            and isinstance(body, dict)
+            and body.get("method") == "tools/list"
+        ):
+            read.capped = CappedResponseStream(response.stream, read.read_cap)
+            response.stream = read.capped
 
     async def _open(self) -> BaseException | None:
         """Open the transport, returning a detached safe failure if needed."""
@@ -427,17 +460,42 @@ class MCPClientAdapter:
         seen: set[str] = set()
         cursor: str | None = None
         while True:
-            page = await client.list_tools(cursor=cursor, cache_mode="refresh")
+            page = await self._fetch_page(client, cursor, progress)
             progress.pages += 1
+            progress.tools += len(page.tools)
+            if progress.tools > self.source.max_discovery_tools:
+                raise self._discovery_limit_error("tool_cap", progress.pages)
             tools.extend(page.tools)
             cursor = page.next_cursor
             if cursor is None:
                 return tools
-            if cursor in seen:
-                raise self._discovery_limit_error("repeated_cursor", progress.pages)
-            seen.add(cursor)
-            if progress.pages >= self.source.max_discovery_pages:
-                raise self._discovery_limit_error("page_cap", progress.pages)
+            self._check_cursor(cursor, seen, progress)
+
+    def _check_cursor(self, cursor: str, seen: set[str], progress: _PageWalk) -> None:
+        if len(cursor) > MAX_CURSOR_CHARS:
+            raise self._discovery_limit_error("cursor_length", progress.pages)
+        if cursor in seen:
+            raise self._discovery_limit_error("repeated_cursor", progress.pages)
+        seen.add(cursor)
+        if progress.pages >= self.source.max_discovery_pages:
+            raise self._discovery_limit_error("page_cap", progress.pages)
+
+    async def _fetch_page(self, client: Any, cursor: str | None, progress: _PageWalk) -> Any:
+        """One ``tools/list`` request, its HTTP body read within what is left of the byte cap."""
+        remaining = self.source.max_discovery_bytes - progress.wire_bytes
+        read = _DiscoveryRead(self, max(remaining, 1))
+        token = _discovery_read.set(read)
+        try:
+            page = await client.list_tools(cursor=cursor, cache_mode="refresh")
+        except Exception:
+            if read.capped is not None and read.capped.exceeded:
+                raise self._discovery_limit_error("byte_cap", progress.pages + 1) from None
+            raise
+        finally:
+            _discovery_read.reset(token)
+        if read.capped is not None:
+            progress.wire_bytes += read.capped.read
+        return page
 
     def _discovery_limit_error(
         self, reason: DiscoveryLimitReason, pages: int

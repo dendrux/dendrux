@@ -145,7 +145,68 @@ class TestAggregateDeadline:
             await task
 
 
+class TestOneOversizedPage:
+    async def test_too_many_tools_in_one_page(self) -> None:
+        class Huge:
+            async def list_tools(self, cursor: Any = None, cache_mode: Any = None) -> Any:
+                tools = [_tool(f"t{i}") for i in range(100_000)]
+                return SimpleNamespace(tools=tools, next_cursor=None)
+
+        adapter = MCPClientAdapter(_source(max_discovery_pages=1))
+        adapter._client = Huge()  # type: ignore[assignment]
+        with pytest.raises(MCPDiscoveryLimitError) as caught:
+            await adapter.list_tools()
+        assert caught.value.reason == "tool_cap"
+
+    async def test_tool_cap_counts_across_pages(self) -> None:
+        client = _PagedClient(lambda i: f"c{i}")
+        with pytest.raises(MCPDiscoveryLimitError) as caught:
+            await _adapter(_source(max_discovery_tools=3), client).list_tools()
+        assert caught.value.reason == "tool_cap"
+        assert client.pages == 4
+
+    async def test_exactly_the_tool_cap_is_allowed(self) -> None:
+        client = _PagedClient(lambda i: f"c{i}" if i < 2 else None)
+        assert len(await _adapter(_source(max_discovery_tools=3), client).list_tools()) == 3
+
+    async def test_overlong_cursor_is_refused(self) -> None:
+        client = _PagedClient(lambda i: "c" * 100_000)
+        with pytest.raises(MCPDiscoveryLimitError) as caught:
+            await _adapter(_source(), client).list_tools()
+        assert caught.value.reason == "cursor_length"
+        assert client.pages == 1
+
+    async def test_error_text_and_log_name_the_reason_only(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _PagedClient(lambda i: "c" * 100_000)
+        with caplog.at_level(logging.WARNING), pytest.raises(MCPDiscoveryLimitError) as caught:
+            await _adapter(_source(), client).list_tools()
+        assert "mcp_discovery_cursor_length" in caplog.text
+        assert "ccccc" not in caplog.text
+        assert "ccccc" not in str(caught.value)
+
+
 class TestSourceConfiguration:
+    def test_new_bound_defaults(self) -> None:
+        source = _source()
+        assert source.max_discovery_tools == 2000
+        assert source.max_discovery_bytes == 16 * 1024 * 1024
+
+    @pytest.mark.parametrize("field", ["max_discovery_tools", "max_discovery_bytes"])
+    @pytest.mark.parametrize("bad", [0, -1, True, 1.5, "10"])
+    def test_new_bounds_must_be_positive_ints(self, field: str, bad: Any) -> None:
+        with pytest.raises(ValueError, match=field):
+            _source(**{field: bad})
+
+    def test_new_bounds_pass_through_every_constructor(self) -> None:
+        stdio = MCPSource.stdio("l", ["echo"], max_discovery_tools=5, max_discovery_bytes=6)
+        assert (stdio.max_discovery_tools, stdio.max_discovery_bytes) == (5, 6)
+        server = MCPServer(
+            "r", url="https://mcp.example.com/mcp", max_discovery_tools=7, max_discovery_bytes=8
+        )
+        assert (server.source.max_discovery_tools, server.source.max_discovery_bytes) == (7, 8)
+
     def test_defaults(self) -> None:
         source = _source()
         assert source.max_discovery_pages == 100
@@ -234,6 +295,103 @@ async def _serve_pages(*, delay: float = 0.0) -> AsyncIterator[tuple[str, dict[s
     finally:
         server.close()
         await server.wait_closed()
+
+
+@asynccontextmanager
+async def _serve_huge_page(*, tool_count: int) -> AsyncIterator[tuple[str, dict[str, int]]]:
+    """A local server whose one ``tools/list`` page is ``tool_count`` fat tools, no cursor."""
+    stats = {"requests": 0, "sent": 0}
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = (await reader.readuntil(b"\r\n\r\n")).decode()
+            length = next(
+                (
+                    int(line.split(":", 1)[1])
+                    for line in head.split("\r\n")
+                    if line.lower().startswith("content-length:")
+                ),
+                0,
+            )
+            req = json.loads(await reader.readexactly(length) if length else b"{}")
+            method = req.get("method")
+            if method == "tools/list":
+                stats["requests"] += 1
+                fat = "x" * 200
+                result: dict[str, Any] = {
+                    "tools": [
+                        {"name": f"t{i}", "description": fat, "inputSchema": {"type": "object"}}
+                        for i in range(tool_count)
+                    ]
+                }
+            elif method == "initialize":
+                result = {
+                    "protocolVersion": req.get("params", {}).get("protocolVersion", "2025-03-26"),
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "local", "version": "1"},
+                }
+            else:
+                result = {}
+            payload = json.dumps(
+                {"jsonrpc": "2.0", "id": req.get("id", 1), "result": result}
+            ).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+            )
+            await writer.drain()
+            stats["sent"] += len(payload)
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/mcp", stats
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+class TestResponseBytesOnTheRealTransport:
+    async def test_an_oversized_page_stops_at_the_byte_cap(self) -> None:
+        async with _serve_huge_page(tool_count=5000) as (url, stats):
+            source = MCPSource.http(
+                "fake", url, max_discovery_bytes=100_000, max_discovery_tools=1_000_000
+            )
+            adapter = MCPClientAdapter(source)
+            await adapter.connect()
+            try:
+                with pytest.raises(MCPDiscoveryLimitError) as caught:
+                    await asyncio.wait_for(adapter.list_tools(), timeout=10)
+            finally:
+                await adapter.close()
+            assert caught.value.reason == "byte_cap"
+            assert error_code_for(caught.value) == "discovery_limit"
+            assert stats["requests"] == 1
+
+    async def test_a_page_within_the_cap_is_read(self) -> None:
+        async with _serve_huge_page(tool_count=20) as (url, _):
+            adapter = MCPClientAdapter(MCPSource.http("fake", url))
+            await adapter.connect()
+            try:
+                tools = await asyncio.wait_for(adapter.list_tools(), timeout=10)
+            finally:
+                await adapter.close()
+            assert len(tools) == 20
+
+    async def test_a_too_big_catalog_stops_at_the_tool_cap(self) -> None:
+        async with _serve_huge_page(tool_count=50) as (url, _):
+            adapter = MCPClientAdapter(MCPSource.http("fake", url, max_discovery_tools=10))
+            await adapter.connect()
+            try:
+                with pytest.raises(MCPDiscoveryLimitError) as caught:
+                    await asyncio.wait_for(adapter.list_tools(), timeout=10)
+            finally:
+                await adapter.close()
+            assert caught.value.reason == "tool_cap"
 
 
 class TestAgainstARealServer:

@@ -232,6 +232,8 @@ class MCPSource:
     destination_policy: MCPDestinationPolicy | None = field(default=None, repr=False)
     max_discovery_pages: int = 100
     discovery_timeout: float = 60.0
+    max_discovery_tools: int = 2000
+    max_discovery_bytes: int = 16 * 1024 * 1024
 
     def __post_init__(self) -> None:
         self._validate_name()
@@ -315,6 +317,10 @@ class MCPSource:
     def _validate_discovery_bounds(self) -> None:
         if type(self.max_discovery_pages) is not int or self.max_discovery_pages < 1:
             raise ValueError("MCPSource max_discovery_pages must be a positive integer.")
+        for name in ("max_discovery_tools", "max_discovery_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"MCPSource {name} must be a positive integer.")
         timeout = self.discovery_timeout
         if (
             isinstance(timeout, bool)
@@ -342,6 +348,8 @@ class MCPSource:
         destination_policy: MCPDestinationPolicy | None = None,
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
+        max_discovery_tools: int = 2000,
+        max_discovery_bytes: int = 16 * 1024 * 1024,
     ) -> MCPSource:
         """Configure a production Streamable HTTP MCP source."""
         return cls(
@@ -359,6 +367,8 @@ class MCPSource:
             destination_policy=destination_policy,
             max_discovery_pages=max_discovery_pages,
             discovery_timeout=discovery_timeout,
+            max_discovery_tools=max_discovery_tools,
+            max_discovery_bytes=max_discovery_bytes,
         )
 
     @classmethod
@@ -375,6 +385,8 @@ class MCPSource:
         failure_mode: MCPFailureMode = "strict",
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
+        max_discovery_tools: int = 2000,
+        max_discovery_bytes: int = 16 * 1024 * 1024,
     ) -> MCPSource:
         """Configure a trusted local subprocess MCP source."""
         if isinstance(command, str):
@@ -390,6 +402,8 @@ class MCPSource:
             failure_mode=failure_mode,
             max_discovery_pages=max_discovery_pages,
             discovery_timeout=discovery_timeout,
+            max_discovery_tools=max_discovery_tools,
+            max_discovery_bytes=max_discovery_bytes,
         )
 
     @property

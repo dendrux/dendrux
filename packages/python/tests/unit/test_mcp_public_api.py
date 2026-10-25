@@ -72,6 +72,7 @@ EXPECTED_ALL = (
     "MCPEvictionStarted",
     "MCPFailureMode",
     "MCPHost",
+    "MCPInvalidToolSchemaError",
     "MCPOAuth",
     "MCPOAuthClaim",
     "MCPOAuthClient",

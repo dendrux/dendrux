@@ -26,7 +26,9 @@ class MCPOrigin:
         return "MCPOrigin()"
 
 
-DiscoveryLimitReason = Literal["repeated_cursor", "page_cap", "deadline"]
+DiscoveryLimitReason = Literal[
+    "repeated_cursor", "page_cap", "deadline", "tool_cap", "byte_cap", "cursor_length"
+]
 
 
 class MCPError(RuntimeError):
@@ -64,7 +66,11 @@ class MCPDiscoveryLimitError(MCPConnectionError):
     ``reason`` is ``repeated_cursor`` (the server returned a page cursor it
     had already returned, so paging would never end), ``page_cap`` (more than
     ``MCPSource.max_discovery_pages`` pages) or ``deadline`` (discovery took
-    longer than ``MCPSource.discovery_timeout``). ``str()`` names the source
+    longer than ``MCPSource.discovery_timeout``), ``tool_cap`` (more than
+    ``MCPSource.max_discovery_tools`` tools), ``byte_cap`` (the responses were
+    larger than ``MCPSource.max_discovery_bytes`` on the wire; HTTP sources
+    only) or ``cursor_length`` (a cursor longer than 4096 characters).
+    ``str()`` names the source
     and the reason only, never a cursor. A subclass of
     :class:`MCPConnectionError`, so existing handlers keep catching it.
     """
@@ -455,6 +461,16 @@ class MCPResultTooLargeError(MCPError, ToolResultTooLargeError):
     """
 
 
+class MCPInvalidToolSchemaError(ValueError):
+    """A strict view found a tool whose argument schema cannot be validated against.
+
+    Raised at discovery with ``strict=True`` (best-effort views skip the tool
+    with reason ``invalid_schema``). A ``ValueError`` subclass, so existing
+    handlers keep catching it; ``error_code_for`` gives ``invalid_tool_schema``.
+    The message names the source, tool and problem kind, never schema text.
+    """
+
+
 class MCPToolNameCollisionError(ValueError):
     """An MCP tool's exposed name clashes with another tool on the Agent.
 
@@ -478,6 +494,7 @@ _ERROR_CODES: tuple[tuple[tuple[type[BaseException], ...], str], ...] = (
     ((MCPConnectionStateError,), "connection_state"),
     ((MCPToolNameCollisionError,), "tool_name_collision"),
     ((MCPToolNotFoundError,), "tool_not_found"),
+    ((MCPInvalidToolSchemaError,), "invalid_tool_schema"),
     # Strict view naming raises plain ValueError; MCP failures never do.
     ((ValueError,), "invalid_tool_names"),
 )
@@ -491,7 +508,7 @@ def error_code_for(exc: BaseException) -> str:
     ``authorization_required``, ``authentication_failed``, ``credential_error``,
     ``destination_denied``, ``discovery_limit``, ``circuit_open``, ``capacity``,
     ``connection_failed``, ``connection_state``, ``tool_name_collision``,
-    ``tool_not_found``, ``invalid_tool_names`` or ``unknown``.
+    ``tool_not_found``, ``invalid_tool_schema``, ``invalid_tool_names`` or ``unknown``.
     """
     for kinds, code in _ERROR_CODES:
         if isinstance(exc, kinds):

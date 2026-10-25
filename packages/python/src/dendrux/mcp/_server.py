@@ -15,6 +15,7 @@ from dendrux.mcp._errors import (
     MCPAuthenticationError,
     MCPAuthorizationRequired,
     MCPDestinationDeniedError,
+    MCPInvalidToolSchemaError,
     MCPResultTooLargeError,
     MCPSessionExpiredError,
     MCPToolCallError,
@@ -123,7 +124,7 @@ def _schema_unusable(source: MCPSource, tool: Any, *, strict: bool) -> bool:
     if issue is None:
         return False
     if strict:
-        raise ValueError(
+        raise MCPInvalidToolSchemaError(
             f"MCP source '{source.name}' tool '{tool.name}' has a malformed "
             f"argument schema ({issue})."
         )
@@ -381,6 +382,8 @@ class MCPServer:
         destination_policy: MCPDestinationPolicy | None = None,
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
+        max_discovery_tools: int = 2000,
+        max_discovery_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         # Keep the legacy error wording and private transport attributes while
         # all real configuration lives in the immutable MCPSource.
@@ -406,6 +409,8 @@ class MCPServer:
             destination_policy=destination_policy,
             max_discovery_pages=max_discovery_pages,
             discovery_timeout=discovery_timeout,
+            max_discovery_tools=max_discovery_tools,
+            max_discovery_bytes=max_discovery_bytes,
         )
         self._configure(source)
 
