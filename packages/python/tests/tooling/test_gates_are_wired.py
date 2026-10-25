@@ -86,13 +86,18 @@ def test_make_ci_runs_every_gate() -> None:
 
 
 def test_load_sensitive_probes_run_serially_after_the_parallel_pass() -> None:
-    """The HOT statistics probe measures page pruning, which depends on how many sessions
-    share the server; under `-n auto` it failed in half the full runs and never alone."""
+    """The HOT statistics probe and the 300k-row writer-block probe measure server behaviour
+    that depends on how many sessions share the server; under `-n auto` they failed in
+    some full runs and not alone."""
     pyproject = tomllib.loads((PKG / "pyproject.toml").read_text())
     markers = pyproject["tool"]["pytest"]["ini_options"].get("markers", [])
     assert any(m.startswith("serial_probe:") for m in markers)
     probe = (PKG / "tests/integration/test_050_t7b_fix2.py").read_text()
     assert "@pytest.mark.serial_probe\nasync def test_hot_updates_recover" in probe
+    migration = (PKG / "tests/integration/test_050_t7b_fix3.py").read_text()
+    assert (
+        "@pytest.mark.serial_probe\nasync def test_online_clock_migration_writer_block" in migration
+    )
 
     makefile = (PKG / "Makefile").read_text()
     recipe = makefile.split("\ntest:", 1)[1].split("\n\n", 1)[0]

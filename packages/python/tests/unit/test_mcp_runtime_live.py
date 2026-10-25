@@ -2346,6 +2346,8 @@ class TestIdleRetirement:
             assert adapter.closed is False  # still warm immediately after release
 
             await _wait_until(lambda: adapter.closed)
+            # The adapter closes before the runtime drops its entry; wait for the entry too.
+            await _wait_until(lambda: runtime._entries == {})
             assert runtime._entries == {}
 
     @pytest.mark.asyncio

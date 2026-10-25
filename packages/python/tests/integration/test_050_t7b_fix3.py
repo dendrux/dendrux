@@ -200,6 +200,7 @@ async def _prior_schema(engine, count):
     )
 
 
+@pytest.mark.serial_probe
 async def test_online_clock_migration_writer_block_at_300k(engine, record_property):
     if engine.dialect.name != "postgresql":
         pytest.skip("Postgres concurrent writer and autocommit evidence")
