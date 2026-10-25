@@ -163,3 +163,43 @@ class TestContextAcrossToolCallParams:
         findings, block = await engine.scan_outgoing("ok", [{"a": _EMAIL, "b": "x"}])
         assert block is None
         assert len(findings) == 1
+
+
+class TestAncestorKeyContext:
+    async def test_parent_key_supplies_context_to_a_nested_value(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        _, block = await engine.scan_outgoing("ok", [{"aws secret": {"value": _TOKEN}}])
+        assert block is not None
+        assert _TOKEN not in block
+
+    async def test_list_of_dicts_under_a_context_key(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        params = {"aws secret": [{"note": "x"}, {"value": _TOKEN}]}
+        _, block = await engine.scan_outgoing("ok", [params])
+        assert block is not None
+
+    async def test_deeply_nested_context_and_value(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        params: dict[str, object] = {"aws secret": {"a": {"b": {"c": [{"d": {"v": _TOKEN}}]}}}}
+        _, block = await engine.scan_outgoing("ok", [params])
+        assert block is not None
+
+    async def test_context_in_a_nested_sibling_branch(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        params = {"left": {"aws secret": {}}, "right": {"deep": {"v": _TOKEN}}}
+        _, block = await engine.scan_outgoing("ok", [params])
+        assert block is not None
+
+    async def test_nested_params_without_context_still_pass(self) -> None:
+        engine = GuardrailEngine([SecretDetection(action="block"), PII(action="block")])
+        findings, block = await engine.scan_outgoing(
+            "ok", [{"outer": {"inner": [{"city": "Oslo"}, {"sha": "a" * 40}]}}]
+        )
+        assert block is None
+        assert findings == []
+
+    async def test_key_context_is_not_double_counted(self) -> None:
+        engine = GuardrailEngine([PII(action="warn")])
+        findings, block = await engine.scan_outgoing("ok", [{"outer": {"mail": _EMAIL}}])
+        assert block is None
+        assert len(findings) == 1

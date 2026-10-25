@@ -924,17 +924,20 @@ async def _scan_joined_leaves(
     *,
     where: str,
 ) -> tuple[list[Finding], str | None]:
-    """Scan the string values of all params as one text, ``key=value`` per leaf.
+    """Scan all params as one text, in walk order: ``key=value`` per value, bare keys too.
 
     A pattern whose evidence sits in a sibling param (``{"label": "aws
-    secret:", "value": "<token>"}``) fires on the joined text as it does on
-    the same text in one string. Only findings beyond what the per-leaf scans
-    already reported are returned, so nothing is counted twice.
+    secret:", "value": "<token>"}``) or in an ancestor key (``{"aws secret":
+    {"value": "<token>"}}``) fires on the joined text as it does on the same
+    text in one string. Only findings beyond what the per-leaf scans already
+    reported are returned, so nothing is counted twice.
     """
-    values = [(k, t) for k, t, with_context in leaves.items if with_context]
-    if len(values) < 2:
+    if len(leaves.items) < 2:
         return [], None
-    joined = _SEGMENT_SEP.join(f"{k[-_KEY_CONTEXT_CHARS:]}={t}" for k, t in values)
+    joined = _SEGMENT_SEP.join(
+        f"{k[-_KEY_CONTEXT_CHARS:]}={t}" if with_context else t
+        for k, t, with_context in leaves.items
+    )
     known = Counter(f.entity_type for f in leaf_findings)
     extra_findings: list[Finding] = []
     for guardrail in guardrails:
