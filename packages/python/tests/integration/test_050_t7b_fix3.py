@@ -64,7 +64,8 @@ async def test_sweep_candidate_cap_warns_with_safe_structured_fields(
         async with engine.begin() as conn:
             await conn.execute(
                 update(AgentRun).values(
-                    status_changed_at=dt.datetime.now(dt.UTC) - dt.timedelta(days=2)
+                    status_changed_at=dt.datetime.now(dt.UTC) - dt.timedelta(days=2),
+                    updated_at=dt.datetime.now(dt.UTC) - dt.timedelta(days=2),
                 )
             )
         await store.sweep_abandoned_runs(dt.timedelta(days=1), max_runs=2)

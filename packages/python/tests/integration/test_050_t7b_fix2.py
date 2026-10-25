@@ -348,7 +348,7 @@ async def test_running_sweep_counts_fresh_rows_against_work_cap(store, engine):
     assert len(await store.sweep_stale_runs(dt.timedelta(days=1), batch_size=2, max_runs=6)) == 3
 
 
-async def test_waiting_sweep_uses_status_clock_not_metadata_updates(store, engine):
+async def test_waiting_sweep_recent_metadata_delays_abandonment(store, engine):
     await store.create_run("waiting-age", "agent")
     await store.pause_run("waiting-age", status="paused", pause_data={})
     old = dt.datetime.now(dt.UTC) - dt.timedelta(days=2)
@@ -357,6 +357,13 @@ async def test_waiting_sweep_uses_status_clock_not_metadata_updates(store, engin
             update(AgentRun).where(AgentRun.id == "waiting-age").values(status_changed_at=old)
         )
     await store.update_run_meta("waiting-age", {"dendrux.patch": 1})
+    assert await store.sweep_abandoned_runs(dt.timedelta(days=1)) == [], (
+        "recent metadata delays abandonment for mixed-version safety"
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).where(AgentRun.id == "waiting-age").values(updated_at=old)
+        )
     assert [r.run_id for r in await store.sweep_abandoned_runs(dt.timedelta(days=1))] == [
         "waiting-age"
-    ], "metadata changes must not extend a waiting lease"
+    ], "abandonment resumes once both clocks are stale"

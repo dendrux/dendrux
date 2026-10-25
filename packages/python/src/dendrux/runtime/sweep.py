@@ -60,8 +60,10 @@ async def sweep(
             is still executing may collide with the sweep's event.
         abandoned_waiting: Threshold for abandoned WAITING detection.
             WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, WAITING_APPROVAL and
-            PAUSED runs whose status has not changed beyond this duration are
-            swept. If None, no abandoned-waiting sweep is performed.
+            PAUSED runs are swept only when both status_changed_at and updated_at
+            are older than this duration. The updated_at check protects pauses
+            written by older workers; recent metadata edits delay abandonment.
+            If None, no abandoned-waiting sweep is performed.
 
         batch_size: Candidate rows per projected page (default 100, maximum 1000).
         max_runs: Candidates inspected per category (default 10,000, maximum

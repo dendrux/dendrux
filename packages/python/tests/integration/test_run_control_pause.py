@@ -140,7 +140,7 @@ class TestPauseStatePrimitives:
         await store.create_run("r1", "a")
         await store.try_pause_run("r1", status="paused", pause_data={"p": 1})
         old = dt.datetime.now(dt.UTC) - dt.timedelta(hours=3)
-        await _set_row(store, "r1", status_changed_at=old)
+        await _set_row(store, "r1", status_changed_at=old, updated_at=old)
         swept = await store.sweep_abandoned_runs(older_than=dt.timedelta(hours=1))
         assert [(s.run_id, s.previous_status) for s in swept] == [("r1", "paused")]
         assert (await store.get_run("r1")).status == "error"

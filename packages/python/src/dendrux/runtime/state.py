@@ -902,8 +902,9 @@ class StateStore(Protocol):
         """Find WAITING_* and PAUSED rows older than threshold and mark them
         ERROR with failure_reason=abandoned_waiting.
 
-        Detection uses status_changed_at (last status transition). Waiting runs have
-        no forward progress by design, so last_progress_at is wrong here.
+        Candidates use status_changed_at (last status transition). The final
+        CAS requires both status_changed_at and updated_at to be stale, protecting
+        pauses written by older workers. A recent metadata edit delays abandonment.
 
         Inspect at most max_runs candidates across waiting statuses (default
         10,000, maximum 100,000), including losing CAS attempts. Saturation emits
@@ -2749,8 +2750,9 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     ) -> list[SweptRun]:
         """Inspect waiting candidates in projected pages; cap 10,000 by default.
 
-        max_runs accepts 1..100,000 across all waiting statuses. Losing CAS
-        attempts count toward it; hitting the cap emits sweep_cap_reached.
+        max_runs accepts 1..100,000 across all waiting statuses. The final CAS
+        requires both status_changed_at and updated_at to be stale. Losing CAS
+        attempts count toward the cap; hitting it emits sweep_cap_reached.
         """
         return await self._sweep_runs(
             older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
@@ -2764,7 +2766,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         batch_size: int,
         max_runs: int,
     ) -> list[SweptRun]:
-        from sqlalchemy import case, func, literal_column, select, tuple_, update
+        from sqlalchemy import case, func, literal_column, select, true, tuple_, update
 
         from dendrux.db.models import AgentRun, RunEvent
 
@@ -2852,7 +2854,12 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         result = await session.execute(
                             update(AgentRun)
                             .where(
-                                AgentRun.id == row.id, AgentRun.status == row.status, age < cutoff
+                                AgentRun.id == row.id,
+                                AgentRun.status == row.status,
+                                age < cutoff,
+                                # Legacy workers update updated_at on pause but
+                                # do not know the new status-transition clock.
+                                AgentRun.updated_at < cutoff if waiting else true(),
                             )
                             .values(
                                 **_status_values(new_status),

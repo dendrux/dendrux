@@ -66,6 +66,41 @@ def upgrade() -> None:
                 )
 
 
+def _exclusive_pg_step(statement: str, *, transactional: bool = False) -> None:
+    """Bound lock acquisition without changing a downgrade's atomic boundary."""
+    bind = op.get_bind()
+    previous = bind.execute(sa.text("SHOW lock_timeout")).scalar_one()
+    try:
+        if transactional:
+            # A later revision may refuse a multi-revision downgrade. Keep the
+            # column drop and revision stamp in that enclosing transaction.
+            # A savepoint restores SET LOCAL on timeout before we translate it.
+            with bind.begin_nested():
+                bind.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+                op.execute(statement)
+                bind.execute(
+                    sa.text("SELECT set_config('lock_timeout', :previous, true)"),
+                    {"previous": previous},
+                )
+        else:
+            bind.execute(sa.text("SET lock_timeout = '5s'"))
+            try:
+                op.execute(statement)
+            finally:
+                bind.execute(
+                    sa.text("SELECT set_config('lock_timeout', :previous, false)"),
+                    {"previous": previous},
+                )
+    except sa.exc.DBAPIError as error:
+        state = getattr(error.orig, "sqlstate", None) or getattr(error.orig, "pgcode", None)
+        if state == "55P03":
+            raise RuntimeError(
+                "Timed out acquiring the agent_runs migration lock after 5 seconds. "
+                "Retry the migration operation after the blocking transaction finishes."
+            ) from None
+        raise
+
+
 def _online_pg_clock() -> None:
     """Commit short DDL and 5k-row batches on the direct migration connection.
 
@@ -75,7 +110,7 @@ def _online_pg_clock() -> None:
     table scan under ACCESS EXCLUSIVE (Postgres 12+).
     """
     with op.get_context().autocommit_block():
-        op.execute(
+        _exclusive_pg_step(
             "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ, "
             "ALTER COLUMN status_changed_at SET DEFAULT now()"
         )
@@ -120,13 +155,13 @@ def _online_pg_clock() -> None:
             .scalar_one_or_none()
         )
         if exists is None:
-            op.execute(
+            _exclusive_pg_step(
                 f"ALTER TABLE agent_runs ADD CONSTRAINT {constraint} "
                 "CHECK (status_changed_at IS NOT NULL) NOT VALID"
             )
         op.execute(f"ALTER TABLE agent_runs VALIDATE CONSTRAINT {constraint}")
-        op.execute("ALTER TABLE agent_runs ALTER COLUMN status_changed_at SET NOT NULL")
-        op.execute(f"ALTER TABLE agent_runs DROP CONSTRAINT {constraint}")
+        _exclusive_pg_step("ALTER TABLE agent_runs ALTER COLUMN status_changed_at SET NOT NULL")
+        _exclusive_pg_step(f"ALTER TABLE agent_runs DROP CONSTRAINT {constraint}")
 
 
 def downgrade() -> None:
@@ -135,7 +170,10 @@ def downgrade() -> None:
         for name, _, _, _ in reversed(_INDEXES):
             concurrent = " CONCURRENTLY" if pg else ""
             op.execute(f"DROP INDEX{concurrent} IF EXISTS {name}")
-    _alter_clock(drop=True)
+    if pg:
+        _exclusive_pg_step("ALTER TABLE agent_runs DROP COLUMN status_changed_at", transactional=True)
+    else:
+        _alter_clock(drop=True)
 
 
 def _alter_clock(*, drop: bool) -> None:
