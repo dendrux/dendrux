@@ -31,8 +31,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux._redact import safe_exception_info
-from dendrux.errors import ProviderError
+from dendrux.errors import ProviderError, safe_exception_info
 from dendrux.loops.base import BaseNotifier
 from dendrux.types import ErrorInfo
 

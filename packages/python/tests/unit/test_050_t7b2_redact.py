@@ -6,12 +6,14 @@ import traceback
 
 
 def test_low_layer_redaction_and_runtime_compatibility():
-    import dendrux._redact as redaction
+    import dendrux.errors as redaction
     from dendrux.errors import ProviderAuthError
     from dendrux.loops import _helpers
     from dendrux.runtime.context import safe_exception_info as compatibility
 
-    assert hasattr(redaction, "safe_exception_info"), "redaction must be available below runtime"
+    assert hasattr(redaction, "safe_exception_info"), (
+        "provider redaction must live in the errors layer"
+    )
     safe_exception_info = redaction.safe_exception_info
     assert compatibility is safe_exception_info
     imports = [

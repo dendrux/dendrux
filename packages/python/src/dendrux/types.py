@@ -1221,10 +1221,11 @@ class RunResult:
     pending: PendingPause | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Version-1 browser DTO; excludes unrestricted output, traces and payloads.
+        """Version-1 browser DTO; excludes arbitrary objects, traces and payloads.
 
-        Known PII is replaced with placeholders. This is not general serialization:
-        arbitrary ``output`` is represented by null. ``pending`` is the active pause,
+        Answer and client arguments mirror the configured in-process PII policy.
+        A configured structured output model is copied as bounded JSON; arbitrary
+        output stays null. ``pending`` is the active pause,
         with approval/input arguments from the recorded placeholder view. Client
         arguments can be sensitive; routes must also authorize the actor and run.
         """

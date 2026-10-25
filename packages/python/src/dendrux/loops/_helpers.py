@@ -20,7 +20,7 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from dendrux._redact import safe_exception_info
+from dendrux.errors import safe_exception_info
 from dendrux.pricing import price_usage
 
 if TYPE_CHECKING:

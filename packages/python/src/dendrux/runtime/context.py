@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
     from dendrux.skills._session import SkillSession
 
-from dendrux._redact import safe_exception_info as safe_exception_info
+from dendrux.errors import safe_exception_info as safe_exception_info
 
 T = TypeVar("T")
 

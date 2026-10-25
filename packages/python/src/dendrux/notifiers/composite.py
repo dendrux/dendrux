@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux._redact import safe_exception_info
+from dendrux.errors import safe_exception_info
 from dendrux.loops.base import BaseNotifier, LoopNotifier
 
 if TYPE_CHECKING:

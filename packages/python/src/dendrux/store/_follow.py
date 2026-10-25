@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 
 from dendrux.errors import RunNotFoundError
+from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime.state import _check_scope
 
 if TYPE_CHECKING:
@@ -94,30 +95,6 @@ FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa
 
 # Pauses whose arguments are shown to a human as the model sent them.
 _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
-
-
-def approval_calls(
-    calls: Any,
-    approval_params: Mapping[str, dict[str, Any]] | None,
-) -> Any:
-    """Use recorded model arguments; never infer them from execution values."""
-    if not isinstance(calls, list):
-        return calls
-    result = []
-    for call in calls:
-        if not isinstance(call, dict):
-            result.append(call)
-            continue
-        shown = dict(call)
-        params = (approval_params or {}).get(str(call.get("id")))
-        if params is not None:
-            shown.pop("arguments", None)
-            shown["params"] = params
-        else:
-            shown.pop("arguments", None)
-            shown.update(params=None, args_hidden=True)
-        result.append(shown)
-    return result
 
 
 def redact_event(

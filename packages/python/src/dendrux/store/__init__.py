@@ -42,8 +42,8 @@ import dataclasses
 import functools
 import inspect
 import warnings
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from dendrux._sentinel import _OmittedType
 from dendrux.db._sqlite_sync import create_sqlite_schema
@@ -51,6 +51,24 @@ from dendrux.errors import BlobNotFoundError, RunNotFoundError
 from dendrux.media._ids import image_id
 from dendrux.media._runtime import tenant_scope_for
 from dendrux.runtime._blob_catalog import BlobServices, CatalogBlobAccessor
+from dendrux.runtime._pending import (
+    _KIND_BY_STATUS as _KIND_BY_STATUS,
+)
+from dendrux.runtime._pending import (
+    PendingKind as PendingKind,
+)
+from dendrux.runtime._pending import (
+    PendingPause as PendingPause,
+)
+from dendrux.runtime._pending import (
+    PendingToolCall as PendingToolCall,
+)
+from dendrux.runtime._pending import (
+    _pending_from as _pending_from,
+)
+from dendrux.runtime._pending import (
+    _PendingReader,
+)
 from dendrux.runtime.state import (
     MAX_LIST_OFFSET,
     UNSCOPED,
@@ -62,15 +80,19 @@ from dendrux.runtime.state import (
     _Unscoped,
 )
 from dendrux.store._follow import (
-    PAUSE_STATUSES,
+    PAUSE_STATUSES as PAUSE_STATUSES,
+)
+from dendrux.store._follow import (
     EventFeed,
     Follow,
     FollowCapacityError,
     FollowEnd,
     FollowHeartbeat,
     FollowItem,
-    approval_calls,
     redact_event,
+)
+from dendrux.store._follow import (
+    approval_calls as approval_calls,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
 
@@ -319,89 +341,6 @@ class PausePair:
     submitted_results: list[dict[str, Any]]
     user_input: str | None
     pause_id: str | None = None
-
-
-PendingKind = Literal["client_tool", "approval", "input", "paused"]
-_KIND_BY_STATUS: dict[str, PendingKind] = {
-    "waiting_client_tool": "client_tool",
-    "waiting_approval": "approval",
-    "waiting_human_input": "input",
-    "paused": "paused",
-}
-
-
-@dataclass(frozen=True, slots=True)
-class PendingToolCall:
-    """One call the active pause waits on: a client tool to run, or a call to approve.
-
-    ``params``: for a **client-tool** pause, the arguments in the form the
-    0.4.1 ``run.paused`` event and ``RunResult.meta["pause_state"]`` carry
-    them, which is the form the client tool receives: after guardrail
-    de-anonymisation, so with ``PII(restore="all")`` (the default) they hold
-    real values. For an **approval** pause, the placeholder form the model
-    sent (``<<EMAIL_ADDRESS_1>>``), never de-anonymised values: that is what a
-    human approves. If recorded model arguments are unavailable, ``params``
-    is None and ``args_hidden`` is True.
-    ``target`` is ``"client"`` or ``"server"``.
-    ``approval`` is ``{"source": "static" | "hook", "reason": ...}`` for a
-    call waiting for approval, else None.
-    """
-
-    id: str
-    name: str
-    target: str | None
-    params: dict[str, Any] | None
-    approval: dict[str, Any] | None = None
-    args_hidden: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class PendingPause:
-    """What a paused run is waiting for (``RunStore.get_pending``).
-
-    ``kind``: ``"client_tool"`` (run ``tool_calls`` and submit results),
-    ``"approval"`` (approve or reject ``tool_calls``), ``"input"`` (answer
-    ``question``, with suggested ``options``) or ``"paused"`` (a requested
-    or budget pause; see ``reason``, ``message``, ``budget_exceeded``).
-    ``pause_id`` identifies this pause (None until the runtime records one).
-    :meth:`to_dict` gives the ``run.paused`` event shape plus the extra fields.
-    """
-
-    run_id: str
-    status: str
-    kind: PendingKind
-    pause_id: str | None
-    tool_calls: list[PendingToolCall] = field(default_factory=list)
-    question: str | None = None
-    options: list[str] = field(default_factory=list)
-    reason: str | None = None
-    message: str | None = None
-    budget_exceeded: list[dict[str, Any]] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-ready dict in the ``run.paused`` shape (``pending_tool_calls`` etc.)."""
-        return {
-            "run_id": self.run_id,
-            "status": self.status,
-            "kind": self.kind,
-            "pause_id": self.pause_id,
-            "pending_tool_calls": [
-                {
-                    "id": c.id,
-                    "name": c.name,
-                    "target": c.target,
-                    "params": c.params,
-                    "approval": c.approval,
-                    **({"args_hidden": True} if c.args_hidden else {}),
-                }
-                for c in self.tool_calls
-            ],
-            "question": self.question,
-            "options": list(self.options),
-            "reason": self.reason,
-            "message": self.message,
-            "exceeded": self.budget_exceeded,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -857,8 +796,7 @@ class RunStore:
         no entities detected, the run does not exist, or it is outside
         ``tenant_id``).
         """
-        mapping = await self._scoped_read(self._state.get_pii_mapping, run_id, tenant_id)
-        return mapping or {}
+        return await _PendingReader(self._state).get_pii_mapping(run_id, tenant_id=tenant_id)
 
     async def get_notes(
         self,
@@ -982,33 +920,7 @@ class RunStore:
         Raises:
             RunNotFoundError: the run does not exist or is outside ``tenant_id``.
         """
-        _check_scope(tenant_id)
-        getter = getattr(self._state, "get_pause_summary", None)
-        if getter is not None:
-            summary = await getter(run_id, tenant_id=tenant_id)
-            if summary is None:
-                raise RunNotFoundError(run_id)
-            status, pause, last_step = summary.status, summary.pause, summary.last_step
-        else:  # custom store: scope by lookup, then the full pause state
-            record = await self._scoped_run(run_id, tenant_id)
-            if record is None:
-                raise RunNotFoundError(run_id)
-            status = record.status
-            full = await self._state.get_pause_state(run_id) or {}
-            pause = dict(full)
-            steps = full.get("steps") or []
-            last_step = steps[-1] if steps else None
-        kind = _KIND_BY_STATUS.get(status)
-        if kind is None:
-            return None
-        if kind in ("approval", "input"):
-            seq = await self._active_pause_sequence(run_id, tenant_id)
-            params = await self._approval_params(run_id, seq, tenant_id)
-            pause = {
-                **pause,
-                "pending_tool_calls": approval_calls(pause.get("pending_tool_calls"), params),
-            }
-        return _pending_from(run_id, status, kind, pause, last_step)
+        return await _PendingReader(self._state).get_pending(run_id, tenant_id=tenant_id)
 
     def follow(
         self,
@@ -1052,47 +964,17 @@ class RunStore:
         )
 
     async def _status(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> str | None:
-        getter = getattr(self._state, "get_run_status", None)
-        if getter is not None:
-            return cast("str | None", await getter(run_id, tenant_id=tenant_id))
-        record = await self._scoped_run(run_id, tenant_id)
-        return str(record.status) if record is not None else None
+        return await _PendingReader(self._state)._status(run_id, tenant_id)
 
     async def _active_pause_sequence(
         self, run_id: str, tenant_id: TenantScope = UNSCOPED
     ) -> int | None:
-        getter = getattr(self._state, "get_active_pause_sequence", None)
-        if getter is not None:
-            return cast("int | None", await getter(run_id, tenant_id=tenant_id))
-        if await self._status(run_id, tenant_id) not in PAUSE_STATUSES:
-            return None
-        # Legacy readers without explicit filters cannot promise a bounded
-        # history read. Fail closed: approval/input params stay hidden.
-        try:
-            parameters = inspect.signature(self._state.get_run_events).parameters
-        except (TypeError, ValueError):
-            return None
-        if not {"limit", "event_types"} <= parameters.keys():
-            return None
-        # Bounded custom-store fallback. Unknown tail means no active exception.
-        rows = await self._scoped_read(
-            self._state.get_run_events,
-            run_id,
-            tenant_id,
-            event_types=["run.paused", "run.resumed"],
-            limit=1000,
-        )
-        if not rows or len(rows) == 1000 or rows[-1].event_type != "run.paused":
-            return None
-        return int(rows[-1].sequence_index)
+        return await _PendingReader(self._state)._active_pause_sequence(run_id, tenant_id)
 
     async def _approval_params(
         self, run_id: str, seq: int | None, tenant_id: TenantScope = UNSCOPED
     ) -> dict[str, dict[str, Any]]:
-        getter = getattr(self._state, "get_approval_params", None)
-        if getter is None or seq is None:
-            return {}  # legacy custom stores fail closed when PII is present
-        return cast("dict[str, dict[str, Any]]", await getter(run_id, seq, tenant_id=tenant_id))
+        return await _PendingReader(self._state)._approval_params(run_id, seq, tenant_id)
 
     async def _event_view(
         self,
@@ -1149,14 +1031,7 @@ class RunStore:
 
     async def _scoped_run(self, run_id: str, tenant_id: TenantScope) -> Any:
         """The run record within ``tenant_id``, or None (missing and foreign alike)."""
-        _check_scope(tenant_id)
-        if isinstance(tenant_id, _Unscoped):
-            return await self._state.get_run(run_id)
-        getter = self._state.get_run
-        if _accepts_tenant(getter):
-            return await getter(run_id, tenant_id=tenant_id)  # type: ignore[call-arg]
-        record = await getter(run_id)
-        return record if record is not None and record.tenant_id == tenant_id else None
+        return await _PendingReader(self._state)._scoped_run(run_id, tenant_id)
 
     async def _scoped_read(
         self, method: Any, run_id: str, tenant_id: TenantScope, **kwargs: Any
@@ -1167,14 +1042,7 @@ class RunStore:
         query. A custom store's method without ``tenant_id`` gets a run
         lookup first (a run's tenant never changes, so this cannot race).
         """
-        _check_scope(tenant_id)
-        if isinstance(tenant_id, _Unscoped):
-            return await method(run_id, **kwargs)
-        if _accepts_tenant(method):
-            return await method(run_id, tenant_id=tenant_id, **kwargs)
-        if await self._scoped_run(run_id, tenant_id) is None:
-            return None
-        return await method(run_id, **kwargs)
+        return await _PendingReader(self._state)._scoped_read(method, run_id, tenant_id, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1215,68 +1083,11 @@ def _warn_stream_events_unscoped() -> None:
     )
 
 
-def _pending_from(
-    run_id: str,
-    status: str,
-    kind: PendingKind,
-    pause: dict[str, Any],
-    last_step: dict[str, Any] | None,
-) -> PendingPause:
-    targets = pause.get("pending_targets") or {}
-    gates = pause.get("approval_gates") or {}
-    calls = []
-    for tc in pause.get("pending_tool_calls") or []:
-        if not isinstance(tc, dict) or "id" not in tc:
-            continue
-        gate = gates.get(tc["id"]) if isinstance(gates, dict) else None
-        calls.append(
-            PendingToolCall(
-                id=str(tc["id"]),
-                name=str(tc.get("name", "")),
-                target=targets.get(tc["id"]) if isinstance(targets, dict) else None,
-                params=None if tc.get("args_hidden") else dict(tc.get("params") or {}),
-                args_hidden=bool(tc.get("args_hidden")),
-                approval=dict(gate) if isinstance(gate, dict) else None,
-            )
-        )
-    question: str | None = None
-    options: list[str] = []
-    action = (last_step or {}).get("action") if kind == "input" else None
-    if isinstance(action, dict) and action.get("type") == "clarification":
-        question = action.get("question")
-        options = [str(o) for o in action.get("options") or []]
-    exceeded = pause.get("budget_exceeded")
-    return PendingPause(
-        run_id=run_id,
-        status=status,
-        kind=kind,
-        pause_id=pause.get("pause_id") if isinstance(pause.get("pause_id"), str) else None,
-        tool_calls=calls,
-        question=question,
-        options=options,
-        reason=pause.get("pause_reason"),
-        message=pause.get("pause_message"),
-        budget_exceeded=exceeded if isinstance(exceeded, list) else None,
-    )
-
-
 def _utc(value: datetime | None) -> datetime | None:
     """Aware datetimes in UTC; naive ones are rejected by the store."""
     if value is None or value.tzinfo is None:
         return value
     return _to_aware_utc(value)
-
-
-def _accepts_tenant(method: Any) -> bool:
-    """True only for an explicit ``tenant_id`` parameter.
-
-    A bare ``**kwargs`` might swallow the scope silently, so such methods get
-    the run-lookup fallback instead (fail closed).
-    """
-    try:
-        return "tenant_id" in inspect.signature(method).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def _error_info_of(record: Any) -> ErrorInfo | None:

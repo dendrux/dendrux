@@ -96,7 +96,7 @@ async def test_live_paused_result_and_fetched_result_match(store, kind):
     )
 
 
-async def test_cached_result_carries_active_pending_and_redacts_persisted_pii(store):
+async def test_cached_result_carries_active_pending_and_mirrors_persisted_values(store):
     from sqlalchemy import update
 
     from dendrux.db.models import AgentRun
@@ -124,11 +124,12 @@ async def test_cached_result_carries_active_pending_and_redacts_persisted_pii(st
         await session.commit()
     cached = await _build_cached_result(store, "cached")
     assert cached.pending is not None, "cached pause must carry the active pause"
-    assert "private@example.test" not in json.dumps(cached.to_dict())
+    assert cached.to_dict()["pending"] == cached.pending.to_dict()
+    assert "pii_mapping" not in json.dumps(cached.to_dict())
     await store.finalize_run("cached", status="success", answer="private@example.test")
     cached = await _build_cached_result(store, "cached")
     assert cached.pending is None
-    assert cached.to_dict()["answer"] == "<<EMAIL_1>>"
+    assert cached.to_dict()["answer"] == cached.answer == "private@example.test"
 
 
 @pytest.mark.parametrize("persisted", [True, False])

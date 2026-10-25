@@ -33,11 +33,10 @@ def test_run_wire_allowlist_and_pii_redaction():
         "error_info",
     }
     assert type(wire["wire_version"]) is int and wire["wire_version"] == 1
-    assert wire["answer"] == "Hello <<EMAIL_1>>"
+    assert wire["answer"] == result.answer
     assert wire["output"] is None
     text = json.dumps(wire)
     for secret in (
-        "private@example.test",
         "PROMPT_SENTINEL",
         "TRACE_SENTINEL",
         "VENDOR_SENTINEL",
@@ -165,10 +164,13 @@ def test_wire_mapping_bound_is_checked_before_allocating_a_regex(monkeypatch):
         raise AssertionError("oversized PII must be refused before building a regexp")
 
     result = RunResult(
-        "R", RunStatus.SUCCESS, answer="ok", meta={"pii_mapping": {"<<DATA_1>>": "x" * 65537}}
+        "R",
+        RunStatus.WAITING_APPROVAL,
+        pending=PendingPause("R", "waiting_approval", "approval", "P"),
+        meta={"pii_mapping": {"<<DATA_1>>": "x" * 65537}},
     )
     monkeypatch.setattr(wire.re, "escape", must_not_escape_oversize)
-    assert result.to_dict()["answer"] is None
+    assert result.to_dict()["pending"] is None
 
 
 @pytest.mark.parametrize("bound", ["depth", "nodes", "chars", "utf8", "unicode"])
@@ -237,8 +239,11 @@ def test_wire_only_copies_finite_json_values():
 )
 def test_wire_aggregate_mapping_budget_fails_closed(mapping):
     assert (
-        RunResult("R", RunStatus.SUCCESS, answer="ok", meta={"pii_mapping": mapping}).to_dict()[
-            "answer"
-        ]
+        RunResult(
+            "R",
+            RunStatus.WAITING_APPROVAL,
+            pending=PendingPause("R", "waiting_approval", "approval", "P"),
+            meta={"pii_mapping": mapping},
+        ).to_dict()["pending"]
         is None
     )

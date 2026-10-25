@@ -98,12 +98,20 @@ def _bind_to_current_loop(engine: AsyncEngine) -> None:
     # acquisition boundary, before the pool can ping, open or invalidate an
     # asyncpg connection on the wrong loop. This also covers raw_connection
     # and survives dispose(), which replaces the pool on this same Engine.
+    # Guard both public entry points: normal acquisition need not route through
+    # raw_connection in Connection.__init__ on any particular SQLAlchemy minor.
+    connect = engine.sync_engine.connect
     raw_connection = engine.sync_engine.raw_connection
+
+    def _checked_connect() -> Any:
+        _check_loop()
+        return connect()
 
     def _checked_connection() -> Any:
         _check_loop()
         return raw_connection()
 
+    engine.sync_engine.connect = _checked_connect  # type: ignore[method-assign]
     engine.sync_engine.raw_connection = _checked_connection  # type: ignore[method-assign]
     event.listen(engine.sync_engine, "checkout", _check_loop)
 

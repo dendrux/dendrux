@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import re
@@ -78,6 +79,18 @@ def _redacted(value: Any, mapping: Any) -> Any:
         return None
 
 
+def _structured_output(output: Any) -> Any:
+    """Only the explicit output_type model is a supported structured schema."""
+    from pydantic import BaseModel
+
+    if not isinstance(output, BaseModel):
+        return None
+    try:
+        return _redacted(output.model_dump(mode="json"), None)
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
 def result_to_dict(result: RunResult) -> dict[str, Any]:
     """Browser DTO, deliberately independent of dataclass/package versions."""
     mapping = result.meta.get("pii_mapping")
@@ -86,10 +99,13 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
         "wire_version": WIRE_VERSION,
         "run_id": result.run_id,
         "status": result.status.value,
-        "pending": _redacted(pending.to_dict(), mapping) if pending else None,
-        "answer": _redacted(result.answer, mapping) if isinstance(result.answer, str) else None,
-        # App output is unrestricted and may contain tool payloads or private objects.
-        "output": None,
+        "pending": _redacted(
+            pending.to_dict(), mapping if pending.kind in ("approval", "input") else None
+        )
+        if pending
+        else None,
+        "answer": _redacted(result.answer, None) if isinstance(result.answer, str) else None,
+        "output": _structured_output(result.output),
         "error_info": _redacted(result.error_info.to_dict(), mapping)
         if result.error_info
         else None,
@@ -143,7 +159,9 @@ def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
                 error="result too large",
                 meta={"code": "size_limit", "bytes": size},
             )
-        json.loads(data["payload"], parse_constant=_invalid_constant, parse_float=_finite_float)
+        # Legacy plain text is preserved byte-for-byte like submit_tool_results.
+        with contextlib.suppress(json.JSONDecodeError):
+            json.loads(data["payload"], parse_constant=_invalid_constant, parse_float=_finite_float)
         refs = tuple(ImageRef.from_dict(image) for image in images)
     except (TypeError, UnicodeError, RecursionError, KeyError) as exc:
         raise ValueError("Tool result must contain valid JSON and image descriptors") from exc

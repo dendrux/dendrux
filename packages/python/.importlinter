@@ -26,7 +26,7 @@ layers =
     llm | guardrails
     chat
     pricing | context_blocks | strategies | media | db
-    types
+    types : _wire
     errors | _sentinel | _redact
 ignore_imports =
     # KNOWN VIOLATION: the retry telemetry helper in the provider layer reports

@@ -495,21 +495,7 @@ class Agent:
             else _resolved_provider
         )
 
-        # --- Persistence ---
-        if database_url is not None and state_store is not None:
-            raise ValueError(
-                "database_url and state_store are mutually exclusive. Pass one or the other."
-            )
-        if (
-            database_options is not None
-            and database_url is None
-            and not os.environ.get("DENDRUX_DATABASE_URL")
-        ):
-            raise ValueError("database_options requires database_url.")
-
-        self._database_url = database_url
-        self._database_options = database_options or {}
-        self._state_store = state_store
+        self._configure_persistence(database_url, database_options, state_store)
 
         from dendrux.runtime.tasks import RunTaskManager
 
@@ -534,6 +520,76 @@ class Agent:
             )
         self._before_tool: BeforeToolHook | None = before_tool
 
+        self._configure_trust(strict_tenancy, limits, tool_threads, on_governance_change)
+        self._configure_images(images, blob_store)
+        self._configure_tool_sources(tool_sources)
+
+        # --- Skills ---
+        if skills_dir is not None and not isinstance(skills_dir, (str, Path)):
+            raise ValueError(
+                f"Agent '{self.name}' skills_dir must be a string or Path, "
+                f"got {type(skills_dir).__name__}."
+            )
+        self._skills_dir: Path | None = Path(skills_dir) if skills_dir is not None else None
+
+        self._explicit_skills: list[Skill] | None = None
+        if skills is not None:
+            from dendrux.skills import Skill as _Skill
+
+            for i, s in enumerate(skills):
+                if not isinstance(s, _Skill):
+                    raise ValueError(
+                        f"Agent '{self.name}' skills[{i}] is {type(s).__name__}, "
+                        f"not a Skill instance. Use Skill.from_dir(path)."
+                    )
+            self._explicit_skills = list(skills)
+
+        self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
+        self._loaded_skills: list[Skill] | None = None
+        self._denied_skill_names: list[str] | None = None
+        self._inline_skill_warning_emitted: bool = False
+        validate_executor(skill_executor)
+        self._skill_executor = skill_executor
+        self._script_warning_names: set[str] = set()
+        self._validate_skill_contents(self._explicit_skills or [])
+
+        self._validate()
+
+        from dendrux import pricing as _pricing
+
+        _pricing.check_budget_config(self)
+
+    def _configure_persistence(
+        self,
+        database_url: str | None,
+        database_options: dict[str, Any] | None,
+        state_store: StateStore | None,
+    ) -> None:
+        """Validate the source of database ownership before any lazy acquisition."""
+        # --- Persistence ---
+        if database_url is not None and state_store is not None:
+            raise ValueError(
+                "database_url and state_store are mutually exclusive. Pass one or the other."
+            )
+        if (
+            database_options is not None
+            and database_url is None
+            and not os.environ.get("DENDRUX_DATABASE_URL")
+        ):
+            raise ValueError("database_options requires database_url.")
+
+        self._database_url = database_url
+        self._database_options = database_options or {}
+        self._state_store = state_store
+
+    def _configure_trust(
+        self,
+        strict_tenancy: bool | _UnsetType,
+        limits: Limits | None,
+        tool_threads: int,
+        on_governance_change: Literal["warn", "raise"] | _UnsetType,
+    ) -> None:
+        """Validate and retain the per-Agent governance policy."""
         # --- Trust (0.5.0): stored here, enforced by the runtime checks ---
         from dendrux.tools._lookups import make_call_limiter
         from dendrux.types import Limits as _Limits
@@ -569,6 +625,8 @@ class Agent:
         self._on_governance_change: Literal["warn", "raise"] = on_governance_change
         self._tool_call_limiter: Any = make_call_limiter(tool_threads)
 
+    def _configure_images(self, images: ImagePolicy | None, blob_store: BlobStore | None) -> None:
+        """Validate image services and initialize their store lifecycle."""
         # --- Images ---
         from dendrux.media._policy import ImagePolicy as _ImagePolicy
         from dendrux.media._store import BlobStore as _BlobStore
@@ -592,6 +650,10 @@ class Agent:
         self._store_lock = threading.Lock()
         self._store_generation = 0
 
+    def _configure_tool_sources(
+        self, tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None
+    ) -> None:
+        """Expand configured MCP sources and validate their identities."""
         # --- MCP tool sources ---
         self._tool_sources: list[MCPServer] = []
         if tool_sources:
@@ -655,41 +717,6 @@ class Agent:
         # mcp.tools_skipped event and RunResult.meta["mcp_skipped_tools"].
         self._mcp_skipped_tools: list[dict[str, Any]] = []
         self._discovery_lock = asyncio.Lock()
-
-        # --- Skills ---
-        if skills_dir is not None and not isinstance(skills_dir, (str, Path)):
-            raise ValueError(
-                f"Agent '{self.name}' skills_dir must be a string or Path, "
-                f"got {type(skills_dir).__name__}."
-            )
-        self._skills_dir: Path | None = Path(skills_dir) if skills_dir is not None else None
-
-        self._explicit_skills: list[Skill] | None = None
-        if skills is not None:
-            from dendrux.skills import Skill as _Skill
-
-            for i, s in enumerate(skills):
-                if not isinstance(s, _Skill):
-                    raise ValueError(
-                        f"Agent '{self.name}' skills[{i}] is {type(s).__name__}, "
-                        f"not a Skill instance. Use Skill.from_dir(path)."
-                    )
-            self._explicit_skills = list(skills)
-
-        self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
-        self._loaded_skills: list[Skill] | None = None
-        self._denied_skill_names: list[str] | None = None
-        self._inline_skill_warning_emitted: bool = False
-        validate_executor(skill_executor)
-        self._skill_executor = skill_executor
-        self._script_warning_names: set[str] = set()
-        self._validate_skill_contents(self._explicit_skills or [])
-
-        self._validate()
-
-        from dendrux import pricing as _pricing
-
-        _pricing.check_budget_config(self)
 
     # ------------------------------------------------------------------
     # Properties
@@ -1154,13 +1181,8 @@ class Agent:
 
         env_url = os.environ.get("DENDRUX_DATABASE_URL")
         if env_url is not None:
-            from dendrux.db.session import get_engine
-
             _warn_env_store_deprecated()
-            engine = await get_engine(
-                env_url,
-                **({"database_options": self._database_options} if self._database_options else {}),
-            )
+            engine = await _get_env_engine(env_url, self._database_options)
             if not was_verified(engine):
                 await _verify_schema_initialized(engine, env_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
@@ -1988,14 +2010,15 @@ class Agent:
         access to this run. Pending arguments use RunStore.get_pending's view.
         """
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
-        from dendrux.store import RunStore
+        from dendrux.runtime._pending import _PendingReader
+        from dendrux.runtime.runner import _cached_output, _public_meta
 
         if tenant_id is not None and not isinstance(tenant_id, str):
             raise ValueError("tenant_id must be a string or None")
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
-        facade = RunStore(store)
+        facade = _PendingReader(store)
         projected = getattr(store, "_get_result_record", None)
         record = (
             await projected(run_id, tenant_id=tenant_id)
@@ -2005,7 +2028,13 @@ class Agent:
         if record is None or record.agent_name != self.name:
             raise RunNotFoundError(run_id)
         result = _record_to_run_result(record)
-        result.meta["pii_mapping"] = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
+        result.meta.update(
+            _public_meta(
+                {"pii_mapping": await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}}
+            )
+        )
+        if result.status.value == "success":
+            result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
         result.pause_id = result.pending.pause_id if result.pending else None
         return result
@@ -3190,3 +3219,12 @@ class Agent:
             f"Agent(name={self.name!r}, model={self.model!r}, "
             f"tools={len(self.tools)}, max_iterations={self.max_iterations})"
         )
+
+
+async def _get_env_engine(url: str, options: dict[str, Any]) -> AsyncEngine:
+    """Retain the legacy singleton call shape when no options were configured."""
+    from dendrux.db.session import get_engine
+
+    if options:
+        return await get_engine(url, database_options=options)
+    return await get_engine(url)

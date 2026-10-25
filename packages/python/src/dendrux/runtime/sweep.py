@@ -82,14 +82,7 @@ async def sweep(
     Raises:
         ValueError: If both or neither of database_url/state_store provided.
     """
-    if database_url is not None and state_store is not None:
-        raise ValueError(
-            "database_url and state_store are mutually exclusive. Pass one or the other."
-        )
-    if database_url is None and state_store is None:
-        raise ValueError("Either database_url or state_store is required.")
-    if database_options is not None and database_url is None:
-        raise ValueError("database_options requires database_url")
+    _validate_source(database_url, state_store, database_options)
     if stale_running is None and abandoned_waiting is None:
         return SweepResult(stale_running=[])
 
@@ -129,6 +122,22 @@ async def sweep(
     finally:
         if engine is not None:
             await engine.dispose()
+
+
+def _validate_source(
+    database_url: str | None,
+    state_store: StateStore | None,
+    database_options: dict[str, Any] | None,
+) -> None:
+    """Reject ambiguous persistence configuration before opening an engine."""
+    if database_url is not None and state_store is not None:
+        raise ValueError(
+            "database_url and state_store are mutually exclusive. Pass one or the other."
+        )
+    if database_url is None and state_store is None:
+        raise ValueError("Either database_url or state_store is required.")
+    if database_options is not None and database_url is None:
+        raise ValueError("database_options requires database_url")
 
 
 async def _create_temp_store(

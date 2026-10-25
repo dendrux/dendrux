@@ -41,7 +41,6 @@ def test_the_package_follows_its_import_rules() -> None:
 
 KNOWN_VIOLATIONS = [
     r"dendrux\.llm\._retry_telemetry -> dendrux\.loops\._helpers",
-    r"dendrux\.loops\._helpers -> dendrux\.runtime\.context",
 ]
 
 
@@ -63,7 +62,7 @@ def test_each_known_upward_import_is_what_its_ignore_entry_covers(
     sorted(
         p.name
         for p in (Path(__file__).resolve().parents[2] / "src" / "dendrux").iterdir()
-        if p.is_dir() and not p.name.startswith(("_", "."))
+        if (p / "__init__.py").is_file() and not p.name.startswith(("_", "."))
     ),
 )
 def test_every_subpackage_has_a_place_in_the_layers(package: str) -> None:

@@ -25,7 +25,6 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, get_args, overload
 
-from dendrux._redact import safe_exception_info
 from dendrux._sentinel import _UnsetType
 from dendrux.chat import (
     history_has_images,
@@ -41,7 +40,7 @@ from dendrux.context_blocks import (
     wire_user_input,
     wire_user_parts,
 )
-from dendrux.errors import BlobNotFoundError, InvalidImageError, RunFencedError
+from dendrux.errors import BlobNotFoundError, InvalidImageError, RunFencedError, safe_exception_info
 from dendrux.loops._budget import BUDGET_EXCEEDED, BudgetCarry
 from dendrux.loops._helpers import (
     notify_message,
@@ -544,8 +543,7 @@ def _public_meta(meta: dict[str, Any]) -> dict[str, Any]:
 
 def _in_memory_pending(result: RunResult) -> Any:
     """Project an ephemeral pause without ever serializing its history."""
-    from dendrux.store import _KIND_BY_STATUS, _pending_from
-    from dendrux.store._follow import approval_calls
+    from dendrux.runtime._pending import _KIND_BY_STATUS, _pending_from, approval_calls
     from dendrux.types import Clarification
 
     state = result.meta.get("pause_state")
@@ -580,9 +578,9 @@ def _in_memory_pending(result: RunResult) -> Any:
 
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
     if result.status in _PAUSE_STATUSES and record is not None:
-        from dendrux.store import RunStore
+        from dendrux.runtime._pending import _PendingReader
 
-        result.pending = await RunStore(store).get_pending(
+        result.pending = await _PendingReader(store).get_pending(
             result.run_id, tenant_id=getattr(record, "tenant_id", None)
         )
         result.pause_id = result.pending.pause_id if result.pending else None
@@ -677,6 +675,9 @@ async def _persist_loop_outcome(
     user_answer, unmapped_placeholders = deanonymize_text(result.answer, pii_mapping)
 
     def _wrap(*, status: RunStatus, won: bool) -> RunResult:
+        pause_id, pending = (
+            (result.pause_id, result.pending) if status in _PAUSE_STATUSES else (None, None)
+        )
         return RunResult(
             run_id=run_id,
             status=status,
@@ -691,8 +692,8 @@ async def _persist_loop_outcome(
             commentary=[deanonymize_text(c, pii_mapping)[0] or c for c in result.commentary],
             replay=result.replay,
             stop_reason=result.stop_reason if status == RunStatus.SUCCESS else None,
-            pause_id=result.pause_id if status in _PAUSE_STATUSES else None,
-            pending=result.pending if status in _PAUSE_STATUSES else None,
+            pause_id=pause_id,
+            pending=pending,
         )
 
     async def _persisted(status_if_missing: RunStatus) -> RunResult:
@@ -2175,6 +2176,28 @@ async def _raise_resume_claim_failure(
     )
 
 
+def _cached_output(answer: str | None, output_type: type | None, run_id: str) -> Any:
+    """Recover only a configured structured schema, failing closed on old data."""
+    # Rebuild typed output from persisted answer if output_type was requested
+    output = None
+    if output_type is not None and answer:
+        from pydantic import ValidationError
+
+        try:
+            output = output_type.model_validate_json(answer)  # type: ignore[attr-defined]
+        except (ValidationError, Exception):
+            # If the persisted answer doesn't validate (schema evolved,
+            # corruption, etc.), return None rather than crashing the
+            # dedup path. The caller still gets answer as raw text.
+            logger.warning(
+                "Cached run %s answer failed validation against %s",
+                run_id,
+                output_type.__name__,
+            )
+
+    return output
+
+
 async def _build_cached_result(
     state_store: StateStore,
     run_id: str,
@@ -2203,22 +2226,7 @@ async def _build_cached_result(
     if run is None:
         raise RuntimeError(f"Idempotent run {run_id} not found in database")
 
-    # Rebuild typed output from persisted answer if output_type was requested
-    output = None
-    if output_type is not None and run.answer:
-        from pydantic import ValidationError
-
-        try:
-            output = output_type.model_validate_json(run.answer)  # type: ignore[attr-defined]
-        except (ValidationError, Exception):
-            # If the persisted answer doesn't validate (schema evolved,
-            # corruption, etc.), return None rather than crashing the
-            # dedup path. The caller still gets answer as raw text.
-            logger.warning(
-                "Cached run %s answer failed validation against %s",
-                run_id,
-                output_type.__name__,
-            )
+    output = _cached_output(run.answer, output_type, run_id)
 
     result = RunResult(
         run_id=run.id,
