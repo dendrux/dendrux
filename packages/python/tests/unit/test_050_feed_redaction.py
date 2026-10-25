@@ -104,7 +104,7 @@ class TestRedactFreeText:
         )
         assert redact_event(ev).data == {"described": [{"sha256": "ab"}], "placeholders": []}
 
-    def test_past_pause_message_hidden_active_kept(self) -> None:
+    def test_pause_message_hidden_codes_kept(self) -> None:
         ev = _event(
             "run.paused",
             {
@@ -116,7 +116,8 @@ class TestRedactFreeText:
         )
         assert "message" not in redact_event(ev).data
         assert redact_event(ev).data["reason"] == "requested"
-        assert redact_event(ev, active_pause=True).data["message"] == SECRET
+        assert "message" not in redact_event(ev, active_pause=True).data
+        assert redact_event(ev, include_payloads=True).data["message"] == SECRET
 
     @pytest.mark.parametrize(
         "event_type",

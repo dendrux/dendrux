@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,11 +33,36 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 from dendrux._sentinel import _UnsetType
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime._pending import approval_calls as approval_calls
-from dendrux.runtime._pending import check_read_int, check_read_scope, check_run_id
-from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
+from dendrux.runtime._pending import (
+    check_read_bool,
+    check_read_duration,
+    check_read_int,
+    check_read_scope,
+    check_run_id,
+)
+from dendrux.store._redact import (
+    PAUSE_CHANGING_EVENTS,
+    PAUSE_VIEW_EVENTS,
+    PastParams,
+    PauseView,
+    _redact,
+    needs_unknown_calls,
+    read_pause_view,
+    read_unknown_calls,
+    view_with,
+)
+from dendrux.store._redact import (
+    REVIEWED_EVENT_TYPES as REVIEWED_EVENT_TYPES,
+)
+from dendrux.store._redact import (
+    redact_event as redact_event,
+)
+from dendrux.store._redact import (
+    without_params as without_params,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator
 
     from dendrux.runtime.state import TenantScope
     from dendrux.store import RunStore, StoredEvent
@@ -50,11 +74,6 @@ PAUSE_STATUSES = frozenset(
     {"waiting_client_tool", "waiting_human_input", "waiting_approval", "paused"}
 )
 _TERMINAL_EVENT_TYPES = frozenset({"run.completed", "run.error", "run.cancelled"})
-
-# Event-data keys that are payloads, hidden unless include_payloads=True.
-_HIDDEN_EVENT_KEYS = frozenset(
-    {"system_prompt", "provider_request", "provider_response", "pii_mapping"}
-)
 
 _DEFAULT_SHARE = _UnsetType()
 
@@ -119,178 +138,6 @@ class FollowEnd:
 FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa: UP007
 
 
-# Pauses whose arguments are shown to a human as the model sent them.
-_PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
-
-# Top-level event-data keys holding free text (a human's or client's words,
-# exception text) that a reader without payloads never sees.
-_FREE_TEXT_KEYS: dict[str, frozenset[str]] = {
-    "run.resumed": frozenset({"user_input"}),
-    "run.error": frozenset({"error"}),
-    "mcp.error": frozenset({"error"}),
-}
-# Dendrux's own fixed denial reasons; any other reason is a person's text.
-_CONSTANT_DENIAL_REASONS = frozenset({"denied_by_policy", DEFAULT_DENIAL_REASON})
-
-
-def redact_event(
-    event: StoredEvent,
-    *,
-    include_payloads: bool = False,
-    active_pause: bool = False,
-    pii_mapping: Mapping[str, str] | None = None,
-    approval_params: Mapping[str, dict[str, Any]] | None = None,
-) -> StoredEvent:
-    """The event as a reader may see it (B2 and the approval-arguments rule).
-
-    In every mode, the arguments of an **approval or input** ``run.paused``
-    use ``approval.requested.params``, exactly as the model sent them. Without
-    those arguments, ``params`` is hidden. Client-tool pauses keep the 0.4.1 form.
-
-    With ``include_payloads=True`` nothing else changes. Otherwise:
-
-    - the system prompt (``run.started``), provider request and response
-      bodies and any ``pii_mapping`` are removed from ``data``;
-    - in ``run.paused``, each pending call's ``params`` and the requested
-      pause's ``message`` are removed **unless** ``active_pause`` is true.
-      Active client-tool arguments remain visible; active approval/input
-      arguments require recorded model-sent params. A past pause's arguments
-      are history and are hidden;
-    - ``approval.requested.params`` is removed unless ``active_pause`` is true
-      (the request belongs to the run's active pause);
-    - free text is removed: ``run.resumed.user_input``, a denial ``reason``
-      in ``approval.decided.decisions`` (Dendrux's constant reasons stay),
-      ``error`` in ``run.error`` and ``mcp.error`` (``error_info`` and codes
-      stay) and image descriptions (``image.state.described[].text``).
-
-    Tool results and server-tool arguments never appear in event data; read
-    them with ``RunStore.get_tool_invocations`` (trusted readers only).
-    ``pii_mapping`` is accepted for compatibility and not used.
-    """
-    if not event.data:
-        return event
-    data = dict(event.data)
-    if (
-        event.event_type == "run.paused"
-        and data.get("status") in _PLACEHOLDER_PAUSES
-        and isinstance(data.get("pending_tool_calls"), list)
-    ):
-        data["pending_tool_calls"] = approval_calls(data["pending_tool_calls"], approval_params)
-    if include_payloads:
-        return dataclasses.replace(event, data=data) if data != event.data else event
-    data = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}
-    if event.event_type == "run.paused" and not active_pause:
-        if isinstance(data.get("pending_tool_calls"), list):
-            data["pending_tool_calls"] = [without_params(c) for c in data["pending_tool_calls"]]
-        data.pop("message", None)
-    return dataclasses.replace(event, data=_without_free_text(event.event_type, data, active_pause))
-
-
-def _without_free_text(event_type: str, data: dict[str, Any], active: bool) -> dict[str, Any]:
-    """``data`` without the free text of its event type (one rule set for every reader)."""
-    hidden = _FREE_TEXT_KEYS.get(event_type)
-    if hidden:
-        data = {k: v for k, v in data.items() if k not in hidden}
-    if event_type == "approval.requested" and not active:
-        data.pop("params", None)
-    elif event_type == "approval.decided" and isinstance(data.get("decisions"), list):
-        data["decisions"] = [_without_reason(d) for d in data["decisions"]]
-    elif event_type == "image.state" and isinstance(data.get("described"), list):
-        data["described"] = [_without_keys(d, ("text",)) for d in data["described"]]
-    return data
-
-
-def _without_reason(decision: Any) -> Any:
-    if isinstance(decision, dict) and decision.get("reason") not in _CONSTANT_DENIAL_REASONS:
-        return _without_keys(decision, ("reason",))
-    return decision
-
-
-def _without_keys(item: Any, keys: tuple[str, ...]) -> Any:
-    if not isinstance(item, dict):
-        return item
-    return {k: v for k, v in item.items() if k not in keys}
-
-
-# Event types whose view depends on the run's active pause.
-_PAUSE_VIEW_EVENTS = frozenset({"run.paused", "approval.requested"})
-# Event types after which a cached view of the active pause may be out of date.
-_PAUSE_CHANGING_EVENTS = _PAUSE_VIEW_EVENTS | {
-    "run.resumed",
-    "run.completed",
-    "run.error",
-    "run.cancelled",
-    "run.interrupted",
-    "run.abandoned",
-}
-# Past pauses' recorded arguments kept per watched run (include_payloads readers).
-_PAST_PARAMS_CACHE = 256
-
-
-@dataclass(slots=True)
-class _PauseView:
-    """The run's active pause when it was read, valid for events up to ``through``.
-
-    ``active`` is the index of the active ``run.paused`` event (None when the
-    run is not paused); ``active_params`` its recorded model-sent arguments by
-    call id (the ``approval.requested`` events of that pause).
-    """
-
-    through: int
-    active: int | None
-    active_params: dict[str, dict[str, Any]]
-    past_params: dict[int, dict[str, dict[str, Any]]] = field(default_factory=dict)
-
-
-async def _read_pause_view(
-    store: Any, run_id: str, tenant_id: TenantScope, through: int
-) -> _PauseView:
-    """Two bounded reads: the active pause's index, then its recorded arguments."""
-    active = await store._active_pause_sequence(run_id, tenant_id)
-    params = {} if active is None else await store._approval_params(run_id, active, tenant_id)
-    return _PauseView(through, active, params)
-
-
-async def _view_with(
-    store: Any,
-    run_id: str,
-    event: StoredEvent,
-    view: _PauseView,
-    *,
-    tenant_id: TenantScope,
-    include_payloads: bool,
-) -> StoredEvent:
-    """``event`` as a reader sees it, given the run's active pause ``view``."""
-    data = event.data or {}
-    seq = event.sequence_index
-    if event.event_type == "approval.requested":
-        active = (
-            view.active is not None
-            and seq < view.active
-            and isinstance(data.get("call_id"), str)
-            and data["call_id"] in view.active_params
-        )
-        return redact_event(event, include_payloads=include_payloads, active_pause=active)
-    if event.event_type != "run.paused":
-        return redact_event(event, include_payloads=include_payloads)
-    active = seq == view.active
-    params = None
-    if (include_payloads or active) and data.get("status") in _PLACEHOLDER_PAUSES:
-        params = view.active_params if active else view.past_params.get(seq)
-        if params is None:  # a past pause's recorded arguments never change
-            params = await store._approval_params(run_id, seq, tenant_id)
-            if len(view.past_params) < _PAST_PARAMS_CACHE:
-                view.past_params[seq] = params
-    return redact_event(
-        event, include_payloads=include_payloads, active_pause=active, approval_params=params
-    )
-
-
-def without_params(call: Any) -> Any:
-    """A pending-call dict without its arguments."""
-    return _without_keys(call, ("params", "arguments"))
-
-
 @dataclass(eq=False)
 class _Follower:
     """One follower of a run feed: a bounded buffer plus a wake-up signal."""
@@ -327,9 +174,10 @@ class _RunFeed:
         self.terminal = False
         self.closing = False
         self.task: asyncio.Task[None] | None = None
-        self._view: _PauseView | None = None
+        self._view: PauseView | None = None
         self._view_generation = 0
         self._view_lock = asyncio.Lock()
+        self._unknown: tuple[int, frozenset[str] | None] | None = None
 
     def _observe(self, event: StoredEvent) -> None:
         """Drop the cached pause view when a newer event may have changed the pause."""
@@ -337,12 +185,12 @@ class _RunFeed:
         if (
             view is not None
             and event.sequence_index > view.through
-            and event.event_type in _PAUSE_CHANGING_EVENTS
+            and event.event_type in PAUSE_CHANGING_EVENTS
         ):
             self._view = None
             self._view_generation += 1
 
-    async def pause_view(self, seq: int, tenant_id: TenantScope) -> _PauseView:
+    async def pause_view(self, seq: int, tenant_id: TenantScope) -> PauseView:
         """The run's active pause for viewing event ``seq``, read once for every follower.
 
         A cached view answers for events up to its ``through`` index; a newer
@@ -359,12 +207,20 @@ class _RunFeed:
                 return view
             generation = self._view_generation
             through = max(seq, self.head if self.head is not None else -1)
-            fresh = await _read_pause_view(self.owner.store, self.run_id, tenant_id, through)
-            if view is not None:
-                fresh.past_params = view.past_params
+            fresh = await read_pause_view(self.owner.store, self.run_id, tenant_id, through)
             if generation == self._view_generation:
                 self._view = fresh
             return fresh
+
+    async def unknown_calls(self, seq: int, tenant_id: TenantScope) -> frozenset[str] | None:
+        """The run's calls rejected as unknown tools, read once per newer failed call."""
+        cached = self._unknown
+        if cached is not None and seq <= cached[0]:
+            return cached[1]
+        through = max(seq, self.head if self.head is not None else -1)
+        ids = await read_unknown_calls(self.owner.store, self.run_id, tenant_id)
+        self._unknown = (through, ids)
+        return ids
 
     def add(self, follower: _Follower) -> int | None:
         """Register ``follower``; return the head it must catch up to from the database."""
@@ -562,8 +418,9 @@ class EventFeed:
         check_run_id(run_id)
         check_read_scope(tenant_id)
         check_read_int("after_sequence_index", after_sequence_index)
-        if max_duration_s is not None and not max_duration_s > 0:
-            raise ValueError("max_duration_s must be positive or None.")
+        check_read_bool("include_payloads", include_payloads)
+        check_read_bool("until_terminal", until_terminal)
+        check_read_duration("max_duration_s", max_duration_s)
         return Follow(
             self,
             run_id,
@@ -685,6 +542,7 @@ class Follow:
         self._tenant_id = tenant_id
         self._cursor = after
         self._include_payloads = include_payloads
+        self._past = PastParams()
         self._until_terminal = until_terminal
         self._max_duration_s = max_duration_s
         self._started = False
@@ -777,7 +635,11 @@ class Follow:
 
     async def _view(self, event: StoredEvent) -> StoredEvent:
         return await _feed_view(
-            self._feed, event, tenant_id=self._tenant_id, include_payloads=self._include_payloads
+            self._feed,
+            event,
+            tenant_id=self._tenant_id,
+            include_payloads=self._include_payloads,
+            past=self._past,
         )
 
     def _expired(self) -> bool:
@@ -873,22 +735,36 @@ async def _feed_view(
     *,
     tenant_id: TenantScope,
     include_payloads: bool,
+    past: PastParams,
 ) -> StoredEvent:
-    """A follower's view of ``event``, using the run feed's shared pause view.
+    """A follower's view of ``event``, using the run feed's shared reads.
 
-    Without a feed (never the case once events flow) there is no active pause,
-    so pause arguments stay hidden.
+    Without a feed (never the case once events flow) nothing is known about
+    the run, so pause arguments and failed calls' names stay hidden.
     """
-    if feed is None or event.event_type not in _PAUSE_VIEW_EVENTS:
-        return redact_event(event, include_payloads=include_payloads)
-    view = await feed.pause_view(event.sequence_index, tenant_id)
-    return await _view_with(
+    if feed is None:
+        return _redact(
+            event,
+            include_payloads=include_payloads,
+            active_pause=False,
+            approval_params=None,
+            unknown_calls=None,
+        )
+    unknown = None
+    if needs_unknown_calls(event, include_payloads):
+        unknown = await feed.unknown_calls(event.sequence_index, tenant_id)
+    view = PauseView(event.sequence_index, None, {})
+    if event.event_type in PAUSE_VIEW_EVENTS:
+        view = await feed.pause_view(event.sequence_index, tenant_id)
+    return await view_with(
         feed.owner.store,
         feed.run_id,
         event,
         view,
         tenant_id=tenant_id,
         include_payloads=include_payloads,
+        past=past,
+        unknown_calls=unknown,
     )
 
 

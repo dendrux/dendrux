@@ -26,6 +26,12 @@ pytestmark = pytest.mark.asyncio
 NUL = "bad\x00id"
 LONE = "bad\ud800id"
 HUGE = 10**30
+SECRET = "probe-secret-5831"
+NAIVE = dt.datetime(2020, 1, 1, 12, 0, 0)
+
+
+async def _started(follow: Any) -> None:
+    await follow.start()
 
 
 @tool(target="client")
@@ -104,6 +110,19 @@ HOSTILE: list[tuple[str, Call]] = [
     ("count_runs nul metadata value", lambda s, r: s.count_runs(metadata_filter={"k": NUL})),
     ("count_runs nul agent", lambda s, r: s.count_runs(agent_name=NUL)),
     ("event_view nul id", lambda s, r: s.get_event_view(NUL, None, tenant_id="A")),
+    ("list_runs str started_after", lambda s, r: s.list_runs(started_after=SECRET)),
+    ("list_runs naive started_before", lambda s, r: s.list_runs(started_before=NAIVE)),
+    ("list_runs date started_after", lambda s, r: s.list_runs(started_after=dt.date(2020, 1, 1))),
+    ("count_runs int started_after", lambda s, r: s.count_runs(started_after=5)),
+    ("count_runs naive started_before", lambda s, r: s.count_runs(started_before=NAIVE)),
+    ("get_events str before", lambda s, r: s.get_events(r, before=SECRET)),
+    ("get_events naive before", lambda s, r: s.get_events(r, before=NAIVE)),
+    ("get_llm_calls str before", lambda s, r: s.get_llm_calls(r, before=SECRET)),
+    ("get_tool_invocations naive before", lambda s, r: s.get_tool_invocations(r, before=NAIVE)),
+    ("get_run dict tenant", lambda s, r: s.get_run(r, tenant_id={"secret": SECRET})),
+    ("get_pending bytes tenant", lambda s, r: s.get_pending(r, tenant_id=SECRET.encode())),
+    ("list_runs dict tenant", lambda s, r: s.list_runs(tenant_id={"secret": SECRET})),
+    ("follow dict tenant", lambda s, r: _started(s.follow(r, tenant_id={"secret": SECRET}))),
 ]
 
 
@@ -117,6 +136,7 @@ async def test_hostile_argument_is_a_validation_error(
     message = str(info.value)
     assert type(info.value) is ValueError, label
     assert "SELECT" not in message.upper() and "\x00" not in message and len(message) < 300
+    assert SECRET not in message and "2020" not in message
     assert any(getattr(r, "code", None) == "read_argument_invalid" for r in caplog.records)
 
 

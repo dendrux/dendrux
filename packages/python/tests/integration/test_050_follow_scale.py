@@ -188,3 +188,67 @@ async def test_default_cap_is_a_fifth_and_untenanted_share_the_global_cap(
 async def test_per_tenant_cap_is_validated(engine: Any, bad: Any) -> None:
     with pytest.raises(ValueError):
         EventFeed(RunStore.from_engine(engine), max_followers_per_tenant=bad)
+
+
+# ---------------------------------------------------------------------------
+# Trusted (include_payloads) followers: past pause arguments are read in pages
+# ---------------------------------------------------------------------------
+
+
+async def _many_approval_pauses(store: Any, pauses: int) -> str:
+    run_id = "rp".ljust(26, "0")
+    await store.create_run(run_id, "a", tenant_id="A")
+    for i in range(pauses):
+        call = f"c{i}"
+        await store.save_run_event(
+            run_id,
+            event_type="approval.requested",
+            data={"tool_name": "t", "call_id": call, "params": {"n": i}},
+        )
+        await store.save_run_event(
+            run_id,
+            event_type="run.paused",
+            data={"status": "waiting_approval", "pending_tool_calls": [{"id": call, "name": "t"}]},
+        )
+        await store.save_run_event(run_id, event_type="run.resumed", data={})
+    await store.finalize_run(run_id, status="success")
+    return run_id
+
+
+async def test_trusted_backfill_reads_past_arguments_in_pages(store: Any, engine: Any) -> None:
+    pauses, followers = 300, 5
+    run_id = await _many_approval_pauses(store, pauses)
+    run_store = RunStore.from_engine(engine)
+    count = [0]
+
+    def on_execute(*_a: Any) -> None:
+        count[0] += 1
+
+    feed = EventFeed(run_store, poll_interval_s=0.01, poll_max_s=0.02, heartbeat_s=5.0)
+
+    async def one() -> dict[int, Any]:
+        shown: dict[int, Any] = {}
+        async with feed.follow(
+            run_id, tenant_id="A", include_payloads=True, max_duration_s=30.0
+        ) as f:
+            async for item in f:
+                if isinstance(item, FollowEnd):
+                    break
+                if not isinstance(item, FollowHeartbeat) and item.event_type == "run.paused":
+                    shown[item.sequence_index] = item.data["pending_tool_calls"][0]["params"]
+        return shown
+
+    event.listen(engine.sync_engine, "before_cursor_execute", on_execute)
+    try:
+        results = await asyncio.gather(*[one() for _ in range(followers)])
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", on_execute)
+        await feed.aclose()
+    for shown in results:
+        assert len(shown) == pauses
+        assert [p["n"] for _, p in sorted(shown.items())] == list(range(pauses))
+    events = 3 * pauses + 1
+    print(f"trusted backfill: {followers} followers, {pauses} pauses -> {count[0]} statements")
+    # Per follower: about one statement per 100 events (event pages) plus one per
+    # 1000 pause-related events (argument pages), never one per pause.
+    assert count[0] <= followers * (events // 100 + events // 1000 + 8), count[0]

@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -19,7 +20,6 @@ from dendrux.runtime.state import (
     PauseSummary,
     TenantScope,
     _apply_tenant_scope,
-    _check_scope,
     _Unscoped,
 )
 
@@ -227,10 +227,78 @@ def check_run_id(run_id: object) -> str:
 
 
 def check_read_scope(tenant_id: object) -> None:
-    """``_check_scope`` plus the id rules for a string tenant."""
-    _check_scope(tenant_id)
-    if isinstance(tenant_id, str):
-        check_read_text("tenant_id", tenant_id)
+    """``UNSCOPED``, ``None`` or a valid tenant id; never echoes a rejected value."""
+    if tenant_id is None or isinstance(tenant_id, _Unscoped):
+        return
+    if not isinstance(tenant_id, str):
+        raise _invalid("tenant_id", "must be a non-empty str, None (untenanted runs) or UNSCOPED.")
+    check_read_text("tenant_id", tenant_id)
+
+
+def check_read_bool(argument: str, value: object) -> bool:
+    """Exactly ``True`` or ``False``: a string such as ``"false"`` is refused."""
+    if value is not True and value is not False:
+        raise _invalid(argument, "must be a bool.")
+    return value
+
+
+def check_read_datetime(argument: str, value: object) -> None:
+    """None, or a timezone-aware ``datetime``."""
+    if value is None:
+        return
+    if not isinstance(value, datetime):
+        raise _invalid(argument, "must be a timezone-aware datetime or None.")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise _invalid(argument, "must be timezone-aware (for example datetime.now(UTC)).")
+
+
+def check_read_duration(argument: str, value: object) -> None:
+    """None, or a finite positive number of seconds."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _invalid(argument, "must be a positive number of seconds or None.")
+    if not math.isfinite(value) or value <= 0:
+        raise _invalid(argument, "must be a positive number of seconds or None.")
+
+
+UNKNOWN_TOOL_PREFIX = "Unknown tool:"
+"""How the loop's unknown-tool rejection message starts (its stored error text)."""
+MAX_UNKNOWN_TOOL_CALLS = 1000
+
+
+async def unknown_tool_calls(
+    state: Any, run_id: str, tenant_id: TenantScope
+) -> frozenset[str] | None:
+    """Call ids of the run's calls rejected because the model named no declared tool.
+
+    One indexed read of ``tool_calls`` (ids only). None when it cannot be
+    known (a custom store, or more than ``MAX_UNKNOWN_TOOL_CALLS``); callers
+    then treat every failed call's name as unknown.
+    """
+    factory = getattr(state, "_session_factory", None)
+    if factory is None:
+        return None
+    from sqlalchemy import select
+
+    from dendrux.db.models import ToolCallRecord as ToolCall
+    from dendrux.runtime.state import _run_in_scope
+
+    stmt = (
+        select(ToolCall.tool_call_id)
+        .where(
+            ToolCall.agent_run_id == run_id,
+            _run_in_scope(run_id, tenant_id),
+            ToolCall.success.is_(False),
+            ToolCall.error_message.startswith(UNKNOWN_TOOL_PREFIX, autoescape=True),
+        )
+        .limit(MAX_UNKNOWN_TOOL_CALLS + 1)
+    )
+    async with factory() as session:
+        ids = (await session.execute(stmt)).scalars().all()
+    if len(ids) > MAX_UNKNOWN_TOOL_CALLS:
+        return None
+    return frozenset(ids)
 
 
 def check_read_int(

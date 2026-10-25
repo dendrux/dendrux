@@ -70,6 +70,8 @@ from dendrux.runtime._pending import (
 from dendrux.runtime._pending import (
     _PendingReader,
     check_metadata_filter,
+    check_read_bool,
+    check_read_datetime,
     check_read_int,
     check_read_names,
     check_read_scope,
@@ -86,23 +88,28 @@ from dendrux.runtime.state import (
     _Unscoped,
 )
 from dendrux.store._follow import (
-    _PAUSE_VIEW_EVENTS,
+    PAUSE_STATUSES as PAUSE_STATUSES,
+)
+from dendrux.store._follow import (
     EventFeed,
     Follow,
     FollowCapacityError,
     FollowEnd,
     FollowHeartbeat,
     FollowItem,
-    _PauseView,
-    _read_pause_view,
-    _view_with,
     redact_event,
 )
 from dendrux.store._follow import (
-    PAUSE_STATUSES as PAUSE_STATUSES,
-)
-from dendrux.store._follow import (
     approval_calls as approval_calls,
+)
+from dendrux.store._redact import (
+    PAUSE_VIEW_EVENTS,
+    PastParams,
+    PauseView,
+    needs_unknown_calls,
+    read_pause_view,
+    read_unknown_calls,
+    view_with,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
 
@@ -566,7 +573,15 @@ class RunStore:
         keys are restricted to ``[A-Za-z0-9_-]+``, nested paths are not
         supported, and values must be scalars (str, int, float, bool or None).
         """
-        _check_list_filters(tenant_id, status, agent_name, parent_run_id, metadata_filter)
+        _check_list_filters(
+            tenant_id,
+            status,
+            agent_name,
+            parent_run_id,
+            metadata_filter,
+            started_after,
+            started_before,
+        )
         check_read_int("limit", limit, wide=True, optional=False)
         check_read_int("offset", offset, wide=True, optional=False)
         if offset > MAX_LIST_OFFSET:
@@ -596,7 +611,15 @@ class RunStore:
         metadata_filter: dict[str, Any] | None = None,
     ) -> int:
         """Count runs matching the same filters as ``list_runs``."""
-        _check_list_filters(tenant_id, status, agent_name, parent_run_id, metadata_filter)
+        _check_list_filters(
+            tenant_id,
+            status,
+            agent_name,
+            parent_run_id,
+            metadata_filter,
+            started_after,
+            started_before,
+        )
         return await self._state.count_runs(
             tenant_id=tenant_id,
             status=status,
@@ -636,6 +659,7 @@ class RunStore:
         check_read_int("after_sequence_index", after_sequence_index)
         check_read_int("limit", limit, wide=True)
         check_read_names("event_types", event_types)
+        check_read_datetime("before", before)
         rows = await self._scoped_read(
             self._state.get_run_events,
             run_id,
@@ -750,7 +774,7 @@ class RunStore:
         pagination into SQL. ``before`` is an exclusive, timezone-aware
         upper bound on ``created_at``. Empty when the run is outside
         ``tenant_id``."""
-        _check_page(iteration, limit, offset)
+        _check_page(iteration, limit, offset, before)
         rows = await self._scoped_read(
             self._state.get_llm_interactions,
             run_id,
@@ -776,7 +800,7 @@ class RunStore:
         pagination into SQL. ``before`` is an exclusive, timezone-aware
         upper bound on ``created_at``. Empty when the run is outside
         ``tenant_id``."""
-        _check_page(iteration, limit, offset)
+        _check_page(iteration, limit, offset, before)
         rows = await self._scoped_read(
             self._state.get_tool_calls,
             run_id,
@@ -840,6 +864,7 @@ class RunStore:
 
         check_run_id(run_id)
         check_read_scope(tenant_id)
+        check_read_bool("undelivered_only", undelivered_only)
         get_notes = require_store_method(self._state, "get_notes")
         if not isinstance(tenant_id, _Unscoped):
             record = await self._state.get_run(run_id)
@@ -867,13 +892,16 @@ class RunStore:
         *,
         tenant_id: TenantScope = UNSCOPED,
         limit: int = 100,
+        include_payloads: bool = False,
     ) -> list[PausePair]:
         """First bounded pause/resume pairs; use get_pause_page for truncation metadata.
 
-        Payloads are hidden as in :meth:`get_pause_page` with the default
-        ``include_payloads=False`` (``user_input`` is None since 0.5.0).
+        Payloads are hidden as in :meth:`get_pause_page` unless
+        ``include_payloads=True`` (``user_input`` is None by default since 0.5.0).
         """
-        items, _ = await self.get_pause_page(run_id, tenant_id=tenant_id, limit=limit)
+        items, _ = await self.get_pause_page(
+            run_id, tenant_id=tenant_id, limit=limit, include_payloads=include_payloads
+        )
         return items
 
     async def get_pause_page(
@@ -895,6 +923,7 @@ class RunStore:
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("limit must be an int between 1 and 1000.")
+        check_read_bool("include_payloads", include_payloads)
         method = self._state.get_run_events
         kwargs: dict[str, Any] = {}
         builtin = "_pause_page" in inspect.signature(method).parameters
@@ -915,9 +944,10 @@ class RunStore:
         if len(rows) == row_limit and pairs and pairs[-1].resume_sequence_index is None:
             pairs.pop()  # unresolved lookahead is not represented as an active pause
         items = []
-        pause_view = _PauseView(-1, None, {})
+        past = PastParams()
+        pause_view = PauseView(-1, None, {})
         if pairs:
-            pause_view = await _read_pause_view(self, run_id, tenant_id, -1)
+            pause_view = await read_pause_view(self, run_id, tenant_id, -1)
         for pair in pairs[:limit]:
             event = StoredEvent(
                 sequence_index=pair.pause_sequence_index,
@@ -927,13 +957,14 @@ class RunStore:
                 created_at=pair.pause_at,
                 data={"status": pair.reason, "pending_tool_calls": pair.pending_tool_calls},
             )
-            view = await _view_with(
+            view = await view_with(
                 self,
                 run_id,
                 event,
                 pause_view,
                 tenant_id=tenant_id,
                 include_payloads=include_payloads,
+                past=past,
             )
             items.append(_pair_view(pair, view, include_payloads))
         return items, truncated
@@ -1015,11 +1046,21 @@ class RunStore:
         tenant_id: TenantScope = UNSCOPED,
         include_payloads: bool = False,
     ) -> StoredEvent:
-        view = _PauseView(event.sequence_index, None, {})
-        if event.event_type in _PAUSE_VIEW_EVENTS:
-            view = await _read_pause_view(self, run_id, tenant_id, event.sequence_index)
-        return await _view_with(
-            self, run_id, event, view, tenant_id=tenant_id, include_payloads=include_payloads
+        view = PauseView(event.sequence_index, None, {})
+        if event.event_type in PAUSE_VIEW_EVENTS:
+            view = await read_pause_view(self, run_id, tenant_id, event.sequence_index)
+        unknown = None
+        if needs_unknown_calls(event, include_payloads):
+            unknown = await read_unknown_calls(self, run_id, tenant_id)
+        return await view_with(
+            self,
+            run_id,
+            event,
+            view,
+            tenant_id=tenant_id,
+            include_payloads=include_payloads,
+            past=PastParams(),
+            unknown_calls=unknown,
         )
 
     async def get_event_view(
@@ -1035,6 +1076,7 @@ class RunStore:
         For the active approval or input pause, missing model-sent arguments
         are hidden even when the stored execution arguments contain real values.
         """
+        check_read_bool("include_payloads", include_payloads)
         if await self._status(run_id, tenant_id) is None:
             raise RunNotFoundError(run_id)
         return await self._event_view(
@@ -1090,9 +1132,13 @@ def _check_list_filters(
     agent_name: object,
     parent_run_id: object,
     metadata_filter: object,
+    started_after: object,
+    started_before: object,
 ) -> None:
     """Validate ``list_runs`` / ``count_runs`` filters before any query."""
     check_read_scope(tenant_id)
+    check_read_datetime("started_after", started_after)
+    check_read_datetime("started_before", started_before)
     check_read_names("status", status, allow_str=True)
     if agent_name is not None:
         check_read_text("agent_name", agent_name)
@@ -1101,7 +1147,8 @@ def _check_list_filters(
     check_metadata_filter(metadata_filter)
 
 
-def _check_page(iteration: object, limit: object, offset: object) -> None:
+def _check_page(iteration: object, limit: object, offset: object, before: object = None) -> None:
+    check_read_datetime("before", before)
     check_read_int("iteration", iteration)
     check_read_int("limit", limit, wide=True)
     check_read_int("offset", offset, wide=True, optional=False)
