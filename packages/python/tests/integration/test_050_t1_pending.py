@@ -219,8 +219,8 @@ async def test_many_followers_one_poller(store: Any, run_store: RunStore, monkey
     slots_ready, registered, polled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_acquire, original_add = feed._acquire, _follow._RunFeed.add
 
-    def acquire():
-        original_acquire()
+    def acquire(*args: Any):
+        original_acquire(*args)
         if feed.followers == n_followers:
             slots_ready.set()
 

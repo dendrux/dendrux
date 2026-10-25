@@ -256,3 +256,35 @@ async def test_event_view_and_pause_page_hide_free_text(state: Any, engine: Any)
     assert pairs[0].user_input is None
     trusted, _ = await store.get_pause_page("r1", tenant_id="T", include_payloads=True)
     assert trusted[0].user_input == SECRET
+
+
+async def test_live_pause_change_refreshes_the_shared_view(state: Any, engine: Any) -> None:
+    """A follower that cached the old pause still shows the new active request."""
+    import asyncio
+
+    await _write_history(state, active=True)
+    store = RunStore.from_engine(engine)
+    feed = EventFeed(store, poll_interval_s=0.01, poll_max_s=0.02, status_every=1, heartbeat_s=5)
+    async with feed.follow("r1", tenant_id="T", max_duration_s=5.0) as f:
+        backfill = [await asyncio.wait_for(anext(f), 5) for _ in range(6)]
+        assert backfill[4].data["params"] == {"q": "now"}  # active request (c2)
+        await state.save_run_event("r1", event_type="run.resumed", data={})
+        await state.save_run_event(
+            "r1",
+            event_type="approval.requested",
+            data={"tool_name": "sql", "call_id": "c3", "params": {"q": "live"}},
+        )
+        await state.save_run_event(
+            "r1",
+            event_type="run.paused",
+            data={
+                "status": "waiting_approval",
+                "pending_tool_calls": [{"id": "c3", "name": "sql", "params": {"q": 3}}],
+            },
+        )
+        live = [await asyncio.wait_for(anext(f), 5) for _ in range(3)]
+    await feed.aclose()
+    assert live[1].event_type == "approval.requested"
+    # The request is committed before its pause: shown once the pause is active.
+    assert live[1].data.get("params") in (None, {"q": "live"})
+    assert live[2].data["pending_tool_calls"][0]["params"] == {"q": "live"}

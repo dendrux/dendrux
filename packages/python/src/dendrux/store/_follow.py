@@ -31,6 +31,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 
+from dendrux._sentinel import _UnsetType
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime.state import _check_scope
@@ -55,21 +56,31 @@ _HIDDEN_EVENT_KEYS = frozenset(
     {"system_prompt", "provider_request", "provider_response", "pii_mapping"}
 )
 
+_DEFAULT_SHARE = _UnsetType()
+
 FollowEndReason = Literal["terminal", "max_duration", "lagging", "error"]
 
 
 class FollowCapacityError(RuntimeError):
-    """The :class:`EventFeed` already serves ``max_followers`` followers.
+    """The :class:`EventFeed` already serves ``max_followers`` followers, or
+    this tenant already holds ``max_followers_per_tenant`` of them.
 
-    Map it to HTTP 503 (retry shortly). ``limit`` is the cap.
+    Map it to HTTP 503 (retry shortly). ``limit`` is the cap that was hit;
+    ``per_tenant`` is True when it was the per-tenant cap.
     """
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, per_tenant: bool = False) -> None:
         self.limit = limit
-        super().__init__(f"This event feed already serves its maximum of {limit} followers.")
+        self.per_tenant = per_tenant
+        scope = "followers for one tenant" if per_tenant else "followers"
+        super().__init__(f"This event feed already serves its maximum of {limit} {scope}.")
 
-    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
-        return (type(self), (self.limit,))
+    def __reduce__(self) -> Any:
+        return (_capacity_error, (self.limit, self.per_tenant))
+
+
+def _capacity_error(limit: int, per_tenant: bool) -> FollowCapacityError:
+    return FollowCapacityError(limit, per_tenant=per_tenant)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +200,17 @@ def _without_keys(item: Any, keys: tuple[str, ...]) -> Any:
 
 # Event types whose view depends on the run's active pause.
 _PAUSE_VIEW_EVENTS = frozenset({"run.paused", "approval.requested"})
+# Event types after which a cached view of the active pause may be out of date.
+_PAUSE_CHANGING_EVENTS = _PAUSE_VIEW_EVENTS | {
+    "run.resumed",
+    "run.completed",
+    "run.error",
+    "run.cancelled",
+    "run.interrupted",
+    "run.abandoned",
+}
+# Past pauses' recorded arguments kept per watched run (include_payloads readers).
+_PAST_PARAMS_CACHE = 256
 
 
 @dataclass(slots=True)
@@ -203,6 +225,7 @@ class _PauseView:
     through: int
     active: int | None
     active_params: dict[str, dict[str, Any]]
+    past_params: dict[int, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
 
 async def _read_pause_view(
@@ -239,9 +262,11 @@ async def _view_with(
     active = seq == view.active
     params = None
     if (include_payloads or active) and data.get("status") in _PLACEHOLDER_PAUSES:
-        params = (
-            view.active_params if active else await store._approval_params(run_id, seq, tenant_id)
-        )
+        params = view.active_params if active else view.past_params.get(seq)
+        if params is None:  # a past pause's recorded arguments never change
+            params = await store._approval_params(run_id, seq, tenant_id)
+            if len(view.past_params) < _PAST_PARAMS_CACHE:
+                view.past_params[seq] = params
     return redact_event(
         event, include_payloads=include_payloads, active_pause=active, approval_params=params
     )
@@ -288,6 +313,44 @@ class _RunFeed:
         self.terminal = False
         self.closing = False
         self.task: asyncio.Task[None] | None = None
+        self._view: _PauseView | None = None
+        self._view_generation = 0
+        self._view_lock = asyncio.Lock()
+
+    def _observe(self, event: StoredEvent) -> None:
+        """Drop the cached pause view when a newer event may have changed the pause."""
+        view = self._view
+        if (
+            view is not None
+            and event.sequence_index > view.through
+            and event.event_type in _PAUSE_CHANGING_EVENTS
+        ):
+            self._view = None
+            self._view_generation += 1
+
+    async def pause_view(self, seq: int, tenant_id: TenantScope) -> _PauseView:
+        """The run's active pause for viewing event ``seq``, read once for every follower.
+
+        A cached view answers for events up to its ``through`` index; a newer
+        pause-changing event (published by the poller, or met by a follower
+        ahead of it) triggers one fresh read. Every follower here passed the
+        run's tenant scope, so one scoped read serves them all.
+        """
+        view = self._view
+        if view is not None and seq <= view.through:
+            return view
+        async with self._view_lock:
+            view = self._view
+            if view is not None and seq <= view.through:
+                return view
+            generation = self._view_generation
+            through = max(seq, self.head if self.head is not None else -1)
+            fresh = await _read_pause_view(self.owner.store, self.run_id, tenant_id, through)
+            if view is not None:
+                fresh.past_params = view.past_params
+            if generation == self._view_generation:
+                self._view = fresh
+            return fresh
 
     def add(self, follower: _Follower) -> int | None:
         """Register ``follower``; return the head it must catch up to from the database."""
@@ -323,6 +386,7 @@ class _RunFeed:
 
     def _publish(self, events: list[StoredEvent]) -> None:
         for event in events:
+            self._observe(event)
             for follower in list(self.followers):
                 follower.push(event)
             self.head = event.sequence_index
@@ -395,6 +459,11 @@ class EventFeed:
         store: The :class:`RunStore` to read from.
         max_followers: Most concurrent followers; :meth:`Follow.start`
             raises :class:`FollowCapacityError` beyond it.
+        max_followers_per_tenant: Most concurrent followers for one tenant
+            (a string ``tenant_id``), so one tenant cannot take every slot.
+            Defaults to a fifth of ``max_followers`` (100 of 500), at least 1;
+            ``None`` turns it off. Untenanted (``None``) and ``UNSCOPED``
+            followers are not one tenant and share only ``max_followers``.
         poll_interval_s / poll_max_s: idle polling starts at the first and
             doubles up to the second; a new event resets it.
         heartbeat_s: idle time before a :class:`FollowHeartbeat` is yielded.
@@ -406,6 +475,7 @@ class EventFeed:
         store: RunStore,
         *,
         max_followers: int = 500,
+        max_followers_per_tenant: int | None | _UnsetType = _DEFAULT_SHARE,
         poll_interval_s: float = 0.5,
         poll_max_s: float = 2.0,
         heartbeat_s: float = 15.0,
@@ -418,10 +488,19 @@ class EventFeed:
             raise ValueError("max_followers must be a positive int.")
         if max_followers <= 0 or buffer <= 0 or status_every <= 0 or batch <= 0:
             raise ValueError("max_followers, buffer, status_every and batch must be positive.")
+        if isinstance(max_followers_per_tenant, _UnsetType):
+            max_followers_per_tenant = max(1, max_followers // 5)
+        elif max_followers_per_tenant is not None and (
+            isinstance(max_followers_per_tenant, bool)
+            or not isinstance(max_followers_per_tenant, int)
+            or max_followers_per_tenant <= 0
+        ):
+            raise ValueError("max_followers_per_tenant must be a positive int or None.")
         if not 0 < poll_interval_s <= poll_max_s or heartbeat_s <= 0:
             raise ValueError("poll intervals and heartbeat_s must be positive (interval <= max).")
         self.store = store
         self.max_followers = max_followers
+        self.max_followers_per_tenant: int | None = max_followers_per_tenant
         self.poll_interval_s = poll_interval_s
         self.poll_max_s = poll_max_s
         self.heartbeat_s = heartbeat_s
@@ -431,6 +510,7 @@ class EventFeed:
         self.stop_timeout_s = stop_timeout_s
         self._closed = False
         self._open = 0
+        self._by_tenant: dict[str, int] = {}
         self._feeds: dict[str, _RunFeed] = {}
 
     @property
@@ -485,7 +565,7 @@ class EventFeed:
             max_duration_s=max_duration_s,
         )
 
-    def _acquire(self) -> None:
+    def _acquire(self, tenant_id: TenantScope) -> None:
         if self._closed:
             raise RuntimeError("This event feed is closed.")
         closing = sum(f.closing for f in self._feeds.values())
@@ -496,10 +576,27 @@ class EventFeed:
                 extra={"code": "follow_capacity"},
             )
             raise FollowCapacityError(self.max_followers)
+        cap = self.max_followers_per_tenant
+        if isinstance(tenant_id, str) and cap is not None:
+            if self._by_tenant.get(tenant_id, 0) >= cap:
+                # The tenant id is caller data: never logged.
+                logger.warning(
+                    "per-tenant follower limit reached: code=follow_tenant_capacity limit=%d",
+                    cap,
+                    extra={"code": "follow_tenant_capacity"},
+                )
+                raise FollowCapacityError(cap, per_tenant=True)
+            self._by_tenant[tenant_id] = self._by_tenant.get(tenant_id, 0) + 1
         self._open += 1
 
-    def _release(self) -> None:
+    def _release(self, tenant_id: TenantScope) -> None:
         self._open = max(0, self._open - 1)
+        if isinstance(tenant_id, str) and tenant_id in self._by_tenant:
+            held = self._by_tenant[tenant_id] - 1
+            if held > 0:
+                self._by_tenant[tenant_id] = held
+            else:
+                del self._by_tenant[tenant_id]
 
     def _drop(self, feed: _RunFeed) -> None:
         if self._feeds.get(feed.run_id) is feed:
@@ -605,7 +702,7 @@ class Follow:
             )
             self.drained_terminal = not pending
         await self._owner._wait_for_closing(self.run_id)
-        self._owner._acquire()
+        self._owner._acquire(self._tenant_id)
         self._holds_slot = True
         self._started = True
         if self._max_duration_s is not None:
@@ -626,7 +723,7 @@ class Follow:
     def _release(self) -> None:
         if self._holds_slot:
             self._holds_slot = False
-            self._owner._release()
+            self._owner._release(self._tenant_id)
 
     def __del__(self) -> None:
         self._release()
@@ -662,9 +759,16 @@ class Follow:
         await self.aclose()
 
     async def _view(self, event: StoredEvent) -> StoredEvent:
-        return await self._owner.store._event_view(
+        if event.event_type not in _PAUSE_VIEW_EVENTS:
+            return redact_event(event, include_payloads=self._include_payloads)
+        feed = self._feed
+        assert feed is not None  # set before the first event is delivered
+        view = await feed.pause_view(event.sequence_index, self._tenant_id)
+        return await _view_with(
+            self._owner.store,
             self.run_id,
             event,
+            view,
             tenant_id=self._tenant_id,
             include_payloads=self._include_payloads,
         )
