@@ -51,7 +51,7 @@ class TestRedactFreeText:
         )
         shown = redact_event(ev).data
         assert "params" not in shown
-        assert shown == {"tool_name": "sql", "reason": "requires_approval"}
+        assert shown == {"tool_name": "<unknown_tool>", "reason": "requires_approval"}
         assert redact_event(ev, active_pause=True).data["params"] == {"q": SECRET}
         assert redact_event(ev, include_payloads=True).data["params"] == {"q": SECRET}
 

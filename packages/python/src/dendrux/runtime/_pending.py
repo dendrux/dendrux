@@ -392,6 +392,33 @@ async def declared_tool_names(
     return frozenset(names)
 
 
+async def pause_window_start(
+    state: Any, run_id: str, pause_seq: int, tenant_id: TenantScope
+) -> int | None:
+    """Index of the boundary before the pause at ``pause_seq``: the last earlier
+    ``run.paused``, ``run.resumed`` or terminal event (-1 when none). Events
+    after it and before ``pause_seq`` belong to that pause. One indexed read;
+    None when it cannot be known (a custom store)."""
+    factory = getattr(state, "_session_factory", None)
+    if factory is None:
+        return None
+    from sqlalchemy import func, select
+
+    from dendrux.db.models import RunEvent
+    from dendrux.runtime.state import _run_in_scope
+
+    stmt = select(func.coalesce(func.max(RunEvent.sequence_index), -1)).where(
+        RunEvent.agent_run_id == run_id,
+        _run_in_scope(run_id, tenant_id),
+        RunEvent.event_type.in_(
+            ["run.paused", "run.resumed", "run.completed", "run.error", "run.cancelled"]
+        ),
+        RunEvent.sequence_index < pause_seq,
+    )
+    async with factory() as session:
+        return int((await session.execute(stmt)).scalar_one())
+
+
 def _is_postgres_store(state: Any) -> bool:
     engine = getattr(state, "_engine", None)
     dialect = getattr(getattr(engine, "dialect", None), "name", None)

@@ -108,11 +108,12 @@ from dendrux.store._redact import (
     PauseView,
     data_of,
     needs_declared_tools,
+    needs_mcp_tools,
     needs_unknown_calls,
     read_declared_tools,
+    read_mcp_tools,
     read_pause_view,
     read_unknown_calls,
-    redacted_submitted,
     view_with,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
@@ -950,8 +951,11 @@ class RunStore:
         items = []
         past = PastParams()
         pause_view = PauseView(-1, None, {})
+        mcp = None
         if pairs:
             pause_view = await read_pause_view(self, run_id, tenant_id, -1)
+            if not include_payloads:
+                mcp = await read_mcp_tools(self, run_id, tenant_id)
         for pair in pairs[:limit]:
             event = StoredEvent(
                 sequence_index=pair.pause_sequence_index,
@@ -969,8 +973,23 @@ class RunStore:
                 tenant_id=tenant_id,
                 include_payloads=include_payloads,
                 past=past,
+                mcp_tools=mcp,
             )
-            items.append(_pair_view(pair, view, include_payloads))
+            resumed = await view_with(
+                self,
+                run_id,
+                dataclasses.replace(
+                    event,
+                    event_type="run.resumed",
+                    data={"submitted_results": pair.submitted_results},
+                ),
+                pause_view,
+                tenant_id=tenant_id,
+                include_payloads=include_payloads,
+                past=past,
+                mcp_tools=mcp,
+            )
+            items.append(_pair_view(pair, view, resumed, include_payloads))
         return items, truncated
 
     async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
@@ -1053,11 +1072,13 @@ class RunStore:
         view = PauseView(event.sequence_index, None, {})
         if event.event_type in PAUSE_VIEW_EVENTS:
             view = await read_pause_view(self, run_id, tenant_id, event.sequence_index)
-        unknown = declared = None
+        unknown = declared = mcp = None
         if needs_unknown_calls(event, include_payloads):
             unknown = await read_unknown_calls(self, run_id, tenant_id)
         if needs_declared_tools(event, include_payloads):
             declared = await read_declared_tools(self, run_id, tenant_id)
+        if needs_mcp_tools(event, include_payloads):
+            mcp = await read_mcp_tools(self, run_id, tenant_id)
         return await view_with(
             self,
             run_id,
@@ -1068,6 +1089,7 @@ class RunStore:
             past=PastParams(),
             unknown_calls=unknown,
             declared_tools=declared,
+            mcp_tools=mcp,
         )
 
     async def get_event_view(
@@ -1125,15 +1147,18 @@ def _image_digest(sha256: object) -> str:
     raise BlobNotFoundError(image_id(""))
 
 
-def _pair_view(pair: PausePair, view: StoredEvent, include_payloads: bool) -> PausePair:
-    """``pair`` with its redacted pending calls; a person's answer only with payloads."""
+def _pair_view(
+    pair: PausePair, view: StoredEvent, resumed: StoredEvent, include_payloads: bool
+) -> PausePair:
+    """``pair`` with its redacted pending calls and results; a person's answer
+    only with payloads."""
     shown = data_of(view).get("pending_tool_calls", [])
     if include_payloads:
         return dataclasses.replace(pair, pending_tool_calls=shown)
     return dataclasses.replace(
         pair,
         pending_tool_calls=shown,
-        submitted_results=redacted_submitted(pair.submitted_results),
+        submitted_results=data_of(resumed).get("submitted_results", []),
         user_input=None,
     )
 

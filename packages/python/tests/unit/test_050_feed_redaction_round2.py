@@ -120,7 +120,7 @@ def test_dendrux_fields_survive() -> None:
 def test_tool_codes_are_enumerated(code: Any, shown: str) -> None:
     data = _shown("tool.completed", {"tool_name": "t", "success": True, "code": code})
     assert data["code"] == shown
-    assert data["tool_name"] == "t"
+    assert data["tool_name"] == "<unknown_tool>"  # standalone: no MCP evidence
 
 
 @pytest.mark.parametrize("bad", [["bad"], "text", 5, True])

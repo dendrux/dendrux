@@ -36,6 +36,7 @@ from dendrux.runtime._pending import (
     approval_calls,
     check_read_bool,
     declared_tool_names,
+    pause_window_start,
     unknown_tool_calls,
 )
 from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
@@ -54,6 +55,13 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import TenantScope
     from dendrux.store import StoredEvent
 
+MCP_TOOL = "<mcp_tool>"
+"""Shown instead of a tool name an MCP server supplied."""
+CUSTOM_PROVIDER = "<custom_provider>"
+"""Shown instead of a provider label that is not one of Dendrux's built-in adapters."""
+BUILTIN_PROVIDERS = frozenset({"anthropic", "openai", "openai_responses", "openrouter"})
+"""Provider labels Dendrux's own adapters set (``llm/anthropic.py``, ``openai.py``,
+``openai_responses.py``, ``openrouter.py``); a test keeps it in step with them."""
 UNKNOWN_TOOL = "<unknown_tool>"
 """Shown instead of a tool name the model invented (a call rejected as unknown)."""
 UNKNOWN_SKILL = "<unknown_skill>"
@@ -127,6 +135,7 @@ class _Context:
     active: bool
     unknown_calls: frozenset[str] | None
     declared_tools: frozenset[str] | None = None
+    mcp_tools: frozenset[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +267,13 @@ def _obj(schema: dict[str, Check]) -> Check:
     return lambda value: _apply(schema, value) if isinstance(value, dict) else _HIDE
 
 
+def _provider(value: Any) -> Any:
+    """A provider label: Dendrux's built-in adapters by name, any other as CUSTOM_PROVIDER."""
+    if value is None:
+        return None
+    return value if is_one_of(value, BUILTIN_PROVIDERS) else CUSTOM_PROVIDER
+
+
 def _kind(value: Any) -> str:
     return value if is_one_of(value, BUILTIN_GUARDRAIL_KINDS) else CUSTOM_KIND
 
@@ -298,7 +314,7 @@ _ERROR_INFO = _obj(
         "category": _enum(PROVIDER_ERROR_CATEGORIES),
         "retryable": _bool,
         "error_type": _enum(PROVIDER_ERROR_TYPES),
-        "provider": _declared,  # the adapter's provider name (approved, round 2)
+        "provider": _provider,  # a built-in adapter's label, else CUSTOM_PROVIDER
         "status_code": _num,
         "timeout_reason": _enum(TIMEOUT_REASONS),
         # hidden: safe_message (embeds provider_code), model, provider_code
@@ -476,7 +492,6 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "source_name": _declared,
         "namespace": _declared,
         "tool_count": _num,
-        "tool_names": _list(_declared),
     },
     "mcp.error": {
         "source_name": _declared,
@@ -531,7 +546,7 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "image_id": _generated_id,
         "sha256": _digest,
         "tenant_scope": _declared,
-        "provider": _declared,
+        "provider": _provider,
         "status_code": _num,
         "located": _bool,
         "retried": _bool,
@@ -572,9 +587,9 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
         for call, original in zip(
             shown.get("pending_tool_calls", []), _dicts(raw.get("pending_tool_calls")), strict=False
         ):
-            call.update({k: original[k] for k in ("id", "params") if k in original})
+            call.update({k: original[k] for k in ("id", "name", "params") if k in original})
     elif kind == "approval.requested" and ctx.active:
-        shown.update({k: raw[k] for k in ("call_id", "params") if k in raw})
+        shown.update({k: raw[k] for k in ("call_id", "tool_name", "params") if k in raw})
     elif kind == "image.state":
         for verdict in shown.get("guardrail_verdicts", []):
             name = verdict.get("tool_name")
@@ -597,6 +612,45 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
         for item in shown.get("skipped", []):
             if item.get("reason") != "unknown_tool":  # only then the developer's name
                 item.pop("tool", None)
+    if kind in TOOL_NAME_EVENTS:
+        _verify_tool_names(kind, shown, ctx)
+
+
+# Events that name tools, and where. An MCP server can supply a tool's name, so a
+# redacted reader sees a name only when the run's ``mcp.connected`` events show
+# it is not an MCP tool; without that evidence every name is hidden.
+_TOOL_NAME_PATHS: dict[str, tuple[str | None, str]] = {
+    "tool.completed": (None, "tool_name"),
+    "approval.requested": (None, "tool_name"),
+    "policy.denied": (None, "tool_name"),
+    "policy.substituted": (None, "tool_name"),
+    "policy.hook_error": (None, "tool_name"),
+    "policy.hook_warning": (None, "tool_name"),
+    "guardrail.restore_skipped": (None, "tool_name"),
+    "approval.decided": ("decisions", "tool_name"),
+    "run.paused": ("pending_tool_calls", "name"),
+    "run.resumed": ("submitted_results", "name"),
+    "image.state": ("guardrail_verdicts", "tool_name"),
+}
+TOOL_NAME_EVENTS = frozenset(_TOOL_NAME_PATHS)
+
+
+def _shown_tool_name(name: Any, ctx: _Context) -> Any:
+    if not isinstance(name, str) or name in (UNKNOWN_TOOL, MCP_TOOL):
+        return name
+    if ctx.mcp_tools is None:
+        return UNKNOWN_TOOL  # no evidence about the run's MCP tools: fail closed
+    return MCP_TOOL if name in ctx.mcp_tools else name
+
+
+def _verify_tool_names(kind: str, shown: dict[str, Any], ctx: _Context) -> None:
+    container, key = _TOOL_NAME_PATHS[kind]
+    if ctx.active and kind in ("run.paused", "approval.requested"):
+        return  # the active pause's names, which a client acts on (B2)
+    items = [shown] if container is None else shown.get(container, [])
+    for item in items:
+        if key in item:
+            item[key] = _shown_tool_name(item[key], ctx)
 
 
 def _unknown_tool(data: dict[str, Any], event: StoredEvent, ctx: _Context) -> bool:
@@ -624,12 +678,6 @@ def _without_call_correlation(event: StoredEvent, active: bool) -> StoredEvent:
     if keep or event.correlation_id is None:
         return event
     return dataclasses.replace(event, correlation_id=None)
-
-
-def redacted_submitted(results: Any) -> list[Any]:
-    """``run.resumed.submitted_results`` as a redacted reader sees them."""
-    shown = _SCHEMAS["run.resumed"]["submitted_results"](results)
-    return [] if shown is _HIDE else list(shown)
 
 
 REVIEWED_EVENT_TYPES: frozenset[str] = frozenset(_SCHEMAS)
@@ -694,6 +742,7 @@ def _redact(
     approval_params: Mapping[str, dict[str, Any]] | None,
     unknown_calls: frozenset[str] | None,
     declared_tools: frozenset[str] | None = None,
+    mcp_tools: frozenset[str] | None = None,
 ) -> StoredEvent:
     if include_payloads is True:
         return _trusted(event, approval_params)
@@ -706,7 +755,10 @@ def _redact(
         return shown_event
     data = _with_recorded_args(event, approval_params)
     context = _Context(
-        active=active_pause is True, unknown_calls=unknown_calls, declared_tools=declared_tools
+        active=active_pause is True,
+        unknown_calls=unknown_calls,
+        declared_tools=declared_tools,
+        mcp_tools=mcp_tools,
     )
     shown = _apply(schema, data)
     _special(event, data, shown, context)  # the original event: its ids are evidence
@@ -769,15 +821,20 @@ class PauseView:
     through: int
     active: int | None
     active_params: dict[str, dict[str, Any]]
+    window_start: int | None = None
+    """The boundary before the active pause; its events lie after it. None: unknown."""
 
 
 async def read_pause_view(
     store: Any, run_id: str, tenant_id: TenantScope, through: int
 ) -> PauseView:
-    """Two bounded reads: the active pause's index, then its recorded arguments."""
+    """Bounded reads: the active pause's index, its recorded arguments and window start."""
     active = await store._active_pause_sequence(run_id, tenant_id)
-    params = {} if active is None else await store._approval_params(run_id, active, tenant_id)
-    return PauseView(through, active, params)
+    if active is None:
+        return PauseView(through, None, {})
+    params = await store._approval_params(run_id, active, tenant_id)
+    start = await pause_window_start(getattr(store, "_state", None), run_id, active, tenant_id)
+    return PauseView(through, active, params, start)
 
 
 @dataclass(slots=True)
@@ -844,6 +901,7 @@ async def view_with(
     past: PastParams,
     unknown_calls: frozenset[str] | None = None,
     declared_tools: frozenset[str] | None = None,
+    mcp_tools: frozenset[str] | None = None,
 ) -> StoredEvent:
     """``event`` as a reader sees it, given the run's active pause ``view``."""
     data = data_of(event)
@@ -851,12 +909,12 @@ async def view_with(
     active = False
     params = None
     if event.event_type == "approval.requested":
-        call_id = data.get("call_id")
+        # Inside the active pause's own event window, never by call id (a
+        # custom provider may reuse one across pauses).
         active = (
             view.active is not None
-            and seq < view.active
-            and isinstance(call_id, str)
-            and call_id in view.active_params
+            and view.window_start is not None
+            and view.window_start < seq < view.active
         )
     elif event.event_type == "run.paused":
         active = seq == view.active
@@ -869,7 +927,29 @@ async def view_with(
         approval_params=params,
         unknown_calls=unknown_calls,
         declared_tools=declared_tools,
+        mcp_tools=mcp_tools,
     )
+
+
+def needs_mcp_tools(event: StoredEvent, include_payloads: bool) -> bool:
+    """A redacted event that names tools: the run's MCP tool names decide what shows."""
+    return not include_payloads and event.event_type in TOOL_NAME_EVENTS
+
+
+async def read_mcp_tools(store: Any, run_id: str, tenant_id: TenantScope) -> frozenset[str] | None:
+    """Exposed MCP tool names from the run's ``mcp.connected`` events (one page
+    of at most 1000; None when the page overflows)."""
+    rows = await store.get_events(
+        run_id, event_types=["mcp.connected"], limit=_PAGE, tenant_id=tenant_id
+    )
+    if len(rows) >= _PAGE:
+        return None
+    names: set[str] = set()
+    for row in rows:
+        listed = data_of(row).get("tool_names")
+        if isinstance(listed, list):
+            names.update(n for n in listed if isinstance(n, str))
+    return frozenset(names)
 
 
 def needs_declared_tools(event: StoredEvent, include_payloads: bool) -> bool:
