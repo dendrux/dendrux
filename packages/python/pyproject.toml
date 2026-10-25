@@ -186,6 +186,9 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "serial_probe: a Postgres statistics probe whose result depends on server load; the gate runs it alone after the parallel pass (see Makefile and CI)",
+]
 
 [tool.coverage.run]
 omit = [

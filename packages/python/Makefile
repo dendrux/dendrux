@@ -1,7 +1,10 @@
 .PHONY: test lint typecheck arch crap api-check format package-smoke ci clean
 
+# Load-sensitive probes (marked serial_probe) run alone after the parallel pass; their
+# coverage is appended so coverage.json describes the whole suite.
 test:
-	pytest tests/ -v -n auto --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
+	pytest tests/ -v -n auto -m "not serial_probe" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
+	pytest tests/ -v -n 0 -m serial_probe --cov=src/dendrux --cov-append --cov-report=json:coverage.json
 	python tools/crap_ratchet.py stamp --coverage coverage.json
 
 lint:

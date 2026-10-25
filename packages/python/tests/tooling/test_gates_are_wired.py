@@ -83,3 +83,22 @@ def test_make_ci_runs_every_gate() -> None:
     for target in ("lint", "typecheck", "arch", "test", "crap", "api-check"):
         assert target in ci_line.split(), f"make ci does not run {target}"
     assert "-n auto" in makefile
+
+
+def test_load_sensitive_probes_run_serially_after_the_parallel_pass() -> None:
+    """The HOT statistics probe measures page pruning, which depends on how many sessions
+    share the server; under `-n auto` it failed in half the full runs and never alone."""
+    pyproject = tomllib.loads((PKG / "pyproject.toml").read_text())
+    markers = pyproject["tool"]["pytest"]["ini_options"].get("markers", [])
+    assert any(m.startswith("serial_probe:") for m in markers)
+    probe = (PKG / "tests/integration/test_050_t7b_fix2.py").read_text()
+    assert "@pytest.mark.serial_probe\nasync def test_hot_updates_recover" in probe
+
+    makefile = (PKG / "Makefile").read_text()
+    recipe = makefile.split("\ntest:", 1)[1].split("\n\n", 1)[0]
+    ci_test = _steps("python")["Test"]["run"]
+    for text in (recipe, ci_test):
+        assert '-m "not serial_probe"' in text
+        assert "-m serial_probe" in text
+        assert "--cov-append" in text
+        assert text.index('-m "not serial_probe"') < text.index("-m serial_probe")

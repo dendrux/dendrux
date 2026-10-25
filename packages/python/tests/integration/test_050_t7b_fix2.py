@@ -217,6 +217,7 @@ async def test_status_migration_backfills_and_repairs_interrupted_index(engine, 
             assert (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one() == 2
 
 
+@pytest.mark.serial_probe
 async def test_hot_updates_recover_with_four_tools_per_run(store, engine, record_property):
     import asyncio
     import json
