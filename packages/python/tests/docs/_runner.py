@@ -87,6 +87,29 @@ def checked_provider_mock(real: type, forwards_to: type | None = None) -> type[D
     return _Checked
 
 
+def _stub(value: Any) -> Any:
+    def stub(*_args: Any, **_kwargs: Any) -> Any:
+        return value() if callable(value) else value
+
+    stub.docs_sandbox_stub = True  # type: ignore[attr-defined]
+    return stub
+
+
+def dotenv_stubs() -> list[tuple[Any, str, Any]]:
+    """(module, attribute, stub) so no snippet can search for or read a ``.env`` file.
+
+    python-dotenv walks up from the caller's directory to the first ``.env`` it finds, which
+    a scratch working directory does not prevent. Returns nothing when it is not installed.
+    """
+    try:
+        import dotenv
+        import dotenv.main
+    except ImportError:
+        return []
+    stubs = {"load_dotenv": _stub(False), "find_dotenv": _stub(""), "dotenv_values": _stub(dict)}
+    return [(module, name, stubs[name]) for module in (dotenv, dotenv.main) for name in stubs]
+
+
 def provider_mocks() -> list[tuple[Any, str, type]]:
     """(module, attribute, mock) for every provider class the docs construct."""
     import dendrux.llm.anthropic as anthropic

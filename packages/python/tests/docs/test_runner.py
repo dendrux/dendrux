@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 from tests.docs._runner import DocsProvider, run_page
 from tests.docs._snippets import Snippet
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _s(code: str, line: int = 1, skip: str | None = None) -> Snippet:
@@ -128,3 +133,69 @@ class TestProviderMocksCheckTheRealConstructor:
             "assert p.model == 'gpt-x'\n"
         )
         assert self._run(code) == []
+
+
+class TestSandboxNeverReadsDotenv:
+    """`load_dotenv()` walks up from the caller to a real `.env`; the sandbox must stop that."""
+
+    def test_the_dotenv_functions_are_stubbed(self, docs_sandbox: None) -> None:
+        import dotenv
+        import dotenv.main
+
+        for module in (dotenv, dotenv.main):
+            for name in ("load_dotenv", "find_dotenv", "dotenv_values"):
+                assert getattr(getattr(module, name), "docs_sandbox_stub", False), (module, name)
+
+    def test_running_the_dotenv_snippet_opens_and_searches_no_env_file(
+        self, docs_sandbox: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+        import io
+        import os
+
+        touched: list[str] = []
+        real_open, real_io_open, real_isfile = builtins.open, io.open, os.path.isfile
+
+        def spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if ".env" in str(file):
+                touched.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        def spy_io_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if ".env" in str(file):
+                touched.append(str(file))
+            return real_io_open(file, *args, **kwargs)
+
+        def spy_isfile(path: Any) -> bool:
+            if ".env" in str(path):
+                touched.append(str(path))
+            return real_isfile(path)
+
+        monkeypatch.setattr(builtins, "open", spy_open)
+        monkeypatch.setattr(io, "open", spy_io_open)
+        monkeypatch.setattr(os.path, "isfile", spy_isfile)
+        code = (
+            "from dotenv import dotenv_values, find_dotenv, load_dotenv\n"
+            "assert load_dotenv() is False\n"
+            "assert find_dotenv() == ''\n"
+            "assert dotenv_values() == {}\n"
+        )
+        assert self._run(code) == []
+        assert touched == []
+
+    def _run(self, code: str) -> list[str]:
+        return run_page([_s(code)])
+
+    def test_the_quickstart_dotenv_block_runs_through_the_stub(self, docs_sandbox: None) -> None:
+        from pathlib import Path
+
+        from tests.docs._snippets import extract_snippets
+
+        repo = Path(__file__).resolve().parents[4]
+        blocks = [
+            s
+            for s in extract_snippets(repo / "docs" / "quickstart.mdx", repo)
+            if "load_dotenv" in s.code
+        ]
+        assert blocks and blocks[0].skip_reason is None
+        assert run_page(blocks) == []

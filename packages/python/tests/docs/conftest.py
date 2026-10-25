@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.docs._runner import provider_mocks
+from tests.docs._runner import dotenv_stubs, provider_mocks
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,6 +25,10 @@ def docs_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.setenv(var, "docs-test-key")
     monkeypatch.delenv("DENDRUX_DATABASE_URL", raising=False)
+    # No snippet may discover or read a .env file (python-dotenv walks up past the cwd).
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    for module, name, stub in dotenv_stubs():
+        monkeypatch.setattr(module, name, stub)
     for module, name, mock in provider_mocks():
         monkeypatch.setattr(module, name, mock)
     yield
