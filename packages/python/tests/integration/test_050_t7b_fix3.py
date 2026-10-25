@@ -79,15 +79,26 @@ async def test_sweep_candidate_cap_warns_with_safe_structured_fields(
     assert "cap-" not in record.getMessage()
 
 
-async def test_running_bound_maximum_is_separate_from_waiting(store):
+async def test_sweep_categories_share_the_same_maximum(store):
     assert await store.sweep_stale_runs(dt.timedelta(days=1), max_runs=100000) == []
-    with pytest.raises(ValueError):
-        await store.sweep_stale_runs(dt.timedelta(days=1), max_runs=100001)
-    with pytest.raises(ValueError):
-        await store.sweep_abandoned_runs(dt.timedelta(days=1), max_runs=10001)
-    assert (
-        await sweep(state_store=store, stale_running=dt.timedelta(days=1), max_runs=100000)
-    ).stale_running == []
+    assert await store.sweep_abandoned_runs(dt.timedelta(days=1), max_runs=100000) == []
+    result = await sweep(
+        state_store=store,
+        stale_running=dt.timedelta(days=1),
+        abandoned_waiting=dt.timedelta(days=1),
+        max_runs=100000,
+    )
+    assert result.stale_running == result.abandoned_waiting == []
+    for method in (store.sweep_stale_runs, store.sweep_abandoned_runs):
+        with pytest.raises(ValueError, match="max_runs"):
+            await method(dt.timedelta(days=1), max_runs=100001)
+    with pytest.raises(ValueError, match="max_runs"):
+        await sweep(
+            state_store=store,
+            stale_running=dt.timedelta(days=1),
+            abandoned_waiting=dt.timedelta(days=1),
+            max_runs=100001,
+        )
 
 
 async def test_ten_thousand_running_inspections_are_bounded(

@@ -39,7 +39,7 @@ async def sweep(
     stale_running: timedelta | None = None,
     abandoned_waiting: timedelta | None = None,
     batch_size: int = 100,
-    max_runs: int | None = None,
+    max_runs: int = 10000,
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
 
@@ -64,14 +64,14 @@ async def sweep(
             swept. If None, no abandoned-waiting sweep is performed.
 
         batch_size: Candidate rows per projected page (default 100, maximum 1000).
-        max_runs: Optional candidate-cap override. Defaults independently to
-            10,000 running rows (maximum 100,000) and 1,000 waiting rows
-            (maximum 10,000). Fresh running rows count toward the cap; running
-            population is bounded operationally by live concurrency plus
-            orphan backlog. A structured ``sweep_cap_reached`` warning signals
-            saturation, including when all inspected rows are fresh. Increase
-            the cap to reach later running IDs; repeat to drain waiting work.
-            No continuation cursor is returned.
+        max_runs: Candidates inspected per category (default 10,000, maximum
+            100,000), using the same integer bound for running and waiting.
+            All waiting statuses share the waiting category's cap. Fresh running
+            rows and losing CAS attempts count toward it. A structured
+            ``sweep_cap_reached`` warning signals saturation. Increase the cap
+            to reach later running IDs; repeat to drain waiting work. Running
+            population is bounded operationally by live concurrency plus orphan
+            backlog. No continuation cursor is returned.
 
     Returns:
         SweepResult with lists of swept runs by category.
@@ -88,10 +88,7 @@ async def sweep(
     if stale_running is None and abandoned_waiting is None:
         return SweepResult(stale_running=[])
 
-    checks = [("batch_size", batch_size, 1000)]
-    if max_runs is not None:
-        checks.append(("max_runs", max_runs, 10000 if abandoned_waiting is not None else 100000))
-    for name, value, ceiling in checks:
+    for name, value, ceiling in (("batch_size", batch_size, 1000), ("max_runs", max_runs, 100000)):
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
             raise ValueError(f"{name} must be between 1 and {ceiling}")
     store: StateStore
@@ -108,7 +105,7 @@ async def sweep(
         limits = {}
         if batch_size != 100:
             limits["batch_size"] = batch_size
-        if max_runs is not None:
+        if max_runs != 10000:
             limits["max_runs"] = max_runs
         stale = (
             await store.sweep_stale_runs(older_than=stale_running, **limits)

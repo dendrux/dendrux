@@ -886,7 +886,9 @@ class StateStore(Protocol):
     ) -> list[SweptRun]:
         """Find RUNNING rows older than threshold and mark them ERROR.
 
-        Returns list of swept runs with classification.
+        Inspect at most max_runs candidates (default 10,000, maximum 100,000),
+        counting fresh rows and losing CAS attempts. Saturation emits a
+        structured sweep_cap_reached warning. Return swept runs with classification.
         """
         ...
 
@@ -895,7 +897,7 @@ class StateStore(Protocol):
         older_than: timedelta,
         *,
         batch_size: int = 100,
-        max_runs: int = 1000,
+        max_runs: int = 10000,
     ) -> list[SweptRun]:
         """Find WAITING_* and PAUSED rows older than threshold and mark them
         ERROR with failure_reason=abandoned_waiting.
@@ -903,8 +905,10 @@ class StateStore(Protocol):
         Detection uses status_changed_at (last status transition). Waiting runs have
         no forward progress by design, so last_progress_at is wrong here.
 
-        Returns list of swept runs with previous_status reflecting the
-        original waiting status.
+        Inspect at most max_runs candidates across waiting statuses (default
+        10,000, maximum 100,000), including losing CAS attempts. Saturation emits
+        a structured sweep_cap_reached warning. Return swept runs with
+        previous_status reflecting the original waiting status.
         """
         ...
 
@@ -2727,7 +2731,11 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         batch_size: int = 100,
         max_runs: int = 10000,
     ) -> list[SweptRun]:
-        """Sweep at most max_runs stale candidates, with bounded projected pages."""
+        """Inspect running candidates in projected pages; cap 10,000 by default.
+
+        max_runs accepts 1..100,000. Fresh rows and losing CAS attempts count
+        toward it; hitting the cap emits sweep_cap_reached.
+        """
         return await self._sweep_runs(
             older_than, waiting=False, batch_size=batch_size, max_runs=max_runs
         )
@@ -2737,9 +2745,13 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         older_than: timedelta,
         *,
         batch_size: int = 100,
-        max_runs: int = 1000,
+        max_runs: int = 10000,
     ) -> list[SweptRun]:
-        """Sweep at most max_runs abandoned candidates; call again to drain more."""
+        """Inspect waiting candidates in projected pages; cap 10,000 by default.
+
+        max_runs accepts 1..100,000 across all waiting statuses. Losing CAS
+        attempts count toward it; hitting the cap emits sweep_cap_reached.
+        """
         return await self._sweep_runs(
             older_than, waiting=True, batch_size=batch_size, max_runs=max_runs
         )
@@ -2758,7 +2770,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         for name, value, ceiling in (
             ("batch_size", batch_size, 1000),
-            ("max_runs", max_runs, 10000 if waiting else 100000),
+            ("max_runs", max_runs, 100000),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
                 raise ValueError(f"{name} must be between 1 and {ceiling}")
