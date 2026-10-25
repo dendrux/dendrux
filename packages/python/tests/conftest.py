@@ -31,22 +31,23 @@ def pytest_configure(config: pytest.Config) -> None:
         os.environ[_PG_URL_ENV] = worker_scoped_pg_url(url, worker)
 
 
-def _reenable_dendrux_loggers() -> None:
-    for name, candidate in list(logging.root.manager.loggerDict.items()):
-        if name.startswith("dendrux") and isinstance(candidate, logging.Logger):
-            candidate.disabled = False
-
-
 @pytest.fixture(autouse=True)
-def _dendrux_loggers_stay_enabled() -> Iterator[None]:
-    """Undo what an Alembic run in an earlier test did to the logging state.
+def _no_test_disables_a_dendrux_logger() -> Iterator[None]:
+    """Fail the test that switches off a ``dendrux`` logger, not a distant caplog test.
 
-    The migration environment script calls ``logging.config.fileConfig`` with its default
-    ``disable_existing_loggers=True``, which silently disables every ``dendrux.*`` logger
-    that already exists in the process. Any later test that reads ``caplog`` then sees
-    nothing, depending on test order. The source fix is tracked as a contract gap (see
-    ``test_logging_survives_migration.py``).
+    ``logging.config.fileConfig`` (Alembic's env script, import-linter) disables every
+    existing logger by default, and a disabled logger makes later ``caplog`` assertions fail
+    depending on test order. Names the culprit and repairs the state so one leak is one
+    failure.
     """
-    _reenable_dendrux_loggers()
     yield
-    _reenable_dendrux_loggers()
+    disabled = [
+        name
+        for name, candidate in list(logging.root.manager.loggerDict.items())
+        if name.startswith("dendrux")
+        and isinstance(candidate, logging.Logger)
+        and candidate.disabled
+    ]
+    for name in disabled:
+        logging.getLogger(name).disabled = False
+    assert not disabled, f"this test disabled the logger(s) {sorted(disabled)[:5]}"

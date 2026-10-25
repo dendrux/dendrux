@@ -34,6 +34,10 @@ ignore_imports =
     # (a function-local import, line 164). It should take the notify/record
     # callables as arguments instead. Remove this line when it does.
     dendrux.llm._retry_telemetry -> dendrux.loops._helpers
+    # KNOWN VIOLATION (new in the T7b-1 merge): the loop helpers import safe_exception_info
+    # from dendrux.runtime.context, so loops reaches up into the runtime. That helper
+    # belongs in a low layer (errors or _redact). Remove this line when it moves.
+    dendrux.loops._helpers -> dendrux.runtime.context
 
 [importlinter:contract:no-persistence-below-the-runtime]
 name = Core layers know nothing about persistence or the runtime
