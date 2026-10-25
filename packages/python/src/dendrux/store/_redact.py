@@ -19,9 +19,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from dendrux import errors as _errors
+from dendrux.errors import PROVIDER_ERROR_CATEGORIES, TIMEOUT_REASONS, ProviderError
 from dendrux.loops.react import _CLIENT_APPROVAL_REASON, _HOOK_ERROR_REASON
+from dendrux.runtime._limit_checks import INPUT_SIZE_LIMIT_CODE
 from dendrux.runtime._pending import approval_calls, check_read_bool, unknown_tool_calls
 from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
+from dendrux.tools._limits import MAX_CALLS_CODE, SIZE_LIMIT_CODE
+from dendrux.tools._validate import (
+    ARGUMENTS_NOT_STABLE_CODE,
+    INVALID_JSON_CODE,
+    INVALID_PARAMS_CODE,
+    PII_PLACEHOLDER_CODE,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
@@ -34,10 +44,6 @@ UNKNOWN_TOOL = "<unknown_tool>"
 UNKNOWN_SKILL = "<unknown_skill>"
 """Shown instead of a skill name the model invented."""
 
-# Event-data keys that are payloads in every event type.
-_HIDDEN_EVENT_KEYS = frozenset(
-    {"system_prompt", "provider_request", "provider_response", "pii_mapping"}
-)
 # Pauses whose arguments are shown to a human as the model sent them.
 _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
 # Dendrux's own fixed reasons; any other reason is someone's text.
@@ -45,6 +51,32 @@ _CONSTANT_DENIAL_REASONS = frozenset(
     {"denied_by_policy", DEFAULT_DENIAL_REASON, _HOOK_ERROR_REASON, _CLIENT_APPROVAL_REASON}
 )
 _CONSTANT_APPROVAL_REASONS = frozenset({"requires_approval"})
+TOOL_RESULT_CODES = frozenset(
+    {
+        # tools/_validate.py
+        INVALID_PARAMS_CODE,
+        INVALID_JSON_CODE,
+        PII_PLACEHOLDER_CODE,
+        ARGUMENTS_NOT_STABLE_CODE,
+        # tools/_limits.py and the result size cap
+        SIZE_LIMIT_CODE,
+        MAX_CALLS_CODE,
+        INPUT_SIZE_LIMIT_CODE,
+        # loops/react.py: timeouts, stopped siblings, the thread pool, unknown tools
+        "timeout_not_started",
+        "timeout_outcome_unknown",
+        "cancelled",
+        "outcome_unknown",
+        "tool_pool_saturated",
+        "unknown_tool",
+    }
+)
+"""Every ``tool.completed`` code Dendrux writes; any other code is shown as UNKNOWN_CODE."""
+PROVIDER_ERROR_TYPES = frozenset(
+    name
+    for name, value in vars(_errors).items()
+    if isinstance(value, type) and issubclass(value, ProviderError)
+)
 _CODE = re.compile(r"[a-z][a-z0-9_.:-]{0,63}")
 _RETRY_AFTER = re.compile(r"\d{1,10}")
 
@@ -60,13 +92,14 @@ def _without_keys(item: Any, keys: tuple[str, ...]) -> Any:
     return {k: v for k, v in item.items() if k not in keys}
 
 
-def _omit(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
-    return {k: v for k, v in data.items() if k not in keys}
-
-
 def without_params(call: Any) -> Any:
     """A pending-call dict without its arguments."""
     return _without_keys(call, ("params", "arguments"))
+
+
+def data_of(event: StoredEvent) -> dict[str, Any]:
+    """The event's data as a dict; a malformed (non-object) row reads as empty."""
+    return event.data if isinstance(event.data, dict) else {}
 
 
 def _dicts(value: Any) -> list[dict[str, Any]]:
@@ -82,58 +115,385 @@ class _Context:
     unknown_calls: frozenset[str] | None
 
 
-Rule = Callable[[dict[str, Any], "StoredEvent", _Context], dict[str, Any]]
+# ---------------------------------------------------------------------------
+# Field checks. Each returns the value to show, or _HIDE. A key with no check
+# in its event type's schema is hidden: the schema is an allowlist.
+# ---------------------------------------------------------------------------
+
+_HIDE: Any = object()
+Check = Callable[[Any], Any]
+_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+_HEX = re.compile(r"[0-9a-f]{8,128}")
+_PLACEHOLDER = re.compile(r"<<[A-Z][A-Z_]*_\d+>>")
+_PATH = re.compile(r"[A-Za-z0-9_./:-]{1,256}")
+_PARSE_ERROR = re.compile(r"[A-Za-z ',\\:]{1,80} at char \d{1,10}")
+UNKNOWN_CODE = "<unknown_code>"
+"""Shown instead of a ``tool.completed`` code Dendrux does not produce."""
 
 
-def _keep(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    return data
+def _code(value: Any) -> Any:
+    """A Dendrux constant code (an enum value written by Dendrux code)."""
+    return value if value is None or (isinstance(value, str) and _CODE.fullmatch(value)) else _HIDE
 
 
-def _drop(*keys: str) -> Rule:
-    def rule(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-        return _omit(data, keys)
-
-    return rule
+def _enum(choices: Collection[str]) -> Check:
+    return lambda value: value if value is None or is_one_of(value, choices) else _HIDE
 
 
-def _constant(key: str, allowed: frozenset[str], data: dict[str, Any]) -> dict[str, Any]:
-    if key in data and not is_one_of(data[key], allowed):
-        return _omit(data, (key,))
-    return data
+def _num(value: Any) -> Any:
+    ok = value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+    return value if ok else _HIDE
 
 
-def _paused(data: dict[str, Any], _event: StoredEvent, ctx: _Context) -> dict[str, Any]:
-    data = _omit(data, ("message",))  # a requested pause's free-text reason
-    if not ctx.active and "pending_tool_calls" in data:
-        data["pending_tool_calls"] = [without_params(c) for c in _dicts(data["pending_tool_calls"])]
-    return data
+def _bool(value: Any) -> Any:
+    return value if value is None or isinstance(value, bool) else _HIDE
 
 
-def _approval_requested(data: dict[str, Any], _event: StoredEvent, ctx: _Context) -> dict[str, Any]:
-    if not ctx.active:
-        data = _omit(data, ("params",))
-    return _constant("reason", _CONSTANT_APPROVAL_REASONS, data)
+def _ident(value: Any) -> Any:
+    """A Dendrux-generated id (run, call, pause, note, image) or a class name."""
+    return value if value is None or (isinstance(value, str) and _ID.fullmatch(value)) else _HIDE
 
 
-def _decided(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    if "decisions" in data:
-        data["decisions"] = [
-            _constant("reason", _CONSTANT_DENIAL_REASONS, d) for d in _dicts(data["decisions"])
-        ]
-    return data
+def _hex(value: Any) -> Any:
+    """A digest Dendrux computed."""
+    return value if value is None or (isinstance(value, str) and _HEX.fullmatch(value)) else _HIDE
 
 
-def _policy_denied(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    return _constant("reason", _CONSTANT_DENIAL_REASONS, data)
+def _name(value: Any) -> Any:
+    """A developer-declared identifier (agent, tool, skill, guardrail, entity kind, source)."""
+    ok = value is None or (isinstance(value, str) and 0 < len(value) <= 255)
+    return value if ok else _HIDE
 
 
-def _tool_completed(data: dict[str, Any], event: StoredEvent, ctx: _Context) -> dict[str, Any]:
-    code = data.get("code")
-    if "code" in data and not (isinstance(code, str) and _CODE.fullmatch(code)):
-        data = _omit(data, ("code",))
-    if _unknown_tool(data, event, ctx):
-        data["tool_name"] = UNKNOWN_TOOL
-    return data
+def _matching(pattern: re.Pattern[str]) -> Check:
+    return lambda value: value if isinstance(value, str) and pattern.fullmatch(value) else _HIDE
+
+
+def _list(check: Check) -> Check:
+    def checked(value: Any) -> Any:
+        if not isinstance(value, list):
+            return _HIDE
+        return [item for item in map(check, value) if item is not _HIDE]
+
+    return checked
+
+
+def _obj(schema: dict[str, Check]) -> Check:
+    return lambda value: _apply(schema, value) if isinstance(value, dict) else _HIDE
+
+
+def _counts(value: Any) -> Any:
+    """``{kind: count}`` with declared kinds and numeric counts."""
+    if not isinstance(value, dict):
+        return _HIDE
+    return {k: v for k, v in value.items() if _name(k) is not _HIDE and _num(v) is not _HIDE}
+
+
+def _kinds(value: Any) -> Any:
+    """Entity kinds as a list or a ``{kind: count}`` map."""
+    return _counts(value) if isinstance(value, dict) else _list(_name)(value)
+
+
+def _apply(schema: dict[str, Check], data: dict[str, Any]) -> dict[str, Any]:
+    shown = {}
+    for key, value in data.items():
+        check = schema.get(key)
+        if check is not None and (kept := check(value)) is not _HIDE:
+            shown[key] = kept
+    return shown
+
+
+# Provenance of every shown field, by writer. "dendrux": a constant or
+# number Dendrux code writes; "declared": a name the developer configured;
+# "id": an id Dendrux generated. Everything else is hidden.
+_EXCEEDED = _obj({"metric": _code, "used": _num, "max": _num})  # dendrux (budget)
+_ERROR_INFO = _obj(
+    {
+        "category": _enum(PROVIDER_ERROR_CATEGORIES),  # dendrux enum
+        "retryable": _bool,  # dendrux
+        "error_type": _enum(PROVIDER_ERROR_TYPES),  # dendrux ProviderError class names
+        "provider": _name,  # declared: the adapter's provider name, never the vendor's text
+        "status_code": _num,  # number
+        "timeout_reason": _enum(TIMEOUT_REASONS),  # dendrux enum
+        # hidden: safe_message (embeds provider_code), model (vendor-reported),
+        # provider_code (vendor-supplied)
+    }
+)
+_PENDING_CALL: dict[str, Check] = {
+    "id": _ident,
+    "name": _name,
+    "target": _code,
+    "args_hidden": _bool,
+}
+_SCHEMAS: dict[str, dict[str, Check]] = {
+    # runtime/runner.py: agent name (declared), retry_of (id); system_prompt hidden
+    "run.started": {"agent_name": _name, "retry_of": _ident},
+    # runner._pause_event_data: status/reason (dendrux), pause_id (id), pending calls
+    # (validated declared names, Dendrux ids); params only for the active pause;
+    # message (a person's request_pause reason) hidden
+    "run.paused": {
+        "status": _code,
+        "pause_id": _ident,
+        "reason": _code,
+        "exceeded": _list(_EXCEEDED),
+        "pending_tool_calls": _list(_obj(_PENDING_CALL)),
+    },
+    # runner resume: resumed_from (dendrux), submitted_results (ids, names checked
+    # against the pause, bools, counts); user_input hidden
+    "run.resumed": {
+        "resumed_from": _code,
+        "image_count": _num,
+        "submitted_results": _list(
+            _obj({"call_id": _ident, "name": _name, "success": _bool, "image_count": _num})
+        ),
+    },
+    # runner finish: status, stop_reason (normalized enum), truncated
+    "run.completed": {"status": _code, "stop_reason": _code, "truncated": _bool},
+    # runner error: error text hidden; error_info reduced to Dendrux fields
+    "run.error": {
+        "status": _code,
+        "stop_reason": _code,
+        "truncated": _bool,
+        "error_info": _ERROR_INFO,
+    },
+    # runner/state cancel paths: all dendrux constants and bools
+    "run.cancelled": {
+        "reason": _code,
+        "interrupted": _bool,
+        "partial_output": _bool,
+        "exceeded": _list(_EXCEEDED),
+        "failure_reason": _code,
+    },
+    "run.interrupted": {"failure_reason": _code},  # state sweep
+    "run.abandoned": {"failure_reason": _code},  # state sweep
+    # loops/react.py gates: tool (declared, unknown tools never gated), call id, source;
+    # reason only "requires_approval" (a hook's reason is hidden); params when active
+    "approval.requested": {
+        "tool_name": _name,
+        "call_id": _ident,
+        "source": _code,
+        "reason": _enum(_CONSTANT_APPROVAL_REASONS),
+    },
+    # runner._decided_payload: decisions with Dendrux's constant denial reasons only
+    "approval.decided": {
+        "decision": _code,
+        "run_id": _ident,
+        "decisions": _list(
+            _obj(
+                {
+                    "call_id": _ident,
+                    "tool_name": _name,
+                    "decision": _code,
+                    "reason": _enum(_CONSTANT_DENIAL_REASONS),
+                }
+            )
+        ),
+    },
+    # react policy paths: declared tool names (hooks run on declared tools), constants
+    "policy.denied": {
+        "tool_name": _name,
+        "call_id": _ident,
+        "source": _code,
+        "reason": _enum(_CONSTANT_DENIAL_REASONS),
+    },
+    "policy.substituted": {"tool_name": _name, "call_id": _ident},
+    "policy.hook_error": {"tool_name": _name, "call_id": _ident, "error_type": _ident},
+    "policy.hook_warning": {
+        "tool_name": _name,
+        "call_id": _ident,
+        "warning": _enum({_CLIENT_APPROVAL_REASON}),
+    },
+    # runtime/persistence.py: usage numbers, Dendrux cost source and phase;
+    # model hidden (the provider reports it)
+    "llm.completed": {
+        "input_tokens": _num,
+        "output_tokens": _num,
+        "cache_read_input_tokens": _num,
+        "cache_creation_input_tokens": _num,
+        "reasoning_tokens": _num,
+        "cost_usd": _num,
+        "cost_source": _code,
+        "usage_reported": _bool,
+        "has_tool_calls": _bool,
+        "phase": _enum({"commentary", "final_answer"}),
+    },
+    "llm.failed": {
+        "error_info": _ERROR_INFO,
+        "timeout_reason": _enum(TIMEOUT_REASONS),
+        "duration_ms": _num,
+    },
+    # persistence.on_tool_completed: name decided in _tool_completed, code enumerated
+    "tool.completed": {
+        "tool_name": _name,
+        "target": _code,
+        "success": _bool,
+        "duration_ms": _num,
+        "zombie_threads": _num,
+        "raw_length": _num,
+        "image_count": _num,
+        "parse_error": _matching(_PARSE_ERROR),  # json decoder message and offset
+    },
+    # llm/_retry_telemetry.py: numbers; endpoint is the configured base URL's path;
+    # retry_after only as digits (the header is vendor text)
+    "provider.retry": {
+        "status_code": _num,
+        "attempt": _num,
+        "endpoint": _matching(_PATH),
+        "retry_after": _matching(_RETRY_AFTER),
+    },
+    # react guardrail paths: direction/code (dendrux), kinds and counts (declared
+    # entity kinds); error and location hidden (they embed provider call ids)
+    "guardrail.blocked": {"direction": _code, "code": _code, "kinds": _kinds, "counts": _counts},
+    "guardrail.detected": {"direction": _code, "findings_count": _num, "entities": _kinds},
+    "guardrail.redacted": {"direction": _code, "entities": _kinds},
+    # runner: placeholders are tokens of Dendrux's placeholder grammar only
+    "guardrail.unmapped_placeholder": {"placeholders": _list(_matching(_PLACEHOLDER))},
+    "guardrail.restore_skipped": {
+        "tool_name": _name,
+        "call_id": _ident,
+        "entities": _kinds,
+        "count": _num,
+        "code": _code,
+    },
+    "guardrail.image_unscanned": {"count": _num},
+    # skills/_session.py: names, revisions and paths validated against declared skills
+    "skill.catalog_resolved": {
+        "delivery": _code,
+        "skills": _list(_obj({"name": _name, "revision": _name, "digest": _hex})),
+        "denied": _list(_name),
+    },
+    "skill.activated": {"name": _name, "digest": _hex, "origin": _code},
+    "skill.activation_failed": {"name": _name, "reason": _enum({"denied", "not_found"})},
+    "skill.resource_read": {"name": _name, "path": _name, "chars": _num, "truncated": _bool},
+    "skill.script_requested": {"name": _name, "path": _name, "argc": _num},
+    "skill.script_completed": {
+        "name": _name,
+        "path": _name,
+        "exit_code": _num,
+        "duration_ms": _num,
+        "stdout_chars": _num,
+        "stderr_chars": _num,
+        "truncated": _bool,
+    },
+    "skill.script_failed": {"name": _name, "path": _name, "error_type": _ident},
+    # runtime/runner.py MCP: source names (declared); exposed tool names passed the
+    # safe-name check and are the run's declared tool set; error text hidden
+    "mcp.connected": {
+        "source_name": _name,
+        "namespace": _name,
+        "tool_count": _num,
+        "tool_names": _list(_name),
+    },
+    "mcp.error": {
+        "source_name": _name,
+        "namespace": _name,
+        "error_type": _ident,
+        "code": _code,
+        "failure_mode": _code,
+        "reason": _code,
+    },
+    "mcp.tools_skipped": {
+        "skipped": _list(
+            _obj(
+                {
+                    "source_name": _name,
+                    "namespace": _name,
+                    "tool": _name,
+                    "reason": _enum({"name_unsafe", "duplicate_name", "unknown_tool"}),
+                }
+            )
+        )
+    },
+    # loops/_budget.py: metric names and reasons (dendrux), numbers
+    "budget.unpriced": {
+        "metric": _code,
+        "used": _num,
+        "max": _num,
+        "unpriced_calls": _num,
+        "known_cost_usd": _num,
+    },
+    "budget.threshold": {
+        "metric": _code,
+        "fraction": _num,
+        "used": _num,
+        "max": _num,
+        "reason": _code,
+    },
+    "budget.exceeded": {
+        "metric": _code,
+        "used": _num,
+        "max": _num,
+        "reason": _code,
+        "action": _code,
+    },
+    # runtime/submit.py: digests and governance part names (dendrux)
+    "governance.changed": {
+        "expected_digest": _hex,
+        "actual_digest": _hex,
+        "changed": _list(_code),
+    },
+    "inbox.delivered": {"note_id": _ident},  # react: note id
+    # loops/_images.py: ids, digests, the run's tenant scope, numbers; model hidden
+    # (the provider reports it)
+    "image.rejected": {
+        "image_id": _ident,
+        "sha256": _hex,
+        "tenant_scope": _name,
+        "provider": _name,
+        "status_code": _num,
+        "located": _bool,
+        "retried": _bool,
+    },
+    "image.view_changed": {"epoch": _num, "dropped_through": _num, "visible": _num},
+    "image.degraded": {"reason": _code, "count": _num, "slots": _list(_num)},
+    "image.warning": {"warning": _code},
+    "image.state": {
+        "tenant_scope": _name,
+        "described": _list(_obj({"sha256": _hex})),  # describer text hidden
+        "guardrail_verdicts": _list(
+            _obj(
+                {
+                    "sha256": _hex,
+                    "guardrail_id": _name,
+                    "guardrail_version": _name,
+                    "origin": _code,
+                    "tool_name": _name,
+                    "action": _code,
+                    "entities": _kinds,
+                }
+            )
+        ),
+        "placeholders": _list(_obj({"slot": _num, "reason": _code})),
+    },
+}
+
+
+def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx: _Context) -> None:
+    """Rules that need more than one field or the reader's context."""
+    kind = event.event_type
+    if kind == "run.paused" and ctx.active:
+        for call, original in zip(
+            shown.get("pending_tool_calls", []), _dicts(raw.get("pending_tool_calls")), strict=False
+        ):
+            if "params" in original:
+                call["params"] = original["params"]  # the active pause's arguments (B2)
+    elif kind == "approval.requested" and ctx.active and "params" in raw:
+        shown["params"] = raw["params"]
+    elif kind == "tool.completed":
+        if "code" in raw:
+            shown["code"] = (
+                raw["code"] if is_one_of(raw["code"], TOOL_RESULT_CODES) else UNKNOWN_CODE
+            )
+        if _unknown_tool(raw, event, ctx):
+            shown["tool_name"] = UNKNOWN_TOOL
+    elif kind == "skill.activation_failed" and "name" in raw:
+        declared = raw.get("reason") == "denied" and isinstance(raw.get("name"), str)
+        if not declared:  # a denied name is the developer's; any other is the model's
+            shown["name"] = UNKNOWN_SKILL
+    elif kind == "mcp.tools_skipped":
+        for item in shown.get("skipped", []):
+            if item.get("reason") != "unknown_tool":  # only then the developer's name
+                item.pop("tool", None)
 
 
 def _unknown_tool(data: dict[str, Any], event: StoredEvent, ctx: _Context) -> bool:
@@ -147,92 +507,8 @@ def _unknown_tool(data: dict[str, Any], event: StoredEvent, ctx: _Context) -> bo
     return event.correlation_id in ctx.unknown_calls
 
 
-def _skill_failed(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    data = _constant("reason", frozenset({"denied", "not_found"}), data)
-    declared = data.get("reason") == "denied" and isinstance(data.get("name"), str)
-    if "name" in data and not declared:  # denied names are the developer's
-        data["name"] = UNKNOWN_SKILL
-    return data
-
-
-def _tools_skipped(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    if "skipped" in data:
-        data["skipped"] = [
-            d if d.get("reason") == "unknown_tool" else _without_keys(d, ("tool",))
-            for d in (_constant("reason", _SKIP_REASONS, d) for d in _dicts(data["skipped"]))
-        ]
-    return data
-
-
-_SKIP_REASONS = frozenset({"name_unsafe", "duplicate_name", "unknown_tool"})
-
-
-def _retry(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    value = data.get("retry_after")
-    if "retry_after" in data and not (isinstance(value, str) and _RETRY_AFTER.fullmatch(value)):
-        return _omit(data, ("retry_after",))
-    return data
-
-
-def _image_state(data: dict[str, Any], _event: StoredEvent, _ctx: _Context) -> dict[str, Any]:
-    if "described" in data:
-        data["described"] = [_without_keys(d, ("text",)) for d in _dicts(data["described"])]
-    return data
-
-
-REVIEWED_EVENT_TYPES: dict[str, Rule] = {
-    # Run lifecycle
-    "run.started": _keep,  # agent_name, retry_of (system_prompt is a payload key)
-    "run.paused": _paused,
-    "run.resumed": _drop("user_input"),  # submitted_results carry validated names
-    "run.completed": _keep,
-    "run.error": _drop("error"),  # error_info is codes and a fixed safe message
-    "run.cancelled": _keep,
-    "run.interrupted": _keep,
-    "run.abandoned": _keep,
-    # Approvals and policy
-    "approval.requested": _approval_requested,
-    "approval.decided": _decided,
-    "policy.denied": _policy_denied,
-    "policy.substituted": _keep,
-    "policy.hook_error": _keep,  # error_type is an exception class name
-    "policy.hook_warning": _keep,
-    # Model and tools
-    "llm.completed": _keep,
-    "llm.failed": _keep,
-    "tool.completed": _tool_completed,
-    "provider.retry": _retry,
-    # Guardrails (messages are built from guardrail ids and entity kinds)
-    "guardrail.blocked": _keep,
-    "guardrail.detected": _keep,
-    "guardrail.redacted": _keep,
-    "guardrail.unmapped_placeholder": _keep,  # placeholder grammar only
-    "guardrail.restore_skipped": _keep,
-    "guardrail.image_unscanned": _keep,
-    # Skills (paths and names are validated against declared skills)
-    "skill.catalog_resolved": _keep,
-    "skill.activated": _keep,
-    "skill.activation_failed": _skill_failed,
-    "skill.resource_read": _keep,
-    "skill.script_requested": _keep,
-    "skill.script_completed": _keep,
-    "skill.script_failed": _keep,
-    # MCP (source names are developer config; exposed names passed the safe-name check)
-    "mcp.connected": _keep,
-    "mcp.error": _drop("error"),
-    "mcp.tools_skipped": _tools_skipped,
-    # Budget, governance, inbox and images
-    "budget.unpriced": _keep,
-    "budget.threshold": _keep,
-    "budget.exceeded": _keep,
-    "governance.changed": _keep,
-    "inbox.delivered": _keep,
-    "image.rejected": _keep,
-    "image.view_changed": _keep,
-    "image.degraded": _keep,
-    "image.warning": _keep,
-    "image.state": _image_state,
-}
+REVIEWED_EVENT_TYPES: frozenset[str] = frozenset(_SCHEMAS)
+"""Every event type with a reviewed allowlist (a test keeps it complete)."""
 
 
 def redact_event(
@@ -295,6 +571,8 @@ def _redact(
 ) -> StoredEvent:
     if not event.data:
         return event
+    if not isinstance(event.data, dict):  # malformed row: nothing to show
+        return event if include_payloads is True else dataclasses.replace(event, data={})
     data = dict(event.data)
     if (
         event.event_type == "run.paused"
@@ -304,12 +582,13 @@ def _redact(
         data["pending_tool_calls"] = approval_calls(data["pending_tool_calls"], approval_params)
     if include_payloads is True:
         return dataclasses.replace(event, data=data) if data != event.data else event
-    rule = REVIEWED_EVENT_TYPES.get(event.event_type)
-    if rule is None:  # an event type nobody reviewed shows no data
+    schema = _SCHEMAS.get(event.event_type)
+    if schema is None:  # an event type nobody reviewed shows no data
         return dataclasses.replace(event, data={})
-    data = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}
     context = _Context(active=active_pause is True, unknown_calls=unknown_calls)
-    return dataclasses.replace(event, data=rule(data, event, context))
+    shown = _apply(schema, data)
+    _special(event, data, shown, context)
+    return dataclasses.replace(event, data=shown)
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +674,7 @@ class PastParams:
         return self.found.get(seq, {})
 
     def _consume(self, event: StoredEvent) -> None:
-        data = event.data or {}
+        data = data_of(event)
         if event.event_type == "approval.requested":
             call_id, params = data.get("call_id"), data.get("params")
             if isinstance(call_id, str) and isinstance(params, dict):
@@ -421,7 +700,7 @@ async def view_with(
     unknown_calls: frozenset[str] | None = None,
 ) -> StoredEvent:
     """``event`` as a reader sees it, given the run's active pause ``view``."""
-    data = event.data or {}
+    data = data_of(event)
     seq = event.sequence_index
     active = False
     params = None
@@ -451,7 +730,7 @@ def needs_unknown_calls(event: StoredEvent, include_payloads: bool) -> bool:
     return (
         not include_payloads
         and event.event_type == "tool.completed"
-        and (event.data or {}).get("success") is not True
+        and data_of(event).get("success") is not True
     )
 
 

@@ -93,16 +93,17 @@ class TestRedactFreeText:
         assert ev.data["decisions"][0]["reason"] == SECRET  # input never mutated
 
     def test_error_text_hidden_codes_kept(self) -> None:
-        err = _event("run.error", {"error": SECRET, "error_info": {"category": "x"}})
-        assert redact_event(err).data == {"error_info": {"category": "x"}}
+        err = _event("run.error", {"error": SECRET, "error_info": {"category": "rate_limit"}})
+        assert redact_event(err).data == {"error_info": {"category": "rate_limit"}}
         mcp = _event("mcp.error", {"error": SECRET, "error_type": "E", "code": "mcp_x"})
         assert redact_event(mcp).data == {"error_type": "E", "code": "mcp_x"}
 
     def test_image_descriptions_hidden(self) -> None:
         ev = _event(
-            "image.state", {"described": [{"sha256": "ab", "text": SECRET}], "placeholders": []}
+            "image.state",
+            {"described": [{"sha256": "ab" * 32, "text": SECRET}], "placeholders": []},
         )
-        assert redact_event(ev).data == {"described": [{"sha256": "ab"}], "placeholders": []}
+        assert redact_event(ev).data == {"described": [{"sha256": "ab" * 32}], "placeholders": []}
 
     def test_pause_message_hidden_codes_kept(self) -> None:
         ev = _event(

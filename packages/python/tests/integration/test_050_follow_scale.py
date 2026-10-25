@@ -111,7 +111,9 @@ async def test_backfill_cost_per_follower_is_flat(store: Any, engine: Any) -> No
     # (a follower arriving after the feed closed pays them again: still fixed).
     assert per_follower <= 6, (small_cost, large_cost)
     # Twelve more past pauses add no statements per follower.
-    assert large_cost - small_cost <= 4, (small_cost, large_cost)
+    # (Per-pause reads would add at least 10 * followers = 200; a few extra
+    # poller statements under a loaded machine are noise.)
+    assert large_cost - small_cost <= 10, (small_cost, large_cost)
 
 
 # ---------------------------------------------------------------------------

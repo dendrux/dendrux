@@ -106,6 +106,7 @@ from dendrux.store._redact import (
     PAUSE_VIEW_EVENTS,
     PastParams,
     PauseView,
+    data_of,
     needs_unknown_calls,
     read_pause_view,
     read_unknown_calls,
@@ -1120,7 +1121,7 @@ def _image_digest(sha256: object) -> str:
 
 def _pair_view(pair: PausePair, view: StoredEvent, include_payloads: bool) -> PausePair:
     """``pair`` with its redacted pending calls; a person's answer only with payloads."""
-    shown = (view.data or {})["pending_tool_calls"]
+    shown = data_of(view).get("pending_tool_calls", [])
     if include_payloads:
         return dataclasses.replace(pair, pending_tool_calls=shown)
     return dataclasses.replace(pair, pending_tool_calls=shown, user_input=None)
@@ -1333,17 +1334,21 @@ def _derive_pauses(events: list[Any]) -> list[PausePair]:
     return pauses
 
 
+def _list_of(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
 def _build_pause_pair(paused: Any, resumed: Any | None) -> PausePair:
-    pdata = paused.data or {}
-    rdata = (resumed.data or {}) if resumed is not None else {}
+    pdata = data_of(paused)
+    rdata = data_of(resumed) if resumed is not None else {}
     return PausePair(
         pause_sequence_index=paused.sequence_index,
         pause_at=paused.created_at,
         resume_sequence_index=resumed.sequence_index if resumed is not None else None,
         resume_at=resumed.created_at if resumed is not None else None,
         reason=str(pdata.get("status", "")),
-        pending_tool_calls=list(pdata.get("pending_tool_calls") or []),
-        submitted_results=list(rdata.get("submitted_results") or []),
+        pending_tool_calls=_list_of(pdata.get("pending_tool_calls")),
+        submitted_results=_list_of(rdata.get("submitted_results")),
         user_input=rdata.get("user_input"),
         pause_id=pdata.get("pause_id") if isinstance(pdata.get("pause_id"), str) else None,
     )
