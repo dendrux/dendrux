@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import threading
+from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_RECURSION_DEPTH = 50
+# Joins the text parts of a message; the same separator as ``Message.content``.
+_SEGMENT_SEP = "\n\n"
 # Text or params past these limits are not scanned; see ``_unscannable``.
 MAX_SCAN_CHARS = 4 * 1024 * 1024
 _MAX_SCAN_NODES = 10_000
@@ -341,17 +344,38 @@ class GuardrailEngine:
         If a guardrail with action="block" finds something, returns
         the block error message. The caller should terminate the run.
         """
-        all_findings: list[Finding] = []
-        oversize = len(text) > MAX_SCAN_CHARS
+        texts, all_findings, block = await self._scan_segments(
+            [text], origin=origin, location=location
+        )
+        return texts[0], all_findings, block
 
+    async def _scan_segments(
+        self,
+        segments: list[str],
+        *,
+        origin: Origin,
+        location: str,
+    ) -> tuple[list[str], list[Finding], str | None]:
+        """Scan the text segments of one message as the single text they project to.
+
+        Segments are joined with :data:`_SEGMENT_SEP` (the ``Message.content``
+        projection), so a contextual pattern whose evidence sits in a
+        neighbouring segment fires exactly as it does on the joined text.
+        Redaction is applied back per segment; a match that spans a boundary
+        is redacted piece by piece, so none of its text survives.
+        """
+        all_findings: list[Finding] = []
+        segments = list(segments)
         for guardrail in self._text_guardrails:
-            raw_findings = [] if oversize else await guardrail.scan(text)
+            joined = _SEGMENT_SEP.join(segments)
+            oversize = len(joined) > MAX_SCAN_CHARS
+            raw_findings = [] if oversize else await guardrail.scan(joined)
             if oversize or _has_unscannable(raw_findings):
                 block = _unscannable_outcome(
                     guardrail, all_findings, where="text over the scan limit", location=location
                 )
                 if block is not None:
-                    return text, all_findings, block
+                    return segments, all_findings, block
                 continue
             findings = _deoverlap(raw_findings)
             if not findings:
@@ -360,13 +384,16 @@ class GuardrailEngine:
 
             if guardrail.action == "block":
                 return (
-                    text,
+                    segments,
                     all_findings,
                     _block_message(guardrail, findings, location=location),
                 )
 
             if guardrail.action == "redact":
-                new_values = {f.text for f in findings if f.text not in self._reverse}
+                per_segment = _split_findings(joined, findings, segments)
+                new_values = {
+                    f.text for part in per_segment for f in part if f.text not in self._reverse
+                }
                 if new_values and len(self._pii_mapping) + len(new_values) > MAX_MAPPING_ENTRIES:
                     block = _unscannable_outcome(
                         guardrail,
@@ -375,13 +402,15 @@ class GuardrailEngine:
                         location=location,
                     )
                     if block is not None:
-                        return text, all_findings, block
+                        return segments, all_findings, block
                     continue
-                text = await self._redact(text, findings, origin)
+                for i, part_findings in enumerate(per_segment):
+                    if part_findings:
+                        segments[i] = await self._redact(segments[i], part_findings, origin)
                 self._at_mapping_cap = len(self._pii_mapping) >= MAX_MAPPING_ENTRIES
             # warn: findings collected but text unchanged
 
-        return text, all_findings, None
+        return segments, all_findings, None
 
     async def scan_incoming_message(
         self, msg: Message, *, index: int | None = None
@@ -420,27 +449,40 @@ class GuardrailEngine:
                 msg = replace(msg, content=cleaned)
             return msg, findings, block_err
 
+        return await self._scan_message_parts(msg, origin, location)
+
+    async def _scan_message_parts(
+        self, msg: Message, origin: Origin, location: str
+    ) -> tuple[Message, list[Finding], str | None]:
+        """Scan a multimodal message's text parts as one text; rebuild changed parts."""
+        from dataclasses import replace
+
         from dendrux.types import TextPart
 
-        all_findings: list[Finding] = []
+        assert msg.parts is not None
+        text_parts = [(i, p) for i, p in enumerate(msg.parts) if isinstance(p, TextPart)]
+        if not text_parts:
+            return msg, [], None
+        part_location = (
+            f"{location}, part {text_parts[0][0]}"
+            if len(text_parts) == 1
+            else f"{location}, text parts"
+        )
+        texts, part_findings, part_block = await self._scan_segments(
+            [p.text for _, p in text_parts], origin=origin, location=part_location
+        )
+        if part_block is not None:
+            return msg, part_findings, part_block
         new_parts = list(msg.parts)
         changed = False
-        for part_index, part in enumerate(msg.parts):
-            if not isinstance(part, TextPart):
-                continue
-            cleaned, findings, block_err = await self.scan_incoming(
-                part.text, origin=origin, location=f"{location}, part {part_index}"
-            )
-            all_findings.extend(findings)
-            if block_err is not None:
-                return msg, all_findings, block_err
-            if cleaned != part.text:
+        for (i, original), text in zip(text_parts, texts, strict=True):
+            if text != original.text:
                 changed = True
-                new_parts[part_index] = TextPart(cleaned)
+                new_parts[i] = TextPart(text)
         if changed:
             parts = tuple(new_parts)
             msg = replace(msg, parts=parts, content=_projection(parts))
-        return msg, all_findings, None
+        return msg, part_findings, None
 
     async def scan_outgoing(
         self,
@@ -619,7 +661,41 @@ def has_placeholder(value: Any, _depth: int = 0) -> bool:
 def _projection(parts: tuple[Any, ...]) -> str:
     from dendrux.types import TextPart
 
-    return "\n\n".join(p.text for p in parts if isinstance(p, TextPart))
+    return _SEGMENT_SEP.join(p.text for p in parts if isinstance(p, TextPart))
+
+
+def _split_findings(
+    joined: str, findings: list[Finding], segments: list[str]
+) -> list[list[Finding]]:
+    """Map findings on the joined text back to per-segment findings.
+
+    A finding that crosses a separator becomes one finding per segment it
+    touches, each carrying only its own slice of the matched text.
+    """
+    starts: list[int] = []
+    pos = 0
+    for seg in segments:
+        starts.append(pos)
+        pos += len(seg) + len(_SEGMENT_SEP)
+    out: list[list[Finding]] = [[] for _ in segments]
+    for f in findings:
+        i = max(bisect_right(starts, f.start) - 1, 0)
+        while i < len(segments) and starts[i] < f.end:
+            seg_start, seg_end = starts[i], starts[i] + len(segments[i])
+            lo, hi = max(f.start, seg_start), min(f.end, seg_end)
+            if hi > lo:
+                whole = lo == f.start and hi == f.end
+                out[i].append(
+                    Finding(
+                        entity_type=f.entity_type,
+                        start=lo - seg_start,
+                        end=hi - seg_start,
+                        score=f.score,
+                        text=f.text if whole else joined[lo:hi],
+                    )
+                )
+            i += 1
+    return out
 
 
 def _deoverlap(findings: list[Finding]) -> list[Finding]:
@@ -834,7 +910,60 @@ async def _scan_params_for_findings(
             if block is not None:
                 return all_findings, block
 
-    return all_findings, None
+    joined_findings, block = await _scan_joined_leaves(
+        leaves, all_findings, guardrails, where=where
+    )
+    all_findings.extend(joined_findings)
+    return all_findings, block
+
+
+async def _scan_joined_leaves(
+    leaves: _Leaves,
+    leaf_findings: list[Finding],
+    guardrails: list[Guardrail],
+    *,
+    where: str,
+) -> tuple[list[Finding], str | None]:
+    """Scan the string values of all params as one text, ``key=value`` per leaf.
+
+    A pattern whose evidence sits in a sibling param (``{"label": "aws
+    secret:", "value": "<token>"}``) fires on the joined text as it does on
+    the same text in one string. Only findings beyond what the per-leaf scans
+    already reported are returned, so nothing is counted twice.
+    """
+    values = [(k, t) for k, t, with_context in leaves.items if with_context]
+    if len(values) < 2:
+        return [], None
+    joined = _SEGMENT_SEP.join(f"{k[-_KEY_CONTEXT_CHARS:]}={t}" for k, t in values)
+    known = Counter(f.entity_type for f in leaf_findings)
+    extra_findings: list[Finding] = []
+    for guardrail in guardrails:
+        if len(joined) > MAX_SCAN_CHARS:
+            block = _unscannable_outcome(
+                guardrail, extra_findings, where=f"{where}, over the size limit"
+            )
+            if block is not None:
+                return extra_findings, block
+            continue
+        raw = await guardrail.scan(joined)
+        if _has_unscannable(raw):
+            block = _unscannable_outcome(guardrail, extra_findings, where=where)
+            if block is not None:
+                return extra_findings, block
+            continue
+        merged = _deoverlap(raw)
+        fresh: list[Finding] = []
+        seen: Counter[str] = Counter()
+        for f in merged:
+            seen[f.entity_type] += 1
+            if seen[f.entity_type] > known[f.entity_type]:
+                fresh.append(f)
+        if not fresh:
+            continue
+        extra_findings.extend(fresh)
+        if guardrail.action == "block":
+            return extra_findings, _block_message(guardrail, fresh, where=where)
+    return extra_findings, None
 
 
 async def _scan_leaf_for_findings(
