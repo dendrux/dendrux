@@ -76,7 +76,7 @@ def _entry(
     return ab.AllowEntry(kind=kind, paths=paths, param=param, b_item=b_item, note=note)
 
 
-KNOWN = [f"B{i}" for i in range(1, 21)]
+KNOWN = [f"B{i}" for i in range(1, 28)]
 
 
 def _allowlist_file(tmp_path: Path, entries: list[dict[str, Any]]) -> Path:
@@ -140,6 +140,10 @@ class TestAllowlist:
 
     def test_committed_allowlist_is_valid(self) -> None:
         assert ab.load_allowlist(COMMITTED_ALLOWLIST)
+
+    def test_every_spec_b_item_can_be_referenced(self) -> None:
+        known = set(json.loads(COMMITTED_ALLOWLIST.read_text())["known_b_items"])
+        assert {f"B{i}" for i in range(1, 28)} <= known
 
     def test_committed_allowlist_has_no_gaps(self) -> None:
         assert [e for e in ab.load_allowlist(COMMITTED_ALLOWLIST) if e.b_item is None] == []
