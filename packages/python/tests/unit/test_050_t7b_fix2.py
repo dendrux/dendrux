@@ -237,7 +237,7 @@ def test_sweep_index_validation_error_does_not_claim_uniqueness(monkeypatch):
         "inspect",
         lambda bind: SimpleNamespace(get_columns=lambda _: [{"name": "status_changed_at"}]),
     )
-    monkeypatch.setattr(module, "_alter_clock", lambda **kw: None, raising=False)
+    monkeypatch.setattr(module, "_online_pg_clock", lambda: None)
     monkeypatch.setattr(module, "read_pg_indexes", lambda *args, **kw: {}, raising=False)
     with pytest.raises(RuntimeError) as caught:
         module.upgrade()

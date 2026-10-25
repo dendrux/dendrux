@@ -29,13 +29,16 @@ _INDEXES = (
 def upgrade() -> None:
     bind = op.get_bind()
     pg = bind.dialect.name == "postgresql"
-    columns = {c["name"] for c in sa.inspect(bind).get_columns("agent_runs")}
-    if "status_changed_at" not in columns:
-        op.add_column("agent_runs", sa.Column("status_changed_at", sa.DateTime(timezone=True)))
-    op.execute(
-        "UPDATE agent_runs SET status_changed_at = updated_at WHERE status_changed_at IS NULL"
-    )
-    _alter_clock(drop=False)
+    if pg:
+        _online_pg_clock()
+    else:
+        columns = {c["name"] for c in sa.inspect(bind).get_columns("agent_runs")}
+        if "status_changed_at" not in columns:
+            op.add_column("agent_runs", sa.Column("status_changed_at", sa.DateTime(timezone=True)))
+        op.execute(
+            "UPDATE agent_runs SET status_changed_at = updated_at WHERE status_changed_at IS NULL"
+        )
+        _alter_clock(drop=False)
     with op.get_context().autocommit_block() if pg else nullcontext():
         for name, table, keys, predicate in _INDEXES:
             if pg:
@@ -61,6 +64,69 @@ def upgrade() -> None:
                     f"Index {name} has an unexpected definition or is not ready. "
                     "Rebuild it with the migration's exact definition before retrying."
                 )
+
+
+def _online_pg_clock() -> None:
+    """Commit short DDL and 5k-row batches on the direct migration connection.
+
+    New inserts get a current clock from the default, installed atomically
+    with the nullable column. SDK transitions explicitly set their clock;
+    backfill never overwrites one. A validated CHECK avoids SET NOT NULL's
+    table scan under ACCESS EXCLUSIVE (Postgres 12+).
+    """
+    with op.get_context().autocommit_block():
+        op.execute(
+            "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ, "
+            "ALTER COLUMN status_changed_at SET DEFAULT now()"
+        )
+        # Freeze the initial high-water mark so continual inserts cannot
+        # extend the migration indefinitely. Later inserts have the default.
+        end = op.get_bind().execute(sa.text("SELECT max(id) FROM agent_runs")).scalar_one()
+        after = None
+        while end is not None:
+            lower = "id > :after AND " if after is not None else ""
+            last_id = op.get_bind().execute(
+                sa.text(
+                    "SELECT max(id) FROM (SELECT id FROM agent_runs WHERE "
+                    + lower + "id <= :end ORDER BY id LIMIT 5000) AS batch"
+                ),
+                {"after": after, "end": end},
+            ).scalar_one()
+            if last_id is None:
+                break
+            # Explicit, bound range endpoints let the planner restrict the
+            # UPDATE itself to this page. A CTE join can hash/scan all runs
+            # for every batch even when its input has only 5k IDs.
+            op.get_bind().execute(
+                sa.text(
+                    "UPDATE agent_runs SET status_changed_at = "
+                    "COALESCE(updated_at, created_at, now()) WHERE "
+                    + lower + "id <= :last AND status_changed_at IS NULL"
+                ),
+                {"after": after, "last": last_id},
+            )
+            after = last_id
+        constraint = "ck_agent_runs_status_clock_not_null"
+        # An interrupted run may already have installed/validated the check.
+        exists = (
+            op.get_bind()
+            .execute(
+                sa.text(
+                    "SELECT 1 FROM pg_constraint WHERE conrelid='agent_runs'::regclass "
+                    "AND conname=:name"
+                ),
+                {"name": constraint},
+            )
+            .scalar_one_or_none()
+        )
+        if exists is None:
+            op.execute(
+                f"ALTER TABLE agent_runs ADD CONSTRAINT {constraint} "
+                "CHECK (status_changed_at IS NOT NULL) NOT VALID"
+            )
+        op.execute(f"ALTER TABLE agent_runs VALIDATE CONSTRAINT {constraint}")
+        op.execute("ALTER TABLE agent_runs ALTER COLUMN status_changed_at SET NOT NULL")
+        op.execute(f"ALTER TABLE agent_runs DROP CONSTRAINT {constraint}")
 
 
 def downgrade() -> None:

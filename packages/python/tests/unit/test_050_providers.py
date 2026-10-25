@@ -919,12 +919,18 @@ class TestDeadlineConfig:
 
 
 @pytest.fixture
-def controlled_deadlines(monkeypatch):
+def deadline_arms():
+    return []
+
+
+@pytest.fixture
+def controlled_deadlines(monkeypatch, deadline_arms):
     from types import SimpleNamespace
 
     timers = []
 
     def controlled_timeout(_when):
+        deadline_arms.append((asyncio.get_running_loop().time(), _when))
         timer = asyncio.timeout_at(None)
         timers.append(timer)
         return timer
@@ -938,7 +944,7 @@ def controlled_deadlines(monkeypatch):
 class TestDeadlines:
     @pytest.mark.parametrize("make", [anthropic_provider, chat_provider, responses_provider])
     async def test_call_timeout_abandons_without_retry(
-        self, make: Callable[..., Any], controlled_deadlines
+        self, make: Callable[..., Any], controlled_deadlines, deadline_arms
     ) -> None:
         provider = make(call_timeout=0.2, max_retries=3)
         entered = asyncio.Event()
@@ -952,6 +958,9 @@ class TestDeadlines:
         call = asyncio.create_task(provider.complete(USER))
         try:
             await asyncio.wait_for(entered.wait(), 20)
+            assert deadline_arms, "fixture must record when the real deadline was armed"
+            armed_at, requested_when = deadline_arms[0]
+            assert requested_when - armed_at == pytest.approx(0.2, abs=0.02)
             controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
             with pytest.raises(ProviderTimeoutError, match="call_timeout=0.2s") as info:
                 await asyncio.wait_for(call, 20)
@@ -1053,7 +1062,7 @@ class TestDeadlines:
         assert info.value.timeout_reason == "stream_total"
 
     async def test_idle_timeout_is_not_retried_before_first_yield(
-        self, controlled_deadlines
+        self, controlled_deadlines, deadline_arms
     ) -> None:
         provider = responses_provider(stream_idle_timeout=0.2)
         reading = asyncio.Event()
@@ -1070,6 +1079,9 @@ class TestDeadlines:
         consumer = asyncio.create_task(drain(provider.complete_stream(USER)))
         try:
             await asyncio.wait_for(reading.wait(), 20)
+            assert deadline_arms, "fixture must record when the real deadline was armed"
+            armed_at, requested_when = deadline_arms[0]
+            assert requested_when - armed_at == pytest.approx(0.2, abs=0.02)
             controlled_deadlines[-1].reschedule(asyncio.get_running_loop().time())
             with pytest.raises(ProviderTimeoutError) as info:
                 await asyncio.wait_for(consumer, 20)

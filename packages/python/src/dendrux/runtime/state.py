@@ -882,7 +882,7 @@ class StateStore(Protocol):
         older_than: timedelta,
         *,
         batch_size: int = 100,
-        max_runs: int = 1000,
+        max_runs: int = 10000,
     ) -> list[SweptRun]:
         """Find RUNNING rows older than threshold and mark them ERROR.
 
@@ -900,7 +900,7 @@ class StateStore(Protocol):
         """Find WAITING_* and PAUSED rows older than threshold and mark them
         ERROR with failure_reason=abandoned_waiting.
 
-        Detection uses updated_at (last state change). Waiting runs have
+        Detection uses status_changed_at (last status transition). Waiting runs have
         no forward progress by design, so last_progress_at is wrong here.
 
         Returns list of swept runs with previous_status reflecting the
@@ -2725,7 +2725,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         older_than: timedelta,
         *,
         batch_size: int = 100,
-        max_runs: int = 1000,
+        max_runs: int = 10000,
     ) -> list[SweptRun]:
         """Sweep at most max_runs stale candidates, with bounded projected pages."""
         return await self._sweep_runs(
@@ -2758,7 +2758,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
         for name, value, ceiling in (
             ("batch_size", batch_size, 1000),
-            ("max_runs", max_runs, 10000),
+            ("max_runs", max_runs, 10000 if waiting else 100000),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
                 raise ValueError(f"{name} must be between 1 and {ceiling}")
@@ -2881,6 +2881,16 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                             status=status,
                         )
                     )
+        if visited == max_runs:
+            logger.warning(
+                "Sweep candidate cap reached",
+                extra={
+                    "code": "sweep_cap_reached",
+                    "category": "waiting" if waiting else "running",
+                    "cap": max_runs,
+                    "inspected": visited,
+                },
+            )
         return swept
 
     # ------------------------------------------------------------------
