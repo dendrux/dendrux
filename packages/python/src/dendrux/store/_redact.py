@@ -668,6 +668,12 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
         _verify_tool_names(event.event_type, shown, ctx)
 
 
+# Threat model: redacted readers protect against untrusted DATA (text from
+# models, provider responses, tool results, MCP servers, hook return values and
+# clients). They do not protect against hostile in-process code: a custom
+# provider, strategy, store or hook runs with full process privileges and
+# could write any record (``tools.declared`` included) or bypass this module.
+#
 # Events that name tools, and where. A tool's name can come from an MCP server
 # (or a custom provider or strategy), so a redacted reader sees a name only with
 # positive evidence that it is a developer-declared, non-MCP tool: one of
@@ -704,11 +710,11 @@ class ToolEvidence:
 def _shown_tool_name(name: Any, ctx: _Context) -> Any:
     if not isinstance(name, str) or name in (UNKNOWN_TOOL, MCP_TOOL):
         return name
-    if name in DENDRUX_TOOL_NAMES:
-        return name
     tools = ctx.tools
     if tools is not None and tools.mcp is not None and name in tools.mcp:
-        return MCP_TOOL
+        return MCP_TOOL  # MCP evidence first, even for a reserved name
+    if name in DENDRUX_TOOL_NAMES:
+        return name
     if tools is not None and tools.local is not None and name in tools.local:
         return name  # positively declared, non-MCP (collisions are rejected at build)
     return UNKNOWN_TOOL

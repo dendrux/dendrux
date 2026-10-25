@@ -235,3 +235,12 @@ async def test_declared_local_tools_are_positive_evidence(store: Any, engine: An
     declared, *completed = events
     assert declared.data == {"count": 1}
     assert [e.data["tool_name"] for e in completed] == ["lookup", "use_skill", "<unknown_tool>"]
+
+
+async def test_mcp_tool_with_a_reserved_name_is_still_an_mcp_tool(store: Any, engine: Any) -> None:
+    """MCP evidence is checked before Dendrux's reserved skill-tool names."""
+    run_id = "rs".ljust(26, "0")
+    await _tool_run(store, run_id, "use_skill", connected=True)
+    run_store = RunStore.from_engine(engine)
+    events = await _follow(run_store, run_id)
+    assert events[-1].data["tool_name"] == "<mcp_tool>"
