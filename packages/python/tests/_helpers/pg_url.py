@@ -17,7 +17,22 @@ from sqlalchemy.exc import ArgumentError
 TEST_SUFFIX = "_test"
 MAX_IDENTIFIER_LENGTH = 63
 _DB_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
-_DATABASE_OPTIONS = frozenset({"database", "dbname"})
+# Query options that would move the connection to another database or another server than
+# the URL's path and authority name. A destructive-test URL must not carry any of them.
+_OVERRIDE_OPTIONS = frozenset(
+    {
+        "database",
+        "dbname",
+        "host",
+        "hostaddr",
+        "port",
+        "service",
+        "servicefile",
+        "unix_sock",
+        "unix_socket",
+        "socket",
+    }
+)
 _ENV = "DENDRUX_TEST_PG_URL"
 
 
@@ -44,8 +59,9 @@ def validate_test_pg_url(raw: str, *, append_suffix: bool = True) -> URL:
 
     With ``append_suffix`` a name that does not end in ``_test`` gets the suffix added
     (the integration conftest's Django-style rewrite); otherwise it is refused. Query
-    options that would override the path database are refused, the effective database
-    must equal the path database, and the identifier must fit PostgreSQL's 63 bytes.
+    options that would override the path database or the host, port or socket are refused,
+    the effective database must equal the path database, and the identifier must fit
+    PostgreSQL's 63 bytes.
     """
     try:
         url = make_url(raw)
@@ -56,9 +72,11 @@ def validate_test_pg_url(raw: str, *, append_suffix: bool = True) -> URL:
     name = url.database or ""
     if not name:
         raise _unsafe("it has no database name in its path")
-    overrides = sorted(k for k in url.query if k.lower() in _DATABASE_OPTIONS)
+    overrides = sorted(k for k in url.query if k.lower() in _OVERRIDE_OPTIONS)
     if overrides:
-        raise _unsafe(f"query option(s) {overrides} would override the database in the path")
+        raise _unsafe(
+            f"query option(s) {overrides} would override the database or server named by the URL"
+        )
     if not name.endswith(TEST_SUFFIX):
         if not append_suffix:
             raise _unsafe(f"database name must end in {TEST_SUFFIX!r}")

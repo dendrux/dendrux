@@ -30,6 +30,31 @@ class TestValidator:
         with pytest.raises(UnsafeTestDatabaseUrl):
             validate_test_pg_url(BASE.format("safe_test") + f"?{key}=production")
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "host=another.invalid",
+            "host=another.invalid:6543",
+            "host=%2Fprivate%2Ftmp",
+            "port=6543",
+            "hostaddr=10.0.0.9",
+            "unix_sock=%2Ftmp%2F.s.PGSQL.5432",
+            "service=prod",
+            "HOST=another.invalid",
+        ],
+    )
+    def test_routing_overrides_are_rejected(self, query: str) -> None:
+        with pytest.raises(UnsafeTestDatabaseUrl, match="override"):
+            validate_test_pg_url(BASE.format("safe_test") + f"?{query}")
+
+    def test_routing_overrides_are_rejected_for_libpq_dialects_too(self) -> None:
+        with pytest.raises(UnsafeTestDatabaseUrl):
+            validate_test_pg_url("postgresql+psycopg2://u:p@h/safe_test?host=another.invalid")
+
+    def test_worker_scoping_rejects_routing_overrides(self) -> None:
+        with pytest.raises(UnsafeTestDatabaseUrl):
+            xdist_pg.worker_scoped_pg_url(BASE.format("safe_test") + "?host=another.invalid", "gw0")
+
     def test_effective_database_is_what_the_dialect_would_connect_to(self) -> None:
         url = validate_test_pg_url(BASE.format("safe_test") + "?sslmode=require")
         assert url.database == "safe_test"
