@@ -123,3 +123,50 @@ async def test_postgres_summary_converts_pause_data_once(store: Any, engine: Any
     summary = [s for s in statements if "pause_data" in s]
     assert len(summary) == 1, summary
     assert summary[0].upper().count("AS JSONB") == 1, summary[0]
+
+
+async def test_event_reads_survive_unconvertible_event_data(store: Any, engine: Any) -> None:
+    """Approval arguments and events holding U+0000 still stream and view."""
+    from dendrux.store import FollowEnd, FollowHeartbeat
+
+    await store.create_run("rn".ljust(26, "0"), "a", tenant_id="A")
+    run_id = "rn".ljust(26, "0")
+    await store.save_run_event(
+        run_id,
+        event_type="approval.requested",
+        data={"tool_name": "t", "call_id": "c1", "params": {"q": "x"}},
+    )
+    await store.save_run_event(
+        run_id,
+        event_type="run.paused",
+        data={"status": "waiting_approval", "pending_tool_calls": [{"id": "c1", "name": "t"}]},
+    )
+    await store.pause_run(
+        run_id,
+        status="waiting_approval",
+        pause_data={"pause_id": "p", "pending_tool_calls": [{"id": "c1", "name": "t"}]},
+    )
+    async with engine.begin() as conn:
+        cast = "CAST(:d AS json)" if engine.dialect.name == "postgresql" else ":d"
+        await conn.execute(
+            text(
+                f"UPDATE run_events SET data = {cast} "
+                "WHERE agent_run_id = :i AND event_type = 'approval.requested'"
+            ),
+            {"d": '{"tool_name": "t", "call_id": "c1", "params": {"q": "a\\u0000b"}}', "i": run_id},
+        )
+    run_store = RunStore.from_engine(engine)
+    pending = await run_store.get_pending(run_id, tenant_id="A")
+    assert pending is not None and pending.tool_calls[0].params == {"q": "a\x00b"}
+    seen = []
+    async with run_store.follow(
+        run_id, tenant_id="A", until_terminal=False, max_duration_s=1.0
+    ) as f:
+        async for item in f:
+            if isinstance(item, (FollowEnd, FollowHeartbeat)) or len(seen) == 2:
+                break
+            seen.append(item)
+    assert [e.event_type for e in seen] == ["approval.requested", "run.paused"]
+    assert seen[1].data["pending_tool_calls"][0]["params"] == {"q": "a\x00b"}
+    pairs, _ = await run_store.get_pause_page(run_id, tenant_id="A")
+    assert len(pairs) == 1
