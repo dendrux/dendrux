@@ -129,3 +129,22 @@ class TestEveryEntryPointUsesIt:
         monkeypatch.setattr(integration_conftest, "create_async_engine", _no_engine)
         with pytest.raises(UnsafeTestDatabaseUrl):
             await integration_conftest._ensure_test_db_exists(OVERRIDE, "safe_test")
+
+
+class TestMigrationSchemaUrlHelper:
+    """`test_database_url()` serves tests that already request the `engine` fixture."""
+
+    def test_unset_means_no_postgres(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DENDRUX_TEST_PG_URL", raising=False)
+        assert _migration_schema.test_database_url() is None
+
+    def test_a_valid_url_is_returned_with_its_password(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DENDRUX_TEST_PG_URL", BASE.format("safe_gw0_test"))
+        assert _migration_schema.test_database_url() == BASE.format("safe_gw0_test")
+
+    def test_an_unsafe_url_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DENDRUX_TEST_PG_URL", OVERRIDE)
+        with pytest.raises(UnsafeTestDatabaseUrl):
+            _migration_schema.test_database_url()

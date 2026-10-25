@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -9,7 +10,17 @@ from sqlalchemy import Engine, event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from tests._helpers.pg_url import validate_test_pg_url
+from tests._helpers.pg_url import render, validate_test_pg_url
+
+
+def test_database_url() -> str | None:
+    """The validated, worker-scoped test database URL, or None when Postgres is off.
+
+    For tests that also request the ``engine`` fixture, which has already created the
+    database; tests that do not use ``engine`` take ``pg_test_url`` instead.
+    """
+    raw = os.environ.get("DENDRUX_TEST_PG_URL")
+    return render(validate_test_pg_url(raw)) if raw else None
 
 
 @asynccontextmanager
