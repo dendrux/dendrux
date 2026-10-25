@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Union
 from dendrux.errors import RunNotFoundError
 from dendrux.runtime._pending import approval_calls as approval_calls
 from dendrux.runtime.state import _check_scope
+from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -96,6 +97,16 @@ FollowItem: TypeAlias = Union["StoredEvent", FollowHeartbeat, FollowEnd]  # noqa
 # Pauses whose arguments are shown to a human as the model sent them.
 _PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
 
+# Top-level event-data keys holding free text (a human's or client's words,
+# exception text) that a reader without payloads never sees.
+_FREE_TEXT_KEYS: dict[str, frozenset[str]] = {
+    "run.resumed": frozenset({"user_input"}),
+    "run.error": frozenset({"error"}),
+    "mcp.error": frozenset({"error"}),
+}
+# Dendrux's own fixed denial reasons; any other reason is a person's text.
+_CONSTANT_DENIAL_REASONS = frozenset({"denied_by_policy", DEFAULT_DENIAL_REASON})
+
 
 def redact_event(
     event: StoredEvent,
@@ -115,13 +126,21 @@ def redact_event(
 
     - the system prompt (``run.started``), provider request and response
       bodies and any ``pii_mapping`` are removed from ``data``;
-    - in ``run.paused``, each pending call's ``params`` are removed **unless**
-      ``active_pause`` is true. Active client-tool arguments remain visible;
-      active approval/input arguments require recorded model-sent params.
-      A past pause's arguments are history and are hidden.
+    - in ``run.paused``, each pending call's ``params`` and the requested
+      pause's ``message`` are removed **unless** ``active_pause`` is true.
+      Active client-tool arguments remain visible; active approval/input
+      arguments require recorded model-sent params. A past pause's arguments
+      are history and are hidden;
+    - ``approval.requested.params`` is removed unless ``active_pause`` is true
+      (the request belongs to the run's active pause);
+    - free text is removed: ``run.resumed.user_input``, a denial ``reason``
+      in ``approval.decided.decisions`` (Dendrux's constant reasons stay),
+      ``error`` in ``run.error`` and ``mcp.error`` (``error_info`` and codes
+      stay) and image descriptions (``image.state.described[].text``).
 
     Tool results and server-tool arguments never appear in event data; read
     them with ``RunStore.get_tool_invocations`` (trusted readers only).
+    ``pii_mapping`` is accepted for compatibility and not used.
     """
     if not event.data:
         return event
@@ -135,20 +154,102 @@ def redact_event(
     if include_payloads:
         return dataclasses.replace(event, data=data) if data != event.data else event
     data = {k: v for k, v in data.items() if k not in _HIDDEN_EVENT_KEYS}
-    if (
-        event.event_type == "run.paused"
-        and not active_pause
-        and isinstance(data.get("pending_tool_calls"), list)
-    ):
-        data["pending_tool_calls"] = [without_params(c) for c in data["pending_tool_calls"]]
-    return dataclasses.replace(event, data=data)
+    if event.event_type == "run.paused" and not active_pause:
+        if isinstance(data.get("pending_tool_calls"), list):
+            data["pending_tool_calls"] = [without_params(c) for c in data["pending_tool_calls"]]
+        data.pop("message", None)
+    return dataclasses.replace(event, data=_without_free_text(event.event_type, data, active_pause))
+
+
+def _without_free_text(event_type: str, data: dict[str, Any], active: bool) -> dict[str, Any]:
+    """``data`` without the free text of its event type (one rule set for every reader)."""
+    hidden = _FREE_TEXT_KEYS.get(event_type)
+    if hidden:
+        data = {k: v for k, v in data.items() if k not in hidden}
+    if event_type == "approval.requested" and not active:
+        data.pop("params", None)
+    elif event_type == "approval.decided" and isinstance(data.get("decisions"), list):
+        data["decisions"] = [_without_reason(d) for d in data["decisions"]]
+    elif event_type == "image.state" and isinstance(data.get("described"), list):
+        data["described"] = [_without_keys(d, ("text",)) for d in data["described"]]
+    return data
+
+
+def _without_reason(decision: Any) -> Any:
+    if isinstance(decision, dict) and decision.get("reason") not in _CONSTANT_DENIAL_REASONS:
+        return _without_keys(decision, ("reason",))
+    return decision
+
+
+def _without_keys(item: Any, keys: tuple[str, ...]) -> Any:
+    if not isinstance(item, dict):
+        return item
+    return {k: v for k, v in item.items() if k not in keys}
+
+
+# Event types whose view depends on the run's active pause.
+_PAUSE_VIEW_EVENTS = frozenset({"run.paused", "approval.requested"})
+
+
+@dataclass(slots=True)
+class _PauseView:
+    """The run's active pause when it was read, valid for events up to ``through``.
+
+    ``active`` is the index of the active ``run.paused`` event (None when the
+    run is not paused); ``active_params`` its recorded model-sent arguments by
+    call id (the ``approval.requested`` events of that pause).
+    """
+
+    through: int
+    active: int | None
+    active_params: dict[str, dict[str, Any]]
+
+
+async def _read_pause_view(
+    store: Any, run_id: str, tenant_id: TenantScope, through: int
+) -> _PauseView:
+    """Two bounded reads: the active pause's index, then its recorded arguments."""
+    active = await store._active_pause_sequence(run_id, tenant_id)
+    params = {} if active is None else await store._approval_params(run_id, active, tenant_id)
+    return _PauseView(through, active, params)
+
+
+async def _view_with(
+    store: Any,
+    run_id: str,
+    event: StoredEvent,
+    view: _PauseView,
+    *,
+    tenant_id: TenantScope,
+    include_payloads: bool,
+) -> StoredEvent:
+    """``event`` as a reader sees it, given the run's active pause ``view``."""
+    data = event.data or {}
+    seq = event.sequence_index
+    if event.event_type == "approval.requested":
+        active = (
+            view.active is not None
+            and seq < view.active
+            and isinstance(data.get("call_id"), str)
+            and data["call_id"] in view.active_params
+        )
+        return redact_event(event, include_payloads=include_payloads, active_pause=active)
+    if event.event_type != "run.paused":
+        return redact_event(event, include_payloads=include_payloads)
+    active = seq == view.active
+    params = None
+    if (include_payloads or active) and data.get("status") in _PLACEHOLDER_PAUSES:
+        params = (
+            view.active_params if active else await store._approval_params(run_id, seq, tenant_id)
+        )
+    return redact_event(
+        event, include_payloads=include_payloads, active_pause=active, approval_params=params
+    )
 
 
 def without_params(call: Any) -> Any:
     """A pending-call dict without its arguments."""
-    if not isinstance(call, dict):
-        return call
-    return {k: v for k, v in call.items() if k not in ("params", "arguments")}
+    return _without_keys(call, ("params", "arguments"))
 
 
 @dataclass(eq=False)

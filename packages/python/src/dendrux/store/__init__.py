@@ -80,16 +80,20 @@ from dendrux.runtime.state import (
     _Unscoped,
 )
 from dendrux.store._follow import (
-    PAUSE_STATUSES as PAUSE_STATUSES,
-)
-from dendrux.store._follow import (
+    _PAUSE_VIEW_EVENTS,
     EventFeed,
     Follow,
     FollowCapacityError,
     FollowEnd,
     FollowHeartbeat,
     FollowItem,
+    _PauseView,
+    _read_pause_view,
+    _view_with,
     redact_event,
+)
+from dendrux.store._follow import (
+    PAUSE_STATUSES as PAUSE_STATUSES,
 )
 from dendrux.store._follow import (
     approval_calls as approval_calls,
@@ -843,7 +847,11 @@ class RunStore:
         tenant_id: TenantScope = UNSCOPED,
         limit: int = 100,
     ) -> list[PausePair]:
-        """First bounded pause/resume pairs; use get_pause_page for truncation metadata."""
+        """First bounded pause/resume pairs; use get_pause_page for truncation metadata.
+
+        Payloads are hidden as in :meth:`get_pause_page` with the default
+        ``include_payloads=False`` (``user_input`` is None since 0.5.0).
+        """
         items, _ = await self.get_pause_page(run_id, tenant_id=tenant_id, limit=limit)
         return items
 
@@ -860,6 +868,9 @@ class RunStore:
         Read a lookahead beyond the maximum paired rows so the last returned
         pause's resume is never lost at the page boundary. Orphan resume events
         can shorten the page; truncated remains true when more rows may exist.
+
+        With ``include_payloads=False`` past pauses' arguments are hidden and
+        ``user_input`` (a person's answer) is None.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("limit must be an int between 1 and 1000.")
@@ -883,7 +894,9 @@ class RunStore:
         if len(rows) == row_limit and pairs and pairs[-1].resume_sequence_index is None:
             pairs.pop()  # unresolved lookahead is not represented as an active pause
         items = []
-        active = await self._active_pause_sequence(run_id, tenant_id) if pairs else None
+        pause_view = _PauseView(-1, None, {})
+        if pairs:
+            pause_view = await _read_pause_view(self, run_id, tenant_id, -1)
         for pair in pairs[:limit]:
             event = StoredEvent(
                 sequence_index=pair.pause_sequence_index,
@@ -893,16 +906,19 @@ class RunStore:
                 created_at=pair.pause_at,
                 data={"status": pair.reason, "pending_tool_calls": pair.pending_tool_calls},
             )
-            view = await self._event_view(
+            view = await _view_with(
+                self,
                 run_id,
                 event,
+                pause_view,
                 tenant_id=tenant_id,
                 include_payloads=include_payloads,
-                active_pause=pair.pause_sequence_index == active,
             )
             items.append(
                 dataclasses.replace(
-                    pair, pending_tool_calls=(view.data or {})["pending_tool_calls"]
+                    pair,
+                    pending_tool_calls=(view.data or {})["pending_tool_calls"],
+                    user_input=pair.user_input if include_payloads else None,
                 )
             )
         return items, truncated
@@ -983,27 +999,12 @@ class RunStore:
         *,
         tenant_id: TenantScope = UNSCOPED,
         include_payloads: bool = False,
-        active_pause: bool | None = None,
     ) -> StoredEvent:
-        mapping = None
-        params = None
-        if event.event_type == "run.paused":
-            if active_pause is None:
-                active_pause = event.sequence_index == await self._active_pause_sequence(
-                    run_id, tenant_id
-                )
-            if (include_payloads or active_pause) and (event.data or {}).get("status") in (
-                "waiting_approval",
-                "waiting_human_input",
-            ):
-                mapping = await self.get_pii_mapping(run_id, tenant_id=tenant_id)
-                params = await self._approval_params(run_id, event.sequence_index, tenant_id)
-        return redact_event(
-            event,
-            include_payloads=include_payloads,
-            active_pause=bool(active_pause),
-            pii_mapping=mapping,
-            approval_params=params,
+        view = _PauseView(event.sequence_index, None, {})
+        if event.event_type in _PAUSE_VIEW_EVENTS:
+            view = await _read_pause_view(self, run_id, tenant_id, event.sequence_index)
+        return await _view_with(
+            self, run_id, event, view, tenant_id=tenant_id, include_payloads=include_payloads
         )
 
     async def get_event_view(
