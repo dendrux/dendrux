@@ -99,6 +99,8 @@ def test_environment_dependent_benchmarks_stay_out_of_the_default_gates() -> Non
     assert "@pytest.mark.benchmark\nasync def test_hot_updates_recover" in probe
     migration = (PKG / "tests/integration/test_050_t7b_fix3.py").read_text()
     assert "marks=pytest.mark.benchmark" in migration
+    # opt-in, so precision wins over flake resistance: serial runs differ by about 1.2 points
+    assert 'metrics["9391133f"]["hot_pct"] - 2,' in probe
     assert "async def test_progress_updates_are_hot_eligible" in probe, (
         "keep the deterministic test"
     )

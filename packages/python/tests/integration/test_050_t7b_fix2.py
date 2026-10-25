@@ -328,10 +328,10 @@ async def test_hot_updates_recover_with_four_tools_per_run(store, engine, record
     print("hot_probe", json.dumps(metrics))
     assert metrics["99f3ac7b"]["hot_updates"] == 0
     # Page packing and pool scheduling vary by a few rows. The catalog test
-    # above enforces exact eligibility; this statistical check rejects lost HOT
-    # (the old layout scores 0%) while allowing five percentage points of noise on 3000
-    # updates: repeated serial runs differ from the baseline layout by up to ~1.2 points.
-    assert metrics["fixed"]["hot_pct"] >= metrics["9391133f"]["hot_pct"] - 5, metrics
+    # above enforces exact eligibility; this benchmark rejects lost HOT (the old layout
+    # scores 0%). It runs only on request (`make bench`, quiet machine), so it is precise:
+    # serial runs differ from the baseline layout by about 1.2 points, and 2 allows that.
+    assert metrics["fixed"]["hot_pct"] >= metrics["9391133f"]["hot_pct"] - 2, metrics
     assert metrics["fixed"]["index_bytes"] < metrics["99f3ac7b"]["index_bytes"], metrics
 
 

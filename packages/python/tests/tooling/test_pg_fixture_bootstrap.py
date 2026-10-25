@@ -29,6 +29,12 @@ class _Collected:
 @pytest.fixture(scope="module")
 def integration_items() -> list[pytest.Item]:
     collected = _Collected()
+    # The outer run may pass options (a random seed, say) through PYTEST_ADDOPTS. This nested
+    # run switches plugins off itself and must not inherit them. The setenv stands in for
+    # such a run, so a regression shows up here too.
+    patch = pytest.MonkeyPatch()
+    patch.setenv("PYTEST_ADDOPTS", "--randomly-seed=7")
+    patch.delenv("PYTEST_ADDOPTS")
     code = pytest.main(
         [
             str(INTEGRATION),
@@ -47,6 +53,7 @@ def integration_items() -> list[pytest.Item]:
         ],
         plugins=[collected],
     )
+    patch.undo()
     assert code == 0 and collected.items, "could not collect tests/integration"
     return collected.items
 

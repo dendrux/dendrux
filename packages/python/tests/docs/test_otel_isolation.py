@@ -20,7 +20,11 @@ NOTIFIER_TESTS = "tests/unit/test_otel_notifier.py"
 
 
 def _run(*targets: str) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("COV_", "COVERAGE_"))}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("COV_", "COVERAGE_")) and k != "PYTEST_ADDOPTS"
+    }
     env |= {"PYTHONPATH": str(PKG / "src"), "PYTHON_DOTENV_DISABLED": "1"}
     return subprocess.run(
         [
@@ -41,7 +45,11 @@ def _run(*targets: str) -> subprocess.CompletedProcess[str]:
     [(DOCS_PAGE, NOTIFIER_TESTS), (NOTIFIER_TESTS, DOCS_PAGE)],
     ids=["docs-first", "tests-first"],
 )
-def test_otel_docs_and_notifier_tests_pass_in_either_order(order: tuple[str, str]) -> None:
+def test_otel_docs_and_notifier_tests_pass_in_either_order(
+    order: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `make ci` and CI can pass options through PYTEST_ADDOPTS; the nested run must ignore them.
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:cacheprovider --randomly-seed=7")
     result = _run(*order)
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-1000:]
     assert " failed" not in result.stdout
