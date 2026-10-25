@@ -1,9 +1,12 @@
 """Closed-loop retirement and guards at SQLAlchemy's public connection APIs."""
 
 import asyncio
+import gc
 import logging
 import threading
+import time
 import uuid
+import warnings
 
 import pytest
 from sqlalchemy import text
@@ -13,7 +16,7 @@ from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse
 
 
-async def test_repeated_asyncio_jobs_with_unclosed_agents_are_bounded(
+async def test_repeated_asyncio_jobs_with_unclosed_agents_are_bounded_after_gc(
     engine, tmp_path, caplog, record_property
 ):
     pg = engine.dialect.name == "postgresql"
@@ -32,8 +35,8 @@ async def test_repeated_asyncio_jobs_with_unclosed_agents_are_bounded(
         if pg
         else {}
     )
-    errors, agents, counts, threads, engine_ids = [], [], [], [], []
-    baseline_threads = len(threading.enumerate())
+    errors, agents, counts, engine_ids, remaining_threads = [], [], [], [], []
+    baseline_threads = set(threading.enumerate())
     caplog.set_level(logging.ERROR)
 
     def jobs():
@@ -65,24 +68,43 @@ async def test_repeated_asyncio_jobs_with_unclosed_agents_are_bounded(
                             )
                         ).scalar_one()
                     )
-            threads.append(len(threading.enumerate()))
 
-        try:
-            for _ in range(12):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ResourceWarning)
+            automatic_gc = gc.isenabled()
+            gc.disable()
+            try:
                 try:
-                    asyncio.run(job())
-                except Exception as exc:
-                    errors.append(type(exc).__name__ + ": " + str(exc))
-        finally:
-            # Also exercise closing the final active entry after its owner loop closed.
-            for a in agents:
-                asyncio.run(a.close())
+                    for _ in range(12):
+                        try:
+                            asyncio.run(job())
+                        except Exception as exc:
+                            errors.append(type(exc).__name__ + ": " + str(exc))
+                        # Collect outside a temporary loop: aiosqlite's GC stop
+                        # must not enqueue a result onto a loop about to close.
+                        gc.collect()
+                finally:
+                    for a in agents:
+                        asyncio.run(a.close())
+                    gc.collect()
+                    deadline = time.monotonic() + 5
+                    for thread in threading.enumerate():
+                        if (
+                            thread not in baseline_threads
+                            and thread is not threading.current_thread()
+                        ):
+                            thread.join(timeout=max(0, deadline - time.monotonic()))
+                            if thread.is_alive():
+                                remaining_threads.append(thread.name)
+            finally:
+                if automatic_gc:
+                    gc.enable()
 
     await asyncio.to_thread(jobs)
     assert not errors, "a closed owner loop must not poison subsequent jobs: " + str(errors)
     assert len(engine_ids) == len(set(engine_ids)) == 12
     if pg:
-        assert max(counts) <= 2, "retired pools must close sockets, not merely forget references"
+        assert max(counts) <= 2, "orphaned PG pools must be released after GC"
         async with engine.connect() as conn:
             assert (
                 await conn.execute(
@@ -96,7 +118,7 @@ async def test_repeated_asyncio_jobs_with_unclosed_agents_are_bounded(
             ).scalar_one() == 0
         record_property("closed_loop_peak_connections", max(counts))
     else:
-        assert max(threads) <= baseline_threads + 2, "retired SQLite workers must be closed"
+        assert not remaining_threads, "orphaned SQLite workers must stop after GC"
     assert not [r for r in caplog.records if "Event loop is closed" in r.getMessage() or r.exc_info]
 
 
@@ -158,7 +180,7 @@ async def test_loop_shutdown_drains_cancelled_run_before_retiring_pool(engine, t
             task_holder.append(task)
             await asyncio.wait_for(llm.entered.wait(), 20)
 
-        asyncio.run(start())  # cancels the unfinished run and the pool sentinel together
+        asyncio.run(start())  # cancellation finishes its durable write before the loop closes
 
     caplog.set_level(logging.ERROR)
     await asyncio.to_thread(job)

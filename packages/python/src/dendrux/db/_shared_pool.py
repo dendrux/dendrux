@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,13 +26,16 @@ class _Entry:
     ready: asyncio.Task[None]
     loop: asyncio.AbstractEventLoop
     refs: int = 0
-    reaper: asyncio.Task[None] | None = None
+
+    def can_retire(self) -> bool:
+        """A dead owner makes every remaining reference stale."""
+        return not self.refs or self.loop.is_closed()
 
 
 _lock = threading.Lock()
 _entries: dict[Any, _Entry] = {}
 _by_engine: dict[AsyncEngine, Any] = {}
-_reapers: set[asyncio.Task[None]] = set()
+logger = logging.getLogger(__name__)
 
 
 async def _initialize(engine: AsyncEngine) -> None:
@@ -54,32 +58,32 @@ def _retrieved(task: asyncio.Task[None]) -> None:
         task.exception()  # also retrieved when every initializer waiter was cancelled
 
 
-async def _loop_lifetime(entry: _Entry) -> None:
-    """asyncio.run cancels this sentinel before closing its still-live loop.
-
-    Forget ownership first so closing cancelled jobs cannot await this reaper.
-    Drain other cancelled tasks before disposal, letting their final writes and
-    checkins finish on the owner loop. Other pool reapers are excluded to avoid
-    mutual waits. Explicit release has already removed its entry, so is a no-op.
-    """
-    try:
-        await asyncio.Future()
-    finally:
-        with _lock:
-            key = _by_engine.get(entry.engine)
-            owned = _entries.get(key) is entry
-            if owned:
-                _entries.pop(key)
-                _by_engine.pop(entry.engine)
-        if owned:
-            others = [t for t in asyncio.all_tasks() if t.cancelling() and t not in _reapers]
-            await asyncio.gather(*others, return_exceptions=True)
-            await entry.engine.dispose()
+async def _dispose_entry(entry: _Entry) -> None:
+    if entry.loop.is_closed():
+        # Public disposal replaces the pool without touching dead-loop drivers.
+        # The orphaned pool's connections are released by garbage collection.
+        await entry.engine.dispose(close=False)
+        logger.warning(
+            "Retired a shared engine after its event loop closed; orphaned connections "
+            "await garbage collection. Call await agent.close() or use async with "
+            "Agent(...) before closing the loop.",
+            extra={"code": "shared_engine_loop_closed"},
+        )
+        return
+    if not entry.ready.done():
+        entry.ready.cancel()
+        await asyncio.gather(entry.ready, return_exceptions=True)
+    await entry.engine.dispose()
 
 
-def _reaped(task: asyncio.Task[None]) -> None:
-    _reapers.discard(task)
-    _retrieved(task)
+async def _prepare(
+    engine: AsyncEngine,
+    initialize: Callable[[AsyncEngine], Awaitable[None]],
+    previous: _Entry | None,
+) -> None:
+    if previous is not None:
+        await _dispose_entry(previous)
+    await initialize(engine)
 
 
 async def acquire(
@@ -97,12 +101,10 @@ async def acquire(
     loop = asyncio.get_running_loop()
     with _lock:
         entry = _entries.get(key)
+        previous = None
         if entry is not None and entry.loop.is_closed():
-            # Defensive fallback for manually closed loops. Normal asyncio.run
-            # shutdown has already drained the pool via _loop_lifetime.
-            _entries.pop(key)
+            previous = _entries.pop(key)
             _by_engine.pop(entry.engine)
-            entry.engine.sync_engine.dispose(close=False)
             entry = None
         if (
             entry is not None
@@ -112,13 +114,10 @@ async def acquire(
             raise RuntimeError("The shared database engine belongs to a different event loop")
         if entry is None:
             engine = (factory or create_async_engine)(parsed, **effective)
-            ready = asyncio.ensure_future((initialize or _initialize)(engine))
+            ready = asyncio.ensure_future(_prepare(engine, initialize or _initialize, previous))
             ready.add_done_callback(_retrieved)
             entry = _entries[key] = _Entry(engine, ready, loop)
             _by_engine[engine] = key
-            entry.reaper = asyncio.create_task(_loop_lifetime(entry))
-            _reapers.add(entry.reaper)
-            entry.reaper.add_done_callback(_reaped)
         entry.refs += 1
     try:
         await asyncio.shield(entry.ready)
@@ -135,21 +134,12 @@ async def release(engine: AsyncEngine) -> None:
         if entry is None:
             return
         entry.refs -= 1
-        if entry.refs:
+        if not entry.can_retire():
             return
         _entries.pop(key)
         _by_engine.pop(engine)
 
-    async def dispose() -> None:
-        if entry.reaper is not None:
-            entry.reaper.cancel()
-            await asyncio.gather(entry.reaper, return_exceptions=True)
-        if not entry.ready.done():
-            entry.ready.cancel()
-            await asyncio.gather(entry.ready, return_exceptions=True)
-        await entry.engine.dispose()
-
-    await close_fully(dispose)
+    await close_fully(lambda: _dispose_entry(entry))
 
 
 def _retire_at_exit() -> None:

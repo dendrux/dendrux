@@ -312,3 +312,8 @@ class _PendingReader:
         """
         mapping = await self._scoped_read(self._state.get_pii_mapping, run_id, tenant_id)
         return mapping or {}
+
+
+# Keep implementation below Agent without changing public docs or pickle paths.
+PendingPause.__module__ = "dendrux.store"
+PendingToolCall.__module__ = "dendrux.store"

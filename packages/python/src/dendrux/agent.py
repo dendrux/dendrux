@@ -2010,6 +2010,7 @@ class Agent:
         access to this run. Pending arguments use RunStore.get_pending's view.
         """
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.guardrails._engine import deanonymize_text
         from dendrux.runtime._pending import _PendingReader
         from dendrux.runtime.runner import _cached_output, _public_meta
 
@@ -2033,6 +2034,7 @@ class Agent:
                 {"pii_mapping": await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}}
             )
         )
+        result.answer = deanonymize_text(record.answer, result.meta["pii_mapping"])[0]
         if result.status.value == "success":
             result.output = _cached_output(record.answer, self._output_type, run_id)
         result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
