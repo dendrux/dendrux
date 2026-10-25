@@ -200,8 +200,8 @@ class TestSourceConfiguration:
             _source(**{field: bad})
 
     def test_new_bounds_pass_through_every_constructor(self) -> None:
-        stdio = MCPSource.stdio("l", ["echo"], max_discovery_tools=5, max_discovery_bytes=6)
-        assert (stdio.max_discovery_tools, stdio.max_discovery_bytes) == (5, 6)
+        stdio = MCPSource.stdio("l", ["echo"], max_discovery_tools=5)
+        assert stdio.max_discovery_tools == 5
         server = MCPServer(
             "r", url="https://mcp.example.com/mcp", max_discovery_tools=7, max_discovery_bytes=8
         )
@@ -406,3 +406,84 @@ class TestAgainstARealServer:
                 await adapter.close()
             assert caught.value.reason == "repeated_cursor"
             assert stats["pages"] <= 3
+
+
+_STDIO_SERVER = """
+from mcp.server.mcpserver import MCPServer
+server = MCPServer(name="small")
+@server.tool(name="one", description="a" * 2000)
+def one() -> str:
+    return "ok"
+@server.tool(name="two", description="b")
+def two() -> str:
+    return "ok"
+server.run(transport="stdio")
+"""
+
+
+class TestStdioSources:
+    def _source(self, tmp_path: Any, **kw: Any) -> MCPSource:
+        import sys
+
+        script = tmp_path / "small_server.py"
+        script.write_text(_STDIO_SERVER)
+        return MCPSource.stdio("local", [sys.executable, str(script)], **kw)
+
+    async def test_discovery_works_and_keeps_the_tool_cap(self, tmp_path: Any) -> None:
+        adapter = MCPClientAdapter(self._source(tmp_path))
+        await adapter.connect()
+        try:
+            tools = await asyncio.wait_for(adapter.list_tools(), timeout=30)
+        finally:
+            await adapter.close()
+        assert sorted(t.name for t in tools) == ["one", "two"]
+        capped = MCPClientAdapter(self._source(tmp_path, max_discovery_tools=1))
+        await capped.connect()
+        try:
+            with pytest.raises(MCPDiscoveryLimitError) as caught:
+                await asyncio.wait_for(capped.list_tools(), timeout=30)
+        finally:
+            await capped.close()
+        assert caught.value.reason == "tool_cap"
+
+    def test_a_byte_cap_on_a_stdio_source_is_rejected_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="only valid for HTTP sources"):
+            MCPSource(name="l", command=("echo",), max_discovery_bytes=1000)
+        with pytest.raises(ValueError, match="only valid for HTTP sources"):
+            MCPServer("l", command=["echo"], max_discovery_bytes=1000)
+
+    def test_the_stdio_factory_has_no_byte_cap_option(self) -> None:
+        with pytest.raises(TypeError):
+            MCPSource.stdio("l", ["echo"], max_discovery_bytes=1000)  # type: ignore[call-arg]
+
+    def test_the_default_byte_cap_is_accepted_on_stdio(self) -> None:
+        source = MCPSource.stdio("l", ["echo"])
+        assert source.max_discovery_bytes == 16 * 1024 * 1024
+        assert MCPSource(name="l", command=("echo",)).max_discovery_bytes == 16 * 1024 * 1024
+
+    def test_the_other_caps_apply_to_stdio_sources(self) -> None:
+        source = MCPSource.stdio(
+            "l", ["echo"], max_discovery_pages=3, discovery_timeout=2, max_discovery_tools=5
+        )
+        assert (source.max_discovery_pages, source.discovery_timeout) == (3, 2)
+        assert source.max_discovery_tools == 5
+
+
+class TestTheSdkIsNotPatched:
+    def test_importing_dendrux_leaves_the_sdk_stdio_module_untouched(self) -> None:
+        import subprocess
+        import sys
+
+        code = (
+            "import mcp.client.stdio as m\n"
+            "before = {k: id(v) for k, v in vars(m).items()}\n"
+            "import dendrux, dendrux.mcp, dendrux.mcp._client\n"
+            "after = {k: id(v) for k, v in vars(m).items()}\n"
+            "assert before == after, sorted(k for k in after if before.get(k) != after[k])\n"
+            "from anyio.streams.text import TextReceiveStream\n"
+            "assert m.TextReceiveStream is TextReceiveStream\n"
+        )
+        done = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert done.returncode == 0, done.stderr

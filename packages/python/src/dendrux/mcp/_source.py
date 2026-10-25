@@ -21,6 +21,8 @@ MCPPhysicalIdentity = (
     tuple[Literal["http"], str] | tuple[Literal["stdio"], tuple[str, ...], Path | None]
 )
 
+DEFAULT_MAX_DISCOVERY_BYTES = 16 * 1024 * 1024
+
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 _REDACTED = "[redacted]"
@@ -210,6 +212,14 @@ class MCPSource:
     immutable configuration; use :attr:`physical_identity` when comparing
     connection targets. Authentication objects are passed through to
     ``httpx2.AsyncClient`` by the official MCP SDK adapter.
+
+    Discovery is bounded by ``max_discovery_pages``, ``max_discovery_tools`` and
+    ``discovery_timeout`` for every source, and by ``max_discovery_bytes``
+    (the ``tools/list`` response bodies, capped before they are decoded) for
+    HTTP sources only. A stdio server is a local process the developer
+    launches, inside the developer's trust boundary; an HTTP server is the
+    untrusted case. Setting ``max_discovery_bytes`` on a stdio source raises
+    ``ValueError``.
     """
 
     name: str
@@ -233,7 +243,7 @@ class MCPSource:
     max_discovery_pages: int = 100
     discovery_timeout: float = 60.0
     max_discovery_tools: int = 2000
-    max_discovery_bytes: int = 16 * 1024 * 1024
+    max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES
 
     def __post_init__(self) -> None:
         self._validate_name()
@@ -315,6 +325,12 @@ class MCPSource:
             raise ValueError("MCPSource env and cwd are only valid for stdio sources.")
 
     def _validate_discovery_bounds(self) -> None:
+        if self.command is not None and self.max_discovery_bytes != DEFAULT_MAX_DISCOVERY_BYTES:
+            raise ValueError(
+                "MCPSource max_discovery_bytes is only valid for HTTP sources: a stdio "
+                "server is a local process you launch, so its discovery is bounded by "
+                "max_discovery_tools, max_discovery_pages and discovery_timeout instead."
+            )
         if type(self.max_discovery_pages) is not int or self.max_discovery_pages < 1:
             raise ValueError("MCPSource max_discovery_pages must be a positive integer.")
         for name in ("max_discovery_tools", "max_discovery_bytes"):
@@ -349,7 +365,7 @@ class MCPSource:
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
         max_discovery_tools: int = 2000,
-        max_discovery_bytes: int = 16 * 1024 * 1024,
+        max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES,
     ) -> MCPSource:
         """Configure a production Streamable HTTP MCP source."""
         return cls(
@@ -386,7 +402,6 @@ class MCPSource:
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
         max_discovery_tools: int = 2000,
-        max_discovery_bytes: int = 16 * 1024 * 1024,
     ) -> MCPSource:
         """Configure a trusted local subprocess MCP source."""
         if isinstance(command, str):
@@ -403,7 +418,6 @@ class MCPSource:
             max_discovery_pages=max_discovery_pages,
             discovery_timeout=discovery_timeout,
             max_discovery_tools=max_discovery_tools,
-            max_discovery_bytes=max_discovery_bytes,
         )
 
     @property

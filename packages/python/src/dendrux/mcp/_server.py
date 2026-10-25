@@ -22,6 +22,7 @@ from dendrux.mcp._errors import (
 )
 from dendrux.mcp._result import error_text, has_image_blocks, normalize_mcp_result
 from dendrux.mcp._source import (
+    DEFAULT_MAX_DISCOVERY_BYTES,
     MCPFailureMode,
     MCPSource,
     redact_source_text,
@@ -383,7 +384,7 @@ class MCPServer:
         max_discovery_pages: int = 100,
         discovery_timeout: float = 60.0,
         max_discovery_tools: int = 2000,
-        max_discovery_bytes: int = 16 * 1024 * 1024,
+        max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES,
     ) -> None:
         # Keep the legacy error wording and private transport attributes while
         # all real configuration lives in the immutable MCPSource.

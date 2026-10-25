@@ -481,9 +481,15 @@ class MCPClientAdapter:
             raise self._discovery_limit_error("page_cap", progress.pages)
 
     async def _fetch_page(self, client: Any, cursor: str | None, progress: _PageWalk) -> Any:
-        """One ``tools/list`` request, its HTTP body read within what is left of the byte cap."""
-        remaining = self.source.max_discovery_bytes - progress.wire_bytes
-        read = _DiscoveryRead(self, max(remaining, 1))
+        """One ``tools/list`` request; an HTTP body is read within what is left of the byte cap.
+
+        Stdio sources are developer-launched local processes inside the
+        developer's trust boundary and are not byte-capped (see
+        ``MCPSource.max_discovery_bytes``); they keep the tool, cursor and page
+        caps and the discovery deadline.
+        """
+        remaining = max(self.source.max_discovery_bytes - progress.wire_bytes, 1)
+        read = _DiscoveryRead(self, remaining)
         token = _discovery_read.set(read)
         try:
             page = await client.list_tools(cursor=cursor, cache_mode="refresh")
