@@ -59,21 +59,82 @@ class MalformedToolSchemaError(ValueError):
     """
 
 
+# Subschema keywords walked by :func:`schema_problem`.
+_SUBSCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_SUBSCHEMA_LISTS = ("anyOf", "oneOf", "allOf", "prefixItems", "items")
+_SUBSCHEMAS = (
+    "items",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "additionalItems",
+    "contains",
+    "propertyNames",
+    "not",
+    "if",
+    "then",
+    "else",
+)
+# Budget for the walk; past it the schema is refused (fail closed).
+_SCHEMA_MAX_DEPTH = 32
+_SCHEMA_MAX_NODES = 10_000
+_SCHEMA_BUDGET_PROBLEM = "schema is too large or too deeply nested to check"
+
+
+def _keyword_problem(node: dict[str, Any]) -> str | None:
+    """Shape of the keywords the validator reads, in one (sub)schema.
+
+    ``required``, when present (even as ``null``), must be a list of argument
+    names; ``properties``, when present, must be an object.
+    """
+    if "required" in node:
+        required = node["required"]
+        if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
+            return "required must be a list of argument names"
+    if "properties" in node and not isinstance(node["properties"], dict):
+        return "properties must be an object"
+    return None
+
+
+def _subschemas(node: dict[str, Any]) -> list[dict[str, Any]]:
+    children: list[Any] = []
+    for key in _SUBSCHEMA_MAPS:
+        if isinstance(node.get(key), dict):
+            children.extend(node[key].values())
+    for key in _SUBSCHEMA_LISTS:
+        if isinstance(node.get(key), list):
+            children.extend(node[key])
+    children.extend(node.get(key) for key in _SUBSCHEMAS)
+    return [child for child in children if isinstance(child, dict)]
+
+
+def root_schema_problem(schema: Any) -> str | None:
+    """:func:`_keyword_problem` for the root schema only: the cheap per-call check."""
+    return _keyword_problem(schema) if isinstance(schema, dict) else None
+
+
 def schema_problem(schema: Any) -> str | None:
     """Why ``schema`` cannot be validated against, or ``None`` when it can.
 
-    The one shape checked is ``required``: when the key is present (even as
-    ``null``) it must be a list of argument names. The validator is tolerant
-    of everything else (unknown keywords, odd property schemas, unsupported
-    constructs) by design, and skips what it does not implement.
+    Every (sub)schema reachable through the standard subschema keywords
+    (``properties``, ``items``, ``anyOf``, ``$defs``, ...) is checked with
+    :func:`_keyword_problem`, within a depth of 32 and 10,000 nodes; a schema
+    past either budget is refused. The validator is tolerant of everything else
+    (unknown keywords, odd property schemas, unsupported constructs) by design,
+    and skips what it does not implement.
     """
     if not isinstance(schema, dict):
         return None
-    if "required" not in schema:
-        return None
-    required = schema["required"]
-    if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
-        return "required must be a list of argument names"
+    stack: list[tuple[dict[str, Any], int]] = [(schema, 1)]
+    nodes = 0
+    while stack:
+        node, depth = stack.pop()
+        nodes += 1
+        if nodes > _SCHEMA_MAX_NODES or depth > _SCHEMA_MAX_DEPTH:
+            return _SCHEMA_BUDGET_PROBLEM
+        issue = _keyword_problem(node)
+        if issue is not None:
+            return issue
+        stack.extend((child, depth + 1) for child in _subschemas(node))
     return None
 
 
@@ -139,7 +200,7 @@ def _collect_problems(tool_def: ToolDef, params: dict[str, Any]) -> tuple[list[_
     schema = tool_def.parameters
     if not isinstance(schema, dict):
         return [], False
-    bad_schema = schema_problem(schema)
+    bad_schema = root_schema_problem(schema)
     if bad_schema is not None:
         raise MalformedToolSchemaError(bad_schema)
     properties = schema.get("properties")

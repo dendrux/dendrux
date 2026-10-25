@@ -517,3 +517,98 @@ class TestUnpersistableCharactersAreRejected:
         (tool_msg,) = [m for m in llm.call_history[1]["messages"] if m.role == Role.TOOL]
         assert json.loads(tool_msg.content)["code"] == "invalid_params"
         assert "\\u0000" not in tool_msg.content
+
+
+class TestNestedSchemaShapes:
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {"type": "object", "properties": {"x": {"type": "object", "required": None}}},
+            {"type": "object", "properties": {"x": {"type": "array", "items": {"required": 3}}}},
+            {"type": "object", "properties": {"x": {"anyOf": [{"required": [1]}]}}},
+            {"type": "object", "properties": {"x": {"properties": {"y": {"required": "z"}}}}},
+            {"type": "object", "additionalProperties": {"required": None}},
+            {"type": "object", "$defs": {"d": {"required": [{}]}}},
+            {"type": "object", "patternProperties": {"^a": {"required": None}}},
+            {"type": "object", "properties": {"x": {"properties": []}}},
+            {"type": "object", "properties": []},
+        ],
+    )
+    def test_malformed_nested_keywords_are_found(self, schema: Any) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        assert schema_problem(schema) is not None
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_discovery_rejects_or_skips_a_nested_malformed_required(self, strict: bool) -> None:
+        from types import SimpleNamespace
+
+        from mcp.types import Tool
+
+        from dendrux.mcp import MCPInvalidToolSchemaError
+        from dendrux.mcp._server import build_mcp_tool_defs
+
+        source = SimpleNamespace(name="srv", transport="stdio", call_timeout=30.0)
+        bad = Tool(
+            name="bad",
+            description="",
+            input_schema={
+                "type": "object",
+                "properties": {"x": {"type": "object", "required": None}},
+            },
+        )
+        good = Tool(name="good", description="", input_schema={"type": "object"})
+        if strict:
+            with pytest.raises(MCPInvalidToolSchemaError):
+                build_mcp_tool_defs(
+                    source=source,  # type: ignore[arg-type]
+                    namespace="srv",
+                    tools=[good, bad],
+                    connection_info=None,
+                    strict=True,
+                )
+            return
+        defs, skipped = build_mcp_tool_defs(
+            source=source,  # type: ignore[arg-type]
+            namespace="srv",
+            tools=[good, bad],
+            connection_info=None,
+        )
+        assert [d.name for d in defs] == ["srv__good"]
+        assert [(s.tool, s.reason) for s in skipped] == [("bad", "invalid_schema")]
+
+    def test_well_formed_deep_schemas_pass(self) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        schema = {
+            "type": "object",
+            "required": ["a"],
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "required": ["b"],
+                    "properties": {"b": {"type": "array", "items": {"required": ["c"]}}},
+                },
+                "u": {"anyOf": [{"type": "string"}, {"type": "object", "required": []}]},
+            },
+            "$defs": {"d": {"type": "object", "properties": {}}},
+        }
+        assert schema_problem(schema) is None
+
+    def test_a_schema_past_the_depth_or_node_budget_fails_closed(self) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        deep: dict[str, Any] = {"type": "object"}
+        for _ in range(200):
+            deep = {"type": "object", "properties": {"n": deep}}
+        assert schema_problem(deep) is not None
+        wide = {
+            "type": "object",
+            "properties": {f"p{i}": {"type": "string"} for i in range(50_000)},
+        }
+        assert schema_problem(wide) is not None
+
+    def test_the_call_time_check_stays_cheap_and_root_only(self) -> None:
+        # Nested keywords are not read by the validator, so a call is not refused for them.
+        td = _td({"type": "object", "properties": {"x": {"type": "object", "required": None}}})
+        assert check_tool_call(ToolCall("remote", {"x": {}}), td) is None
