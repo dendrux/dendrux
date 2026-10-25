@@ -107,9 +107,12 @@ from dendrux.store._redact import (
     PastParams,
     PauseView,
     data_of,
+    needs_declared_tools,
     needs_unknown_calls,
+    read_declared_tools,
     read_pause_view,
     read_unknown_calls,
+    redacted_submitted,
     view_with,
 )
 from dendrux.types import ErrorInfo, ReplaySummary
@@ -1050,9 +1053,11 @@ class RunStore:
         view = PauseView(event.sequence_index, None, {})
         if event.event_type in PAUSE_VIEW_EVENTS:
             view = await read_pause_view(self, run_id, tenant_id, event.sequence_index)
-        unknown = None
+        unknown = declared = None
         if needs_unknown_calls(event, include_payloads):
             unknown = await read_unknown_calls(self, run_id, tenant_id)
+        if needs_declared_tools(event, include_payloads):
+            declared = await read_declared_tools(self, run_id, tenant_id)
         return await view_with(
             self,
             run_id,
@@ -1062,6 +1067,7 @@ class RunStore:
             include_payloads=include_payloads,
             past=PastParams(),
             unknown_calls=unknown,
+            declared_tools=declared,
         )
 
     async def get_event_view(
@@ -1124,7 +1130,12 @@ def _pair_view(pair: PausePair, view: StoredEvent, include_payloads: bool) -> Pa
     shown = data_of(view).get("pending_tool_calls", [])
     if include_payloads:
         return dataclasses.replace(pair, pending_tool_calls=shown)
-    return dataclasses.replace(pair, pending_tool_calls=shown, user_input=None)
+    return dataclasses.replace(
+        pair,
+        pending_tool_calls=shown,
+        submitted_results=redacted_submitted(pair.submitted_results),
+        user_input=None,
+    )
 
 
 def _check_list_filters(

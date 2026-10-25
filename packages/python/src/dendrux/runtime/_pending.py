@@ -354,6 +354,44 @@ def check_metadata_filter(metadata_filter: object) -> None:
             raise _invalid("metadata_filter", "values must be str, int, float, bool or None.")
 
 
+MAX_DECLARED_TOOL_NAMES = 1000
+
+
+async def declared_tool_names(
+    state: Any, run_id: str, tenant_id: TenantScope
+) -> frozenset[str] | None:
+    """Tool names the run recorded for calls to declared tools (unknown-tool
+    rejections excluded). One indexed read of distinct names; None when it
+    cannot be known (a custom store, or more than ``MAX_DECLARED_TOOL_NAMES``)."""
+    factory = getattr(state, "_session_factory", None)
+    if factory is None:
+        return None
+    from sqlalchemy import and_, not_, select
+
+    from dendrux.db.models import ToolCallRecord
+    from dendrux.runtime.state import _run_in_scope
+
+    rejected = and_(
+        ToolCallRecord.success.is_(False),
+        ToolCallRecord.error_message.startswith(UNKNOWN_TOOL_PREFIX, autoescape=True),
+    )
+    stmt = (
+        select(ToolCallRecord.tool_name)
+        .where(
+            ToolCallRecord.agent_run_id == run_id,
+            _run_in_scope(run_id, tenant_id),
+            not_(rejected),
+        )
+        .distinct()
+        .limit(MAX_DECLARED_TOOL_NAMES + 1)
+    )
+    async with factory() as session:
+        names = (await session.execute(stmt)).scalars().all()
+    if len(names) > MAX_DECLARED_TOOL_NAMES:
+        return None
+    return frozenset(names)
+
+
 def _is_postgres_store(state: Any) -> bool:
     engine = getattr(state, "_engine", None)
     dialect = getattr(getattr(engine, "dialect", None), "name", None)

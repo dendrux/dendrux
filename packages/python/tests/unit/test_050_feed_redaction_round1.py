@@ -56,7 +56,7 @@ def test_hook_reasons_hidden_constants_kept() -> None:
     denied = _shown(
         "policy.denied", {"tool_name": "t", "call_id": "c", "reason": SECRET, "source": "hook"}
     )
-    assert denied == {"tool_name": "t", "call_id": "c", "source": "hook"}
+    assert denied == {"tool_name": "t", "source": "hook"}
     for constant in ("denied_by_policy", "policy hook error"):
         assert _shown("policy.denied", {"reason": constant})["reason"] == constant
     requested = _shown(

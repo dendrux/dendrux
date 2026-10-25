@@ -594,7 +594,14 @@ class TestGetPauses:
         assert pause.pause_sequence_index == 0
         assert pause.resume_sequence_index == 1
         assert pause.resume_at is not None
-        assert pause.pending_tool_calls == [{"id": "tc_1", "name": "read_file", "target": "client"}]
+        # Redacted by default since 0.5.0: a past pause's call ids are hidden
+        # (a custom provider may choose them); trusted readers see them.
+        assert pause.pending_tool_calls == [{"name": "read_file", "target": "client"}]
+        assert pause.submitted_results == [{"name": "read_file", "success": True}]
+        (trusted,) = await store.get_pauses("r1", include_payloads=True)
+        assert trusted.pending_tool_calls == [
+            {"id": "tc_1", "name": "read_file", "target": "client"}
+        ]
 
     async def test_unpaired_pause_is_active(self, store, internal_store) -> None:
         """A run.paused event with no following run.resumed is still pending."""

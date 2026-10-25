@@ -32,7 +32,12 @@ from dendrux.media._ids import PlaceholderReason
 from dendrux.media._policy import Origin as ImageOrigin
 from dendrux.pricing import CostSource
 from dendrux.runtime._limit_checks import INPUT_SIZE_LIMIT_CODE
-from dendrux.runtime._pending import approval_calls, check_read_bool, unknown_tool_calls
+from dendrux.runtime._pending import (
+    approval_calls,
+    check_read_bool,
+    declared_tool_names,
+    unknown_tool_calls,
+)
 from dendrux.runtime.submit import DEFAULT_DENIAL_REASON
 from dendrux.tools._limits import MAX_CALLS_CODE, SIZE_LIMIT_CODE
 from dendrux.tools._validate import (
@@ -121,6 +126,7 @@ class _Context:
 
     active: bool
     unknown_calls: frozenset[str] | None
+    declared_tools: frozenset[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +226,9 @@ def _bool(value: Any) -> Any:
 
 
 def _generated_id(value: Any) -> Any:
-    """An id Dendrux generated (run, call, pause, note, image id). Provenance: the
-    writer passes a ``generate_ulid()`` / ``image_id()`` value; the check only
-    rejects malformed rows."""
+    """An id Dendrux generated (run, pause, note, image id; never a tool call id,
+    which a custom provider may choose). Provenance: the writer passes a
+    ``generate_ulid()`` / ``image_id()`` value; the check only rejects malformed rows."""
     return value if value is None or (isinstance(value, str) and _ID.fullmatch(value)) else _HIDE
 
 
@@ -299,7 +305,7 @@ _ERROR_INFO = _obj(
     }
 )
 _PENDING_CALL: dict[str, Check] = {
-    "id": _generated_id,
+    # "id" is a ToolCall.id a custom provider may choose: active pause only (_special)
     "name": _declared,  # a pending call is a declared tool (unknown tools never pause)
     "target": _enum(_TARGETS),
     "args_hidden": _bool,
@@ -323,7 +329,6 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "submitted_results": _list(
             _obj(
                 {
-                    "call_id": _generated_id,
                     "name": _declared,
                     "success": _bool,
                     "image_count": _num,
@@ -354,7 +359,6 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
     # loops/react.py: gated calls are declared tools; params in _special
     "approval.requested": {
         "tool_name": _declared,
-        "call_id": _generated_id,
         "source": _enum(_APPROVAL_SOURCES),
         "reason": _enum(_CONSTANT_APPROVAL_REASONS),
     },
@@ -364,7 +368,6 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "decisions": _list(
             _obj(
                 {
-                    "call_id": _generated_id,
                     "tool_name": _declared,
                     "decision": _enum(_CALL_DECISIONS),
                     "reason": _enum(_CONSTANT_DENIAL_REASONS),
@@ -375,15 +378,13 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
     # react policy paths: hooks run on declared tools; error_type (a class name) hidden
     "policy.denied": {
         "tool_name": _declared,
-        "call_id": _generated_id,
         "source": _enum(_APPROVAL_SOURCES),
         "reason": _enum(_CONSTANT_DENIAL_REASONS),
     },
-    "policy.substituted": {"tool_name": _declared, "call_id": _generated_id},
-    "policy.hook_error": {"tool_name": _declared, "call_id": _generated_id},
+    "policy.substituted": {"tool_name": _declared},
+    "policy.hook_error": {"tool_name": _declared},
     "policy.hook_warning": {
         "tool_name": _declared,
-        "call_id": _generated_id,
         "warning": _enum({_CLIENT_APPROVAL_REASON}),
     },
     # runtime/persistence.py: numbers and enumerations; model hidden
@@ -434,7 +435,6 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
     "guardrail.unmapped_placeholder": {},
     "guardrail.restore_skipped": {
         "tool_name": _declared,
-        "call_id": _generated_id,
         "entities": _kinds,
         "count": _num,
         "code": _enum(_RESTORE_CODES),
@@ -568,13 +568,18 @@ def _special(event: StoredEvent, raw: dict[str, Any], shown: dict[str, Any], ctx
     """Rules that need more than one field or the reader's context."""
     kind = event.event_type
     if kind == "run.paused" and ctx.active:
+        # The active pause's call ids and arguments, which a client acts on (B2).
         for call, original in zip(
             shown.get("pending_tool_calls", []), _dicts(raw.get("pending_tool_calls")), strict=False
         ):
-            if "params" in original:
-                call["params"] = original["params"]  # the active pause's arguments (B2)
-    elif kind == "approval.requested" and ctx.active and "params" in raw:
-        shown["params"] = raw["params"]
+            call.update({k: original[k] for k in ("id", "params") if k in original})
+    elif kind == "approval.requested" and ctx.active:
+        shown.update({k: raw[k] for k in ("call_id", "params") if k in raw})
+    elif kind == "image.state":
+        for verdict in shown.get("guardrail_verdicts", []):
+            name = verdict.get("tool_name")
+            if name is not None and (ctx.declared_tools is None or name not in ctx.declared_tools):
+                verdict["tool_name"] = UNKNOWN_TOOL  # a strategy-built name, unverified
     elif kind == "tool.completed":
         if "code" in raw:
             shown["code"] = (
@@ -603,6 +608,28 @@ def _unknown_tool(data: dict[str, Any], event: StoredEvent, ctx: _Context) -> bo
     if ctx.unknown_calls is None:
         return True  # no evidence: fail closed
     return event.correlation_id in ctx.unknown_calls
+
+
+# Event types whose correlation_id is an id Dendrux generates (an LLM
+# interaction, an inbox note). Every other correlation id is a ToolCall.id.
+_DENDRUX_CORRELATED = frozenset({"llm.completed", "inbox.delivered"})
+
+
+def _without_call_correlation(event: StoredEvent, active: bool) -> StoredEvent:
+    """Hide a tool call id carried as ``correlation_id`` (a custom provider may
+    choose it), except on the active pause's approval request."""
+    keep = event.event_type in _DENDRUX_CORRELATED or (
+        active and event.event_type == "approval.requested"
+    )
+    if keep or event.correlation_id is None:
+        return event
+    return dataclasses.replace(event, correlation_id=None)
+
+
+def redacted_submitted(results: Any) -> list[Any]:
+    """``run.resumed.submitted_results`` as a redacted reader sees them."""
+    shown = _SCHEMAS["run.resumed"]["submitted_results"](results)
+    return [] if shown is _HIDE else list(shown)
 
 
 REVIEWED_EVENT_TYPES: frozenset[str] = frozenset(_SCHEMAS)
@@ -666,27 +693,47 @@ def _redact(
     active_pause: bool,
     approval_params: Mapping[str, dict[str, Any]] | None,
     unknown_calls: frozenset[str] | None,
+    declared_tools: frozenset[str] | None = None,
 ) -> StoredEvent:
-    if not isinstance(event.data, dict):  # malformed or empty row: nothing to show
-        return event if include_payloads is True else dataclasses.replace(event, data={})
+    if include_payloads is True:
+        return _trusted(event, approval_params)
+    shown_event = _without_call_correlation(event, active_pause is True)
+    schema = _SCHEMAS.get(event.event_type)
+    if not isinstance(event.data, dict) or schema is None:
+        # A malformed row, or an event type nobody reviewed: nothing to show.
+        return dataclasses.replace(shown_event, data={})
     if not event.data:
+        return shown_event
+    data = _with_recorded_args(event, approval_params)
+    context = _Context(
+        active=active_pause is True, unknown_calls=unknown_calls, declared_tools=declared_tools
+    )
+    shown = _apply(schema, data)
+    _special(event, data, shown, context)  # the original event: its ids are evidence
+    return dataclasses.replace(shown_event, data=shown)
+
+
+def _trusted(
+    event: StoredEvent, approval_params: Mapping[str, dict[str, Any]] | None
+) -> StoredEvent:
+    """A payload reader's view: everything, with approval pauses' recorded arguments."""
+    if not isinstance(event.data, dict) or not event.data:
         return event
-    data = dict(event.data)
+    data = _with_recorded_args(event, approval_params)
+    return dataclasses.replace(event, data=data) if data != event.data else event
+
+
+def _with_recorded_args(
+    event: StoredEvent, approval_params: Mapping[str, dict[str, Any]] | None
+) -> dict[str, Any]:
+    data = dict(event.data or {})
     if (
         event.event_type == "run.paused"
         and is_one_of(data.get("status"), _PLACEHOLDER_PAUSES)
         and isinstance(data.get("pending_tool_calls"), list)
     ):
         data["pending_tool_calls"] = approval_calls(data["pending_tool_calls"], approval_params)
-    if include_payloads is True:
-        return dataclasses.replace(event, data=data) if data != event.data else event
-    schema = _SCHEMAS.get(event.event_type)
-    if schema is None:  # an event type nobody reviewed shows no data
-        return dataclasses.replace(event, data={})
-    context = _Context(active=active_pause is True, unknown_calls=unknown_calls)
-    shown = _apply(schema, data)
-    _special(event, data, shown, context)
-    return dataclasses.replace(event, data=shown)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +843,7 @@ async def view_with(
     include_payloads: bool,
     past: PastParams,
     unknown_calls: frozenset[str] | None = None,
+    declared_tools: frozenset[str] | None = None,
 ) -> StoredEvent:
     """``event`` as a reader sees it, given the run's active pause ``view``."""
     data = data_of(event)
@@ -820,7 +868,19 @@ async def view_with(
         active_pause=active,
         approval_params=params,
         unknown_calls=unknown_calls,
+        declared_tools=declared_tools,
     )
+
+
+def needs_declared_tools(event: StoredEvent, include_payloads: bool) -> bool:
+    """A redacted ``image.state``: its verdicts' tool names need the run's recorded tools."""
+    return not include_payloads and event.event_type == "image.state"
+
+
+async def read_declared_tools(
+    store: Any, run_id: str, tenant_id: TenantScope
+) -> frozenset[str] | None:
+    return await declared_tool_names(getattr(store, "_state", None), run_id, tenant_id)
 
 
 def needs_unknown_calls(event: StoredEvent, include_payloads: bool) -> bool:

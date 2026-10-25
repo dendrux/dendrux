@@ -46,7 +46,9 @@ from dendrux.store._redact import (
     PastParams,
     PauseView,
     _redact,
+    needs_declared_tools,
     needs_unknown_calls,
+    read_declared_tools,
     read_pause_view,
     read_unknown_calls,
     view_with,
@@ -178,6 +180,7 @@ class _RunFeed:
         self._view_generation = 0
         self._view_lock = asyncio.Lock()
         self._unknown: tuple[int, frozenset[str] | None] | None = None
+        self._declared: tuple[int, frozenset[str] | None] | None = None
 
     def _observe(self, event: StoredEvent) -> None:
         """Drop the cached pause view when a newer event may have changed the pause."""
@@ -221,6 +224,16 @@ class _RunFeed:
         ids = await read_unknown_calls(self.owner.store, self.run_id, tenant_id)
         self._unknown = (through, ids)
         return ids
+
+    async def declared_tools(self, seq: int, tenant_id: TenantScope) -> frozenset[str] | None:
+        """Tool names the run recorded for declared calls, read once per newer event."""
+        cached = self._declared
+        if cached is not None and seq <= cached[0]:
+            return cached[1]
+        through = max(seq, self.head if self.head is not None else -1)
+        names = await read_declared_tools(self.owner.store, self.run_id, tenant_id)
+        self._declared = (through, names)
+        return names
 
     def add(self, follower: _Follower) -> int | None:
         """Register ``follower``; return the head it must catch up to from the database."""
@@ -750,9 +763,11 @@ async def _feed_view(
             approval_params=None,
             unknown_calls=None,
         )
-    unknown = None
+    unknown = declared = None
     if needs_unknown_calls(event, include_payloads):
         unknown = await feed.unknown_calls(event.sequence_index, tenant_id)
+    if needs_declared_tools(event, include_payloads):
+        declared = await feed.declared_tools(event.sequence_index, tenant_id)
     view = PauseView(event.sequence_index, None, {})
     if event.event_type in PAUSE_VIEW_EVENTS:
         view = await feed.pause_view(event.sequence_index, tenant_id)
@@ -765,6 +780,7 @@ async def _feed_view(
         include_payloads=include_payloads,
         past=past,
         unknown_calls=unknown,
+        declared_tools=declared,
     )
 
 

@@ -51,7 +51,7 @@ class TestRedactFreeText:
         )
         shown = redact_event(ev).data
         assert "params" not in shown
-        assert shown == {"tool_name": "sql", "call_id": "c1", "reason": "requires_approval"}
+        assert shown == {"tool_name": "sql", "reason": "requires_approval"}
         assert redact_event(ev, active_pause=True).data["params"] == {"q": SECRET}
         assert redact_event(ev, include_payloads=True).data["params"] == {"q": SECRET}
 
@@ -240,9 +240,9 @@ async def test_follow_active_approval_request_keeps_its_params(state: Any, engin
     await _write_history(state, active=True)
     store = RunStore.from_engine(engine)
     events = await _follow_all(store)
-    by_call = {e.data["call_id"]: e.data for e in events if e.event_type == "approval.requested"}
-    assert "params" not in by_call["c1"]  # past
-    assert by_call["c2"]["params"] == {"q": "now"}  # active
+    past, active = [e.data for e in events if e.event_type == "approval.requested"]
+    assert "params" not in past and "call_id" not in past  # a past call id is hidden too
+    assert active["call_id"] == "c2" and active["params"] == {"q": "now"}
     assert SECRET not in json.dumps([e.data for e in events])
 
 
