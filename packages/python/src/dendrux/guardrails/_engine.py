@@ -863,7 +863,7 @@ def _collect_leaves(params: dict[str, Any]) -> _Leaves:
                 out.limit = out.limit or "size"
                 break
             out.items.append((key, text, True))
-        elif isinstance(value, dict | list):
+        elif isinstance(value, dict | list | tuple):
             if depth + 1 > _MAX_RECURSION_DEPTH:
                 out.limit = out.limit or "nesting depth"
             elif isinstance(value, dict):
@@ -924,49 +924,72 @@ async def _scan_joined_leaves(
     *,
     where: str,
 ) -> tuple[list[Finding], str | None]:
-    """Scan all params as one text, in walk order: ``key=value`` per value, bare keys too.
+    """Scan all params as one text: ``key=value`` per value, bare keys too.
 
     A pattern whose evidence sits in a sibling param (``{"label": "aws
     secret:", "value": "<token>"}``) or in an ancestor key (``{"aws secret":
     {"value": "<token>"}}``) fires on the joined text as it does on the same
-    text in one string. Only findings beyond what the per-leaf scans already
-    reported are returned, so nothing is counted twice.
+    text in one string. Contextual patterns read their evidence before (or
+    around) the value, and a dict's insertion order is the sender's choice, so
+    the text is scanned in walk order and in reverse leaf order: a context key
+    that comes after, or in a later branch than, the value is found either way.
+    Only findings beyond what the per-leaf scans already reported are returned,
+    so nothing is counted twice.
     """
     if len(leaves.items) < 2:
         return [], None
-    joined = _SEGMENT_SEP.join(
+    lines = [
         f"{k[-_KEY_CONTEXT_CHARS:]}={t}" if with_context else t
         for k, t, with_context in leaves.items
-    )
+    ]
     known = Counter(f.entity_type for f in leaf_findings)
     extra_findings: list[Finding] = []
+    for ordered in (lines, lines[::-1]):
+        block = await _scan_joined_text(
+            _SEGMENT_SEP.join(ordered), known, extra_findings, guardrails, where=where
+        )
+        if block is not None:
+            return extra_findings, block
+    return extra_findings, None
+
+
+async def _scan_joined_text(
+    joined: str,
+    known: Counter[str],
+    extra_findings: list[Finding],
+    guardrails: list[Guardrail],
+    *,
+    where: str,
+) -> str | None:
+    """One pass of :func:`_scan_joined_leaves`; adds fresh findings, returns a block error."""
+    before = Counter(known)
     for guardrail in guardrails:
         if len(joined) > MAX_SCAN_CHARS:
             block = _unscannable_outcome(
                 guardrail, extra_findings, where=f"{where}, over the size limit"
             )
             if block is not None:
-                return extra_findings, block
+                return block
             continue
         raw = await guardrail.scan(joined)
         if _has_unscannable(raw):
             block = _unscannable_outcome(guardrail, extra_findings, where=where)
             if block is not None:
-                return extra_findings, block
+                return block
             continue
-        merged = _deoverlap(raw)
         fresh: list[Finding] = []
         seen: Counter[str] = Counter()
-        for f in merged:
+        for f in _deoverlap(raw):
             seen[f.entity_type] += 1
-            if seen[f.entity_type] > known[f.entity_type]:
+            if seen[f.entity_type] > before[f.entity_type]:
                 fresh.append(f)
+        known.update({e: n - known[e] for e, n in seen.items() if n > known[e]})
         if not fresh:
             continue
         extra_findings.extend(fresh)
         if guardrail.action == "block":
-            return extra_findings, _block_message(guardrail, fresh, where=where)
-    return extra_findings, None
+            return _block_message(guardrail, fresh, where=where)
+    return None
 
 
 async def _scan_leaf_for_findings(

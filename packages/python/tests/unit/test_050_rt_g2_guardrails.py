@@ -203,3 +203,42 @@ class TestAncestorKeyContext:
         findings, block = await engine.scan_outgoing("ok", [{"outer": {"mail": _EMAIL}}])
         assert block is None
         assert len(findings) == 1
+
+
+class TestContextIsIndependentOfOrder:
+    async def _blocks(self, params: dict[str, object]) -> bool:
+        engine = GuardrailEngine([SecretDetection(action="block")])
+        _, block = await engine.scan_outgoing("ok", [params])
+        return block is not None
+
+    async def test_value_before_its_context_key(self) -> None:
+        assert await self._blocks({"value": _TOKEN, "aws secret": {}})
+
+    async def test_context_in_a_later_nested_sibling_branch(self) -> None:
+        assert await self._blocks({"value": _TOKEN, "branch": {"inner": {"aws secret": {}}}})
+
+    async def test_nested_value_before_a_context_in_a_later_branch(self) -> None:
+        assert await self._blocks({"a": {"b": [{"v": _TOKEN}]}, "z": {"aws secret": 1}})
+
+    async def test_tuples_are_descended(self) -> None:
+        assert await self._blocks({"aws secret": (_TOKEN,)})
+        assert await self._blocks({"aws secret": ({"v": _TOKEN},)})
+        assert await self._blocks({"v": (_TOKEN,), "aws secret": ()})
+
+    async def test_access_key_id_on_either_side(self) -> None:
+        akia = "AKIAIOSFODNN7EXAMPLE"
+        assert await self._blocks({"id": akia, "k": _TOKEN})
+        assert await self._blocks({"k": _TOKEN, "id": akia})
+
+    async def test_no_context_means_no_block_in_either_order(self) -> None:
+        assert not await self._blocks({"value": _TOKEN, "city": "Oslo"})
+        assert not await self._blocks({"city": "Oslo", "value": _TOKEN})
+
+    async def test_findings_are_not_counted_twice_by_the_two_passes(self) -> None:
+        engine = GuardrailEngine([PII(action="warn")])
+        findings, _ = await engine.scan_outgoing("ok", [{"a": _EMAIL, "b": {"c": "x"}}])
+        assert len(findings) == 1
+        findings, _ = await engine.scan_outgoing(
+            "ok", [{"a": _EMAIL, "b": "bob@example.org", "c": [(_EMAIL,)]}]
+        )
+        assert len(findings) == 3
