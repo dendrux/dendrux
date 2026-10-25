@@ -27,12 +27,11 @@ no arguments model and keep JSON-Schema validation only.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import re
-import typing
 from typing import TYPE_CHECKING, Any, NamedTuple, get_type_hints
 
-import pydantic_core
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from dendrux.tool import _VARIADIC_KINDS, _is_optional, _strip_annotated
@@ -42,14 +41,106 @@ if TYPE_CHECKING:
 
 _ARGS_SPEC_ATTR = "__tool_args_spec__"
 
-# Built-in Pydantic error types whose message templates never contain the
-# input value. ``value_error`` / ``assertion_error`` carry a custom
-# validator's own text, and custom error types are arbitrary, so neither is
-# ever shown.
-_SAFE_ERROR_TYPES = frozenset(typing.get_args(pydantic_core.core_schema.ErrorType)) - {
-    "value_error",
-    "assertion_error",
+# Pydantic error types whose message templates are fixed text or quote only
+# the schema (limits, allowed values, type names), never the input. This is an
+# allow-list: a type not listed (``value_error`` and ``assertion_error`` carry a
+# custom validator's own text; ``union_tag_invalid``, ``uuid_parsing``,
+# ``bytes_invalid_encoding`` and ``json_invalid`` quote parts of the input; custom
+# and future types are arbitrary) is reported by its type name alone.
+_SAFE_ERROR_TYPES = frozenset(
+    {
+        "missing",
+        "extra_forbidden",
+        "none_required",
+        "frozen_field",
+        "frozen_instance",
+        "model_type",
+        "model_attributes_type",
+        "dataclass_type",
+        "dataclass_exact_type",
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+        "multiple_of",
+        "finite_number",
+        "too_short",
+        "too_long",
+        "string_type",
+        "string_sub_type",
+        "string_unicode",
+        "string_too_short",
+        "string_too_long",
+        "string_pattern_mismatch",
+        "enum",
+        "literal_error",
+        "dict_type",
+        "mapping_type",
+        "list_type",
+        "tuple_type",
+        "set_type",
+        "frozen_set_type",
+        "set_item_not_hashable",
+        "bool_type",
+        "bool_parsing",
+        "int_type",
+        "int_parsing",
+        "int_parsing_size",
+        "int_from_float",
+        "float_type",
+        "float_parsing",
+        "bytes_type",
+        "bytes_too_short",
+        "bytes_too_long",
+        "date_type",
+        "date_parsing",
+        "date_from_datetime_parsing",
+        "date_from_datetime_inexact",
+        "date_past",
+        "date_future",
+        "time_type",
+        "time_parsing",
+        "datetime_type",
+        "datetime_parsing",
+        "datetime_from_date_parsing",
+        "datetime_past",
+        "datetime_future",
+        "timezone_naive",
+        "timezone_aware",
+        "timezone_offset",
+        "time_delta_type",
+        "time_delta_parsing",
+        "union_tag_not_found",
+        "url_type",
+        "url_parsing",
+        "url_syntax_violation",
+        "url_too_long",
+        "url_scheme",
+        "uuid_type",
+        "uuid_version",
+        "decimal_type",
+        "decimal_parsing",
+        "decimal_max_digits",
+        "decimal_max_places",
+        "decimal_whole_digits",
+        "complex_type",
+        "is_instance_of",
+        "is_subclass_of",
+        "callable_type",
+    }
+)
+# Fixed texts for types that are useful to the model but whose template quotes the input.
+_FIXED_MESSAGES = {
+    "union_tag_invalid": "Input does not match any of the expected tags",
+    "uuid_parsing": "Input should be a valid UUID",
+    "bytes_invalid_encoding": "Input should be validly encoded",
+    "json_invalid": "Input should be valid JSON",
 }
+# Stands in for a dict key (or any other input-derived name) in an error location.
+KEY_PLACEHOLDER = "<key>"
+# Locations pydantic adds itself: ``dict[K, V]`` key and value positions.
+_STRUCTURAL_LOC = frozenset({"[key]", "[value]"})
+_MAX_SCHEMA_NODES = 20_000
 
 _MAX_REPORTED_ERRORS = 10
 
@@ -132,7 +223,7 @@ def _validate(spec: ArgsSpec, params: dict[str, Any]) -> BaseModel:
     try:
         return spec.model.model_validate(params)
     except ValidationError as exc:
-        problems = _problems(exc)
+        problems = _problems(exc, declared_names(spec))
     raise ArgumentCoercionError(problems)
 
 
@@ -192,32 +283,80 @@ def build_call(spec: ArgsSpec, normalized: dict[str, Any]) -> tuple[list[Any], d
     return args, kwargs
 
 
-def _path(loc: tuple[int | str, ...]) -> str:
+@functools.lru_cache(maxsize=512)
+def _model_names(model: type[BaseModel]) -> frozenset[str]:
+    names: set[str] = set()
+    try:
+        schema: Any = model.model_json_schema(by_alias=True, mode="validation")
+    except Exception:
+        return frozenset()
+    stack: list[Any] = [schema]
+    seen = 0
+    while stack and seen < _MAX_SCHEMA_NODES:
+        node = stack.pop()
+        seen += 1
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                names.update(k for k in properties if isinstance(k, str))
+            defs = node.get("$defs")
+            if isinstance(defs, dict):
+                names.update(k for k in defs if isinstance(k, str))
+            mapping = (node.get("discriminator") or {}).get("mapping")
+            if isinstance(mapping, dict):
+                names.update(k for k in mapping if isinstance(k, str))
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return frozenset(names)
+
+
+def declared_names(spec: ArgsSpec) -> frozenset[str]:
+    """Names the tool's own signature and types declare: argument, field and type names.
+
+    Only these may appear in an error location; any other name there came
+    from the input (a dict key, an extra key) and is replaced by ``<key>``.
+    """
+    return _model_names(spec.model) | {name for name, _, _ in spec.params}
+
+
+def _loc_name(item: str, declared: frozenset[str]) -> str:
+    return item if item in declared or item in _STRUCTURAL_LOC else KEY_PLACEHOLDER
+
+
+def _path(loc: tuple[int | str, ...], declared: frozenset[str] = frozenset()) -> str:
     parts: list[str] = []
     for item in loc:
         if isinstance(item, int):
             parts.append(f"[{item}]")
         elif parts:
-            parts.append(f".{item}")
+            parts.append(f".{_loc_name(item, declared)}")
         else:
-            parts.append(str(item))
+            parts.append(_loc_name(item, declared))
     return "".join(parts) or "(arguments)"
 
 
-def _problems(exc: ValidationError) -> list[ArgumentProblem]:
-    problems: list[ArgumentProblem] = []
-    for error in exc.errors(include_url=False)[:_MAX_REPORTED_ERRORS]:
-        kind = error.get("type", "")
-        if kind in _SAFE_ERROR_TYPES:
-            message = str(error.get("msg", "is invalid"))
-        elif kind in ("value_error", "assertion_error"):
-            message = "failed the tool's own validation"
-        else:
-            message = f"failed validation ({kind})" if kind else "is invalid"
-        problems.append(
-            ArgumentProblem(_path(tuple(error.get("loc", ()))), message, error.get("input"))
+def _problem_message(kind: str, error: Any) -> str:
+    if kind in _SAFE_ERROR_TYPES:
+        return str(error.get("msg", "is invalid"))
+    if kind in _FIXED_MESSAGES:
+        return _FIXED_MESSAGES[kind]
+    if kind in ("value_error", "assertion_error"):
+        return "failed the tool's own validation"
+    return f"failed validation ({kind})" if kind else "is invalid"
+
+
+def _problems(
+    exc: ValidationError, declared: frozenset[str] = frozenset()
+) -> list[ArgumentProblem]:
+    return [
+        ArgumentProblem(
+            _path(tuple(error.get("loc", ())), declared),
+            _problem_message(error.get("type", ""), error),
+            error.get("input"),
         )
-    return problems
+        for error in exc.errors(include_url=False)[:_MAX_REPORTED_ERRORS]
+    ]
 
 
 # Same shape as the PII guardrail's ``<<ENTITY_N>>`` placeholders.

@@ -1,0 +1,382 @@
+"""Tool validation: value-free errors and typed rejection of malformed schemas."""
+
+from __future__ import annotations
+
+import enum
+import json
+import logging
+import uuid  # noqa: TC003
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal, TypedDict
+
+import pytest
+from pydantic import Base64Bytes, BaseModel, ConfigDict, Field, Json, field_validator
+
+from dendrux.tool import get_tool_def, tool
+from dendrux.tools._validate import check_tool_call, prepare_tool_call, validate_tool_params
+from dendrux.types import ToolCall, ToolDef, ToolResult
+
+PRIVATE = "astra.person@example.com"
+SENTINEL = "zq7Sentinel"
+
+
+def _prepare(fn: Any, params: dict[str, Any]) -> ToolResult:
+    result = prepare_tool_call(ToolCall("t", params), get_tool_def(fn), fn)
+    assert isinstance(result, ToolResult)
+    assert result.success is False
+    return result
+
+
+def _assert_value_free(result: ToolResult, *needles: str) -> None:
+    blob = json.dumps([result.payload, result.error, result.meta])
+    for needle in needles:
+        assert needle not in blob, f"{needle!r} escaped through the validation error"
+
+
+class Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    age: int
+
+
+class Cat(BaseModel):
+    kind: Literal["cat"]
+
+
+class Dog(BaseModel):
+    kind: Literal["dog"]
+
+
+class Pet(BaseModel):
+    animal: Annotated[Cat | Dog, Field(discriminator="kind")]
+
+
+class WithUuid(BaseModel):
+    ident: uuid.UUID
+
+
+class WithBase64(BaseModel):
+    blob: Base64Bytes
+
+
+class WithJson(BaseModel):
+    blob: Json[int]
+
+
+class IntKeys(BaseModel):
+    values: dict[int, int]
+
+
+class Row(TypedDict):
+    n: int
+
+
+class Color(enum.Enum):
+    RED = "red"
+
+
+@dataclass
+class Item:
+    qty: int
+
+
+class Checked(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def check(cls, value: str) -> str:
+        raise ValueError(f"bad value {value}")
+
+
+class TestInputKeysNeverEchoed:
+    def test_dict_key_in_the_location(self) -> None:
+        @tool()
+        def ingest(values: dict[str, int]) -> str:
+            """Ingest numeric values."""
+            return "ok"
+
+        result = _prepare(ingest, {"values": {PRIVATE: "not-an-int"}})
+        _assert_value_free(result, PRIVATE, "astra")
+        assert "values.<key>" in (result.error or "")
+
+    def test_dict_key_that_fails_key_validation(self) -> None:
+        @tool()
+        def ingest(model: IntKeys) -> str:
+            """Ingest numeric values."""
+            return "ok"
+
+        result = _prepare(ingest, {"model": {"values": {PRIVATE: 1}}})
+        _assert_value_free(result, PRIVATE)
+
+    def test_nested_dict_keys_inside_a_list(self) -> None:
+        @tool()
+        def ingest(rows: list[dict[str, int]]) -> str:
+            """Ingest rows."""
+            return "ok"
+
+        result = _prepare(ingest, {"rows": [{"ok": 1}, {PRIVATE: "x"}]})
+        _assert_value_free(result, PRIVATE)
+        assert "rows[1].<key>" in (result.error or "")
+
+    def test_extra_key_in_a_forbidding_model(self) -> None:
+        @tool()
+        def make(person: Strict) -> str:
+            """Make a person."""
+            return "ok"
+
+        result = _prepare(make, {"person": {"age": 3, PRIVATE: 1}})
+        _assert_value_free(result, PRIVATE)
+
+    def test_extra_key_in_a_typed_dict(self) -> None:
+        @tool()
+        def make(row: Row) -> str:
+            """Make a row."""
+            return "ok"
+
+        result = _prepare(make, {"row": {"n": "x", PRIVATE: 1}})
+        _assert_value_free(result, PRIVATE)
+        assert "row.n" in (result.error or "")
+
+    def test_declared_field_names_are_kept(self) -> None:
+        @tool()
+        def make(person: Strict, items: list[Item]) -> str:
+            """Make."""
+            return "ok"
+
+        result = _prepare(make, {"person": {"age": "old"}, "items": [{"qty": "many"}]})
+        assert "person.age" in (result.error or "")
+        assert "items[0].qty" in (result.error or "")
+
+    @pytest.mark.parametrize(
+        "name", [PRIVATE, "alice_smith", "sk_live_a1b2c3", "Alice Smith", "555-123-4567", 'r4<|"|>']
+    )
+    def test_unknown_top_level_names_are_never_echoed(self, name: str) -> None:
+        @tool()
+        def look(city: str) -> str:
+            """Look."""
+            return "ok"
+
+        result = _prepare(look, {"city": "Oslo", name: "x"})
+        _assert_value_free(result, name)
+        assert "1 unknown argument" in (result.error or "")
+        assert "Valid arguments: city" in (result.error or "")
+
+    def test_unknown_names_in_the_json_schema_check_report_a_count(self) -> None:
+        td = ToolDef(
+            name="t",
+            description="",
+            parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+        )
+        problems = validate_tool_params(td, {"Alice Smith": 1, "bogus": 2, "city": "x"})
+        assert problems == ["t has 2 unknown arguments"]
+
+    def test_many_unknown_names_are_one_short_problem(self) -> None:
+        td = ToolDef(
+            name="t",
+            description="",
+            parameters={"type": "object", "properties": {"a": {}}},
+        )
+        assert validate_tool_params(td, {f"k{i}": i for i in range(50)}) == [
+            "t has 50 unknown arguments"
+        ]
+
+    def test_exception_text_carries_the_same_path(self) -> None:
+        from dendrux.tools._coerce import ArgumentCoercionError, get_args_spec, normalize_arguments
+
+        @tool()
+        def ingest(values: dict[str, int]) -> str:
+            """Ingest numeric values."""
+            return "ok"
+
+        spec = get_args_spec(ingest)
+        assert spec is not None
+        with pytest.raises(ArgumentCoercionError) as caught:
+            normalize_arguments(spec, {"values": {PRIVATE: "x"}})
+        assert PRIVATE not in str(caught.value)
+
+
+class TestMessageTextNeverEchoesInput:
+    """Pydantic message templates that quote the input are replaced by fixed text."""
+
+    def test_wrong_discriminator_tag(self) -> None:
+        @tool()
+        def pet(model: Pet) -> str:
+            """Pet."""
+            return "ok"
+
+        result = _prepare(pet, {"model": {"animal": {"kind": SENTINEL}}})
+        _assert_value_free(result, SENTINEL)
+
+    def test_bad_uuid(self) -> None:
+        @tool()
+        def look(model: WithUuid) -> str:
+            """Look."""
+            return "ok"
+
+        result = _prepare(
+            look, {"model": {"ident": f"1234567{SENTINEL}-1234-1234-1234-123456789012"}}
+        )
+        _assert_value_free(result, SENTINEL, "found `")
+
+    def test_bad_base64(self) -> None:
+        @tool()
+        def look(model: WithBase64) -> str:
+            """Look."""
+            return "ok"
+
+        result = _prepare(look, {"model": {"blob": SENTINEL + "!!"}})
+        _assert_value_free(result, SENTINEL)
+
+    def test_bad_embedded_json(self) -> None:
+        @tool()
+        def look(model: WithJson) -> str:
+            """Look."""
+            return "ok"
+
+        result = _prepare(look, {"model": {"blob": '{"' + SENTINEL + '": x}'}})
+        _assert_value_free(result, SENTINEL)
+
+    def test_custom_validator_text_is_not_shown(self) -> None:
+        @tool()
+        def look(item: Checked) -> str:
+            """Look."""
+            return "ok"
+
+        result = _prepare(look, {"item": {"name": SENTINEL}})
+        _assert_value_free(result, SENTINEL)
+
+    @pytest.mark.parametrize(
+        ("annotation", "value"),
+        [
+            (int, SENTINEL),
+            (float, SENTINEL),
+            (bool, SENTINEL),
+            (Color, SENTINEL),
+            (Literal["a", "b"], SENTINEL),
+            (list[int], SENTINEL),
+        ],
+    )
+    def test_common_types_stay_value_free(self, annotation: Any, value: Any) -> None:
+        def fn(x: annotation) -> str:  # type: ignore[valid-type]
+            """Fn."""
+            return "ok"
+
+        fn.__annotations__["x"] = annotation
+        decorated = tool()(fn)
+        result = _prepare(decorated, {"x": value})
+        _assert_value_free(result, SENTINEL)
+
+
+def _td(parameters: Any) -> ToolDef:
+    return ToolDef(name="remote", description="", parameters=parameters)
+
+
+class TestMalformedSchemaIsTypedRejection:
+    def test_required_entry_that_is_not_a_string(self) -> None:
+        td = _td({"type": "object", "properties": {"x": {"type": "string"}}, "required": [{}]})
+        result = check_tool_call(ToolCall("remote", {"x": "ok"}), td)
+        assert result is not None
+        assert result.success is False
+        assert result.meta == {"code": "invalid_tool_schema"}
+        assert json.loads(result.payload)["code"] == "invalid_tool_schema"
+        assert "remote" in (result.error or "")
+
+    @pytest.mark.parametrize(
+        "parameters",
+        [
+            {"type": "object", "required": [1, 2]},
+            {"type": "object", "required": [["a"]]},
+            {"type": "object", "required": [None]},
+            {"type": "object", "properties": {"x": {"type": "string"}}, "required": [{}, "x"]},
+            {"type": "object", "properties": {"x": {"type": [{}]}}},
+            {"type": "object", "properties": {"x": {"type": {"a": 1}}}},
+            {"type": "object", "properties": {"x": {"enum": "abc"}}},
+            {"type": "object", "properties": {"x": {"enum": [{}, []]}}},
+            {"type": "object", "properties": {"x": []}},
+            {"type": "object", "properties": {"x": None}},
+            {"type": "object", "properties": []},
+            {"type": "object", "properties": "nope"},
+            {"type": "object", "required": "x"},
+            {"type": "object", "required": None},
+            {"type": "object", "additionalProperties": []},
+            {"type": "object", "patternProperties": 3},
+            {"type": []},
+            {"type": 5},
+            {"properties": {"x": {"type": ["string", None]}}},
+            {"properties": {"x": True}},
+            {"properties": {"x": {"anyOf": 3}}},
+            {"properties": {"x": {"$ref": []}}},
+            {},
+            {"properties": {}},
+        ],
+    )
+    def test_no_malformed_shape_crashes(self, parameters: Any) -> None:
+        td = _td(parameters)
+        for params in ({}, {"x": "ok"}, {"x": 1, "y": [1]}, {"x": None}, {"x": {"a": []}}):
+            result = check_tool_call(ToolCall("remote", params), td)
+            assert result is None or isinstance(result, ToolResult)
+            problems = validate_tool_params(td, params)
+            assert isinstance(problems, list)
+
+    def test_non_dict_schema_is_ignored(self) -> None:
+        td = ToolDef(name="remote", description="", parameters={})
+        object.__setattr__(td, "parameters", "not a dict")
+        assert check_tool_call(ToolCall("remote", {"x": 1}), td) is None
+
+    def test_rejection_is_logged_with_a_code_and_no_schema_text(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        td = _td({"type": "object", "required": [{"secret": SENTINEL}]})
+        with caplog.at_level(logging.WARNING):
+            check_tool_call(ToolCall("remote", {}), td)
+        assert "invalid_tool_schema" in caplog.text
+        assert SENTINEL not in caplog.text
+
+    def test_well_formed_schemas_are_unchanged(self) -> None:
+        td = _td({"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]})
+        assert check_tool_call(ToolCall("remote", {"x": "ok"}), td) is None
+        result = check_tool_call(ToolCall("remote", {}), td)
+        assert result is not None
+        assert json.loads(result.payload)["code"] == "invalid_params"
+
+
+class TestMalformedSchemaAtDiscovery:
+    def _tools(self) -> list[Any]:
+        from mcp.types import Tool
+
+        return [
+            Tool(name="good", description="", input_schema={"type": "object"}),
+            Tool(
+                name="bad",
+                description="",
+                input_schema={"type": "object", "required": [{}]},
+            ),
+        ]
+
+    def _build(self, *, strict: bool = False) -> Any:
+        from types import SimpleNamespace
+
+        from dendrux.mcp._server import build_mcp_tool_defs
+
+        source = SimpleNamespace(name="srv", transport="stdio", call_timeout=30.0)
+        return build_mcp_tool_defs(
+            source=source,  # type: ignore[arg-type]  # minimal stand-in
+            namespace="srv",
+            tools=self._tools(),
+            connection_info=None,
+            strict=strict,
+        )
+
+    def test_tool_with_a_malformed_schema_is_skipped_and_reported(self) -> None:
+        from dendrux.mcp._server import MCPSkippedTool
+
+        defs, skipped = self._build()
+        assert [d.name for d in defs] == ["srv__good"]
+        assert skipped == [
+            MCPSkippedTool(source_name="srv", namespace="srv", tool="bad", reason="invalid_schema")
+        ]
+
+    def test_strict_view_raises_a_value_error_without_schema_text(self) -> None:
+        with pytest.raises(ValueError, match="malformed") as caught:
+            self._build(strict=True)
+        assert "bad" in str(caught.value)

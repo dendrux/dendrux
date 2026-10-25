@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from dendrux.tools._coerce import (
@@ -34,7 +35,10 @@ if TYPE_CHECKING:
 
     from dendrux.types import ToolCall
 
+logger = logging.getLogger(__name__)
+
 INVALID_PARAMS_CODE = "invalid_params"
+INVALID_TOOL_SCHEMA_CODE = "invalid_tool_schema"
 INVALID_JSON_CODE = "invalid_json"
 PII_PLACEHOLDER_CODE = "pii_placeholder"
 ARGUMENTS_NOT_STABLE_CODE = "arguments_not_stable"
@@ -45,11 +49,42 @@ _COMPOSITE_KEYWORDS = frozenset(
 _KNOWN_TYPES = frozenset({"string", "integer", "number", "boolean", "array", "object", "null"})
 
 
+class MalformedToolSchemaError(ValueError):
+    """A tool's argument schema has a shape the validator cannot interpret.
+
+    Raised by :func:`_collect_problems`; :func:`check_tool_call` turns it into
+    a failed result with ``code="invalid_tool_schema"``. The message names the
+    problem kind only, never schema text.
+    """
+
+
+def schema_problem(schema: Any) -> str | None:
+    """Why ``schema`` cannot be validated against, or ``None`` when it can.
+
+    Only shapes that would break validation count: the validator is tolerant
+    of everything else (unknown keywords, odd property schemas) by design.
+    """
+    if not isinstance(schema, dict):
+        return None
+    required = schema.get("required")
+    if required is not None and (
+        not isinstance(required, list) or not all(isinstance(r, str) for r in required)
+    ):
+        return "required must be a list of argument names"
+    return None
+
+
 class _Problem(NamedTuple):
     """A model-facing problem text plus the input that caused it (never rendered)."""
 
     text: str
     value: Any = None
+
+
+def _unknown_names_problem(tool_name: str, unknown: list[Any]) -> _Problem:
+    """The "unknown argument" problem: a count only, never the names the model sent."""
+    noun = "argument" if len(unknown) == 1 else "arguments"
+    return _Problem(f"{tool_name} has {len(unknown)} unknown {noun}")
 
 
 def validate_tool_params(tool_def: ToolDef, params: dict[str, Any]) -> list[str]:
@@ -60,7 +95,7 @@ def validate_tool_params(tool_def: ToolDef, params: dict[str, Any]) -> list[str]
     Problems name the argument and the constraint, never the value.
     Pure and synchronous; never runs tool code.
     """
-    return [p.text for p in _collect_problems(tool_def, params)[0]]
+    return [p.text for p in _problems_for(tool_def, params)[0]]
 
 
 def _collect_problems(tool_def: ToolDef, params: dict[str, Any]) -> tuple[list[_Problem], bool]:
@@ -68,6 +103,9 @@ def _collect_problems(tool_def: ToolDef, params: dict[str, Any]) -> tuple[list[_
     schema = tool_def.parameters
     if not isinstance(schema, dict):
         return [], False
+    bad_schema = schema_problem(schema)
+    if bad_schema is not None:
+        raise MalformedToolSchemaError(bad_schema)
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         properties = None
@@ -78,9 +116,7 @@ def _collect_problems(tool_def: ToolDef, params: dict[str, Any]) -> tuple[list[_
     if properties is not None and not _allows_unknown_names(schema):
         unknown = [key for key in params if key not in properties]
         if unknown:
-            quoted = ", ".join(f"'{key}'" for key in unknown)
-            noun = "argument" if len(unknown) == 1 else "arguments"
-            problems.append(_Problem(f"{name} has no {noun} {quoted}"))
+            problems.append(_unknown_names_problem(name, unknown))
             names_wrong = True
 
     required = schema.get("required")
@@ -105,6 +141,23 @@ def _collect_problems(tool_def: ToolDef, params: dict[str, Any]) -> tuple[list[_
                 problems.append(_Problem(f"{name} argument '{key}' {problem}", value))
 
     return problems, names_wrong
+
+
+_MALFORMED_SCHEMA: Any = object()  # marks the problem for an unusable schema
+
+
+def _problems_for(tool_def: ToolDef, params: dict[str, Any]) -> tuple[list[_Problem], bool]:
+    """:func:`_collect_problems`, with an unusable schema reported as one problem.
+
+    The one problem carries ``_MALFORMED_SCHEMA`` as its value so callers can
+    tell it from an argument problem; it holds no schema or input text.
+    """
+    try:
+        return _collect_problems(tool_def, params)
+    except (MalformedToolSchemaError, TypeError, ValueError, AttributeError, RecursionError):
+        return [
+            _Problem(f"{tool_def.name} has a malformed argument schema", _MALFORMED_SCHEMA)
+        ], False
 
 
 def format_invalid_params(
@@ -158,16 +211,26 @@ def check_tool_call(
     Unparseable arguments are rejected first (``invalid_json``). Unknown
     tools (no ``ToolDef``) otherwise pass through so the executor reports them.
     A problem caused by one of ``placeholders`` (redacted PII the tool may
-    not receive) is reported as ``code="pii_placeholder"``.
+    not receive) is reported as ``code="pii_placeholder"``. A tool whose own
+    argument schema cannot be validated against is refused with
+    ``code="invalid_tool_schema"`` instead of raising.
     """
     json_result = check_tool_json(tool_call)
     if json_result is not None:
         return json_result
     if tool_def is None:
         return None
-    problems, names_wrong = _collect_problems(tool_def, tool_call.params or {})
+    return _check_params(tool_call, tool_def, placeholders)
+
+
+def _check_params(
+    tool_call: ToolCall, tool_def: ToolDef, placeholders: Collection[str]
+) -> ToolResult | None:
+    problems, names_wrong = _problems_for(tool_def, tool_call.params or {})
     if not problems:
         return None
+    if any(p.value is _MALFORMED_SCHEMA for p in problems):
+        return malformed_schema_result(tool_call)
     if any(contains_placeholder(p.value, placeholders) for p in problems):
         return placeholder_result(tool_call)
     message = format_invalid_params(
@@ -188,6 +251,20 @@ def invalid_params_result(
         error=message,
         meta={"code": code},
     )
+
+
+def malformed_schema_result(tool_call: ToolCall) -> ToolResult:
+    """The ``invalid_tool_schema`` failure: the tool's own schema cannot be validated against."""
+    logger.warning(
+        "tool call refused: code=%s tool=%s",
+        INVALID_TOOL_SCHEMA_CODE,
+        tool_call.name,
+    )
+    message = (
+        f"`{tool_call.name}` cannot be called: its argument schema is malformed. "
+        "The call was not made; do not retry it."
+    )
+    return invalid_params_result(tool_call, message, code=INVALID_TOOL_SCHEMA_CODE)
 
 
 def placeholder_result(tool_call: ToolCall) -> ToolResult:

@@ -29,6 +29,7 @@ from dendrux.mcp._source import (
     safe_source_exception_detail,
     source_has_opaque_credentials,
 )
+from dendrux.tools._validate import schema_problem
 from dendrux.types import ToolDef, ToolTarget
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ def _tool_meta(tool: Any) -> dict[str, Any] | None:
     return dict(value) if value else None
 
 
-MCPSkipReason = Literal["name_unsafe", "duplicate_name", "unknown_tool"]
+MCPSkipReason = Literal["name_unsafe", "duplicate_name", "unknown_tool", "invalid_schema"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,9 +92,10 @@ class MCPSkippedTool:
     ``reason`` is ``name_unsafe`` (the exposed name is not provider-safe, or
     its base name is empty),
     ``duplicate_name`` (an earlier tool in server order already produced the
-    exposed name) or ``unknown_tool`` (the view's ``allowed_tools``,
-    ``force_serial_tools`` or ``rename`` names a tool the server does not
-    list). ``tool`` is the server's tool name, or the requested name for
+    exposed name), ``invalid_schema`` (the tool's argument schema has a shape
+    that cannot be validated against) or ``unknown_tool`` (the view's
+    ``allowed_tools``, ``force_serial_tools`` or ``rename`` names a tool the
+    server does not list). ``tool`` is the server's tool name, or the requested name for
     ``unknown_tool``.
     """
 
@@ -113,6 +115,62 @@ def exposed_tool_name(
     """Return the Agent-visible name of one server tool under a view's policy."""
     base = (rename or {}).get(mcp_name) or _sanitize_tool_name(mcp_name)
     return f"{namespace}__{base}" if prefix else base
+
+
+def _schema_unusable(source: MCPSource, tool: Any, *, strict: bool) -> bool:
+    """Whether ``tool``'s argument schema cannot be validated against (it is then skipped)."""
+    issue = schema_problem(tool.input_schema)
+    if issue is None:
+        return False
+    if strict:
+        raise ValueError(
+            f"MCP source '{source.name}' tool '{tool.name}' has a malformed "
+            f"argument schema ({issue})."
+        )
+    logger.warning(
+        "MCP tool skipped: code=invalid_schema source=%s tool=%s", source.name, tool.name
+    )
+    return True
+
+
+def _build_tool_def(
+    source: MCPSource,
+    namespace: str,
+    tool: Any,
+    canonical: str,
+    *,
+    connection_info: Any,
+    serial: bool,
+) -> ToolDef:
+    meta: dict[str, Any] = {
+        "source_name": source.name,
+        "namespace": namespace,
+        "mcp_tool_name": tool.name,
+        "exposed_name": canonical,
+        "transport": source.transport,
+        "annotations": _annotation_dict(tool.annotations),
+        "title": getattr(tool, "title", None),
+        "output_schema": getattr(tool, "output_schema", None),
+        "mcp_meta": _tool_meta(tool),
+    }
+    if connection_info is not None:
+        meta.update(
+            {
+                "protocol_version": connection_info.protocol_version,
+                "server_name": connection_info.server_name,
+                "server_version": connection_info.server_version,
+            }
+        )
+    return ToolDef(
+        name=canonical,
+        description=tool.description or "",
+        parameters=tool.input_schema,
+        target=ToolTarget.SERVER,
+        parallel=_tool_is_parallel_safe(tool.annotations) and not serial,
+        timeout_seconds=source.call_timeout,
+        has_explicit_timeout=True,
+        meta=meta,
+    )
 
 
 def build_mcp_tool_defs(
@@ -194,41 +252,18 @@ def build_mcp_tool_defs(
                 )
             skip(tool.name, "duplicate_name")
             continue
+        if _schema_unusable(source, tool, strict=strict):
+            skip(tool.name, "invalid_schema")
+            continue
         seen_names.add(canonical)
-
-        annotations = _annotation_dict(tool.annotations)
-        meta: dict[str, Any] = {
-            "source_name": source.name,
-            "namespace": namespace,
-            "mcp_tool_name": tool.name,
-            "exposed_name": canonical,
-            "transport": source.transport,
-            "annotations": annotations,
-            "title": getattr(tool, "title", None),
-            "output_schema": getattr(tool, "output_schema", None),
-            "mcp_meta": _tool_meta(tool),
-        }
-        if connection_info is not None:
-            meta.update(
-                {
-                    "protocol_version": connection_info.protocol_version,
-                    "server_name": connection_info.server_name,
-                    "server_version": connection_info.server_version,
-                }
-            )
-
         tool_defs.append(
-            ToolDef(
-                name=canonical,
-                description=tool.description or "",
-                parameters=tool.input_schema,
-                target=ToolTarget.SERVER,
-                parallel=(
-                    _tool_is_parallel_safe(tool.annotations) and tool.name not in force_serial_tools
-                ),
-                timeout_seconds=source.call_timeout,
-                has_explicit_timeout=True,
-                meta=meta,
+            _build_tool_def(
+                source,
+                namespace,
+                tool,
+                canonical,
+                connection_info=connection_info,
+                serial=tool.name in force_serial_tools,
             )
         )
     return tool_defs, skipped

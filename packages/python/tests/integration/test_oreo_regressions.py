@@ -562,7 +562,7 @@ async def test_leaked_tool_syntax_argument_is_rejected_before_tool_runs(store):
 
     result = await agent.run("hello")
 
-    expected = "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result."
+    expected = "show has 1 unknown argument. Valid arguments: kind, title, result."
     assert result.status == RunStatus.SUCCESS
     assert calls == []
     tool_msg = [m for m in provider.call_history[1]["messages"] if m.role.value == "tool"][0]

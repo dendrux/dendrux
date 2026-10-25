@@ -62,7 +62,7 @@ async def test_invalid_call_is_rejected_before_the_approval_pause(store):
     assert REFUNDS == []
     tool_msgs = [m for m in llm.call_history[1]["messages"] if m.role.value == "tool"]
     assert json.loads(tool_msgs[0].content) == {
-        "error": "refund has no argument 'orderid'; refund is missing required "
+        "error": "refund has 1 unknown argument; refund is missing required "
         "argument(s): order_id. Valid arguments: order_id.",
         "code": "invalid_params",
     }

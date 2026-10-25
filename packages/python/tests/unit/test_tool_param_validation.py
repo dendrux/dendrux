@@ -56,17 +56,17 @@ SHOW_SCHEMA: dict[str, Any] = {
 class TestUnknownNames:
     def test_unknown_name_rejected_when_additional_properties_absent(self) -> None:
         problems = validate_tool_params(_td(SHOW_SCHEMA), {"kind": "table", "r4<|": 1})
-        assert problems == ["show has no argument 'r4<|'"]
+        assert problems == ["show has 1 unknown argument"]
 
     def test_unknown_name_rejected_when_additional_properties_false(self) -> None:
         schema = {**SHOW_SCHEMA, "additionalProperties": False}
         assert validate_tool_params(_td(schema), {"kind": "table", "x": 1}) == [
-            "show has no argument 'x'"
+            "show has 1 unknown argument"
         ]
 
     def test_multiple_unknown_names_grouped(self) -> None:
         problems = validate_tool_params(_td(SHOW_SCHEMA), {"kind": "table", "x": 1, "y": 2})
-        assert problems == ["show has no arguments 'x', 'y'"]
+        assert problems == ["show has 2 unknown arguments"]
 
     @pytest.mark.parametrize("additional", [True, {"type": "string"}, {}])
     def test_permissive_additional_properties_allows_unknown(self, additional: Any) -> None:
@@ -87,7 +87,7 @@ class TestUnknownNames:
 
     def test_empty_properties_rejects_every_name(self) -> None:
         schema = {"type": "object", "properties": {}}
-        assert validate_tool_params(_td(schema), {"a": 1}) == ["show has no argument 'a'"]
+        assert validate_tool_params(_td(schema), {"a": 1}) == ["show has 1 unknown argument"]
 
     def test_non_dict_schema_is_ignored(self) -> None:
         assert validate_tool_params(_td(None), {"a": 1}) == []
@@ -231,7 +231,7 @@ class TestTypes:
     def test_all_problems_collected_in_order(self) -> None:
         problems = validate_tool_params(_td(SHOW_SCHEMA), {"bogus": 1, "limit": "x"})
         assert problems == [
-            "show has no argument 'bogus'",
+            "show has 1 unknown argument",
             "show is missing required argument(s): kind",
             "show argument 'limit' must be integer, got string",
         ]
@@ -247,7 +247,7 @@ class TestMessageAndResult:
         result = check_tool_call(tc, _td(schema))
         assert result is not None
         assert result.error == (
-            "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result."
+            "show has 1 unknown argument. Valid arguments: kind, title, result."
         )
 
     def test_type_only_message_omits_valid_names(self) -> None:
@@ -303,7 +303,7 @@ class TestMessageAndResult:
         td = get_tool_def(search)
         assert validate_tool_params(td, {"query": "q", "tag": None}) == []
         assert validate_tool_params(td, {"query": "q", "limit": "ten", "qury": 1}) == [
-            "search has no argument 'qury'",
+            "search has 1 unknown argument",
             "search argument 'limit' must be integer, got string",
         ]
 
@@ -380,7 +380,7 @@ class TestLoopValidation:
         payload = json.loads(tool_msgs[0].content)
         assert payload["code"] == "invalid_params"
         assert payload["error"] == (
-            "show has no argument 'r4<|\"|>,split'; "
+            "show has 1 unknown argument; "
             "show is missing required argument(s): kind. "
             "Valid arguments: kind, title, limit."
         )
@@ -428,7 +428,7 @@ class TestLoopValidation:
         result = await agent.run("go")
 
         assert result.status == RunStatus.SUCCESS
-        assert "read_range has no argument 'sheeet'" in _tool_messages(llm, 1)[0].content
+        assert "read_range has 1 unknown argument" in _tool_messages(llm, 1)[0].content
 
     async def test_valid_client_tool_still_pauses(self) -> None:
         tc = ToolCall(name="read_range", params={"sheet": "S1"}, provider_tool_call_id="t1")
@@ -503,7 +503,7 @@ class TestUseSkillValidation:
 
         assert result.status == RunStatus.SUCCESS
         first = _tool_messages(llm, 1)[0].content
-        assert "use_skill has no argument 'skill'" in first
+        assert "use_skill has 1 unknown argument" in first
         second = _tool_messages(llm, 2)[-1].content
         assert "Say hello warmly." in second
 
@@ -561,7 +561,7 @@ class TestMCPValidation:
         assert counter == {"n": 1}
         assert _tool_messages(llm, 1)[0].content == json.dumps(
             {
-                "error": "fs__read_file has no argument 'pth'; fs__read_file is missing "
+                "error": "fs__read_file has 1 unknown argument; fs__read_file is missing "
                 "required argument(s): path. Valid arguments: path.",
                 "code": "invalid_params",
             }
@@ -609,7 +609,7 @@ class TestMCPValidation:
         assert result.status == RunStatus.SUCCESS
         first = json.loads(_tool_messages(llm, 1)[0].content)
         assert first == {
-            "error": "echo__echo has no argument 'msg'; echo__echo is missing required "
+            "error": "echo__echo has 1 unknown argument; echo__echo is missing required "
             "argument(s): message. Valid arguments: message.",
             "code": "invalid_params",
         }
