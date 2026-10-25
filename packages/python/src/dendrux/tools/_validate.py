@@ -59,13 +59,23 @@ class MalformedToolSchemaError(ValueError):
     """
 
 
-# Subschema keywords walked by :func:`schema_problem`.
-_SUBSCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+# Every JSON Schema 2020-12 keyword (and its draft-07 spelling) whose value is a schema,
+# a map of schemas or an array of schemas; walked by :func:`schema_problem`.
+_SUBSCHEMA_MAPS = (
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "dependencies",
+)
 _SUBSCHEMA_LISTS = ("anyOf", "oneOf", "allOf", "prefixItems", "items")
 _SUBSCHEMAS = (
     "items",
     "additionalProperties",
     "unevaluatedProperties",
+    "unevaluatedItems",
+    "contentSchema",
     "additionalItems",
     "contains",
     "propertyNames",

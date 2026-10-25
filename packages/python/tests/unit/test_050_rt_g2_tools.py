@@ -612,3 +612,85 @@ class TestNestedSchemaShapes:
         # Nested keywords are not read by the validator, so a call is not refused for them.
         td = _td({"type": "object", "properties": {"x": {"type": "object", "required": None}}})
         assert check_tool_call(ToolCall("remote", {"x": {}}), td) is None
+
+
+_BAD = {"required": None}
+# Every JSON Schema 2020-12 keyword (plus the draft-07 spellings) whose value is a
+# schema, a map of schemas or an array of schemas.
+_SCHEMA_VALUED = [
+    "items",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contentSchema",
+    "additionalItems",
+]
+_SCHEMA_MAPS = ["properties", "patternProperties", "dependentSchemas", "$defs", "definitions"]
+_SCHEMA_ARRAYS = ["allOf", "anyOf", "oneOf", "prefixItems", "items"]
+
+
+class TestEverySchemaKeywordIsWalked:
+    @pytest.mark.parametrize("keyword", _SCHEMA_VALUED)
+    def test_schema_valued_keyword(self, keyword: str) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        assert schema_problem({"type": "object", keyword: dict(_BAD)}) is not None
+
+    @pytest.mark.parametrize("keyword", _SCHEMA_MAPS)
+    def test_schema_map_keyword(self, keyword: str) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        assert schema_problem({"type": "object", keyword: {"k": dict(_BAD)}}) is not None
+
+    @pytest.mark.parametrize("keyword", _SCHEMA_ARRAYS)
+    def test_schema_array_keyword(self, keyword: str) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        assert (
+            schema_problem({"type": "object", keyword: [{"type": "string"}, dict(_BAD)]})
+            is not None
+        )
+
+    @pytest.mark.parametrize("keyword", [*_SCHEMA_VALUED, *_SCHEMA_ARRAYS, *_SCHEMA_MAPS])
+    def test_nested_one_level_deeper(self, keyword: str) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        inner = {
+            keyword: {"k": dict(_BAD)}
+            if keyword in _SCHEMA_MAPS
+            else ([dict(_BAD)] if keyword in _SCHEMA_ARRAYS else dict(_BAD))
+        }
+        assert schema_problem({"type": "object", "properties": {"x": inner}}) is not None
+
+    @pytest.mark.parametrize("keyword", [*_SCHEMA_VALUED, *_SCHEMA_ARRAYS, *_SCHEMA_MAPS])
+    def test_well_formed_values_pass(self, keyword: str) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        good = {"type": "object", "required": ["a"]}
+        value = (
+            {"k": good}
+            if keyword in _SCHEMA_MAPS
+            else ([good] if keyword in _SCHEMA_ARRAYS else good)
+        )
+        assert schema_problem({"type": "object", keyword: value}) is None
+
+    def test_booleans_and_scalars_in_schema_positions_are_ignored(self) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        assert (
+            schema_problem({"items": True, "unevaluatedItems": False, "contentSchema": 3}) is None
+        )
+
+    def test_the_budget_still_applies_to_the_new_keywords(self) -> None:
+        from dendrux.tools._validate import schema_problem
+
+        deep: dict[str, Any] = {"type": "string"}
+        for _ in range(100):
+            deep = {"unevaluatedItems": {"contentSchema": deep}}
+        assert schema_problem(deep) is not None
