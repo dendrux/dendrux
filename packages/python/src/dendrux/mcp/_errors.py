@@ -26,6 +26,9 @@ class MCPOrigin:
         return "MCPOrigin()"
 
 
+DiscoveryLimitReason = Literal["repeated_cursor", "page_cap", "deadline"]
+
+
 class MCPError(RuntimeError):
     """Base class for Dendrux MCP runtime errors."""
 
@@ -53,6 +56,20 @@ class MCPConnectionError(MCPError):
 
 class MCPDestinationDeniedError(MCPConnectionError):
     """A destination was denied before connecting or sending credentials."""
+
+
+class MCPDiscoveryLimitError(MCPConnectionError):
+    """``tools/list`` passed one of its bounds, so discovery stopped.
+
+    ``reason`` is ``repeated_cursor`` (the server returned a page cursor it
+    had already returned, so paging would never end), ``page_cap`` (more than
+    ``MCPSource.max_discovery_pages`` pages) or ``deadline`` (discovery took
+    longer than ``MCPSource.discovery_timeout``). ``str()`` names the source
+    and the reason only, never a cursor. A subclass of
+    :class:`MCPConnectionError`, so existing handlers keep catching it.
+    """
+
+    reason: DiscoveryLimitReason = "deadline"
 
 
 class MCPCredentialError(MCPConnectionError):
@@ -448,37 +465,35 @@ class MCPToolNameCollisionError(ValueError):
     """
 
 
+# Most specific first: the first match wins.
+_ERROR_CODES: tuple[tuple[tuple[type[BaseException], ...], str], ...] = (
+    ((MCPAuthorizationRequired,), "authorization_required"),
+    ((MCPAuthenticationError,), "authentication_failed"),
+    ((MCPCredentialError,), "credential_error"),
+    ((MCPDestinationDeniedError,), "destination_denied"),
+    ((MCPDiscoveryLimitError,), "discovery_limit"),
+    ((MCPCircuitOpenError,), "circuit_open"),
+    ((MCPCapacityError,), "capacity"),
+    ((MCPConnectionLostError, MCPConnectionError), "connection_failed"),
+    ((MCPConnectionStateError,), "connection_state"),
+    ((MCPToolNameCollisionError,), "tool_name_collision"),
+    ((MCPToolNotFoundError,), "tool_not_found"),
+    # Strict view naming raises plain ValueError; MCP failures never do.
+    ((ValueError,), "invalid_tool_names"),
+)
+
+
 def error_code_for(exc: BaseException) -> str:
     """Return the stable machine code for an MCP discovery failure.
 
     Hosts branch on this instead of matching error text. The code depends on
     the exception class alone, most specific first, and is one of
     ``authorization_required``, ``authentication_failed``, ``credential_error``,
-    ``destination_denied``, ``circuit_open``, ``capacity``,
+    ``destination_denied``, ``discovery_limit``, ``circuit_open``, ``capacity``,
     ``connection_failed``, ``connection_state``, ``tool_name_collision``,
     ``tool_not_found``, ``invalid_tool_names`` or ``unknown``.
     """
-    if isinstance(exc, MCPAuthorizationRequired):
-        return "authorization_required"
-    if isinstance(exc, MCPAuthenticationError):
-        return "authentication_failed"
-    if isinstance(exc, MCPCredentialError):
-        return "credential_error"
-    if isinstance(exc, MCPDestinationDeniedError):
-        return "destination_denied"
-    if isinstance(exc, MCPCircuitOpenError):
-        return "circuit_open"
-    if isinstance(exc, MCPCapacityError):
-        return "capacity"
-    if isinstance(exc, (MCPConnectionLostError, MCPConnectionError)):
-        return "connection_failed"
-    if isinstance(exc, MCPConnectionStateError):
-        return "connection_state"
-    if isinstance(exc, MCPToolNameCollisionError):
-        return "tool_name_collision"
-    if isinstance(exc, MCPToolNotFoundError):
-        return "tool_not_found"
-    # Strict view naming raises plain ValueError; MCP failures never do.
-    if isinstance(exc, ValueError):
-        return "invalid_tool_names"
+    for kinds, code in _ERROR_CODES:
+        if isinstance(exc, kinds):
+            return code
     return "unknown"

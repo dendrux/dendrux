@@ -20,10 +20,12 @@ from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
 from dendrux.mcp._challenge import parse_auth_challenge
 from dendrux.mcp._errors import (
+    DiscoveryLimitReason,
     MCPAuthChallenge,
     MCPAuthenticationError,
     MCPConnectionError,
     MCPDestinationDeniedError,
+    MCPDiscoveryLimitError,
     MCPOrigin,
     MCPResultTooLargeError,
     MCPSessionExpiredError,
@@ -165,6 +167,13 @@ def _is_session_rejection(exc: BaseException) -> bool:
         and "session" in str(node.message).lower()
         for node in _iter_error_tree(exc)
     )
+
+
+@dataclass
+class _PageWalk:
+    """Pages fetched so far by one ``tools/list`` walk."""
+
+    pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,24 +391,65 @@ class MCPClientAdapter:
         return self._safe_error("connect to", failure)
 
     async def list_tools(self) -> list[Any]:
+        """Page through ``tools/list`` within the source's discovery bounds.
+
+        Stops with :class:`MCPDiscoveryLimitError` when a page cursor repeats,
+        more than ``max_discovery_pages`` pages are needed, or the whole walk
+        outlasts ``discovery_timeout``.
+        """
         client = self._require_client()
         self._last_status = None
         self._last_rejection = None
         try:
-            tools: list[Any] = []
-            cursor: str | None = None
-            while True:
-                page = await client.list_tools(cursor=cursor, cache_mode="refresh")
-                tools.extend(page.tools)
-                cursor = page.next_cursor
-                if cursor is None:
-                    return tools
+            return await self._walk_pages(client)
+        except MCPDiscoveryLimitError:
+            raise
         except Exception as exc:
             # Discovery fails on its own request, not just at connect: a token
             # can expire between the two. Its text reaches last_error and the
             # persisted MCP_ERROR governance event, so it needs the same care.
             failure: Exception = exc
         raise self._safe_error("list tools from", failure) from None
+
+    async def _walk_pages(self, client: Any) -> list[Any]:
+        progress = _PageWalk()
+        scope = asyncio.timeout(self.source.discovery_timeout)
+        try:
+            async with scope:
+                return await self._collect_pages(client, progress)
+        except TimeoutError:
+            if scope.expired():
+                raise self._discovery_limit_error("deadline", progress.pages) from None
+            raise
+
+    async def _collect_pages(self, client: Any, progress: _PageWalk) -> list[Any]:
+        tools: list[Any] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        while True:
+            page = await client.list_tools(cursor=cursor, cache_mode="refresh")
+            progress.pages += 1
+            tools.extend(page.tools)
+            cursor = page.next_cursor
+            if cursor is None:
+                return tools
+            if cursor in seen:
+                raise self._discovery_limit_error("repeated_cursor", progress.pages)
+            seen.add(cursor)
+            if progress.pages >= self.source.max_discovery_pages:
+                raise self._discovery_limit_error("page_cap", progress.pages)
+
+    def _discovery_limit_error(
+        self, reason: DiscoveryLimitReason, pages: int
+    ) -> MCPDiscoveryLimitError:
+        logger.warning("mcp_discovery_%s source=%s pages=%d", reason, self.source.name, pages)
+        error = MCPDiscoveryLimitError(
+            f"Failed to list tools from MCP source '{self.source.name}': "
+            f"discovery stopped ({reason})."
+        )
+        error.reason = reason
+        error.origin = _diagnostic_origin(self.source.url) if self.source.url else None
+        return error
 
     def _safe_error(self, action: str, exc: BaseException) -> MCPConnectionError:
         """Build a transport error that cannot carry configured credentials.

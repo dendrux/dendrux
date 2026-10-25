@@ -65,6 +65,7 @@ EXPECTED_ALL = (
     "MCPDestinationDeniedError",
     "MCPDestinationPolicy",
     "MCPDiscovery",
+    "MCPDiscoveryLimitError",
     "MCPError",
     "MCPEvictionCompleted",
     "MCPEvictionMode",

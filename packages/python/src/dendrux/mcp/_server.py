@@ -379,6 +379,8 @@ class MCPServer:
         follow_redirects: bool = True,
         max_redirects: int = 20,
         destination_policy: MCPDestinationPolicy | None = None,
+        max_discovery_pages: int = 100,
+        discovery_timeout: float = 60.0,
     ) -> None:
         # Keep the legacy error wording and private transport attributes while
         # all real configuration lives in the immutable MCPSource.
@@ -402,6 +404,8 @@ class MCPServer:
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             destination_policy=destination_policy,
+            max_discovery_pages=max_discovery_pages,
+            discovery_timeout=discovery_timeout,
         )
         self._configure(source)
 
