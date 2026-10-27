@@ -134,6 +134,9 @@ def _upgrade_pg() -> None:
             )
         _pg_build_index("uq_agent_runs_tenant_idempotency_key", _TENANT_KEY_INDEX)
         _pg_build_index("ix_agent_runs_tenant_id_created_at", _TENANT_CREATED_INDEX)
+        # Migrated databases have it already; a create_all 0.4.1 database does not.
+        # Same repair and definition check as the tenant indexes.
+        _pg_build_index("ix_agent_runs_retry_of_run_id", _RETRY_OF_INDEX)
         # The tenant-scoped unique index is valid, so uniqueness is never unenforced.
         drop_index_concurrently(op.get_bind(), "ix_agent_runs_idempotency_key", revision=revision)
         if _pg_has_constraint("agent_runs_idempotency_key_key"):
@@ -141,8 +144,6 @@ def _upgrade_pg() -> None:
                 "ALTER TABLE agent_runs DROP CONSTRAINT IF EXISTS agent_runs_idempotency_key_key",
                 "drop_constraint.agent_runs_idempotency_key_key",
             )
-        # Present on every migrated database already; the models now declare it too.
-        _step(_concurrently(_RETRY_OF_INDEX), "build_index.ix_agent_runs_retry_of_run_id")
 
 
 def _downgrade_pg() -> None:

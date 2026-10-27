@@ -184,6 +184,7 @@ _STEPS = {
     "restore_global_index": "build_index.ix_agent_runs_idempotency_key",
     "drop_tenant_index": "drop_index.uq_agent_runs_tenant_idempotency_key",
     "drop_column": "drop_claim_epoch",
+    "retry_of_index": "build_index.ix_agent_runs_retry_of_run_id",
 }
 _PHASES = {
     "add_column": ("upgrade", "add column if not exists claim_epoch", _READ),
@@ -200,6 +201,12 @@ _PHASES = {
     "drop_global_index": (
         "upgrade",
         "drop index concurrently if exists ix_agent_runs_idempotency_key",
+        _WRITE,
+    ),
+    # A 0.4.1 database built by ``create_all`` has no retry_of index; R1 builds it.
+    "retry_of_index": (
+        "upgrade",
+        "create index concurrently if not exists ix_agent_runs_retry_of_run_id",
         _WRITE,
     ),
     "drop_global_constraint": (
@@ -230,6 +237,9 @@ async def test_every_exclusive_step_is_bounded_and_retry_completes(
     action, marker, blocker_sql = _PHASES[phase]
     await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
     await _seed(engine)
+    if phase == "retry_of_index":
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP INDEX ix_agent_runs_retry_of_run_id"))
     if phase == "drop_global_constraint":
         # The 0.4.1 shape a ``create_all`` database has, stamped and then migrated.
         async with engine.begin() as conn:
@@ -301,6 +311,8 @@ async def test_every_exclusive_step_is_bounded_and_retry_completes(
 
     async with engine.connect() as conn:
         assert (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one() == 4
+    # The refusal leaves the database at its last completed revision.
+    assert await _version(engine) == (PRIOR if action == "upgrade" else R1)
 
     # Rerunning the same command repairs whatever the refused step left behind.
     await asyncio.to_thread(_alembic, url, action, target)
@@ -322,6 +334,21 @@ async def test_every_exclusive_step_is_bounded_and_retry_completes(
         )
         await asyncio.to_thread(_alembic, url, "upgrade", "head")
         assert await _version(engine) == HEAD
+
+
+async def test_upgrade_rejects_a_wrong_retry_of_index(pg: Any) -> None:
+    """A valid index named like the retry_of index but defined differently is refused."""
+    url, engine = pg
+    await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP INDEX ix_agent_runs_retry_of_run_id"))
+        await conn.execute(
+            text("CREATE INDEX ix_agent_runs_retry_of_run_id ON agent_runs (tenant_id)")
+        )
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        await asyncio.to_thread(_alembic, url, "upgrade", "head")
+    assert await _version(engine) == PRIOR
+    assert "ix_agent_runs_idempotency_key" in await _indexes(engine)
 
 
 async def test_upgrade_repairs_an_invalid_interrupted_tenant_index(pg: Any) -> None:
