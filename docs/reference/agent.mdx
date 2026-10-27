@@ -116,7 +116,7 @@ agent = Agent(provider=provider, prompt="...", limits=Limits(max_input_bytes=4 *
 
 The note cap is enforced by one conditional insert in the store, so concurrent `submit_note` calls cannot exceed it. A custom `StateStore` whose `add_note` has no `max_notes` keyword keeps working without the cap.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: caps are enforced by T4 (inputs, tool results) and T1 (notes, metadata); T0 only stores them. Recheck the replacement JSON and the ValueError behaviour. Checked against the merged code in the 0.5.0 docs pass."
 
 ### Transforming tool results
 
@@ -179,7 +179,7 @@ for runs with no narration, and for idempotent cached results. Persisted traces
 carry the same split as `TraceEntry.phase`. A paused run may instead carry a
 clarification question.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: AGT-209 item 5 (RunResult fields listed plainly, including stop_reason, truncated, error_info, pause_id) is written in the RunResult section above; recheck the field table and the to_dict envelope against types.RunResult and _wire.py at the release candidate. Checked against the merged code in the 0.5.0 docs pass."
 
 ### Truncated answers
 

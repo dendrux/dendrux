@@ -92,7 +92,7 @@ DELETE FROM react_traces     WHERE agent_run_id IN (SELECT id FROM agent_runs WH
 DELETE FROM agent_runs       WHERE tenant_id = 'acme';
 ```
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: confirm child-table foreign key column names (agent_run_id vs run_id) against db/models.py at the final schema, and that no 0.5 track added a table keyed by run. Checked against the merged code in the 0.5.0 docs pass."
 
 ### 4. Remove leftover image rows
 

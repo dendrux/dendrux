@@ -261,12 +261,12 @@ async def main() -> None:
         result = await agent.run("Here is my key: AKIAIOSFODNN7EXAMPLE, please store it.")
         print(result.status.value)        # error  (the secret never reaches the model)
         print(result.error)
-        # Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY (1 finding in message 0, role user)
+        # Guardrail 'SecretDetection' blocked: 1 AWS_ACCESS_KEY at message 1 (role=user)
 
     store = RunStore.from_database_url(url)
     async with store:
         print([e.event_type for e in await store.get_events(result.run_id)])
-        # ['run.started', 'guardrail.blocked', 'run.completed']
+        # ['run.started', 'tools.declared', 'guardrail.blocked', 'run.error']
 
 
 asyncio.run(main())
@@ -279,12 +279,13 @@ The captured governance rows from that run:
 ```text
 status: error
 governance events:
-  seq=1  guardrail.blocked  data={"direction": "incoming", "error": "Guardrail 'SecretDetection' blocked: AWS_ACCESS_KEY (1 finding in message 0, role user)", ...
+  seq=2  guardrail.blocked  data={"direction": "incoming", "error": "Guardrail 'SecretDetection' blocked: 1 AWS_ACCESS_KEY at message 1 (role=user)", "code": "guardrail_blocked", "kinds": ["AWS_ACCESS_KEY"], "counts": {"AWS_ACCESS_KEY": 1}, "location": "message 1 (role=user)"}
+  seq=3  run.error          data={"error": "Guardrail 'SecretDetection' blocked: 1 AWS_ACCESS_KEY at message 1 (role=user)", "status": "error", ...}
 ```
 
-One row on `run_events`, one terminal status, no LLM call. The blocked error carries the pattern name, a count and a location (message index, role, tool call id), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the audit trail.
+The blocked event, a terminal `run.error` (not `run.completed`, which a blocked run ended with before 0.5.0) and no LLM call. The run row gets the same safe `error` and `failure_reason="guardrail_blocked"`. The message carries the pattern name, a count and a location (message index counting the system prompt as message 0, role, and the tool call id for tool results), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the audit trail.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T3 owns the exact message wording; replace the example strings with real output (replaced with a captured run in the 0.5.0 docs pass)"
 
 ## Prompt injection — domain-specific by design
 
@@ -364,7 +365,7 @@ Like every finding, it carries a kind, a count and a location, never the content
 
 A message made of several text parts, and a tool result, is scanned as the one text the model would read (the parts joined by a blank line), so a pattern whose context sits in a neighbouring part is still found. Redaction is mapped back to each part. Tool-call parameters are scanned leaf by leaf and also as one joined `key=value` text in walk order and in reverse order, so an ancestor key such as `{"aws secret": {"value": TOKEN}}` supplies context to its children. A pattern's own context window still applies, so a context key separated from its value by many long keys can be missed. More parts can mean more blocks and redactions than in 0.4.1, never fewer. Joined text over the 4 Mi limit is `unscannable`.
 
-[//]: # "VERIFY-0.5.0: T3 owns this; confirm the kind name is unscannable and the depth and size limits worth documenting"
+[//]: # "VERIFY-0.5.0: T3 owns this; confirm the kind name is unscannable and the depth and size limits worth documenting. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Multiple guardrails compose
 

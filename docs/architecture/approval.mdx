@@ -172,7 +172,7 @@ See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-
 
 On resume the run re-checks `deny` and the per-tool call limits before executing approved calls, so a tool denied or capped after the pause is not run.
 
-[//]: # "VERIFY-0.5.0: Confirm resume-side policy checks and approval argument form against the release candidate."
+[//]: # "VERIFY-0.5.0: resume-side deny and call-limit re-check are T7 wave 2 (merged); expected_pause_id is documented above; the approval-event argument form is T4 (the model-sent view)"
 
 ## Per-call decisions
 

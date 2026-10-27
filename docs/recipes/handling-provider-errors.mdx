@@ -75,7 +75,9 @@ except ProviderError as err:
 
 `ErrorInfo` has `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. It is also stored with the run (`RunDetail.error_info`), put on the `run.error` event, and `RunResult.error`, `agent_runs.error` and `RunDetail.error` now hold the `safe_message`.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+Each failed provider call also writes an `llm.failed` event with the `error_info`, the `timeout_reason` and the call's duration; no billed usage is invented for it. A database failure uses the same envelope with `category="persistence_error"` and no provider fields. Provider failures are logged with `run_id`, category, status and code only, never a traceback or vendor text, so diagnose from `ErrorInfo`, not log text. Inside a custom provider, raise the `ProviderError` taxonomy: Dendrux recognises it through cause and context chains and grouped worker failures, and normalises it at its own call sites. Vendor text that your own code copies into an unrelated exception message, or into a notifier's message, is outside that protection.
+
+[//]: # "VERIFY-0.5.0: the run wiring of error_info (run.error payload, RunResult.error from safe_message, RunDetail.error_info) is T7 wave 2 and is merged; AGT-209 item 5 is written in the Agent reference. Recheck every sentence in this paragraph. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Should I retry?
 
@@ -113,7 +115,7 @@ When a deadline fires the call is abandoned and not retried again, and you get `
 
 The old `timeout=` argument still works as a shorthand that sets both `call_timeout` and `stream_idle_timeout`, and prints a `DeprecationWarning`.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T2 owns providers; confirm the kwarg names, defaults, the DeprecationWarning for timeout=, and the 30 second margin wording. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Mapping to HTTP
 

@@ -180,7 +180,7 @@ async with agent.stream("Write me a long essay") as stream:
     partial = events[-1].run_result.answer              # partial text from the current turn
 ```
 
-The interrupt lives on the `Agent` instance, so it only reaches streams that instance is driving. `cancel_run` from another process (or another `Agent` object) still sets the durable flag; that run finishes its current model call and cancels at the next checkpoint. If you need cross-process mid-stream interruption, call `cancel_run` on the instance that owns the stream, for example by routing the request to the server that holds the SSE connection.
+The interrupt lives on the `Agent` instance, so it only reaches streams and `submit_*` calls that instance is driving (an in-process interrupt of a `submit_*` or `resume` call returns a `CANCELLED` result; see [Cancelling a run](/docs/recipes/cancel-run#in-process-submitresume-task)).  `cancel_run` from another process (or another `Agent` object) still sets the durable flag; that run finishes its current model call and cancels at the next checkpoint. If you need cross-process mid-stream interruption, call `cancel_run` on the instance that owns the stream, for example by routing the request to the server that holds the SSE connection.
 
 The abandoned model call reports no usage (providers send token counts only at the end of a stream), so `usage` on the cancelled result covers completed iterations only. The interrupted call is not stored as an `llm_interactions` row; the partial answer on the run row and the `run.cancelled` payload are the audit trail.
 

@@ -198,7 +198,7 @@ Agent(..., on_governance_change="raise")   # raise GovernanceMismatchError; the 
 
 `governance.changed` carries `expected_digest`, `actual_digest` and `changed`, the names of the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `FutureWarning` if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
 
-[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the FutureWarning against the merged code"
+[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the FutureWarning against the merged code. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Why one pipeline instead of four subsystems
 

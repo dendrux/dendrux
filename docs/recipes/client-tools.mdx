@@ -105,7 +105,9 @@ async def main() -> None:
                 payload=json.dumps([[1], [2], [3]]),  # whatever the client read
             )
         ]
-        done = await agent.submit_tool_results(paused.run_id, results)
+        done = await agent.submit_tool_results(
+            paused.run_id, results, expected_pause_id=pause.pause_id
+        )
         print(done.status.value)                         # success
         print(done.answer)                               # references the submitted cell values
 
@@ -124,7 +126,9 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from dendrux.errors import RunNotFoundError
+from dendrux.errors import (
+    InvalidToolResultError, PauseStatusMismatchError, RunAlreadyClaimedError, RunNotFoundError,
+)
 from dendrux.store import RunStore
 from dendrux.types import ToolResult
 
@@ -141,6 +145,7 @@ class ResultItem(BaseModel):
     success: bool = True
 
 class ResultsIn(BaseModel):
+    pause_id: str | None = None        # the pause_id the client was shown by /pending
     results: list[ResultItem]
 
 # current_tenant authenticates the header credential and resolves the tenant.
@@ -169,9 +174,14 @@ async def tool_results(body: ResultsIn, run_id: str = Depends(owned_run),
     try:
         result = await agent.submit_tool_results(
             run_id, results, tenant_id=tenant,
+            expected_pause_id=body.pause_id,     # a stale submit raises PauseStatusMismatchError
         )
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
+    except (PauseStatusMismatchError, RunAlreadyClaimedError):
+        raise HTTPException(409, "this pause was already answered; re-fetch /pending")
+    except (InvalidToolResultError, ValueError):
+        raise HTTPException(400, "invalid tool results")
     return {"run_id": result.run_id, "status": result.status.value, "answer": result.answer}
 ```
 
@@ -179,7 +189,9 @@ async def tool_results(body: ResultsIn, run_id: str = Depends(owned_run),
 
 Add a `DELETE /runs/{run_id}` route over `agent.cancel_run(run_id, tenant_id=tenant)` the same way.
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
+Send `pause_id` down with the pending calls and back with the results. `expected_pause_id=` makes a delayed or replayed submit fail with `PauseStatusMismatchError` (409) instead of answering a newer pause; it is optional for tool results, but you should always pass it. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+A submission is checked before the run is claimed: every pending call must be answered once by id and tool name, payloads must be finite JSON or plain text within `Limits.max_tool_result_bytes`, and text may not contain NUL or lone surrogates. A bad submission raises `InvalidToolResultError` (or another `ValueError`, such as `InputValidationError`) and leaves the run paused, so the client can correct it and send it again.
 
 Keep result metadata, traces, provider bodies, arbitrary output and PII mappings
 out of browser responses. The answer in this allowlist is intended for the authenticated
@@ -232,7 +244,7 @@ async function drive(run_id, status) {
     const r = await fetch(`/runs/${run_id}/tool-results`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({results}),
+      body: JSON.stringify({pause_id: pending.pause_id, results}),
     });
     if (!r.ok) throw new Error("Submit failed; re-fetch pending before retrying");
     ({status} = await r.json());                           // the next status: another pause, or done

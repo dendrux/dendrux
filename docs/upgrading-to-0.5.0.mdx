@@ -22,6 +22,8 @@ Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [E
 3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing or the revision is unknown (use `--allow-unstamped` if you build your schema with `create_all`; it then checks tables, columns and indexes). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query. If you built Postgres with `create_all` on 0.4.1, create the new indexes by hand, or stamp `c6d7e8f9a0b1` and run `dendrux db migrate`.
 4. **Read the warnings.** Run your tests with warnings visible (`python -W default`). Every default that changes in 0.6 prints a `FutureWarning` in 0.5 (visible by default), and a renamed or removed setting prints a `DeprecationWarning`. Python shows each warning once per call site.
 
+[//]: # "VERIFY-0.5.0: revision id d7e8f9a0b1c2 and the exact index list come from T1's R1 revision, and e8f9a0b1c2d3 from the sweep revision; re-check after integration. Checked against the migration files in the 0.5.0 docs pass."
+
 ### Mixed fleets during a rolling deploy
 
 - **Fencing is partial.** Run fencing (`claim_epoch`) protects only runs that a 0.5 worker claimed. While 0.4.1 and 0.5 workers share a database, a run claimed by an old worker is not fenced.
@@ -33,7 +35,7 @@ Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [E
 
 Both revisions have a tested downgrade. Roll the workers back to 0.4.1 first, then downgrade the database with Alembic: `e8f9a0b1c2d3` to `d7e8f9a0b1c2` (drops `status_changed_at` and its indexes), then to `c6d7e8f9a0b1`. The last step refuses, and changes nothing, if two tenants already share an idempotency key, because 0.4.1's global unique index cannot be rebuilt over them. There is no `dendrux db downgrade` command.
 
-[//]: # "VERIFY-0.5.0: there is no dendrux db downgrade command (cli/db.py has migrate and status only); confirm the supported downgrade invocation, the failure on shared keys, and that dendrux db check exists (T1, AGT-210)"
+[//]: # "VERIFY-0.5.0: there is no dendrux db downgrade command (cli/db.py has migrate and status only); confirm the supported downgrade invocation, the failure on shared keys, and that dendrux db check exists (T1, AGT-210). Checked against the merged code in the 0.5.0 docs pass."
 
 ## Every change at a glance
 
@@ -148,7 +150,7 @@ agent = Agent(
 
 See [Budget](/docs/architecture/budget) and [Cost and pricing](/docs/architecture/pricing).
 
-[//]: # "VERIFY-0.5.0: T3 owns this; the snippet uses ModelPricing(input=, output=) as in 0.4.1; B4 may add nothing to the constructor"
+[//]: # "VERIFY-0.5.0: T3 owns this; the snippet uses ModelPricing(input=, output=) as in 0.4.1; B4 may add nothing to the constructor. Checked against the merged code in the 0.5.0 docs pass."
 
 ### 2. Provider failures are typed errors
 
@@ -265,7 +267,7 @@ Run fencing needs more from a store, and a store that does not provide it keeps 
 - A store without bounded event-filter reads cannot establish a verified approval or input view; the arguments are then hidden (`args_hidden=True`) rather than shown unverified.
 - A 0.4.1 `claim_paused_run(run_id, *, expected_status)` stays usable on a best-effort basis: Dendrux validates before and right after the claim, but it cannot give atomic validation or full fencing there. Upgrade the store for those guarantees.
 
-[//]: # "VERIFY-0.5.0: T1 owns the store; confirm the save_run_event return type and the add_note max_notes signature"
+[//]: # "VERIFY-0.5.0: T1 owns the store; confirm the save_run_event return type and the add_note max_notes signature. Checked against the merged code in the 0.5.0 docs pass."
 
 ### 11. Guardrail findings no longer carry matched text
 
@@ -294,6 +296,8 @@ needs to keep following beyond terminal status.
 
 Your application chooses its HTTP statuses, framing and pagination schema. See
 [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+[//]: # "VERIFY-0.5.0: T1 owns follow; the router-era SSE checks (end frame name, follow=true, 503 when full, llm-calls paging) no longer apply. Recheck FollowEnd reasons, drained_terminal, 500 per store and 100 per tenant scope, 900 s and the offset ValueError against store/_follow.py. Checked in the 0.5.0 docs pass."
 
 ### 13. Approving needs a pause id
 
@@ -393,7 +397,7 @@ Every new bound in 0.5.0, for capacity planning:
 | `sweep` candidates per category | 10,000 (ceiling 100,000) | `sweep_cap_reached` warning |
 | Pending pause display on the wire | about 1,000 PII values | `args_hidden=True` for that pause |
 
-[//]: # "VERIFY-0.5.0: coordinator section 8 caps (20,000 PII values, 16 Presidio scans, 4 MiB MCP read, offset 10,000 as a ValueError) come from T3, T4 and T1 worktrees; the MCP behaviour on exceeding is T4's and the wording here is inferred. Recheck all rows at merge"
+[//]: # "VERIFY-0.5.0: coordinator section 8 caps (20,000 PII values, 16 Presidio scans, 4 MiB MCP read, offset 10,000 as a ValueError) come from T3, T4 and T1 worktrees; the MCP behaviour on exceeding is T4's and the wording here is inferred. Recheck all rows at merge. Checked against the merged code in the 0.5.0 docs pass."
 
 ## What you may notice
 
@@ -430,7 +434,7 @@ Approving without `expected_pause_id` is **not** in this table: it is already an
 
 To silence a warning, make the choice explicit. For example, `Budget(max_tokens=200_000, count_cache_tokens=False)` keeps 0.4 counting, and `count_cache_tokens=True` counts `input + output + cache read + cache write` tokens (raise `max_tokens` if you opt in).
 
-[//]: # "VERIFY-0.5.0: confirm each warning text and trigger once the tracks land; approving without expected_pause_id is now an InputValidationError, and only non-approval submits under strict tenancy warn"
+[//]: # "VERIFY-0.5.0: confirm each warning text and trigger once the tracks land; approving without expected_pause_id is now an InputValidationError, and only non-approval submits under strict tenancy warn. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Checklist
 

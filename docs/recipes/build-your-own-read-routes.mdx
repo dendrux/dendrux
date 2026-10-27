@@ -63,8 +63,6 @@ approving without a pause id raises `InputValidationError` (answer 400). After a
 409, call `get_pending` again before asking the actor again; never retry the old
 decision. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
-
 ## Optional live feed over SSE
 
 `follow` has a shared poller per watched run, terminal drain, redaction, heartbeats,

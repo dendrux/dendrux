@@ -12,6 +12,8 @@ docs/
 ├── is-dendrux-for-you.mdx  → /docs/is-dendrux-for-you
 ├── quickstart.mdx          → /docs/quickstart
 ├── upgrading-to-0.5.0.mdx  → /docs/upgrading-to-0.5.0
+├── guides/                 → /docs/guides/*
+│   └── scaling.mdx         (pools, PgBouncer, migrations, sweeps, every bound)
 ├── architecture/           → /docs/architecture/*
 │   ├── runs.mdx, state-persistence.mdx, event-ordering.mdx
 │   ├── pause-resume.mdx, cancellation.mdx, inbox.mdx

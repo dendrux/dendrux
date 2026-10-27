@@ -71,7 +71,7 @@ Every provider also accepts three deadlines, so a stalled call ends instead of h
 
 The duration and any timeout reason are recorded with each LLM call.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T2 owns the providers; confirm the argument names and defaults, the retry rule, and where duration and timeout_reason are recorded. Checked against the merged code in the 0.5.0 docs pass."
 
 Provider clients are rebuilt per event loop, so using one provider from a second loop (a test client, a second `asyncio.run`) no longer fails on a connection from the first.
 

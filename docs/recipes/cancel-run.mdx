@@ -141,7 +141,7 @@ Closing the stream yourself (`aclose()` / leaving `async with`) also ends the ru
 
 ### In-process submit/resume task
 
-If you hold the `Agent` instance that started the submit/resume task (the asyncio task spawned by `submit_tool_results`, `submit_input`, or `submit_approval`), `cancel_run` cancels that task synchronously in addition to setting the DB flag. The task awaits release immediately; the DB cancel signal is the durable backstop in case the cancel call comes from a different process.
+If you hold the `Agent` instance that is executing a `submit_tool_results`, `submit_input`, `submit_approval` or `resume` call, `cancel_run` interrupts that run in addition to setting the DB flag. Since 0.5.0 the awaiting `submit_*` call **returns a `CANCELLED` `RunResult`** instead of raising `CancelledError` (cancelling the task that awaits the call yourself still raises). Check `result.status`, and check `result.meta["dendrux.cancel_persisted"]`: it is `False` when the durable `cancelled` status could not be confirmed, so do not treat that cancellation as saved. A cancel that lands between the claim and the moment the runner takes ownership never discards the claim; the caller receives a typed run outcome. The DB cancel signal is the durable backstop in case the cancel call comes from a different process.
 
 ### Terminal run
 

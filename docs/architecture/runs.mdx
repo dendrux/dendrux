@@ -156,7 +156,7 @@ Where else to read it:
 
 A failed LLM request ends the run `error`. Since 0.5.0 the cause is a typed `ProviderError` (rate limit, timeout, refusal, empty stream and so on) summarised as `RunResult.error_info` and `RunDetail.error_info`, and `RunResult.error` is a fixed safe message, never the vendor's text. A run no longer ends `success` with an empty answer when the provider returned nothing. See [Handling provider errors](/docs/recipes/handling-provider-errors).
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: the run-level wiring of error_info and the safe error message is T7 wave 2; recheck this section after it merges. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Verified end-to-end
 

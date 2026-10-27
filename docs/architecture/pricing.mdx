@@ -115,7 +115,7 @@ their stored cost but may have no source information.
 - **Budget.** A `Budget(max_cost_usd=...)` uses these prices, and since 0.5.0 it refuses to start when the model has none (`BudgetConfigurationError`). See [Dollar limits](/docs/architecture/budget#dollar-limits).
 - **Long cache lifetimes.** A call that wrote the long (12 hour) cache tier is marked cost-unknown, because its write rate differs from the default tier; the rate table for it arrives in 0.6.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T2 owns the cache-write partition; confirm cache_write_tokens maps to cache_creation_input_tokens, fresh = input - read - write, and the ttl_12h cost_unknown rule. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Where this fits
 

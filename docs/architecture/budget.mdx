@@ -79,7 +79,7 @@ Budget(max_tokens=200_000, count_cache_tokens=False)   # keep the 0.4 count, sil
 
 The dollar limit is where caching always shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes. A delegated child can still spend past a parent's limit within one of its own iterations; tightening that is planned for 0.6.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T3 owns count_cache_tokens; confirm the formula, the warning trigger, and the child overshoot note. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Dollar limits
 
@@ -102,6 +102,8 @@ Under `"warn"` the first unpriced call writes the event:
 ```
 
 Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
+
+**Invalid usage numbers.** A provider response whose token counts or cost are negative, non-finite or out of range is recorded as unreported and cost-unknown (a `usage_invalid` log line carries no values), and it cannot be re-priced from the table. A budget with `on_exceed="pause"` or `"cancel"` stops at its next checkpoint instead of treating the call as free; a `"warn"` budget keeps its warn behaviour, and a response that ends the run still completes it.
 
 ## What the events look like
 
@@ -181,9 +183,10 @@ A child run is a run with its own `Agent`, and its own budget if it has one. Eac
 
 ## Usage source and persistence
 
-- **With persistence** (a database or `state_store`), the run's own usage is tracked in memory as calls complete, and the subtree rollup of children is read from successfully recorded `llm_interactions`. A failed usage write is retried and never switches enforcement off; if the live read itself raises, the tracker falls back to in-memory usage.
+- **With persistence** (a database or `state_store`), the run's own usage is tracked in memory as calls complete, and the subtree rollup of children is read from successfully recorded `llm_interactions`. A failed usage write is retried and never switches enforcement off. If the live read of the subtree fails or lags, the tracker keeps enforcing the last spend it observed for the children plus the run's own growth since, so a transient database error cannot hide spend.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: the budget read is T7 wave 2; recheck this bullet against the final budget reads. Checked against the merged code in the 0.5.0 docs pass."
+
 - **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
 
 Paused runs write their running totals (tokens and `total_cost_usd`) to the row when they pause, so a paused run no longer reads as zero spend.
