@@ -128,9 +128,14 @@ _ADVERSARIAL_UNITS = [
 ]
 
 
+# A quadratic scan costs about 100x for 10x the text; a linear one about 10x.
+# The bound sits well between the two so a busy CI runner cannot tip it.
+_SCALING_BOUND = 25
+
+
 def _best_scan_time(pii: PII, sec: SecretDetection, text: str) -> float:
     best = float("inf")
-    for _ in range(3):
+    for _ in range(5):
         start = time.perf_counter()
         asyncio.run(_scan_both(pii, sec, text))
         best = min(best, time.perf_counter() - start)
@@ -152,13 +157,13 @@ class TestScanScaling:
 
         small = _best_scan_time(pii, sec, make(100_000))
         large = _best_scan_time(pii, sec, make(1_000_000))
-        assert large / max(small, 1e-4) < 15, (unit, small, large)
+        assert large / max(small, 1e-4) < _SCALING_BOUND, (unit, small, large)
 
     def test_trailing_at_sign_does_not_go_quadratic(self) -> None:
         pii, sec = PII(), SecretDetection()
         small = _best_scan_time(pii, sec, "a" * 100_000 + "@")
         large = _best_scan_time(pii, sec, "a" * 1_000_000 + "@")
-        assert large / max(small, 1e-4) < 15
+        assert large / max(small, 1e-4) < _SCALING_BOUND
 
 
 class TestScansLeaveTheLoop:
