@@ -46,7 +46,7 @@ The switch is uniform; what the vendor *returns* is not. The key split is **toke
 | `OpenAIResponsesProvider` | Reasoning via the Responses API | Yes — summary (`show_thinking=True`) | The provider to use when you want gpt-5 / o-series thinking as text. |
 | `OpenAIProvider` (Chat Completions) | `effort` → `reasoning_effort` | No | Chat Completions returns reasoning **token counts only**, never the trace. |
 
-Adaptive thinking is the only mode current Anthropic models (4.6–4.8 / Fable / Mythos) support; `thinking_budget` exists for older models and fixed-cost workloads. See [Models and providers](/docs/architecture/models) for picking between the two OpenAI providers.
+Adaptive thinking is the only mode current Anthropic models (4.6–4.8 / Fable / Mythos) support; `thinking_budget` exists for older models and fixed-cost workloads. Haiku 4.5 is one of the older models: `thinking=True` alone is rejected by the API (a `ProviderError` with category `rejected`), so pass `thinking_budget=` with it. See [Models and providers](/docs/architecture/models) for picking between the two OpenAI providers.
 
 ## Reading reasoning back
 
