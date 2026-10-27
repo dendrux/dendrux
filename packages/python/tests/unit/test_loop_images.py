@@ -1,4 +1,4 @@
-"""Track D1: request view (prepare_request), loop commit protocol, tool images, rejection.
+"""request view (prepare_request), loop commit protocol, tool images, rejection.
 
 The module also hosts the in-test fakes shared by the other D1 test files:
 an in-memory ``BlobCatalog`` + ``BlobResolver``, a PNG generator, an
@@ -695,6 +695,12 @@ async def shot() -> Any:
 
 
 @tool()
+async def shot_at(target: str, nested: list[str]) -> Any:
+    """Take a screenshot of a target."""
+    return ToolOutput("Captured.", images=[Image.from_bytes(PNG_A)])
+
+
+@tool()
 async def bad_shot() -> Any:
     """Return an image the wrong way."""
     return {"img": Image.from_bytes(PNG_A)}
@@ -845,7 +851,7 @@ async def test_before_tool_substitute_tooloutput_and_ctx_images() -> None:
             LLMResponse(
                 tool_calls=[
                     ToolCall(
-                        name="shot",
+                        name="shot_at",
                         params={"target": prior.image_id, "nested": [prior.image_id + "x"]},
                         provider_tool_call_id="p",
                     )
@@ -854,7 +860,7 @@ async def test_before_tool_substitute_tooloutput_and_ctx_images() -> None:
             LLMResponse(text="done"),
         ]
     )
-    agent = Agent(provider=llm, tools=[shot], prompt="p", before_tool=hook)
+    agent = Agent(provider=llm, tools=[shot_at], prompt="p", before_tool=hook)
     result = await ReActLoop().run(
         agent=agent,
         provider=llm,
@@ -1301,7 +1307,7 @@ async def test_release_wire_drops_bytes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Review fix round (review-D1.md)
+# Image wire cleanup
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""``tenant_id=`` on the run-control write methods (0.4.1, Oreo #31).
+"""``tenant_id=`` on the run-control write methods.
 
 ``submit_tool_results``, ``submit_input``, ``submit_approval``,
 ``submit_resume``, ``resume`` and ``resume_stream`` take the same optional
@@ -128,17 +128,30 @@ async def _submit_input(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
 
 
 async def _submit_approval_bool(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await p.agent.submit_approval(p.run_id, approved=True, **scope)
+    return await p.agent.submit_approval(
+        p.run_id,
+        approved=True,
+        **scope,
+        expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
+    )
 
 
 async def _submit_approval_reject(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await p.agent.submit_approval(p.run_id, approved=False, **scope)
+    return await p.agent.submit_approval(
+        p.run_id,
+        approved=False,
+        **scope,
+        expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
+    )
 
 
 async def _submit_approval_decisions(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
     ids = await _call_ids(store, p.run_id)
     return await p.agent.submit_approval(
-        p.run_id, decisions={i: ApprovalDecision.approve() for i in ids}, **scope
+        p.run_id,
+        decisions={i: ApprovalDecision.approve() for i in ids},
+        **scope,
+        expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
     )
 
 
@@ -147,28 +160,58 @@ async def _submit_resume(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
 
 
 async def _resume_tool_results(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await p.agent.resume(p.run_id, tool_results=await _results(store, p.run_id), **scope)
+    return await p.agent.resume(
+        p.run_id,
+        tool_results=await _results(store, p.run_id),
+        **scope,
+        expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
+    )
 
 
 async def _resume_input(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await p.agent.resume(p.run_id, user_input="answer", **scope)
+    return await p.agent.resume(
+        p.run_id,
+        user_input="answer",
+        **scope,
+        expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
+    )
 
 
 async def _resume_approve(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await p.agent.resume(p.run_id, **scope)
+    return await p.agent.resume(
+        p.run_id, **scope, expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"]
+    )
 
 
 async def _resume_stream_tool_results(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
     results = await _results(store, p.run_id)
-    return await _drain(p.agent.resume_stream(p.run_id, tool_results=results, **scope))
+    return await _drain(
+        p.agent.resume_stream(
+            p.run_id,
+            tool_results=results,
+            **scope,
+            expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
+        )
+    )
 
 
 async def _resume_stream_input(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await _drain(p.agent.resume_stream(p.run_id, user_input="answer", **scope))
+    return await _drain(
+        p.agent.resume_stream(
+            p.run_id,
+            user_input="answer",
+            **scope,
+            expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"],
+        )
+    )
 
 
 async def _resume_stream_approve(p: Paused, store: Any, scope: dict[str, Any]) -> Any:
-    return await _drain(p.agent.resume_stream(p.run_id, **scope))
+    return await _drain(
+        p.agent.resume_stream(
+            p.run_id, **scope, expected_pause_id=(await store.get_pause_state(p.run_id))["pause_id"]
+        )
+    )
 
 
 CASES: dict[str, tuple[str, Invoke]] = {
@@ -270,7 +313,12 @@ async def test_missing_run_with_scope_is_not_found(store) -> None:
 async def test_resume_stream_mismatch_raises_before_any_event(store) -> None:
     paused = await _pause("client", store, "t1")
     results = await _results(store, paused.run_id)
-    stream = paused.agent.resume_stream(paused.run_id, tool_results=results, tenant_id="t2")
+    stream = paused.agent.resume_stream(
+        paused.run_id,
+        tool_results=results,
+        tenant_id="t2",
+        expected_pause_id=(await store.get_pause_state(paused.run_id))["pause_id"],
+    )
     events: list[Any] = []
     with pytest.raises(RunNotFoundError):
         async for event in stream:
@@ -293,7 +341,11 @@ async def test_resume_stream_mismatch_does_not_cancel_a_running_run(store) -> No
         await session.commit()
     before = await _snapshot(store, paused.run_id)
 
-    async with paused.agent.resume_stream(paused.run_id, tenant_id="t2") as stream:
+    async with paused.agent.resume_stream(
+        paused.run_id,
+        tenant_id="t2",
+        expected_pause_id=(await store.get_pause_state(paused.run_id))["pause_id"],
+    ) as stream:
         with pytest.raises(RunNotFoundError):
             async for _ in stream:
                 pass

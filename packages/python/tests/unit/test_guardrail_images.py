@@ -1,4 +1,4 @@
-"""Track D1: image guardrails (§5.11, S-03) and parts-aware text guardrails."""
+"""image guardrails (§5.11, S-03) and parts-aware text guardrails."""
 
 from __future__ import annotations
 

@@ -22,10 +22,12 @@ def _model_dump(value: Any) -> Any:
 def _enforce_size(value: Any, max_result_bytes: int) -> None:
     encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
     if len(encoded) > max_result_bytes:
-        raise MCPResultTooLargeError(
+        error = MCPResultTooLargeError(
             f"MCP tool result is {len(encoded)} bytes; configured limit is "
             f"{max_result_bytes} bytes."
         )
+        error.size = len(encoded)
+        raise error
 
 
 def _is_image(block: Any) -> bool:

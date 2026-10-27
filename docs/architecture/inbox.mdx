@@ -7,9 +7,13 @@ description: Leave a note for a run that is already in progress. How submit_note
 
 Sometimes a person has something to add while an agent is mid-run: "also skip anything older than 2023", "the customer just replied". `submit_note` leaves that message for the run. The model sees it at the next iteration, and the run keeps going. It does not pause the run and it does not need the run to be waiting for anything.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 note_id = await agent.submit_note(run_id, "Skip anything older than 2023.")
 ```
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def submit_note(
@@ -43,12 +47,16 @@ The runner appends and records the message first, then marks the note delivered.
 
 A note submitted while the run makes its last LLM call (or after its final iteration began) may never be delivered. When a run ends, the result lists the notes it did not deliver:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run("...")
 print(result.meta.get("undelivered_notes"))   # ['01M5...'] or missing
 ```
 
 `meta["undelivered_notes"]` appears only when there are any. The same list is available later, with the text and your metadata, from the store:
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 notes = await store.get_notes(run_id, undelivered_only=True)
@@ -66,6 +74,7 @@ for n in notes:
 | `text` over 32 KiB as UTF-8 | `ValueError` |
 | `metadata` not JSON-serializable, or over 8 KiB encoded | `ValueError` |
 | `run_id` does not exist (or is outside `tenant_id`) | `RunNotFoundError` |
+| The run already holds `Limits.max_notes_per_run` notes (default 1000) | `NoteLimitExceededError` (a `ValueError`) |
 | The run is already terminal | `RunAlreadyTerminalError` |
 | No persistence configured | `PersistenceNotConfiguredError` |
 
@@ -77,13 +86,14 @@ A delivered note is an ordinary user message in the history, so incoming [guardr
 
 ## Tenants
 
-Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it for trusted, single-tenant use. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `dendrux.store.RunNotFoundError` (the store module has its own not-found error, separate from `dendrux.errors.RunNotFoundError`). Delegated child runs inherit their parent's tenant (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
+Pass `tenant_id=` to require that the run belongs to exactly that tenant (`None` means untenanted); a mismatch raises `RunNotFoundError`, the same as an unknown run. Omit it for trusted, single-tenant use (or pass `UNSCOPED`); with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`. `RunStore.get_notes(run_id, tenant_id=...)` applies the same rule and raises `RunNotFoundError` (since 0.5.0 the store and `dendrux.errors` use one class). Delegated child runs inherit their parent's tenant (see [Access control](/docs/architecture/access-control#tenants-and-delegated-runs)), so one tenant value covers a run and its children.
 
 ## Limits to know
 
 - **`SingleCall` never delivers notes.** It makes one LLM call, so there is no next iteration. A note on a `SingleCall` run is listed as undelivered when the run ends.
 - Delivery is at the iteration boundary. A run in the middle of a long tool call sees the note after the tool returns.
 - Notes go to one run. To brief a delegated child, submit the note to the child's `run_id` (`RunStore.get_subtree` lists them).
+- The note cap is enforced by one conditional insert in the store, so concurrent `submit_note` calls cannot exceed it. A custom `StateStore` whose `add_note` has no `max_notes` keyword keeps working without the cap.
 - A custom `StateStore` written before 0.3.0 does not implement `add_note`, `get_notes` or `mark_notes_delivered`; `submit_note` and `get_notes` raise `NotImplementedError` naming the missing method, and runs on such a store finish normally without an inbox.
 
 ## Where this fits

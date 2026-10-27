@@ -54,6 +54,7 @@ async def main() -> None:
         tools=[refund],
         require_approval=["refund"],            # refund pauses the run for approval
         database_url="sqlite+aiosqlite:///cancel.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("Refund order 42 using the refund tool.")
         print(result.status.value)              # waiting_approval
@@ -69,7 +70,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The DB state before and after, pulled directly from SQLite, shows the single-statement transition:
+The DB state before and after, pulled directly from SQLite, shows the single-statement transition (captured on Dendrux 0.5.0 with claude-haiku-4-5):
 
 ```text
 first.run returned: status=waiting_approval
@@ -81,9 +82,10 @@ STATE AT PAUSE (waiting_approval)
   pause_data: <set>
   run_events:
     seq=0  run.started
-    seq=1  llm.completed
-    seq=2  approval.requested
-    seq=3  run.paused
+    seq=1  tools.declared
+    seq=2  llm.completed
+    seq=3  approval.requested
+    seq=4  run.paused
 
 cancel_run returned: status=cancelled
 
@@ -94,17 +96,18 @@ STATE AFTER CANCEL
   pause_data: null
   run_events:
     seq=0  run.started
-    seq=1  llm.completed
-    seq=2  approval.requested
-    seq=3  run.paused
-    seq=4  run.cancelled
+    seq=1  tools.declared
+    seq=2  llm.completed
+    seq=3  approval.requested
+    seq=4  run.paused
+    seq=5  run.cancelled
 ```
 
 Three things worth noting in that diff.
 
 1. `status` went straight from `waiting_approval` to `cancelled` without an intermediate `running` state. One SQL statement made the transition.
 2. `pause_data` was cleared to JSON null as part of the same UPDATE. There is no stale handoff data sitting on a terminal row.
-3. A `run.cancelled` event was appended at `seq=4`, continuing the existing per-run monotonic sequence. SSE clients that were streaming this run see the cancel arrive as a normal event.
+3. A `run.cancelled` event was appended at `seq=5`, continuing the existing per-run monotonic sequence. SSE clients that were streaming this run see the cancel arrive as a normal event.
 
 ## Cancelling a running run
 
@@ -168,6 +171,8 @@ When `stream()` or `resume_stream()` starts driving the loop, the runner registe
 
 The runner persists that outcome exactly like any other terminal result: status `cancelled`, `answer` set to the partial text, and a `run.cancelled` event carrying `{"reason": "cancel_requested", "interrupted": true, "partial_output": true}`.
 
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
 ```python
 async with agent.stream("Write me a long essay") as stream:
     consumer = asyncio.create_task(consume(stream))     # your code reads events
@@ -178,7 +183,7 @@ async with agent.stream("Write me a long essay") as stream:
     partial = events[-1].run_result.answer              # partial text from the current turn
 ```
 
-The interrupt lives on the `Agent` instance, so it only reaches streams that instance is driving. `cancel_run` from another process (or another `Agent` object) still sets the durable flag; that run finishes its current model call and cancels at the next checkpoint. If you need cross-process mid-stream interruption, call `cancel_run` on the instance that owns the stream, for example by routing the request to the server that holds the SSE connection.
+The interrupt lives on the `Agent` instance, so it only reaches streams and `submit_*` calls that instance is driving (an in-process interrupt of a `submit_*` or `resume` call returns a `CANCELLED` result; see [Cancelling a run](/docs/recipes/cancel-run#in-process-submitresume-task)).  `cancel_run` from another process (or another `Agent` object) still sets the durable flag; that run finishes its current model call and cancels at the next checkpoint. If you need cross-process mid-stream interruption, call `cancel_run` on the instance that owns the stream, for example by routing the request to the server that holds the SSE connection.
 
 The abandoned model call reports no usage (providers send token counts only at the end of a stream), so `usage` on the cancelled result covers completed iterations only. The interrupted call is not stored as an `llm_interactions` row; the partial answer on the run row and the `run.cancelled` payload are the audit trail.
 
@@ -197,6 +202,8 @@ Prefer `cancel_run` when the interruption is a product action (a user hit stop, 
 ## Cascade
 
 Delegated child runs have their own rows and their own cancel flags. `cancel_run(run_id, cascade=True)` cancels the whole subtree:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.cancel_run(run_id, cascade=True)

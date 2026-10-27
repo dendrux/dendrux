@@ -17,7 +17,13 @@ from dendrux.errors import (
     ImageError, InvalidImageError, ImageLimitError, ImageFetchError, UnsupportedModalityError,
     ImageRejectedError, ProviderError, BlobNotFoundError, BlobIntegrityError,
     ImagePersistenceUnsupportedError, BlobContentionError,
+    ProviderAuthError, ProviderRateLimitError, ProviderTimeoutError, ProviderUnavailableError,
+    ProviderStreamIncompleteError, ModelRefusalError, ContentFilteredError,
+    BudgetConfigurationError, TenantScopeRequiredError, GovernanceMismatchError,
+    NoteLimitExceededError, PersistenceError,
 )
+from dendrux.types import InputValidationError   # also a ValueError
+from dendrux.store import FollowCapacityError
 ```
 
 The most common ones are also re-exported from the top-level `dendrux` package.
@@ -26,23 +32,30 @@ The most common ones are also re-exported from the top-level `dendrux` package.
 
 | Exception | Base | Raised when | Suggested HTTP |
 | --- | --- | --- | --- |
-| `RunNotFoundError(run_id)` | `LookupError` | `run_id` does not exist in the store. | 404 |
+| `RunNotFoundError(run_id)` | `LookupError` | `run_id` does not exist, or belongs to a tenant other than the one you passed. The same error for both, from `Agent`, `retry` and `RunStore` alike (`dendrux.store.RunNotFoundError` is an alias of this class). | 404 |
 | `RunNotPausedError(run_id, current_status)` | `RuntimeError` | A submit method is called on a run that is not paused. | 409 |
-| `PauseStatusMismatchError(run_id, current_status, expected_status)` | `RuntimeError` | Submit called for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). | 409 |
+| `PauseStatusMismatchError(run_id, current_status, expected_status, *, expected_pause_id=, current_pause_id=, reason=)` | `RuntimeError` | `reason="status"` (the default): a submit for the wrong pause type (e.g. `submit_tool_results` on `waiting_human_input`). `reason="pause_id"`: the call carried an `expected_pause_id=` that is no longer the run's current pause, so it is a stale submit; nothing was claimed or written. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits). | 409 |
 | `RunAlreadyClaimedError(run_id)` | `RuntimeError` | A concurrent submit already won the CAS claim on this pause. | 409 |
 | `RunAlreadyTerminalError(run_id, current_status)` | `RuntimeError` | A submit method, or `submit_note`, targets a run that is already terminal; also a submit on a run whose cancellation was requested but not yet observed. (`cancel_run` and `request_pause` do not raise this.) | 409 |
-| `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set (unknown or duplicate ids). | 400 |
-| `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` / `DENDRUX_DATABASE_URL` is configured. | 500 |
+| `InvalidToolResultError(run_id, detail)` | `ValueError` | Submitted tool results do not match the pending set: an unknown, duplicate or missing call id, a tool name that differs from the pending call, a payload that is not valid, finite JSON or text, or an approval-path result that is not a failed denial. `detail` is a fixed description and never echoes a client id or payload. The run stays paused and unclaimed. | 400 |
+| `InputValidationError(field, code)` | `ValueError` | A client value cannot be accepted or stored: `field` names a fixed API field (never an input key or value) and `code` is `invalid_identifier`, `invalid_text` (NUL or a lone surrogate), `invalid_json`, `nonfinite_json`, `structure_limit` or `pause_id_required` (approving without `expected_pause_id`). Raised before anything is written or claimed. Import it from `dendrux.types`. | 400 |
+| `PersistenceError()` | `RuntimeError` | A database operation failed. SQL, bound parameters and driver text are omitted (`safe_message`, `retryable`). Inside a run it ends the run `error` with `error_info.category == "persistence_error"`. | 500 or 503 |
+| `FollowCapacityError(limit, per_tenant=False)` | `RuntimeError` | `RunStore.follow` has no free follower slot: the store cap, or (`per_tenant=True`) the cap for that tenant scope. Safe to retry shortly. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). | 503 |
+| `PersistenceNotConfiguredError()` | `RuntimeError` | A method needs persistence but no `database_url` / `state_store` is configured (and the deprecated `DENDRUX_DATABASE_URL` fallback is unset). | 500 |
 | `SchemaNotInitializedError()` | `RuntimeError` | The database has no Dendrux tables yet (non-SQLite needs `dendrux db migrate`). | 500 |
-| `SchemaOutOfDateError(missing_tables, missing_columns)` | `RuntimeError` | A non-SQLite database is missing tables or columns this version needs, because `dendrux db migrate` was not run after upgrading. Raised once per engine, before the first run (`Agent`, `sweep`, dashboard; `RunStore` is not checked). Only presence of tables and columns is verified, not their types or defaults. Carries `err.missing_tables`, `err.missing_columns` (`"table.column"`) and `err.missing`. Set `DENDRUX_SKIP_SCHEMA_CHECK=1` to skip the check. See [Upgrading](/docs/architecture/state-persistence#upgrading). | 500 |
-| `ContextLengthExceededError(message, status_code=, provider_code=, model=)` | `RuntimeError` | An OpenAI-compatible endpoint (`OpenAIProvider`, `OpenRouterProvider`) rejected a batch or streaming request as larger than the model's context window. The SDK error is chained as `__cause__`; the message never contains prompt content. See [Models and providers](/docs/architecture/models#request-errors-on-openai-compatible-endpoints). | 413 or 400 |
+| `SchemaOutOfDateError(missing_tables=(), missing_columns=(), missing_indexes=())` | `RuntimeError` | A non-SQLite database is missing tables, columns or required indexes this version needs, because `dendrux db migrate` was not run after upgrading. Raised once per engine, before the first run (`Agent`, `sweep`; `RunStore` is not checked). Table/column presence and required Postgres index definitions/readiness are verified; column types and defaults are not. Carries `err.missing_tables`, `err.missing_columns` (`"table.column"`), `err.missing_indexes` and `err.missing`. Set `DENDRUX_SKIP_SCHEMA_CHECK=1` to skip the check. See [Upgrading](/docs/architecture/state-persistence#upgrading). | 500 |
+| `ContextLengthExceededError(message, status_code=, provider_code=, model=)` | `ProviderError` | A provider rejected a batch or streaming request as larger than the model's context window. The SDK error is chained as `__cause__`; the message never contains prompt content. See [Models and providers](/docs/architecture/models#request-errors-on-openai-compatible-endpoints). | 413 or 400 |
+| `ProviderError(provider=, model=, status_code=, provider_code=, category=, retryable=, timeout_reason=)` | `RuntimeError` | The base of every failed LLM request in 0.5.0. Carries `.category`, `.retryable` and `.safe_message`; the SDK exception is on `__cause__`. See [Provider errors](#provider-errors). | 502 |
+| `BudgetConfigurationError(model=, reason=)` | `ValueError` | `Budget(max_cost_usd=...)` on an `Agent` whose model has no price (no `PriceTable` entry and a provider that does not report cost), at construction or at run start. See [Budget](/docs/architecture/budget#dollar-limits). | 500 |
+| `TenantScopeRequiredError(operation)` | `ValueError` | `Agent(strict_tenancy=True)` and the call omitted `tenant_id`. See [Multi-tenancy](/docs/architecture/multi-tenancy#strict-tenancy). | 500 |
+| `GovernanceMismatchError(run_id, expected_digest=, actual_digest=, changed=)` | `RuntimeError` | A resume found different governance from the run's start and the Agent has `on_governance_change="raise"`. `changed` names the parts, never their contents. See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume). | 409 |
+| `NoteLimitExceededError(run_id, limit)` | `ValueError` | `submit_note` on a run that already holds `max_notes_per_run` notes. | 409 |
 | `ImageError(ValueError)` | `ValueError` | Base class of `InvalidImageError`, `ImageLimitError` and `ImageFetchError`; catch it for any bad image input. | 400 |
 | `InvalidImageError(reason=, index=, media_type=, byte_length=)` | `ImageError` (`ValueError`) | An image failed validation at ingest: `reason` is `unsupported_type`, `type_mismatch`, `corrupt`, `animated`, `empty`, `purged`, `descriptor_version`, `descriptor_mismatch`, `bad_base64` or `path`. See [Images](/docs/recipes/images#errors). | 400 |
 | `ImageLimitError(scope=, limit=, actual=, index=)` | `ImageError` | An image cap was exceeded (`image_bytes`, `source_bytes`, `image_side`, `image_pixels`, `message_count`, `request_count`, `request_bytes`, `estimated_tokens`, `many_image_dimension`, and `store_bytes` for a full in-memory store). | 413 |
 | `ImageFetchError(reason=, host=, status_code=)` | `ImageError` | `Image.from_url` was refused or failed (`scheme`, `port`, `credentials`, `host_not_allowed`, `blocked_address`, `dns`, `redirect`, `timeout`, `too_large`, `http_status`, `content_encoding`, `disabled`, `connect`). Carries the host only, never the path or query. | 502 for `http_status` and `timeout`; otherwise 400 |
 | `UnsupportedModalityError(provider=, model=, source=, ...)` | `RuntimeError` | The model cannot take images. `source` is `capability`, `catalog`, `adapter` or `provider_response`. | 400 |
 | `ImageRejectedError(image_ids=, located=, retried=)` | `RuntimeError` | The provider refused a specific image. | 422 |
-| `ProviderError(provider=, model=, status_code=, provider_code=, message=)` | `RuntimeError` | Any other provider failure on a request that carried images; sanitised, at most 500 characters. Text-only requests keep their existing errors. | 502 |
 | `BlobNotFoundError(image_id)` | `LookupError` | The blob is missing, belongs to another tenant, or the run has no reference to it. The same error for all three. | 404 |
 | `BlobIntegrityError(image_id, check=)` | `RuntimeError` | Stored bytes or a persisted descriptor do not match the catalog. | 500 |
 | `ImagePersistenceUnsupportedError(reason=)` | `RuntimeError` | The state store has no blob catalog, an external blob row is read with no `blob_store`, or a tool returned images in a loop run without an image runtime. | 500 |
@@ -60,7 +73,7 @@ A few related exceptions live on the package root rather than `dendrux.errors`:
 | Exception | Raised when |
 | --- | --- |
 | `RunAlreadyActiveError` | An idempotent create finds an already-active run. |
-| `IdempotencyConflictError` | An `idempotency_key` collides with a different request fingerprint. |
+| `IdempotencyConflictError(run_id, idempotency_key)` | An `idempotency_key` collides with a different request fingerprint within the same tenant. On a SQLite file created before 0.5.0 it can also be raised when another tenant already uses the key; `run_id` is then `None`, so nothing about the other tenant leaks. |
 | `StructuredOutputValidationError(raw_response, output_type_name, validation_error, *, usage=None, model=None, stop_reason=None)` | A SingleCall `output_type` fails validation. Carries `err.raw_response`, `err.output_type_name`, `err.validation_error` and, for the call that produced the invalid output, `err.usage` (`UsageStats`, priced when you set a `PriceTable`), `err.model` and `err.stop_reason`; each is `None` when unknown. `stop_reason == "max_tokens"` means the JSON was cut off. That call is recorded and priced even though the run fails. See [Structured output](/docs/architecture/loops#when-validation-fails). |
 | `DelegationDepthExceededError` | A sub-agent exceeds `max_delegation_depth`. |
 
@@ -70,22 +83,54 @@ The 0.3.0 methods reuse the hierarchy above. These are the cases worth knowing:
 
 | Call | Raises |
 | --- | --- |
-| `submit_approval(decisions=...)` | `ValueError` for both or neither of `approved=` / `decisions=`, for `rejection_reason` with `decisions`, and for a missing, unknown or duplicate call id. Raised before anything is claimed. |
+| `submit_approval(decisions=...)` | `ValueError` for both or neither of `approved=` / `decisions=`, for `rejection_reason` with `decisions`, for a missing, unknown or duplicate call id, and for a non-`bool` `approved`. Raised before anything is claimed. |
+| `submit_approval(approved=True, ...)` or `resume` approving a batch without `expected_pause_id=` | `InputValidationError` (field `expected_pause_id`, code `pause_id_required`). Rejecting needs no token. |
 | `submit_resume(run_id)` | `PauseStatusMismatchError` when the run is paused for another reason (for example `waiting_approval`), plus the usual resume errors. |
 | `request_pause(run_id)` | `RunNotFoundError`, `ValueError` for a bad `reason`. A `waiting_*`, `paused` or terminal run is a no-op, not an error. |
-| `submit_note(run_id, text)` | `ValueError` for empty or oversized text or bad metadata, `RunNotFoundError`, `RunAlreadyTerminalError`. |
+| `submit_note(run_id, text)` | `ValueError` for empty or oversized text or bad metadata, `NoteLimitExceededError` (a `ValueError`) when the run already holds `max_notes_per_run` notes, `RunNotFoundError`, `RunAlreadyTerminalError`. |
 | `cancel_run(..., cascade=True)`, `request_pause`, `submit_note`, `RunStore.get_notes` or `RunStore.get_subtree` on a custom pre-0.3 `StateStore` | `NotImplementedError` naming the missing store method. Existing flows on such a store keep working. |
 | `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume` or `resume_stream` with `tenant_id=` | `RunNotFoundError` when the run is missing or belongs to another tenant, raised before anything is written. `resume_stream` raises it, and any store error from the tenant check, from the first iteration instead of yielding `RUN_ERROR`. |
-| `RunStore.get_subtree` / `get_notes(tenant_id=...)` | `dendrux.store.RunNotFoundError`, a separate class from `dendrux.errors.RunNotFoundError`. |
+| `RunStore.get_subtree`, `get_pending`, `follow`, `get_event_view` and a scoped `get_notes` for a missing or foreign run (the paged reads return empty results instead; see [RunStore](/docs/reference/run-store#tenant-scope)) | `RunNotFoundError`. Since 0.5.0 `dendrux.store.RunNotFoundError` is the same class as `dendrux.errors.RunNotFoundError`, so one `except` clause covers `Agent` and `RunStore`. |
+| `retry(run_id, tenant_id=...)` | `RunNotFoundError` for a missing or foreign run (it was `ValueError` or `ReplayRunError` before 0.5.0). |
+| `RunStore` reads, `get_pending` and `follow` with a bad id, tenant, cursor, limit, offset, filter or non-`bool` flag | `ValueError` with a fixed message that never echoes the rejected value (and a `read_argument_invalid` log line), before any query: ids and tenants are non-empty strings of at most 255 characters without NUL or lone surrogates; cursors fit 32 bits; at most 100 `event_types` or `status` entries; `metadata_filter` has at most 32 keys with scalar values; dates are timezone-aware. Map it to 400. `get_run(None)` raises too (it used to return `None`). |
+| `Agent.get_result` with a malformed id or tenant | `ValueError` ("Invalid run_id." or "Invalid tenant_id."), before any query. |
 | `MCPConnection.call_tool` | `MCPToolNotFoundError` for an unlisted tool name, `MCPToolCallError` for a server error result, `TimeoutError` when `timeout=` expires. See [MCP](/docs/architecture/mcp#calling-a-tool-directly). |
 | `Agent(before_tool=...)` with `SingleCall` | `ValueError` at construction. |
+| `run`, `stream` or any entry point with `tenant_id=""`, metadata keys starting with `dendrux.`, or input or metadata over the `Limits` caps | `ValueError` before anything is written. |
 | A delegated run with a `tenant_id` different from its parent's | `ValueError` before the child run is created. |
+
+## Provider errors
+
+Every failed LLM request raises a `ProviderError` subclass (inside a run it ends the run `error` and is summarised as `RunResult.error_info`). Catch `ProviderError` and read `.category` and `.retryable`.
+
+| Class | `category` | `retryable` default | Also a |
+| --- | --- | --- | --- |
+| `ProviderAuthError` | `auth` | no | |
+| `ProviderRateLimitError` (`retry_after`) | `rate_limit` | yes | |
+| `ProviderUnavailableError` | `unavailable` | yes | `ConnectionError` |
+| `ProviderTimeoutError` | `timeout` | no | `TimeoutError` |
+| `ProviderResponseError` | `rejected` | no | |
+| `ProviderStreamIncompleteError` | `stream_incomplete` | no | |
+| `ModelRefusalError` (`refusal_text`, in process only) | `refusal` | no | |
+| `ContentFilteredError` | `content_filter` | no | |
+| `ContextLengthExceededError` | `context_length` | no | |
+| `ProviderError` itself | `credits`, `rejected`, `unknown` | by error | |
+
+`safe_message` is a fixed template (`"{provider} {category} (HTTP {status}, code {provider_code})"`) that never contains vendor text, and is what `RunResult.error`, `agent_runs.error` and the `run.error` event carry. The vendor's own text lives only in debug traces and stored provider evidence, excluded from default contextual event views; raw store evidence remains operator-only. Image-path errors keep their sanitised `message`. The recipe is [Handling provider errors](/docs/recipes/handling-provider-errors).
+
+Database failures use the same envelope: `ErrorInfo(category="persistence_error")` has no provider fields, and the run's `error` is a fixed message. A provider failure inside a custom provider, a grouped worker failure or a failed stream close is normalised to the `ProviderError` taxonomy at Dendrux's call sites; raise `ProviderError` subclasses from your own providers. Provider and model identifiers on these errors are bounded and control-free, and `provider_code` appears only when it looks like a code.
+
+`ProviderResponseError` reports an empty normal completion (`empty_completion`) or a local stream bound (`stream_size_limit`, `stream_tool_call_limit`). It is not retryable. Tool-only output remains valid, and token-limit emptiness keeps its truncation flag.
+
+A fenced stream observing a still-running owner ends its local feed with `RUN_ERROR` and `ErrorInfo(category="run_fenced", retryable=False)`. The result preserves the durable run status; this observation does not fail or mutate the winning run. Read its current state with `Agent.get_result` or `RunStore`. If the winner paused, the stale feed ends with `RUN_PAUSED` instead.
 
 ## MCP errors
 
 MCP tool sources raise their own typed hierarchy under `MCPError`, importable from `dendrux.mcp`. The ones an application should be ready to handle — including `MCPCircuitOpenError` (fail-fast with `retry_after`), the capacity errors, and `MCPOutcomeUnknownError` (interrupted call the server may have applied; never retry automatically) — are tabulated with their semantics on the [MCP page](/docs/architecture/mcp#calls-errors-and-result-limits).
 
 ## Example: mapping errors in a write route
+
+[//]: # "docs-test: skip - fragment: relies on `router`, defined by setup shown elsewhere"
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException
@@ -100,12 +145,15 @@ async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
     try:
         result = await agent.submit_approval(
             run_id, approved=body["approved"], rejection_reason=body.get("rejection_reason"),
+            expected_pause_id=body.get("pause_id"),    # required when approving
         )
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
+    except ValueError:    # includes InputValidationError (a missing pause_id, bad input)
+        raise HTTPException(400, "invalid request")
     except (RunNotPausedError, PauseStatusMismatchError,
             RunAlreadyClaimedError, RunAlreadyTerminalError) as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, str(e))   # a stale pause_id lands here too
     except PersistenceNotConfiguredError:
         raise HTTPException(500, "persistence not configured")
     return {"status": result.status.value, "answer": result.answer}

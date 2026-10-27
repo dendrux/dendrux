@@ -182,7 +182,9 @@ class TestSubmitApprovalLifecycle:
         assert paused.status == RunStatus.WAITING_APPROVAL
 
         n = CapturingNotifier()
-        result = await agent.submit_approval(paused.run_id, approved=True, notifier=n)
+        result = await agent.submit_approval(
+            paused.run_id, approved=True, notifier=n, expected_pause_id=paused.pause_id
+        )
         assert result.status == RunStatus.SUCCESS
 
         names = n.names()
@@ -202,7 +204,9 @@ class TestSubmitApprovalLifecycle:
         assert paused.status == RunStatus.WAITING_APPROVAL
 
         n = CapturingNotifier()
-        await agent.submit_approval(paused.run_id, approved=True, notifier=n)
+        await agent.submit_approval(
+            paused.run_id, approved=True, notifier=n, expected_pause_id=paused.pause_id
+        )
 
         starts = [c for c in n.calls if c[0] == "on_tool_started" and c[1][1] == "refund"]
         completes = [c for c in n.calls if c[0] == "on_tool_completed" and c[1][1] == "refund"]
@@ -665,7 +669,9 @@ class TestSubmitApprovalRejectionGovernance:
 
         paused = await agent.run("refund 7")
         n = _GovEventCapturer()
-        await agent.submit_approval(paused.run_id, approved=True, notifier=n)
+        await agent.submit_approval(
+            paused.run_id, approved=True, notifier=n, expected_pause_id=paused.pause_id
+        )
 
         decided = [(etype, data) for etype, data in n.gov_events if etype == "approval.decided"]
         assert decided

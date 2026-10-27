@@ -102,7 +102,7 @@ class TestPauseStatePrimitives:
         await store.create_run("r1", "a")
         await store.try_pause_run("r1", status="paused", pause_data={"p": 1})
         await _set_row(store, "r1", pause_requested=True)  # stale flag
-        assert await store.claim_paused_run("r1", expected_status="paused") is True
+        assert await store.claim_paused_run("r1", expected_status="paused") == 1
         assert (await store.get_run("r1")).pause_requested is False
 
         await store.request_pause("r1")
@@ -140,7 +140,7 @@ class TestPauseStatePrimitives:
         await store.create_run("r1", "a")
         await store.try_pause_run("r1", status="paused", pause_data={"p": 1})
         old = dt.datetime.now(dt.UTC) - dt.timedelta(hours=3)
-        await _set_row(store, "r1", updated_at=old)
+        await _set_row(store, "r1", status_changed_at=old, updated_at=old)
         swept = await store.sweep_abandoned_runs(older_than=dt.timedelta(hours=1))
         assert [(s.run_id, s.previous_status) for s in swept] == [("r1", "paused")]
         assert (await store.get_run("r1")).status == "error"
@@ -204,12 +204,14 @@ class TestRequestedPause:
         assert paused.status == RunStatus.PAUSED
 
         if how == "resume":
-            result = await agent.resume(paused.run_id)
+            result = await agent.resume(paused.run_id, expected_pause_id=paused.pause_id)
         elif how == "submit_resume":
             result = await agent.submit_resume(paused.run_id)
         else:
             events = []
-            async with agent.resume_stream(paused.run_id) as stream:
+            async with agent.resume_stream(
+                paused.run_id, expected_pause_id=paused.pause_id
+            ) as stream:
                 async for event in stream:
                     events.append(event)
             assert events[0].type == RunEventType.RUN_RESUMED
@@ -340,7 +342,7 @@ class TestRequestedPause:
         assert waiting.status == RunStatus.WAITING_CLIENT_TOOL
         assert (await store.get_run(waiting.run_id)).pause_requested is False
 
-        call_id = waiting.meta["pause_state"].pending_tool_calls[0].id
+        call_id = waiting.pending.tool_calls[0].id
         result = await agent.submit_tool_results(
             waiting.run_id, [ToolResult(name="client_read", call_id=call_id, payload='"x"')]
         )
@@ -360,7 +362,7 @@ class TestRequestedPause:
         assert outcome.affected == [(waiting.run_id, "already_waiting")]
         assert (await store.get_run(waiting.run_id)).pause_requested is False
 
-        call_id = waiting.meta["pause_state"].pending_tool_calls[0].id
+        call_id = waiting.pending.tool_calls[0].id
         result = await agent.submit_tool_results(
             waiting.run_id, [ToolResult(name="client_read", call_id=call_id, payload='"x"')]
         )
@@ -450,7 +452,9 @@ class TestApprovalBarrier:
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_APPROVAL
 
-        paused = await agent.submit_approval(waiting.run_id, approved=True)
+        paused = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert paused.status == RunStatus.PAUSED
         assert counts == {"a": 1, "b": 0}
 
@@ -473,16 +477,17 @@ class TestApprovalBarrier:
     async def test_remainder_keeps_per_call_denial(self, store) -> None:
         agent, llm, counts = _approval_agent(store, on_a="pause")
         waiting = await agent.run("go")
-        ids = {tc.name: tc.id for tc in waiting.meta["pause_state"].pending_tool_calls}
+        ids = {tc.name: tc.id for tc in waiting.pending.tool_calls}
         paused = await agent.submit_approval(
             waiting.run_id,
             decisions={
                 ids["a"]: ApprovalDecision.approve(),
                 ids["b"]: ApprovalDecision.deny("not today"),
             },
+            expected_pause_id=waiting.pause_id,
         )
         assert paused.status == RunStatus.PAUSED
-        result = await agent.resume(paused.run_id)
+        result = await agent.resume(paused.run_id, expected_pause_id=paused.pause_id)
         assert result.status == RunStatus.SUCCESS
         assert counts == {"a": 1, "b": 0}
         b_msg = next(m for m in llm.messages[1] if m.role.value == "tool" and m.name == "b")
@@ -491,7 +496,9 @@ class TestApprovalBarrier:
     async def test_cancel_between_approved_calls_stops_side_effects(self, store) -> None:
         agent, _, counts = _approval_agent(store, on_a="cancel")
         waiting = await agent.run("go")
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert result.status == RunStatus.CANCELLED
         assert counts == {"a": 1, "b": 0}
         assert (await store.get_run(waiting.run_id)).status == "cancelled"
@@ -501,14 +508,16 @@ class TestApprovalBarrier:
         waiting = await agent.run("go")
         original = store.claim_paused_run
 
-        async def claim_then_pause(run_id: str, *, expected_status: str) -> bool:
-            won = await original(run_id, expected_status=expected_status)
+        async def claim_then_pause(run_id: str, *, expected_status: str, **kwargs) -> int:
+            won = await original(run_id, expected_status=expected_status, **kwargs)
             if won:
                 await store.request_pause(run_id)
             return won
 
         store.claim_paused_run = claim_then_pause  # type: ignore[method-assign]
-        paused = await agent.submit_approval(waiting.run_id, approved=True)
+        paused = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         store.claim_paused_run = original  # type: ignore[method-assign]
 
         assert paused.status == RunStatus.PAUSED
@@ -525,14 +534,16 @@ class TestApprovalBarrier:
         waiting = await agent.run("go")
         original = store.claim_paused_run
 
-        async def claim_then_cancel(run_id: str, *, expected_status: str) -> bool:
-            won = await original(run_id, expected_status=expected_status)
+        async def claim_then_cancel(run_id: str, *, expected_status: str, **kwargs) -> int:
+            won = await original(run_id, expected_status=expected_status, **kwargs)
             if won:
                 await store.request_cancel(run_id)
             return won
 
         store.claim_paused_run = claim_then_cancel  # type: ignore[method-assign]
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert result.status == RunStatus.CANCELLED
         assert counts == {"a": 0, "b": 0}
 
@@ -541,16 +552,20 @@ class TestApprovalBarrier:
         waiting = await agent.run("go")
         outcome = await agent.request_pause(waiting.run_id)
         assert outcome.affected == [(waiting.run_id, "already_waiting")]
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert result.status == RunStatus.SUCCESS
         assert counts == {"a": 1, "b": 1}
 
     async def test_stream_resume_of_paused_remainder(self, store) -> None:
         agent, _, counts = _approval_agent(store, on_a="pause")
         waiting = await agent.run("go")
-        paused = await agent.submit_approval(waiting.run_id, approved=True)
+        paused = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         events = []
-        async with agent.resume_stream(paused.run_id) as stream:
+        async with agent.resume_stream(paused.run_id, expected_pause_id=paused.pause_id) as stream:
             async for event in stream:
                 events.append(event)
         assert events[-1].type == RunEventType.RUN_COMPLETED

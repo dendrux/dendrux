@@ -31,7 +31,14 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
-from dendrux.llm._retry_telemetry import telemetry_context
+from dendrux.llm._calls import complete_call, stream_call
+from dendrux.llm._evidence import (
+    RejectedArguments,
+    RejectedToolName,
+    persistable_call,
+    persistable_response,
+)
+from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
     StreamInterruptedError,
@@ -69,8 +76,28 @@ from dendrux.media._image import Image, ToolOutput
 from dendrux.media._ingest import ingest
 from dendrux.media._policy import ImagePolicy
 from dendrux.tool import DEFAULT_TOOL_TIMEOUT
+from dendrux.tools._coerce import ArgumentCoercionError, build_call, get_args_spec
+from dendrux.tools._limits import (
+    ToolResultTooLargeError,
+    cap_value_payload,
+    enforce_call_limits,
+    result_cap,
+    size_limit_payload,
+)
 from dendrux.tools._lookups import ToolLookups, build_tool_lookups
-from dendrux.tools._validate import check_tool_call, check_tool_json
+from dendrux.tools._mask import approval_view, placeholder_mapping
+from dendrux.tools._pool import (
+    CallTracker,
+    ToolCallLimiter,
+    ToolPoolSaturatedError,
+    run_sync_tool,
+)
+from dendrux.tools._validate import (
+    check_tool_call,
+    check_tool_json,
+    coercion_failure,
+    prepare_tool_call,
+)
 from dendrux.types import (
     REASONING_MODEL_META_KEY,
     AgentStep,
@@ -80,6 +107,7 @@ from dendrux.types import (
     ImagePart,
     ImageRef,
     ImageViewState,
+    Limits,
     LLMResponse,
     Message,
     PauseState,
@@ -100,7 +128,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
     from pydantic import BaseModel
 
@@ -129,6 +157,43 @@ _notify_llm_failed = notify_llm_failed
 _notify_tool = notify_tool
 _notify_tool_started = notify_tool_started
 _notify_governance = notify_governance
+
+
+def _blocked_data(direction: str, error: str, findings: list[Any], location: str) -> dict[str, Any]:
+    from collections import Counter
+
+    counts = dict(Counter(f.entity_type for f in findings))
+    return {
+        "direction": direction,
+        "error": error,
+        "code": "guardrail_blocked",
+        "kinds": sorted(counts),
+        "counts": counts,
+        "location": location,
+    }
+
+
+def _image_block_data(error: str, state: ImageViewState) -> dict[str, Any]:
+    from collections import Counter
+
+    counts = dict(
+        Counter(
+            kind
+            for verdict in state.guardrail_verdicts.values()
+            if verdict.action == "block"
+            for kind in verdict.entities
+        )
+    )
+    return {
+        **_blocked_data("incoming_image", error, [], "incoming_image"),
+        "kinds": sorted(counts),
+        "counts": counts,
+    }
+
+
+def _incoming_location(msg: Message, index: int) -> str:
+    call = f", tool_call_id={msg.call_id}" if msg.call_id else ""
+    return f"message {index} (role={msg.role.value}{call})"
 
 
 class _ToolCallOutcome(NamedTuple):
@@ -173,8 +238,8 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
     total.output_tokens += step_usage.output_tokens
     total.total_tokens += step_usage.total_tokens
     total.usage_reported = total.usage_reported and step_usage.usage_reported
-    total.cost_unknown = cost_unknown or step_usage.cost_usd is None
-    if cost_unknown or step_usage.cost_usd is None:
+    total.cost_unknown = cost_unknown or step_usage.cost_unknown or step_usage.cost_usd is None
+    if total.cost_unknown:
         total.cost_usd = None
         total.cost_source = None
     else:
@@ -183,7 +248,8 @@ def _accumulate_usage(total: UsageStats, step_usage: UsageStats) -> None:
             total.cost_source = step_usage.cost_source
         elif total.cost_source != step_usage.cost_source:
             total.cost_source = "mixed"
-        total.cost_usd += step_usage.cost_usd
+        if step_usage.cost_usd is not None:
+            total.cost_usd += step_usage.cost_usd
     if step_usage.cache_read_input_tokens is not None:
         total.cache_read_input_tokens = (
             total.cache_read_input_tokens or 0
@@ -562,7 +628,11 @@ async def _init_loop_state(
 
     call_counts: dict[str, int] = {}
     for msg in history:
-        if msg.role == Role.TOOL and msg.name is not None:
+        if (
+            msg.role == Role.TOOL
+            and msg.name is not None
+            and not msg.meta.get("dendrux.not_executed")
+        ):
             call_counts[msg.name] = call_counts.get(msg.name, 0) + 1
 
     steps: list[AgentStep] = list(initial_steps) if initial_steps else []
@@ -591,6 +661,29 @@ async def _init_loop_state(
         warnings=[],
         image_view=image_view_state if image_view_state is not None else ImageViewState(),
     )
+
+
+def _rejected_call_result(tc: ToolCall) -> ToolResult:
+    from dendrux.tools._validate import invalid_params_result
+
+    if isinstance(tc, RejectedToolName):
+        return _unknown_tool_result(tc, None)
+    return invalid_params_result(tc, "Tool arguments must contain persistable text and JSON.")
+
+
+def _persistable_argument_validator(validator: Any) -> Any:
+    from functools import wraps
+
+    @wraps(validator)
+    def validate(tc: ToolCall, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(tc, (RejectedToolName, RejectedArguments)):
+            return _rejected_call_result(tc)
+        return validator(tc, *args, **kwargs)
+
+    return validate
+
+
+prepare_tool_call = _persistable_argument_validator(prepare_tool_call)
 
 
 async def _process_tool_calls(
@@ -706,18 +799,71 @@ async def _process_tool_calls(
         else:
             non_denied.append(tc)
 
+    async def reject(tc: ToolCall, result: ToolResult) -> None:
+        """Record, notify and append a call rejected before execution."""
+        await _record_tool(recorder, run_id, tc, result, iteration)
+        await _notify_tool(notifier, run_id, tc, result, iteration, warnings)
+        result_msg = _format_result(strategy, result)
+        history.append(result_msg)
+        await _record_message(recorder, run_id, result_msg, iteration)
+        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
+        all_results.append((tc, result))
+
+    # --- Phase 0.25: Unknown tools are answered now, never hooked or approved ---
+    known: list[ToolCall] = []
+    for tc in non_denied:
+        if tc.name in lookups.fn:
+            known.append(tc)
+        else:
+            await reject(tc, _unknown_tool_result(tc, lookups))
+    non_denied = known
+
     # --- Phase 0.5: Deanonymize tool call params ---
+    pii_mapping = (
+        placeholder_mapping(guardrail_engine.get_pii_mapping())
+        if guardrail_engine is not None
+        else {}
+    )
+    # The arguments as the model sent them (placeholder form, pre-restore and
+    # pre-coercion), per call id: the only form approval views ever show.
+    sent_params: dict[str, dict[str, Any]] = {tc.id: tc.params for tc in non_denied}
     if guardrail_engine is not None:
+
+        async def restore_skipped(data: dict[str, Any], call_id: str) -> None:
+            event = "guardrail.restore_skipped"
+            await _record_governance(
+                recorder, run_id, event, iteration, data, correlation_id=call_id
+            )
+            await _notify_governance(
+                notifier, run_id, event, iteration, data, correlation_id=call_id, warnings=warnings
+            )
+
         for i, tc in enumerate(non_denied):
             if tc.params:
-                deaned = guardrail_engine.deanonymize(tc.params)
+                deaned = await _restore_params(guardrail_engine, tc, lookups, restore_skipped)
                 if deaned != tc.params:
-                    non_denied[i] = ToolCall(
-                        name=tc.name,
-                        params=deaned,
-                        id=tc.id,
-                        provider_tool_call_id=tc.provider_tool_call_id,
-                    )
+                    non_denied[i] = replace(tc, params=deaned)
+
+    # --- Phase 0.6: Validate, then coerce local tools to normalised arguments ---
+    # Before hooks and approval: a human never approves a malformed call, and
+    # everything downstream sees exactly the arguments the function receives.
+    placeholders = frozenset(pii_mapping)
+    valid_calls: list[ToolCall] = []
+    for tc in non_denied:
+        prepared = prepare_tool_call(
+            tc, lookups.defs.get(tc.name), lookups.fn.get(tc.name), placeholders=placeholders
+        )
+        if isinstance(prepared, ToolResult):
+            await reject(tc, prepared)
+        else:
+            valid_calls.append(prepared)
+
+    # --- Phase 0.7: Enforce max_calls_per_run (before hooks and approval) ---
+    non_denied, over_limit = enforce_call_limits(
+        valid_calls, max_calls=lookups.max_calls, call_counts=call_counts
+    )
+    for tc, limit_result in over_limit:
+        await reject(tc, limit_result)
 
     # Preflight before approval. Earlier valid activation barriers in this batch
     # may satisfy reads; execution rechecks against actual successful activations.
@@ -780,25 +926,26 @@ async def _process_tool_calls(
         for tc in non_denied:
             gate = gates.get(tc.id)
             if gate is not None:
+                approval_data: dict[str, Any] = {
+                    "tool_name": tc.name,
+                    "call_id": tc.id,
+                    "reason": "requires_approval",
+                }
                 if gate["source"] == "hook":
-                    event_data = {
-                        "tool_name": tc.name,
-                        "call_id": tc.id,
-                        "reason": gate["reason"] or "requires_approval",
-                        "source": "hook",
-                    }
-                else:
-                    event_data = {
-                        "tool_name": tc.name,
-                        "call_id": tc.id,
-                        "reason": "requires_approval",
-                    }
+                    approval_data["reason"] = gate["reason"] or "requires_approval"
+                    approval_data["source"] = "hook"
+                # What is being approved: the call as the model sent it
+                # (placeholder form, pre-coercion). Coercion is deterministic
+                # from these arguments, and no restored value can appear.
+                approval_data["params"] = approval_view(
+                    sent_params.get(tc.id, _NO_SENT_PARAMS), pii_mapping
+                )
                 await _record_governance(
                     recorder,
                     run_id,
                     "approval.requested",
                     iteration,
-                    event_data,
+                    approval_data,
                     correlation_id=tc.id,
                 )
                 await _notify_governance(
@@ -806,7 +953,7 @@ async def _process_tool_calls(
                     run_id,
                     "approval.requested",
                     iteration,
-                    event_data,
+                    approval_data,
                     correlation_id=tc.id,
                     warnings=warnings,
                 )
@@ -817,53 +964,10 @@ async def _process_tool_calls(
             approval_gates=gates,
         )
 
-    # --- Phase 1.5: Validate params against each tool's schema ---
-    valid_calls: list[ToolCall] = []
-    for tc in non_denied:
-        invalid_result = check_tool_call(tc, lookups.defs.get(tc.name))
-        if invalid_result is None:
-            valid_calls.append(tc)
-            continue
-        await _record_tool(recorder, run_id, tc, invalid_result, iteration)
-        await _notify_tool(notifier, run_id, tc, invalid_result, iteration, warnings)
-        result_msg = _format_result(strategy, invalid_result)
-        history.append(result_msg)
-        await _record_message(recorder, run_id, result_msg, iteration)
-        await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-        all_results.append((tc, invalid_result))
-
-    # --- Phase 1: Enforce max_calls_per_run ---
-    allowed_calls: list[ToolCall] = []
-    batch_counts: dict[str, int] = {}
-    for tc in valid_calls:
-        max_calls = lookups.max_calls.get(tc.name)
-        current = call_counts.get(tc.name, 0) + batch_counts.get(tc.name, 0)
-        if max_calls is not None and current >= max_calls:
-            limit_msg = (
-                f"Tool '{tc.name}' has reached its maximum of {max_calls} calls for this run."
-            )
-            limit_result = ToolResult(
-                name=tc.name,
-                call_id=tc.id,
-                payload=json.dumps({"limit": limit_msg}),
-                success=False,
-                error=limit_msg,
-            )
-            await _record_tool(recorder, run_id, tc, limit_result, iteration)
-            await _notify_tool(notifier, run_id, tc, limit_result, iteration, warnings)
-            result_msg = _format_result(strategy, limit_result)
-            history.append(result_msg)
-            await _record_message(recorder, run_id, result_msg, iteration)
-            await _notify_message(notifier, run_id, result_msg, iteration, warnings)
-            all_results.append((tc, limit_result))
-        else:
-            batch_counts[tc.name] = batch_counts.get(tc.name, 0) + 1
-            allowed_calls.append(tc)
-
     # --- Phase 2: Split into server (execute now) vs non-server (pause) ---
     server_calls: list[ToolCall] = []
     pending_calls: list[ToolCall] = []
-    for tc in allowed_calls:
+    for tc in non_denied:
         target = lookups.target.get(tc.name, ToolTarget.SERVER)
         if target == ToolTarget.SERVER:
             server_calls.append(tc)
@@ -875,9 +979,23 @@ async def _process_tool_calls(
     executed: list[tuple[ToolCall, ToolResult]] = []
     for group, is_parallel in exec_groups:
         if is_parallel and len(group) > 1:
-            pairs = await asyncio.gather(
-                *[
-                    _execute_record_notify(
+            executed.extend(
+                await _execute_parallel_group(
+                    group,
+                    lookups,
+                    recorder,
+                    notifier,
+                    run_id,
+                    iteration,
+                    warnings,
+                    tool_result_transform,
+                    image_runtime=image_runtime,
+                )
+            )
+        else:
+            for tc in group:
+                executed.append(
+                    await _execute_record_notify(
                         tc,
                         lookups,
                         recorder,
@@ -888,20 +1006,7 @@ async def _process_tool_calls(
                         tool_result_transform,
                         image_runtime=image_runtime,
                     )
-                    for tc in group
-                ]
-            )
-            executed.extend(pairs)
-        else:
-            for tc in group:
-                await _record_tool_started(recorder, run_id, tc, iteration)
-                await _notify_tool_started(notifier, run_id, tc, iteration, warnings)
-                tool_result = await _execute_tool(
-                    tc, lookups, tool_result_transform, image_runtime=image_runtime
                 )
-                await _record_tool(recorder, run_id, tc, tool_result, iteration)
-                await _notify_tool(notifier, run_id, tc, tool_result, iteration, warnings)
-                executed.append((tc, tool_result))
 
     # --- Phase 4: Append history in original order (deterministic for LLM) ---
     for tc, tool_result in executed:
@@ -1230,6 +1335,17 @@ def _image_policy(agent: Any, image_runtime: ImageRuntime | None) -> ImagePolicy
     return policy if isinstance(policy, ImagePolicy) else ImagePolicy()
 
 
+def _mark_call_rejections(
+    history: list[Message], start: int, results: list[tuple[ToolCall, ToolResult]]
+) -> None:
+    """Keep generated cap rejections out of execution counts after a resume."""
+    rejected = {tc.id for tc, result in results if result.meta.get("code") == "max_calls"}
+    if rejected:
+        for message in history[start:]:
+            if message.role == Role.TOOL and message.call_id in rejected:
+                message.meta["dendrux.not_executed"] = True
+
+
 class ReActLoop(Loop):
     """Think → act → observe → repeat.
 
@@ -1324,7 +1440,9 @@ class ReActLoop(Loop):
         before_tool: BeforeToolHook | None = getattr(agent, "before_tool", None)
         hook_tenant_id = await _hook_tenant_id(before_tool, state_store, resolved_run_id)
         g_engine = (
-            GuardrailEngine(agent.guardrails, pii_mapping=initial_pii_mapping)
+            GuardrailEngine(
+                agent.guardrails, pii_mapping=initial_pii_mapping, run_id=resolved_run_id
+            )
             if agent.guardrails
             else None
         )
@@ -1403,7 +1521,9 @@ class ReActLoop(Loop):
                 for msg_idx, msg in enumerate(messages):
                     if not msg.content:
                         continue
-                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg)
+                    cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
+                        msg, index=msg_idx
+                    )
                     if findings:
                         all_in_findings.extend(findings)
                     if block_err is not None:
@@ -1412,14 +1532,18 @@ class ReActLoop(Loop):
                             resolved_run_id,
                             "guardrail.blocked",
                             iteration,
-                            {"direction": "incoming", "error": block_err},
+                            _blocked_data(
+                                "incoming", block_err, findings, _incoming_location(msg, msg_idx)
+                            ),
                         )
                         await _notify_governance(
                             notifier,
                             resolved_run_id,
                             "guardrail.blocked",
                             iteration,
-                            {"direction": "incoming", "error": block_err},
+                            _blocked_data(
+                                "incoming", block_err, findings, _incoming_location(msg, msg_idx)
+                            ),
                             warnings=notifier_warnings,
                         )
                         return RunResult(
@@ -1430,7 +1554,10 @@ class ReActLoop(Loop):
                             commentary=_commentary(steps),
                             iteration_count=iteration,
                             usage=total_usage,
-                            meta=guardrail_meta(g_engine, notifier_warnings),
+                            meta={
+                                **guardrail_meta(g_engine, notifier_warnings),
+                                "failure_reason": "guardrail_blocked",
+                            },
                         )
                     if cleaned_msg is not msg:
                         _in_was_redacted = True
@@ -1526,7 +1653,8 @@ class ReActLoop(Loop):
                         recorder=recorder,
                         notifier=notifier,
                     ):
-                        response = await provider.complete(
+                        response = await complete_call(
+                            provider,
                             prepared.wire,
                             tools=tools,
                             run_id=resolved_run_id,
@@ -1605,7 +1733,13 @@ class ReActLoop(Loop):
                     )
             prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
-            response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+            response = persistable_response(response)
+            response = price_response(
+                response,
+                pricing=agent.pricing,
+                default_model=provider.model,
+                model=_pkw.get("model"),
+            )
 
             # Output guardrail — detection-only. Persistence stores raw
             # (DB is ground truth); the next scan_incoming redacts for
@@ -1687,14 +1821,14 @@ class ReActLoop(Loop):
                         resolved_run_id,
                         "guardrail.blocked",
                         iteration,
-                        {"direction": "outgoing", "error": out_block},
+                        _blocked_data("outgoing", out_block, out_findings, "output"),
                     )
                     await _notify_governance(
                         notifier,
                         resolved_run_id,
                         "guardrail.blocked",
                         iteration,
-                        {"direction": "outgoing", "error": out_block},
+                        _blocked_data("outgoing", out_block, out_findings, "output"),
                         warnings=notifier_warnings,
                     )
                     return RunResult(
@@ -1705,7 +1839,10 @@ class ReActLoop(Loop):
                         commentary=_commentary(steps),
                         iteration_count=iteration,
                         usage=total_usage,
-                        meta=guardrail_meta(g_engine, notifier_warnings),
+                        meta={
+                            **guardrail_meta(g_engine, notifier_warnings),
+                            "failure_reason": "guardrail_blocked",
+                        },
                     )
 
             # Record the LLM response (raw — DB is ground truth)
@@ -1813,6 +1950,10 @@ class ReActLoop(Loop):
                     notifier_warnings,
                     phase="commentary",
                 )
+                if state_store is not None:
+                    # The provider may have returned after sweep revoked this worker.
+                    await _read_control(state_store, resolved_run_id)
+                tool_history_start = len(history)
                 outcome = await _process_tool_calls(
                     step=step,
                     call_counts=call_counts,
@@ -1832,6 +1973,7 @@ class ReActLoop(Loop):
                     tenant_id=hook_tenant_id,
                     image_runtime=image_runtime,
                 )
+                _mark_call_rejections(history, tool_history_start, outcome.all_results)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -1883,9 +2025,7 @@ class ReActLoop(Loop):
         meta: dict[str, Any],
     ) -> RunResult:
         """ERROR result for an image guardrail ``block`` (commit step 4)."""
-        await images.emit(
-            "guardrail.blocked", {"direction": "incoming_image", "error": error}, iteration
-        )
+        await images.emit("guardrail.blocked", _image_block_data(error, images.state), iteration)
         return RunResult(
             run_id=run_id,
             status=RunStatus.ERROR,
@@ -1894,7 +2034,7 @@ class ReActLoop(Loop):
             commentary=_commentary(steps),
             iteration_count=iteration,
             usage=usage,
-            meta=meta,
+            meta={**meta, "failure_reason": "guardrail_blocked"},
         )
 
     async def run_stream(
@@ -2086,19 +2226,19 @@ class ReActLoop(Loop):
             )
             t0 = time.monotonic()
             llm_response: LLMResponse | None = None
-            _stream_telemetry = telemetry_context(
+            provider_stream = telemetry_stream(
+                stream_call(
+                    provider,
+                    prepared.wire,
+                    tools=tools,
+                    run_id=resolved_run_id,
+                    cache_key_prefix=cache_key_prefix,
+                    **_pkw,
+                ),
                 run_id=resolved_run_id,
                 iteration=iteration,
                 recorder=recorder,
                 notifier=notifier,
-            )
-            _stream_telemetry.__enter__()
-            provider_stream = provider.complete_stream(
-                prepared.wire,
-                tools=tools,
-                run_id=resolved_run_id,
-                cache_key_prefix=cache_key_prefix,
-                **_pkw,
             )
             partial_text: list[str] = []
             # Text after a tool block in the same call is known commentary.
@@ -2144,7 +2284,7 @@ class ReActLoop(Loop):
                                 visible_deltas += 1
                                 yield RunEvent(
                                     type=RunEventType.TOOL_USE_END,
-                                    tool_call=event.tool_call,
+                                    tool_call=persistable_call(event.tool_call),
                                     tool_name=event.tool_name,
                                     tool_call_id=event.tool_call_id,
                                     iteration=iteration,
@@ -2228,16 +2368,22 @@ class ReActLoop(Loop):
                         semantic_tools=tools,
                     )
                     t0 = time.monotonic()
-                    provider_stream = provider.complete_stream(
-                        prepared.wire,
-                        tools=tools,
+                    provider_stream = telemetry_stream(
+                        stream_call(
+                            provider,
+                            prepared.wire,
+                            tools=tools,
+                            run_id=resolved_run_id,
+                            cache_key_prefix=cache_key_prefix,
+                            **_pkw,
+                        ),
                         run_id=resolved_run_id,
-                        cache_key_prefix=cache_key_prefix,
-                        **_pkw,
+                        iteration=iteration,
+                        recorder=recorder,
+                        notifier=notifier,
                     )
             finally:
                 await provider_stream.aclose()
-                _stream_telemetry.__exit__(None, None, None)
 
             if stop_control is not None:
                 stop_result = _control_stop_result(
@@ -2284,8 +2430,12 @@ class ReActLoop(Loop):
             assert llm_response is not None
             prepared = images.mark_sent(prepared)
             llm_duration_ms = int((time.monotonic() - t0) * 1000)
+            llm_response = persistable_response(llm_response)
             llm_response = price_response(
-                llm_response, pricing=agent.pricing, default_model=provider.model
+                llm_response,
+                pricing=agent.pricing,
+                default_model=provider.model,
+                model=_pkw.get("model"),
             )
 
             await _record_llm(
@@ -2400,6 +2550,10 @@ class ReActLoop(Loop):
                     notifier_warnings,
                     phase="commentary",
                 )
+                if state_store is not None:
+                    # The provider may have returned after sweep revoked this worker.
+                    await _read_control(state_store, resolved_run_id)
+                tool_history_start = len(history)
                 outcome = await _process_tool_calls(
                     step=step,
                     call_counts=call_counts,
@@ -2427,6 +2581,7 @@ class ReActLoop(Loop):
                         iteration=iteration,
                         phase="commentary",
                     )
+                _mark_call_rejections(history, tool_history_start, outcome.all_results)
                 if outcome.pending_calls:
                     pause_status = (
                         RunStatus.WAITING_APPROVAL
@@ -2563,18 +2718,165 @@ async def _execute_record_notify(
     transform: ToolResultTransform | None = None,
     *,
     image_runtime: ImageRuntime | None = None,
+    tracker: CallTracker | None = None,
 ) -> tuple[ToolCall, ToolResult]:
-    """Execute a tool, record, then notify — for parallel execution.
+    """Execute a tool, record, then notify.
 
-    Each tool records and streams its event as soon as it finishes,
-    without waiting for siblings.
+    In a parallel batch each tool records and streams its event as soon as
+    it finishes, without waiting for siblings.
     """
     await _record_tool_started(recorder, run_id, tool_call, iteration)
     await _notify_tool_started(notifier, run_id, tool_call, iteration, notifier_warnings)
-    result = await _execute_tool(tool_call, lookups, transform, image_runtime=image_runtime)
+    result = await _execute_tool(
+        tool_call,
+        lookups,
+        transform,
+        image_runtime=image_runtime,
+        tracker=tracker,
+        run_id=run_id,
+    )
+    if tracker is not None:
+        tracker.result = result
     await _record_tool(recorder, run_id, tool_call, result, iteration)
+    if tracker is not None:
+        tracker.recorded = True
     await _notify_tool(notifier, run_id, tool_call, result, iteration, notifier_warnings)
     return tool_call, result
+
+
+_SIBLING_CANCELLED = "cancelled: another tool call in the same batch failed"
+_SIBLING_UNKNOWN = (
+    "outcome unknown: another tool call in the same batch failed while this one was "
+    "running; it may still finish and apply its effects"
+)
+
+
+async def _execute_parallel_group(
+    group: list[ToolCall],
+    lookups: ToolLookups,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+    run_id: str,
+    iteration: int,
+    notifier_warnings: list[str],
+    transform: ToolResultTransform | None = None,
+    *,
+    image_runtime: ImageRuntime | None = None,
+) -> list[tuple[ToolCall, ToolResult]]:
+    """Run a parallel batch; a run-ending failure stops its siblings.
+
+    When one call fails in a way that ends the run (a persistence failure,
+    say), the other calls are cancelled and awaited before the failure
+    propagates, so none keeps running or writes rows after the run ended.
+    Each stopped sibling is recorded best effort: ``cancelled`` for async
+    calls and calls that never started, ``outcome_unknown`` for sync calls
+    whose thread had already started (a thread cannot be stopped). Outer
+    cancellation stops the siblings the same way.
+    """
+    trackers = [CallTracker() for _ in group]
+    tasks = [
+        asyncio.ensure_future(
+            _execute_record_notify(
+                tc,
+                lookups,
+                recorder,
+                notifier,
+                run_id,
+                iteration,
+                notifier_warnings,
+                transform,
+                image_runtime=image_runtime,
+                tracker=tracker,
+            )
+        )
+        for tc, tracker in zip(group, trackers, strict=True)
+    ]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except asyncio.CancelledError:
+        await _stop_siblings(tasks)
+        _log_stopped(run_id, group, tasks, trackers, reason="cancelled")
+        raise
+    failed = next(
+        (t for t in tasks if t.done() and not t.cancelled() and t.exception() is not None),
+        None,
+    )
+    if failed is None:
+        return [t.result() for t in tasks]
+    error = failed.exception()
+    assert error is not None
+    await _stop_siblings(tasks)
+    stopped = _log_stopped(run_id, group, tasks, trackers, reason="sibling_failed")
+    for tc, tracker in stopped:
+        if tracker.result is not None:
+            # The tool returned and its own row write had started (it may or
+            # may not have landed). Never write a second row for the call.
+            if not tracker.recorded:
+                logger.warning(
+                    "A finished tool call was stopped while being recorded "
+                    "(code=tool_row_may_be_missing, run_id=%s, tool=%s)",
+                    run_id,
+                    tc.name,
+                )
+            continue
+        message = _SIBLING_UNKNOWN if tracker.abandoned else _SIBLING_CANCELLED
+        code = "outcome_unknown" if tracker.abandoned else "cancelled"
+        result = ToolResult(
+            name=tc.name,
+            call_id=tc.id,
+            payload=json.dumps({"error": message, "code": code}),
+            success=False,
+            error=message,
+            meta={"code": code},
+        )
+        try:
+            await _record_tool(recorder, run_id, tc, result, iteration)
+            await _notify_tool(notifier, run_id, tc, result, iteration, notifier_warnings)
+        except Exception:
+            logger.warning(
+                "Could not record stopped tool call (code=%s, run_id=%s, tool=%s)",
+                code,
+                run_id,
+                tc.name,
+            )
+    raise error
+
+
+async def _stop_siblings(tasks: Sequence[asyncio.Future[Any]]) -> None:
+    """Cancel unfinished tasks and wait until each has unwound."""
+    pending = [t for t in tasks if not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        # Shielded so a second cancellation cannot leave siblings running.
+        await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+
+
+def _log_stopped(
+    run_id: str,
+    group: list[ToolCall],
+    tasks: Sequence[asyncio.Future[Any]],
+    trackers: list[CallTracker],
+    *,
+    reason: str,
+) -> list[tuple[ToolCall, CallTracker]]:
+    """Log each sibling that was stopped; return them."""
+    stopped = [
+        (tc, tracker)
+        for tc, task, tracker in zip(group, tasks, trackers, strict=True)
+        if task.cancelled()
+    ]
+    for tc, tracker in stopped:
+        if tracker.result is not None:
+            continue  # it finished; only its row or event was cut short
+        logger.warning(
+            "Stopped tool call in a parallel batch (code=%s, reason=%s, run_id=%s, tool=%s)",
+            "outcome_unknown" if tracker.abandoned else "cancelled",
+            reason,
+            run_id,
+            tc.name,
+        )
+    return stopped
 
 
 _UNKNOWN_TOOL_LIST_LIMIT = 50
@@ -2596,17 +2898,159 @@ def _unknown_tool_message(name: str, lookups: ToolLookups) -> str:
     return f"Unknown tool: {name}. Available tools: {listed}"
 
 
+def _tool_failure_message(name: str, lookups: ToolLookups | None) -> str:
+    if lookups is None:
+        return "Unknown tool: name exceeds the supported length."
+    return _unknown_tool_message(name, lookups)
+
+
+def _unknown_tool_result(tool_call: ToolCall, lookups: ToolLookups | None) -> ToolResult:
+    message = _tool_failure_message(tool_call.name, lookups)
+    return ToolResult(
+        name=tool_call.name,
+        call_id=tool_call.id,
+        payload=json.dumps({"error": message}, ensure_ascii=False),
+        success=False,
+        error=message,
+        meta={"code": "unknown_tool"},
+    )
+
+
+_NO_SENT_PARAMS: dict[str, Any] = {}
+
+
+async def _restore_params(
+    engine: GuardrailEngine,
+    tool_call: ToolCall,
+    lookups: ToolLookups,
+    on_skipped: Callable[[dict[str, Any], str], Awaitable[None]],
+) -> dict[str, Any]:
+    """Real values for the call's PII placeholders, as the guardrail decides.
+
+    The PII guardrail owns the restore decision (``PII(restore=...)``,
+    ``@tool(receives_pii=...)``); this is its single call site in the tool
+    pipeline. Placeholders it deliberately leaves in place are reported as
+    ``guardrail.restore_skipped`` (counts and kinds only).
+    """
+    restore = getattr(engine, "restore_params", None)
+    if restore is None:  # guardrail engines without the restore allowlist
+        return engine.deanonymize(tool_call.params)
+    outcome = restore(tool_call.params, tool_def=lookups.defs.get(tool_call.name))
+    if outcome.skipped:
+        await on_skipped(outcome.event_data(tool_call.name, tool_call.id), tool_call.id)
+    params: dict[str, Any] = outcome.params
+    return params
+
+
+def _image_wire_bytes(image_runtime: ImageRuntime | None) -> int:
+    """Read-cap room for one image block (base64 of the policy's largest source)."""
+    if image_runtime is None:
+        return 0
+    return -(-image_runtime.policy.max_source_bytes * 4 // 3) + 4096
+
+
+class _ToolTimedOutError(Exception):
+    """The tool's own deadline (not a ``TimeoutError`` the tool raised)."""
+
+
+async def _invoke_tool(
+    fn: Callable[..., Any],
+    args: list[Any],
+    kwargs: dict[str, Any],
+    *,
+    timeout_s: float,
+    limiter: ToolCallLimiter | None,
+    result_limit: int,
+    image_wire_bytes: int,
+    tracker: CallTracker,
+) -> Any:
+    """Run the tool under its deadline; async on the loop, sync on the tool pool."""
+    deadline = asyncio.timeout(timeout_s)
+    try:
+        async with deadline:
+            with result_cap(result_limit, image_bytes=image_wire_bytes):
+                if inspect.iscoroutinefunction(fn):
+                    tracker.started = True
+                    return await fn(*args, **kwargs)
+                return await run_sync_tool(fn, args, kwargs, limiter=limiter, tracker=tracker)
+    except TimeoutError:
+        if not deadline.expired():
+            raise  # the tool raised its own TimeoutError: an ordinary failure
+        if tracker.completed is not None:
+            # The thread finished right at the deadline: the outcome is known.
+            return tracker.completed.result()
+        raise _ToolTimedOutError from None
+
+
+def _timeout_result(
+    tool_call: ToolCall,
+    timeout_s: float,
+    tracker: CallTracker,
+    *,
+    is_explicit: bool,
+    duration_ms: int,
+    run_id: str | None,
+) -> ToolResult:
+    name = tool_call.name
+    meta: dict[str, Any]
+    if tracker.started:
+        code = "timeout_outcome_unknown"
+        error_msg = (
+            f"Tool '{name}' timed out after {timeout_s}s while running. It may still finish "
+            "and apply its effects: check before retrying, and do not retry blindly if the "
+            "tool changes anything."
+        )
+        meta = {"code": code}
+        if tracker.abandoned:
+            meta["zombie_threads"] = tracker.zombies
+    else:
+        code = "timeout_not_started"
+        error_msg = (
+            f"Tool '{name}' did not start within {timeout_s}s because every tool thread was "
+            "busy. It was not run and is safe to retry."
+        )
+        meta = {"code": code}
+    logger.warning(
+        "Tool '%s' timed out after %ss%s (code=%s, run_id=%s, zombie_threads=%s)",
+        name,
+        timeout_s,
+        "" if is_explicit else " (default). Set an explicit timeout: @tool(timeout_seconds=N)",
+        code,
+        run_id,
+        meta.get("zombie_threads", 0),
+    )
+    return ToolResult(
+        name=name,
+        call_id=tool_call.id,
+        payload=json.dumps({"error": error_msg, "code": code}),
+        success=False,
+        error=error_msg,
+        duration_ms=duration_ms,
+        meta=meta,
+    )
+
+
 async def _execute_tool(
     tool_call: ToolCall,
     lookups: ToolLookups,
     transform: ToolResultTransform | None = None,
     *,
     image_runtime: ImageRuntime | None = None,
+    tracker: CallTracker | None = None,
+    run_id: str | None = None,
 ) -> ToolResult:
     """Execute a server tool function and return a ToolResult.
 
     Non-server tools are filtered out by the loop before reaching this
     function. They trigger a pause instead of execution.
+
+    A local ``@tool`` receives arguments rebuilt from the call's normalised
+    JSON (:mod:`dendrux.tools._coerce`); a call that no longer validates
+    fails as ``invalid_params`` without running. Async tools run on the
+    loop; sync tools run on the bounded tool pool under the Agent's
+    ``tool_threads`` limiter. A timeout reports ``timeout_not_started`` (the
+    call never ran) or ``timeout_outcome_unknown`` (it started and may still
+    finish); a ``TimeoutError`` the tool raises itself is an ordinary error.
 
     ``transform`` (``Agent.tool_result_transform``) rewrites the raw
     return value of a successful call before serialization, so the
@@ -2616,34 +3060,46 @@ async def _execute_tool(
     A ``ToolOutput`` result serialises its ``result`` like a plain return and
     ingests its images through ``image_runtime`` (strict for local tools;
     lenient with per-image notes for MCP tools). An image ingest failure
-    fails the call like any tool exception.
+    fails the call like any tool exception. The serialised payload is capped
+    at ``Limits.max_tool_result_bytes`` (images excluded).
     """
     from dendrux.skills._session import SkillTool
 
     fn = lookups.fn.get(tool_call.name)
     if fn is None:
-        message = _unknown_tool_message(tool_call.name, lookups)
-        return ToolResult(
-            name=tool_call.name,
-            call_id=tool_call.id,
-            payload=json.dumps({"error": message}, ensure_ascii=False),
-            success=False,
-            error=message,
-        )
+        return _unknown_tool_result(tool_call, lookups)
 
     if isinstance(fn, SkillTool):
         return await fn.session.execute(tool_call)
 
+    tracker = tracker if tracker is not None else CallTracker()
+    limiter = lookups.call_limiter if isinstance(lookups.call_limiter, ToolCallLimiter) else None
+    limits = limiter.limits if limiter is not None else Limits()
     timeout_s = lookups.timeout.get(tool_call.name, DEFAULT_TOOL_TIMEOUT)
     is_explicit = lookups.explicit_timeout.get(tool_call.name, False)
 
+    spec = get_args_spec(fn)
+    tool_def = lookups.defs.get(tool_call.name)
+    args: list[Any] = []
+    kwargs: dict[str, Any] = dict(tool_call.params or {})
+    if spec is not None and tool_def is not None:
+        try:
+            args, kwargs = build_call(spec, tool_call.params or {})
+        except ArgumentCoercionError as exc:
+            return coercion_failure(tool_call, tool_def, exc)
+
     start = time.monotonic()
     try:
-        if inspect.iscoroutinefunction(fn):
-            coro = fn(**tool_call.params)
-        else:
-            coro = asyncio.to_thread(fn, **tool_call.params)
-        result = await asyncio.wait_for(coro, timeout=timeout_s)
+        result = await _invoke_tool(
+            fn,
+            args,
+            kwargs,
+            timeout_s=timeout_s,
+            limiter=limiter,
+            result_limit=limits.max_tool_result_bytes,
+            image_wire_bytes=_image_wire_bytes(image_runtime),
+            tracker=tracker,
+        )
 
         duration_ms = int((time.monotonic() - start) * 1000)
         if transform is not None:
@@ -2683,6 +3139,28 @@ async def _execute_tool(
                 f"{type(result).__name__}. Tool return values must be JSON-serializable "
                 f"(str, int, float, bool, list, dict, or None).{hint}"
             ) from ser_err
+        payload, cap_meta = cap_value_payload(result, payload, limits.max_tool_result_bytes)
+        if cap_meta is not None:
+            logger.warning(
+                "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%d, limit=%d, "
+                "truncated=%s)",
+                tool_call.name,
+                cap_meta["code"],
+                run_id,
+                cap_meta["bytes"],
+                limits.max_tool_result_bytes,
+                bool(cap_meta.get("truncated")),
+            )
+            if not cap_meta.get("truncated"):
+                return ToolResult(
+                    name=tool_call.name,
+                    call_id=tool_call.id,
+                    payload=payload,
+                    success=False,
+                    error="result too large",
+                    duration_ms=duration_ms,
+                    meta=cap_meta,
+                )
         if output is not None and output.images:
             try:
                 if _tool_source(tool_call.name, lookups) == "mcp":
@@ -2711,24 +3189,52 @@ async def _execute_tool(
             duration_ms=duration_ms,
             images=images,
             notes=notes,
+            meta=cap_meta or {},
         )
-    except TimeoutError:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        error_msg = f"Tool '{tool_call.name}' timed out after {timeout_s}s"
-        if is_explicit:
-            logger.warning("%s", error_msg)
-        else:
-            logger.warning(
-                "%s (default). Set an explicit timeout: @tool(timeout_seconds=N)",
-                error_msg,
-            )
+    except _ToolTimedOutError:
+        return _timeout_result(
+            tool_call,
+            timeout_s,
+            tracker,
+            is_explicit=is_explicit,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            run_id=run_id,
+        )
+    except ToolResultTooLargeError as too_large:
+        # The source stopped reading an oversized result (MCP read cap).
+        payload, cap_meta = size_limit_payload(too_large.size)
+        logger.warning(
+            "Tool '%s' result over the size cap (code=%s, run_id=%s, bytes=%s, limit=%d)",
+            tool_call.name,
+            cap_meta["code"],
+            run_id,
+            too_large.size,
+            limits.max_tool_result_bytes,
+        )
         return ToolResult(
             name=tool_call.name,
             call_id=tool_call.id,
-            payload=json.dumps({"error": error_msg}),
+            payload=payload,
+            success=False,
+            error="result too large",
+            duration_ms=int((time.monotonic() - start) * 1000),
+            meta=cap_meta,
+        )
+    except ToolPoolSaturatedError:
+        error_msg = (
+            f"Tool '{tool_call.name}' could not be queued because the tool pool is full. "
+            "It was not run and is safe to retry."
+        )
+        logger.warning(
+            "Tool '%s' rejected (code=tool_pool_saturated, run_id=%s)", tool_call.name, run_id
+        )
+        return ToolResult(
+            name=tool_call.name,
+            call_id=tool_call.id,
+            payload=json.dumps({"error": error_msg, "code": "tool_pool_saturated"}),
             success=False,
             error=error_msg,
-            duration_ms=duration_ms,
+            meta={"code": "tool_pool_saturated"},
         )
     except Exception as e:
         duration_ms = int((time.monotonic() - start) * 1000)

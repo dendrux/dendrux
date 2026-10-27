@@ -22,7 +22,6 @@ Run with:
 After running, inspect the data with:
     dendrux runs
     dendrux traces <run_id> --tools
-    dendrux dashboard --db ~/.dendrux/dendrux.db
 """
 
 from __future__ import annotations
@@ -178,7 +177,6 @@ async def main() -> None:
     console.print("[bold]Inspect persisted data with:[/bold]")
     console.print("  dendrux runs")
     console.print(f"  dendrux traces {result.run_id} --tools")
-    console.print(f"  dendrux dashboard --db {db_path}")
 
 
 if __name__ == "__main__":

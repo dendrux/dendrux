@@ -1,4 +1,4 @@
-"""Image capability surface of the providers (0.4.0 Track C, spec §2.8, §5.6).
+"""Image capability surface of the providers.
 
 Static tables, OpenRouter catalogue, custom-provider default, learned "no"
 cache (keyed by surface + base URL + model; per instance; thread-safe),

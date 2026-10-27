@@ -17,6 +17,8 @@ This is the full public surface of Dendrux: everything you import in normal use.
 | `heartbeat` / `aheartbeat` | `from dendrux import heartbeat, aheartbeat` | Call from inside a long-running tool to refresh persisted progress and reduce the risk of the stale sweep reaping the run (best-effort; no-op outside a persisted run). See [State persistence](/docs/architecture/state-persistence#long-running-tools-and-the-stale-sweep). |
 | `run` | `from dendrux import run` | Low-level functional runner behind `Agent.run` (advanced use). |
 | `sweep` | `from dendrux import sweep` | One-shot reconciliation of stale/abandoned runs (you schedule it). |
+| `Limits` | `from dendrux import Limits` | Size caps for `Agent(limits=...)`: `max_tool_result_bytes`, `max_input_bytes`, `max_metadata_bytes`, `max_notes_per_run`. See [Agent](/docs/reference/agent#limits). |
+| `UNSCOPED` | `from dendrux import UNSCOPED` | The "every tenant" scope for reads and run-control writes; `None` means untenanted only. See [Multi-tenancy](/docs/architecture/multi-tenancy). |
 
 ## Loops
 
@@ -37,7 +39,7 @@ This is the full public surface of Dendrux: everything you import in normal use.
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `AnthropicProvider` | `from dendrux.llm.anthropic import AnthropicProvider` | Anthropic Messages API provider. |
+| `AnthropicProvider` | `from dendrux.llm.anthropic import AnthropicProvider` | Anthropic Messages API provider. All providers take `call_timeout`, `stream_idle_timeout` and `stream_total_timeout`. See [Handling provider errors](/docs/recipes/handling-provider-errors). |
 | `OpenAIProvider` | `from dendrux.llm.openai import OpenAIProvider` | OpenAI Chat Completions provider. |
 | `OpenAIResponsesProvider` | `from dendrux.llm.openai_responses import OpenAIResponsesProvider` | OpenAI Responses API provider (built-in tools). |
 
@@ -47,20 +49,20 @@ Caching is automatic for all built-in providers. See [Prompt cache](/docs/archit
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `PII` | `from dendrux.guardrails import PII` | Redact/block/warn on PII (regex or Presidio). See [Guardrails](/docs/architecture/guardrails). |
+| `PII` | `from dendrux.guardrails import PII` | Redact/block/warn on PII (regex or Presidio). `restore="all"` or `"allowlisted"` chooses which tools get real values back. See [Guardrails](/docs/architecture/guardrails) and [PII restore](/docs/architecture/pii-restore). |
 | `SecretDetection` | `from dendrux.guardrails import SecretDetection` | Block on leaked secrets (AWS keys, tokens, PEM). |
 | `PromptInjection` | `from dendrux.guardrails import PromptInjection` | Regex injection guard (you supply patterns). See [Patterns](/docs/recipes/prompt-injection-patterns). |
 | `Pattern` | `from dendrux.guardrails import Pattern` | A named regex `Pattern(name, regex)`. |
 | `Guardrail` | `from dendrux.guardrails import Guardrail` | Protocol for custom guardrails (`async scan(text)`). |
-| `Finding` | `from dendrux.guardrails import Finding` | One detection: entity type, span, score, text. |
+| `Finding` | `from dendrux.guardrails import Finding` | One detection: entity type, span, score, text (in process only; events and errors carry the kind, count and location, never the text). |
 | `ImageGuardrail` / `ImageScanInput` | `from dendrux.guardrails import ImageGuardrail, ImageScanInput` | Opt-in protocol for guardrails that scan images (`async scan_image(image)`). See [Images](/docs/recipes/images#guardrails). |
 
 ## Images
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `Image` | `from dendrux import Image` | An image input: `from_bytes`, `from_path`, `from_base64`, `from_url`. Accepted in `user_input`, `ChatMessage.user`, `ToolOutput` and `ToolResult.images`. |
-| `ToolOutput` | `from dendrux import ToolOutput` | What a server `@tool` returns to attach images: `ToolOutput(result, images=[...])`. |
+| `Image` | `from dendrux.media import Image` (also importable from `dendrux`) | An image input: `from_bytes`, `from_path`, `from_base64`, `from_url`. Accepted in `user_input`, `ChatMessage.user`, `ToolOutput` and `ToolResult.images`. |
+| `ToolOutput` | `from dendrux.media import ToolOutput` (also importable from `dendrux`) | What a server `@tool` returns to attach images: `ToolOutput(result, images=[...])`. |
 | `ImageRef` / `ImagePart` / `TextPart` | `from dendrux import ImageRef, ImagePart, TextPart` | A stored image's descriptor, and the ordered parts of a multimodal `Message.parts`. |
 | `ImagePolicy` / `ImageDropPolicy` / `UrlPolicy` | `from dendrux.media import ImagePolicy, ImageDropPolicy, UrlPolicy` | `Agent(images=...)`: caps, non-vision behaviour, the drop-old-images window, URL fetching and the ingest hook. |
 | `BlobStore` / `BlobKey` / `InMemoryBlobStore` | `from dendrux.media import BlobStore, BlobKey, InMemoryBlobStore` | The byte-storage protocol for `Agent(blob_store=...)`. See [S3 recipe](/docs/recipes/images-s3). |
@@ -82,7 +84,11 @@ The guide is [Images](/docs/recipes/images).
 | Symbol | Import | What it is |
 | --- | --- | --- |
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
-| `make_read_router` | `from dendrux.http import make_read_router` | Mountable FastAPI read router. See [make_read_router](/docs/reference/read-router). |
+| `PendingPause` / `PendingToolCall` | `from dendrux.store import PendingPause, PendingToolCall` | What a paused run waits on, from `RunStore.get_pending`. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). |
+| `Follow` / `FollowEnd` / `FollowHeartbeat` / `FollowCapacityError` / `EventFeed` | `from dendrux.store import ...` | The hardened live feed behind `RunStore.follow`. |
+| `redact_event` | `from dendrux.store import redact_event` | Conservative standalone event projection; use `RunStore.get_event_view` for verified active approval arguments. See [redacted views](/docs/reference/run-store#redacted-views). |
+| `EventFeed(store, max_followers=, max_followers_per_tenant=)` | `from dendrux.store import EventFeed` | Build your own feed when you need other follower caps (500 per store and 100 per tenant scope by default). |
+| `tool_pool_stats` | `from dendrux import tool_pool_stats` | Process-wide tool threads, queued calls and timed-out calls still running. |
 
 `RunStore` read methods return these record types (all from `dendrux.store`): `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`, plus `RunSubtree`, `SubtreeNode`, `RunUsage` (from `get_subtree`) and `RunNote` (from `get_notes`). Fields are documented on the [RunStore](/docs/reference/run-store) page.
 
@@ -93,6 +99,7 @@ The guide is [Images](/docs/recipes/images).
 | `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration. See [MCP](/docs/architecture/mcp). |
 | `MCPRuntime` | `from dendrux.mcp import MCPRuntime` | Process-wide managed owner of MCP connections: tenancy, capacity, circuit breaking, telemetry. Recommended for production. |
 | `MCPConnection` | `runtime.bind(...)` / `await runtime.rebind(...)` | Lazy handle for one `(tenant_key, connection_key)` identity; `connection.tools()` creates agent views, `await connection.discover()` returns the server's catalog without an Agent. |
+| `MCPDiscoveryLimitError` / `MCPInvalidToolSchemaError` | `from dendrux.mcp import MCPDiscoveryLimitError, MCPInvalidToolSchemaError` | `tools/list` passed a page, tool, byte, cursor or time bound (code `discovery_limit`); a strict view found a malformed argument schema (code `invalid_tool_schema`). See [MCP: discovery limits](/docs/architecture/mcp#discovery-limits). |
 | `MCPToolNotFoundError` | `from dendrux.mcp import MCPToolNotFoundError` | Raised by `await connection.call_tool(name, arguments)` for a tool the server does not list. `call_tool` runs a server tool directly and bypasses Agent governance; see [MCP](/docs/architecture/mcp#calling-a-tool-directly). |
 | `MCPDiscovery` | `await connection.discover()` | Server name, version, protocol version, instructions, and the raw `MCPToolInfo` catalog of one connection. |
 | `MCPToolView` | `connection.tools(...)` | Namespace and tool policy one agent consumes via `tool_sources=`. |
@@ -105,14 +112,16 @@ The guide is [Images](/docs/recipes/images).
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`. |
+| `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`/`get_result`. Fields include `error_info`, `pause_id` and `pending`; `to_dict()` is the versioned browser envelope. See [RunResult](/docs/reference/agent#runresult). |
+| `ErrorInfo` | `from dendrux import ErrorInfo` | The safe, structured summary of a provider failure on `RunResult.error_info` and `RunDetail.error_info`. See [Handling provider errors](/docs/recipes/handling-provider-errors). |
 | `RunStatus` | `from dendrux.types import RunStatus` | `pending`, `running`, `waiting_*`, `paused`, `success`, `error`, `cancelled`, `max_iterations`. |
 | `StopReason` | `from dendrux import StopReason` | Why the final LLM call stopped: `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `content_filter`, `refusal`, `pause_turn`, `other`. On `RunResult.stop_reason`; `RunResult.truncated` is true for `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers). |
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
-| `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |
+| `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. `ToolResult.from_dict` and `list_from_dict` validate results that arrive from a browser. |
+| `InputValidationError` | `from dendrux.types import InputValidationError` | A `ValueError` for a value Dendrux cannot accept or store, or an approval with no `expected_pause_id`; carries a fixed `field` and `code`. |
 | `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
-| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 31 governance event types. See [Governance](/docs/architecture/governance). |
+| `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 33 governance event types. See [Governance](/docs/architecture/governance). |
 | `ApprovalDecision` | `from dendrux import ApprovalDecision` | One human decision for `submit_approval(decisions=...)`: `approve()` or `deny(reason)`. See [Approval](/docs/architecture/approval#per-call-decisions). |
 | `ToolCallContext` / `ToolDecision` / `BeforeToolHook` | `from dendrux import ToolCallContext, ToolDecision, BeforeToolHook` | Input, verdict and type of `Agent(before_tool=...)`. See [Tool policy hook](/docs/architecture/tool-policy). |
 | `PauseOutcome` | `from dendrux import PauseOutcome` | Returned by `agent.request_pause`: root status before/after and each affected run. See [Pause and resume](/docs/architecture/pause-resume#requesting-a-pause). |
@@ -120,12 +129,13 @@ The guide is [Images](/docs/recipes/images).
 
 ## Errors
 
-Run-control, skill-continuity, schema, and context-length exceptions live in `dendrux.errors`; common ones are re-exported from `dendrux`. MCP exceptions live in `dendrux.mcp`, RunStore read errors in `dendrux.store`, and several validation/idempotency exceptions are exported from `dendrux`. Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`, `SchemaOutOfDateError`, `ContextLengthExceededError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`.
+Run-control, skill-continuity, schema, and context-length exceptions live in `dendrux.errors`; common ones are re-exported from `dendrux`. MCP exceptions live in `dendrux.mcp`, RunStore read errors in `dendrux.store`, and several validation/idempotency exceptions are exported from `dendrux`. Full table with when-raised and suggested HTTP mappings on the [Errors](/docs/reference/errors) page: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`, `PersistenceNotConfiguredError`, `SchemaNotInitializedError`, `SchemaOutOfDateError`, `ContextLengthExceededError`. Plus `RunAlreadyActiveError`, `IdempotencyConflictError`, `StructuredOutputValidationError`, `DelegationDepthExceededError` from `dendrux`. New in 0.5.0, also from `dendrux`: `ProviderError` and its subclasses (`ProviderAuthError`, `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderUnavailableError`, `ProviderStreamIncompleteError`, `ModelRefusalError`, `ContentFilteredError`), `BudgetConfigurationError`, `TenantScopeRequiredError`, `GovernanceMismatchError` and `NoteLimitExceededError`.
 
 ## Where to go next
 
 - [Agent](/docs/reference/agent): the constructor and every runtime method.
 - [RunStore](/docs/reference/run-store): every read method and record type.
-- [make_read_router](/docs/reference/read-router): the HTTP read surface.
+- [Build your own read routes](/docs/recipes/build-your-own-read-routes): the HTTP read surface.
 - [Errors](/docs/reference/errors): the exception hierarchy and HTTP mappings.
-- [HTTP API surface](/docs/reference/http-api): the read router's endpoints in detail.
+- [HTTP integration](/docs/reference/http-api): the Python methods and application-owned HTTP boundary.
+- [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0): every change from 0.4.1, with an action for each.

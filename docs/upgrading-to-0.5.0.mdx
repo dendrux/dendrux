@@ -1,0 +1,534 @@
+---
+title: Upgrading to 0.5.0
+description: What changes in Dendrux 0.5.0 ("Trust"), the migration step, the rolling-deploy rules, a one-line action for every change, a map from the removed read router to RunStore, and the warnings that announce the 0.6 defaults.
+---
+
+# Upgrading to 0.5.0
+
+0.5.0 makes Dendrux safer by default: pending and live reads require a tenant scope, payloads are hidden unless you ask for them, provider failures are typed instead of silent, and size and time limits exist everywhere they were missing. Most of that needs no code change. A handful of things do, and each has a note below.
+
+Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [Every change at a glance](#every-change-at-a-glance) for the rows that touch your code, and follow its links. Scripts without persistence need no database migration; install 0.5.0 and run your tests. Applications with persistence follow the migration procedure below.
+
+> **Three defaults change in 0.6, and 0.5 warns first.** Strict tenancy, the hard stop on changed governance and the cache-token budget count ship as opt-ins or `FutureWarning`s in 0.5; the implicit `DENDRUX_DATABASE_URL` engine and the old `timeout=` argument print a `DeprecationWarning`. See [Warnings that announce 0.6](#warnings-that-announce-06). **One change is not gradual:** approving a pause now requires `expected_pause_id` (see [Approving needs a pause id](#13-approving-needs-a-pause-id)).
+
+## The upgrade in four steps
+
+1. **Install the migration distribution, back up, then migrate.** Install 0.5.0 in the migration job environment first (`python -m pip install 'dendrux[postgres]==0.5.0'`). Keep application workers on their existing version while the job runs. Back up the database, then run `dendrux db migrate` against your database, **once, as a single deploy job, over a direct Postgres connection** (not through PgBouncer, and not from every pod at startup). Do it before you start 0.5 workers. From a 0.4.1 database (head `c6d7e8f9a0b1`) it applies exactly two revisions, in this order, and ends at head `e8f9a0b1c2d3`:
+   - `d7e8f9a0b1c2` adds `agent_runs.claim_epoch` (`INTEGER NOT NULL DEFAULT 0`), replaces the global idempotency-key unique index with a tenant-scoped one, and adds an index on `agent_runs(tenant_id, created_at DESC)`.
+   - `e8f9a0b1c2d3` adds `agent_runs.status_changed_at` (backfilled from `updated_at`, `NOT NULL`, default `now()`) and three indexes that keep `sweep()` cheap: `ix_agent_runs_sweep_running (status, id)`, `ix_agent_runs_sweep_waiting (status, status_changed_at, id)` and a partial index on `run_events` for `run.started` (`ix_run_events_started`, `WHERE event_type = 'run.started'`).
+
+   Timing guidance: a rehearsal on Postgres with 5,000 runs (about 35,000 events) upgraded both revisions in about 1 second. Larger tables take longer, because the backfill runs in batches and the indexes are built concurrently: expect roughly 20 seconds at a million runs, and minutes for a very large `run_events` table. Rehearse on a copy of your own data.
+
+   **Both revisions run online on Postgres; no manual pre-build step is needed.** Each step commits on its own over the direct connection. Adding a column and dropping the old constraint wait at most 5 seconds for their table lock (`lock_timeout`). Every index is built or dropped with `CONCURRENTLY`, so 0.4.1 workers keep reading and writing during the migration. The backfill commits in 5,000-row batches and works best on Postgres 12 or later. On a large `run_events` table the concurrent index build can take minutes.
+
+   If a step cannot get its lock within 5 seconds, the job exits with code 1 and prints:
+
+   ```
+   Migration failed: Timed out acquiring the Dendrux migration lock after 5 seconds. Retry the migration operation after the blocking transaction finishes.
+   ```
+
+   The database stays at its last completed revision (`dendrux db check` exits 1 and names it), so 0.5 workers still refuse to start. Steps that already finished are harmless to 0.4.1 workers. End the blocking transaction and run `dendrux db migrate` again. It skips finished steps and rebuilds any index that an interrupted concurrent build left invalid. The 5-second bound applies to each wait, so a busy table with short transactions migrates normally. A second migration runner started at the same time refuses with a retry message.
+
+   Two kinds of session cause a refusal. Any open transaction that has touched `agent_runs` blocks the column and constraint steps. A concurrent index build also waits for every older transaction in the same database, even one that never touched Dendrux's tables, including sessions left "idle in transaction". Before you start, look for them:
+
+   ```sql
+   SELECT pid, state, now() - xact_start AS open_for, left(query, 60) AS query
+   FROM pg_stat_activity
+   WHERE datname = current_database() AND xact_start < now() - interval '5 seconds';
+   ```
+
+   SQLite files are brought up to date automatically on first use.
+2. **Roll your workers.** Rolling deploys are allowed. 0.5 writes are readable by 0.4.1 workers, pause state readers tolerate unknown keys, and event numbering is compatible with old workers. Do not run abandoned-waiting sweeps until the migration has finished.
+3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing or the revision is unknown (use `--allow-unstamped` if you build your schema with `create_all`; it then checks tables, columns and indexes). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query. For an unstamped Postgres database built with 0.4.1 `create_all`, first verify that its schema matches the 0.4.1 baseline, stamp `c6d7e8f9a0b1` with `alembic stamp c6d7e8f9a0b1` from `packages/python` using the migration job's Alembic configuration. For an installed distribution, use an `alembic.ini` whose `script_location` points to the installed package's `dendrux/db/migrations` directory. Then run the full chain with `dendrux db migrate`. Adding indexes alone does not perform this upgrade.
+4. **Read the warnings.** Run your tests with warnings visible (`python -W default`). Every default that changes in 0.6 prints a `FutureWarning` in 0.5 (visible by default), and a renamed or removed setting prints a `DeprecationWarning`. Python shows each warning once per call site.
+
+### Mixed fleets during a rolling deploy
+
+- **Keep idempotency keys globally unique until all workers run 0.5.0.** Do not reuse an idempotency key across tenants while any 0.4.1 worker can read the database. Old workers look keys up without a tenant filter; tenant-scoped reuse is supported only after the fleet has finished rolling.
+
+- **Fencing is partial.** Run fencing (`claim_epoch`) protects only runs that a 0.5 worker claimed. While 0.4.1 and 0.5 workers share a database, a run claimed by an old worker is not fenced.
+- **Waiting runs written by old workers are protected.** A waiting run is abandoned by `sweep()` only when both its last status change and its `updated_at` are stale, so a pause written by a 0.4.1 worker is not swept early.
+- **One duplicate event index is possible.** Event numbering is now allocated inside the insert, but the unique index that makes duplicates impossible arrives in 0.5.1. During a mixed fleet an SSE or `follow` cursor can, in rare races, miss one duplicated event. That behaviour already existed in 0.4.1.
+- **0.5.1 needs everyone on 0.5.0 or later.** The follow-up release that adds the unique event index requires all workers to be on 0.5.0 or later before you migrate.
+
+### Downgrading
+
+Both revisions have a tested downgrade. Roll the workers back to 0.4.1 first, then run Alembic against the same database. There is no `dendrux db downgrade` command. From a source checkout, in `packages/python` (where `alembic.ini` lives; `env.py` reads the database URL from `DENDRUX_DATABASE_URL`):
+
+```bash
+export DENDRUX_DATABASE_URL="postgresql+asyncpg://user:password@host/dbname"
+alembic downgrade c6d7e8f9a0b1
+```
+
+`c6d7e8f9a0b1` is 0.4.1's head. The command runs two steps: `e8f9a0b1c2d3` to `d7e8f9a0b1c2` (drops `status_changed_at` and the sweep indexes), then `d7e8f9a0b1c2` to `c6d7e8f9a0b1` (drops `claim_epoch` and the 0.5 indexes and restores the global idempotency-key index). **`alembic downgrade -1` from head lands on `d7e8f9a0b1c2`, not on 0.4.1**: the schema is still 0.5-shaped. After the full downgrade `dendrux db status` shows `c6d7e8f9a0b1` and the schema matches a fresh 0.4.1 database. The last step refuses, and changes nothing, if two tenants already share an idempotency key, because 0.4.1's global unique index cannot be rebuilt over them.
+
+That includes a key shared by a write that lands while the downgrade runs. The downgrade has the same 5-second lock bound and concurrent index steps as the upgrade, and the same retry message.
+
+In a rehearsal on 5,000 runs both steps took about 1 second.
+
+Downgrading drops `status_changed_at` and its history. A later `dendrux db migrate` adds the column again and backfills every row from `updated_at`, so the time of the last status change is not preserved across a downgrade and re-upgrade. Alembic migrations are validated on Postgres; SQLite files are upgraded in place by Dendrux and are not downgraded this way. Without a checkout, point an `alembic.ini` at the installed package's `dendrux/db/migrations` directory as its `script_location`.
+
+## Every change at a glance
+
+One line per change, with the action to take. The numbers link to the detailed notes under [What you must change](#what-you-must-change) and [What you may notice](#what-you-may-notice).
+
+| Change | Action |
+| --- | --- |
+| `make_read_router`, `dendrux.http`, the embedded dashboard, the `dendrux dashboard` command and the `http` extra are removed ([Removed](#removed-in-050)) | Delete mounts, imports and CLI configuration; build routes on `RunStore` using the endpoint map below. |
+| `Budget(max_cost_usd=...)` on an unpriced model raises `BudgetConfigurationError` ([1](#1-dollar-budgets-need-a-price)) | Add a `PriceTable` entry for the model you request, or use a provider that reports cost. |
+| Provider failures are typed `ProviderError` subclasses; empty answers are errors ([2](#2-provider-failures-are-typed-errors)) | Catch `ProviderError` where you caught SDK exceptions. |
+| Provider calls have deadlines: `call_timeout=600`, `stream_idle_timeout=600` ([2](#2-provider-failures-are-typed-errors)) | Set `call_timeout=None` or larger values for legitimately slower calls; replace `timeout=`. |
+| The implicit `DENDRUX_DATABASE_URL` engine is deprecated ([3](#3-create-one-state-store-per-process)) | Build one `state_store` per process at startup and pass it to every Agent. |
+| `Agent(database_url=...)` Agents with equal URL and options share one pool; non-SQLite pools default to `pool_pre_ping=True` and `pool_recycle=1800` ([3](#3-create-one-state-store-per-process)) | Close every Agent; set `database_options` if the defaults do not fit; for PgBouncer transaction mode disable both asyncpg statement caches. |
+| Local `@tool` arguments are validated and coerced ([4](#4-local-tool-arguments-are-validated-and-coerced)) | Accept model instances for model-typed parameters. |
+| Metadata keys starting with `dendrux.` are reserved ([5](#5-metadata-keys-starting-with-dendrux-are-reserved)) | Rename the key. |
+| `RunNotFoundError` takes a run id and is one class everywhere; `retry()` and `submit_*` raise it for foreign runs ([6](#6-runnotfounderror-takes-a-run-id), [7](#7-retry-and-submit_-raise-runnotfounderror-for-foreign-runs)) | Catch `RunNotFoundError`; answer 404. |
+| `list_runs` and `count_runs` treat `tenant_id=None` as untenanted only ([8](#8-list_runs-and-count_runs-treat-none-as-untenanted)) | Pass `UNSCOPED`, or omit the argument, for "all tenants". |
+| Input, metadata, notes and tool results have size caps ([9](#9-size-caps)) | Pass `Limits(...)` if your data is legitimately larger. |
+| Custom `StateStore`: `save_run_event` allocates and returns the index; claim, epoch and sweep methods changed ([10](#10-custom-statestore-changes)) | Update the store. |
+| Guardrail findings carry no matched text; detection is stricter; content that cannot be scanned fails closed ([11](#11-guardrail-findings-no-longer-carry-matched-text)) | Use `kind` and `location`, not text. |
+| `RunStore.follow` and `get_pending` are the live and pending reads; `follow` has per-scope caps ([12](#12-live-reads-and-query-bounds)) | Single-tenant apps with more than 100 live readers per process set `max_followers_per_tenant=None`. |
+| `expected_pause_id` is required to approve ([13](#13-approving-needs-a-pause-id)) | Send `pause_id` to the client and pass it back as `expected_pause_id=`. |
+| `get_result(include_pii=False)` leaves `pii_mapping` out; `RunResult.meta` has no `pause_state`; `RunResult.pending`, `to_dict()` and `ToolResult.from_dict` are new ([14](#14-results-pii-and-the-browser-envelope)) | Pass `include_pii=True` only in trusted server code; return `to_dict()`, never `meta`. |
+| Redacted feeds hide free text, past tool call ids and names they cannot prove (`<unknown_tool>`, `<mcp_tool>`, `<custom_kind>`, `<custom_provider>`) ([15](#15-redacted-views-show-less)) | Use `get_pending` for the active pause; `include_payloads=True` only for trusted readers. |
+| Read flags and control booleans must be real `bool`s; read arguments are validated ([16](#16-strict-flags-and-validated-read-arguments)) | Pass `True` or `False`; map `ValueError` from reads to 400. |
+| NUL and lone surrogates are rejected in input text, keys and metadata; JSON must be finite; client results are checked and capped ([17](#17-client-results-and-unstorable-text)) | Send valid UTF-8 text and finite JSON; map `InvalidToolResultError` and `InputValidationError` to 400. |
+| Guardrail-blocked runs end with `run.error`, not `run.completed` ([18](#18-guardrail-blocked-runs-end-with-runerror)) | Treat both `run.completed` and `run.error` as terminal. |
+| In-process `cancel_run` on a resumed run returns a `CANCELLED` result ([19](#19-in-process-cancellation-returns-a-result)) | Check `result.status` and `meta["dendrux.cancel_persisted"]`. |
+| `sweep()` is bounded: `max_runs` 10,000 (ceiling 100,000) per category and a `sweep_cap_reached` warning; swept waiting runs carry an error ([20](#20-sweep-is-bounded)) | Call it repeatedly from your maintenance job; monitor the warning. |
+| MCP discovery is bounded (pages, tools, bytes on HTTP, cursor length, time); malformed tool schemas are rejected or skipped ([21](#21-mcp-discovery-limits-and-malformed-schemas)) | Raise the `MCPSource` limits for servers that need more; handle `discovery_limit`. |
+| Per-Agent tool calls waiting for a slot are capped at 256 ([22](#22-tool-calls-waiting-for-a-slot-are-capped)) | Handle the retryable `tool_pool_saturated` result; set `DENDRUX_TOOL_QUEUE_LIMIT` to change the bound. |
+| The OpenTelemetry run span is `ERROR` when `RunResult.error_info` is set ([23](#23-opentelemetry-run-spans)) | Update trace dashboards that counted those runs as OK. |
+| `tools.declared` is a new event recorded at the start of every run segment ([24](#24-the-toolsdeclared-event)) | Nothing; redacted feeds use it to prove tool names. |
+| Provider output is bounded before it is stored: opaque evidence, model and tool-call identities ([25](#25-provider-output-is-bounded-before-it-is-stored)) | Custom providers: keep ids within 26 characters (Dendrux ids) and 255 (provider ids), tool names within 255; do not rely on raw response artifacts beyond the bounds. |
+| Large structured client results (above about 64 KiB) are validated off the event loop; a caller cancelled after the claim still has the run finalised as cancelled ([26](#26-large-client-results-and-caller-cancellation)) | Async routes that parse large wire objects call `ToolResult.from_dict` through `asyncio.to_thread`. |
+| Migrations `d7e8f9a0b1c2` and `e8f9a0b1c2d3` ([steps](#the-upgrade-in-four-steps)) | Run `dendrux db migrate` once, as a deploy job, over a direct connection. |
+| Resuming under changed governance emits `governance.changed`; `on_governance_change="raise"` stops it ([what you may notice](#what-you-may-notice)) | Choose `"warn"` or `"raise"` explicitly before 0.6 makes `"raise"` the default. |
+| Token budgets can count cache read and write tokens: `Budget(count_cache_tokens=...)` ([warnings](#warnings-that-announce-06)) | Choose `True` (and raise `max_tokens`) or `False` to silence the `FutureWarning`. |
+| Idempotency keys are unique per tenant; `tenant_id=""` is rejected; `Agent(strict_tenancy=True)` is available ([what you may notice](#what-you-may-notice)) | Opt in to strict tenancy now; pass `tenant_id=` everywhere. |
+| Provider failures log safe fields only (no traceback or vendor text) ([2](#2-provider-failures-are-typed-errors)) | Diagnose from `run_id` and `ErrorInfo`, not log text. |
+| Sync tools run on a bounded pool; timeouts report `timeout_not_started` or `timeout_outcome_unknown` ([what you may notice](#what-you-may-notice)) | Treat `timeout_outcome_unknown` as "may have run"; give sync tools their own client timeouts. |
+
+## Removed in 0.5.0
+
+`make_read_router` (`dendrux.http`) and the embedded dashboard (`dendrux.dashboard`,
+`packages/dashboard`, and the `dendrux dashboard` command) are removed in 0.5.0.
+The `http` extra is removed; install your web framework and server explicitly.
+Delete old mounts/imports and CLI token/host configuration. Dendrux is a library:
+developers build their own routes on `RunStore`. The recipe is
+[Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+| Old router endpoint | Replacement library call |
+| --- | --- |
+| `GET /health` | Your app's health check; no RunStore equivalent |
+| `GET /runs` | `list_runs(tenant_id=..., limit=..., offset=...)` and `count_runs(tenant_id=...)`; filters include `status`, `agent_name`, `started_after`, `started_before` |
+| `GET /runs/{id}` | `get_run(id, tenant_id=...)` |
+| `GET /runs/{id}/events` | `get_events(id, tenant_id=..., after_sequence_index=..., limit=...)` then `get_event_view(id, event, tenant_id=...)` |
+| `GET /runs/{id}/events/stream` | `follow(id, tenant_id=..., after_sequence_index=...)`; use `until_terminal=False` to keep following beyond terminal status |
+| `GET /runs/{id}/llm-calls` | `get_llm_calls(id, tenant_id=..., limit=..., offset=...)` (raw; project fields yourself) |
+| `GET /runs/{id}/tool-calls` | `get_tool_invocations(id, tenant_id=..., limit=..., offset=...)` (raw; project fields yourself) |
+| `GET /runs/{id}/traces` | `get_traces(id, tenant_id=..., limit=..., offset=...)` (raw; project fields yourself) |
+| `GET /runs/{id}/pauses` | `get_pause_page(id, tenant_id=..., limit=...)` for pairs plus truncation; `get_pending(id, tenant_id=...)` for current actionable state |
+| Write routes (tool results, input, approval, cancel) | Your own thin routes over `Agent.submit_tool_results`, `submit_input`, `submit_approval` and `cancel_run`, with `tenant_id=` and `expected_pause_id=` |
+
+Return one 404 for missing and foreign runs. Authenticate with headers and verify
+user-level run ownership as well as tenant scope. Enforce approval roles server-side.
+Clamp limits/offsets and expose incomplete pages; raw store records are not safe
+browser DTOs. Keep traces, provider bodies, arbitrary output, metadata and PII
+mappings server-side. Current client-tool params can contain real personal data.
+If `args_hidden=True`, stop and resolve on the server; never approve empty arguments.
+
+For SSE you now own Last-Event-ID parsing, reconnects, 204 drained-terminal responses,
+capacity handling, redaction, disconnect cleanup and network-send deadlines.
+Those HTTP status mappings belong to your application.
+The feed's maximum duration bounds iteration, not blocked sends. Always call
+`follow.aclose()` in `finally`. Never put bearer tokens in URLs or pipe
+`agent.stream()` directly to a browser. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+**Observability migration.** The embedded dashboard's normalized historical timeline
+and operator UI have no drop-in replacement. Use RunStore reads plus your own tracing:
+page events, inspect pending state and bounded pause pairs/tool/LLM reads, and build
+any timeline projection with explicit bounds and truncation. Connect
+`OpenTelemetryNotifier` to your app's tracing. See the working
+[operator inspection recipe](/docs/recipes/observability).
+
+### Tenant scope and redaction on your routes
+
+Pass `tenant_id=` on every Agent and RunStore call. `get_pending` and `follow`
+require an explicit scope; older reads default to all tenants. `None` means
+untenanted runs only and `UNSCOPED` is an explicit all-tenant operator view.
+`get_event_view` and `follow` hide payloads by default, while keeping the active
+pause actionable. Approval/input arguments use recorded model values
+or fail closed. This does not make every RunStore read a redacted wire response.
+See [redacted views](/docs/reference/run-store#redacted-views).
+
+## What you must change
+
+### 1. Dollar budgets need a price
+
+`Budget(max_cost_usd=...)` on a model Dendrux cannot price now raises `BudgetConfigurationError`, at construction and again at run start for the model actually used. Before, the budget silently never fired.
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
+```python
+from dendrux import Agent, Budget, ModelPricing, PriceTable
+
+agent = Agent(
+    provider=provider,
+    prompt="...",
+    budget=Budget(max_cost_usd=5.0, on_exceed="pause"),
+    pricing=PriceTable({"gpt-5*": ModelPricing(input=1.25, output=10.0)}),
+)
+```
+
+- Price the model you request. Globs work. Lookup order: exact match on the returned model, exact match on the requested model, glob on the returned model, glob on the requested model. So a dated snapshot id the vendor returns is priced by your entry for the alias, and an exact entry beats a glob. A cost the provider marks unknown is never filled in.
+- OpenRouter reports its own cost, so it needs no table.
+- During a run, an unpriced call counts as over the limit when `on_exceed` is `"pause"` or `"cancel"`, and emits `budget.unpriced` when it is `"warn"`.
+- A provider response whose token or cost numbers are invalid (negative, non-finite, out of range) is recorded as unreported and cost-unknown, with a `usage_invalid` log line that carries no values. Enforcing token and dollar budgets stop at their next checkpoint; they never treat the call as free.
+
+See [Budget](/docs/architecture/budget) and [Cost and pricing](/docs/architecture/pricing).
+
+### 2. Provider failures are typed errors
+
+Silent empty answers are gone. A stream that ends with no terminal event, a Responses `error` or `response.failed`, a refusal and a content filter each raise a `ProviderError` subclass, and the run ends `error` with `RunResult.error_info`.
+
+- Catch `ProviderError`. It has `.category`, `.status_code`, `.retryable` and `.safe_message`; the SDK exception is on `__cause__`.
+- `ProviderTimeoutError` also subclasses `TimeoutError`, and `ProviderUnavailableError` also subclasses `ConnectionError`, so existing `except TimeoutError:` clauses keep working. SDK exception types no longer escape. Code that caught an SDK exception class directly must catch `ProviderError` instead.
+- A completed response with neither text nor tool calls raises `ProviderResponseError` (`category="rejected"`, `provider_code="empty_completion"`). Batch `run` and `resume` raise the typed error after persisting it; streams yield an error outcome. Tool-only responses remain valid. A token-limited empty response keeps `truncated=True`. A serialized empty structured object (`{}`) remains valid for SingleCall batch output; SingleCall does not support structured streaming or resume.
+- Provider streams have a cumulative local bound of 16 MiB (`max_stream_bytes`), including retained UTF-8 text, reasoning, refusal, tool arguments and small event/data charges, plus at most 1,000 tool-call slots (`max_stream_tool_calls`). Configure these on the provider alongside deadlines. Exceeding either closes the upstream and raises `ProviderResponseError` with category `rejected` and code `stream_size_limit` or `stream_tool_call_limit`. SDK events are parsed before the local check. Dendrux charges retained fragments; Anthropic helper snapshots and the final Responses output snapshot are not charged again.
+- New deadlines can fail calls that used to hang: `call_timeout=600` for a non-streaming call and `stream_idle_timeout=600` between stream events. Pass `None` to opt out. An old `timeout=X` still works and sets both, with a `DeprecationWarning`. `call_timeout=None` also removes the bound on the SDK's own retries, so a paid call can be re-run; keep a deadline unless you have a reason not to.
+- `error_info` is also set for database failures, with `category="persistence_error"` (`dendrux.errors.PersistenceError`). SQL, bound parameters and driver text never appear in the error, the logs or the event.
+- Provider failures are logged with safe fields only (`run_id`, category, status, code) and no traceback or vendor text. Ordinary non-provider failures keep their tracebacks. Diagnose provider failures from `run_id` and `ErrorInfo`, not from log text.
+- Failures raised by a custom provider are recognised through `ProviderError` and its cause and context chains, including grouped worker failures. Raise the `ProviderError` taxonomy from your own providers; vendor text inside an unrelated exception message of a custom provider, or inside a notifier's own message, is outside this protection.
+
+See [Handling provider errors](/docs/recipes/handling-provider-errors) and [Models and providers](/docs/architecture/models).
+
+### 3. Create one state store per process
+
+Build the store once at startup. The implicit engine built from `DENDRUX_DATABASE_URL` is deprecated. An `Agent` with no `state_store=` or `database_url=` still resolves it, but warns, and the shared engine guards against use from a second event loop and raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress".
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
+```python
+# once, at app startup
+from dendrux.db.session import get_engine
+from dendrux.runtime.state import SQLAlchemyStateStore
+
+engine = await get_engine(DATABASE_URL)
+STORE = SQLAlchemyStateStore(engine)
+
+# every request
+async with Agent(provider=..., prompt=..., state_store=STORE) as agent:
+    ...
+```
+
+An `Agent(database_url=...)` now reuses one reference-counted engine for equal normalised URL and `database_options`, so building an Agent per message no longer opens a pool each time. You still choose the pool size only with your own store, and you must close every Agent (use `async with`). Equal in-memory SQLite URLs share one database while the pool lives.
+
+For non-SQLite URLs, Dendrux creates pools with `pool_pre_ping=True` and `pool_recycle=1800`; override either with `database_options=`, which `Agent`, `RunStore.from_database_url`, `sweep` and `get_engine` all accept. Behind PgBouncer in transaction mode, pass `connect_args=dict(statement_cache_size=0, prepared_statement_cache_size=0)`. Database URLs and bound parameters are masked in errors and logs. See [Scaling workers](/docs/guides/scaling) and [Web endpoints](/docs/recipes/web-endpoint).
+
+### 4. Local `@tool` arguments are validated and coerced
+
+For `@tool` functions Dendrux now checks the model's arguments against the schema, then coerces them to the annotated types. A parameter annotated with a Pydantic model receives the model instance, not a dict; an `Enum` parameter receives the member; `3.0` becomes `3` for an `int`; ISO strings become `datetime`; `Field(...)` constraints (`ge`, `le`, `max_length` and so on) are enforced and appear in the schema.
+
+- Tools that took a dict for a model-typed parameter must now accept the model.
+- The function receives objects built from the coerced arguments, and `before_tool` receives real values in process, as before. The approval view (`approval.requested` and anything else shown to or stored for a reviewer) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when PII redaction is on, before coercion, and without defaults Dendrux filled in. Coercion is deterministic, so what a person approves decides what runs.
+- Tools declared with an explicit `parameters=` keep JSON Schema validation with no coercion. MCP tools and client tools are unchanged.
+- `*args` and `**kwargs` are left out of the generated schema.
+- Validation errors name the field and the constraint, never the value. They also no longer echo dictionary keys or unknown argument names: a key shows as `<key>`, and unexpected arguments are reported as a count plus the list of valid names.
+- Arguments with NUL, a lone surrogate or a non-finite number are refused with `invalid_params` before any hook, approval or execution. A tool whose own schema is malformed returns `invalid_tool_schema`.
+
+See [Tools](/docs/reference/tools).
+
+### 5. Metadata keys starting with `dendrux.` are reserved
+
+`agent.run(..., metadata={"dendrux.x": 1})` raises `ValueError`. Rename the key. Dendrux uses that prefix for its own run metadata.
+
+### 6. `RunNotFoundError` takes a run id
+
+`dendrux.store.RunNotFoundError` is now the same class as `dendrux.errors.RunNotFoundError`, and its constructor takes a run id: `RunNotFoundError("01J...")`. One `except RunNotFoundError` catches it from `Agent`, `RunStore`. If you raised it yourself with a message, pass the id instead.
+
+### 7. `retry()` and `submit_*` raise `RunNotFoundError` for foreign runs
+
+A missing run and a run that belongs to another tenant now raise the same `RunNotFoundError` (a `LookupError`) from `retry`, `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume` and `resume`. A foreign or absent replay source reads the same way. Before, `retry` raised `ValueError` or `ReplayRunError` and some paths leaked that a run existed. Catch `RunNotFoundError` and return 404.
+
+### 8. `list_runs` and `count_runs` treat `None` as "untenanted"
+
+On `RunStore` and `StateStore`, `tenant_id` now defaults to `UNSCOPED`.
+
+| You pass | Before 0.5 | 0.5 |
+| --- | --- | --- |
+| nothing | all tenants | all tenants |
+| `tenant_id="acme"` | acme only | acme only |
+| `tenant_id=None` | all tenants | **untenanted runs only** |
+| `tenant_id=UNSCOPED` | not available | all tenants |
+
+If you called `list_runs(tenant_id=maybe_tenant)` with a value that can be `None`, decide which you mean. Authors of a custom `StateStore` must treat `UNSCOPED` as "no filter" and `None` as `tenant_id IS NULL`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+
+### 9. Size caps
+
+Input text, metadata, notes and tool results now have limits. The defaults:
+
+| Limit | Default | When exceeded |
+| --- | --- | --- |
+| `max_input_bytes` | 1 MiB of UTF-8 text in a run's input | `ValueError` before the run starts |
+| `max_metadata_bytes` | 64 KiB | `ValueError` |
+| `max_notes_per_run` | 1000 | `NoteLimitExceededError` (a `ValueError`) from `submit_note` |
+| `max_tool_result_bytes` | 1 MiB per tool result (local, MCP and client) | the result is replaced with `{"error": "result too large", "code": "size_limit", "bytes": N}`; a plain string result is cut with a marker |
+
+```python
+from dendrux import Agent, Limits
+
+agent = Agent(provider=..., prompt="...", limits=Limits(max_tool_result_bytes=4 * 1024 * 1024))
+```
+
+Images keep their own caps ([Images](/docs/recipes/images)). MCP results are cut off while they are read, so an oversized result is never held in memory in full.
+
+### 10. Custom `StateStore` changes
+
+`save_run_event` must allocate the sequence index inside the insert and **return** it. `EventSequencer` is removed. A single statement does it on SQL stores:
+
+```sql
+INSERT INTO run_events (agent_run_id, sequence_index, ...)
+SELECT :run_id, COALESCE(MAX(sequence_index), -1) + 1, ...
+FROM run_events WHERE agent_run_id = :run_id
+```
+
+Custom stores must also accept `tenant_id` on the read methods and `max_notes=` on `add_note` (one conditional statement that raises `NoteLimitExceededError` when the run is full). A store whose `add_note` has no `max_notes` keyword keeps working, without the cap.
+
+Run fencing needs more from a store, and a store that does not provide it keeps working with the older, weaker guarantees:
+
+- Claims return the new positive integer epoch (and `False` on loss), accept `expected_pause_id=` and a `validate=` callback that runs while the claim transaction holds the run row, and let a failed claim be released back to its paused status.
+- `RunControl` exposes the current epoch and status, and every runner status write and claim release is conditional on the worker's own epoch.
+- `finalize_run` may accept `error_info=` and `failure_reason=` so the safe error descriptor is stored in the same transaction; without them the run keeps the safe error string only.
+- `sweep_stale_runs` and `sweep_abandoned_runs` take `batch_size` and `max_runs`, and should treat negative ages as an error.
+- A store without bounded event-filter reads cannot establish a verified approval or input view; the arguments are then hidden (`args_hidden=True`) rather than shown unverified.
+- A 0.4.1 `claim_paused_run(run_id, *, expected_status)` stays usable on a best-effort basis: Dendrux validates before and right after the claim, but it cannot give atomic validation or full fencing there. Upgrade the store for those guarantees.
+
+### 11. Guardrail findings no longer carry matched text
+
+`guardrail.blocked` events and guardrail errors report the kind, the count and the location (message index, role, tool call id), never the matched text. If you parsed text out of `guardrail.blocked`, use `kind` and `location`.
+
+Detection got stricter in a good way: phone numbers need E.164 or separators plus a context keyword, card numbers must pass the Luhn check, IP octets must be 255 or less, and an AWS secret key needs the `AKIA...` pair or a context keyword. Expect fewer false positives. Content a guardrail cannot scan (too deep, too large) is an `unscannable` finding that blocks under `block` and `redact` and is only reported under `warn`. A message with several text parts, and each tool result, is scanned as one text, so context in a neighbouring part counts; expect more matches there, never fewer.
+
+See [Guardrails](/docs/architecture/guardrails).
+
+### 12. Live reads and query bounds
+
+`RunStore.follow` ends with `FollowEnd("terminal", cursor)` once a terminal run's
+stored events are drained. `Follow.drained_terminal` signals that no events remain;
+your route can map that signal to HTTP 204. Set `until_terminal=False` if your app
+needs to keep following beyond terminal status.
+
+- A store admits at most 500 followers by default, then raises `FollowCapacityError`.
+- **Each tenant scope admits at most 100 of them by default** (`FollowCapacityError(per_tenant=True)`). The cap is per scope, not per user: each string tenant is one scope, all untenanted (`tenant_id=None`) followers together are one scope, and all `UNSCOPED` followers together are one scope. A single-tenant app with more than 100 concurrent readers per process builds its own feed, `EventFeed(store, max_followers_per_tenant=None)` (or a larger number), and calls `feed.follow(...)`.
+- `max_duration_s=900` bounds iteration by default and returns a resume cursor.
+  Your transport must also bound network sends, re-authorize reconnects and close
+  the follower in `finally`.
+- Followers of the same run share one poller, so polling load grows with watched runs.
+- `list_runs` rejects `offset > 10_000` with `ValueError`. Its `started_after` and
+  `started_before` values must be timezone-aware datetimes.
+- `RunStore.stream_events(run_id)` without `tenant_id` still works but prints a `DeprecationWarning`; use `follow`.
+
+Your application chooses its HTTP statuses, framing and pagination schema. See
+[Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+### 13. Approving needs a pause id
+
+Every pause has a `pause_id`, and **approving requires it**. `submit_approval(approved=True, ...)`, a `decisions=` batch that approves any call, and `resume` of an approval pause raise `InputValidationError` (a `ValueError`, code `pause_id_required`) unless `expected_pause_id=` is passed. Rejecting does not need it. A wrong id raises `PauseStatusMismatchError` with `reason="pause_id"` (answer 409), and nothing is claimed.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
+```python
+paused = await agent.run("Refund order 42", tenant_id=tenant)
+# send paused.pause_id to the client with the approval request, then:
+await agent.submit_approval(
+    paused.run_id, approved=True, expected_pause_id=paused.pause_id, tenant_id=tenant,
+)
+```
+
+Round-trip `pause_id` through your client (it is on `RunResult.pause_id`, `PendingPause.pause_id` and the `run.paused` event). Tool results, input answers and plain continues accept it as an option; under `Agent(strict_tenancy=True)` leaving it out prints a `FutureWarning`. Approval flags such as `approved` and `cascade` must be real `bool` values. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+### 14. Results, PII and the browser envelope
+
+- `Agent.get_result(run_id, tenant_id=..., include_pii=False)` is new. It needs an explicit tenant (`None` for untenanted runs), refuses `UNSCOPED`, restores the answer exactly as `run()` returned it, and leaves `pii_mapping` out of `meta` unless you pass `include_pii=True`.
+- A result straight from `run()` still carries `meta["pii_mapping"]`. Do not return `meta` wholesale.
+- `RunResult.meta` no longer has a `pause_state` key. The internal pause state is not public. Read the current pause with `RunResult.pending` (a `PendingPause`) or `RunStore.get_pending`.
+- `RunResult.to_dict()` is the browser envelope: `wire_version` (1), `run_id`, `status`, `pending`, `answer`, `answer_omitted`, `output` and `error_info`, and nothing else. Client-tool arguments follow the PII restore policy; approval and input prompts and arguments are placeholders; `pii_mapping` is never included. `ToolResult.from_dict` and `list_from_dict` validate results coming back from a client. See [RunResult](/docs/reference/agent#runresult).
+
+### 15. Redacted views show less
+
+`RunStore.follow`, `get_event_view`, `get_pause_page`, `get_pauses` and `redact_event` with `include_payloads=False` (the default) now work from a field allowlist. Compared with the first 0.5 builds and with 0.4.1's raw reads, they hide free text (a person's answer, a reviewer's denial reason, exception text, image descriptions, a pause's `message`), tool call ids outside the active pause, provider-reported `model` and `safe_message`, and tool names they cannot prove are declared. Those show as `<unknown_tool>`, `<mcp_tool>`, `<custom_kind>`, `<custom_provider>`, `<unknown_code>` or `<unknown_skill>`. Past pauses' arguments are hidden; the active pause stays actionable. `get_pauses` and `get_pause_page` return `user_input=None` unless `include_payloads=True`.
+
+What this does and does not protect is written down on [RunStore: redacted views](/docs/reference/run-store#redacted-views): it protects readers from untrusted data (models, providers, tools, MCP servers, hooks, clients), not from hostile code in your own process. Use `get_pending` to get the call ids a client submits against; use `include_payloads=True` only in trusted operator code.
+
+### 16. Strict flags and validated read arguments
+
+Read flags (`include_payloads`, `until_terminal`, `active_pause`, `undelivered_only`) and control flags (`approved`, `cascade`, `include_pii`) must be exactly `True` or `False`; `"false"`, `0` or `1` raise `ValueError` instead of being read as truthy. `follow(max_duration_s=...)` must be a finite positive number or `None`. `RunStore` reads, `get_pending` and `follow` also validate ids, tenants, cursors, limits, offsets, filters and dates before they query, and raise `ValueError` with a fixed message that never echoes the rejected value, and log `code=read_argument_invalid` with the argument name: map it to 400. `get_run(None)` now raises instead of returning `None`. See [RunStore](/docs/reference/run-store#arguments-are-validated).
+
+### 17. Client results and unstorable text
+
+- Text input, metadata, tool arguments and client results may not contain NUL (`\x00`) or lone surrogates, in values or in dictionary keys. They raise `InputValidationError` (a `ValueError`) before anything is written or claimed; the message names a fixed field and a code, never the content. Model-written text with such characters is stored with each bad code unit replaced by U+FFFD.
+- JSON must be finite (`NaN` and infinities are refused), nested at most 32 levels and sized within a node budget derived from the 1 MiB cap, which admits compact spreadsheet ranges.
+- A client result must match a pending call by id **and** tool name, cover every pending call once, and fit `Limits.max_tool_result_bytes`; an oversized payload becomes the `size_limit` failure before any success transform. A bad submission raises `InvalidToolResultError` and leaves the run paused and unclaimed. `tool_result_transform` now applies to client results too.
+- Plain-text client results reach the model unchanged, as in 0.4.1. A result sent in place of an approval can only be a failed denial.
+- With `resume_stream`, a rejected client result ends that attempt with a `RUN_ERROR` event (`meta["error_type"] == "InvalidToolResultError"`), but the durable run stays waiting and can be resubmitted.
+
+### 18. Guardrail-blocked runs end with `run.error`
+
+In 0.4.1 a run stopped by a guardrail ended with `run.completed` and no error. It now ends with `run.error`, a safe `agent_runs.error` and `failure_reason="guardrail_blocked"`. Event consumers should treat both `run.completed` and `run.error` as terminal; `RunStore.follow` already does.
+
+### 19. In-process cancellation returns a result
+
+Calling `cancel_run` in the same process on a run that a `submit_*` or `resume` call is executing used to raise `CancelledError` in that caller. It now returns a `CANCELLED` `RunResult`. Cancelling the task that awaits the call still raises. When the durable `cancelled` status could not be confirmed, `result.meta["dendrux.cancel_persisted"]` is `False`; check it before you treat the cancellation as saved.
+
+### 20. Sweep is bounded
+
+`sweep()` inspects at most `max_runs` candidates per category (default 10,000, ceiling 100,000; `batch_size` defaults to 100) and logs a structured `sweep_cap_reached` warning when a category reaches the bound. The bound counts candidates, including fresh running rows and lost compare-and-swap attempts, not only winners. There is no cursor and no "more" flag: a short result does not prove the backlog is empty, so call it repeatedly from your maintenance job and raise `max_runs` when the warning appears. `sweep(stale_running=timedelta(0))` works; negative ages are rejected.
+
+Waiting runs are aged from the new `status_changed_at` column, and a run is abandoned only when both `status_changed_at` and `updated_at` are stale. Runs swept as abandoned while waiting now carry the safe error `Run swept as abandoned_waiting` together with `failure_reason`, and their private pause history is cleared; read-side filters must not assume swept waiting rows have no error. Code that inserts `agent_runs` rows by hand gets `status_changed_at` from the column default. See [Scaling workers](/docs/guides/scaling#sweep-cadence).
+
+### 21. MCP discovery limits and malformed schemas
+
+`tools/list` is now bounded. `MCPSource` gains `max_discovery_pages` (100), `max_discovery_tools` (2000), `discovery_timeout` (60.0 seconds) and, for HTTP sources only, `max_discovery_bytes` (16 MiB); a cursor longer than 4096 characters or a repeated cursor also stops paging. Passing a bound raises `MCPDiscoveryLimitError` (code `discovery_limit`, with a `reason`). Setting a non-default `max_discovery_bytes` on a stdio source raises `ValueError`, because a stdio server is a local process inside your trust boundary. Raise the limits on the source if a server legitimately lists more.
+
+A tool whose argument schema is malformed (`required` that is not a list of strings, including `required: null`, or `properties` that is not an object, at any depth) is no longer accepted: a best-effort view skips it with reason `invalid_schema`, and a `strict=True` view raises `MCPInvalidToolSchemaError` (code `invalid_tool_schema`). A local tool call against such a schema returns `invalid_tool_schema` instead of raising. See [MCP](/docs/architecture/mcp#discovery-limits).
+
+### 22. Tool calls waiting for a slot are capped
+
+Each Agent keeps at most 256 tool calls waiting for one of its `tool_threads` slots. A call that arrives when the queue is full is not started and the model gets a retryable `tool_pool_saturated` result. Set `DENDRUX_TOOL_QUEUE_LIMIT` to change the bound for the process. See [Tools](/docs/reference/tools#timeouts-and-the-thread-pool).
+
+### 23. OpenTelemetry run spans
+
+`OpenTelemetryNotifier` now ends the run span with status `ERROR` when `RunResult.error_info` is set (it was `OK`), and adds the safe `dendrux.error.*` attributes and a `provider.error` span event. Update dashboards and alerts that counted those runs as successful. A user notifier that formats a `ProviderError` into its own exception message is outside the protection against vendor text.
+
+### 24. The `tools.declared` event
+
+Every run segment (`run`, `stream`, `retry`, `resume` and `resume_stream`) now records one `tools.declared` governance event whose data is `local_tool_names`: the sorted names of the tools declared in code, client tools included, at most 1,000 and each at most 64 identifier characters. MCP discovery and model output never add to it. Redacted readers use it to prove which tool names are developer-declared; consumers that assert on the exact event count of a run will see one more event.
+
+### 25. Provider output is bounded before it is stored
+
+Everything a provider (yours or a built-in one) returns is normalised before it reaches callbacks, events or the database. Built-in providers already satisfy this; a custom provider can see differences from 0.4.1:
+
+- **Text.** NUL and lone surrogates in model text, tool names, tool-call ids and questions are replaced with U+FFFD.
+- **Identities.** A Dendrux tool-call id longer than 26 characters, or a provider tool-call id or response model longer than 255, is replaced by a deterministic SHA-256 hex digest (cut to that length at most). Valid identities of up to those lengths are unchanged. A tool name longer than 255 characters is not stored or echoed: the call is rejected as an unknown tool (`code="unknown_tool"`) and shown as `<unknown_tool>` in redacted views.
+- **Opaque evidence.** `provider_response` and `reasoning_blocks` are copied as bounded JSON: at most 1 MiB of text, 10,000 nodes, 32 levels and 5,000 keys per object. Past a bound that evidence is dropped (stored as null) instead of failing the run; non-finite numbers become null and objects other than JSON values are never serialised.
+- **Rejected arguments.** If a model's tool arguments cannot be stored (NUL, lone surrogate, non-finite number, oversized structure), the call returns `invalid_params` to the model with empty stored params, and that response's raw artifacts (`raw`, `provider_response`, `reasoning_blocks`) are not stored at all.
+
+Raw provider records in `llm_interactions` and traces can therefore be missing or shortened for oversized or hostile responses. Dendrux never fails a valid answer because of this.
+
+### 26. Large client results and caller cancellation
+
+- **Large structured results are validated off the event loop.** A client result whose payload is above about 64 KiB (an upper UTF-8 estimate; ASCII uses the exact length) is validated in a worker thread before the run is claimed, with at most one such job per event loop at a time; smaller payloads are validated inline. `ToolResult.from_dict` and `list_from_dict` stay **synchronous**, so an async route that parses a large wire object should offload it:
+
+  [//]: # "docs-test: skip - fragment: relies on `data`, `agent` and `run_id`, defined by setup shown elsewhere"
+
+  ```python
+  import asyncio
+
+  result = await asyncio.to_thread(ToolResult.from_dict, data)
+  finished = await agent.submit_tool_results(run_id, [result], tenant_id=tenant_id)
+  ```
+
+  A result you convert with `from_dict` is validated once; `submit_tool_results` re-checks the current identity, metadata, image and size limits and does not parse the payload a second time. A result changed with `dataclasses.replace` is validated again. Do not send the private validation marker over the wire; Dendrux never accepts it from a wire object.
+- **Cancelling a submit caller after the claim.** If the task awaiting `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume` or `resume` is cancelled right after the run was claimed, Dendrux finalises the run as `cancelled` (fenced by the claim epoch) before it re-raises that `CancelledError`, so the run is not left `running`. This holds when the database write succeeds. If it fails, Dendrux logs `code=cancel_persist_failed` and still re-raises `CancelledError`; the row can then stay `running` until your `sweep()` job marks it stale, so keep that job scheduled and watch for the log line. `cancel_run` continues to return its typed `CANCELLED` result as in [item 19](#19-in-process-cancellation-returns-a-result).
+
+## Limits at a glance
+
+Every new bound in 0.5.0, for capacity planning:
+
+| Limit | Value | When exceeded |
+| --- | --- | --- |
+| Input text per run | 1 MiB (`Limits.max_input_bytes`) | `ValueError` |
+| Run metadata | 64 KiB (`Limits.max_metadata_bytes`) | `ValueError` |
+| Notes per run | 1000 (`Limits.max_notes_per_run`) | `NoteLimitExceededError` |
+| One tool result | 1 MiB (`Limits.max_tool_result_bytes`) | replaced by a `size_limit` result |
+| Client results per submit | 1,000 by default (`ToolResult.list_from_dict(max_results=)`), together within `max_input_bytes` | `ValueError` |
+| MCP response body read (4 times the text cap), no images | 4 MiB | the read is cut off and the result is rejected as too large |
+| MCP discovery | 100 pages, 2,000 tools, 60 s, 4,096-character cursor; 16 MiB of response bodies on HTTP | `MCPDiscoveryLimitError` |
+| Distinct PII values redacted per run | 20,000 | the scan is `unscannable`, so `block` and `redact` stop the run |
+| Concurrent Presidio scans | 16 | an extra scan is `unscannable` (fails closed) rather than queued |
+| Text scanned by one guardrail | 4 Mi characters | `unscannable` |
+| `list_runs` offset | 10,000 | `ValueError` |
+| Concurrent `follow` readers | 500 per store, 100 per tenant scope by default | `FollowCapacityError` (`per_tenant=True` for the scope cap) |
+| One `follow` reader | 900 s by default (`max_duration_s`) | `FollowEnd("max_duration", cursor)` |
+| Provider evidence stored per response | 1 MiB of text, 10,000 nodes, 32 levels, 5,000 keys per object; ids 26 / 255 characters, tool names 255 | the evidence is dropped; an id is hashed; a long tool name is rejected as unknown |
+| Structured client result validated inline | up to about 64 KiB; larger is validated in a worker thread, one job per event loop | none (backpressure) |
+| Provider call deadline | 600 s call, 600 s between stream events | `ProviderTimeoutError` |
+| Sync-tool threads | 32 per process, 8 per Agent | calls queue |
+| Tool calls waiting per Agent | 256 (`DENDRUX_TOOL_QUEUE_LIMIT`) | retryable `tool_pool_saturated` result |
+| `sweep` candidates per category | 10,000 (ceiling 100,000) | `sweep_cap_reached` warning |
+| Pending pause display on the wire | about 1,000 PII values | `args_hidden=True` for that pause |
+
+## What you may notice
+
+These need no change but are visible.
+
+- **`governance.changed` on resume.** Resuming a run with different governance (guardrails, `deny`, `require_approval`, `before_tool`, limits) now emits a `governance.changed` event and a log line. It does not stop the run unless you opt in with `Agent(on_governance_change="raise")`, which raises `GovernanceMismatchError`. Runs paused before 0.5 are skipped. Budget numbers are excluded from the comparison. See [Governance](/docs/architecture/governance#detecting-changed-governance-on-resume).
+- **Stale submits are caught.** A `submit_*` call with an `expected_pause_id` that is no longer current raises `PauseStatusMismatchError` and writes nothing. See [item 13](#13-approving-needs-a-pause-id).
+- **Pause state is versioned.** It carries `schema_version`, and keeps only the generation settings `model`, `max_tokens`, `temperature`, `thinking` and `effort`, which a resume restores. Request headers and other provider options are never stored.
+- **Resume re-checks policy.** A resume re-applies `deny` and the per-run tool call limits, so a call that policy would now refuse does not run.
+- **Idempotency keys are per tenant.** The same `idempotency_key` in two tenants now creates two runs. `tenant_id=""` is rejected with `ValueError` on every entry point. See [Multi-tenancy](/docs/architecture/multi-tenancy#idempotency-keys).
+- **Strict tenancy is available.** `Agent(strict_tenancy=True)` makes every entry point require an explicit `tenant_id`, including the module-level `dendrux.run`. It is off by default and becomes the default in 0.6.
+- **Tool timeouts are bounded.** Sync tools run on one process-wide bounded thread pool (`DENDRUX_TOOL_THREADS`, default 32) with a per-Agent cap (`Agent(tool_threads=8)`). A call that times out before it started returns `code="timeout_not_started"` (safe to retry); one that had started returns `code="timeout_outcome_unknown"`. A failure that ends the run stops the other calls in a parallel batch. See [Tools](/docs/reference/tools#timeouts-and-the-thread-pool).
+- **Unknown tools are answered first.** A call to a tool that does not exist is rejected before `before_tool` and approval, with `code="unknown_tool"` and no `tool.started` event.
+- **PII restore can be limited.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` restores real values only into the tools you name. The default is unchanged. See [PII restore](/docs/architecture/pii-restore).
+- **Counting cache tokens in a token budget is opt-in.** `Budget(count_cache_tokens=True)`. See below.
+- **Errors from MCP.** A `tools/call` that fails with HTTP 404 "Session not found" re-initialises the session and retries once. After any mid-call loss the outcome is unknown and nothing is retried. See [MCP](/docs/architecture/mcp#calls-errors-and-result-limits).
+- **Cost of Responses cache writes** is now reported as cache-creation tokens and no longer counted as fresh input, and a call that used the long (12 hour) cache TTL is marked cost-unknown until 0.6 adds its rate.
+- **The Anthropic thinking plus structured output combination** uses the supported `output_config.format` request shape.
+- **Dead transports are rebuilt.** A provider reused across event loops rebuilds its HTTP transport, and streams close their upstream request when you stop iterating.
+
+## Warnings that announce 0.6
+
+0.5 prints a `FutureWarning` for each default that flips in 0.6, and a `DeprecationWarning` for each setting that is renamed or removed (the `DENDRUX_DATABASE_URL` fallback, the old `timeout=` argument and `stream_events` without a tenant). Python's warnings machinery shows each one once per call site; Dendrux keeps no flag of its own. Act on them now.
+
+| Warning | 0.5 | 0.6 |
+| --- | --- | --- |
+| Strict tenancy | off unless `Agent(strict_tenancy=True)`; `FutureWarning` when you have not chosen | on by default |
+| Token on non-approval submits | optional; `FutureWarning` when omitted under strict tenancy | required, subject to a later decision |
+| `DENDRUX_DATABASE_URL` implicit engine | works, `DeprecationWarning` | removed |
+| `on_governance_change` | `"warn"`; `FutureWarning` when a resume finds changed governance and you have not chosen | `"raise"` |
+| Token budgets and cache tokens | `Budget(count_cache_tokens=...)` unset gives a `FutureWarning` when a token budget is used | cache read and write tokens counted by default |
+
+Approving without `expected_pause_id` is **not** in this table: it is already an error in 0.5 (see [item 13](#13-approving-needs-a-pause-id)).
+
+To silence a warning, make the choice explicit. For example, `Budget(max_tokens=200_000, count_cache_tokens=False)` keeps 0.4 counting, and `count_cache_tokens=True` counts `input + output + cache read + cache write` tokens (raise `max_tokens` if you opt in).
+
+## Checklist
+
+- [ ] `dendrux db migrate` once, as a deploy job over a direct connection, then `dendrux db check`
+- [ ] Replace removed mounts with app-owned routes and explicit tenant scope
+- [ ] Send `pause_id` to clients and pass it back as `expected_pause_id=` on approvals
+- [ ] `include_payloads=True` only where a trusted viewer needs raw payloads
+- [ ] A price for every model under a dollar budget
+- [ ] `except ProviderError` where you caught SDK exceptions
+- [ ] One `state_store=` per process, built at startup; every Agent closed
+- [ ] Tools that take model-typed parameters accept the model
+- [ ] `Limits(...)` if your tool results or inputs are legitimately larger than 1 MiB
+- [ ] `tenant_id=` on `list_runs` calls that passed `None` meaning "all"
+- [ ] Custom `StateStore` updated
+- [ ] `max_followers_per_tenant=None` if one scope needs more than 100 live readers
+- [ ] A maintenance job that calls `sweep()` and watches `sweep_cap_reached`
+- [ ] Trace dashboards updated for `ERROR` run spans
+- [ ] Operator inspection and tracing configured in your application
+- [ ] Tests run with `-W default` and every `FutureWarning` and `DeprecationWarning` answered
+
+## Where this fits
+
+- [Multi-tenancy](/docs/architecture/multi-tenancy): scoping reads and writes by tenant.
+- [Handling provider errors](/docs/recipes/handling-provider-errors): the typed error taxonomy.
+- [Erasing a tenant's data](/docs/recipes/erasing-tenant-data): the manual recipe until 0.6.
+- [HTTP integration](/docs/reference/http-api): the library and transport boundary.
+- [Scaling workers](/docs/guides/scaling): pools, PgBouncer, migrations, sweeps and every bound.
+
+### Bounded continuation and delegation reads
+
+SQL persistence reads the next trace index as one scalar using the existing run/order index. Custom stores can add `get_next_trace_index(run_id)`; stores without it retain the full `get_traces` compatibility read.
+
+`Budget(include_children=True)` accounts at most 10,000 nodes including the root. Set `max_subtree_nodes` on `Budget` to change the bound. Larger trees raise `BudgetConfigurationError(reason="subtree_limit")`; partial totals are never used. Custom accounting stores should accept `subtree_usage(run_id, *, max_nodes=10000)` to enforce the bound. Legacy implementations without that parameter retain their existing accounting behavior.
+
+Cascade cancellation reads and signals descendant ids in pages of 500 before reading the next page. `meta["cascade"]` contains at most 1,000 outcomes including the root; `cascade_count` gives the number processed, and `cascade_truncated` indicates omitted detail. Custom stores can implement `get_descendant_page(run_id, *, after=None, limit=500, tenant_id=UNSCOPED)` to enable paging; legacy stores retain their `get_subtree` compatibility path.
+
+Approval denial results are validated before claiming, including their encoded per-result size, metadata and the expanded batch size. Oversized denials raise `InvalidToolResultError` and leave the pause waiting. Client submissions continue to replace oversized individual results with a size-limit result.
+
+`Limits.max_input_bytes` applies to the combined caller-supplied text in `user_input`, `history` and `context`. NUL and lone surrogates are rejected before a run is created.

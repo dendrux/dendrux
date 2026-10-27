@@ -28,6 +28,7 @@ agent = Agent(
     tools=[refund],
     require_approval=["refund"],
     database_url="sqlite+aiosqlite:///support.db",
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 ```
 
@@ -45,32 +46,36 @@ print(first.run_id)
 
 Status comes back as `waiting_approval`. The run row in `agent_runs` is in that status, the pending tool call is recorded in `pause_data`, and a `approval.requested` event has landed in `run_events` with the tool name and `correlation_id` set to the call id.
 
-The refund function has not been invoked. You can verify this in your code or in the dashboard — `tool_calls` is empty for the run.
+The refund function has not been invoked. You can verify this in your code or in your inspection tools — `tool_calls` is empty for the run.
 
 ## Approving
 
-Pull the run by id (typically from the dashboard, an alert, or a queue), and ship the decision back:
+Read the pending pause and send its pause_id with the approval so a stale decision cannot approve later work:
 
 ```python
-result = await agent.submit_approval(first.run_id, approved=True)
+result = await agent.submit_approval(
+    first.run_id, approved=True, expected_pause_id=first.pause_id
+)
 print(result.status.value)   # success
 print(result.answer)         # "I've successfully refunded order 42..."
 ```
 
 `submit_approval` is race-safe: persist-first plus CAS claim plus blocking until the run reaches the next pause or terminal. The pending tool runs server-side; its result is fed back into the LLM; the LLM responds to the user.
 
-Captured event sequence (real run):
+Event sequence (captured on Dendrux 0.5.0 with claude-haiku-4-5):
 
 ```text
 seq=0  run.started
-seq=1  llm.completed         (LLM emits refund tool call)
-seq=2  approval.requested    {"tool_name": "refund", "call_id": "01KP...", "reason": "requires_approval"}
-seq=3  run.paused            {"status": "waiting_approval", "pending_tool_calls": [...]}
-seq=4  run.resumed           {"resumed_from": "waiting_approval"}
-seq=5  tool.completed        {"tool_name": "refund", "target": "server", "success": true}
-seq=6  approval.decided      {"decision": "approved", "run_id": "..."}
-seq=7  llm.completed         (LLM responds with the refund confirmation)
-seq=8  run.completed
+seq=1  tools.declared        {"local_tool_names": ["refund"]}
+seq=2  llm.completed         (LLM emits refund tool call)
+seq=3  approval.requested    {"tool_name": "refund", "call_id": "01M5Y7MRAR1SFRK68BK369YRXZ", "reason": "requires_approval", "params": {"order_id": 42}}
+seq=4  run.paused            {"status": "waiting_approval", "pause_id": "01M5Y7MRBF9R9HKDRVZCVDK0D9", "pending_tool_calls": [...]}
+seq=5  run.resumed           {"resumed_from": "waiting_approval"}
+seq=6  tools.declared        {"local_tool_names": ["refund"]}
+seq=7  tool.completed        {"tool_name": "refund", "target": "server", "success": true}
+seq=8  approval.decided      {"decision": "approved", "run_id": "01M5Y7MQ7STANG3S4GGAJ40T8Y", "decisions": [...]}
+seq=9  llm.completed         (LLM responds with the refund confirmation)
+seq=10 run.completed
 ```
 
 The `tool_calls` table now has one row for the refund: `tool_name=refund`, `success=1`.
@@ -78,6 +83,8 @@ The `tool_calls` table now has one row for the refund: `tool_name=refund`, `succ
 ## Rejecting
 
 Same pause, opposite decision:
+
+[//]: # "docs-test: skip - fragment: needs the paused run from the previous step"
 
 ```python
 result = await agent.submit_approval(
@@ -106,6 +113,8 @@ The third row is for contrast. `deny=` is a hard policy block (tool never reache
 
 When the model asks for several gated calls in one turn, decide each one:
 
+[//]: # "docs-test: skip - fragment: relies on `call_a`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import ApprovalDecision
 
@@ -115,6 +124,7 @@ result = await agent.submit_approval(
         call_a: ApprovalDecision.approve(),
         call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
     },
+    expected_pause_id=first.pause_id,      # required when any call is approved
 )
 ```
 
@@ -125,6 +135,8 @@ To approve something *later*, after the run has moved on, deny it with a reason 
 ## Wiring it up over HTTP
 
 Approval decisions usually arrive over HTTP from a UI. The route is a thin wrapper:
+
+[//]: # "docs-test: skip - fragment: relies on `router`, defined by setup shown elsewhere"
 
 ```python
 from fastapi import APIRouter, Depends, HTTPException
@@ -141,9 +153,12 @@ async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
             run_id,
             approved=body["approved"],
             rejection_reason=body.get("rejection_reason"),
+            expected_pause_id=body.get("pause_id"),    # send it down with the form
         )
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
+    except ValueError:    # a non-bool "approved", or approving without a pause_id
+        raise HTTPException(400, "invalid request")
     except (RunNotPausedError, PauseStatusMismatchError,
             RunAlreadyClaimedError, RunAlreadyTerminalError) as e:
         raise HTTPException(409, str(e))
@@ -152,12 +167,13 @@ async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
     return {"status": result.status.value, "answer": result.answer}
 ```
 
-See [HTTP API surface](/docs/reference/http-api) for the full set of write routes you would build alongside this one.
+See [HTTP integration](/docs/reference/http-api) for the full set of write routes you would build alongside this one.
 
 ## Notes
 
-- **Approval requires persistence.** No `database_url` (or `state_store`, or `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
+- **Approval requires persistence.** No `database_url` or `state_store` (or the deprecated `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
 - **The agent instance does not have to be the same one that started the run.** Any agent process with the same DB and same tool definitions can serve the approval. That is what makes pause/resume crash-resilient and worker-friendly.
+- **Send the `pause_id` back with the decision.** Hand `result.pause_id` to your client with the pending approval and pass it as `expected_pause_id=` when you submit. Approving without it raises `InputValidationError` (answer 400), and a stale decision fails with `PauseStatusMismatchError` (409) instead of approving a later pause. Rejecting does not need it. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 - **One decision per pause.** Decide the batch with `approved=`, or each gated call with `decisions=`; either way the whole pause resolves in one `submit_approval` call.
 - **Client tools never run server-side on approval.** If the batch also holds client-target calls, the run moves on to `waiting_client_tool` for them.
 - **Server tools only.** `require_approval` rejects client tools at construction. Approval is about human judgement before a server-side action; client-tool execution already involves the user.
@@ -165,4 +181,4 @@ See [HTTP API surface](/docs/reference/http-api) for the full set of write route
 ## Where this fits
 
 - Architecture: [Approval](/docs/architecture/approval), [Governance](/docs/architecture/governance), [Pause and resume](/docs/architecture/pause-resume).
-- Reference: [HTTP API surface](/docs/reference/http-api) for `submit_approval` and the matching errors.
+- Reference: [HTTP integration](/docs/reference/http-api) for `submit_approval` and the matching errors.

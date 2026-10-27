@@ -7,7 +7,7 @@ description: The pluggable strategy that drives an agent's turn cycle, with two 
 
 A **loop** is the piece of dendrux that decides how many LLM turns to do and when to stop. It is pluggable. You pass one to the `Agent` constructor, and from then on every `agent.run(...)` call hands control to that loop to drive the think, act, observe cycle. If you do not pass one, dendrux uses `ReActLoop`.
 
-Two loops ship in the box: `ReActLoop` (the default) and `SingleCall`. They target two different shapes of work. This page covers what each one is, when to pick it, and how `iteration_count` behaves under each. Every claim below is read from the `dendrux==0.2.0a1` source.
+Two loops ship in the box: `ReActLoop` (the default) and `SingleCall`. They target two different shapes of work. This page covers what each one is, when to pick it, and how `iteration_count` behaves under each. Every claim below is read from the Dendrux source.
 
 ## What a loop actually does
 
@@ -21,6 +21,8 @@ When you call `agent.run(input)`, the runner hands the request to the loop. The 
 The loop never touches provider-specific APIs or prompt formatting. That belongs to the strategy. The loop is pure orchestration: it owns the question "does the agent go around again?"
 
 ```python
+from abc import ABC
+
 class Loop(ABC):
     """Base class for agent execution loops.
 
@@ -35,6 +37,8 @@ Those two lines from `dendrux/loops/base.py` are the shipping contract.
 ## Plugging a loop in
 
 The `Agent` constructor takes a `loop=` keyword. Default is `None`, which the runner resolves to `ReActLoop`.
+
+[//]: # "docs-test: skip - fragment: relies on `refund`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent
@@ -80,6 +84,8 @@ The `Loop` instance you pass is held on the agent for the whole lifetime of the 
 
 These rules are enforced in the `Agent._validate()` path. The relevant failure messages, straight from `dendrux/agent.py`:
 
+[//]: # "docs-test: skip - fragment: relies on `self`, defined by setup shown elsewhere"
+
 ```python
 # Tools with SingleCall
 f"Agent '{self.name}' uses SingleCall loop but has {len(self.tools)} tools. "
@@ -106,7 +112,7 @@ The cycle inside one iteration, taken from `dendrux/loops/react.py`:
    - `ToolCall` → execute server tools, pause for client tools or approval, then go around.
 5. If `max_iterations` is hit without a `Finish`, return `status=max_iterations`.
 
-That last bullet is the safety cap. `Agent(max_iterations=...)` defaults to 10, with a hard ceiling validated in the constructor.
+That last bullet is the safety cap. `Agent(max_iterations=...)` defaults to 10 and must be at least 1.
 
 ### What `iteration_count` means here
 
@@ -134,6 +140,7 @@ async def main() -> None:
         prompt="You are a calculator. Use the add tool.",
         tools=[add],                         # ReActLoop is the default
         database_url="sqlite+aiosqlite:///calc.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is 15 + 27?")
         print(result.iteration_count)        # 2  (one turn to call add, one to answer)
@@ -143,12 +150,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The DB rows afterward:
+The DB rows afterward (captured on Dendrux 0.5.0 with claude-haiku-4-5; the model's wording varies):
 
 ```text
 ==== ReActLoop ====
   status: success
-  answer: "15 + 27 = **42**"
+  answer: "The answer is **42**."
   iteration_count: 2
   steps_len: 2
 
@@ -159,7 +166,9 @@ react_traces:
   order= 3  role=assistant  iter=2
 
 agent_runs.iteration_count = 2
-agent_runs.meta            = {"dendrux.loop": "ReActLoop", "dendrux.max_delegation_depth": 10}
+agent_runs.meta            = {"dendrux.loop": "ReActLoop", "dendrux.governance": {...},
+                              "dendrux.max_delegation_depth": 10, "dendrux.prefix": {...},
+                              "dendrux.stop_reason": "end_turn"}
 ```
 
 Two iterations. First turn: the LLM emitted the `add` tool call (assistant row at `iter=1`, then the tool result). Second turn: it read the tool result and produced the final answer (assistant row at `iter=2`). The loop name is persisted in `meta["dendrux.loop"]` so you can filter old runs by which loop produced them.
@@ -178,16 +187,18 @@ When the LLM emits a tool call that runs in the browser (target `client`), or on
 
 Before any tool runs, `ReActLoop` checks the call's arguments against the tool's JSON schema (`ToolDef.parameters`). This applies to every tool: local `@tool` functions, MCP tools (using the schema the server published), client tools (checked before the run pauses), and approval-gated tools (checked again when the run resumes after approval). The checks are:
 
-- **Unknown argument names.** Any name not in `properties` is rejected, unless the schema sets `additionalProperties` to something other than `false`.
+- **Unknown argument names.** Any name not in `properties` is rejected, unless the schema sets `additionalProperties` to something other than `false`. The message gives a count and the valid names, never the names the model sent.
 - **Missing required arguments.** Anything listed in `required`.
 - **Basic types and `enum`.** Top-level arguments are checked against `string`, `integer`, `number`, `boolean`, `array`, `object` and `null`, including type arrays like `["string", "null"]`. `integer` rejects booleans. Optional arguments may be `null`.
 
+For local `@tool` functions that use generated schemas, validation is followed by coercion to the annotated types, and `Field(...)` constraints are enforced (0.5.0). See [How arguments are checked](/docs/reference/tools#how-arguments-are-checked). MCP and client tools get only the JSON-schema check described here.
+
 The validator only rejects what it understands. A property that uses `anyOf`, `oneOf`, `allOf`, `$ref`, or an unknown type is not type-checked, and nested objects are not checked.
 
-If the arguments fail validation, the tool's code does not run. The model gets one failed tool result that lists every problem it found:
+Messages name the argument and the problem, never the value the model sent. If the arguments fail validation, the tool's code does not run. The model gets one failed tool result that lists every problem it found:
 
 ```json
-{"error": "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result.", "code": "invalid_params"}
+{"error": "show has 1 unknown argument. Valid arguments: kind, title, result.", "code": "invalid_params"}
 ```
 
 ```text
@@ -217,15 +228,18 @@ summarization, extraction, one-turn Q&A.
 """
 ```
 
-Three constraints are enforced at construction or at run time:
+Four constraints are enforced at construction or at run time:
 
 1. **Zero tools.** The `Agent` constructor raises `ValueError` if `tools` is non-empty and `loop=SingleCall()`. Same for `tool_sources` (MCP). Skills are the exception: instruction-only skills are allowed and are written into the system prompt (see [Skills](/docs/architecture/skills#singlecall)), while a skill that carries files is rejected.
-2. **No resume.** If the runner ever passes resume-shaped parameters (`initial_history`, `initial_steps`, `iteration_offset`, `initial_usage`), `SingleCall.run()` raises `RuntimeError`. SingleCall has no waiting states to resume from.
-3. **No tool calls from the provider.** If the provider unexpectedly returns `tool_calls`, `SingleCall` raises `RuntimeError` rather than silently swallow them.
+2. **No resume.** If the runner ever passes resume-shaped parameters (`initial_steps`, `iteration_offset`, `initial_usage`), `SingleCall.run()` raises `RuntimeError`. SingleCall has no waiting states to resume from.
+3. **`before_tool` and structured output with guardrails are refused.** `Agent(before_tool=...)` with `SingleCall` raises `ValueError` (there are no tool calls to gate), and so does `output_type` together with `guardrails` (the typed model would bypass redaction).
+4. **No tool calls from the provider.** If the provider unexpectedly returns `tool_calls`, `SingleCall` raises `RuntimeError` rather than silently swallow them.
 
 ### What `iteration_count` means here
 
 Always `1`. The loop writes exactly one LLM interaction, appends the assistant's response to history, and returns. From `dendrux/loops/single.py`:
+
+[//]: # "docs-test: skip - fragment: the body of a function defined elsewhere"
 
 ```python
 return RunResult(
@@ -256,6 +270,8 @@ async def main() -> None:
         provider=AnthropicProvider(model="claude-haiku-4-5"),
         prompt="Classify the sentiment. Reply with one word: positive, negative, or neutral.",
         loop=SingleCall(),                   # no tools, exactly one LLM call
+        database_url="sqlite+aiosqlite:///classifier.db",   # so the rows below are written
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("I love this product!")
         print(result.answer)                 # "positive"
@@ -265,7 +281,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The DB rows afterward:
+The DB rows afterward (captured on Dendrux 0.5.0 with claude-haiku-4-5):
 
 ```text
 ==== SingleCall ====
@@ -279,7 +295,9 @@ react_traces:
   order= 1  role=assistant  iter=1
 
 agent_runs.iteration_count = 1
-agent_runs.meta            = {"dendrux.loop": "SingleCall", "dendrux.max_delegation_depth": 10}
+agent_runs.meta            = {"dendrux.loop": "SingleCall", "dendrux.governance": {...},
+                              "dendrux.max_delegation_depth": 10, "dendrux.prefix": {...},
+                              "dendrux.stop_reason": "end_turn"}
 ```
 
 One user row, one assistant row, and we are done. No tool iterations, no pause states.

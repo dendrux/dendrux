@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
     from dendrux.skills._session import SkillSession
 
+from dendrux.errors import safe_exception_info as safe_exception_info
+
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)

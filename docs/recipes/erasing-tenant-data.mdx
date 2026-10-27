@@ -1,0 +1,131 @@
+---
+title: Erasing a tenant's data
+description: A manual recipe for deleting everything Dendrux stored for one tenant (runs, events, traces, tool payloads, images), until a built-in erasure API ships in 0.6.
+---
+
+# Erasing a tenant's data
+
+When a customer leaves or asks for deletion, you need to remove what Dendrux stored for that tenant. Dendrux 0.5 has no erasure API; one is the first priority for 0.6. This recipe does it by hand with a few statements. It assumes you stamp each run with `tenant_id=` (see [Multi-tenancy](/docs/architecture/multi-tenancy)); untenanted runs cannot be erased by tenant.
+
+> **Rehearse first.** Run the recipe on a copy of your database. Erasure is permanent, and Dendrux's tables are append-only on purpose, so this is a deliberate exception that you run yourself.
+
+## What Dendrux stored for the tenant
+
+| Where | Holds | Removed by |
+| --- | --- | --- |
+| `agent_runs` | the run row: input, answer, error, metadata, PII mapping, pause state | `DELETE ... WHERE tenant_id = :t` |
+| `react_traces`, `tool_calls`, `token_usage`, `llm_interactions`, `run_events`, `run_inbox` | messages, tool parameters and results, raw provider requests and responses, events, inbox notes | cascade from the run row |
+| `dendrux_blob_refs` | which run used which image | cascade from the run row |
+| `dendrux_blobs` (and your `BlobStore`, for example S3) | image bytes, keyed by tenant scope `t:` plus the tenant id | `agent.blobs.purge(...)`, then a row delete |
+
+Things Dendrux cannot reach: your own tables (`dendrux_run_id` links, chat messages), logs, traces exported through a notifier or OpenTelemetry, analytics, and database backups. Cover those in your own process.
+
+On Postgres the foreign keys are `ON DELETE CASCADE`, so deleting the run rows removes the child rows. SQLite does not enforce foreign keys by default, so delete the child tables yourself (shown below). Delegated child runs carry the parent's tenant, so they are removed with the rest. A retry or child pointing at a deleted run keeps its row with the link set to `NULL`.
+
+## Steps
+
+### 1. Stop new work and cancel what is running
+
+Block the tenant at your own edge first. Then cancel anything still active so no run writes while you delete:
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
+```python
+from dendrux.store import RunStore
+
+active = ["running", "pending", "paused", "waiting_client_tool",
+          "waiting_human_input", "waiting_approval"]
+page = await store.list_runs(tenant_id="acme", status=active, limit=1000)
+for run in page:
+    await agent.cancel_run(run.run_id, tenant_id="acme")
+```
+
+Wait until `list_runs(..., status=active)` returns nothing.
+
+### 2. Purge the tenant's images
+
+`purge` deletes the bytes (also from an external `BlobStore`). It needs each image hash:
+
+```sql
+SELECT sha256 FROM dendrux_blobs WHERE tenant_scope = 't:acme';
+```
+
+[//]: # "docs-test: skip - fragment: relies on `hashes`, defined by setup shown elsewhere"
+
+```python
+for sha in hashes:
+    await agent.blobs.purge(sha, tenant_id="acme", reason="tenant erasure 2026-11-02")
+```
+
+Skip this step if the tenant never sent images.
+
+### 3. Delete the runs
+
+On Postgres, inside one transaction:
+
+```sql
+BEGIN;
+DELETE FROM agent_runs WHERE tenant_id = 'acme';
+COMMIT;
+```
+
+For a very large tenant, delete in batches of a few thousand ids so the transaction and locks stay small:
+
+```sql
+DELETE FROM agent_runs WHERE id IN (
+    SELECT id FROM agent_runs WHERE tenant_id = 'acme' LIMIT 5000
+);
+```
+
+Repeat until it deletes 0 rows. The `(tenant_id, created_at)` index added in 0.5.0 keeps the lookup cheap.
+
+On SQLite, delete the child rows first:
+
+```sql
+DELETE FROM dendrux_blob_refs WHERE run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM run_inbox        WHERE run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM run_events       WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM llm_interactions WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM token_usage      WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM tool_calls       WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM react_traces     WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE tenant_id = 'acme');
+DELETE FROM agent_runs       WHERE tenant_id = 'acme';
+```
+
+### 4. Remove leftover image rows
+
+After the runs are gone nothing references the tenant's blob rows, so collect them:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
+```python
+await agent.blobs.collect_garbage(older_than=timedelta(hours=1), limit=1000)
+```
+
+Then check for anything left, and remove purged tombstones if your policy needs the hashes gone too:
+
+```sql
+SELECT count(*) FROM dendrux_blobs WHERE tenant_scope = 't:acme';
+DELETE FROM dendrux_blobs WHERE tenant_scope = 't:acme' AND state = 'purged';
+```
+
+A purged tombstone keeps only the hash, size and the reason you gave. Deleting it means the same image could be uploaded again later, so keep tombstones if you need to block that.
+
+### 5. Verify
+
+```sql
+SELECT count(*) FROM agent_runs WHERE tenant_id = 'acme';        -- 0
+SELECT count(*) FROM dendrux_blobs WHERE tenant_scope = 't:acme'; -- 0
+```
+
+Then clear your own copies: app tables that store `dendrux_run_id`, log pipelines, exported traces, and backups on their normal retention schedule.
+
+## What to record
+
+Keep an erasure log in your own system: tenant id, date, who ran it, the row counts from step 5. Do not keep the deleted content.
+
+## Where this fits
+
+- [Multi-tenancy](/docs/architecture/multi-tenancy): how runs are scoped.
+- [Images](/docs/recipes/images#storage): purge and garbage collection in detail.
+- [State persistence](/docs/architecture/state-persistence): the tables.

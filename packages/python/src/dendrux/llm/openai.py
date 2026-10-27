@@ -13,44 +13,54 @@ No business logic, no agent loop awareness. Just shape translation.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import logging
 import os
 from typing import TYPE_CHECKING, Any, Literal
 
-import httpx
 import openai
 
-from dendrux.errors import ContextLengthExceededError
+from dendrux.errors import ProviderError
 from dendrux.llm._helpers import (
-    GatewayErrorKind,
     build_call_index,
     build_tool_call,
-    classify_gateway_error,
-    connection_error,
     resolve_tool_message_call,
-    timeout_error,
 )
 from dendrux.llm._images import (
     WireImageRegistry,
     chat_image,
     chat_text,
-    close_stream_quietly,
     convert_parts,
     normalize_base_url,
     openai_image_support,
     portable_framing,
     portable_tool_text,
     sdk_image_request_error,
-    transport_image_error,
 )
-from dendrux.llm._retry_telemetry import (
-    begin_call_attempt_tracking,
-    call_attempt_tracking,
-    end_call_attempt_tracking,
-    make_telemetry_http_client,
+from dendrux.llm._resilience import (
+    DEFAULT_CALL_TIMEOUT,
+    DEFAULT_STREAM_IDLE_TIMEOUT,
+    TIMEOUT_UNSET,
+    LoopClients,
+    StreamClock,
+    WireRequest,
+    call_with_timeout,
+    close_quietly,
+    content_filter_error,
+    logs_provider_errors,
+    logs_provider_stream_errors,
+    make_http_client,
+    map_sdk_error,
+    refusal_error,
+    resolve_deadlines,
+    retry_unstarted_stream,
+    stream_incomplete,
 )
+from dendrux.llm._retry_telemetry import call_attempt_tracking
 from dendrux.llm._stop_reason import chat_stop_reason
+from dendrux.llm._usage import openai_wire_usage
 from dendrux.llm.base import LLMProvider
 from dendrux.types import (
     LLMResponse,
@@ -64,6 +74,8 @@ from dendrux.types import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+
+    import httpx
 
     from dendrux.llm.base import ImageSupport
     from dendrux.types import ImagePart, Message, ToolDef
@@ -79,15 +91,6 @@ _EFFORT_ALIASES = {"extra": "xhigh"}
 def _normalize_effort(effort: str) -> str:
     """Map a Dendrux effort alias to OpenAI's vocabulary."""
     return _EFFORT_ALIASES.get(effort, effort)
-
-
-def _reasoning_tokens_from(details: Any) -> int | None:
-    """Read reasoning_tokens from completion_tokens_details (dict or object)."""
-    if isinstance(details, dict):
-        return details.get("reasoning_tokens")
-    if details is not None:
-        return getattr(details, "reasoning_tokens", None)
-    return None
 
 
 def _extra_attr(obj: Any, field: str) -> Any:
@@ -131,26 +134,18 @@ def _reasoning_details_from(obj: Any) -> list[Any] | None:
 def _build_usage_with_cache(usage: Any) -> UsageStats:
     """Build UsageStats from an OpenAI Chat Completions usage object.
 
-    Reads cached_tokens from usage.prompt_tokens_details when present
-    (compatible backends may omit it). Normalizes input_tokens to mean
-    fresh-only by subtracting cached from prompt_tokens, so cross-provider
-    semantics match Anthropic's native behavior. Clamps to zero so a
-    misbehaving vendor that reports cached > prompt does not propagate
-    negative counts into the rollup or budget guardrails.
+    Reads ``prompt_tokens_details.cached_tokens`` (cache reads) and
+    ``prompt_tokens_details.cache_write_tokens`` (cache writes) when present
+    (compatible backends may omit them; an omitted field stays ``None``).
+    ``input_tokens`` is fresh-only: ``prompt_tokens`` minus reads and
+    writes, clamped at zero, matching Anthropic's native semantics.
     """
-    prompt_tokens = usage.prompt_tokens or 0
-    completion_tokens = usage.completion_tokens or 0
-    details = getattr(usage, "prompt_tokens_details", None)
-    cache_read: int | None = getattr(details, "cached_tokens", None) if details else None
-    reasoning_tokens = _reasoning_tokens_from(getattr(usage, "completion_tokens_details", None))
-    fresh_input = max(0, prompt_tokens - (cache_read or 0))
-    return UsageStats(
-        input_tokens=fresh_input,
-        output_tokens=completion_tokens,
-        total_tokens=fresh_input + completion_tokens,
-        cache_read_input_tokens=cache_read,
-        cache_creation_input_tokens=None,
-        reasoning_tokens=reasoning_tokens,
+    return openai_wire_usage(
+        usage,
+        input_field="prompt_tokens",
+        output_field="completion_tokens",
+        details_field="prompt_tokens_details",
+        output_details_field="completion_tokens_details",
     )
 
 
@@ -170,6 +165,34 @@ _SUPPORTED_KWARGS = frozenset(
         "reasoning_effort",
     }
 )
+
+
+def _track_sse_done(stream: Any) -> list[bool] | None:
+    """Watch an SDK chat stream for the ``data: [DONE]`` sentinel.
+
+    The SDK stops at ``[DONE]`` without saying so, so a clean ``[DONE]`` end
+    and a connection a proxy closed early look the same. This wraps the
+    stream's SSE event iterator (before the first pull) to record the
+    sentinel. Returns the flag holder, or None when the stream cannot be
+    observed (then ``finish_reason`` or a usage chunk counts as the end).
+    """
+    original = getattr(stream, "_iter_events", None)
+    if not callable(original):
+        return None
+    seen = [False]
+
+    async def tracked() -> AsyncGenerator[Any, None]:
+        async for sse in original():
+            data = getattr(sse, "data", None)
+            if isinstance(data, str) and data.startswith("[DONE]"):
+                seen[0] = True
+            yield sse
+
+    try:
+        stream._iter_events = tracked
+    except (AttributeError, TypeError):
+        return None
+    return seen
 
 
 class _ToolCallBuffer:
@@ -234,6 +257,8 @@ class OpenAIProvider(LLMProvider):
     # located from the vendor error's request path.
     _image_provider_name = "openai"
     _locate_rejected_images = True
+    # Frames between the user's call and the ``timeout=`` deprecation warning.
+    _deprecation_stacklevel = 3
 
     def __init__(
         self,
@@ -245,12 +270,17 @@ class OpenAIProvider(LLMProvider):
         temperature: float | None = None,
         reasoning_effort: str | None = None,
         effort: str | None = None,
-        timeout: float = 120.0,
+        timeout: Any = TIMEOUT_UNSET,
         max_retries: int = 3,
         prompt_cache_retention: Literal["in-memory", "24h"] | None = None,
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         cache_key_prefix: str | None = None,
+        call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
+        stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
+        stream_total_timeout: float | None = None,
+        max_stream_bytes: int = 16 * 1024 * 1024,
+        max_stream_tool_calls: int = 1000,
     ) -> None:
         """Create an OpenAI Chat Completions provider.
 
@@ -266,8 +296,11 @@ class OpenAIProvider(LLMProvider):
                 non-reasoning models (gpt-4o) and compatible backends are unaffected.
                 OpenAI Chat returns no reasoning text — only ``reasoning_tokens``; use
                 OpenAIResponsesProvider to surface reasoning summaries.
-            timeout: HTTP request timeout in seconds.
-            max_retries: Number of automatic retries on transient errors.
+            timeout: Deprecated shorthand: sets both ``call_timeout`` and
+                ``stream_idle_timeout`` (with a ``DeprecationWarning``).
+            max_retries: Number of automatic SDK retries on transient errors
+                (connection resets, 408/409/429/5xx). They all count against
+                ``call_timeout``.
             prompt_cache_retention: OpenAI prompt-cache retention. ``None``
                 (default) omits the field so OpenAI uses its in-memory default
                 (5–10 min idle, up to 1 h). Set ``"24h"`` for long-running
@@ -287,6 +320,22 @@ class OpenAIProvider(LLMProvider):
                 agent loop derives (``"{agent}:{model}"``). ``None`` (default)
                 leaves routing to the per-call prefix, and sends no key when
                 there is none.
+            call_timeout: Wall-clock limit in seconds for one non-streaming
+                call, SDK retries included. When it fires the call is
+                abandoned and never retried (``ProviderTimeoutError``).
+                ``None`` turns it off, but the socket read timeout still
+                applies (the largest deadline + 30 s, or 600 s) and the SDK
+                retries a read timeout, so a slow
+                generation can be re-run (and paid for) up to
+                ``max_retries + 1`` times. For long generations stream, or
+                set a large ``call_timeout`` instead.
+            stream_idle_timeout: Maximum gap in seconds between meaningful
+                stream chunks, and before the first one. ``None`` turns it off.
+            max_stream_bytes: Cumulative UTF-8 and structural stream budget.
+                Default 16 MiB. Exceeding it closes the upstream response.
+            max_stream_tool_calls: Maximum retained tool-call slots (default 1,000).
+            stream_total_timeout: Wall-clock limit in seconds for a whole
+                stream. ``None`` (default) means no limit.
         """
         if api_key is None and not os.getenv("OPENAI_API_KEY"):
             raise ValueError(
@@ -295,19 +344,36 @@ class OpenAIProvider(LLMProvider):
                 "For local OpenAI-compatible servers (vLLM, Ollama, LM Studio), "
                 "pass any non-empty placeholder, e.g. api_key='not-needed'."
             )
+        self._deadlines = resolve_deadlines(
+            type(self).__name__,
+            timeout=timeout,
+            call_timeout=call_timeout,
+            stream_idle_timeout=stream_idle_timeout,
+            stream_total_timeout=stream_total_timeout,
+            max_stream_bytes=max_stream_bytes,
+            max_stream_tool_calls=max_stream_tool_calls,
+            stacklevel=self._deprecation_stacklevel,
+        )
+        deadlines = self._deadlines
+
+        def new_http() -> httpx.AsyncClient:
+            return make_http_client(openai, deadlines)
+
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            http_client=make_telemetry_http_client(httpx.Timeout(timeout, connect=10.0)),
+            http_client=new_http(),
             max_retries=max_retries,
             default_headers=default_headers,
+        )
+        self._clients: LoopClients[openai.AsyncOpenAI] = LoopClients(
+            new_http, lambda client, http: client.copy(http_client=http)
         )
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
         self._effort = effort
-        self._timeout = timeout
         self._prompt_cache_retention = prompt_cache_retention
         self._extra_body = extra_body
         self._cache_key_prefix = cache_key_prefix
@@ -325,7 +391,15 @@ class OpenAIProvider(LLMProvider):
 
     async def close(self) -> None:
         """Close the underlying HTTP client and release connections."""
-        await self._client.close()
+        # Close only what belongs to the running loop: after a loop change the
+        # home transport is first rebuilt, never awaited across loops.
+        current = self._clients.resolve(self._client)
+        self._clients.pop_current_loop_extra()
+        await current.close()
+
+    def _sdk(self) -> openai.AsyncOpenAI:
+        """The SDK client for the running event loop (rebuilt after a loop change)."""
+        return self._clients.resolve(self._client)
 
     # ------------------------------------------------------------------
     # Image input (0.4.0)
@@ -354,12 +428,23 @@ class OpenAIProvider(LLMProvider):
             locate=self._locate_rejected_images,
         )
 
-    def _transport_image_error(
-        self, kind: Literal["timeout", "connection"], model: str
-    ) -> Exception:
-        hint = str(timeout_error(type(self).__name__, self._timeout)) if kind == "timeout" else None
-        return transport_image_error(
-            kind, provider_name=self._image_provider_name, model=model, hint=hint
+    def _map_failure(
+        self, exc: BaseException, registry: WireImageRegistry, model: str, *, streaming: bool
+    ) -> Exception | None:
+        """Typed error for a failed call, or None to re-raise ``exc`` unchanged."""
+        if (
+            registry.has_images
+            and isinstance(exc, openai.APIError)
+            and not isinstance(exc, openai.APIConnectionError)
+        ):
+            return self._image_error(exc, registry, model, streaming=streaming)
+        return map_sdk_error(
+            exc,
+            sdk=openai,
+            provider=self._image_provider_name,
+            model=model,
+            streaming=streaming,
+            endpoint=str(self._client.base_url),
         )
 
     async def __aenter__(self) -> OpenAIProvider:
@@ -493,6 +578,7 @@ class OpenAIProvider(LLMProvider):
         api_kwargs["response_format"] = response_format
         captured_request["response_format"] = response_format
 
+    @logs_provider_errors
     async def complete(
         self,
         messages: list[Message],
@@ -515,6 +601,12 @@ class OpenAIProvider(LLMProvider):
 
         When output_schema is provided, sets response_format to json_schema
         with strict mode. The response is a JSON string in message.content.
+
+        The whole call, SDK retries included, is bounded by ``call_timeout``.
+        Failures raise typed :class:`~dendrux.errors.ProviderError`
+        subclasses (SDK exception on ``__cause__``); a refusal raises
+        :class:`~dendrux.errors.ModelRefusalError` and a content filter
+        :class:`~dendrux.errors.ContentFilteredError`.
         """
         registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
@@ -528,48 +620,52 @@ class OpenAIProvider(LLMProvider):
 
         if output_schema is not None:
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
+        request = WireRequest(api_kwargs, captured_request, registry)
+        model = request.model
+        del api_kwargs, captured_request
+        client = self._sdk()
 
         # Image-bearing requests never chain SDK errors (they carry the request
         # body): the typed error is built in the handler, raised after it.
         failure: Exception | None = None
         try:
-            with call_attempt_tracking():
-                response = await self._client.chat.completions.create(**api_kwargs)
-        except openai.APIStatusError as exc:
-            if registry.has_images:
-                failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
-            else:
-                translated = self._translate_error(exc, streaming=False, model=api_kwargs["model"])
-                if translated is not None:
-                    raise translated from exc
+            response = await call_with_timeout(
+                functools.partial(self._create, client, request),
+                deadlines=self._deadlines,
+                provider=self._image_provider_name,
+                model=model,
+            )
+        except ProviderError:
+            raise
+        except Exception as exc:
+            mapped = self._map_failure(exc, registry, model, streaming=False)
+            if mapped is None:
                 raise
-        except openai.APITimeoutError:
             if not registry.has_images:
-                raise timeout_error("OpenAIProvider", self._timeout) from None
-            failure = self._transport_image_error("timeout", api_kwargs["model"])
-        except openai.APIConnectionError as exc:
-            if not registry.has_images:
-                raise connection_error("OpenAI API", self._model, exc) from exc
-            failure = self._transport_image_error("connection", api_kwargs["model"])
-        except openai.APIError as exc:
-            if not registry.has_images:
-                raise
-            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=False)
+                raise mapped from exc
+            failure = mapped
         if failure is not None:
             # Frame locals reach tracebacks (and error trackers): drop the
-            # request kwargs and registry, which hold the base64 payloads.
-            del api_kwargs, registry
+            # request and registry, which hold the base64 payloads.
+            del request, registry
             raise failure
 
-        llm_response = self._normalize_response(response)
+        llm_response = self._normalize_response(response, model=model)
 
         # Attach adapter-boundary payloads for evidence layer
-        llm_response.provider_request = captured_request
-        llm_response.model = captured_request["model"]
+        llm_response.provider_request = request.captured_request
+        llm_response.model = model
         llm_response.provider_response = response.model_dump()
 
         return llm_response
 
+    @staticmethod
+    async def _create(client: openai.AsyncOpenAI, request: WireRequest) -> Any:
+        """One ``chat.completions.create`` (SDK retries included)."""
+        with call_attempt_tracking():
+            return await client.chat.completions.create(**request.api_kwargs)
+
+    @logs_provider_stream_errors
     async def complete_stream(
         self,
         messages: list[Message],
@@ -596,7 +692,11 @@ class OpenAIProvider(LLMProvider):
         Raises NotImplementedError if the endpoint says streaming is not
         supported (common with some OpenAI-compatible backends), and
         ContextLengthExceededError if the request overflows the context window.
-        Other request errors propagate unchanged.
+        Other failures raise typed :class:`~dendrux.errors.ProviderError`
+        subclasses. A stream that ends without ``[DONE]``, a ``finish_reason``
+        or a usage chunk raises :class:`~dendrux.errors.ProviderStreamIncompleteError`
+        (retried once when nothing has been yielded yet). Closing the
+        generator closes the upstream response.
         """
         registry = WireImageRegistry()
         api_kwargs, captured_request = self._build_api_kwargs(
@@ -612,146 +712,191 @@ class OpenAIProvider(LLMProvider):
             self._inject_structured_output(api_kwargs, captured_request, output_schema)
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
+        request = WireRequest(api_kwargs, captured_request, registry)
+        model = request.model
+        del api_kwargs, captured_request, registry
+        client = self._sdk()
+        clock = StreamClock(self._deadlines, provider=self._image_provider_name, model=model)
+        # Closing this generator (aclose, cancel) closes the upstream response.
+        async with contextlib.aclosing(
+            retry_unstarted_stream(
+                functools.partial(self._stream_attempt, client, clock, request),
+                provider=self._image_provider_name,
+                model=model,
+                run_id=run_id,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
-        failure: Exception | None = None
-        attempt_token = begin_call_attempt_tracking()
-        try:
-            stream = await self._client.chat.completions.create(**api_kwargs)
-        except openai.APIStatusError as exc:
-            if registry.has_images:
-                failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
-            else:
-                translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
-                if translated is not None:
-                    raise translated from exc
-                raise
-        except openai.APITimeoutError:
-            if not registry.has_images:
-                raise timeout_error("OpenAIProvider", self._timeout) from None
-            failure = self._transport_image_error("timeout", api_kwargs["model"])
-        except openai.APIConnectionError as exc:
-            if not registry.has_images:
-                raise connection_error("OpenAI API", self._model, exc, streaming=True) from exc
-            failure = self._transport_image_error("connection", api_kwargs["model"])
-        except openai.APIError as exc:
-            if not registry.has_images:
-                raise
-            failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
-        finally:
-            # Counter only spans the request-establishing call. Once the
-            # stream is open the SDK no longer retries, so iteration below
-            # does not need the counter.
-            end_call_attempt_tracking(attempt_token)
-        if failure is not None:
-            # Frame locals reach tracebacks (and error trackers): drop the
-            # request kwargs and registry, which hold the base64 payloads.
-            del api_kwargs, registry
-            raise failure
-
+    async def _stream_attempt(
+        self,
+        client: openai.AsyncOpenAI,
+        clock: StreamClock,
+        request: WireRequest,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """One streaming request: open, relay chunks, require the terminal chunk."""
+        model = request.model
         # Accumulators for building the final LLMResponse
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         reasoning_parts: list[str] = []
         reasoning_block_acc: list[Any] = []
+        refusal_parts: list[str] = []
         usage = UsageStats(usage_reported=False)
         finish_reason: str | None = None
+        saw_usage = False
 
         # Tool call buffers keyed by chunk index — no ordering assumptions.
         # Name, id, and arguments may arrive in any order for a given index
         # (some OpenAI-compatible backends don't guarantee name-first).
         _tool_buffers: dict[int, _ToolCallBuffer] = {}
 
-        chunk_iter = stream.__aiter__()
-        while True:
+        failure: Exception | None = None
+        stream: Any = None
+        done_seen: list[bool] | None = None
+        try:
             try:
-                chunk = await chunk_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            except openai.APIError as exc:
-                if registry.has_images:
-                    # In-stream error: may follow deltas already yielded.
-                    failure = self._image_error(exc, registry, api_kwargs["model"], streaming=True)
-                    break
-                translated = self._translate_error(exc, streaming=True, model=api_kwargs["model"])
-                if translated is not None:
-                    raise translated from exc
-                raise
+                stream = await clock.open(functools.partial(self._create, client, request))
+                done_seen = _track_sse_done(stream)
+                chunk_iter = stream.__aiter__()
+                while True:
+                    try:
+                        chunk = await clock.step(chunk_iter.__anext__())
+                    except StopAsyncIteration:
+                        break
+                    semantic = False
 
-            # Usage arrives in the final chunk
-            if chunk.usage:
-                usage = self._normalize_usage(chunk.usage)
+                    # Usage arrives in the final chunk (``include_usage``: no
+                    # choices). Some backends repeat usage on every content
+                    # chunk; only the choice-less shape marks the end.
+                    if chunk.usage:
+                        usage = self._normalize_usage(chunk.usage)
+                        saw_usage = saw_usage or not chunk.choices
+                        semantic = True
 
-            if not chunk.choices:
-                continue
+                    if not chunk.choices:
+                        clock.account()
+                        if semantic:
+                            clock.mark_semantic()
+                        continue
 
-            choice = chunk.choices[0]
-            delta = choice.delta
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    reasoning_delta = _reasoning_text_from(delta)
+                    reasoning_detail_delta = _reasoning_details_from(delta)
+                    refusal_delta = getattr(delta, "refusal", None)
+                    clock.account(
+                        [delta.content, reasoning_delta, reasoning_detail_delta, refusal_delta]
+                    )
 
-            # --- Reasoning deltas (OpenRouter/compatible; inert on pure OpenAI) ---
-            # Reasoning streams before content, so emit it first.
-            reasoning_delta = _reasoning_text_from(delta)
-            if reasoning_delta:
-                reasoning_parts.append(reasoning_delta)
-                yield StreamEvent(type=StreamEventType.REASONING_DELTA, text=reasoning_delta)
-            reasoning_detail_delta = _reasoning_details_from(delta)
-            if reasoning_detail_delta:
-                reasoning_block_acc.extend(reasoning_detail_delta)
-
-            # --- Text deltas ---
-            if delta.content:
-                text_parts.append(delta.content)
-                yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=delta.content)
-
-            # --- Tool call deltas ---
-            if delta.tool_calls:
-                for delta_tc in delta.tool_calls:
-                    idx = delta_tc.index
-
-                    # Ensure buffer exists for this index
-                    if idx not in _tool_buffers:
-                        _tool_buffers[idx] = _ToolCallBuffer()
-
-                    buf = _tool_buffers[idx]
-
-                    # Capture id (first occurrence)
-                    if delta_tc.id and buf.tool_call_id is None:
-                        buf.tool_call_id = delta_tc.id
-
-                    if delta_tc.function:
-                        # Capture name (first occurrence)
-                        if delta_tc.function.name and buf.name is None:
-                            buf.name = delta_tc.function.name
-
-                        # Accumulate argument fragments
-                        if delta_tc.function.arguments:
-                            buf.json_parts.append(delta_tc.function.arguments)
-
-                    # Emit TOOL_USE_START once we know the name (deferred
-                    # if args arrived before name for this index).
-                    if buf.name and not buf.start_emitted:
-                        buf.start_emitted = True
+                    # --- Reasoning deltas (OpenRouter/compatible; inert on pure OpenAI) ---
+                    # Reasoning streams before content, so emit it first.
+                    if reasoning_delta:
+                        semantic = True
+                        reasoning_parts.append(reasoning_delta)
                         yield StreamEvent(
-                            type=StreamEventType.TOOL_USE_START,
-                            tool_name=buf.name,
-                            tool_call_id=buf.tool_call_id,
+                            type=StreamEventType.REASONING_DELTA, text=reasoning_delta
                         )
+                    if reasoning_detail_delta:
+                        semantic = True
+                        reasoning_block_acc.extend(reasoning_detail_delta)
 
-            # --- Flush all buffered tool calls on terminal finish_reason ---
-            if choice.finish_reason is not None:
-                finish_reason = choice.finish_reason
-                for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
-                    yield flush_event
+                    if isinstance(refusal_delta, str) and refusal_delta:
+                        semantic = True
+                        refusal_parts.append(refusal_delta)
 
+                    # --- Text deltas ---
+                    if delta.content:
+                        semantic = True
+                        text_parts.append(delta.content)
+                        yield StreamEvent(type=StreamEventType.TEXT_DELTA, text=delta.content)
+
+                    # --- Tool call deltas ---
+                    if delta.tool_calls:
+                        semantic = True
+                        for delta_tc in delta.tool_calls:
+                            idx = delta_tc.index
+
+                            # Ensure buffer exists for this index
+                            if idx not in _tool_buffers:
+                                clock.tool_slot((len(tool_calls), idx))
+                                _tool_buffers[idx] = _ToolCallBuffer()
+
+                            buf = _tool_buffers[idx]
+                            clock.account(
+                                [
+                                    delta_tc.id if buf.tool_call_id is None else None,
+                                    delta_tc.function.name
+                                    if delta_tc.function and buf.name is None
+                                    else None,
+                                    delta_tc.function.arguments if delta_tc.function else None,
+                                ]
+                            )
+
+                            # Capture id (first occurrence)
+                            if delta_tc.id and buf.tool_call_id is None:
+                                buf.tool_call_id = delta_tc.id
+
+                            if delta_tc.function:
+                                # Capture name (first occurrence)
+                                if delta_tc.function.name and buf.name is None:
+                                    buf.name = delta_tc.function.name
+
+                                # Accumulate argument fragments
+                                if delta_tc.function.arguments:
+                                    buf.json_parts.append(delta_tc.function.arguments)
+
+                            # Emit TOOL_USE_START once we know the name (deferred
+                            # if args arrived before name for this index).
+                            if buf.name and not buf.start_emitted:
+                                buf.start_emitted = True
+                                yield StreamEvent(
+                                    type=StreamEventType.TOOL_USE_START,
+                                    tool_name=buf.name,
+                                    tool_call_id=buf.tool_call_id,
+                                )
+
+                    # --- Flush all buffered tool calls on terminal finish_reason ---
+                    if choice.finish_reason is not None:
+                        semantic = True
+                        finish_reason = choice.finish_reason
+                        clock.check_tool_count(len(tool_calls) + len(_tool_buffers))
+                        for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
+                            yield flush_event
+
+                    if semantic:
+                        clock.mark_semantic()
+            finally:
+                if stream is not None:
+                    await close_quietly(stream)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            mapped = self._map_failure(exc, request.registry, model, streaming=True)
+            if mapped is None:
+                raise
+            if not request.registry.has_images:
+                raise mapped from exc
+            failure = mapped
         if failure is not None:
-            await close_stream_quietly(stream)
-            # Frame locals reach tracebacks (and error trackers): drop the
-            # request kwargs and registry, which hold the base64 payloads.
-            del api_kwargs, registry, stream, chunk_iter
+            # Frame locals reach tracebacks (and error trackers): the request
+            # (with its base64 payloads) is never bound here.
+            del stream
             raise failure
 
-        # Some compatible backends end the stream without ever sending a
-        # finish_reason; flush whatever is still buffered so calls are not lost.
-        # No-op when the finish_reason chunk already drained the buffers.
+        if finish_reason is None and not saw_usage and not (done_seen and done_seen[0]):
+            raise stream_incomplete(self._image_provider_name, model)
+        if refusal_parts:
+            raise refusal_error(
+                self._image_provider_name, model, refusal_text="".join(refusal_parts)
+            )
+        if finish_reason == "content_filter":
+            raise content_filter_error(self._image_provider_name, model)
+
+        # Some compatible backends end the stream ([DONE]) without ever sending
+        # a finish_reason; flush whatever is still buffered so calls are not
+        # lost. No-op when the finish_reason chunk drained the buffers.
         for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
             yield flush_event
 
@@ -767,8 +912,8 @@ class OpenAIProvider(LLMProvider):
             stop_reason=stop_reason,
             raw_stop_reason=raw_stop_reason,
         )
-        llm_response.provider_request = captured_request
-        llm_response.model = captured_request["model"]
+        llm_response.provider_request = request.captured_request
+        llm_response.model = model
         llm_response.provider_response = {
             "object": "chat.completion.chunked",
             "finish_reason": finish_reason,
@@ -833,39 +978,6 @@ class OpenAIProvider(LLMProvider):
             )
         buffers.clear()
         return events
-
-    def _translate_error(
-        self, exc: openai.APIError, *, streaming: bool, model: str
-    ) -> ContextLengthExceededError | NotImplementedError | None:
-        """Translate an SDK error via the shared classifier, or None to re-raise it as-is.
-
-        Used around the batch call, stream creation and stream iteration.
-        Streaming-unsupported is only meaningful for a streaming call.
-        """
-        classified = classify_gateway_error(
-            status_code=getattr(exc, "status_code", None),
-            code=exc.code if isinstance(exc.code, str) else None,
-            param=exc.param if isinstance(exc.param, str) else None,
-            message=exc.message,
-            body=exc.body,
-        )
-        if classified.kind is GatewayErrorKind.CONTEXT_LENGTH:
-            where = f" for model '{model}'"
-            status = f" (HTTP {classified.status_code})" if classified.status_code else ""
-            return ContextLengthExceededError(
-                f"Request exceeds the model's context window{where}{status}. "
-                "Reduce the conversation history, tool results or max_tokens.",
-                status_code=classified.status_code,
-                provider_code=classified.provider_code,
-                model=model,
-            )
-        if streaming and classified.kind is GatewayErrorKind.STREAMING_UNSUPPORTED:
-            return NotImplementedError(
-                f"Streaming request rejected by endpoint at {self._client.base_url}. "
-                f"If this endpoint does not support streaming, use agent.run() instead. "
-                f"(Provider detail is on __cause__.)"
-            )
-        return None
 
     # ------------------------------------------------------------------
     # Outbound conversions: Dendrux → OpenAI
@@ -1021,14 +1133,28 @@ class OpenAIProvider(LLMProvider):
         """
         return _build_usage_with_cache(usage)
 
-    def _normalize_response(self, response: Any) -> LLMResponse:
-        """Convert OpenAI ChatCompletion to Dendrux LLMResponse."""
+    def _normalize_response(self, response: Any, *, model: str | None = None) -> LLMResponse:
+        """Convert OpenAI ChatCompletion to Dendrux LLMResponse.
+
+        A ``message.refusal`` raises :class:`~dendrux.errors.ModelRefusalError`;
+        ``finish_reason="content_filter"`` raises
+        :class:`~dendrux.errors.ContentFilteredError`.
+        """
+        model = model or self._model
         if not response.choices:
-            raise RuntimeError(
-                f"OpenAI returned a ChatCompletion with no choices. Model: {self._model}"
+            raise ProviderError(
+                provider=self._image_provider_name,
+                model=model,
+                category="unknown",
+                message="The provider returned a completion with no choices.",
             )
         choice = response.choices[0]
         message = choice.message
+        refusal = getattr(message, "refusal", None)
+        if isinstance(refusal, str) and refusal:
+            raise refusal_error(self._image_provider_name, model, refusal_text=refusal)
+        if getattr(choice, "finish_reason", None) == "content_filter":
+            raise content_filter_error(self._image_provider_name, model)
 
         # Extract text
         text = message.content

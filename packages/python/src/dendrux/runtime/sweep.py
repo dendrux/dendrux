@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from dendrux.runtime.state import SweepResult
+from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
 if TYPE_CHECKING:
     from datetime import timedelta
@@ -38,6 +38,9 @@ async def sweep(
     state_store: StateStore | None = None,
     stale_running: timedelta | None = None,
     abandoned_waiting: timedelta | None = None,
+    batch_size: int = 100,
+    max_runs: int = 10000,
+    database_options: dict[str, Any] | None = None,
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
 
@@ -58,8 +61,20 @@ async def sweep(
             is still executing may collide with the sweep's event.
         abandoned_waiting: Threshold for abandoned WAITING detection.
             WAITING_CLIENT_TOOL, WAITING_HUMAN_INPUT, WAITING_APPROVAL and
-            PAUSED runs with no state change beyond this duration are
-            swept. If None, no abandoned-waiting sweep is performed.
+            PAUSED runs are swept only when both status_changed_at and updated_at
+            are older than this duration. The updated_at check protects pauses
+            written by older workers; recent metadata edits delay abandonment.
+            If None, no abandoned-waiting sweep is performed.
+
+        batch_size: Candidate rows per projected page (default 100, maximum 1000).
+        max_runs: Candidates inspected per category (default 10,000, maximum
+            100,000), using the same integer bound for running and waiting.
+            All waiting statuses share the waiting category's cap. Fresh running
+            rows and losing CAS attempts count toward it. A structured
+            ``sweep_cap_reached`` warning signals saturation. Increase the cap
+            to reach later running IDs; repeat to drain waiting work. Running
+            population is bounded operationally by live concurrency plus orphan
+            backlog. No continuation cursor is returned.
 
     Returns:
         SweepResult with lists of swept runs by category.
@@ -67,29 +82,41 @@ async def sweep(
     Raises:
         ValueError: If both or neither of database_url/state_store provided.
     """
-    if database_url is not None and state_store is not None:
-        raise ValueError(
-            "database_url and state_store are mutually exclusive. Pass one or the other."
-        )
-    if database_url is None and state_store is None:
-        raise ValueError("Either database_url or state_store is required.")
+    _validate_source(database_url, state_store, database_options)
+    _validate_thresholds(stale_running, abandoned_waiting)
     if stale_running is None and abandoned_waiting is None:
         return SweepResult(stale_running=[])
 
+    for name, value, ceiling in (("batch_size", batch_size, 1000), ("max_runs", max_runs, 100000)):
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
+            raise ValueError(f"{name} must be between 1 and {ceiling}")
     store: StateStore
     engine = None
 
     if database_url is not None:
-        store, engine = await _create_temp_store(database_url)
+        store, engine = await _create_temp_store(
+            database_url,
+            **({"database_options": database_options} if database_options is not None else {}),
+        )
     else:
         assert state_store is not None
         store = state_store
 
     try:
-        stale = await store.sweep_stale_runs(older_than=stale_running) if stale_running else []
+        # Preserve legacy custom-store signatures at the default settings.
+        limits = {}
+        if batch_size != 100:
+            limits["batch_size"] = batch_size
+        if max_runs != 10000:
+            limits["max_runs"] = max_runs
+        stale = (
+            await store.sweep_stale_runs(older_than=stale_running, **limits)
+            if stale_running is not None
+            else []
+        )
         abandoned = (
-            await store.sweep_abandoned_runs(older_than=abandoned_waiting)
-            if abandoned_waiting
+            await store.sweep_abandoned_runs(older_than=abandoned_waiting, **limits)
+            if abandoned_waiting is not None
             else []
         )
         return SweepResult(stale_running=stale, abandoned_waiting=abandoned)
@@ -98,8 +125,32 @@ async def sweep(
             await engine.dispose()
 
 
+def _validate_thresholds(*thresholds: timedelta | None) -> None:
+    for threshold in thresholds:
+        if threshold is not None:
+            _validate_sweep_age(threshold)
+
+
+def _validate_source(
+    database_url: str | None,
+    state_store: StateStore | None,
+    database_options: dict[str, Any] | None,
+) -> None:
+    """Reject ambiguous persistence configuration before opening an engine."""
+    if database_url is not None and state_store is not None:
+        raise ValueError(
+            "database_url and state_store are mutually exclusive. Pass one or the other."
+        )
+    if database_url is None and state_store is None:
+        raise ValueError("Either database_url or state_store is required.")
+    if database_options is not None and database_url is None:
+        raise ValueError("database_options requires database_url")
+
+
 async def _create_temp_store(
     database_url: str,
+    *,
+    database_options: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """Create a temporary StateStore + engine from a database URL.
 
@@ -112,19 +163,13 @@ async def _create_temp_store(
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
+    from dendrux.db._engine_options import engine_options, normalized_url
     from dendrux.db._schema_check import ensure_schema_current
     from dendrux.db._sqlite_sync import create_sqlite_schema
     from dendrux.runtime.state import SQLAlchemyStateStore
 
-    connect_args: dict[str, Any] = {}
-    if database_url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
-
-    engine = create_async_engine(
-        database_url,
-        echo=False,
-        connect_args=connect_args,
-    )
+    parsed = normalized_url(database_url)
+    engine = create_async_engine(parsed, **engine_options(parsed, database_options))
 
     try:
         if database_url.startswith("sqlite"):

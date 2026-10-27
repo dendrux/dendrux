@@ -643,10 +643,10 @@ class TestIndexReconciliation:
         _build_old_db(db, without={"idempotency_key"})
         con = sqlite3.connect(db)
         con.execute("CREATE TABLE app_owned (k TEXT)")
-        con.execute("CREATE UNIQUE INDEX uq_agent_runs_idempotency_key ON app_owned (k)")
+        con.execute("CREATE UNIQUE INDEX uq_agent_runs_tenant_idempotency_key ON app_owned (k)")
         con.commit()
         con.close()
-        with pytest.raises(SqliteSchemaSyncError, match="uq_agent_runs_idempotency_key"):
+        with pytest.raises(SqliteSchemaSyncError, match="uq_agent_runs_tenant_idempotency_key"):
             _sync(db)
 
     def test_plain_index_name_owned_by_other_table_is_an_error(self, tmp_path: Path) -> None:
@@ -681,18 +681,18 @@ class TestIndexReconciliation:
         with pytest.raises(SqliteSchemaSyncError, match="idempotency_key"):
             _sync(db)
 
-    def test_partial_unique_index_does_not_satisfy_uniqueness(self, tmp_path: Path) -> None:
+    def test_expression_index_with_a_different_definition_is_an_error(self, tmp_path: Path) -> None:
         db = tmp_path / "old.db"
         _build_old_db(db, without={"idempotency_key"})
         con = sqlite3.connect(db)
         con.execute("ALTER TABLE agent_runs ADD COLUMN idempotency_key VARCHAR(255)")
         con.execute(
-            "CREATE UNIQUE INDEX uq_agent_runs_idempotency_key ON agent_runs (idempotency_key)"
-            " WHERE status = 'never'"
+            "CREATE UNIQUE INDEX uq_agent_runs_tenant_idempotency_key"
+            " ON agent_runs (idempotency_key) WHERE status = 'never'"
         )
         con.commit()
         con.close()
-        with pytest.raises(SqliteSchemaSyncError, match="uq_agent_runs_idempotency_key"):
+        with pytest.raises(SqliteSchemaSyncError, match="definition differs"):
             _sync(db)
 
 

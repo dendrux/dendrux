@@ -19,6 +19,7 @@ real LLM call.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
@@ -26,9 +27,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Awaitable, Callable, Iterator
 
     from dendrux.loops.base import LoopNotifier, LoopRecorder
+    from dendrux.types import StreamEvent
 
 _logger = logging.getLogger(__name__)
 
@@ -180,6 +182,76 @@ async def _on_response(response: httpx.Response) -> None:
         _logger.warning("retry telemetry hook raised", exc_info=True)
 
 
+def telemetry_event_hooks() -> dict[str, list[Callable[..., Awaitable[None]]]]:
+    """Fresh httpx hooks for clients that also configure limits or deadlines."""
+    return {"response": [_on_response]}
+
+
+class TelemetryStream(AsyncGenerator["StreamEvent", None]):
+    """Own the provider immediately, including close before the first advance."""
+
+    def __init__(
+        self,
+        stream: AsyncGenerator[StreamEvent, None],
+        *,
+        run_id: str,
+        iteration: int,
+        recorder: LoopRecorder | None,
+        notifier: LoopNotifier | None,
+    ):
+        self._stream = stream
+        self._run_id, self._iteration = run_id, iteration
+        self._recorder, self._notifier = recorder, notifier
+        self._closed = False
+        with self._binding():
+            self._iterator = aiter(stream)
+
+    def _binding(self) -> Any:
+        return telemetry_context(
+            run_id=self._run_id,
+            iteration=self._iteration,
+            recorder=self._recorder,
+            notifier=self._notifier,
+        )
+
+    async def __anext__(self) -> StreamEvent:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            with self._binding():
+                return await anext(self._iterator)
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+
+    async def asend(self, value: None) -> StreamEvent:
+        return await self.__anext__()
+
+    async def athrow(self, *args: Any) -> StreamEvent:
+        with self._binding():
+            return await self._stream.athrow(*args)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self._binding():
+            await self._stream.aclose()
+
+
+def telemetry_stream(
+    stream: AsyncGenerator[StreamEvent, None],
+    *,
+    run_id: str,
+    iteration: int,
+    recorder: LoopRecorder | None,
+    notifier: LoopNotifier | None,
+) -> TelemetryStream:
+    return TelemetryStream(
+        stream, run_id=run_id, iteration=iteration, recorder=recorder, notifier=notifier
+    )
+
+
 def make_telemetry_http_client(
     timeout: httpx.Timeout,
 ) -> httpx.AsyncClient:
@@ -191,7 +263,7 @@ def make_telemetry_http_client(
     """
     return httpx.AsyncClient(
         timeout=timeout,
-        event_hooks={"response": [_on_response]},
+        event_hooks=telemetry_event_hooks(),
     )
 
 
@@ -201,4 +273,6 @@ __all__ = [
     "end_call_attempt_tracking",
     "make_telemetry_http_client",
     "telemetry_context",
+    "telemetry_event_hooks",
+    "telemetry_stream",
 ]

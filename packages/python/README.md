@@ -2,7 +2,7 @@
 
 > Python SDK for Dendrux — the framework for building agents with tools, persistence, and observability.
 
-**Version:** 0.4.1
+**Version:** 0.5.0
 
 ## Install
 
@@ -30,6 +30,7 @@ async def main():
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         prompt="You are a calculator.",
         tools=[add],
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is 15 + 27?")
         print(result.answer)
@@ -42,6 +43,8 @@ asyncio.run(main())
 `MCPRuntime` is the application-scoped owner of process-local MCP connections.
 Bind cheaply for each request, hand an explicit tool view to an ephemeral
 `Agent`, and close the runtime once during application shutdown:
+
+[//]: # "docs-test: skip - fragment: relies on `current_user`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent
@@ -96,26 +99,29 @@ and the [end-to-end example](https://github.com/dendrux/dendrux/blob/main/packag
 
 ## API Quick Reference
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from pathlib import Path
-from dendrux.observers.console import ConsoleObserver
+from dendrux.notifiers.console import ConsoleNotifier
 
 async with Agent(
     provider=provider,                  # Required: LLM provider
     prompt="...",                        # Required: system prompt
     tools=[add],                         # Optional: tool functions
     database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrux' / 'dendrux.db'}",
-    redact=my_scrubber,                  # Optional: scrub persisted strings
 ) as agent:
     result = await agent.run(
         "What is 15 + 27?",
-        observer=ConsoleObserver(),      # Optional: terminal output
+        notifier=ConsoleNotifier(),      # Optional: terminal output
         tenant_id="org-123",             # Optional: multi-tenant isolation
         metadata={"thread": "t1"},       # Optional: your linking data
     )
 ```
 
 ### RunResult
+
+[//]: # "docs-test: skip - fragment: relies on `result`, defined by setup shown elsewhere"
 
 ```python
 result.answer          # str | None — the agent's final answer
@@ -124,10 +130,17 @@ result.steps           # list[AgentStep] — full reasoning chain
 result.iteration_count # int — how many loop iterations ran
 result.usage           # UsageStats — input_tokens, output_tokens, total_tokens
 result.run_id          # str — unique run identifier (ULID)
-result.error           # str | None — error message if status is ERROR
+result.error           # str | None — safe error message if status is ERROR
+result.error_info      # ErrorInfo | None — category, retryable, safe_message of a provider or database failure
+result.stop_reason     # StopReason | None — why the answer call stopped; result.truncated is True at max_tokens
+result.pause_id        # str | None — id of the current pause; pass it as expected_pause_id= (required to approve)
+result.pending         # PendingPause | None — what a paused run is waiting on
+result.to_dict()       # versioned, allowlisted browser envelope (never meta, traces or PII mappings)
 ```
 
 ### Tool Options
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 @tool()                                  # Basic server tool
@@ -137,6 +150,10 @@ result.error           # str | None — error message if status is ERROR
 @tool(parallel=False)                    # Run alone, not concurrently
 ```
 
+## Upgrading
+
+See [Upgrading to 0.5.0](https://www.dendrux.dev/docs/upgrading-to-0.5.0) for every change from 0.4.1 with an action for each, the migration steps, and a map from the removed read router to `RunStore`.
+
 ## Full Documentation
 
-See the [full documentation on GitHub](https://github.com/dendrux/dendrux) for provider setup, configuration, database guide, CLI, dashboard, observer system, and examples.
+See the [full documentation on GitHub](https://github.com/dendrux/dendrux) for provider setup, configuration, database guide, CLI, inspection tools you build, the notifier system, and examples.

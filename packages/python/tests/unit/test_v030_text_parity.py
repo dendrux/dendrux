@@ -1,4 +1,4 @@
-"""v0.3.0 text-only parity (Dendrux 0.4.0 Track O: U-01, R-04, R-05).
+"""v0.3.0 text-only parity.
 
 Compares today's behaviour for text-only runs against goldens frozen from tag
 v0.3.0 (``tests/fixtures/v030_oracle``): provider request payload bytes for the

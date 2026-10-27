@@ -1,4 +1,4 @@
-"""v0.3.0 text-only differential oracle (Dendrux 0.4.0 Track O, U-01 / R-05).
+"""v0.3.0 text-only differential oracle.
 
 Purpose
 -------
@@ -445,21 +445,25 @@ def anthropic_stream(turn: Turn, usage: Usage, index: int, model: str) -> _Anthr
 
 def _chat_usage(usage: Usage, *, openrouter: bool, index: int) -> Fake:
     details: dict[str, Any] = {"cached_tokens": usage.cache_read}
+    prompt = usage.prompt_total
     if openrouter:
         details["cache_write_tokens"] = usage.cache_write
+        # OpenRouter's prompt_tokens counts cache writes too (0.5.0 partitions
+        # them out of fresh input).
+        prompt += usage.cache_write
     extra: dict[str, Any] = {"cost": round(0.0001 * (index + 1), 6)} if openrouter else {}
     dump = {
-        "prompt_tokens": usage.prompt_total,
+        "prompt_tokens": prompt,
         "completion_tokens": usage.out,
-        "total_tokens": usage.prompt_total + usage.out,
+        "total_tokens": prompt + usage.out,
         "prompt_tokens_details": details,
         **extra,
     }
     return Fake(
         dump,
-        prompt_tokens=usage.prompt_total,
+        prompt_tokens=prompt,
         completion_tokens=usage.out,
-        total_tokens=usage.prompt_total + usage.out,
+        total_tokens=prompt + usage.out,
         prompt_tokens_details=Fake(**details),
         completion_tokens_details=None,
         **extra,
@@ -1023,7 +1027,13 @@ class RunOutcome:
     events: list[list[Any]] | None = None
 
 
-def result_view(result: Any) -> dict[str, Any]:
+def _strip_pause_versioned_fields(pause: dict[str, Any]) -> None:
+    """These text-era scenarios pass no per-call provider options."""
+    assert pause.pop("schema_version", 1) == 1
+    assert pause.pop("provider_kwargs", {}) == {}
+
+
+def result_view(result: Any, persisted_pause: dict[str, Any] | None = None) -> dict[str, Any]:
     """Stable subset of RunResult (text-era fields) + pause JSON."""
     view: dict[str, Any] = {
         "run_id": result.run_id,
@@ -1036,8 +1046,15 @@ def result_view(result: Any) -> dict[str, Any]:
     }
     replay = getattr(result, "replay", None)
     view["replay"] = jsonable(replay) if replay is not None else None
-    pause = (result.meta or {}).get("pause_state")
-    view["pause_state"] = pause.to_dict() if pause is not None else None
+    from dendrux.types import PauseState
+
+    view["pause_state"] = (
+        PauseState.from_dict(persisted_pause).to_dict() if persisted_pause is not None else None
+    )
+    if view["pause_state"] is not None:
+        _strip_pause_versioned_fields(view["pause_state"])
+        pause_id = view["pause_state"].pop("pause_id", None)
+        assert pause_id is None or re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", pause_id)
     return view
 
 
@@ -1124,13 +1141,25 @@ class Ctx:
     async def run(self, agent: Any, user_input: str, **kw: Any) -> RunOutcome:
         if self.mode == "batch":
             result = await agent.run(user_input, **kw)
-            return self._record("run", RunOutcome(result.run_id, result_view(result)))
+            return self._record(
+                "run",
+                RunOutcome(
+                    result.run_id,
+                    result_view(result, await self.store.get_pause_state(result.run_id)),
+                ),
+            )
         return self._record("run", await self._drain(agent.stream(user_input, **kw)))
 
     async def resume(self, agent: Any, run_id: str, **kw: Any) -> RunOutcome:
         if self.mode == "batch":
             result = await agent.resume(run_id, **kw)
-            return self._record("resume", RunOutcome(result.run_id, result_view(result)))
+            return self._record(
+                "resume",
+                RunOutcome(
+                    result.run_id,
+                    result_view(result, await self.store.get_pause_state(result.run_id)),
+                ),
+            )
         return self._record("resume", await self._drain(agent.resume_stream(run_id, **kw)))
 
     async def _drain(self, stream: Any) -> RunOutcome:
@@ -1143,7 +1172,9 @@ class Ctx:
                     final = event.run_result
         assert final is not None, "stream ended without a terminal run_result"
         return RunOutcome(
-            final.run_id, result_view(final), canonical_concurrent_tool_results(events)
+            final.run_id,
+            result_view(final, await self.store.get_pause_state(final.run_id)),
+            canonical_concurrent_tool_results(events),
         )
 
     def _record(self, kind: str, outcome: RunOutcome) -> RunOutcome:
@@ -1623,12 +1654,51 @@ def _row_dict(row: Any) -> dict[str, Any]:
     return {k: jsonable(v) if not isinstance(v, datetime) else "<ts>" for k, v in dict(row).items()}
 
 
+def _legacy_run_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate the additive declaration event before projecting the older oracle.
+
+    Subtract only removed positions; preserve unrelated sequence gaps and order.
+    Called before identity normalization so new event IDs cannot rename old IDs.
+    """
+    removed: dict[str, int] = {}
+    legacy = []
+    for event in events:
+        run_id = event["agent_run_id"]
+        if event.get("event_type") == "tools.declared":
+            data = event.get("data")
+            assert isinstance(data, dict) and set(data) == {"local_tool_names"}, (
+                "invalid tools.declared"
+            )
+            names = data["local_tool_names"]
+            assert isinstance(names, list) and len(names) <= 1000, "invalid tools.declared"
+            assert all(
+                isinstance(name, str) and len(name) <= 64 and name.isidentifier() for name in names
+            ), "invalid tools.declared"
+            assert names == sorted(set(names)), "invalid tools.declared"
+            assert event.get("iteration_index") == 0, "invalid tools.declared"
+            removed[run_id] = removed.get(run_id, 0) + 1
+        else:
+            legacy.append(
+                {
+                    **event,
+                    "sequence_index": event["sequence_index"] - removed.get(run_id, 0),
+                }
+            )
+    return legacy
+
+
 def normalise_rows(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     """Normalise a ``dump_rows`` result; golden-visible tables only (see compare_rows)."""
     norm = Normalizer()
     out: dict[str, Any] = {}
     for name in ROW_TABLES:
-        out[name] = norm(rows[name])
+        projected = []
+        source_rows = _legacy_run_events(rows[name]) if name == "run_events" else rows[name]
+        for row in source_rows:
+            row, problem = _strip_050_additions(name, row)
+            assert problem is None, problem
+            projected.append(row)
+        out[name] = norm(projected)
     # Round-trip through sorted-key JSON so dialect JSON key order cannot matter.
     return json.loads(dumps_canonical(out))
 
@@ -1679,11 +1749,79 @@ def _strip_041_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any
     return row, None
 
 
+def _strip_050_additions(table: str, row: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Validate new integrity fields before comparing the older text wire shape.
+
+    Strip ULIDs before Normalizer allocates identities, so an added pause ID
+    cannot renumber the pre-existing run and call IDs. Goldens stay unchanged.
+    """
+    row = dict(row)
+    if table == "agent_runs":
+        if "status_changed_at" in row and row.pop("status_changed_at") != "<ts>":
+            return row, "agent_runs.status_changed_at: expected a non-null timestamp"
+        if "claim_epoch" in row:
+            epoch = row.pop("claim_epoch")
+            if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+                return row, "agent_runs.claim_epoch: expected a non-negative int"
+        if isinstance(row.get("meta"), dict):
+            meta = dict(row["meta"])
+            governance = meta.pop("dendrux.governance", None)
+            if governance is not None and (
+                governance.get("version") != 1
+                or not re.fullmatch(r"[0-9a-f]{64}", governance.get("digest", ""))
+                or set(governance.get("parts", {}))
+                != {"guardrails", "before_tool", "deny", "require_approval", "limits", "budget"}
+                or not all(
+                    re.fullmatch(r"[0-9a-f]{64}", value) for value in governance["parts"].values()
+                )
+            ):
+                return row, "agent_runs.meta: invalid governance digest"
+            row["meta"] = meta
+        if isinstance(row.get("pause_data"), dict):
+            pause = dict(row["pause_data"])
+            _strip_pause_versioned_fields(pause)
+            pause.pop("pause_id", None)
+            pause.pop("status", None)
+            pause.pop("dendrux.governance", None)
+            row["pause_data"] = pause
+    if table == "run_events" and row.get("event_type") == "run.paused":
+        data = dict(row["data"] or {})
+        pause_id = data.pop("pause_id", None)
+        if pause_id is not None and not re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", pause_id):
+            return row, "run.paused: invalid pause_id"
+        row["data"] = data
+    return row, None
+
+
+def _strip_050_cache_write_prompt(
+    table: str, row: dict[str, Any]
+) -> tuple[dict[str, Any], str | None]:
+    """Undo the realistic OpenRouter wire in a persisted ``provider_response``.
+
+    The fake OpenRouter wire counts cache writes in ``prompt_tokens`` (as the
+    real one does; the v0.3.0 goldens did not). 0.5.0 partitions the writes
+    out of fresh input, so the normalised usage still matches the
+    goldens; only the raw vendor dump differs, by exactly the writes.
+    """
+    response = row.get("provider_response") if table == "llm_interactions" else None
+    usage = response.get("usage") if isinstance(response, dict) else None
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    writes = details.get("cache_write_tokens") if isinstance(details, dict) else None
+    if not isinstance(writes, int) or not writes:
+        return row, None
+    prompt, total = usage.get("prompt_tokens"), usage.get("total_tokens")
+    if not isinstance(prompt, int) or not isinstance(total, int) or prompt < writes:
+        return row, f"provider_response.usage: prompt_tokens {prompt!r} lacks the cache writes"
+    usage = {**usage, "prompt_tokens": prompt - writes, "total_tokens": total - writes}
+    return {**row, "provider_response": {**response, "usage": usage}}, None
+
+
 def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None:
     """None when identical. New nullable columns in ``actual`` must be NULL (R-02/P-06).
 
-    The 0.4.1 stop-reason keys are validated and then ignored (see
-    :func:`_strip_041_additions`).
+    The 0.4.1 stop-reason keys and the 0.5.0 integrity columns are
+    validated and then ignored (see :func:`_strip_041_additions` and
+    :func:`_strip_050_additions`).
     """
     for table in ROW_TABLES:
         exp_rows, act_rows = expected[table], actual[table]
@@ -1691,6 +1829,12 @@ def compare_rows(expected: dict[str, Any], actual: dict[str, Any]) -> str | None
             return f"{table}: {len(exp_rows)} rows expected, {len(act_rows)} found"
         for i, (e, raw) in enumerate(zip(exp_rows, act_rows, strict=True)):
             a, problem = _strip_041_additions(table, raw)
+            if problem:
+                return f"{table}[{i}]: {problem}"
+            a, problem = _strip_050_additions(table, a)
+            if problem:
+                return f"{table}[{i}]: {problem}"
+            a, problem = _strip_050_cache_write_prompt(table, a)
             if problem:
                 return f"{table}[{i}]: {problem}"
             for col in e:

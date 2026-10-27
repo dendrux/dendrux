@@ -17,7 +17,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
 
+    from dendrux.errors import ProviderError
     from dendrux.media import Image
+    from dendrux.store import PendingPause
 
 from ulid import ULID
 
@@ -523,6 +525,9 @@ class ToolDef:
     has_explicit_timeout: bool = False  # True when developer set timeout_seconds explicitly
     meta: dict[str, Any] = field(default_factory=dict)  # MCP source info, annotations, etc.
     strict: bool = False
+    # PII restore allowlist (``PII(restore="allowlisted")``): False, True (every
+    # entity) or a frozenset of entity names. Ignored under ``restore="all"``.
+    receives_pii: bool | frozenset[str] = False
 
 
 @dataclass(frozen=True)
@@ -547,6 +552,8 @@ class ToolResult:
     # Per-image ingest notes (lenient MCP results): rendered as text after the payload.
     notes: tuple[str, ...] = field(default=(), compare=False)
 
+    _validated_payload: str | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if type(self.images) is not tuple:
             if isinstance(self.images, (str, bytes, bytearray)):
@@ -556,6 +563,29 @@ class ToolResult:
             if isinstance(self.notes, (str, bytes)):
                 raise TypeError("ToolResult.notes must be a sequence of strings")
             object.__setattr__(self, "notes", tuple(self.notes))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], *, limits: Limits | None = None) -> ToolResult:
+        """Validate a client object; replace oversized payloads using B12 caps.
+
+        Only image references are accepted, never inline bytes or trusted meta.
+        This converter is synchronous: in an async route, offload large input
+        with ``await asyncio.to_thread(ToolResult.from_dict, data)``. Submission
+        reuses its private immutable-payload validation, while checking current
+        metadata and limits again.
+        """
+        from dendrux._wire import tool_result_from_dict
+
+        return tool_result_from_dict(data, limits or Limits())
+
+    @classmethod
+    def list_from_dict(
+        cls, data: list[dict[str, Any]], *, limits: Limits | None = None, max_results: int = 1000
+    ) -> list[ToolResult]:
+        """Validate unique results, bounded count and aggregate max_input_bytes."""
+        from dendrux._wire import tool_results_from_dict
+
+        return tool_results_from_dict(data, limits or Limits(), max_results)
 
 
 def tool_result_message(result: ToolResult) -> Message:
@@ -830,6 +860,10 @@ class Budget:
         max_cost_usd: Dollar limit (> 0), or None.
         on_exceed: ``"warn"``, ``"pause"`` or ``"cancel"``.
         include_children: Count delegated descendant runs' usage.
+        max_subtree_nodes: Root-inclusive accounting cap (default 10,000).
+            Larger trees raise BudgetConfigurationError instead of using partial usage.
+        count_cache_tokens: Count cache read and write tokens toward
+            ``max_tokens``. ``None`` (default) means not chosen.
 
     Raises:
         ValueError: If neither limit is set, a limit is not positive, a
@@ -841,8 +875,16 @@ class Budget:
     max_cost_usd: float | None = None
     on_exceed: BudgetAction = "warn"
     include_children: bool = True
+    count_cache_tokens: bool | None = None
+    max_subtree_nodes: int = 10000
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_subtree_nodes, bool)
+            or not isinstance(self.max_subtree_nodes, int)
+            or self.max_subtree_nodes < 1
+        ):
+            raise ValueError("Budget max_subtree_nodes must be a positive integer.")
         if self.max_tokens is None and self.max_cost_usd is None:
             raise ValueError("Budget needs max_tokens and/or max_cost_usd.")
         if self.max_tokens is not None and (
@@ -866,6 +908,8 @@ class Budget:
             )
         if not isinstance(self.include_children, bool):
             raise ValueError("Budget include_children must be a bool.")
+        if self.count_cache_tokens is not None and not isinstance(self.count_cache_tokens, bool):
+            raise ValueError("Budget count_cache_tokens must be a bool or None.")
 
 
 @dataclass
@@ -979,6 +1023,8 @@ class GovernanceEventType(StrEnum):
     GUARDRAIL_REDACTED = "guardrail.redacted"
     GUARDRAIL_BLOCKED = "guardrail.blocked"
     GUARDRAIL_UNMAPPED_PLACEHOLDER = "guardrail.unmapped_placeholder"
+    # PII(restore="allowlisted") kept placeholders for a non-allowlisted tool (counts only)
+    GUARDRAIL_RESTORE_SKIPPED = "guardrail.restore_skipped"
 
     # Init events: Skills + MCP
     SKILL_CATALOG_RESOLVED = "skill.catalog_resolved"
@@ -1005,6 +1051,143 @@ class GovernanceEventType(StrEnum):
     IMAGE_DEGRADED = "image.degraded"
     IMAGE_WARNING = "image.warning"
     GUARDRAIL_IMAGE_UNSCANNED = "guardrail.image_unscanned"
+
+    # Resume with governance different from the run's start (digests only)
+    GOVERNANCE_CHANGED = "governance.changed"
+
+
+_MIB = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Limits:
+    """Size and count caps for one Agent (``Agent(limits=Limits(...))``).
+
+    Args:
+        max_tool_result_bytes: Largest tool result (local, MCP or client)
+            passed to the model, in bytes. Default 1 MiB.
+        max_input_bytes: Largest UTF-8 text input to a run or submit, in
+            bytes. Images have their own caps (``ImagePolicy``). Default 1 MiB.
+        max_metadata_bytes: Largest run ``metadata`` as encoded JSON, in
+            bytes. Default 64 KiB.
+        max_notes_per_run: Most notes ``submit_note`` accepts for one run.
+            Default 1000.
+
+    Raises:
+        ValueError: If a cap is not a positive integer.
+    """
+
+    max_tool_result_bytes: int = _MIB
+    max_input_bytes: int = _MIB
+    max_metadata_bytes: int = 64 * 1024
+    max_notes_per_run: int = 1000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_tool_result_bytes",
+            "max_input_bytes",
+            "max_metadata_bytes",
+            "max_notes_per_run",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+@dataclass(frozen=True)
+class ErrorInfo:
+    """Structured, safe description of a provider, persistence or ownership failure.
+
+    Provider fields come from :class:`dendrux.errors.ProviderError`.
+    Database failures use ``category="persistence_error"`` and omit provider
+    fields. ``category="run_fenced"`` on a stream means that execution lost
+    ownership; the result keeps the current owner's actual status. This
+    observation does not change the durable run. Every field is a code,
+    number or name: ``safe_message`` is a fixed template, never vendor text
+    or SQL. Provider and database failures are persisted under
+    ``agent_runs.meta["dendrux.error_info"]``; ownership-loss info belongs only
+    to the observing stream.
+
+    Attributes:
+        category: The error's ``category`` (``"rate_limit"``, ``"timeout"``, ...).
+        retryable: Whether repeating the same request may succeed.
+        safe_message: ``"{provider} {category} (HTTP {status}, code {code})"``.
+        error_type: The exception class name.
+        provider: Provider name, when known.
+        model: Model name, when known.
+        status_code: HTTP status, when there was one.
+        provider_code: The provider's error code when it looks like a code
+            (``ProviderError.safe_provider_code``), else None.
+        timeout_reason: Why a deadline fired (``"call_deadline"``,
+            ``"stream_idle"``, ...), when one did.
+    """
+
+    category: str
+    retryable: bool
+    safe_message: str
+    error_type: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    status_code: int | None = None
+    provider_code: str | None = None
+    timeout_reason: str | None = None
+
+    @classmethod
+    def from_error(cls, exc: ProviderError) -> ErrorInfo:
+        """Build from a provider error, reading only its safe fields."""
+        return cls(
+            category=exc.category,
+            retryable=exc.retryable,
+            safe_message=exc.safe_message,
+            error_type=type(exc).__name__,
+            provider=exc.provider,
+            model=exc.model,
+            status_code=exc.status_code,
+            provider_code=exc.safe_provider_code,
+            timeout_reason=exc.timeout_reason,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe dict for persistence and events."""
+        return {
+            "category": self.category,
+            "retryable": self.retryable,
+            "safe_message": self.safe_message,
+            "error_type": self.error_type,
+            "provider": self.provider,
+            "model": self.model,
+            "status_code": self.status_code,
+            "provider_code": self.provider_code,
+            "timeout_reason": self.timeout_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ErrorInfo:
+        """Rebuild from :meth:`to_dict` output.
+
+        Unknown keys are ignored, and a field of the wrong type reads as its
+        default, since stored run meta is not trusted input.
+        """
+
+        def _text(key: str) -> str | None:
+            value = data.get(key)
+            return value if isinstance(value, str) else None
+
+        status = data.get("status_code")
+        retryable = data.get("retryable")
+        return cls(
+            category=_text("category") or "unknown",
+            retryable=retryable if isinstance(retryable, bool) else False,
+            safe_message=_text("safe_message") or "",
+            error_type=_text("error_type"),
+            provider=_text("provider"),
+            model=_text("model"),
+            status_code=status
+            if isinstance(status, int) and not isinstance(status, bool)
+            else None,
+            provider_code=_text("provider_code"),
+            timeout_reason=_text("timeout_reason"),
+        )
 
 
 @dataclass
@@ -1036,6 +1219,9 @@ class RunResult:
     ``truncated`` is True when that call hit the output-token limit
     (``stop_reason == "max_tokens"``): the run still ends SUCCESS, but the
     answer is cut off.
+
+    ``error_info`` describes a provider failure that ended the run (ERROR
+    only). ``pause_id`` identifies the current pause of a paused run.
     """
 
     run_id: str
@@ -1050,6 +1236,26 @@ class RunResult:
     commentary: list[str] = field(default_factory=list)
     replay: ReplaySummary | None = None
     stop_reason: StopReason | None = None
+    error_info: ErrorInfo | None = None
+    pause_id: str | None = None
+
+    pending: PendingPause | None = None
+    _wire_pii_mapping: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Version-1 browser DTO; excludes arbitrary objects, traces and payloads.
+
+        Answer and client arguments mirror the configured in-process PII policy.
+        A configured structured output model is copied as bounded JSON; arbitrary
+        output stays null. ``pending`` is the active pause,
+        with approval/input arguments from the recorded placeholder view. Client
+        arguments can be sensitive; routes must also authorize the actor and run.
+        """
+        from dendrux._wire import result_to_dict
+
+        return result_to_dict(self)
 
     @property
     def truncated(self) -> bool:
@@ -1281,6 +1487,12 @@ class PauseState:
     budget_unpriced_calls: int = 0
     # Image view bookkeeping; None until a run has seen an image.
     image_view: ImageViewState | None = None
+    # Identifier of this pause (ULID); None on pauses written before 0.5.0.
+    pause_id: str | None = None
+    # Current pause format; stored snapshots without a version read as 1.
+    schema_version: int | None = 1
+
+    provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict for DB storage.
@@ -1320,6 +1532,15 @@ class PauseState:
             d["budget_unpriced_calls"] = self.budget_unpriced_calls
         if self.image_view is not None:
             d["image_view"] = self.image_view.to_dict()
+        if self.pause_id is not None:
+            d["pause_id"] = self.pause_id
+        if self.schema_version is not None:
+            d["schema_version"] = self.schema_version
+        d["provider_kwargs"] = {
+            k: v
+            for k, v in self.provider_kwargs.items()
+            if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+        }
         # Validate JSON safety — catch non-serializable meta values early
         try:
             json.dumps(d)
@@ -1335,13 +1556,15 @@ class PauseState:
         """Deserialize from a dict (loaded from DB)."""
         return cls(
             agent_name=data["agent_name"],
-            pending_tool_calls=[_tool_call_from_dict(tc) for tc in data["pending_tool_calls"]],
+            pending_tool_calls=[
+                _tool_call_from_dict(tc) for tc in data.get("pending_tool_calls", [])
+            ],
             pending_targets=data.get("pending_targets", {}),
-            history=[_message_from_dict(m) for m in data["history"]],
-            steps=[_step_from_dict(s) for s in data["steps"]],
-            iteration=data["iteration"],
-            trace_order_offset=data["trace_order_offset"],
-            usage=_usage_from_dict(data["usage"]),
+            history=[_message_from_dict(m) for m in data.get("history", [])],
+            steps=[_step_from_dict(s) for s in data.get("steps", [])],
+            iteration=data.get("iteration", 0),
+            trace_order_offset=data.get("trace_order_offset", 0),
+            usage=_usage_from_dict(data.get("usage", {})),
             approval_gates=data.get("approval_gates"),
             pause_reason=data.get("pause_reason"),
             pause_message=data.get("pause_message"),
@@ -1356,6 +1579,13 @@ class PauseState:
                 if data.get("image_view") is not None
                 else None
             ),
+            pause_id=data.get("pause_id"),
+            schema_version=data.get("schema_version") or 1,
+            provider_kwargs={
+                k: v
+                for k, v in (data.get("provider_kwargs") or {}).items()
+                if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
+            },
         )
 
 
@@ -1793,12 +2023,14 @@ class RunStream:
         if self._closed:
             return
         self._closed = True
-        if not self._terminated:
-            try:
-                self._result = await self._cleanup()
-            except Exception:
-                logger.warning("RunStream cleanup failed", exc_info=True)
-        await self._gen.aclose()
+        try:
+            if not self._terminated:
+                try:
+                    self._result = await self._cleanup()
+                except Exception:
+                    logger.warning("RunStream cleanup failed", exc_info=True)
+        finally:
+            await self._gen.aclose()
 
     async def text(self) -> AsyncGenerator[str, None]:
         """Convenience filter — yields only text deltas as plain strings."""
@@ -1842,15 +2074,21 @@ class IdempotencyConflictError(RuntimeError):
 
     This indicates a bug in the caller — keys must not be reused across
     different requests. Generate a new key for each distinct request.
+    ``run_id`` is None when the existing run must not be disclosed (for
+    example, it belongs to another tenant).
     """
 
-    def __init__(self, run_id: str, idempotency_key: str) -> None:
+    def __init__(self, run_id: str | None, idempotency_key: str) -> None:
         self.run_id = run_id
         self.idempotency_key = idempotency_key
+        where = f" for run {run_id}" if run_id is not None else ""
         super().__init__(
-            f"Idempotency key '{idempotency_key}' already used for run {run_id} "
+            f"Idempotency key '{idempotency_key}' already used{where} "
             f"with different input. Keys must not be reused across different requests."
         )
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (type(self), (self.run_id, self.idempotency_key))
 
 
 class StructuredOutputValidationError(RuntimeError):
@@ -1952,3 +2190,85 @@ def _history_fingerprint_entry(m: Message) -> dict[str, Any]:
     if m.parts is not None:
         entry["parts"] = parts_digest(m.parts)
     return entry
+
+
+class InputValidationError(ValueError):
+    """A client value cannot be safely accepted or persisted.
+
+    ``field`` names a fixed API field, never an input dictionary key or value.
+    ``code`` is a stable rejection category, suitable for client error handling.
+    """
+
+    def __init__(self, field: str, code: str = "invalid_input") -> None:
+        self.field = field
+        self.code = code
+        super().__init__(f"{field} rejected ({code}).")
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        return type(self), (self.field, self.code)
+
+
+_PERSISTABLE_NODE_LIMIT = 1048576 // 2
+
+
+def _persistable_nodes(value: Any, field: str) -> Iterator[tuple[Any, int]]:
+    from itertools import chain
+
+    stack: list[Iterator[Any]] = [iter((value,))]
+    visited = 0
+    while stack:
+        try:
+            item = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        visited += 1
+        if visited > _PERSISTABLE_NODE_LIMIT:
+            raise InputValidationError(field, "structure_limit")
+        yield item, len(stack) - 1
+        if isinstance(item, dict):
+            stack.append(chain.from_iterable(item.items()))
+        elif isinstance(item, (list, tuple)):
+            stack.append(iter(item))
+
+
+def _validate_persistable(value: Any, field: str = "input") -> None:
+    """Reject unpersistable JSON without echoing it, with depth and work bounds.
+
+    The node budget admits even compact JSON within the 1 MiB client cap
+    (one scalar per two bytes), including spreadsheet ranges. Byte limits
+    remain the responsibility of each API boundary.
+    """
+    import math
+
+    for item, depth in _persistable_nodes(value, field):
+        if depth > 32:
+            raise InputValidationError(field, "structure_limit")
+        if isinstance(item, str):
+            if "\x00" in item:
+                raise InputValidationError(field, "invalid_text")
+            try:
+                for start in range(0, len(item), 65536):
+                    item[start : start + 65536].encode("utf-8")
+            except UnicodeError:
+                raise InputValidationError(field, "invalid_text") from None
+        elif isinstance(item, dict):
+            if len(item) > _PERSISTABLE_NODE_LIMIT // 2:
+                raise InputValidationError(field, "structure_limit")
+            for key in item:
+                if not isinstance(key, str):
+                    raise InputValidationError(field, "invalid_json")
+        elif isinstance(item, (list, tuple)):
+            if len(item) > _PERSISTABLE_NODE_LIMIT:
+                raise InputValidationError(field, "structure_limit")
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise InputValidationError(field, "nonfinite_json")
+        elif item is not None and not isinstance(item, (bool, int)):
+            raise InputValidationError(field, "invalid_json")
+
+
+def _validate_identifier(value: Any, field: str, *, maximum: int = 255) -> None:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise InputValidationError(field, "invalid_identifier")
+    _validate_persistable(value, field)

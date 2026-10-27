@@ -188,7 +188,9 @@ async def test_continuation_matrix(store, path, change):
 
     async def proceed():
         if path == "resume_stream":
-            stream = new.resume_stream(paused.run_id, tool_results=results)
+            stream = new.resume_stream(
+                paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+            )
             events = [e async for e in stream]
             if change != "success":
                 assert events[-1].run_result.meta["error_type"] == (
@@ -196,12 +198,16 @@ async def test_continuation_matrix(store, path, change):
                 )
             return stream.result
         if path == "resume":
-            return await new.resume(paused.run_id, tool_results=results)
+            return await new.resume(
+                paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+            )
         if path == "submit_tool_results":
             return await new.submit_tool_results(paused.run_id, results)
         if path == "submit_input":
             return await new.submit_input(paused.run_id, "answer")
-        return await new.submit_approval(paused.run_id, approved=path == "approve")
+        return await new.submit_approval(
+            paused.run_id, approved=path == "approve", expected_pause_id=paused.pause_id
+        )
 
     if change != "success" and path != "resume_stream":
         with pytest.raises(SkillMissingError if change == "missing" else SkillMismatchError):
@@ -223,7 +229,9 @@ async def test_approved_execution_rechecks_policy(store, change):
     paused = await a.run("input", activate_skills=["demo"])
     kwargs = {"deny": ["run_skill_script"]} if change == "deny" else {"skill_executor": None}
     new = agent(store, [LLMResponse(text="done")], **kwargs)
-    result = await new.submit_approval(paused.run_id, approved=True)
+    result = await new.submit_approval(
+        paused.run_id, approved=True, expected_pause_id=paused.pause_id
+    )
     assert result.status == RunStatus.SUCCESS
     traces = await store.get_traces(paused.run_id)
     assert next(t for t in traces if t.role == "tool").meta["is_error"]
@@ -238,12 +246,12 @@ async def test_approved_execution_rechecks_policy(store, change):
 
 
 async def test_retry_rebuilds_activation_and_checks_tenant(store):
-    from dendrux.errors import ReplayRunError
+    from dendrux.errors import RunNotFoundError
 
     a = agent(store, [LLMResponse(text="done")])
     original = await a.run("raw", tenant_id="tenant", activate_skills=["demo"])
     new = agent(store, [LLMResponse(text="retried")], skills=[skill("updated body")])
-    with pytest.raises(ReplayRunError):
+    with pytest.raises(RunNotFoundError):
         await new.retry(original.run_id, tenant_id="other")
     result = await new.retry(original.run_id, tenant_id="tenant")
     assert result.status == RunStatus.SUCCESS
@@ -281,7 +289,9 @@ async def test_script_cancellation_finalizes_cancelled(store, path):
     if path == "submit":
         paused = await a.run("input", activate_skills=["demo"])
         run_id = paused.run_id
-        task = asyncio.create_task(a.submit_approval(run_id, approved=True))
+        task = asyncio.create_task(
+            a.submit_approval(run_id, approved=True, expected_pause_id=paused.pause_id)
+        )
     elif path == "stream":
         stream = a.stream("input", activate_skills=["demo"])
         run_id = stream.run_id
@@ -369,7 +379,7 @@ async def test_approved_script_rechecks_activation(store):
             message.setdefault("meta", {})["is_error"] = True
     await store.pause_run(paused.run_id, status="waiting_approval", pause_data=state)
     new = agent(store, [LLMResponse(text="done")])
-    await new.submit_approval(paused.run_id, approved=True)
+    await new.submit_approval(paused.run_id, approved=True, expected_pause_id=paused.pause_id)
     calls = await store.get_tool_calls(paused.run_id)
     script = next(c for c in calls if c.tool_name == "run_skill_script")
     assert not script.success and "not active" in script.error_message

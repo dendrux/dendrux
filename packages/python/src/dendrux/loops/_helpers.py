@@ -20,6 +20,7 @@ import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from dendrux.errors import safe_exception_info
 from dendrux.pricing import price_usage
 
 if TYPE_CHECKING:
@@ -267,8 +268,15 @@ def price_response(
     *,
     pricing: PriceTable | None,
     default_model: str | None,
+    model: str | None = None,
 ) -> LLMResponse:
     """Resolve ``response.usage.cost_usd`` from the agent's price table.
+
+    ``model`` is the per-call requested model (``run(model=...)``), or None
+    when the call used the provider's configured ``default_model``. The table
+    is consulted for ``response.model`` first, then for the requested model, so
+    a dated snapshot id returned by the vendor still prices through the entry
+    written for the alias that was requested.
 
     Applied once per LLM call, before the response is recorded, so the
     persisted usage, the ``llm.completed`` event, the budget check and the
@@ -277,7 +285,8 @@ def price_response(
     """
     priced = price_usage(
         response.usage,
-        model=response.model or default_model,
+        model=response.model,
+        fallback_models=(model or default_model,),
         pricing=pricing,
     )
     if priced is response.usage:
@@ -385,7 +394,7 @@ async def notify_run_started(
     try:
         await notifier.on_run_started(run_id, agent_name=agent_name, agent_model=agent_model)
     except Exception:
-        logger.warning("Notifier.on_run_started failed", exc_info=True)
+        logger.warning("Notifier.on_run_started failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_run_started failed for run {run_id}")
 
@@ -402,7 +411,7 @@ async def notify_run_finished(
     try:
         await notifier.on_run_finished(run_id, result)
     except Exception:
-        logger.warning("Notifier.on_run_finished failed", exc_info=True)
+        logger.warning("Notifier.on_run_finished failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_run_finished failed for run {run_id}")
 
@@ -421,7 +430,7 @@ async def notify_run_failed(
     try:
         await notifier.on_run_failed(run_id, error, iteration=iteration)
     except Exception:
-        logger.warning("Notifier.on_run_failed failed", exc_info=True)
+        logger.warning("Notifier.on_run_failed failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_run_failed failed for run {run_id}")
 
@@ -439,7 +448,7 @@ async def notify_message(
     try:
         await notifier.on_message_appended(run_id, message, iteration)
     except Exception:
-        logger.warning("Notifier.on_message_appended failed", exc_info=True)
+        logger.warning("Notifier.on_message_appended failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_message_appended failed at iteration {iteration}")
 
@@ -464,7 +473,7 @@ async def notify_llm_started(
             semantic_tools=semantic_tools,
         )
     except Exception:
-        logger.warning("Notifier.on_llm_call_started failed", exc_info=True)
+        logger.warning("Notifier.on_llm_call_started failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_llm_call_started failed at iteration {iteration}")
 
@@ -495,7 +504,7 @@ async def notify_llm(
             guardrail_findings=guardrail_findings,
         )
     except Exception:
-        logger.warning("Notifier.on_llm_call_completed failed", exc_info=True)
+        logger.warning("Notifier.on_llm_call_completed failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_llm_call_completed failed at iteration {iteration}")
 
@@ -515,7 +524,7 @@ async def notify_llm_failed(
     try:
         await notifier.on_llm_call_failed(run_id, iteration, error, duration_ms=duration_ms)
     except Exception:
-        logger.warning("Notifier.on_llm_call_failed failed", exc_info=True)
+        logger.warning("Notifier.on_llm_call_failed failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_llm_call_failed failed at iteration {iteration}")
 
@@ -533,7 +542,7 @@ async def notify_tool_started(
     try:
         await notifier.on_tool_started(run_id, tool_call, iteration)
     except Exception:
-        logger.warning("Notifier.on_tool_started failed", exc_info=True)
+        logger.warning("Notifier.on_tool_started failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_tool_started failed at iteration {iteration}")
 
@@ -552,7 +561,7 @@ async def notify_tool(
     try:
         await notifier.on_tool_completed(run_id, tool_call, tool_result, iteration)
     except Exception:
-        logger.warning("Notifier.on_tool_completed failed", exc_info=True)
+        logger.warning("Notifier.on_tool_completed failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_tool_completed failed at iteration {iteration}")
 
@@ -575,6 +584,6 @@ async def notify_governance(
             run_id, event_type, iteration, data, correlation_id=correlation_id
         )
     except Exception:
-        logger.warning("Notifier.on_governance_event failed", exc_info=True)
+        logger.warning("Notifier.on_governance_event failed", exc_info=safe_exception_info())
         if warnings is not None:
             warnings.append(f"on_governance_event failed at iteration {iteration}")

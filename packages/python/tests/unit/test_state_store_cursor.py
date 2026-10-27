@@ -1,7 +1,7 @@
 """Cursor pagination semantics on ``StateStore.get_run_events``.
 
 Covers the ``after_sequence_index`` (exclusive ``>``) and ``limit``
-parameters that back the read-router polling and SSE endpoints.
+parameters that back the live event polling.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ async def store_with_events():
         await store.save_run_event(
             run_id,
             event_type=f"test.event.{i}",
-            sequence_index=i,
             iteration_index=0,
             data={"index": i},
         )

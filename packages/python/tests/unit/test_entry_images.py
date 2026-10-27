@@ -1,4 +1,4 @@
-"""Track D2: image input at the runtime entry points (run/stream/submit/resume/retry).
+"""image input at the runtime entry points (run/stream/submit/resume/retry).
 
 The blob catalog, resolver and loop image pipeline belong to other tracks; these
 tests use small fakes for them (``ImageStore`` = the real SQLAlchemy store plus an
@@ -1173,7 +1173,11 @@ class TestApprovalCarry:
                 {"d": json.dumps(raw), "i": run_id},
             )
 
-        approved = await agent.submit_approval(run_id, approved=True)
+        approved = await agent.submit_approval(
+            run_id,
+            approved=True,
+            expected_pause_id=(await store.get_pause_state(run_id))["pause_id"],
+        )
         assert approved.status == RunStatus.WAITING_CLIENT_TOOL
         client_raw = await store.get_pause_state(run_id)
         assert client_raw["image_view"] == view.to_dict()
@@ -1350,7 +1354,6 @@ class TestRetryAndReplay:
         await store.save_run_event(
             source.run_id,
             event_type="image.rejected",
-            sequence_index=99,
             iteration_index=1,
             data={"image_id": "img_x", "sha256": sha, "tenant_scope": "t:acme"},
         )
@@ -1628,7 +1631,7 @@ class TestD1Seams:
 
 
 # ---------------------------------------------------------------------------
-# Review fix round (review-D2.md)
+# Image validation before persistence
 # ---------------------------------------------------------------------------
 
 JPG = (FIXTURES / "zebra42.jpg").read_bytes()
@@ -1824,7 +1827,7 @@ class TestResumeStreamValidatesFirst:
                 ToolResult("take_screenshot", "wrong", '"x"', images=(Image.from_bytes(PNG),))
             ],
         )
-        with pytest.raises(ValueError, match="call_ids"):
+        with pytest.raises(ValueError, match="call ids"):
             async for _ in stream:
                 pass
         assert store.rows == {}

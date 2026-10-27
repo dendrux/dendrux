@@ -49,6 +49,7 @@ async def main() -> None:
         tools=[refund, delete_user],
         deny=["delete_user"],                 # delete_user can never execute
         database_url="sqlite+aiosqlite:///admin.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("Delete user 42 using the delete_user tool.")
         print(result.status.value)            # success  (deny is a gate, not a run-killer)
@@ -58,20 +59,21 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Captured from a live run of that script:
+Captured from a live run of that script, on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```text
 status: success
 delete_user actually called?  False
-final answer preview: "I'm unable to delete user 42. The delete_user action has been denied
-by policy, which means I don't have permission to permanently delete..."
+final answer preview: "I was unable to delete user 42. The system has blocked the `delete_user` tool
+due to a policy restriction. This is likely a safety measure to prevent accidental or unauthorized..."
 
 run_events:
   [lifecycle] seq=0  run.started
-  [lifecycle] seq=1  llm.completed       (model emits delete_user(user_id=42))
-  [GOV]       seq=2  policy.denied       data={"tool_name": "delete_user", "call_id": "...", "reason": "denied_by_policy"}
-  [lifecycle] seq=3  llm.completed       (model sees the denial, picks a different action)
-  [lifecycle] seq=4  run.completed
+  [lifecycle] seq=1  tools.declared
+  [lifecycle] seq=2  llm.completed       (model emits delete_user(user_id=42))
+  [GOV]       seq=3  policy.denied       data={"tool_name": "delete_user", "call_id": "01M5Y7QD2XNQKZEZPJP8XBBTR0", "reason": "denied_by_policy"}
+  [lifecycle] seq=4  llm.completed       (model sees the denial, picks a different action)
+  [lifecycle] seq=5  run.completed
 
 tool_calls table:
   rows: 0
@@ -80,13 +82,15 @@ tool_calls table:
 Four things to pull out of that trace:
 
 1. **The tool function never ran.** `DELETE_CALLED` is empty. No DB row landed in `tool_calls` (that table only records actual executions, not blocked attempts).
-2. **A `policy.denied` event landed on the timeline.** `seq=2`, same `correlation_id` as the LLM's tool-call id, so a reader can join the denial to the call that triggered it.
+2. **A `policy.denied` event landed on the timeline.** `seq=3`, same `correlation_id` as the LLM's tool-call id, so a reader can join the denial to the call that triggered it.
 3. **The model was told.** A synthetic tool result with `{"denied": "Tool 'delete_user' is denied by policy."}` was appended to history. The next LLM turn saw it and produced a sensible user-facing answer.
 4. **The run still succeeded.** `status=success`. Deny is not a run-killer; it is a gate that the loop routes around.
 
 ## What "deny" actually does inside the loop
 
 From `dendrux/loops/react.py`, the relevant branch of the tool-dispatch phase:
+
+[//]: # "docs-test: skip - fragment: relies on `tc`, defined by setup shown elsewhere"
 
 ```python
 if tc.name in deny_set:
@@ -120,6 +124,8 @@ Three observations about the exact code:
 ## Construction-time validation
 
 The deny list is not just enforced at runtime; `Agent` validates it at construction:
+
+[//]: # "docs-test: skip - fragment: relies on `self`, defined by setup shown elsewhere"
 
 ```python
 # From dendrux/agent.py
@@ -166,11 +172,14 @@ The run-control and read APIs take a `tenant_id=` argument that makes a call beh
 | `agent.submit_note(run_id, text)` | Run must be in the tenant, else `RunNotFoundError`. | Unscoped. |
 | `agent.submit_tool_results(...)`, `submit_input`, `submit_approval`, `submit_resume`, `resume`, `resume_stream` | Run must be in the tenant, else `RunNotFoundError`, raised before any result, input, decision, claim, status change or event is written. | Unscoped. |
 | `RunStore.get_subtree(run_id)` | Root and every descendant must be in the tenant; others are excluded with everything below them. | Unscoped. |
-| `RunStore.get_notes(run_id)` | Run must be in the tenant, else `dendrux.store.RunNotFoundError`. | Unscoped. |
+| `RunStore.get_notes(run_id)` | Run must be in the tenant, else `RunNotFoundError`. | Unscoped. |
+| Every other `RunStore` read (`get_run`, `get_events`, `list_runs`, ...) | Scoped to the tenant (0.5.0). `get_run` returns `None` when out of scope. | `UNSCOPED`: all tenants. |
 
 `tenant_id=None` is a real value meaning "untenanted runs only", which is different from leaving the argument out. A `before_tool` hook sees the run's tenant as `ToolCallContext.tenant_id`.
 
 Since 0.4.1 the submit and resume methods take the same keyword-only `tenant_id=`. A run outside the tenant raises `RunNotFoundError`, indistinguishable from a missing run, so a caller cannot learn that another tenant's run exists. The check is a read that happens first, and a run's tenant never changes, so it cannot race. Nothing is persisted on a mismatch.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
@@ -180,6 +189,8 @@ await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 
 Passing `tenant_id` is how your route handlers keep one customer from touching another's runs. Dendrux does not decide who the caller is; derive the tenant from the authenticated request and pass it in.
 
+Forgetting it once is the easy mistake. `Agent(strict_tenancy=True)` (0.5.0) makes every entry point require an explicit `tenant_id`, raising `TenantScopeRequiredError` otherwise; delegated children still inherit their parent's tenant. Strict tenancy becomes the default in 0.6. Scopes, the application tenant resolution and idempotency keys are covered on [Multi-tenancy](/docs/architecture/multi-tenancy).
+
 ## Why a synthetic result instead of an exception
 
 The most obvious alternative is to raise a Python exception when a denied tool is called. The loop could catch it, mark the run failed, and stop.
@@ -187,7 +198,7 @@ The most obvious alternative is to raise a Python exception when a denied tool i
 That design is wrong for two reasons.
 
 1. **The LLM has useful work left to do.** A model that gets a "denied" tool result can apologize, ask for a different approach, suggest an escalation path, or try a non-destructive alternative. All of that is lost if the runtime kills the run on the first denied attempt. The user's request still deserves a response.
-2. **Denial is not an error.** `status=error` is reserved for things that actually broke: a guardrail-blocked secret, an unrecoverable tool failure, a provider outage. A policy denial is a normal branch of the decision tree, and should look like one in the event log. `policy.denied` is its own event type so dashboards can aggregate access-control activity without mixing it with failure alerts.
+2. **Denial is not an error.** `status=error` is reserved for things that actually broke: a guardrail-blocked secret, an unrecoverable tool failure, a provider outage. A policy denial is a normal branch of the decision tree, and should look like one in the event log. `policy.denied` is its own event type so inspection tools can aggregate access-control activity without mixing it with failure alerts.
 
 The synthetic tool result is the cheapest way to give the model enough information to keep going. The `success=False, error="denied"` shape matches what it would see from a real tool failure, and most prompts already handle that case.
 

@@ -12,10 +12,14 @@ not need to interpret store return values.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import weakref
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NoReturn
+from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from dendrux.errors import (
     InvalidToolResultError,
@@ -42,6 +46,7 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Sequence
 
+    from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._policy import ImagePolicy, Origin
@@ -109,6 +114,17 @@ async def raise_for_non_paused_status(store: StateStore, run_id: str) -> NoRetur
     raise RunNotPausedError(run_id, current)
 
 
+def _invalid_tool_result(run_id: str, reason: str) -> InvalidToolResultError:
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "Invalid client tool result: run_id=%s code=invalid_tool_result",
+        run_id,
+        extra={"run_id": run_id, "code": "invalid_tool_result"},
+    )
+    return InvalidToolResultError(run_id, reason)
+
+
 async def validate_tool_results(
     store: StateStore, run_id: str, results: list[ToolResult]
 ) -> PauseState:
@@ -123,6 +139,7 @@ async def validate_tool_results(
         await raise_for_non_paused_status(store, run_id)
 
     pause_state = PauseState.from_dict(raw_pause)
+    _check_result_identities(run_id, results)
     pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
     provided_counts = Counter(r.call_id for r in results)
     duplicates = sorted(k for k, v in provided_counts.items() if v > 1)
@@ -130,17 +147,84 @@ async def validate_tool_results(
 
     parts: list[str] = []
     if duplicates:
-        parts.append(f"duplicate call_ids={duplicates}")
+        parts.append(f"duplicate call id count={len(duplicates)}")
     missing = sorted(pending_ids - provided_ids)
     extra = sorted(provided_ids - pending_ids)
     if missing:
-        parts.append(f"missing call_ids={missing}")
+        parts.append(f"missing call id count={len(missing)}")
     if extra:
-        parts.append(f"unexpected call_ids={extra}")
+        parts.append(f"unexpected call id count={len(extra)}")
 
     if parts:
-        raise InvalidToolResultError(run_id, "; ".join(parts))
+        raise _invalid_tool_result(run_id, "; ".join(parts))
+    validate_result_names(run_id, pause_state, results, json_payload=False)
     return pause_state
+
+
+def validate_result_names(
+    run_id: str, pause: PauseState, results: list[ToolResult], *, json_payload: bool = True
+) -> None:
+    """Bind result IDs/names and require a string payload; text is normalized later."""
+
+    _check_result_identities(run_id, results)
+    pending = {call.id: call.name for call in pause.pending_tool_calls}
+    if (
+        len(results) != len(pending)
+        or len({r.call_id for r in results}) != len(results)
+        or {r.call_id for r in results} != set(pending)
+    ):
+        raise _invalid_tool_result(run_id, "tool result call ids do not match pending calls")
+    for result in results:
+        if pending.get(result.call_id) != result.name:
+            raise _invalid_tool_result(run_id, "tool result name does not match pending call")
+        if not isinstance(result.payload, str):
+            raise _invalid_tool_result(run_id, "tool result payload must be a JSON string")
+
+
+def pause_validator(
+    run_id: str,
+    expected_pause_id: str | None,
+    *,
+    agent_name: str | None = None,
+    call_results: list[ToolResult] | None = None,
+) -> Callable[[dict[str, Any]], None]:
+    """Validation performed while the claim transaction holds the run row."""
+
+    from dendrux.types import _validate_identifier
+
+    if expected_pause_id is not None:
+        _validate_identifier(expected_pause_id, "expected_pause_id", maximum=26)
+
+    def validate(current: dict[str, Any]) -> None:
+        current_id = current.get("pause_id")
+        if expected_pause_id is not None and expected_pause_id != current_id:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Pause generation mismatch: run_id=%s code=pause_id_mismatch",
+                run_id,
+                extra={"run_id": run_id, "code": "pause_id_mismatch"},
+            )
+            raise PauseStatusMismatchError(
+                run_id,
+                RunStatus(current.get("status", RunStatus.PAUSED.value)),
+                RunStatus(current.get("status", RunStatus.PAUSED.value)),
+                expected_pause_id=expected_pause_id,
+                current_pause_id=current_id,
+                reason="pause_id",
+            )
+        if agent_name is not None and current.get("agent_name") not in (None, agent_name):
+            raise ValueError("Agent name mismatch on resume")
+        if call_results is not None:
+            pending = {call["id"]: call["name"] for call in current.get("pending_tool_calls", [])}
+            if (
+                len(pending) != len(call_results)
+                or len({r.call_id for r in call_results}) != len(call_results)
+                or any(pending.get(result.call_id) != result.name for result in call_results)
+            ):
+                raise _invalid_tool_result(run_id, "tool results do not match pending calls")
+
+    return validate
 
 
 async def preflight_status(store: StateStore, run_id: str, expected_status: RunStatus) -> None:
@@ -165,16 +249,90 @@ async def preflight_status(store: StateStore, run_id: str, expected_status: RunS
         raise RunAlreadyTerminalError(run_id, RunStatus.CANCELLED)
 
 
+@dataclass
+class _ClaimValidationSupport:
+    atomic: bool
+    logged: bool = False
+
+
+@lru_cache(maxsize=128)
+def _claim_validation_support(method: Any) -> _ClaimValidationSupport:
+    import inspect
+
+    params = inspect.signature(method).parameters
+    return _ClaimValidationSupport(
+        "validate" in params
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    )
+
+
+async def claim_paused_validated(
+    store: StateStore,
+    run_id: str,
+    *,
+    expected_status: str,
+    validate: Callable[[dict[str, Any]], None],
+) -> int:
+    """Use atomic validation when supported; preserve legacy claims best effort.
+
+    The cached key is the unbound implementation, not a store instance. Legacy
+    post-claim validation cannot eliminate a race; it stops execution on mismatch.
+    """
+    import logging
+
+    method = store.claim_paused_run
+    implementation = getattr(method, "__func__", method)
+    try:
+        hash(implementation)
+    except TypeError:
+        implementation = type(implementation).__call__
+    support = _claim_validation_support(implementation)
+    if support.atomic:
+        return await method(run_id, expected_status=expected_status, validate=validate)
+    if not support.logged:
+        support.logged = True
+        logging.getLogger(__name__).warning(
+            "Custom store lacks atomic claim validation; using pre/post checks: "
+            "run_id=%s code=legacy_claim_validation",
+            run_id,
+            extra={"run_id": run_id, "code": "legacy_claim_validation"},
+        )
+    current = await store.get_pause_state(run_id)
+    if current is None:
+        await raise_for_non_paused_status(store, run_id)
+    validate(current)
+    epoch = await method(run_id, expected_status=expected_status)
+    if epoch:
+        try:
+            current = await store.get_pause_state(run_id)
+            if current is None:
+                raise ValueError("Claimed run has no pause state")
+            validate(current)
+        except BaseException:
+            release = getattr(store, "release_run_claim", None)
+            if release is not None and type(epoch) is int:
+                import anyio
+
+                with anyio.CancelScope(shield=True):
+                    await release(run_id, status=expected_status, claim_epoch=epoch)
+            raise
+    return epoch
+
+
 async def claim_or_raise(
     store: StateStore,
     run_id: str,
     *,
     expected_status: RunStatus,
     submitted_data: dict[str, Any] | None = None,
+    agent: Agent | None = None,
+    expected_pause_id: str | None = None,
+    approval: bool = False,
+    call_results: list[ToolResult] | None = None,
     validate: Callable[[dict[str, Any]], None] | None = None,
     blob_refs: Sequence[BlobEdge] | None = None,
     blob_refs_scope: str | None = None,
-) -> None:
+) -> int:
     """Perform a status preflight, then persist-first handoff + CAS claim.
 
     The preflight reads the current status before attempting the CAS so
@@ -202,6 +360,22 @@ async def claim_or_raise(
     """
     await preflight_status(store, run_id, expected_status)
 
+    raw = await store.get_pause_state(run_id)
+    if raw is None:
+        await raise_for_non_paused_status(store, run_id)
+    if agent is not None:
+        warn_missing_pause_id(
+            agent, expected_pause_id, pause_id=raw.get("pause_id"), approval=approval
+        )
+    validate = submission_validator(
+        run_id,
+        raw,
+        agent=agent,
+        expected_pause_id=expected_pause_id,
+        call_results=call_results,
+        extra=validate,
+    )
+
     # --- Claim: run was expected_status at preflight, attempt CAS. ---
     if submitted_data is not None:
         claim_kwargs: dict[str, Any] = {} if validate is None else {"validate": validate}
@@ -215,10 +389,26 @@ async def claim_or_raise(
             **claim_kwargs,
         )
     else:
-        won = await store.claim_paused_run(run_id, expected_status=expected_status.value)
+        won = await claim_paused_validated(
+            store,
+            run_id,
+            expected_status=expected_status.value,
+            validate=validate,
+        )
 
     if won:
-        return
+        if agent is not None:
+            try:
+                await report_governance_change(agent, store, run_id, raw)
+            except BaseException:
+                release = getattr(store, "release_run_claim", None)
+                if release is not None and type(won) is int:
+                    import anyio
+
+                    with anyio.CancelScope(shield=True):
+                        await release(run_id, status=expected_status.value, claim_epoch=won)
+                raise
+        return won
 
     # CAS lost after preflight succeeded — something transitioned the run
     # between the two reads. Re-check to pick the most specific error.
@@ -267,6 +457,34 @@ def build_rejection_results(
             duration_ms=0,
         )
         for tc in pause_state.pending_tool_calls
+    ]
+
+
+def validate_denial_results(agent: Agent, run_id: str, results: list[ToolResult]) -> None:
+    """Reject oversized synthetic denials before claiming the pause."""
+    if any(
+        len(result.payload.encode("utf-8")) > agent._limits.max_tool_result_bytes
+        for result in results
+    ):
+        raise _invalid_tool_result(run_id, "denial result exceeds the result limit")
+    _validated_client_results(agent, run_id, results)
+
+
+def decision_denial_results(
+    pause: PauseState, decisions: Mapping[str, ApprovalDecision]
+) -> list[ToolResult]:
+    import json
+
+    return [
+        ToolResult(
+            name=call.name,
+            call_id=call.id,
+            payload=json.dumps({"denied": decisions[call.id].reason or DEFAULT_DENIAL_REASON}),
+            success=False,
+            error=decisions[call.id].reason or DEFAULT_DENIAL_REASON,
+        )
+        for call in pause.pending_tool_calls
+        if call.id in decisions and not decisions[call.id].approved
     ]
 
 
@@ -553,6 +771,11 @@ def approval_gates_of(
     }
 
 
+def _check_decisions_size(decisions: Mapping[Any, Any]) -> None:
+    if len(decisions) > 1000:
+        raise ValueError("decisions exceeds its count limit")
+
+
 def normalize_decisions(decisions: object) -> list[tuple[str, ApprovalDecision]]:
     """Type-check a public ``decisions`` mapping into ``(call_id, decision)`` pairs."""
     if not isinstance(decisions, Mapping):
@@ -560,8 +783,13 @@ def normalize_decisions(decisions: object) -> list[tuple[str, ApprovalDecision]]
             "decisions must be a mapping of tool call id to ApprovalDecision, "
             f"got {type(decisions).__name__}."
         )
+    from dendrux.runtime._entry_checks import require_boolean
+    from dendrux.types import _validate_identifier, _validate_persistable
+
+    _check_decisions_size(decisions)
     pairs: list[tuple[str, ApprovalDecision]] = []
     for call_id, decision in decisions.items():
+        _validate_identifier(call_id, "call_id")
         if not isinstance(call_id, str):
             raise ValueError(f"decisions keys must be tool call id strings, got {call_id!r}.")
         if not isinstance(decision, ApprovalDecision):
@@ -569,6 +797,8 @@ def normalize_decisions(decisions: object) -> list[tuple[str, ApprovalDecision]]
                 f"decisions[{call_id!r}] must be an ApprovalDecision, "
                 f"got {type(decision).__name__}."
             )
+        require_boolean(decision.approved, "approved")
+        _validate_persistable(decision.reason, "reason")
         pairs.append((call_id, decision))
     return pairs
 
@@ -635,3 +865,448 @@ def deserialize_decisions(raw: object) -> list[tuple[str, ApprovalDecision]]:
             )
         )
     return pairs
+
+
+GOVERNANCE_KEY = "dendrux.governance"
+
+
+def _invalid_json_constant(value: str) -> NoReturn:
+    raise ValueError("non-finite JSON number")
+
+
+def governance_snapshot(agent: Agent) -> dict[str, Any]:
+    """Versioned digests of stable governance configuration, never object reprs.
+
+    Budget amounts are intentionally excluded so a caller can raise them when
+    resuming a budget pause. Opaque custom settings opt in with a fingerprint.
+    """
+    import hashlib
+    import json
+
+    def qualified(value: Any) -> str:
+        return (
+            str(getattr(value, "__module__", type(value).__module__))
+            + "."
+            + str(getattr(value, "__qualname__", type(value).__qualname__))
+        )
+
+    def digest(value: Any) -> str:
+        wire = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(wire.encode("utf-8")) > 65536:
+            raise ValueError("Governance fingerprint exceeds 64 KiB")
+        return hashlib.sha256(wire.encode("utf-8")).hexdigest()
+
+    guards = []
+    for guard in agent.guardrails or ():
+        detectors = getattr(guard, "_detectors", None)
+        if detectors is None:
+            detectors = getattr(getattr(guard, "_scanner", None), "_detectors", ())
+        entities = getattr(guard, "entities", None)
+        if entities is None:
+            entities = [det.name for det in detectors or ()]
+        fingerprint = getattr(guard, "governance_fingerprint", None)
+        guards.append(
+            {
+                "class": qualified(type(guard)),
+                "action": guard.action,
+                "entities": sorted(set(entities)),
+                "engine": getattr(guard, "engine", None),
+                "restore": getattr(guard, "restore", None),
+                "fingerprint": fingerprint() if fingerprint is not None else None,
+            }
+        )
+    budget = agent.budget
+    parts = {
+        "guardrails": guards,
+        "before_tool": qualified(agent.before_tool) if agent.before_tool else None,
+        "deny": sorted(agent.deny),
+        "require_approval": sorted(agent.require_approval),
+        "limits": asdict(agent._limits),
+        "budget": (
+            {
+                "on_exceed": budget.on_exceed,
+                "include_children": budget.include_children,
+                "count_cache_tokens": bool(budget.count_cache_tokens),
+            }
+            if budget
+            else None
+        ),
+    }
+    hashed = {key: digest(value) for key, value in parts.items()}
+    return {"version": 1, "digest": digest(hashed), "parts": hashed}
+
+
+def _governance_change(agent: Agent, raw: dict[str, Any]) -> dict[str, Any] | None:
+    saved = raw.get(GOVERNANCE_KEY)
+    if saved is None:
+        return None
+    actual = governance_snapshot(agent)
+    if saved.get("digest") == actual["digest"]:
+        return None
+    changed = sorted(
+        key for key, value in actual["parts"].items() if saved.get("parts", {}).get(key) != value
+    )
+    return {
+        "expected_digest": saved.get("digest"),
+        "actual_digest": actual["digest"],
+        "changed": changed,
+    }
+
+
+def submission_validator(
+    run_id: str,
+    raw: dict[str, Any],
+    *,
+    agent: Agent | None,
+    expected_pause_id: str | None = None,
+    call_results: list[ToolResult] | None = None,
+    extra: Callable[[dict[str, Any]], None] | None = None,
+) -> Callable[[dict[str, Any]], None]:
+    """Validate before claiming, then repeat under the claim transaction's lock."""
+    from dendrux.errors import GovernanceMismatchError
+
+    # Even an optional-token client is bound to the generation we observed.
+    generation = expected_pause_id if expected_pause_id is not None else raw.get("pause_id")
+    base = pause_validator(
+        run_id, generation, agent_name=agent.name if agent else None, call_results=call_results
+    )
+
+    def validate(current: dict[str, Any]) -> None:
+        base(current)
+        if agent is not None and agent._on_governance_change == "raise":
+            change = _governance_change(agent, current)
+            if change is not None:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Governance mismatch: run_id=%s code=governance_mismatch",
+                    run_id,
+                    extra={"run_id": run_id, "code": "governance_mismatch"},
+                )
+                raise GovernanceMismatchError(run_id, **change)
+        if extra is not None:
+            extra(current)
+
+    validate(raw)
+    return validate
+
+
+@dataclass(frozen=True)
+class _WarningLocation:
+    filename: str
+    lineno: int
+    module: str
+    registry: dict[str | tuple[str, type[Warning], int], int]
+
+
+def capture_warning_location() -> _WarningLocation | None:
+    """Keep a lazy stream's creation site without retaining the caller frame."""
+    import inspect
+
+    frame = inspect.currentframe()
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+        frame = frame.f_back
+    if frame is None:
+        return None
+    return _WarningLocation(
+        frame.f_code.co_filename,
+        frame.f_lineno,
+        frame.f_globals.get("__name__", ""),
+        frame.f_globals.setdefault("__warningregistry__", {}),
+    )
+
+
+def _warn_at_location(message: str, location: _WarningLocation | None) -> None:
+    import warnings
+
+    if location is not None:
+        warnings.warn_explicit(
+            message,
+            FutureWarning,
+            location.filename,
+            location.lineno,
+            module=location.module,
+            registry=location.registry,
+        )
+    else:
+        warnings.warn(message, FutureWarning, stacklevel=_user_warning_stacklevel())
+
+
+def _user_warning_stacklevel() -> int:
+    import inspect
+
+    frame = inspect.currentframe()
+    frame = frame.f_back if frame is not None else None
+    level = 1
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("dendrux."):
+        level += 1
+        frame = frame.f_back
+    return level
+
+
+async def report_governance_change(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    raw: dict[str, Any],
+    *,
+    warning_location: _WarningLocation | None = None,
+) -> None:
+    import logging
+
+    log = logging.getLogger(__name__)
+    if GOVERNANCE_KEY not in raw:
+        log.info(
+            "Skipping pre-0.5 governance check: run_id=%s code=governance_legacy",
+            run_id,
+            extra={"run_id": run_id, "code": "governance_legacy"},
+        )
+        return
+    change = _governance_change(agent, raw)
+    if change is None:
+        return
+    log.warning(
+        "Governance changed: run_id=%s code=governance_changed",
+        run_id,
+        extra={"run_id": run_id, "code": "governance_changed"},
+    )
+    if not agent._on_governance_change_chosen:
+        _warn_at_location(
+            "Changed governance warns in 0.5; the default becomes 'raise' in 0.6. "
+            "Choose on_governance_change explicitly.",
+            warning_location,
+        )
+    await store.save_run_event(run_id, event_type="governance.changed", data=change)
+
+
+def _require_approval_token(approval: bool, expected: str | None) -> None:
+    from dendrux.types import InputValidationError, _validate_identifier
+
+    if expected is not None:
+        _validate_identifier(expected, "expected_pause_id", maximum=26)
+    if approval and expected is None:
+        raise InputValidationError("expected_pause_id", "pause_id_required")
+
+
+def warn_missing_pause_id(
+    agent: Agent,
+    expected: str | None,
+    *,
+    pause_id: str | None,
+    approval: bool = False,
+    warning_location: _WarningLocation | None = None,
+) -> None:
+    _require_approval_token(approval, expected)
+    if pause_id is not None and expected is None and agent._strict_tenancy:
+        _warn_at_location(
+            "Pass expected_pause_id to bind this submission to its pause.",
+            warning_location,
+        )
+
+
+def _client_json_payload(payload: str) -> str:
+    """JSON form for caps and transform input, without changing model text."""
+    import json
+
+    try:
+        json.loads(payload, parse_constant=_invalid_json_constant)
+    except (ValueError, RecursionError):
+        return json.dumps(payload)
+    return payload
+
+
+def _cap_client_result(result: ToolResult, limit: int) -> ToolResult:
+    """Apply the tool cap to an already validated client result."""
+    from dendrux.tools import cap_tool_result
+
+    return cap_tool_result(result, limit)
+
+
+async def prepare_client_results(
+    agent: Agent, run_id: str, pause: PauseState, results: list[ToolResult]
+) -> list[ToolResult]:
+    """Validate identity and cap; preserve wire bytes unless a transform applies."""
+    import json
+
+    from dendrux.loops.react import _apply_result_transform
+
+    results = await _validate_client_results(agent, run_id, results)
+    validate_result_names(run_id, pause, results, json_payload=False)
+    try:
+        capped = [
+            _cap_client_result(result, agent._limits.max_tool_result_bytes) for result in results
+        ]
+    except UnicodeError as exc:
+        raise _invalid_tool_result(run_id, "tool result payload is not valid UTF-8") from exc
+    validate_result_names(run_id, pause, capped)
+    lookups = await agent.get_tool_lookups()
+    pending = {call.id: call for call in pause.pending_tool_calls}
+    prepared = []
+    for result in capped:
+        if result.meta.get("code") == "size_limit":
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Client tool result capped: run_id=%s code=size_limit",
+                run_id,
+                extra={"run_id": run_id, "code": "size_limit"},
+            )
+        if result.success and agent.tool_result_transform is not None:
+            try:
+                normalized = _client_json_payload(result.payload)
+                value = await _apply_result_transform(
+                    agent.tool_result_transform,
+                    pending[result.call_id],
+                    lookups,
+                    json.loads(normalized, parse_constant=_invalid_json_constant),
+                )
+                # A string returned for legacy plain text is already model text.
+                # JSON inputs and structured outputs retain JSON serialization.
+                payload = (
+                    value
+                    if normalized != result.payload and isinstance(value, str)
+                    else json.dumps(value, allow_nan=False)
+                )
+                result = replace(result, payload=payload)
+            except Exception as exc:
+                raise _invalid_tool_result(run_id, "client tool result transform failed") from exc
+            result = (await _validate_client_results(agent, run_id, [result]))[0]
+            result = _cap_client_result(result, agent._limits.max_tool_result_bytes)
+        prepared.append(result)
+    return prepared
+
+
+def legacy_approval_denial(
+    run_id: str, pause: PauseState, results: list[ToolResult]
+) -> list[ToolResult]:
+    """Legacy rejection is a denial, never proof that server code executed."""
+    validate_result_names(run_id, pause, results, json_payload=False)
+    if any(result.success is not False for result in results):
+        raise _invalid_tool_result(run_id, "approval tool results must be failed denials")
+    return build_rejection_results(pause)
+
+
+async def prepare_resume_results(
+    agent: Agent, store: StateStore, run_id: str, pause: PauseState, results: list[ToolResult]
+) -> list[ToolResult]:
+    if await _resume_status(store, run_id) == RunStatus.WAITING_APPROVAL.value:
+        results = legacy_approval_denial(
+            run_id, pause, await _validate_client_results(agent, run_id, results)
+        )
+    return await prepare_client_results(agent, run_id, pause, results)
+
+
+async def _resume_status(store: StateStore, run_id: str) -> str | None:
+    projected = getattr(store, "get_run_status", None)
+    if projected is not None:
+        return cast("str | None", await projected(run_id))
+    record = await store.get_run(run_id)
+    return record.status if record is not None else None
+
+
+def _check_result_identities(run_id: str, results: list[ToolResult]) -> None:
+    if not isinstance(results, list) or len(results) > 1000:
+        raise _invalid_tool_result(run_id, "tool results exceed the batch limit")
+    for result in results:
+        if not isinstance(result, ToolResult) or any(
+            not isinstance(value, str) or not value or len(value) > 255
+            for value in (result.name, result.call_id)
+        ):
+            raise _invalid_tool_result(run_id, "invalid tool result identity")
+
+
+_CLIENT_VALIDATION_THREAD_BYTES = 65536
+_VALIDATION_GATES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+_VALIDATION_GATES_LOCK = threading.Lock()
+
+
+def _validation_gate() -> asyncio.Lock:
+    """The per-loop gate for off-loop client-result validation. Its wait queue
+    is bounded by the caller's own concurrency (one waiter per in-flight submit
+    call), so it needs no separate cap."""
+    loop = asyncio.get_running_loop()
+    with _VALIDATION_GATES_LOCK:
+        reference = _VALIDATION_GATES.get(loop)
+        gate = reference() if reference is not None else None
+        if gate is None:
+            gate = asyncio.Lock()
+            _VALIDATION_GATES[loop] = weakref.ref(gate)
+        return gate
+
+
+async def _finish_validation(worker: asyncio.Task[list[ToolResult]]) -> None:
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    if not worker.cancelled():
+        worker.exception()
+
+
+async def _thread_client_results(
+    agent: Agent, run_id: str, results: list[ToolResult]
+) -> list[ToolResult]:
+    async with _validation_gate():
+        worker = asyncio.create_task(
+            asyncio.to_thread(_validated_client_results, agent, run_id, results)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Hold the admission slot until the CPU job really ends. Cancelling
+            # an asyncio waiter cannot stop a running default-executor thread.
+            await _finish_validation(worker)
+            raise
+
+
+async def _validate_client_results(
+    agent: Agent, run_id: str, results: list[ToolResult]
+) -> list[ToolResult]:
+    _check_result_identities(run_id, results)
+    size = sum(
+        len(result.payload) * (1 if result.payload.isascii() else 4)
+        for result in results
+        if isinstance(result.payload, str)
+    )
+    if size >= _CLIENT_VALIDATION_THREAD_BYTES:
+        return await _thread_client_results(agent, run_id, results)
+    return _validated_client_results(agent, run_id, results)
+
+
+def _validated_client_results(
+    agent: Agent, run_id: str, results: list[ToolResult]
+) -> list[ToolResult]:
+    _check_result_identities(run_id, results)
+    checked = []
+    total = 0
+    for result in results:
+        try:
+            if len(result.images) > 100:
+                raise ValueError("image count limit")
+            data = {
+                "name": result.name,
+                "call_id": result.call_id,
+                "payload": result.payload,
+                "success": result.success,
+                "error": result.error,
+                "duration_ms": result.duration_ms,
+            }
+            from dendrux._wire import tool_result_from_dict
+
+            parsed = tool_result_from_dict(
+                data, agent._limits, _validated_payload=result._validated_payload
+            )
+            total += len(parsed.payload.encode("utf-8"))
+            if total > agent._limits.max_input_bytes:
+                raise ValueError("batch limit")
+        except (ValueError, TypeError, RecursionError):
+            raise _invalid_tool_result(
+                run_id, "tool result fields violate the client boundary"
+            ) from None
+        checked.append(replace(parsed, images=result.images))
+    return checked

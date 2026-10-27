@@ -238,7 +238,9 @@ class TestSubmitApproval:
         paused = await agent.run("refund 7")
         assert paused.status == RunStatus.WAITING_APPROVAL
 
-        result = await agent.submit_approval(paused.run_id, approved=True)
+        result = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
         assert result.status == RunStatus.SUCCESS
         assert result.answer == "processed"
 
@@ -345,11 +347,14 @@ class TestCancelRun:
         cancel_observed = asyncio.Event()
 
         async def fake_resume() -> None:
+            agent._task_manager.register_current(run_id)
             try:
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
                 cancel_observed.set()
                 raise
+            finally:
+                agent._task_manager.release_current(run_id)
 
         task = agent._task_manager.spawn(run_id, fake_resume())
         await asyncio.sleep(0)  # let the sleep park the task

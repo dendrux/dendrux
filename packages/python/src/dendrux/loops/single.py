@@ -18,7 +18,9 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux.guardrails._engine import GuardrailEngine
-from dendrux.llm._retry_telemetry import telemetry_context
+from dendrux.llm._calls import complete_call, stream_call
+from dendrux.llm._evidence import persistable_response
+from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetTracker
 from dendrux.loops._helpers import (
     StreamInterruptedError,
@@ -41,8 +43,11 @@ from dendrux.loops._helpers import (
 from dendrux.loops._images import ImageCallSite, control_stop, release_wire
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
+    _blocked_data,
     _drop_frame_locals,
+    _image_block_data,
     _image_policy,
+    _incoming_location,
     _interrupted_result,
     _read_control,
 )
@@ -106,7 +111,11 @@ async def _single_call_budget(
 
 def _call_usage(usage: UsageStats) -> UsageStats:
     """Run usage for the one call; an unpriced call marks the total unknown."""
-    return replace(usage, cost_unknown=usage.cost_usd is None)
+    return replace(
+        usage,
+        cost_unknown=usage.cost_unknown or usage.cost_usd is None,
+        cost_usd=None if usage.cost_unknown else usage.cost_usd,
+    )
 
 
 async def _record_rejected_call(
@@ -120,6 +129,7 @@ async def _record_rejected_call(
     warnings: list[str],
     semantic_messages: list[Message] | None,
     duration_ms: int,
+    model: str | None = None,
 ) -> None:
     """Record a structured call whose output failed validation as a completed call.
 
@@ -149,7 +159,9 @@ async def _record_rejected_call(
             stop_reason=response.stop_reason,
             raw_stop_reason=response.raw_stop_reason,
         )
-    response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+    response = price_response(
+        response, pricing=agent.pricing, default_model=provider.model, model=model
+    )
     exc.usage = response.usage
     exc.model = response.model or provider.model
     await record_llm(
@@ -282,7 +294,9 @@ class SingleCall(Loop):
             for msg_idx, msg in enumerate(messages):
                 if not msg.content:
                     continue
-                cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(msg)
+                cleaned_msg, findings, block_err = await g_engine.scan_incoming_message(
+                    msg, index=msg_idx
+                )
                 if findings:
                     all_in_findings.extend(findings)
                 if block_err is not None:
@@ -291,14 +305,18 @@ class SingleCall(Loop):
                         resolved_run_id,
                         "guardrail.blocked",
                         1,
-                        {"direction": "incoming", "error": block_err},
+                        _blocked_data(
+                            "incoming", block_err, findings, _incoming_location(msg, msg_idx)
+                        ),
                     )
                     await notify_governance(
                         notifier,
                         resolved_run_id,
                         "guardrail.blocked",
                         1,
-                        {"direction": "incoming", "error": block_err},
+                        _blocked_data(
+                            "incoming", block_err, findings, _incoming_location(msg, msg_idx)
+                        ),
                         warnings=notifier_warnings,
                     )
                     return RunResult(
@@ -308,7 +326,10 @@ class SingleCall(Loop):
                         steps=[],
                         iteration_count=1,
                         usage=UsageStats(),
-                        meta=guardrail_meta(g_engine, notifier_warnings),
+                        meta={
+                            **guardrail_meta(g_engine, notifier_warnings),
+                            "failure_reason": "guardrail_blocked",
+                        },
                     )
                 if cleaned_msg is not msg:
                     _in_was_redacted = True
@@ -362,7 +383,7 @@ class SingleCall(Loop):
         if prepared.block_error is not None:
             await images.emit(
                 "guardrail.blocked",
-                {"direction": "incoming_image", "error": prepared.block_error},
+                _image_block_data(prepared.block_error, images.state),
                 1,
             )
             return RunResult(
@@ -372,7 +393,10 @@ class SingleCall(Loop):
                 steps=[],
                 iteration_count=1,
                 usage=UsageStats(),
-                meta=guardrail_meta(g_engine, notifier_warnings),
+                meta={
+                    **guardrail_meta(g_engine, notifier_warnings),
+                    "failure_reason": "guardrail_blocked",
+                },
             )
 
         # Structured output path: use the structured helper
@@ -416,7 +440,8 @@ class SingleCall(Loop):
                             **_pkw,
                         )
                     else:
-                        response = await provider.complete(
+                        response = await complete_call(
+                            provider,
                             prepared.wire,
                             tools=None,
                             run_id=resolved_run_id,
@@ -441,6 +466,7 @@ class SingleCall(Loop):
                     warnings=notifier_warnings,
                     semantic_messages=prepared.semantic,
                     duration_ms=int((time.monotonic() - t0) * 1000),
+                    model=_pkw.get("model"),
                 )
                 raise
             except Exception as _llm_exc:
@@ -501,7 +527,13 @@ class SingleCall(Loop):
 
         prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
-        response = price_response(response, pricing=agent.pricing, default_model=provider.model)
+        response = persistable_response(response)
+        response = price_response(
+            response,
+            pricing=agent.pricing,
+            default_model=provider.model,
+            model=_pkw.get("model"),
+        )
 
         # Output guardrail — detection-only. Persistence stores raw
         # (DB is ground truth); block policies abort the run, findings
@@ -585,14 +617,14 @@ class SingleCall(Loop):
                     resolved_run_id,
                     "guardrail.blocked",
                     1,
-                    {"direction": "outgoing", "error": out_block},
+                    _blocked_data("outgoing", out_block, out_findings, "output"),
                 )
                 await notify_governance(
                     notifier,
                     resolved_run_id,
                     "guardrail.blocked",
                     1,
-                    {"direction": "outgoing", "error": out_block},
+                    _blocked_data("outgoing", out_block, out_findings, "output"),
                     warnings=notifier_warnings,
                 )
                 return RunResult(
@@ -602,7 +634,10 @@ class SingleCall(Loop):
                     steps=[],
                     iteration_count=1,
                     usage=response.usage,
-                    meta=guardrail_meta(g_engine, notifier_warnings),
+                    meta={
+                        **guardrail_meta(g_engine, notifier_warnings),
+                        "failure_reason": "guardrail_blocked",
+                    },
                 )
 
         # Record the LLM response (raw — DB is ground truth).
@@ -772,19 +807,19 @@ class SingleCall(Loop):
         )
         t0 = time.monotonic()
         llm_response: LLMResponse | None = None
-        _stream_telemetry = telemetry_context(
+        provider_stream = telemetry_stream(
+            stream_call(
+                provider,
+                prepared.wire,
+                tools=None,
+                run_id=resolved_run_id,
+                cache_key_prefix=cache_key_prefix,
+                **_pkw,
+            ),
             run_id=resolved_run_id,
             iteration=1,
             recorder=recorder,
             notifier=notifier,
-        )
-        _stream_telemetry.__enter__()
-        provider_stream = provider.complete_stream(
-            prepared.wire,
-            tools=None,
-            run_id=resolved_run_id,
-            cache_key_prefix=cache_key_prefix,
-            **_pkw,
         )
         partial_text: list[str] = []
         interrupted = False
@@ -900,16 +935,22 @@ class SingleCall(Loop):
                     semantic_tools=None,
                 )
                 t0 = time.monotonic()
-                provider_stream = provider.complete_stream(
-                    prepared.wire,
-                    tools=None,
+                provider_stream = telemetry_stream(
+                    stream_call(
+                        provider,
+                        prepared.wire,
+                        tools=None,
+                        run_id=resolved_run_id,
+                        cache_key_prefix=cache_key_prefix,
+                        **_pkw,
+                    ),
                     run_id=resolved_run_id,
-                    cache_key_prefix=cache_key_prefix,
-                    **_pkw,
+                    iteration=1,
+                    recorder=recorder,
+                    notifier=notifier,
                 )
         finally:
             await provider_stream.aclose()
-            _stream_telemetry.__exit__(None, None, None)
 
         if cancelled:
             yield RunEvent(
@@ -943,8 +984,12 @@ class SingleCall(Loop):
         assert llm_response is not None
         prepared = images.mark_sent(prepared)
         llm_duration_ms = int((time.monotonic() - t0) * 1000)
+        llm_response = persistable_response(llm_response)
         llm_response = price_response(
-            llm_response, pricing=agent.pricing, default_model=provider.model
+            llm_response,
+            pricing=agent.pricing,
+            default_model=provider.model,
+            model=_pkw.get("model"),
         )
 
         await record_llm(

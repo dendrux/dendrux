@@ -36,6 +36,7 @@ The tool's `description` is the full docstring. The arguments schema is generate
 | `timeout_seconds` | `120.0` | Execution timeout for server tools. |
 | `parameters` | `None` | Explicit JSON Schema for the arguments. Skips generation from type hints. |
 | `strict` | `False` | Opt into strict tool calling on OpenAI and Anthropic. See [Strict mode](#strict-mode). |
+| `receives_pii` | `False` | With `PII(restore="allowlisted")`, `True` (or a set of entity names such as `{"EMAIL_ADDRESS"}`) lets this tool receive real values in place of placeholders. See [PII restore](/docs/architecture/pii-restore). |
 
 ## Supported parameter types
 
@@ -67,7 +68,7 @@ Some types are rejected at decoration time with a `TypeError` that names the par
 
 For any of these, pass the schema yourself with `parameters=`.
 
-> **Arguments arrive as JSON-decoded values.** A `BaseModel`, dataclass, or `TypedDict` parameter receives a `dict`, and an `Enum` parameter receives the raw value. Validate the input yourself, for example with `Node.model_validate(raw)` or `Unit(raw)`.
+> **Arguments are validated and coerced (0.5.0).** A `BaseModel` parameter receives the model instance, an `Enum` parameter receives the member, and values are converted to the annotated types. See [How arguments are checked](#how-arguments-are-checked). Before 0.5.0 these arrived as plain JSON values (`dict`, raw value) and you had to validate them yourself.
 
 > **Malformed arguments never reach your tool.** If the model's arguments are not valid JSON, the call is rejected before parameter validation with `code: "invalid_json"`. The model sees the parse error and retries; the run does not fail, and the raw arguments are never persisted. See [Tool argument validation](/docs/architecture/loops#tool-argument-validation).
 
@@ -92,6 +93,79 @@ async def search(
 ```
 
 **Google-style docstring `Args:` section**: Dendrux reads lines of the form `name: text` and `name (type): text`. Indented continuation lines are joined to the line above. Entries for names that are not parameters are ignored. The docstring itself stays unchanged as the tool's `description`.
+
+## How arguments are checked
+
+For a local `@tool`, each call goes through these steps in order, and a failure at any step returns an error to the model instead of running your function:
+
+1. The arguments string is parsed as JSON (`code: "invalid_json"` on failure).
+2. `deny=` is applied.
+3. PII placeholders are restored, if your PII guardrail and `restore=` mode allow it for this tool.
+4. The arguments are validated against the tool's JSON Schema. Integral floats such as `3.0` are accepted for `integer`.
+5. They are coerced to the annotated types: `3.0` becomes `3`, a dict becomes the `BaseModel`, dataclass or `TypedDict`, a string becomes the `Enum` member, an ISO 8601 string becomes a `datetime`, and `Field(...)` constraints (`ge`, `le`, `min_length`, `max_length`, `pattern` and so on) are enforced. The constraints also appear as keywords in the generated schema.
+6. `max_calls_per_run` is checked.
+7. `before_tool` runs.
+8. If approval is needed, the run pauses.
+9. Your function runs.
+
+Validation happens before the approval pause, so a person is never asked to approve a call that could not have run.
+
+**What a reviewer sees, and what runs.** Your function is called with objects built from the coerced arguments, and `before_tool` receives real values in process. The approval view (`approval.requested` and any stored or displayed approval) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when PII redaction is on, before coercion, and without injected defaults. Coercion is deterministic, so the approved arguments decide what runs.
+
+```python
+from pydantic import BaseModel, Field
+
+class Address(BaseModel):
+    city: str
+    zip: str = Field(pattern=r"^\d{5}$")
+
+@tool()
+async def ship(order_id: int, to: Address) -> str:
+    """Ship an order."""
+    return f"{order_id} -> {to.city}"     # `to` is an Address, not a dict
+```
+
+Details:
+
+- Error messages name the field and the constraint that failed, never the value, so personal data cannot flow back to the model provider through an error. Dictionary keys and unknown argument names are not echoed either: a key shows as `<key>`, and an unexpected top-level argument is reported as a count with the list of valid arguments (`ship has 1 unknown argument. Valid arguments: order_id, to`). A few Pydantic messages that quote the input (a bad discriminator tag, UUID, base64 or embedded JSON) are replaced with fixed text.
+- Arguments that cannot be stored are refused before any hook, approval or execution, for known, unknown and client tools alike: a string or key holding NUL or a lone surrogate, a non-finite number, or a structure too large to persist returns `code: "invalid_params"` to the model. The message names the tool and the rule, never the content.
+- A tool whose own argument schema is malformed (for example `required` that is not a list of strings, including `required: null`) returns `code: "invalid_tool_schema"` instead of raising. The log line names the tool, not the schema. MCP tools with such a schema are skipped at discovery (see [MCP](/docs/architecture/mcp#discovery-limits)).
+- `*args` and `**kwargs` are left out of the generated schema.
+- A tool with an explicit `parameters=` schema keeps JSON Schema validation only. There is no coercion, and your function receives the plain JSON values.
+- MCP tools and client tools are not coerced: their arguments and results are unchanged from 0.4.
+- Tool schemas are part of the prompt, so adding constraint keywords can change a prompt-cache key once, on the first request after you upgrade.
+
+## Timeouts and the thread pool
+
+`timeout_seconds` bounds each server tool call. How a timeout behaves depends on whether the call had started:
+
+| Situation | The model sees | Safe to retry? |
+| --- | --- | --- |
+| The call was still queued when the timeout hit | `code: "timeout_not_started"` | Yes, it never ran |
+| The call had started | `code: "timeout_outcome_unknown"`, with text warning not to blindly retry tools with side effects | No, it may have completed |
+
+Sync tools (plain `def` functions) run on one process-wide, bounded thread pool, created on first use. Size it with `DENDRUX_TOOL_THREADS` (default 32). Limit what one `Agent` can occupy with `Agent(tool_threads=8)` (default 8), so one agent or tenant cannot starve the others. Pool threads are daemon threads: a hung sync tool never blocks interpreter exit, but its side effect may be cut off at exit.
+
+A sync tool that has timed out cannot be killed; it keeps its thread until it returns. Dendrux counts these and reports them in a log line and as `zombie_threads` on the `tool.completed` event. `dendrux.tool_pool_stats()` returns a snapshot (`max_threads`, `threads`, `busy`, `queued`, `zombies`) so you can export it as a gauge; restart the process if `zombies` keeps growing toward `max_threads`. Async tools are cancelled at the timeout.
+
+**Waiting calls are bounded too.** Each Agent runs at most `tool_threads` tool calls at once, and at most **256 more may wait** for a slot. A call that arrives when the queue is full is not started: the model gets a retryable `code: "tool_pool_saturated"` result and the tool never runs, so a burst of calls cannot build an unbounded backlog. Change the bound for the process with the `DENDRUX_TOOL_QUEUE_LIMIT` environment variable (a positive integer, read the first time a call has to wait). There is no `Agent` argument for it in 0.5.
+
+If a parallel batch ends the run (a failure that stops the run), the async siblings are cancelled and recorded as `cancelled`; sibling sync tools that had already started are recorded with an unknown outcome.
+
+## Result size limits
+
+A tool result larger than `Limits.max_tool_result_bytes` (1 MiB by default) is replaced before it is stored or sent to the model. A JSON result becomes `{"error": "result too large", "code": "size_limit", "bytes": N}`; a plain string result is truncated with a marker. The same cap applies to local, MCP and client-submitted results.
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
+```python
+from dendrux import Agent, Limits
+
+Agent(provider=provider, prompt="...", tools=[export_csv],
+      limits=Limits(max_tool_result_bytes=8 * 1024 * 1024))
+```
+
+Return a summary, a count, or a file reference from the tool and let the model ask for more, rather than raising the cap. The other limits (`max_input_bytes`, `max_metadata_bytes`, `max_notes_per_run`) are on the [Agent](/docs/reference/agent#limits) page.
 
 ## Explicit schema: `parameters=`
 
@@ -154,6 +228,8 @@ If Anthropic still rejects a strict schema (its grammar compiler has size and re
 To turn strict mode off for a provider, pass `strict=False`:
 
 ```python
+from dendrux.llm.anthropic import AnthropicProvider
+
 provider = AnthropicProvider(model="claude-sonnet-4-6", strict=False)
 ```
 
@@ -171,7 +247,7 @@ The call does not run. The model gets a failed tool result that lists what it ca
 Unknown tool: bash. Available tools: read_file, write_file
 ```
 
-Names are sorted and capped at 50, then `, … and N more`. If no tools were offered, the text is `Unknown tool: bash. No tools are available.` The `Unknown tool: <name>` prefix is stable.
+Names are sorted and capped at 50, then `, … and N more`. If no tools were offered, the text is `Unknown tool: bash. No tools are available.` The `Unknown tool: <name>` prefix is stable. The rejection is recorded with `code: "unknown_tool"` on the result and the `tool.completed` event, and happens before `before_tool` and approval, so neither sees it. A name too long to store is not echoed back.
 
 ## MCP tools
 

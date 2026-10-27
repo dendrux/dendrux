@@ -20,7 +20,7 @@ Scenarios
     S9a  Anthropic many-image dimension rule (no request is sent)
     L06  text-only two-call run (cache, usage and request-hash baseline for the v0.3.0 pairing)
 
-Run (the coordinator does this; keys come from the environment only):
+Run (the database does this; keys come from the environment only):
     DENDRUX_LIVE=1 DENDRUX_LIVE_RESULTS=/path/results.json \
         pytest tests/live/test_images_live.py -v
 

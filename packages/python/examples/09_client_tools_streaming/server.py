@@ -104,7 +104,7 @@ def _serialize_event(event: RunEvent) -> dict[str, Any]:
         if r.error is not None:
             rd["error"] = r.error
         # On RUN_PAUSED: include pending tool calls for the browser
-        ps = r.meta.get("pause_state")
+        ps = r.pending
         if ps is not None:
             rd["pending_tool_calls"] = [
                 {
@@ -112,7 +112,7 @@ def _serialize_event(event: RunEvent) -> dict[str, Any]:
                     "name": tc.name,
                     "params": _json_safe(tc.params),
                 }
-                for tc in ps.pending_tool_calls
+                for tc in ps.tool_calls
             ]
         d["run_result"] = rd
 
@@ -238,10 +238,12 @@ def create_demo_app():
                 )
                 for r in raw_results
             ]
-        except (KeyError, TypeError) as exc:
+        except (KeyError, TypeError):
+            # Keep exception text out of the response: a fixed message is enough
+            # for the client, and never leaks payload fragments.
             return JSONResponse(
                 status_code=400,
-                content={"error": f"Invalid tool_results: {exc}"},
+                content={"error": "Invalid tool_results: each item needs call_id and result"},
             )
 
         stream = agent.resume_stream(run_id, tool_results=tool_results)

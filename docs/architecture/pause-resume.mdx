@@ -16,8 +16,8 @@ A run can be paused in four ways. Each maps to a status on the `agent_runs` row 
 | Status | Triggered by | Resume method |
 | --- | --- | --- |
 | `waiting_client_tool` | A tool declared with `target="client"` is called. The runtime stops before executing it and expects the client to run it and submit the result. | `submit_tool_results(run_id, results=...)` |
-| `waiting_human_input` | The loop returns a `Clarification` action, signalling that the model needs free-text input from a human to continue. | `submit_input(run_id, text=...)` |
-| `waiting_approval` | A tool declared in `require_approval=[...]`, or a call the [`before_tool` hook](/docs/architecture/tool-policy) gated, is about to run. The runtime pauses to gate the call. | `submit_approval(run_id, approved=True)` or `submit_approval(run_id, decisions={...})` |
+| `waiting_human_input` | The loop returns a `Clarification` action, signalling that the model needs free-text input from a human to continue. The built-in tool-calling strategy never returns one on its own (a text-only reply is a final answer), so this pause needs a strategy that does; a built-in ask-the-user tool is planned. | `submit_input(run_id, text=...)` |
+| `waiting_approval` | A tool declared in `require_approval=[...]`, or a call the [`before_tool` hook](/docs/architecture/tool-policy) gated, is about to run. The runtime pauses to gate the call. | `submit_approval(run_id, approved=True, expected_pause_id=...)` or `submit_approval(run_id, decisions={...}, expected_pause_id=...)` (rejecting needs no pause id) |
 | `paused` | `request_pause(run_id)` was called, or a [budget](/docs/architecture/budget) with `on_exceed="pause"` was reached. Nothing is pending; the run simply stopped at a checkpoint. | `submit_resume(run_id)` |
 
 All four follow the same shape: runtime hits a pause point, persists pending metadata, writes `run.paused`, and returns. A later call to the matching `submit_*` method loads the row, atomically flips the status back to `running`, and re-enters the loop.
@@ -81,12 +81,15 @@ async def main() -> None:
         tools=[refund],
         require_approval=["refund"],          # refund gates on approval
         database_url="sqlite+aiosqlite:///pr.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         paused = await agent.run("Refund order 42 using the refund tool.")
         print(paused.status.value)            # waiting_approval
 
-        # Later, elsewhere: only the run_id is needed to resume.
-        done = await agent.submit_approval(paused.run_id, approved=True)
+        # Later, send the pause generation that the approver reviewed.
+        done = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
         print(done.status.value)              # success
         print(done.answer)                    # "The refund has been successfully processed..."
 
@@ -96,7 +99,7 @@ asyncio.run(main())
 
 The other pause statuses resume the same way, with the method that matches the pause: `submit_tool_results(run_id, results=...)` for `waiting_client_tool`, `submit_input(run_id, text=...)` for `waiting_human_input` and `submit_resume(run_id)` for `paused`.
 
-The DB row above after calling `submit_approval(run_id, approved=True)`:
+The DB row above after calling `submit_approval(run_id, approved=True, expected_pause_id=pause_id)`:
 
 ```text
 id: 01KPG17P8XNWVJC1EN0M3XKCK4
@@ -139,14 +142,46 @@ UPDATE agent_runs
 
 This collapses "check the status is something I can finalize, then finalize it" into a single atomic statement. A cancel request arriving during that window either wins or loses based on whose UPDATE commits first. There is no in-between state.
 
+## Pause ids and stale submits
+
+The atomic claim guarantees one winner, but it cannot tell whether the winner was answering the pause they actually saw. A browser tab left open for an hour can approve a pause that has since been replaced by a newer one on the same run. Since 0.5.0 every pause has a `pause_id` (a ULID) to close that gap.
+
+- The id is stored in the run's pause state and exposed on `RunResult.pause_id`, on `PendingPause.pause_id` (`RunStore.get_pending`), on `PausePair.pause_id` (`RunStore.get_pause_page`) and on the `run.paused` event. Pauses recorded before 0.5.0 have none.
+- Every `submit_*` method, `resume` and `resume_stream` accepts `expected_pause_id=`. If the run's current pause has a different id, nothing is claimed, nothing is written, and the call raises `PauseStatusMismatchError` with `reason="pause_id"` (HTTP 409). The error carries `expected_pause_id` and `current_pause_id`.
+- **Approving requires it.** `submit_approval(approved=True)`, a `decisions=` batch that approves any call, and `resume` of a `waiting_approval` run all raise `InputValidationError` (field `expected_pause_id`, code `pause_id_required`, a `ValueError`) when the token is missing, before anything is claimed. Rejecting (`approved=False`, or only denials) does not need it. Tool results, input answers and plain continues take it as an option; under `Agent(strict_tenancy=True)` leaving it out prints a `FutureWarning`.
+- A token must be a non-empty string of at most 26 characters without NUL or lone surrogates; anything else raises `InputValidationError` and never reaches the database.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
+```python
+paused = await agent.run("Refund order 42")
+await agent.submit_approval(
+    paused.run_id, approved=True, expected_pause_id=paused.pause_id,
+)
+```
+
+Round-trip the id through your client: send it down with the approval request and send it back with the decision. After a `PauseStatusMismatchError`, fetch the pending pause again with `RunStore.get_pending` and ask the actor again; do not retry the old decision.
+
+Validation (agent name, `pause_id`, call ids) runs before the claim and again inside the claim transaction, and a failure after the claim releases it back to the paused status, so a rejected submit never leaves the run stuck as `running`.
+
+Pause state is versioned (`schema_version`, currently `1`). A reader ignores keys it does not know and defaults ones that are missing, which is what lets 0.4.1 and 0.5 workers share runs during a rolling deploy. Pause state also keeps the generation settings the run used (`model`, `max_tokens`, `temperature`, `thinking`, `effort`) so a resume continues with them; request headers and other provider options are never stored.
+
+## Fencing: which worker owns a run
+
+`agent_runs.claim_epoch` counts claims. Every claim raises it and every status change (finish, pause, release) is conditional on the worker's own value. If a sweep takes over a run, or a slow worker wakes up after another has claimed the run, the old worker finds its epoch stale at its next checkpoint (top of an iteration, before a tool, before a pause) and stops without writing. Fencing protects runs claimed by 0.5 workers; during a rolling deploy a run claimed by a 0.4.1 worker has no epoch to compare.
+
 ## Requesting a pause
 
 A waiting pause happens because the run needs input. A **requested pause** is for the opposite case: the run is healthy and running, and your application wants it to stop where it is (a deploy window, an operator's "hold on", a tenant that hit a limit) and continue later, in this process or another.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 outcome = await agent.request_pause(run_id, reason="deploy window")
 print(outcome.status_before, "->", outcome.affected)   # running -> [('01M5...', 'requested')]
 ```
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def request_pause(
@@ -180,6 +215,8 @@ A request does not wait for the pause. It returns when the flag is recorded. `Pa
 If the run reaches a waiting pause first (it asks for approval, say), that pause satisfies the request and clears the flag. If the iteration in flight produces the final answer, the run completes and the flag is cleared.
 
 ### Resuming
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.submit_resume(run_id)      # blocks to the next pause or terminal state
@@ -225,7 +262,7 @@ Cancellation is cooperative in both directions. A cancel (or pause) that arrives
 
 ### Paused runs show their spend
 
-When a run pauses, its running totals (`total_*` tokens and `total_cost_usd`) are written to the row at the same time. Before 0.3.0 a paused run could read zero until it finished; now `RunStore.get_run` and the dashboard show what it has spent so far.
+When a run pauses, its running totals (`total_*` tokens and `total_cost_usd`) are written to the row at the same time. Before 0.3.0 a paused run could read zero until it finished; now `RunStore.get_run` and your app can display what it has spent so far.
 
 ### SingleCall
 
@@ -238,7 +275,7 @@ The alternative to persist-and-exit is to keep the run in memory and block the c
 1. The human who has to approve is not on the same server that started the run.
 2. The server restarts while waiting.
 3. The pause lasts longer than an HTTP request, a worker lease, or a connection timeout.
-4. The app wants to read the paused state from a dashboard or a separate API.
+4. The app wants to read the paused state from inspection tools you build or a separate API.
 
 Persist-and-exit solves all four at once. The `agent_runs` row is the handoff token, `pause_data` carries what the runner needs, `run_events` gives readers the timeline, and the CAS on the status column keeps concurrent resumers honest.
 

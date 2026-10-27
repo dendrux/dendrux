@@ -1,8 +1,7 @@
 """Image-blob migration (c6d7e8f9a0b1) on a populated database: up, down, up.
 
-Postgres runs the real Alembic chain in a private database
-(``<name>_imgmig_test``, derived from ``DENDRUX_TEST_PG_URL``, dropped at the
-end); skipped when that variable is unset. SQLite checks this revision alone
+Postgres runs the real Alembic chain in a temporary schema inside
+``DENDRUX_TEST_PG_URL``; skipped when that variable is unset. SQLite checks this revision alone
 (it cannot run the full chain): the prior shape is ``create_all`` minus the
 blob tables, stamped at ``b5c6d7e8f9a0``.
 """
@@ -11,12 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
-import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -26,10 +22,13 @@ from dendrux.media import BlobEdge
 from dendrux.runtime._blob_catalog import BlobServices
 from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.store import RunStore
+from tests.integration._migration_schema import (
+    migration_schema,
+)
 from tests.unit.test_blob_catalog import make_png, store_png
 
 PRIOR = "b5c6d7e8f9a0"
-HEAD = "c6d7e8f9a0b1"
+HEAD = "e8f9a0b1c2d3"  # R1 and sweep indexes sit above the image blobs
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "migrations"
 
 
@@ -41,15 +40,6 @@ def _alembic(url: str, op: str, rev: str) -> None:
     cfg.set_main_option("script_location", str(_MIGRATIONS))
     cfg.set_main_option("sqlalchemy.url", url)
     getattr(command, op)(cfg, rev)
-
-
-def _private_pg_url() -> str | None:
-    raw = os.environ.get("DENDRUX_TEST_PG_URL")
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    name = parsed.path.lstrip("/").removesuffix("_test") + "_imgmig_test"
-    return urlunparse(parsed._replace(path=f"/{name}"))
 
 
 async def _seed(conn: Any) -> None:
@@ -84,10 +74,20 @@ async def _seed(conn: Any) -> None:
 
 
 async def _snapshot(conn: Any) -> list[Any]:
+    # 0.5.0 R1 adds agent_runs.claim_epoch above this revision; leave it out.
     out: list[Any] = []
     for table in ("agent_runs", "react_traces"):
         result = await conn.execute(text(f"SELECT * FROM {table} ORDER BY id"))
-        out.append([tuple(r) for r in result.all()])
+        out.append(
+            [
+                tuple(
+                    v
+                    for k, v in r._mapping.items()
+                    if k not in {"claim_epoch", "status_changed_at"}
+                )
+                for r in result.all()
+            ]
+        )
     return out
 
 
@@ -143,22 +143,9 @@ async def _check_prior(engine: Any) -> None:
         assert "run_inbox" in tables
 
 
-async def test_postgres_up_down_up_on_populated_db() -> None:
-    url = _private_pg_url()
-    if url is None:
-        pytest.skip("DENDRUX_TEST_PG_URL not set")
-    name = urlparse(url).path.lstrip("/")
-    assert name.endswith("_imgmig_test")
-    maintenance = create_async_engine(
-        urlunparse(urlparse(url)._replace(path="/postgres")),
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-    )
-    async with maintenance.connect() as conn:
-        await conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
-        await conn.execute(text(f'CREATE DATABASE "{name}"'))
-    engine = create_async_engine(url, poolclass=NullPool)
-    try:
+async def test_postgres_up_down_up_on_populated_db(pg_test_url: str) -> None:
+    url = pg_test_url
+    async with migration_schema(url, "image_migration") as engine:
         await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
         async with engine.begin() as conn:
             await _seed(conn)
@@ -184,11 +171,6 @@ async def test_postgres_up_down_up_on_populated_db() -> None:
             blobs = (await conn.execute(text("SELECT count(*) FROM dendrux_blobs"))).scalar_one()
             assert blobs == 0
         await _check_head(engine, url)
-    finally:
-        await engine.dispose()
-        async with maintenance.connect() as conn:
-            await conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
-        await maintenance.dispose()
 
 
 async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
@@ -199,6 +181,8 @@ async def test_sqlite_revision_on_populated_db(tmp_path: Path) -> None:
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(text("DROP TABLE dendrux_blob_refs"))
             await conn.execute(text("DROP TABLE dendrux_blobs"))
+            # 0.5.0 R1 sits above the image blobs.
+            await conn.execute(text("ALTER TABLE agent_runs DROP COLUMN claim_epoch"))
             await _seed(conn)
         async with engine.connect() as conn:
             before = await _snapshot(conn)

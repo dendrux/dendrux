@@ -7,6 +7,8 @@ description: Decide every tool call in code with before_tool. Allow, deny, requi
 
 `deny=` and `require_approval=` are static: they key on a tool name. Real policy usually depends on the arguments, the run, or something outside the agent ("this email goes to more than ten people", "this tenant is locked", "a prompt-injection flag fired on this run"). `Agent(before_tool=...)` takes a function that sees each tool call before it runs and returns a decision.
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, ToolCallContext, ToolDecision
 

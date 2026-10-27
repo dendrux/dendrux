@@ -5,7 +5,8 @@ StateStore. The runner creates this when persistence is active.
 
 Write classification:
   - Fail-closed (retry with backoff, then propagate): save_trace, save_tool_call, save_run_event
-  - Best-effort (exceptions swallowed): save_usage, save_llm_interaction, touch_progress
+  - Best-effort (bounded transient retry, then swallowed): save_usage, save_llm_interaction
+  - Best-effort (exceptions swallowed): touch_progress
 
 Images (0.4.0): parts messages persist ``meta["dendrux.parts"]`` on traces
 and ``parts`` in ``semantic_request.messages``; tool results with images
@@ -24,13 +25,14 @@ LoopRecorder protocol so third-party recorders can subscribe.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Any
 
-from dendrux.errors import ImagePersistenceUnsupportedError
+from dendrux.errors import ImagePersistenceUnsupportedError, safe_exception_info
 from dendrux.loops.base import BaseRecorder
 from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
-from dendrux.runtime.durability import retry_critical
+from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
     ImageRef,
@@ -180,7 +182,6 @@ class PersistenceRecorder(BaseRecorder):
         provider_name: str | None = None,
         target_lookup: dict[str, ToolTarget] | None = None,
         initial_order_index: int = 0,
-        event_sequencer: Any | None = None,
         tenant_scope: str | None = None,
         provider: Any | None = None,
     ) -> None:
@@ -192,7 +193,6 @@ class PersistenceRecorder(BaseRecorder):
         self._provider_name = provider_name
         self._target_lookup = target_lookup or {}
         self._order_index = initial_order_index
-        self._event_sequencer = event_sequencer
 
     def _edge_kwargs(self, edges: list[BlobEdge]) -> dict[str, Any]:
         """``blob_refs`` kwargs for a store write, only when there are edges."""
@@ -216,18 +216,23 @@ class PersistenceRecorder(BaseRecorder):
         data: dict[str, Any] | None = None,
         correlation_id: str | None = None,
     ) -> None:
-        """Record a durable run event. FAIL-CLOSED with retry."""
-        seq = self._event_sequencer.next() if self._event_sequencer else 0
+        """Record a durable run event. FAIL-CLOSED with retry.
+
+        The store allocates the sequence index in the insert.
+        """
 
         async def _write() -> None:
-            await self._store.save_run_event(
+            from dendrux.runtime.state import validate_event_index, validate_event_writer
+
+            validate_event_writer(self._store)
+            index = await self._store.save_run_event(
                 self._run_id,
                 event_type=event_type,
-                sequence_index=seq,
                 iteration_index=iteration,
                 correlation_id=correlation_id,
                 data=data,
             )
+            validate_event_index(index)
 
         await retry_critical(_write, label="save_run_event", run_id=self._run_id)
 
@@ -345,52 +350,74 @@ class PersistenceRecorder(BaseRecorder):
 
         # BEST-EFFORT: llm_interactions (full forensics)
         try:
-            await self._store.save_llm_interaction(
-                self._run_id,
-                iteration_index=iteration,
-                usage=response.usage,
-                model=response.model or self._model,
-                provider=self._provider_name,
-                duration_ms=duration_ms,
-                semantic_request=semantic_request,
-                semantic_response=semantic_response,
-                provider_request=(
-                    scrub_inline_images(response.provider_request)
-                    if has_parts
-                    else response.provider_request
-                ),
-                provider_response=response.provider_response,
-                guardrail_findings=guardrail_findings,
-                interaction_id=interaction_id,
+
+            async def _write_interaction() -> None:
+                await self._store.save_llm_interaction(
+                    self._run_id,
+                    iteration_index=iteration,
+                    usage=response.usage,
+                    model=response.model or self._model,
+                    provider=self._provider_name,
+                    duration_ms=duration_ms,
+                    semantic_request=semantic_request,
+                    semantic_response=semantic_response,
+                    provider_request=(
+                        scrub_inline_images(response.provider_request)
+                        if has_parts
+                        else response.provider_request
+                    ),
+                    provider_response=response.provider_response,
+                    guardrail_findings=guardrail_findings,
+                    interaction_id=interaction_id,
+                )
+
+            await retry_transient_db(
+                _write_interaction, label="save_llm_interaction", run_id=self._run_id
             )
         except Exception:
             logger.warning(
                 "Failed to save llm_interaction for run %s iteration %d",
                 self._run_id,
                 iteration,
-                exc_info=True,
+                exc_info=safe_exception_info(),
             )
 
+        # Mint once per logical call, outside the bounded retry loop.
+        usage_id = generate_ulid()
+        usage_params = inspect.signature(self._store.save_usage).parameters
+        idempotent_usage = "usage_id" in usage_params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in usage_params.values()
+        )
         # BEST-EFFORT: token_usage (cost tracking)
         try:
-            await self._store.save_usage(
-                self._run_id,
-                iteration_index=iteration,
-                usage=response.usage,
-                model=response.model or self._model,
-                provider=self._provider_name,
-                meta=(
-                    {"cost_source": response.usage.cost_source}
-                    if response.usage.cost_source is not None
-                    else None
-                ),
-            )
+            usage_kwargs: dict[str, Any] = {"usage_id": usage_id} if idempotent_usage else {}
+
+            async def _write_usage() -> None:
+                await self._store.save_usage(
+                    self._run_id,
+                    **usage_kwargs,
+                    iteration_index=iteration,
+                    usage=response.usage,
+                    model=response.model or self._model,
+                    provider=self._provider_name,
+                    meta=(
+                        {"cost_source": response.usage.cost_source}
+                        if response.usage.cost_source is not None
+                        else None
+                    ),
+                )
+
+            if idempotent_usage:
+                await retry_transient_db(_write_usage, label="save_usage", run_id=self._run_id)
+            else:
+                # A legacy store cannot safely replay an ambiguous commit.
+                await _write_usage()
         except Exception:
             logger.warning(
                 "Failed to save usage for run %s iteration %d",
                 self._run_id,
                 iteration,
-                exc_info=True,
+                exc_info=safe_exception_info(),
             )
 
         # FAIL-CLOSED: run event (lifecycle audit trail). correlation_id joins
@@ -418,14 +445,48 @@ class PersistenceRecorder(BaseRecorder):
         try:
             await self._store.touch_progress(self._run_id)
         except Exception:
-            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+            )
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         """Touch ``last_progress_at`` at dispatch so a long tool starts fresh. BEST-EFFORT."""
         try:
             await self._store.touch_progress(self._run_id)
         except Exception:
-            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+            )
+
+    async def on_llm_call_failed(
+        self,
+        run_id: str,
+        iteration: int,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Persist safe failure/deadline evidence without inventing billed usage."""
+        from dendrux.errors import ProviderError
+        from dendrux.types import ErrorInfo
+
+        if not isinstance(error, ProviderError):
+            return
+        info = ErrorInfo.from_error(error)
+        try:
+            await self._emit_event(
+                "llm.failed",
+                iteration,
+                {
+                    "error_info": info.to_dict(),
+                    "timeout_reason": info.timeout_reason,
+                    "duration_ms": duration_ms,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Failed-call evidence unavailable: run_id=%s code=llm_failed_write", self._run_id
+            )
 
     async def on_tool_completed(
         self,
@@ -474,6 +535,11 @@ class PersistenceRecorder(BaseRecorder):
                 "target": target,
                 "success": tool_result.success,
                 "duration_ms": tool_result.duration_ms,
+                **{
+                    k: tool_result.meta[k]
+                    for k in ("code", "zombie_threads")
+                    if k in tool_result.meta
+                },
                 **tool_call_parse_meta(tool_call),
                 **({"image_count": len(images)} if images else {}),
             },
@@ -484,7 +550,9 @@ class PersistenceRecorder(BaseRecorder):
         try:
             await self._store.touch_progress(self._run_id)
         except Exception:
-            logger.warning("Failed to touch progress for run %s", self._run_id, exc_info=True)
+            logger.warning(
+                "Failed to touch progress for run %s", self._run_id, exc_info=safe_exception_info()
+            )
 
     async def on_governance_event(
         self,

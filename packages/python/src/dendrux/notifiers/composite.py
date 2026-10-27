@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from dendrux.errors import safe_exception_info
 from dendrux.loops.base import BaseNotifier, LoopNotifier
 
 if TYPE_CHECKING:
@@ -40,14 +41,18 @@ class CompositeNotifier(BaseNotifier):
                     run_id, agent_name=agent_name, agent_model=agent_model
                 )
             except Exception:
-                logger.warning("CompositeNotifier: on_run_started failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_run_started failed", exc_info=safe_exception_info()
+                )
 
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
         for notifier in self._notifiers:
             try:
                 await notifier.on_run_finished(run_id, result)
             except Exception:
-                logger.warning("CompositeNotifier: on_run_finished failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_run_finished failed", exc_info=safe_exception_info()
+                )
 
     async def on_run_failed(
         self,
@@ -60,14 +65,18 @@ class CompositeNotifier(BaseNotifier):
             try:
                 await notifier.on_run_failed(run_id, error, iteration=iteration)
             except Exception:
-                logger.warning("CompositeNotifier: on_run_failed failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_run_failed failed", exc_info=safe_exception_info()
+                )
 
     async def on_message_appended(self, run_id: str, message: Message, iteration: int) -> None:
         for notifier in self._notifiers:
             try:
                 await notifier.on_message_appended(run_id, message, iteration)
             except Exception:
-                logger.warning("CompositeNotifier: on_message_appended failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_message_appended failed", exc_info=safe_exception_info()
+                )
 
     async def on_llm_call_started(
         self,
@@ -86,7 +95,9 @@ class CompositeNotifier(BaseNotifier):
                     semantic_tools=semantic_tools,
                 )
             except Exception:
-                logger.warning("CompositeNotifier: on_llm_call_started failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_llm_call_started failed", exc_info=safe_exception_info()
+                )
 
     async def on_llm_call_completed(
         self,
@@ -111,7 +122,10 @@ class CompositeNotifier(BaseNotifier):
                     guardrail_findings=guardrail_findings,
                 )
             except Exception:
-                logger.warning("CompositeNotifier: on_llm_call_completed failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_llm_call_completed failed",
+                    exc_info=safe_exception_info(),
+                )
 
     async def on_llm_call_failed(
         self,
@@ -125,14 +139,18 @@ class CompositeNotifier(BaseNotifier):
             try:
                 await notifier.on_llm_call_failed(run_id, iteration, error, duration_ms=duration_ms)
             except Exception:
-                logger.warning("CompositeNotifier: on_llm_call_failed failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_llm_call_failed failed", exc_info=safe_exception_info()
+                )
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
         for notifier in self._notifiers:
             try:
                 await notifier.on_tool_started(run_id, tool_call, iteration)
             except Exception:
-                logger.warning("CompositeNotifier: on_tool_started failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_tool_started failed", exc_info=safe_exception_info()
+                )
 
     async def on_tool_completed(
         self,
@@ -145,7 +163,9 @@ class CompositeNotifier(BaseNotifier):
             try:
                 await notifier.on_tool_completed(run_id, tool_call, tool_result, iteration)
             except Exception:
-                logger.warning("CompositeNotifier: on_tool_completed failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_tool_completed failed", exc_info=safe_exception_info()
+                )
 
     async def on_governance_event(
         self,
@@ -162,4 +182,6 @@ class CompositeNotifier(BaseNotifier):
                     run_id, event_type, iteration, data, correlation_id=correlation_id
                 )
             except Exception:
-                logger.warning("CompositeNotifier: on_governance_event failed", exc_info=True)
+                logger.warning(
+                    "CompositeNotifier: on_governance_event failed", exc_info=safe_exception_info()
+                )

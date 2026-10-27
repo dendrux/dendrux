@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import datetime
 import enum
 import inspect
 import json
 import re
 import typing
+from collections.abc import Iterable
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -42,8 +44,15 @@ _TYPE_MAP: dict[type, str] = {
     list: "array",
 }
 
+# ISO 8601 strings; coerced to the Python type at call time.
+_FORMAT_MAP: dict[type, str] = {
+    datetime.datetime: "date-time",
+    datetime.date: "date",
+}
+
 _SUPPORTED_TYPES_HINT = (
-    "Supported types: str, int, float, bool, list[T], dict, dict[str, T], Literal[...], "
+    "Supported types: str, int, float, bool, datetime, date, list[T], dict, dict[str, T], "
+    "Literal[...], "
     "Enum subclasses, pydantic BaseModel, dataclasses, TypedDict, Annotated[T, ...], "
     "and Optional variants. For anything else pass an explicit schema with "
     "@tool(parameters=...)."
@@ -51,6 +60,8 @@ _SUPPORTED_TYPES_HINT = (
 
 
 _SENTINEL: float = object()  # type: ignore[assignment]
+
+_VARIADIC_KINDS = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 
 DEFAULT_TOOL_TIMEOUT = 120.0
 
@@ -63,6 +74,7 @@ def tool(
     *,
     parameters: dict[str, Any] | None = None,
     strict: bool = False,
+    receives_pii: bool | Iterable[str] = False,
 ) -> Callable[..., Any]:
     """Decorator that registers a function as a Dendrux tool.
 
@@ -84,6 +96,10 @@ def tool(
             a schema Anthropic cannot take strictly (recursion, tuples,
             untyped values, or over the request's 20 strict tools / 24
             optional / 16 union-typed parameter limits) is sent non-strict.
+        receives_pii: Under ``PII(restore="allowlisted")``, whether this tool
+            receives real values instead of placeholders: ``True`` for every
+            entity, or a set of entity names (``{"EMAIL"}``). Ignored under
+            the default ``restore="all"``.
 
     Usage:
         @tool(target="server")
@@ -108,6 +124,7 @@ def tool(
                 f"'human' and 'agent' are reserved for future use."
             )
 
+        resolved_receives_pii = _normalize_receives_pii(receives_pii, name)
         explicit_timeout = timeout_seconds is not _SENTINEL
         resolved_timeout = float(timeout_seconds) if explicit_timeout else DEFAULT_TOOL_TIMEOUT
 
@@ -115,6 +132,14 @@ def tool(
             schema = _validate_explicit_parameters(parameters, name)
         else:
             schema = _generate_schema(fn)
+            # Server tools with a generated schema also get lax Pydantic
+            # coercion. Explicit ``parameters=`` tools and client tools keep
+            # JSON-Schema validation only: a client receives its arguments
+            # exactly as the model sent them.
+            if resolved_target == ToolTarget.SERVER:
+                from dendrux.tools._coerce import attach_args_spec
+
+                attach_args_spec(fn)
         if strict:
             schema = _strict_schema(schema, name)
 
@@ -128,6 +153,7 @@ def tool(
             timeout_seconds=resolved_timeout,
             has_explicit_timeout=explicit_timeout,
             strict=strict,
+            receives_pii=resolved_receives_pii,
         )
         setattr(fn, _TOOL_DEF_ATTR, tool_def)
         return fn
@@ -144,6 +170,20 @@ tool.__signature__ = _tool_sig.replace(  # type: ignore[attr-defined]
         for p in _tool_sig.parameters.values()
     ]
 )
+
+
+def _normalize_receives_pii(value: Any, tool_name: str) -> bool | frozenset[str]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) or not isinstance(value, Iterable):
+        raise ValueError(
+            f"Tool '{tool_name}' receives_pii must be a bool or a set of entity names, "
+            f"got {type(value).__name__}."
+        )
+    entities = frozenset(value)
+    if not all(isinstance(e, str) and e for e in entities):
+        raise ValueError(f"Tool '{tool_name}' receives_pii entity names must be non-empty strings.")
+    return entities
 
 
 def get_tool_def(fn: Callable[..., Any]) -> ToolDef:
@@ -207,7 +247,8 @@ def _generate_schema(fn: Callable[..., Any]) -> dict[str, Any]:
     required: list[str] = []
 
     for name, param in sig.parameters.items():
-        if name == "self":
+        if name == "self" or param.kind in _VARIADIC_KINDS:
+            # A model cannot pass *args / **kwargs by name.
             continue
 
         hint = hints.get(name)
@@ -253,6 +294,7 @@ def _type_to_schema(hint: Any, seen: frozenset[type] = frozenset()) -> dict[str,
 
     if origin is Annotated:
         schema = _type_to_schema(hint.__origin__, seen)
+        _apply_constraints(schema, hint.__metadata__)
         description = _annotated_description(hint)
         if description is not None:
             schema["description"] = description
@@ -298,10 +340,68 @@ def _type_to_schema(hint: Any, seen: frozenset[type] = frozenset()) -> dict[str,
     json_type = _TYPE_MAP.get(hint)
     if json_type:
         return {"type": json_type}
+    string_format = _FORMAT_MAP.get(hint)
+    if string_format:
+        return {"type": "string", "format": string_format}
 
     raise TypeError(
         f"Type {hint!r} is not supported in Dendrux tool schemas. {_SUPPORTED_TYPES_HINT}"
     )
+
+
+_NUMERIC_BOUNDS = (
+    ("gt", "exclusiveMinimum"),
+    ("ge", "minimum"),
+    ("lt", "exclusiveMaximum"),
+    ("le", "maximum"),
+    ("multiple_of", "multipleOf"),
+)
+_LENGTH_KEYWORDS = {
+    "string": ("minLength", "maxLength"),
+    "array": ("minItems", "maxItems"),
+    "object": ("minProperties", "maxProperties"),
+}
+
+
+def _constraint_items(metadata: Iterable[Any]) -> list[Any]:
+    """Constraint objects in ``Annotated`` metadata, unpacking ``Field(...)``."""
+    from pydantic.fields import FieldInfo
+
+    items: list[Any] = []
+    for meta in metadata:
+        if isinstance(meta, FieldInfo):
+            items.extend(meta.metadata)
+        else:
+            items.append(meta)
+    return items
+
+
+def _apply_constraints(schema: dict[str, Any], metadata: Iterable[Any]) -> None:
+    """Add JSON-Schema keywords for ``Field`` / ``annotated_types`` constraints.
+
+    Only constraints the generated schema can state exactly are added; the
+    call-time coercion enforces every constraint either way. A schema with no
+    constraints is unchanged, so existing tools keep byte-identical schemas.
+    """
+    types = schema.get("type")
+    type_names = set(types) if isinstance(types, list) else {types}
+    length_keywords = next(
+        (kw for name, kw in _LENGTH_KEYWORDS.items() if name in type_names), None
+    )
+    for item in _constraint_items(metadata):
+        for attr, keyword in _NUMERIC_BOUNDS:
+            value = getattr(item, attr, None)
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if numeric and type_names & {"integer", "number"}:
+                schema[keyword] = value
+        if length_keywords is not None:
+            for attr, keyword in zip(("min_length", "max_length"), length_keywords, strict=True):
+                value = getattr(item, attr, None)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    schema[keyword] = value
+        pattern = getattr(item, "pattern", None)
+        if isinstance(pattern, str) and "string" in type_names:
+            schema["pattern"] = pattern
 
 
 def _enum_schema(values: list[Any], hint: Any) -> dict[str, Any]:

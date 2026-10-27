@@ -52,19 +52,26 @@ dev with no Postgres still gets a green suite).
 from __future__ import annotations
 
 import os
-import re
 import sys
 from typing import TYPE_CHECKING
-from urllib.parse import urlparse, urlunparse
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from dendrux.db.models import Base
+from tests._helpers.pg_url import (
+    TEST_SUFFIX,
+    UnsafeTestDatabaseUrl,
+    maintenance_url,
+    render,
+    validate_test_pg_url,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -73,45 +80,22 @@ if TYPE_CHECKING:
 
 
 _PG_URL_ENV = "DENDRUX_TEST_PG_URL"
-_TEST_DB_SUFFIX = "_test"
-_DB_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_TEST_DB_SUFFIX = TEST_SUFFIX
 _REWRITE_WARNED = False
 
 
 def _rewrite_to_test_db(url: str) -> tuple[str, str, bool]:
     """Ensure URL points at a ``*_test`` database.
 
-    Returns ``(rewritten_url, db_name, was_rewritten)``. Rewrites the URL's
-    database name by appending ``_test`` if it doesn't already end that way.
-    Validates the final name matches ``[A-Za-z0-9_]+`` so it can be safely
-    interpolated into ``CREATE DATABASE`` (asyncpg/PG don't bind-parameterize
-    DDL identifiers).
+    Returns ``(rewritten_url, db_name, was_rewritten)``. Appends ``_test`` to the
+    database name when it is missing. Validation (see ``tests/_helpers/pg_url.py``)
+    refuses query options that would override the database, names outside
+    ``[A-Za-z0-9_]`` (the name is interpolated into ``CREATE DATABASE``; PG does not
+    bind-parameterize DDL identifiers) and identifiers over PostgreSQL's 63 bytes.
     """
-    parsed = urlparse(url)
-    db_name = parsed.path.lstrip("/")
-    if not db_name:
-        raise pytest.UsageError(f"{_PG_URL_ENV} has no database name in path: {url!r}")
-
-    rewritten = False
-    if not db_name.endswith(_TEST_DB_SUFFIX):
-        db_name = f"{db_name}{_TEST_DB_SUFFIX}"
-        parsed = parsed._replace(path=f"/{db_name}")
-        url = urlunparse(parsed)
-        rewritten = True
-
-    if not _DB_NAME_RE.match(db_name):
-        raise pytest.UsageError(
-            f"{_PG_URL_ENV} database name {db_name!r} contains characters "
-            f"outside [A-Za-z0-9_]; refuse to interpolate into DDL."
-        )
-    if not db_name.endswith(_TEST_DB_SUFFIX):
-        # Belt + suspenders — the rewrite above guarantees this, but keep
-        # the assert so a future refactor can't regress the safety property.
-        raise pytest.UsageError(
-            f"{_PG_URL_ENV} resolved DB name {db_name!r} does not end in "
-            f"{_TEST_DB_SUFFIX!r} — refusing to run destructive tests against it."
-        )
-    return url, db_name, rewritten
+    validated = validate_test_pg_url(url)
+    name = validated.database or ""
+    return render(validated), name, name != make_url(url).database
 
 
 async def _ensure_test_db_exists(url: str, db_name: str) -> None:
@@ -119,12 +103,16 @@ async def _ensure_test_db_exists(url: str, db_name: str) -> None:
 
     Connects to ``postgres`` (the standard maintenance database) on the same
     host with AUTOCOMMIT — PG forbids ``CREATE DATABASE`` inside a transaction.
-    Idempotent: if the DB already exists, this is a no-op.
+    Idempotent: if the DB already exists, this is a no-op. The URL is validated
+    before any engine exists.
     """
-    parsed = urlparse(url)
-    maintenance_url = urlunparse(parsed._replace(path="/postgres"))
+    validated = validate_test_pg_url(url, append_suffix=False)
+    if validated.database != db_name:
+        raise UnsafeTestDatabaseUrl("database to create does not match the validated URL")
 
-    eng = create_async_engine(maintenance_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    eng = create_async_engine(
+        render(maintenance_url(validated)), isolation_level="AUTOCOMMIT", poolclass=NullPool
+    )
     try:
         async with eng.connect() as conn:
             result = await conn.execute(
@@ -132,8 +120,12 @@ async def _ensure_test_db_exists(url: str, db_name: str) -> None:
                 {"name": db_name},
             )
             if result.first() is None:
-                # db_name is validated against _DB_NAME_RE above; safe to interpolate.
-                await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+                try:
+                    # db_name passed validation ([A-Za-z0-9_], <= 63): safe to interpolate.
+                    await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+                except ProgrammingError as exc:
+                    if "already exists" not in str(exc.orig):  # lost a creation race: fine
+                        raise
     finally:
         await eng.dispose()
 
@@ -195,21 +187,40 @@ _PG_TRUNCATE_SQL = "TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE".format(
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def _pg_schema_setup() -> AsyncIterator[None]:
-    # Marker-style fixture: depends on its side effect (schema exists for
-    # the rest of the session), not on the yielded value. The function-
-    # scoped ``engine`` fixture takes it as a positional dep purely to
-    # establish ordering — schema must be in place before any test
-    # tries to TRUNCATE it.
+async def pg_database() -> AsyncIterator[str | None]:
+    """Make sure the validated ``*_test`` database exists. Yields its URL, or None if unset.
+
+    Every Postgres fixture and test must depend on this (directly or through
+    ``pg_test_url`` / ``_pg_schema_setup``): under xdist each worker owns a database that
+    does not exist on a fresh server, and nothing else creates it. It only creates the
+    database; the public-schema lifecycle lives in ``_pg_schema_setup``.
+    ``test_pg_fixture_bootstrap`` pins that no Postgres-touching fixture skips it.
+    """
     url = _resolve_pg_url()
+    if url:
+        _, db_name, _ = _rewrite_to_test_db(os.environ[_PG_URL_ENV])
+        await _ensure_test_db_exists(url, db_name)
+    yield url
+
+
+@pytest.fixture
+def pg_test_url(pg_database: str | None) -> str:
+    """The validated, existing test database URL for tests that manage their own schema."""
+    if pg_database is None:
+        pytest.skip(f"{_PG_URL_ENV} not set")
+    return pg_database
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def _pg_schema_setup(pg_database: str | None) -> AsyncIterator[None]:
+    # Marker-style fixture: depends on its side effect (public schema exists for the
+    # rest of the session), not on the yielded value. The function-scoped ``engine``
+    # fixture takes it as a positional dep purely to establish ordering — schema must be
+    # in place before any test tries to TRUNCATE it.
+    url = pg_database
     if not url:
         yield
         return
-
-    # Auto-create the *_test database if missing — Django-style. Connects
-    # to the postgres maintenance DB on the same host. See module docstring.
-    _, db_name, _ = _rewrite_to_test_db(os.environ[_PG_URL_ENV])
-    await _ensure_test_db_exists(url, db_name)
 
     # NullPool: this engine only runs DDL once and is disposed; we don't
     # want it holding pooled connections bound to the session loop.

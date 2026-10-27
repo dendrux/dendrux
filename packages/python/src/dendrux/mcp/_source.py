@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 # Public class and factory annotations are resolved at runtime by
@@ -19,6 +20,8 @@ MCPFailureMode = Literal["strict", "best_effort"]
 MCPPhysicalIdentity = (
     tuple[Literal["http"], str] | tuple[Literal["stdio"], tuple[str, ...], Path | None]
 )
+
+DEFAULT_MAX_DISCOVERY_BYTES = 16 * 1024 * 1024
 
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -209,6 +212,14 @@ class MCPSource:
     immutable configuration; use :attr:`physical_identity` when comparing
     connection targets. Authentication objects are passed through to
     ``httpx2.AsyncClient`` by the official MCP SDK adapter.
+
+    Discovery is bounded by ``max_discovery_pages``, ``max_discovery_tools`` and
+    ``discovery_timeout`` for every source, and by ``max_discovery_bytes``
+    (the ``tools/list`` response bodies, capped before they are decoded) for
+    HTTP sources only. A stdio server is a local process the developer
+    launches, inside the developer's trust boundary; an HTTP server is the
+    untrusted case. Setting ``max_discovery_bytes`` on a stdio source raises
+    ``ValueError``.
     """
 
     name: str
@@ -229,8 +240,21 @@ class MCPSource:
     follow_redirects: bool = True
     max_redirects: int = 20
     destination_policy: MCPDestinationPolicy | None = field(default=None, repr=False)
+    max_discovery_pages: int = 100
+    discovery_timeout: float = 60.0
+    max_discovery_tools: int = 2000
+    max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES
 
     def __post_init__(self) -> None:
+        self._validate_name()
+        self._validate_transport()
+        self._validate_http_settings()
+        self._validate_limits()
+        self._validate_transport_options()
+        object.__setattr__(self, "headers", _copy_string_mapping(self.headers, "headers"))
+        object.__setattr__(self, "env", _copy_string_mapping(self.env, "env"))
+
+    def _validate_name(self) -> None:
         if not self.name or not _SOURCE_NAME_RE.fullmatch(self.name):
             raise ValueError(
                 f"MCPSource name '{self.name}' is not a valid identifier. "
@@ -241,6 +265,8 @@ class MCPSource:
                 f"MCPSource name '{self.name}' cannot contain '__'. "
                 "Double underscore is reserved as the namespace separator."
             )
+
+    def _validate_transport(self) -> None:
         if (self.url is None) == (self.command is None):
             raise ValueError(
                 "MCPSource requires exactly one transport: "
@@ -263,6 +289,8 @@ class MCPSource:
                 raise ValueError("MCPSource command must contain only strings.")
             if not self.command[0]:
                 raise ValueError("MCPSource command executable must be non-empty.")
+
+    def _validate_http_settings(self) -> None:
         if not isinstance(self.reauthenticate_on_401, bool):
             raise ValueError("MCPSource reauthenticate_on_401 must be a bool.")
         if not isinstance(self.follow_redirects, bool):
@@ -278,21 +306,45 @@ class MCPSource:
             or self.destination_policy is not None
         ):
             raise ValueError("MCPSource HTTP security settings are only valid for HTTP sources.")
+
+    def _validate_limits(self) -> None:
         if self.connect_timeout <= 0:
             raise ValueError("MCPSource connect_timeout must be greater than zero.")
         if self.call_timeout <= 0:
             raise ValueError("MCPSource call_timeout must be greater than zero.")
         if self.max_result_bytes <= 0:
             raise ValueError("MCPSource max_result_bytes must be greater than zero.")
+        self._validate_discovery_bounds()
         if self.failure_mode not in ("strict", "best_effort"):
             raise ValueError("MCPSource failure_mode must be 'strict' or 'best_effort'.")
+
+    def _validate_transport_options(self) -> None:
         if self.command is not None and (self.headers or self.auth is not None):
             raise ValueError("MCPSource headers and auth are only valid for HTTP sources.")
         if self.url is not None and (self.env or self.cwd is not None):
             raise ValueError("MCPSource env and cwd are only valid for stdio sources.")
 
-        object.__setattr__(self, "headers", _copy_string_mapping(self.headers, "headers"))
-        object.__setattr__(self, "env", _copy_string_mapping(self.env, "env"))
+    def _validate_discovery_bounds(self) -> None:
+        if self.command is not None and self.max_discovery_bytes != DEFAULT_MAX_DISCOVERY_BYTES:
+            raise ValueError(
+                "MCPSource max_discovery_bytes is only valid for HTTP sources: a stdio "
+                "server is a local process you launch, so its discovery is bounded by "
+                "max_discovery_tools, max_discovery_pages and discovery_timeout instead."
+            )
+        if type(self.max_discovery_pages) is not int or self.max_discovery_pages < 1:
+            raise ValueError("MCPSource max_discovery_pages must be a positive integer.")
+        for name in ("max_discovery_tools", "max_discovery_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"MCPSource {name} must be a positive integer.")
+        timeout = self.discovery_timeout
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("MCPSource discovery_timeout must be a positive, finite number.")
 
     @classmethod
     def http(
@@ -310,6 +362,10 @@ class MCPSource:
         follow_redirects: bool = True,
         max_redirects: int = 20,
         destination_policy: MCPDestinationPolicy | None = None,
+        max_discovery_pages: int = 100,
+        discovery_timeout: float = 60.0,
+        max_discovery_tools: int = 2000,
+        max_discovery_bytes: int = DEFAULT_MAX_DISCOVERY_BYTES,
     ) -> MCPSource:
         """Configure a production Streamable HTTP MCP source."""
         return cls(
@@ -325,6 +381,10 @@ class MCPSource:
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             destination_policy=destination_policy,
+            max_discovery_pages=max_discovery_pages,
+            discovery_timeout=discovery_timeout,
+            max_discovery_tools=max_discovery_tools,
+            max_discovery_bytes=max_discovery_bytes,
         )
 
     @classmethod
@@ -339,6 +399,9 @@ class MCPSource:
         call_timeout: float = 120.0,
         max_result_bytes: int = 1_000_000,
         failure_mode: MCPFailureMode = "strict",
+        max_discovery_pages: int = 100,
+        discovery_timeout: float = 60.0,
+        max_discovery_tools: int = 2000,
     ) -> MCPSource:
         """Configure a trusted local subprocess MCP source."""
         if isinstance(command, str):
@@ -352,6 +415,9 @@ class MCPSource:
             call_timeout=call_timeout,
             max_result_bytes=max_result_bytes,
             failure_mode=failure_mode,
+            max_discovery_pages=max_discovery_pages,
+            discovery_timeout=discovery_timeout,
+            max_discovery_tools=max_discovery_tools,
         )
 
     @property

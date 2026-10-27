@@ -10,6 +10,8 @@ Dendrux 0.4.0 accepts images (PNG, JPEG, GIF, WebP) anywhere text goes into a ru
 - in the user's message: `run()`, `stream()`, `submit_input()`, `resume(user_input=)`, and `history=`;
 - in tool results: a server `@tool` returns `ToolOutput`, a client tool attaches `ToolResult.images`, and an MCP tool's image content becomes image parts.
 
+Import image names from one place: `from dendrux.media import Image, ToolOutput, ImagePolicy, ImageDropPolicy, UrlPolicy`. (`Image` and `ToolOutput` are also exported from `dendrux`, but the examples here use `dendrux.media` throughout.)
+
 Every image is checked once, stored once as a content-addressed blob, and referenced everywhere else by a small descriptor. Your run rows, pause snapshots, traces and events hold references, never pixels or base64. Pause and resume, retry and `runs=` replay all work with images, including across processes.
 
 Runnable scripts: [`examples/37_images.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/37_images.py) (user image plus a tool that returns an image) and [`examples/38_images_client_tool.py`](https://github.com/dendrux/dendrux/blob/main/packages/python/examples/38_images_client_tool.py) (client-tool screenshot, pause, resume on a second Agent). Both run on a scripted mock model by default and on a real vision model with `--provider`.
@@ -18,9 +20,12 @@ Runnable scripts: [`examples/37_images.py`](https://github.com/dendrux/dendrux/b
 
 `user_input` may be a string or a list of strings and images. Order is kept.
 
+[//]: # "docs-test: skip - uses a placeholder image path"
+
 ```python
-from dendrux import Agent, Image
+from dendrux import Agent
 from dendrux.llm.anthropic import AnthropicProvider
+from dendrux.media import Image
 
 async with Agent(
     name="Reader",
@@ -52,6 +57,8 @@ A bad input raises before a run exists: `agent.run(...)` raises `InvalidImageErr
 
 `ChatMessage.user(...)` takes the same list form, so a chat history can carry images. Those images are stored when the run starts and count as already sent: they are never an error for a model that cannot read images (see [Models that cannot read images](#models-that-cannot-read-images)).
 
+[//]: # "docs-test: skip - uses a placeholder image path"
+
 ```python
 from dendrux.chat import ChatMessage
 
@@ -67,7 +74,8 @@ For tool-using chats, `runs=thread.run_ids` ([Memory across runs](/docs/recipes/
 Return `ToolOutput(result, images=[...])`. `result` is serialised exactly like a normal return value, so `ToolOutput("Captured.")` produces the same payload as `return "Captured."`. The images follow the text, in order.
 
 ```python
-from dendrux import Image, ToolOutput, tool
+from dendrux import tool
+from dendrux.media import Image, ToolOutput
 
 @tool()
 async def render_chart(metric: str) -> ToolOutput:
@@ -88,9 +96,11 @@ Where this plugs into the rest of the tool pipeline:
 
 A `@tool(target="client")` pauses the run. Your app runs the tool and sends the result back; attach the images on the `ToolResult`:
 
+[//]: # "docs-test: skip - fragment: relies on `run_id`, defined by setup shown elsewhere"
+
 ```python
 import json
-from dendrux import Image
+from dendrux.media import Image
 from dendrux.types import ToolResult
 
 result = await agent.submit_tool_results(
@@ -189,6 +199,8 @@ What happens when the answer is **no**:
 OpenRouter, OpenAI-compatible servers and other gateways word "this model has no image support" in their own ways. Dendrux recognises the OpenAI, OpenAI Responses and OpenRouter messages; a gateway that says it differently surfaces as `ProviderError` or `ImageRejectedError`, not `UnsupportedModalityError`. When you know a model cannot take images, say so up front and Dendrux never sends them:
 
 ```python
+from dendrux.media import ImagePolicy
+
 ImagePolicy(capability_overrides={"my-gateway/text-model": "no"})
 ```
 
@@ -225,6 +237,8 @@ Caps apply when an image enters (`InvalidImageError`, `ImageLimitError`) and are
 
 A long tool loop that returns a screenshot every step grows the prompt by one image per step. The drop policy is opt-in and keeps the model's view bounded:
 
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
 ```python
 from dendrux.media import ImageDropPolicy, ImagePolicy
 
@@ -250,7 +264,7 @@ By default image bytes live in the Dendrux database, in a table of content-addre
 
 The tenant scope is `t:<tenant_id>` or `-` when a run has no tenant. The same bytes uploaded under two tenants are two rows; one tenant can never read another's image, and a missing image and another tenant's image raise the same `BlobNotFoundError`. Identical bytes inside one tenant are stored once however many times they are used.
 
-**Reading an image back.** `RunStore.read_image(run_id, sha256, tenant_id=...)` returns the verified bytes only if that run references the blob, which is the call to put behind your own auth when you serve thumbnails. `agent.blobs.read(ref_or_sha256, tenant_id=...)` and `RunStore(...).blobs` read without a run. Dendrux ships no image route in `make_read_router`; serving images is your app's decision. Each read re-checks length, SHA-256, media type and dimensions and raises `BlobIntegrityError` on a mismatch.
+**Reading an image back.** `RunStore.read_image(run_id, sha256, tenant_id=...)` returns the verified bytes only if that run references the blob, which is the call to put behind your own auth when you serve thumbnails. `agent.blobs.read(ref_or_sha256, tenant_id=...)` and `RunStore(...).blobs` read without a run. Serving images is your app's decision. Each read re-checks length, SHA-256, media type and dimensions and raises `BlobIntegrityError` on a mismatch.
 
 **A heavier store.** For high volume, keep bytes in object storage and only metadata in the database. Implement the three-method `BlobStore` protocol and pass it to the Agent (and to every `RunStore` that reads or purges):
 
@@ -273,6 +287,8 @@ class BlobStore(Protocol):
 
 Run deletion is your SQL. Blobs are deleted by garbage collection, which removes blobs no run references and which have not been used for the grace period:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from datetime import timedelta
 
@@ -283,6 +299,8 @@ print(result.deleted_blobs, result.bytes_freed)
 Run it on a schedule (hourly or daily) from any process. It is idempotent and restartable, it finishes interrupted deletes and purges, and it never raises on a single bad row. `older_than` must be at least one hour; the grace period protects an image that was just stored and not yet referenced. On SQLite, which does not enforce foreign keys, collection also removes references of deleted runs.
 
 **Purge is erasure.** To remove an image's bytes for compliance:
+
+[//]: # "docs-test: skip - fragment: relies on `sha256`, defined by setup shown elsewhere"
 
 ```python
 await agent.blobs.purge(sha256, tenant_id="acme", reason="gdpr request 4411")

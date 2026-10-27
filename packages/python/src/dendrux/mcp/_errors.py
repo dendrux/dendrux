@@ -7,6 +7,7 @@ from typing import Literal
 
 # Public error attributes are resolved at runtime by documentation tooling.
 from dendrux.mcp._credentials import MCPAuthKey  # noqa: TC001
+from dendrux.tools._limits import ToolResultTooLargeError
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -23,6 +24,11 @@ class MCPOrigin:
 
     def __repr__(self) -> str:
         return "MCPOrigin()"
+
+
+DiscoveryLimitReason = Literal[
+    "repeated_cursor", "page_cap", "deadline", "tool_cap", "byte_cap", "cursor_length"
+]
 
 
 class MCPError(RuntimeError):
@@ -52,6 +58,24 @@ class MCPConnectionError(MCPError):
 
 class MCPDestinationDeniedError(MCPConnectionError):
     """A destination was denied before connecting or sending credentials."""
+
+
+class MCPDiscoveryLimitError(MCPConnectionError):
+    """``tools/list`` passed one of its bounds, so discovery stopped.
+
+    ``reason`` is ``repeated_cursor`` (the server returned a page cursor it
+    had already returned, so paging would never end), ``page_cap`` (more than
+    ``MCPSource.max_discovery_pages`` pages) or ``deadline`` (discovery took
+    longer than ``MCPSource.discovery_timeout``), ``tool_cap`` (more than
+    ``MCPSource.max_discovery_tools`` tools), ``byte_cap`` (the responses were
+    larger than ``MCPSource.max_discovery_bytes`` on the wire; HTTP sources
+    only) or ``cursor_length`` (a cursor longer than 4096 characters).
+    ``str()`` names the source
+    and the reason only, never a cursor. A subclass of
+    :class:`MCPConnectionError`, so existing handlers keep catching it.
+    """
+
+    reason: DiscoveryLimitReason = "deadline"
 
 
 class MCPCredentialError(MCPConnectionError):
@@ -386,6 +410,20 @@ class MCPToolCallError(MCPError):
     connection_lost: bool = False
 
 
+class MCPSessionExpiredError(MCPToolCallError):
+    """The server answered ``tools/call`` with HTTP 404 for the call's session.
+
+    The MCP spec says a 404 to a request carrying ``Mcp-Session-Id`` means
+    the server no longer knows that session (it restarted, a load balancer
+    moved the client, or the session expired). The request was rejected
+    before the tool ran, so it was **not executed**. The managed runtime
+    fences the connection, opens a new session and retries the call once.
+    Stateless servers (no session id) never raise it.
+    """
+
+    connection_lost = True
+
+
 class MCPToolNotFoundError(MCPError):
     """``MCPConnection.call_tool`` named a tool the server does not list.
 
@@ -416,8 +454,21 @@ class MCPOutcomeUnknownError(MCPError):
     """
 
 
-class MCPResultTooLargeError(MCPError):
-    """An MCP result exceeded the configured output boundary."""
+class MCPResultTooLargeError(MCPError, ToolResultTooLargeError):
+    """An MCP result exceeded the configured output boundary.
+
+    In an Agent run the tool result becomes the ``size_limit`` error payload.
+    """
+
+
+class MCPInvalidToolSchemaError(ValueError):
+    """A strict view found a tool whose argument schema cannot be validated against.
+
+    Raised at discovery with ``strict=True`` (best-effort views skip the tool
+    with reason ``invalid_schema``). A ``ValueError`` subclass, so existing
+    handlers keep catching it; ``error_code_for`` gives ``invalid_tool_schema``.
+    The message names the source, tool and problem kind, never schema text.
+    """
 
 
 class MCPToolNameCollisionError(ValueError):
@@ -430,37 +481,36 @@ class MCPToolNameCollisionError(ValueError):
     """
 
 
+# Most specific first: the first match wins.
+_ERROR_CODES: tuple[tuple[tuple[type[BaseException], ...], str], ...] = (
+    ((MCPAuthorizationRequired,), "authorization_required"),
+    ((MCPAuthenticationError,), "authentication_failed"),
+    ((MCPCredentialError,), "credential_error"),
+    ((MCPDestinationDeniedError,), "destination_denied"),
+    ((MCPDiscoveryLimitError,), "discovery_limit"),
+    ((MCPCircuitOpenError,), "circuit_open"),
+    ((MCPCapacityError,), "capacity"),
+    ((MCPConnectionLostError, MCPConnectionError), "connection_failed"),
+    ((MCPConnectionStateError,), "connection_state"),
+    ((MCPToolNameCollisionError,), "tool_name_collision"),
+    ((MCPToolNotFoundError,), "tool_not_found"),
+    ((MCPInvalidToolSchemaError,), "invalid_tool_schema"),
+    # Strict view naming raises plain ValueError; MCP failures never do.
+    ((ValueError,), "invalid_tool_names"),
+)
+
+
 def error_code_for(exc: BaseException) -> str:
     """Return the stable machine code for an MCP discovery failure.
 
     Hosts branch on this instead of matching error text. The code depends on
     the exception class alone, most specific first, and is one of
     ``authorization_required``, ``authentication_failed``, ``credential_error``,
-    ``destination_denied``, ``circuit_open``, ``capacity``,
+    ``destination_denied``, ``discovery_limit``, ``circuit_open``, ``capacity``,
     ``connection_failed``, ``connection_state``, ``tool_name_collision``,
-    ``tool_not_found``, ``invalid_tool_names`` or ``unknown``.
+    ``tool_not_found``, ``invalid_tool_schema``, ``invalid_tool_names`` or ``unknown``.
     """
-    if isinstance(exc, MCPAuthorizationRequired):
-        return "authorization_required"
-    if isinstance(exc, MCPAuthenticationError):
-        return "authentication_failed"
-    if isinstance(exc, MCPCredentialError):
-        return "credential_error"
-    if isinstance(exc, MCPDestinationDeniedError):
-        return "destination_denied"
-    if isinstance(exc, MCPCircuitOpenError):
-        return "circuit_open"
-    if isinstance(exc, MCPCapacityError):
-        return "capacity"
-    if isinstance(exc, (MCPConnectionLostError, MCPConnectionError)):
-        return "connection_failed"
-    if isinstance(exc, MCPConnectionStateError):
-        return "connection_state"
-    if isinstance(exc, MCPToolNameCollisionError):
-        return "tool_name_collision"
-    if isinstance(exc, MCPToolNotFoundError):
-        return "tool_not_found"
-    # Strict view naming raises plain ValueError; MCP failures never do.
-    if isinstance(exc, ValueError):
-        return "invalid_tool_names"
+    for kinds, code in _ERROR_CODES:
+        if isinstance(exc, kinds):
+            return code
     return "unknown"

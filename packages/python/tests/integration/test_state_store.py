@@ -499,12 +499,12 @@ class TestCountPausesPerRun:
         await store.create_run("r3", "Agent")
 
         # r1: 2 pauses, r2: 1 pause, r3: 0 pauses
-        await store.save_run_event("r1", event_type="run.paused", sequence_index=0)
-        await store.save_run_event("r1", event_type="run.resumed", sequence_index=1)
-        await store.save_run_event("r1", event_type="run.paused", sequence_index=2)
-        await store.save_run_event("r2", event_type="run.paused", sequence_index=0)
+        await store.save_run_event("r1", event_type="run.paused")
+        await store.save_run_event("r1", event_type="run.resumed")
+        await store.save_run_event("r1", event_type="run.paused")
+        await store.save_run_event("r2", event_type="run.paused")
         # Non-pause events on r3 must not show up.
-        await store.save_run_event("r3", event_type="llm.completed", sequence_index=0)
+        await store.save_run_event("r3", event_type="llm.completed")
 
         counts = await store.count_pauses_per_run(["r1", "r2", "r3"])
         assert counts == {"r1": 2, "r2": 1}  # r3 absent (0 pauses)
@@ -694,7 +694,7 @@ class TestPauseResume:
         await store.pause_run("run_cl", status="waiting_client_tool", pause_data={"x": 1})
 
         claimed = await store.claim_paused_run("run_cl", expected_status="waiting_client_tool")
-        assert claimed is True
+        assert claimed == 1
 
         record = await store.get_run("run_cl")
         assert record is not None
@@ -720,7 +720,7 @@ class TestPauseResume:
         await store.pause_run("run_dc", status="waiting_client_tool", pause_data={"x": 1})
 
         claimed1 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
-        assert claimed1 is True
+        assert claimed1 == 1
 
         # Second claim fails — status is now 'running', not 'waiting_client_tool'
         claimed2 = await store.claim_paused_run("run_dc", expected_status="waiting_client_tool")
@@ -786,7 +786,7 @@ class TestSubmitAndClaim:
                 ]
             },
         )
-        assert won is True
+        assert won == 1
 
         # Status transitioned to running
         record = await store.get_run("run_sac1")
@@ -813,7 +813,7 @@ class TestSubmitAndClaim:
             expected_status="waiting_client_tool",
             submitted_data={"submitted_tool_results": [{"call_id": "tc1"}]},
         )
-        assert won1 is True
+        assert won1 == 1
 
         won2 = await store.submit_and_claim(
             "run_sac2",
@@ -873,7 +873,7 @@ class TestSubmitAndClaim:
             expected_status="waiting_human_input",
             submitted_data={"submitted_user_input": "yes, proceed"},
         )
-        assert won is True
+        assert won == 1
 
         pause = await store.get_pause_state("run_sac6")
         assert pause is not None
@@ -881,7 +881,7 @@ class TestSubmitAndClaim:
 
 
 # ------------------------------------------------------------------
-# Run Events (Dashboard Phase 0)
+# Run events
 # ------------------------------------------------------------------
 
 
@@ -890,20 +890,16 @@ class TestRunEvents:
         """Events are saved and retrieved in sequence_index order."""
         await store.create_run("run_ev", "Agent")
 
-        await store.save_run_event(
-            "run_ev", event_type="run.started", sequence_index=0, data={"agent": "A"}
-        )
+        await store.save_run_event("run_ev", event_type="run.started", data={"agent": "A"})
         await store.save_run_event(
             "run_ev",
             event_type="llm.completed",
-            sequence_index=1,
             iteration_index=1,
             data={"tokens": 500},
         )
         await store.save_run_event(
             "run_ev",
             event_type="run.completed",
-            sequence_index=2,
             data={"status": "success"},
         )
 
@@ -932,7 +928,6 @@ class TestRunEvents:
         await store.save_run_event(
             "run_corr",
             event_type="tool.completed",
-            sequence_index=0,
             iteration_index=1,
             correlation_id="tc_abc123",
             data={"tool_name": "lookup", "success": True},
@@ -943,19 +938,17 @@ class TestRunEvents:
         assert events[0].correlation_id == "tc_abc123"
 
     async def test_pause_resume_events_give_exact_timing(self, store) -> None:
-        """Pause and resume events provide durable timestamps for the dashboard."""
+        """Pause and resume events provide durable timestamps for inspection tools."""
         await store.create_run("run_pr_ev", "Agent")
 
         await store.save_run_event(
             "run_pr_ev",
             event_type="run.paused",
-            sequence_index=0,
             data={"pending_tool_calls": [{"name": "read_excel"}]},
         )
         await store.save_run_event(
             "run_pr_ev",
             event_type="run.resumed",
-            sequence_index=1,
             data={"resumed_from": "waiting_client_tool"},
         )
 
@@ -971,11 +964,23 @@ class TestRunEvents:
 
     async def test_sequence_index_determines_order(self, store) -> None:
         """Events are returned by sequence_index, not insertion order."""
+        from dendrux.db.models import RunEvent
+
         await store.create_run("run_seq", "Agent")
 
-        # Insert out of order
-        await store.save_run_event("run_seq", event_type="second", sequence_index=1)
-        await store.save_run_event("run_seq", event_type="first", sequence_index=0)
+        # Insert out of order, bypassing allocation (as a 0.4.1 writer could).
+        async with store._session_factory() as session:
+            for event_id, event_type, seq in (("e2", "second", 1), ("e1", "first", 0)):
+                session.add(
+                    RunEvent(
+                        id=event_id,
+                        agent_run_id="run_seq",
+                        event_type=event_type,
+                        sequence_index=seq,
+                        iteration_index=0,
+                    )
+                )
+                await session.commit()
 
         events = await store.get_run_events("run_seq")
         assert events[0].event_type == "first"
@@ -989,7 +994,7 @@ class TestRunEvents:
         """Events are deleted when the parent run is deleted."""
         await store.create_run("run_cas_ev", "Agent")
         await store.save_run_event("run_cas_ev", event_type="run.started")
-        await store.save_run_event("run_cas_ev", event_type="run.completed", sequence_index=1)
+        await store.save_run_event("run_cas_ev", event_type="run.completed")
 
         async with session_factory() as session:
             from sqlalchemy import delete, select

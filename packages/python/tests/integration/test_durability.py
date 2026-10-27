@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from dendrux.errors import PersistenceError
 from dendrux.types import RunStatus
 
 # ------------------------------------------------------------------
@@ -219,7 +220,7 @@ class TestClaimPausedRunDurability:
         with _FailOnceCommit():
             ok = await store.claim_paused_run("run1", expected_status="waiting_client_tool")
 
-        assert ok is True
+        assert ok == 1
         run = await store.get_run("run1")
         assert run.status == "running"
 
@@ -254,7 +255,7 @@ class TestSubmitAndClaimDurability:
                 submitted_data={"result": "done"},
             )
 
-        assert ok is True
+        assert ok == 1
         run = await store.get_run("run1")
         assert run.status == "running"
 
@@ -269,7 +270,7 @@ class TestSubmitAndClaimDurability:
                 submitted_data={"result": "done"},
             )
 
-        assert ok is True
+        assert ok == 1
 
     async def test_submit_and_claim_cas_miss_not_retried(self, store):
         """CAS miss on submit_and_claim returns False, not retried."""
@@ -314,7 +315,7 @@ class TestRetryTransientDb:
         async def _always_fail():
             raise OperationalError("persistent failure", {}, None)
 
-        with pytest.raises(OperationalError, match="persistent failure"):
+        with pytest.raises(PersistenceError, match="persistence_error"):
             await retry_transient_db(_always_fail, label="test", run_id="r1")
 
     async def test_does_not_retry_integrity_error(self):
@@ -327,7 +328,7 @@ class TestRetryTransientDb:
             call_count += 1
             raise IntegrityError("unique constraint", {}, None)
 
-        with pytest.raises(IntegrityError):
+        with pytest.raises(PersistenceError):
             await retry_transient_db(_attempt, label="test", run_id="r1")
 
         assert call_count == 1

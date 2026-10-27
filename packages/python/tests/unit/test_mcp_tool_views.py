@@ -604,13 +604,6 @@ class TestSurfacing:
         )
         assert "1 tool(s)" in capsys.readouterr().out
 
-    def test_dashboard_knows_the_event(self) -> None:
-        from dendrux.dashboard.normalizer import GOVERNANCE_EVENT_META
-
-        severity, _ = GOVERNANCE_EVENT_META[GovernanceEventType.MCP_TOOLS_SKIPPED]
-        assert severity == "warning"
-        assert GovernanceEventType.MCP_TOOLS_SKIPPED == "mcp.tools_skipped"
-
 
 _IDENTITY = (None, "c")
 

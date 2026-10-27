@@ -29,6 +29,7 @@ warning, never a broken run.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from dataclasses import dataclass, replace
@@ -427,6 +428,7 @@ class OpenRouterProvider(OpenAIProvider):
     # upstream's wire format, not this request.
     _image_provider_name = "openrouter"
     _locate_rejected_images = False
+    _deprecation_stacklevel = 4
 
     def __repr__(self) -> str:
         return f"OpenRouterProvider(model={self._model!r})"
@@ -639,35 +641,30 @@ class OpenRouterProvider(OpenAIProvider):
             return
         kwargs["extra_body"] = {**call_extra_body, "cache_control": dict(_AUTOMATIC_CACHE_CONTROL)}
 
+    @property
+    def reports_cost(self) -> bool:
+        """True: OpenRouter reports what it charged for each call (``usage.cost``)."""
+        return True
+
     def _normalize_usage(self, usage: Any) -> UsageStats:
-        """Enrich base usage with OpenRouter's cost and cache-write fields.
+        """Enrich base usage with OpenRouter's cost.
 
-        OpenRouter returns these on the standard usage object and they ride
-        through the OpenAI SDK as extra fields:
-
-          - ``cost`` → ``cost_usd``. USD-denominated, matching the USD
-            per-token pricing :meth:`list_models` already exposes; it is what
-            OpenRouter charged the account for this call. (``upstream_inference_cost``
-            stays available on the raw response — not mapped in v1.)
-          - ``prompt_tokens_details.cache_write_tokens`` →
-            ``cache_creation_input_tokens``, aligning with Anthropic's field.
-
-        A missing field leaves the base value unchanged; a reported zero (e.g.
-        free models) is preserved. Populating these at the source is enough —
-        the run-level accumulator and RunStore already carry both.
+        OpenRouter returns ``cost`` on the standard usage object (it rides
+        through the OpenAI SDK as an extra field) and it becomes ``cost_usd``:
+        USD-denominated, matching the USD per-token pricing :meth:`list_models`
+        exposes; it is what OpenRouter charged the account for this call.
+        (``upstream_inference_cost`` stays on the raw response, unmapped.)
+        Cache writes (``prompt_tokens_details.cache_write_tokens``) are read
+        by the base Chat usage mapping. A missing cost leaves the base value
+        unchanged; a reported zero (e.g. free models) is preserved.
         """
         base = super()._normalize_usage(usage)
         cost = _read_usage_extra(usage, "cost")
-        details = _read_usage_extra(usage, "prompt_tokens_details")
-        cache_write = _read_usage_extra(details, "cache_write_tokens")
-        return replace(
-            base,
-            cost_usd=float(cost) if cost is not None else base.cost_usd,
-            cost_source="provider" if cost is not None else base.cost_source,
-            cache_creation_input_tokens=(
-                int(cache_write) if cache_write is not None else base.cache_creation_input_tokens
-            ),
-        )
+        from dendrux.llm._usage import normalize_usage
+
+        if cost is None or not base.usage_reported:
+            return base
+        return normalize_usage(replace(base, cost_usd=cost, cost_source="provider"))
 
     async def complete(
         self,
@@ -714,12 +711,15 @@ class OpenRouterProvider(OpenAIProvider):
         await self._ensure_reasoning_allowed(model, thinking)
         self._apply_reasoning(kwargs, reasoning)
         self._apply_cache_control(kwargs, model)
-        async for event in super().complete_stream(
-            messages,
-            tools,
-            output_schema=output_schema,
-            run_id=run_id,
-            cache_key_prefix=cache_key_prefix,
-            **kwargs,
-        ):
-            yield event
+        async with contextlib.aclosing(
+            super().complete_stream(
+                messages,
+                tools,
+                output_schema=output_schema,
+                run_id=run_id,
+                cache_key_prefix=cache_key_prefix,
+                **kwargs,
+            )
+        ) as events:
+            async for event in events:
+                yield event

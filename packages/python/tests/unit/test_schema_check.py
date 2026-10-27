@@ -66,6 +66,7 @@ def test_error_message_lists_objects_and_the_remedy() -> None:
     assert "dendrux db migrate" in text
     assert "DENDRUX_DATABASE_URL" in text
     assert SKIP_ENV in text
+    assert err.missing_indexes == ()
     assert err.missing_tables == ("run_inbox",)
     assert err.missing_columns == ("agent_runs.pause_requested",)
     assert err.missing == ("agent_runs.pause_requested", "run_inbox")
@@ -179,3 +180,30 @@ async def test_connect_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> No
     engine.connect.side_effect = OSError("refused")
     with pytest.raises(OSError, match="refused"):
         await ensure_schema_current(engine)
+
+
+def test_missing_indexes_are_separate_from_columns() -> None:
+    err = SchemaOutOfDateError(missing_indexes=["agent_runs.ix_run (index)"])
+    assert err.missing_columns == ()
+    assert err.missing_indexes == ("agent_runs.ix_run (index)",)
+    assert err.missing == err.missing_indexes
+    assert err.missing_indexes[0] in str(err)
+
+
+async def test_schema_check_populates_missing_indexes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dendrux.db import _schema_check
+
+    monkeypatch.delenv(SKIP_ENV, raising=False)
+    engine = _engine("postgresql")
+    conn = MagicMock()
+
+    async def run_sync(fn):
+        return _full() if fn is _schema_check.read_actual_schema else set()
+
+    conn.run_sync = run_sync
+    engine.connect.return_value.__aenter__ = _async_return(conn)
+    engine.connect.return_value.__aexit__ = _async_return(None)
+    with pytest.raises(SchemaOutOfDateError) as info:
+        await ensure_schema_current(engine)
+    assert info.value.missing_columns == ()
+    assert set(info.value.missing_indexes) == set(_schema_check.compare_indexes([], _full()))

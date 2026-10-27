@@ -32,7 +32,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from dendrux._sentinel import _UnsetType
+from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
+from dendrux.runtime._entry_checks import entry_checks, require_boolean
 from dendrux.runtime.state import UNSCOPED, TenantScope, require_store_method
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
         BeforeToolHook,
         Budget,
         ImageRef,
+        Limits,
         PauseOutcome,
         RunEvent,
         RunResult,
@@ -77,13 +79,40 @@ if TYPE_CHECKING:
 
 _agent_logger = logging.getLogger(__name__)
 
+
+def _check_result_read_arguments(run_id: Any, tenant_id: Any) -> None:
+    from dendrux.types import _validate_identifier
+
+    try:
+        _validate_identifier(run_id, "run_id", maximum=26)
+        if tenant_id is not None:
+            _validate_identifier(tenant_id, "tenant_id")
+    except ValueError:
+        _agent_logger.warning(
+            "Invalid result read argument", extra={"code": "read_argument_invalid"}
+        )
+        raise ValueError(
+            "Invalid run_id." if not _valid_read_id(run_id) else "Invalid tenant_id."
+        ) from None
+
+
+def _valid_read_id(value: Any) -> bool:
+    from dendrux.types import _validate_identifier
+
+    try:
+        _validate_identifier(value, "run_id", maximum=26)
+    except ValueError:
+        return False
+    return True
+
+
 # Safety limit to prevent runaway LLM costs. Can be overridden per-agent
 # once the worker/config layer ships (Sprint 6).
 MAX_ITERATIONS_CEILING = 200
 
 _UNSET = _UnsetType()
 
-# Inbox note limits (E-P2-3): text is UTF-8 bytes; metadata is encoded JSON.
+# Inbox note limits: text is UTF-8 bytes; metadata is encoded JSON.
 MAX_NOTE_TEXT_BYTES = 32 * 1024
 MAX_NOTE_METADATA_BYTES = 8 * 1024
 MAX_PAUSE_REASON_CHARS = 1000
@@ -103,10 +132,8 @@ async def _require_run_in_scope(store: StateStore, run_id: str, tenant_id: Tenan
     """Raise ``RunNotFoundError`` unless the run exists within ``tenant_id``.
 
     Run before any write so a cross-tenant call changes nothing. A run's
-    tenant never changes, so this read cannot race. Omitted scope skips it.
+    tenant never changes, so this read cannot race. Missing runs use the same error.
     """
-    if tenant_id is UNSCOPED:
-        return
     from dendrux.errors import RunNotFoundError
 
     record = await store.get_run(run_id)
@@ -161,7 +188,7 @@ def _record_to_run_result(record: Any) -> RunResult:
         cache_read_input_tokens=record.total_cache_read_tokens,
         cache_creation_input_tokens=record.total_cache_creation_tokens,
     )
-    from dendrux.runtime.runner import _stop_reason_from_meta
+    from dendrux.runtime.runner import _error_info_from_meta, _stop_reason_from_meta
 
     status = RunStatus(record.status)
     return RunResult(
@@ -169,6 +196,7 @@ def _record_to_run_result(record: Any) -> RunResult:
         status=status,
         answer=record.answer,
         error=record.error,
+        error_info=_error_info_from_meta(record.meta),
         iteration_count=record.iteration_count,
         usage=usage,
         meta={"cancel_requested": bool(record.cancel_requested)},
@@ -177,6 +205,26 @@ def _record_to_run_result(record: Any) -> RunResult:
             if status == RunStatus.SUCCESS
             else None
         ),
+    )
+
+
+def _warn_env_store_deprecated() -> None:
+    """B6 ``DeprecationWarning`` for the implicit DENDRUX_DATABASE_URL store.
+
+    Deduplicated by ``warnings`` per caller location; ``stacklevel`` points at
+    the code that called the Agent method (this function,
+    ``_resolve_state_store``, the Agent method).
+    """
+    import warnings
+
+    warnings.warn(
+        "Agent found no state_store or database_url and fell back to DENDRUX_DATABASE_URL. "
+        "This implicit store is deprecated and is removed in dendrux 0.6. Create one state "
+        "store per process (for example at app startup: "
+        "SQLAlchemyStateStore(create_async_engine(url))) and pass state_store= to every "
+        "Agent. Explicit database_url Agents share a reference-counted pool per URL and options.",
+        DeprecationWarning,
+        stacklevel=4,
     )
 
 
@@ -358,6 +406,10 @@ class Agent:
         before_tool: BeforeToolHook | None = ...,
         images: ImagePolicy | None = ...,
         blob_store: BlobStore | None = ...,
+        strict_tenancy: bool = ...,
+        limits: Limits | None = ...,
+        tool_threads: int = ...,
+        on_governance_change: Literal["warn", "raise"] = ...,
     ) -> None: ...
 
     @overload
@@ -389,6 +441,10 @@ class Agent:
         before_tool: BeforeToolHook | None = ...,
         images: ImagePolicy | None = ...,
         blob_store: BlobStore | None = ...,
+        strict_tenancy: bool = ...,
+        limits: Limits | None = ...,
+        tool_threads: int = ...,
+        on_governance_change: Literal["warn", "raise"] = ...,
     ) -> None: ...
 
     def __init__(
@@ -419,6 +475,10 @@ class Agent:
         before_tool: BeforeToolHook | None = None,
         images: ImagePolicy | None = None,
         blob_store: BlobStore | None = None,
+        strict_tenancy: bool | _UnsetType = _UNSET,
+        limits: Limits | None = None,
+        tool_threads: int = 8,
+        on_governance_change: Literal["warn", "raise"] | _UnsetType = _UNSET,
     ) -> None:
         # --- Subclass guard: block class-level provider ---
         from dendrux.llm.base import LLMProvider as _LLMBase
@@ -462,17 +522,7 @@ class Agent:
             else _resolved_provider
         )
 
-        # --- Persistence ---
-        if database_url is not None and state_store is not None:
-            raise ValueError(
-                "database_url and state_store are mutually exclusive. Pass one or the other."
-            )
-        if database_options is not None and database_url is None:
-            raise ValueError("database_options requires database_url.")
-
-        self._database_url = database_url
-        self._database_options = database_options or {}
-        self._state_store = state_store
+        self._configure_persistence(database_url, database_options, state_store)
 
         from dendrux.runtime.tasks import RunTaskManager
 
@@ -497,6 +547,113 @@ class Agent:
             )
         self._before_tool: BeforeToolHook | None = before_tool
 
+        self._configure_trust(strict_tenancy, limits, tool_threads, on_governance_change)
+        self._configure_images(images, blob_store)
+        self._configure_tool_sources(tool_sources)
+
+        # --- Skills ---
+        if skills_dir is not None and not isinstance(skills_dir, (str, Path)):
+            raise ValueError(
+                f"Agent '{self.name}' skills_dir must be a string or Path, "
+                f"got {type(skills_dir).__name__}."
+            )
+        self._skills_dir: Path | None = Path(skills_dir) if skills_dir is not None else None
+
+        self._explicit_skills: list[Skill] | None = None
+        if skills is not None:
+            from dendrux.skills import Skill as _Skill
+
+            for i, s in enumerate(skills):
+                if not isinstance(s, _Skill):
+                    raise ValueError(
+                        f"Agent '{self.name}' skills[{i}] is {type(s).__name__}, "
+                        f"not a Skill instance. Use Skill.from_dir(path)."
+                    )
+            self._explicit_skills = list(skills)
+
+        self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
+        self._loaded_skills: list[Skill] | None = None
+        self._denied_skill_names: list[str] | None = None
+        self._inline_skill_warning_emitted: bool = False
+        validate_executor(skill_executor)
+        self._skill_executor = skill_executor
+        self._script_warning_names: set[str] = set()
+        self._validate_skill_contents(self._explicit_skills or [])
+
+        self._validate()
+
+        from dendrux import pricing as _pricing
+
+        _pricing.check_budget_config(self)
+
+    def _configure_persistence(
+        self,
+        database_url: str | None,
+        database_options: dict[str, Any] | None,
+        state_store: StateStore | None,
+    ) -> None:
+        """Validate the source of database ownership before any lazy acquisition."""
+        # --- Persistence ---
+        if database_url is not None and state_store is not None:
+            raise ValueError(
+                "database_url and state_store are mutually exclusive. Pass one or the other."
+            )
+        if (
+            database_options is not None
+            and database_url is None
+            and not os.environ.get("DENDRUX_DATABASE_URL")
+        ):
+            raise ValueError("database_options requires database_url.")
+
+        self._database_url = database_url
+        self._database_options = database_options or {}
+        self._state_store = state_store
+
+    def _configure_trust(
+        self,
+        strict_tenancy: bool | _UnsetType,
+        limits: Limits | None,
+        tool_threads: int,
+        on_governance_change: Literal["warn", "raise"] | _UnsetType,
+    ) -> None:
+        """Validate and retain the per-Agent governance policy."""
+        # --- Trust (0.5.0): stored here, enforced by the runtime checks ---
+        from dendrux.tools._lookups import make_call_limiter
+        from dendrux.types import Limits as _Limits
+
+        # "Not chosen" is kept apart from an explicit False / "warn": the 0.6
+        # default flips warn only developers who did not choose.
+        self._strict_tenancy_chosen: bool = not isinstance(strict_tenancy, _UnsetType)
+        self._on_governance_change_chosen: bool = not isinstance(on_governance_change, _UnsetType)
+        if isinstance(strict_tenancy, _UnsetType):
+            strict_tenancy = False
+        if isinstance(on_governance_change, _UnsetType):
+            on_governance_change = "warn"
+        if not isinstance(strict_tenancy, bool):
+            raise ValueError(f"Agent '{self.name}' strict_tenancy must be a bool.")
+        if limits is not None and not isinstance(limits, _Limits):
+            raise ValueError(
+                f"Agent '{self.name}' limits must be a Limits instance, "
+                f"got {type(limits).__name__}."
+            )
+        if isinstance(tool_threads, bool) or not isinstance(tool_threads, int) or tool_threads < 1:
+            raise ValueError(
+                f"Agent '{self.name}' tool_threads must be a positive int, got {tool_threads!r}."
+            )
+        if on_governance_change not in ("warn", "raise"):
+            raise ValueError(
+                f"Agent '{self.name}' on_governance_change must be 'warn' or 'raise', "
+                f"got {on_governance_change!r}."
+            )
+        self._strict_tenancy: bool = strict_tenancy
+        # None means the default caps: B12 applies them unless the developer overrides.
+        self._limits: Limits = limits if limits is not None else _Limits()
+        self._tool_threads: int = tool_threads
+        self._on_governance_change: Literal["warn", "raise"] = on_governance_change
+        self._tool_call_limiter: Any = make_call_limiter(tool_threads)
+
+    def _configure_images(self, images: ImagePolicy | None, blob_store: BlobStore | None) -> None:
+        """Validate image services and initialize their store lifecycle."""
         # --- Images ---
         from dendrux.media._policy import ImagePolicy as _ImagePolicy
         from dendrux.media._store import BlobStore as _BlobStore
@@ -520,6 +677,10 @@ class Agent:
         self._store_lock = threading.Lock()
         self._store_generation = 0
 
+    def _configure_tool_sources(
+        self, tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None
+    ) -> None:
+        """Expand configured MCP sources and validate their identities."""
         # --- MCP tool sources ---
         self._tool_sources: list[MCPServer] = []
         if tool_sources:
@@ -583,37 +744,6 @@ class Agent:
         # mcp.tools_skipped event and RunResult.meta["mcp_skipped_tools"].
         self._mcp_skipped_tools: list[dict[str, Any]] = []
         self._discovery_lock = asyncio.Lock()
-
-        # --- Skills ---
-        if skills_dir is not None and not isinstance(skills_dir, (str, Path)):
-            raise ValueError(
-                f"Agent '{self.name}' skills_dir must be a string or Path, "
-                f"got {type(skills_dir).__name__}."
-            )
-        self._skills_dir: Path | None = Path(skills_dir) if skills_dir is not None else None
-
-        self._explicit_skills: list[Skill] | None = None
-        if skills is not None:
-            from dendrux.skills import Skill as _Skill
-
-            for i, s in enumerate(skills):
-                if not isinstance(s, _Skill):
-                    raise ValueError(
-                        f"Agent '{self.name}' skills[{i}] is {type(s).__name__}, "
-                        f"not a Skill instance. Use Skill.from_dir(path)."
-                    )
-            self._explicit_skills = list(skills)
-
-        self._deny_skills: frozenset[str] = frozenset(deny_skills) if deny_skills else frozenset()
-        self._loaded_skills: list[Skill] | None = None
-        self._denied_skill_names: list[str] | None = None
-        self._inline_skill_warning_emitted: bool = False
-        validate_executor(skill_executor)
-        self._skill_executor = skill_executor
-        self._script_warning_names: set[str] = set()
-        self._validate_skill_contents(self._explicit_skills or [])
-
-        self._validate()
 
     # ------------------------------------------------------------------
     # Properties
@@ -1032,12 +1162,12 @@ class Agent:
 
         Resolution order:
           1. Explicit state_store from constructor → returned as-is
-          2. database_url from constructor → private engine (agent-owned)
+          2. database_url from constructor → reference-counted shared engine
           3. DENDRUX_DATABASE_URL env var → shared global engine
           4. None (ephemeral mode)
 
         Ownership rule:
-          - Explicit database_url creates a private engine disposed by close().
+          - Explicit database_url acquires a shared reference released by close().
           - Env-var path uses the shared singleton from get_engine() — NOT
             owned by this agent, NOT disposed by close().
         """
@@ -1048,6 +1178,7 @@ class Agent:
             return self._lazy_store
 
         from dendrux.db._schema_check import was_verified
+        from dendrux.db._shared_pool import release
         from dendrux.runtime.state import SQLAlchemyStateStore
 
         if self._database_url is not None:
@@ -1058,7 +1189,7 @@ class Agent:
                 if not was_verified(engine):
                     await _verify_schema_initialized(engine, self._database_url)
             except BaseException:
-                await engine.dispose()
+                await release(engine)
                 raise
             with self._store_lock:
                 if self._store_generation != generation:
@@ -1069,7 +1200,7 @@ class Agent:
                     self._private_engine = engine
                     self._lazy_store = SQLAlchemyStateStore(engine)
                     return self._lazy_store
-            await engine.dispose()
+            await release(engine)
             if closed:
                 raise RuntimeError("Agent was closed while its database was initializing.")
             assert self._lazy_store is not None
@@ -1077,9 +1208,8 @@ class Agent:
 
         env_url = os.environ.get("DENDRUX_DATABASE_URL")
         if env_url is not None:
-            from dendrux.db.session import get_engine
-
-            engine = await get_engine(env_url)
+            _warn_env_store_deprecated()
+            engine = await _get_env_engine(env_url, self._database_options)
             if not was_verified(engine):
                 await _verify_schema_initialized(engine, env_url)
             self._lazy_store = SQLAlchemyStateStore(engine)
@@ -1088,44 +1218,10 @@ class Agent:
         return None
 
     async def _create_private_engine(self, url: str) -> AsyncEngine:
-        """Create an agent-owned engine from an explicit database_url.
+        """Acquire this Agent's reference to the shared URL/options engine."""
+        from dendrux.db._shared_pool import acquire
 
-        Unlike the global get_engine() singleton, this creates a fresh engine
-        per agent so multiple agents with different URLs can coexist.
-        database_options are applied here.
-        """
-        from pathlib import Path
-
-        from sqlalchemy.ext.asyncio import create_async_engine
-
-        from dendrux.db._schema_check import ensure_schema_current
-        from dendrux.db._sqlite_sync import create_sqlite_schema
-
-        connect_args: dict[str, Any] = {}
-        if url.startswith("sqlite"):
-            connect_args["check_same_thread"] = False
-
-        engine = create_async_engine(
-            url,
-            echo=False,
-            connect_args=connect_args,
-            **self._database_options,
-        )
-
-        try:
-            if url.startswith("sqlite"):
-                # Auto-create tables for SQLite (zero-config promise)
-                db_path = url.split("///", 1)[-1] if "///" in url else None
-                if db_path:
-                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-                await create_sqlite_schema(engine)
-            else:
-                await ensure_schema_current(engine)
-        except BaseException:
-            await engine.dispose()
-            raise
-
-        return engine
+        return await acquire(url, self._database_options)
 
     # ------------------------------------------------------------------
     # Runtime methods
@@ -1180,7 +1276,7 @@ class Agent:
         runs: list[str] | None = None,
         replay_last: int | Literal["all"] = 0,
         replay_reasoning: bool = True,
-        tenant_id: str | None = None,
+        tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
@@ -1286,6 +1382,18 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
+        tenant_id = entry_checks(
+            self,
+            "run",
+            tenant_id,
+            default_tenant=None,
+            metadata=metadata,
+            user_input=user_input,
+            history=history,
+            context=context,
+            provider_kwargs=kwargs,
+            idempotency_key=idempotency_key,
+        )
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
@@ -1350,7 +1458,7 @@ class Agent:
         self,
         run_id: str,
         *,
-        tenant_id: str | None = None,
+        tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
         **kwargs: Any,
@@ -1381,6 +1489,17 @@ class Agent:
                 source run is not terminal, or if the source run was
                 SingleCall.
         """
+        tenant_id = entry_checks(
+            self,
+            "retry",
+            tenant_id,
+            default_tenant=None,
+            run_id=run_id,
+            metadata=metadata,
+            history=kwargs.get("history"),
+            context=kwargs.get("context"),
+            provider_kwargs=kwargs,
+        )
         provider = self._require_provider()
         store = await self._resolve_state_store()
 
@@ -1410,7 +1529,8 @@ class Agent:
         tool_results: list[ToolResult] | None = None,
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Resume a paused run.
 
@@ -1426,6 +1546,7 @@ class Agent:
                 ``ToolResult.images`` are ingested before the run is claimed.
             user_input: Clarification answer (for human-in-the-loop runs): a
                 string, or strings and images.
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier. Composed with
                 PersistenceRecorder internally.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
@@ -1440,6 +1561,15 @@ class Agent:
                 both args provided, or neither provided.
             RunNotFoundError: ``run_id`` is outside ``tenant_id``.
         """
+        tenant_id = entry_checks(
+            self,
+            "resume",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            tool_results=tool_results,
+            user_input=user_input,
+        )
         # Validate args before any I/O
         provider = self._require_provider()
         if tool_results is not None and user_input is not None:
@@ -1465,6 +1595,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                expected_pause_id=expected_pause_id,
             )
         if user_input is not None:
             return await resume_with_input(
@@ -1474,6 +1605,7 @@ class Agent:
                 agent=self,
                 provider=provider,
                 extra_notifier=notifier,
+                expected_pause_id=expected_pause_id,
             )
         # No-arg resume — approve path. Runner validates status is
         # WAITING_APPROVAL and executes pending tools.
@@ -1484,7 +1616,27 @@ class Agent:
             agent=self,
             provider=provider,
             extra_notifier=notifier,
+            expected_pause_id=expected_pause_id,
         )
+
+    async def _await_claimed_task(
+        self, task: asyncio.Task[RunResult], store: StateStore, run_id: str
+    ) -> RunResult:
+        from dendrux.runtime.runner import _persist_task_cancellation
+
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # The awaited task can be cancelled before its first step. Its
+            # runner guard has not run, so finish the epoch-bound claim here.
+            cleanup = asyncio.create_task(_persist_task_cancellation(store, run_id))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise
 
     async def submit_tool_results(
         self,
@@ -1492,7 +1644,8 @@ class Agent:
         results: list[ToolResult],
         *,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Submit client-side tool results and resume the paused run.
 
@@ -1504,10 +1657,13 @@ class Agent:
             run_id: A run in status ``WAITING_CLIENT_TOOL``.
             results: One :class:`ToolResult` per pending tool call. Must
                 cover every pending call; unknown or missing ids raise
-                ``InvalidToolResultError``. ``ToolResult.images`` are
-                validated and stored before the claim; an image error
+                ``InvalidToolResultError``. Text and JSON payloads keep their original
+                bytes unless capped or changed by ``tool_result_transform``.
+                ``ToolResult.images`` are validated and stored before the claim; an image error
                 (``ImageError``, ``UnsupportedModalityError``) raises with the
                 run still waiting.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1526,10 +1682,19 @@ class Agent:
             RunAlreadyTerminalError: run already reached a terminal state.
             InvalidToolResultError: results don't match pending calls.
         """
+        tenant_id = entry_checks(
+            self,
+            "submit_tool_results",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            tool_results=results,
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
             claim_or_raise,
+            prepare_client_results,
             serialize_tool_results,
             validate_tool_results,
         )
@@ -1544,6 +1709,10 @@ class Agent:
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
             pause = await validate_tool_results(store, run_id, results)
+            from dendrux.runtime.submit import warn_missing_pause_id
+
+            warn_missing_pause_id(self, expected_pause_id, pause_id=pause.pause_id)
+            results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
             if any(r.images for r in results):
                 from dendrux.runtime.runner import ingest_submitted_tool_images
@@ -1551,13 +1720,21 @@ class Agent:
                 results, claim_kwargs = await ingest_submitted_tool_images(
                     self, provider, store, run_id, pause, results
                 )
-            await claim_or_raise(
+            epoch = await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_CLIENT_TOOL,
                 submitted_data={"submitted_tool_results": serialize_tool_results(results)},
+                agent=self,
+                expected_pause_id=(
+                    expected_pause_id if expected_pause_id is not None else pause.pause_id
+                ),
+                call_results=results,
                 **claim_kwargs,
             )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
 
             task = self._task_manager.spawn(
                 run_id,
@@ -1570,7 +1747,7 @@ class Agent:
                     pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def submit_input(
         self,
@@ -1578,7 +1755,8 @@ class Agent:
         text: UserContent,
         *,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Submit clarification input and resume the paused run.
 
@@ -1589,6 +1767,8 @@ class Agent:
             run_id: A run in status ``WAITING_HUMAN_INPUT``.
             text: The user's clarification answer: a string, or strings and
                 images (ingested before the claim).
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1600,6 +1780,14 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_id = entry_checks(
+            self,
+            "submit_input",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            user_input=text,
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import claim_or_raise
@@ -1624,13 +1812,18 @@ class Agent:
                 submitted, claim_kwargs = await ingest_submitted_user_parts(
                     self, provider, store, run_id, projection, items
                 )
-            await claim_or_raise(
+            epoch = await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_HUMAN_INPUT,
                 submitted_data=submitted,
+                agent=self,
+                expected_pause_id=expected_pause_id,
                 **claim_kwargs,
             )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
 
             task = self._task_manager.spawn(
                 run_id,
@@ -1643,7 +1836,7 @@ class Agent:
                     pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def submit_approval(
         self,
@@ -1653,7 +1846,8 @@ class Agent:
         decisions: Mapping[str, ApprovalDecision] | None = None,
         rejection_reason: str | None = None,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Submit an approval decision for a run awaiting human approval.
 
@@ -1689,6 +1883,8 @@ class Agent:
             approved: Whole-batch decision.
             decisions: Per-call decisions keyed by tool call id.
             rejection_reason: Reason used with ``approved=False``.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -1701,17 +1897,30 @@ class Agent:
             PauseStatusMismatchError, RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        require_boolean(approved, "approved", optional=True)
+        tenant_id = entry_checks(
+            self,
+            "submit_approval",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            rejection_reason=rejection_reason,
+            decisions=decisions,
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_approval_approved_claim, resume_claimed
         from dendrux.runtime.submit import (
             build_rejection_results,
             claim_or_raise,
+            decision_denial_results,
             normalize_decisions,
             preflight_status,
             raise_for_non_paused_status,
             serialize_decisions,
             serialize_tool_results,
             validate_approval_decisions,
+            validate_denial_results,
+            warn_missing_pause_id,
         )
         from dendrux.types import PauseState, RunStatus
 
@@ -1745,6 +1954,16 @@ class Agent:
                     run_id, pause_state, pairs, target_lookup
                 )
 
+                validate_denial_results(
+                    self, run_id, decision_denial_results(pause_state, decision_map)
+                )
+                warn_missing_pause_id(
+                    self,
+                    expected_pause_id,
+                    pause_id=pause_state.pause_id,
+                    approval=any(decision.approved for decision in decision_map.values()),
+                )
+
                 def same_pause_generation(current: dict[str, Any]) -> None:
                     # Re-validate against the exact pause being claimed: a
                     # newer approval pause (ABA) must reject stale decisions
@@ -1753,7 +1972,7 @@ class Agent:
                         run_id, PauseState.from_dict(current), pairs, target_lookup
                     )
 
-                await claim_or_raise(
+                epoch = await claim_or_raise(
                     store,
                     run_id,
                     expected_status=RunStatus.WAITING_APPROVAL,
@@ -1761,7 +1980,14 @@ class Agent:
                         "submitted_decisions": serialize_decisions(pause_state, decision_map)
                     },
                     validate=same_pause_generation,
+                    agent=self,
+                    expected_pause_id=(
+                        expected_pause_id if expected_pause_id is not None else pause_state.pause_id
+                    ),
                 )
+                from dendrux.runtime.state import claimed_store
+
+                store = claimed_store(store, run_id, epoch)
                 task = self._task_manager.spawn(
                     run_id,
                     resume_claimed(
@@ -1773,14 +1999,20 @@ class Agent:
                         pre_claim_status=RunStatus.WAITING_APPROVAL.value,
                     ),
                 )
-                return await task
+                return await self._await_claimed_task(task, store, run_id)
 
-            if approved:
-                await claim_or_raise(
+            if approved is True:
+                epoch = await claim_or_raise(
                     store,
                     run_id,
                     expected_status=RunStatus.WAITING_APPROVAL,
+                    agent=self,
+                    expected_pause_id=expected_pause_id,
+                    approval=True,
                 )
+                from dendrux.runtime.state import claimed_store
+
+                store = claimed_store(store, run_id, epoch)
                 task = self._task_manager.spawn(
                     run_id,
                     resume_approval_approved_claim(
@@ -1791,7 +2023,7 @@ class Agent:
                         extra_notifier=notifier,
                     ),
                 )
-                return await task
+                return await self._await_claimed_task(task, store, run_id)
 
             # Rejection path — fabricate one failed result per pending tool call,
             # then submit-and-claim so the runner's resume_claimed sees them as
@@ -1800,13 +2032,23 @@ class Agent:
             if raw_pause is None:
                 await raise_for_non_paused_status(store, run_id)
             pause_state = PauseState.from_dict(raw_pause)
+            warn_missing_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id)
             synthetic = build_rejection_results(pause_state, rejection_reason)
-            await claim_or_raise(
+            validate_denial_results(self, run_id, synthetic)
+            epoch = await claim_or_raise(
                 store,
                 run_id,
                 expected_status=RunStatus.WAITING_APPROVAL,
                 submitted_data={"submitted_tool_results": serialize_tool_results(synthetic)},
+                agent=self,
+                call_results=synthetic,
+                expected_pause_id=(
+                    expected_pause_id if expected_pause_id is not None else pause_state.pause_id
+                ),
             )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
             task = self._task_manager.spawn(
                 run_id,
                 resume_claimed(
@@ -1818,14 +2060,53 @@ class Agent:
                     pre_claim_status=RunStatus.WAITING_APPROVAL.value,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
+
+    async def get_result(
+        self, run_id: str, *, tenant_id: str | None, include_pii: bool = False
+    ) -> RunResult:
+        """Read a persisted result in one explicit tenant scope, or raise not found.
+
+        Never accepts UNSCOPED. Routes must separately authorize their actor's
+        access to this run. Pending arguments use RunStore.get_pending's view.
+        """
+        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.guardrails._engine import deanonymize_text
+        from dendrux.runtime._pending import _PendingReader
+        from dendrux.runtime.runner import _cached_output, _public_meta
+
+        _check_result_read_arguments(run_id, tenant_id)
+        require_boolean(include_pii, "include_pii")
+        store = await self._resolve_state_store()
+        if store is None:
+            raise PersistenceNotConfiguredError()
+        facade = _PendingReader(store)
+        projected = getattr(store, "_get_result_record", None)
+        record = (
+            await projected(run_id, tenant_id=tenant_id)
+            if projected is not None
+            else await facade._scoped_run(run_id, tenant_id)
+        )
+        if record is None or record.agent_name != self.name:
+            raise RunNotFoundError(run_id)
+        result = _record_to_run_result(record)
+        mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
+        result.answer = deanonymize_text(record.answer, mapping)[0]
+        result._wire_pii_mapping = mapping
+        if include_pii:
+            result.meta.update(_public_meta({"pii_mapping": mapping}))
+        if result.status.value == "success":
+            result.output = _cached_output(record.answer, self._output_type, run_id)
+        result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
+        result.pause_id = result.pending.pause_id if result.pending else None
+        return result
 
     async def cancel_run(
         self,
         run_id: str,
         *,
         cascade: bool = False,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> RunResult:
         """Request cancellation for ``run_id``.
 
@@ -1862,8 +2143,9 @@ class Agent:
         - **In-process submit/resume task on this Agent instance:** the
           asyncio task spawned by :meth:`submit_tool_results`,
           :meth:`submit_input`, :meth:`submit_approval` or
-          :meth:`submit_resume` is cancelled synchronously in addition to
-          the DB-level cancel signal.
+          :meth:`submit_resume` is cancelled after entering the runner's
+          ownership guard. Before that guard, it stays alive to observe the
+          durable DB cancellation request and finalize its claim.
         - **Terminal run:** no-op; returns the current persisted state.
           Does not raise.
         - **Non-persisted runs:** unsupported. ``cancel_run`` requires a
@@ -1899,6 +2181,10 @@ class Agent:
             RunNotFoundError: ``run_id`` does not exist (or is outside
                 ``tenant_id``).
         """
+        require_boolean(cascade, "cascade")
+        tenant_id = entry_checks(
+            self, "cancel_run", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+        )
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
 
         store = await self._resolve_state_store()
@@ -1912,19 +2198,55 @@ class Agent:
             raise RunNotFoundError(run_id)
 
         outcomes: list[dict[str, str]] = []
-        # Descendants are signalled together with the root, after every
-        # durable request: a parent and child sharing one task must both
-        # register their interrupt before the task sees the cancellation.
+        cascade_count = 0
         to_signal: list[str] = []
+        root_outcome = None
+        root_signalled = False
+        if cascade and record.status not in _TERMINAL_STATUS_VALUES:
+            # A child can share its task with the root. Persist the root's
+            # request before the first page can interrupt that shared task.
+            root_outcome = await self._cancel_one(store, run_id, signal=False)
         if cascade:
-            get_subtree = require_store_method(store, "get_subtree")
-            subtree = await get_subtree(run_id, tenant_id=tenant_id)
-            if subtree is not None:
-                for rid in _cascade_order(subtree)[:-1]:
-                    outcome = await self._cancel_one(store, rid, signal=False)
-                    outcomes.append({"run_id": rid, "outcome": outcome})
-                    if outcome != "terminal":
-                        to_signal.append(rid)
+            page_reader = getattr(store, "get_descendant_page", None)
+            if page_reader is not None:
+                after = None
+                while True:
+                    page = await page_reader(run_id, after=after, tenant_id=tenant_id)
+                    for rid in page:
+                        outcome = await self._cancel_one(store, rid, signal=False)
+                        cascade_count += 1
+                        if len(outcomes) < 999:
+                            outcomes.append({"run_id": rid, "outcome": outcome})
+                        if outcome != "terminal":
+                            to_signal.append(rid)
+                    # Register both root and child interrupts before the shared
+                    # task reaches its next checkpoint.
+                    if (
+                        root_outcome is not None
+                        and root_outcome != "terminal"
+                        and not root_signalled
+                    ):
+                        self._task_manager.cancel(run_id)
+                        root_signalled = True
+                    for rid in to_signal:
+                        self._task_manager.cancel(rid)
+                    to_signal.clear()
+                    if len(page) < 500:
+                        break
+                    after = page[-1]
+            else:
+                # Compatibility with stores predating paged descendant reads.
+                subtree = await require_store_method(store, "get_subtree")(
+                    run_id, tenant_id=tenant_id
+                )
+                if subtree is not None:
+                    for rid in _cascade_order(subtree)[:-1]:
+                        outcome = await self._cancel_one(store, rid, signal=False)
+                        cascade_count += 1
+                        if len(outcomes) < 999:
+                            outcomes.append({"run_id": rid, "outcome": outcome})
+                        if outcome != "terminal":
+                            to_signal.append(rid)
 
         if record.status in _TERMINAL_STATUS_VALUES:
             for rid in to_signal:
@@ -1932,7 +2254,7 @@ class Agent:
             result = _record_to_run_result(record)
             outcomes.append({"run_id": run_id, "outcome": "terminal"})
         else:
-            outcome = await self._cancel_one(store, run_id, signal=False)
+            outcome = root_outcome or await self._cancel_one(store, run_id, signal=False)
             outcomes.append({"run_id": run_id, "outcome": outcome})
             record = await store.get_run(run_id)
             if record is None:  # pragma: no cover — we just preflight-checked
@@ -1944,7 +2266,8 @@ class Agent:
             # meta.cancel_requested) rather than racing the loop's own finalize.
             for rid in to_signal:
                 self._task_manager.cancel(rid)
-            self._task_manager.cancel(run_id)
+            if not root_signalled:
+                self._task_manager.cancel(run_id)
             result = _record_to_run_result(record)
         if result.status.value in _TERMINAL_STATUS_VALUES:
             from dendrux.runtime.runner import _attach_undelivered_notes
@@ -1952,6 +2275,8 @@ class Agent:
             await _attach_undelivered_notes(store, run_id, result)
         if cascade:
             result.meta["cascade"] = outcomes
+            result.meta["cascade_count"] = cascade_count + 1
+            result.meta["cascade_truncated"] = cascade_count + 1 > len(outcomes)
         return result
 
     async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
@@ -1968,12 +2293,11 @@ class Agent:
         # transaction (sequence allocated under the row lock) so it always
         # sorts after the runner's run.paused. Running-run cancel: the runner
         # emits run.cancelled at a checkpoint.
-        from dendrux.runtime.runner import EventSequencer, _transition_with_event
+        from dendrux.runtime.runner import _transition_with_event
 
         cancel_won = await _transition_with_event(
             store,
             run_id,
-            EventSequencer(initial=await store.get_next_event_sequence(run_id)),
             status=RunStatus.CANCELLED.value,
             allowed_current_statuses=[
                 RunStatus.WAITING_CLIENT_TOOL.value,
@@ -1993,7 +2317,7 @@ class Agent:
         run_id: str,
         *,
         cascade: bool = True,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
         reason: str | None = None,
     ) -> PauseOutcome:
         """Ask a running run to pause durably at its next checkpoint.
@@ -2048,6 +2372,10 @@ class Agent:
                 ``tenant_id``).
             ValueError: ``reason`` is not a string or is too long.
         """
+        require_boolean(cascade, "cascade")
+        tenant_id = entry_checks(
+            self, "request_pause", tenant_id, default_tenant=UNSCOPED, run_id=run_id, reason=reason
+        )
         from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
         from dendrux.types import PauseOutcome, RunStatus
 
@@ -2099,7 +2427,8 @@ class Agent:
         run_id: str,
         *,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunResult:
         """Resume a PAUSED run and block until its next pause or terminal state.
 
@@ -2112,6 +2441,8 @@ class Agent:
 
         Args:
             run_id: A run in status ``PAUSED``.
+            expected_pause_id: Current pause generation; required when approving.
+                Stale or missing approval generations are rejected before claiming.
             notifier: Optional additional notifier composed during resume.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -2124,6 +2455,9 @@ class Agent:
             WAITING_APPROVAL), RunAlreadyClaimedError,
             RunAlreadyTerminalError.
         """
+        tenant_id = entry_checks(
+            self, "submit_resume", tenant_id, default_tenant=UNSCOPED, run_id=run_id
+        )
         from dendrux.errors import PersistenceNotConfiguredError
         from dendrux.runtime.runner import resume_paused_claim
         from dendrux.runtime.submit import claim_or_raise
@@ -2137,7 +2471,16 @@ class Agent:
         await _require_run_in_scope(store, run_id, tenant_id)
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind():
-            await claim_or_raise(store, run_id, expected_status=RunStatus.PAUSED)
+            epoch = await claim_or_raise(
+                store,
+                run_id,
+                expected_status=RunStatus.PAUSED,
+                agent=self,
+                expected_pause_id=expected_pause_id,
+            )
+            from dendrux.runtime.state import claimed_store
+
+            store = claimed_store(store, run_id, epoch)
             task = self._task_manager.spawn(
                 run_id,
                 resume_paused_claim(
@@ -2148,7 +2491,7 @@ class Agent:
                     extra_notifier=notifier,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def submit_note(
         self,
@@ -2156,7 +2499,7 @@ class Agent:
         text: str,
         *,
         metadata: Any = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
     ) -> str:
         """Leave a note for a non-terminal run; the model sees it at the next iteration.
 
@@ -2194,6 +2537,15 @@ class Agent:
                 ``tenant_id``).
             RunAlreadyTerminalError: the run already finished.
         """
+        tenant_id = entry_checks(
+            self,
+            "submit_note",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            note_text=text,
+            note_metadata=metadata,
+        )
         import json
 
         from dendrux.errors import (
@@ -2222,9 +2574,25 @@ class Agent:
             raise PersistenceNotConfiguredError()
 
         add_note = require_store_method(store, "add_note")
+        from dendrux.runtime.runner import _accepts_kwarg
+
+        note_kwargs: dict[str, Any] = {}
+        if _accepts_kwarg(add_note, "max_notes"):  # custom stores written before 0.5.0
+            note_kwargs["max_notes"] = self._limits.max_notes_per_run
+        else:
+            _agent_logger.warning(
+                "Custom store does not enforce the note cap: run_id=%s code=note_cap_unenforced",
+                run_id,
+                extra={"run_id": run_id, "code": "note_cap_unenforced"},
+            )
         note_id = generate_ulid()
         if await add_note(
-            run_id, note_id=note_id, text=text, metadata=metadata, tenant_id=tenant_id
+            run_id,
+            note_id=note_id,
+            text=text,
+            metadata=metadata,
+            tenant_id=tenant_id,
+            **note_kwargs,
         ):
             return note_id
         record = await store.get_run(run_id)
@@ -2279,7 +2647,7 @@ class Agent:
         runs: list[str] | None = None,
         replay_last: int | Literal["all"] = 0,
         replay_reasoning: bool = True,
-        tenant_id: str | None = None,
+        tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
         idempotency_key: str | None = None,
@@ -2369,6 +2737,17 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
+        tenant_id = entry_checks(
+            self,
+            "stream",
+            tenant_id,
+            default_tenant=None,
+            metadata=metadata,
+            user_input=user_input,
+            history=history,
+            context=context,
+            provider_kwargs=kwargs,
+        )
         _validate_max_delegation_depth(max_delegation_depth)
 
         if self._guardrails:
@@ -2420,7 +2799,8 @@ class Agent:
         tool_results: list[ToolResult] | None = None,
         user_input: UserContent | None = None,
         notifier: LoopNotifier | None = None,
-        tenant_id: TenantScope = UNSCOPED,
+        tenant_id: TenantScope | _OmittedType = _OMITTED,
+        expected_pause_id: str | None = None,
     ) -> RunStream:
         """Stream a resumed run as RunEvents.
 
@@ -2443,6 +2823,7 @@ class Agent:
             run_id: The paused run's ID.
             tool_results: Results for pending tool calls (client tool runs).
             user_input: Clarification answer (human-in-the-loop runs).
+            expected_pause_id: Current pause generation; stale submissions are rejected.
             notifier: Optional additional loop notifier.
             tenant_id: Omitted = no tenant check. Otherwise the run must belong
                 to this tenant (``None`` = untenanted) or ``RunNotFoundError``
@@ -2457,6 +2838,15 @@ class Agent:
                 event, when ``run_id`` is outside ``tenant_id``. The run is
                 left untouched (the stream's close-time cleanup is a no-op).
         """
+        tenant_id = entry_checks(
+            self,
+            "resume_stream",
+            tenant_id,
+            default_tenant=UNSCOPED,
+            run_id=run_id,
+            tool_results=tool_results,
+            user_input=user_input,
+        )
         if self._guardrails:
             raise ValueError(
                 "guardrails are not supported with resume_stream() in this version. "
@@ -2467,6 +2857,7 @@ class Agent:
             raise ValueError("Cannot provide both tool_results and user_input to resume_stream().")
 
         from dendrux.runtime.runner import resume_stream as runner_resume_stream
+        from dendrux.runtime.submit import capture_warning_location
 
         stream = runner_resume_stream(
             run_id,
@@ -2476,9 +2867,9 @@ class Agent:
             tool_results=tool_results,
             user_input=user_input,
             extra_notifier=notifier,
+            expected_pause_id=expected_pause_id,
+            warning_location=capture_warning_location(),
         )
-        if tenant_id is UNSCOPED:
-            return stream
         return self._tenant_checked_stream(stream, run_id, tenant_id)
 
     def _tenant_checked_stream(
@@ -2644,6 +3035,7 @@ class Agent:
             self.tools,
             mcp_executors=self._mcp_executors,
             mcp_tool_defs=self._discovered_tool_defs,
+            call_limiter=self._tool_call_limiter,
         )
 
         from dendrux.skills._session import SkillTool
@@ -2870,7 +3262,7 @@ class Agent:
     async def close(self) -> None:
         """Close MCP sources, provider, and agent-owned engine.
 
-        Only disposes the private engine created from an explicit database_url.
+        Releases this Agent's shared engine reference for an explicit database_url.
         The shared global engine (from DENDRUX_DATABASE_URL env var) is NOT
         owned by this agent and is left untouched.
 
@@ -2898,7 +3290,9 @@ class Agent:
             if engine is not None:
                 self._lazy_store = None
         if engine is not None:
-            await engine.dispose()
+            from dendrux.db._shared_pool import release
+
+            await release(engine)
 
     async def __aenter__(self) -> Agent:
         return self
@@ -2936,3 +3330,12 @@ class Agent:
             f"Agent(name={self.name!r}, model={self.model!r}, "
             f"tools={len(self.tools)}, max_iterations={self.max_iterations})"
         )
+
+
+async def _get_env_engine(url: str, options: dict[str, Any]) -> AsyncEngine:
+    """Retain the legacy singleton call shape when no options were configured."""
+    from dendrux.db.session import get_engine
+
+    if options:
+        return await get_engine(url, database_options=options)
+    return await get_engine(url)

@@ -22,6 +22,8 @@ connect, refresh, step-up, sign-out) is in
 
 ## Set up once per process
 
+[//]: # "docs-test: skip - fragment: relies on `PostgresOAuthStore`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.mcp import MCPOAuth, MCPOAuthClient, MCPRuntime, MCPSource
 
@@ -59,6 +61,8 @@ metadata).
 Call `await oauth.aclose()` and `await runtime.close()` at shutdown.
 
 ## The routes (FastAPI)
+
+[//]: # "docs-test: skip - fragment: relies on `current_user`, defined by setup shown elsewhere"
 
 ```python
 from fastapi import Depends, FastAPI, Request
@@ -145,6 +149,8 @@ Agent run the tool error reaches the model and the runtime emits
 `MCPOAuthRequired(reason="insufficient_scope")`. Start a new sign-in with the
 union of what the user already granted and what the server asked for:
 
+[//]: # "docs-test: skip - fragment: relies on `oauth`, defined by setup shown elsewhere"
+
 ```python
 status = await oauth.status(key)
 granted = (status.scope or "").split()
@@ -227,6 +233,8 @@ credential the user revoked.
 Check your implementation with the conformance helper. The factory must
 return a **new client** bound to the **same backend namespace** on every
 call, because competing operations run on two clients at once:
+
+[//]: # "docs-test: skip - fragment: relies on `new_pool`, defined by setup shown elsewhere"
 
 ```python
 from dendrux.mcp import check_oauth_store

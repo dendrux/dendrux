@@ -41,6 +41,8 @@ Thumbs.db
 
 # Testing / coverage
 .coverage
+coverage.json
+coverage.json.sources.json
 htmlcov/
 .pytest_cache/
 .mypy_cache/
@@ -58,10 +60,8 @@ scratch/
 examples/**/output/
 **/examples/**/output/
 
-# Dashboard (React build artifacts — keep dir via .gitkeep, ignore contents)
-node_modules/
-packages/python/src/dendrite/dashboard/static/*
-!packages/python/src/dendrite/dashboard/static/.gitkeep
-
 # Private notes (never commit)
 meeting-prep.md
+
+# JavaScript dependencies used by local tooling
+node_modules/

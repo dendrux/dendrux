@@ -16,17 +16,21 @@ from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKMCPError
-from mcp.types import CONNECTION_CLOSED
+from mcp.types import CONNECTION_CLOSED, INVALID_REQUEST
 
 from dendrux.mcp._challenge import parse_auth_challenge
 from dendrux.mcp._errors import (
+    DiscoveryLimitReason,
     MCPAuthChallenge,
     MCPAuthenticationError,
     MCPConnectionError,
     MCPDestinationDeniedError,
+    MCPDiscoveryLimitError,
     MCPOrigin,
+    MCPResultTooLargeError,
+    MCPSessionExpiredError,
 )
-from dendrux.mcp._http import create_http_client
+from dendrux.mcp._http import CappedResponseStream, create_http_client, wire_cap
 from dendrux.mcp._source import (
     exception_class_name,
     safe_source_exception_detail,
@@ -148,6 +152,39 @@ class _ToolHTTPAttempt:
     status: int | None = None
     destination: MCPOrigin | None = None
     challenge: MCPAuthChallenge | None = None
+    # The tools/call POST carried an Mcp-Session-Id header.
+    session_sent: bool = False
+    # Byte cap on the tools/call response body, and the stream enforcing it.
+    read_cap: int | None = None
+    capped: CappedResponseStream | None = None
+
+
+def _is_session_rejection(exc: BaseException) -> bool:
+    """A JSON-RPC ``INVALID_REQUEST`` naming the session (SDK or server text)."""
+    return any(
+        isinstance(node, SDKMCPError)
+        and node.code == INVALID_REQUEST
+        and "session" in str(node.message).lower()
+        for node in _iter_error_tree(exc)
+    )
+
+
+@dataclass
+class _PageWalk:
+    """What one ``tools/list`` walk has retained so far."""
+
+    pages: int = 0
+    tools: int = 0
+    wire_bytes: int = 0
+
+
+@dataclass
+class _DiscoveryRead:
+    """The byte cap on the ``tools/list`` response being read, and the stream enforcing it."""
+
+    adapter: MCPClientAdapter
+    read_cap: int
+    capped: CappedResponseStream | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +199,9 @@ class _Rejection:
 _tool_http_attempt: ContextVar[_ToolHTTPAttempt | None] = ContextVar(
     "mcp_tool_http_attempt", default=None
 )
+_discovery_read: ContextVar[_DiscoveryRead | None] = ContextVar("mcp_discovery_read", default=None)
+# Longest page cursor accepted (cursors are short opaque tokens).
+MAX_CURSOR_CHARS = 4096
 
 
 class MCPClientAdapter:
@@ -249,6 +289,7 @@ class MCPClientAdapter:
                     self._last_redirect_target = _diagnostic_origin(
                         response.request.url.join(location)
                     )
+        self._cap_discovery_response(response)
         attempt = _tool_http_attempt.get()
         if attempt is None or attempt.adapter is not self:
             return
@@ -265,11 +306,36 @@ class MCPClientAdapter:
             return
         attempt.destination = _diagnostic_origin(request.url)
         attempt.status = response.status_code
+        attempt.session_sent = bool(request.headers.get("mcp-session-id"))
         attempt.challenge = (
             parse_auth_challenge(response)
             if response.status_code in _AUTH_REJECTION_STATUSES
             else None
         )
+        if attempt.read_cap is not None:
+            # Stop reading an oversized result before it is all in memory.
+            capped = CappedResponseStream(response.stream, attempt.read_cap)
+            response.stream = capped
+            if attempt.capped is None or not attempt.capped.exceeded:
+                attempt.capped = capped
+
+    def _cap_discovery_response(self, response: Any) -> None:
+        """Stop reading a ``tools/list`` response body at the discovery byte cap."""
+        read = _discovery_read.get()
+        if read is None or read.adapter is not self or read.capped is not None:
+            return
+        request = response.request
+        try:
+            body = json.loads(request.content)
+        except (ValueError, httpx2.RequestNotRead):
+            return
+        if (
+            request.method == "POST"
+            and isinstance(body, dict)
+            and body.get("method") == "tools/list"
+        ):
+            read.capped = CappedResponseStream(response.stream, read.read_cap)
+            response.stream = read.capped
 
     async def _open(self) -> BaseException | None:
         """Open the transport, returning a detached safe failure if needed."""
@@ -358,24 +424,96 @@ class MCPClientAdapter:
         return self._safe_error("connect to", failure)
 
     async def list_tools(self) -> list[Any]:
+        """Page through ``tools/list`` within the source's discovery bounds.
+
+        Stops with :class:`MCPDiscoveryLimitError` when a page cursor repeats,
+        more than ``max_discovery_pages`` pages are needed, or the whole walk
+        outlasts ``discovery_timeout``.
+        """
         client = self._require_client()
         self._last_status = None
         self._last_rejection = None
         try:
-            tools: list[Any] = []
-            cursor: str | None = None
-            while True:
-                page = await client.list_tools(cursor=cursor, cache_mode="refresh")
-                tools.extend(page.tools)
-                cursor = page.next_cursor
-                if cursor is None:
-                    return tools
+            return await self._walk_pages(client)
+        except MCPDiscoveryLimitError:
+            raise
         except Exception as exc:
             # Discovery fails on its own request, not just at connect: a token
             # can expire between the two. Its text reaches last_error and the
             # persisted MCP_ERROR governance event, so it needs the same care.
             failure: Exception = exc
         raise self._safe_error("list tools from", failure) from None
+
+    async def _walk_pages(self, client: Any) -> list[Any]:
+        progress = _PageWalk()
+        scope = asyncio.timeout(self.source.discovery_timeout)
+        try:
+            async with scope:
+                return await self._collect_pages(client, progress)
+        except TimeoutError:
+            if scope.expired():
+                raise self._discovery_limit_error("deadline", progress.pages) from None
+            raise
+
+    async def _collect_pages(self, client: Any, progress: _PageWalk) -> list[Any]:
+        tools: list[Any] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        while True:
+            page = await self._fetch_page(client, cursor, progress)
+            progress.pages += 1
+            progress.tools += len(page.tools)
+            if progress.tools > self.source.max_discovery_tools:
+                raise self._discovery_limit_error("tool_cap", progress.pages)
+            tools.extend(page.tools)
+            cursor = page.next_cursor
+            if cursor is None:
+                return tools
+            self._check_cursor(cursor, seen, progress)
+
+    def _check_cursor(self, cursor: str, seen: set[str], progress: _PageWalk) -> None:
+        if len(cursor) > MAX_CURSOR_CHARS:
+            raise self._discovery_limit_error("cursor_length", progress.pages)
+        if cursor in seen:
+            raise self._discovery_limit_error("repeated_cursor", progress.pages)
+        seen.add(cursor)
+        if progress.pages >= self.source.max_discovery_pages:
+            raise self._discovery_limit_error("page_cap", progress.pages)
+
+    async def _fetch_page(self, client: Any, cursor: str | None, progress: _PageWalk) -> Any:
+        """One ``tools/list`` request; an HTTP body is read within what is left of the byte cap.
+
+        Stdio sources are developer-launched local processes inside the
+        developer's trust boundary and are not byte-capped (see
+        ``MCPSource.max_discovery_bytes``); they keep the tool, cursor and page
+        caps and the discovery deadline.
+        """
+        remaining = max(self.source.max_discovery_bytes - progress.wire_bytes, 1)
+        read = _DiscoveryRead(self, remaining)
+        token = _discovery_read.set(read)
+        try:
+            page = await client.list_tools(cursor=cursor, cache_mode="refresh")
+        except Exception:
+            if read.capped is not None and read.capped.exceeded:
+                raise self._discovery_limit_error("byte_cap", progress.pages + 1) from None
+            raise
+        finally:
+            _discovery_read.reset(token)
+        if read.capped is not None:
+            progress.wire_bytes += read.capped.read
+        return page
+
+    def _discovery_limit_error(
+        self, reason: DiscoveryLimitReason, pages: int
+    ) -> MCPDiscoveryLimitError:
+        logger.warning("mcp_discovery_%s source=%s pages=%d", reason, self.source.name, pages)
+        error = MCPDiscoveryLimitError(
+            f"Failed to list tools from MCP source '{self.source.name}': "
+            f"discovery stopped ({reason})."
+        )
+        error.reason = reason
+        error.origin = _diagnostic_origin(self.source.url) if self.source.url else None
+        return error
 
     def _safe_error(self, action: str, exc: BaseException) -> MCPConnectionError:
         """Build a transport error that cannot carry configured credentials.
@@ -458,8 +596,15 @@ class MCPClientAdapter:
         return error
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Send one ``tools/call``; typed failures for the cases callers act on.
+
+        Raises :class:`MCPSessionExpiredError` when the POST itself got HTTP
+        404 for a session-carrying request (not executed), and
+        :class:`MCPResultTooLargeError` when the response body passed the
+        read cap (see :func:`dendrux.mcp._http.wire_cap`).
+        """
         client = self._require_client()
-        attempt = _ToolHTTPAttempt(self, name)
+        attempt = _ToolHTTPAttempt(self, name, read_cap=wire_cap(self.source.max_result_bytes))
         token = _tool_http_attempt.set(attempt)
         try:
             return await client.call_tool(
@@ -471,6 +616,18 @@ class MCPClientAdapter:
             failure = exc
         finally:
             _tool_http_attempt.reset(token)
+        if attempt.capped is not None and attempt.capped.exceeded:
+            too_large = MCPResultTooLargeError(
+                f"MCP tool result exceeded the read limit of {attempt.capped.limit} bytes; "
+                "the response was not read further."
+            )
+            too_large.size = attempt.capped.read
+            raise too_large
+        if attempt.status == 404 and attempt.session_sent and _is_session_rejection(failure):
+            raise MCPSessionExpiredError(
+                f"MCP source '{self.source.name}' no longer knows this session (HTTP 404); "
+                "the call was not executed."
+            )
         if attempt.status in _AUTH_REJECTION_STATUSES:
             error = MCPAuthenticationError(
                 f"MCP source '{self.source.name}' rejected tool-call credentials "

@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: the jobs only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python:
     name: python ${{ matrix.python-version }} / SQLAlchemy ${{ matrix.sqlalchemy-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/python
@@ -28,7 +37,9 @@ jobs:
       # Postgres backend matrix — integration tests parametrize across
       # [sqlite, postgres] via the DENDRUX_TEST_PG_URL env var. Without
       # this service the PG branch is skipped (locally fine, in CI not
-      # acceptable — that's how the original tz-naive bug shipped).
+      # acceptable — that's how the original tz-naive bug shipped). The
+      # "Require the Postgres backend" and "Test" steps below fail the job if
+      # the variable goes missing or any test is skipped for lack of it.
       postgres:
         image: postgres:16-alpine
         env:
@@ -44,17 +55,26 @@ jobs:
           --health-retries 10
 
     env:
+      PYTHON_DOTENV_DISABLED: "1"
       DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: packages/python/pyproject.toml
 
       - name: Install dependencies
         run: pip install -e ".[dev,all]"
+
+      # Presidio loads this model by default. Install it once before workers.
+      - name: Install pinned NLP test model
+        run: make test-model-install
 
       - name: Pin SQLAlchemy ${{ matrix.sqlalchemy-version }}
         run: |
@@ -70,8 +90,58 @@ jobs:
       - name: Type check
         run: mypy src/dendrux/
 
+      - name: Architecture rules
+        run: lint-imports
+
+      - name: Require the Postgres backend
+        shell: bash
+        run: |
+          if [ -z "${DENDRUX_TEST_PG_URL:-}" ]; then
+            echo "::error::DENDRUX_TEST_PG_URL is not set; the Postgres test matrix would be skipped silently."
+            exit 1
+          fi
+
       - name: Test
-        run: pytest tests/ -v --cov=src/dendrux --cov-report=term-missing --cov-fail-under=80
+        shell: bash
+        run: |
+          # Benchmarks (marked benchmark) depend on the machine; `make bench` runs them.
+          pytest tests/ -v -rs -n auto -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80 | tee pytest.log
+          if grep -q 'DENDRUX_TEST_PG_URL not set' pytest.log; then
+            echo "::error::Postgres integration tests were skipped (DENDRUX_TEST_PG_URL not set)."
+            exit 1
+          fi
+
+      # Tie coverage.json to the source it measured; the ratchet rejects a stale report.
+      - name: Record coverage source digests
+        if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        run: python tools/crap_ratchet.py stamp --coverage coverage.json
+
+      # Coverage is the same on every leg, so one leg judges it.
+      - name: CRAP ratchet
+        if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
+        run: python tools/crap_ratchet.py check --report-only --coverage coverage.json
 
       - name: Build and smoke-test distributions
         run: python scripts/mcp_distribution_smoke.py
+
+  api-compat:
+    name: public API vs the last release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The release tag must be in the clone for griffe to read it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # griffe reads source statically, so the package itself is not installed.
+      - name: Install griffe
+        run: pip install "griffe>=1.5,<3.0"
+
+      - name: Compare the public API with v0.4.1
+        run: python packages/python/tools/api_breaks.py --against v0.4.1

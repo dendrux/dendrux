@@ -1,0 +1,130 @@
+---
+title: Multi-tenancy
+description: How Dendrux scopes runs, reads, writes and idempotency keys by tenant. The three scope values, strict tenancy, the application tenant resolution, and what a foreign run looks like to a caller.
+---
+
+# Multi-tenancy
+
+A run can belong to a tenant (an organisation, a workspace, a customer). Dendrux stores that as `agent_runs.tenant_id` and uses it to keep tenants apart on three surfaces: reads (`RunStore`), writes (`run`, `submit_*`, `cancel_run` and friends) and idempotency keys. Dendrux does not authenticate anyone. Your app decides who the caller is and passes the tenant in.
+
+## Three scope values
+
+Everywhere a tenant is accepted on a read or a run-control write, it means one of three things:
+
+| Value | Meaning |
+| --- | --- |
+| `"acme"` (a non-empty string) | Exactly that tenant's runs |
+| `None` | Untenanted runs only (`tenant_id IS NULL`) |
+| `UNSCOPED` | Every tenant. A trusted, operator-level view |
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
+```python
+from dendrux import UNSCOPED
+# also: from dendrux.store import UNSCOPED
+
+runs = await store.list_runs(tenant_id="acme")      # acme only
+runs = await store.list_runs(tenant_id=None)        # untenanted only
+runs = await store.list_runs(tenant_id=UNSCOPED)    # everything
+runs = await store.list_runs()                      # same as UNSCOPED
+```
+
+`None` means "untenanted only" since 0.5.0. In 0.4.1 `list_runs(tenant_id=None)` returned every tenant. If you pass a variable that can be `None`, check which one you mean. The empty string is not a tenant: `tenant_id=""` raises `ValueError` on every entry point, because it would collide with `None` in a tenant-scoped index.
+
+## Reads: `RunStore`
+
+Every `RunStore` read takes `tenant_id: TenantScope = UNSCOPED`: `get_run`, `get_events`, `stream_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pii_mapping`, `get_pauses`, `get_pause_page`, `list_runs` and `count_runs`. (`get_subtree`, `get_notes` and `read_image` already took a tenant.) `get_pending`, `follow` and `get_event_view` are different on purpose: they **require** `tenant_id` and raise `TypeError` when it is left out, so omitting it can never read across tenants. `Agent.get_result` also requires an explicit tenant and refuses `UNSCOPED`.
+
+- A run outside the scope is reported exactly like a missing one: `get_run` returns `None`, and the other reads raise `RunNotFoundError` or return nothing, with no way to tell the two cases apart.
+- The scope is part of the same SQL query as the read, not a second lookup, so it cannot race.
+- `RunSummary` and `RunDetail` carry `tenant_id`.
+- Live readers are counted per scope. `RunStore.follow` admits 500 followers per store and, by default, 100 per tenant scope, so one tenant cannot take every slot. The cap is per scope, not per user: each string tenant is one scope, all untenanted (`None`) followers together are one scope and all `UNSCOPED` followers together are one. A single-tenant app with more than 100 live readers per process builds its own `EventFeed(store, max_followers_per_tenant=None)`. See [RunStore](/docs/reference/run-store#pending-and-live-reads).
+
+In your own routes, pass the caller's tenant on every read:
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
+```python
+detail = await store.get_run(run_id, tenant_id=current_tenant)
+if detail is None:
+    raise HTTPException(404)
+```
+
+## Reads over HTTP
+
+Your application authenticates the actor and resolves their tenant from a header
+credential, then verifies user-level run ownership. Pass that tenant explicitly to
+every RunStore read and Agent write. Tenant membership alone does not authorize a
+user to inspect every run in the tenant. Use the same missing/foreign 404 response.
+See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+
+## Writes: `tenant_id=` on every entry point
+
+`run`, `stream`, `retry`, `resume`, `resume_stream`, `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `cancel_run`, `request_pause` and `submit_note` all take `tenant_id=`.
+
+| Entry point | Omitted `tenant_id` means (default mode) |
+| --- | --- |
+| `run`, `stream`, `retry` | `None`: the new run is untenanted |
+| every other entry point | `UNSCOPED`: no tenant check |
+
+An explicit `tenant_id` on a run-control write must match the run's tenant exactly, otherwise `RunNotFoundError` is raised before anything is written, the same error as a missing run.
+
+### Strict tenancy
+
+In a multi-tenant service the dangerous mistake is forgetting `tenant_id=` once. `strict_tenancy=True` turns that into an error:
+
+[//]: # "docs-test: skip - fragment: relies on `Agent`, defined by setup shown elsewhere"
+
+```python
+agent = Agent(provider=provider, prompt="...", strict_tenancy=True)
+
+await agent.run("hi")                       # TenantScopeRequiredError
+await agent.run("hi", tenant_id="acme")     # ok
+await agent.run("hi", tenant_id=None)       # ok, explicitly untenanted
+await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operator action
+```
+
+- `TenantScopeRequiredError` is a `ValueError`. It names the operation, not the data.
+- Delegated child runs inherit their parent's tenant and never raise.
+- Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `FutureWarning` when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
+- It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
+
+### Metadata
+
+Top-level metadata keys starting with `dendrux.` are reserved and raise `ValueError`. Metadata is capped at 64 KiB (`Limits(max_metadata_bytes=...)`).
+
+## Idempotency keys
+
+An idempotency key is unique **per tenant**. Two tenants can use the same key for different runs, and neither can see or collide with the other's. A key that matches a run of the same tenant behaves as before: the same input returns the existing run, a different input raises `IdempotencyConflictError`. The request fingerprint did not change, so existing keys keep working after the migration.
+
+- Untenanted runs share one namespace (the key is scoped by `COALESCE(tenant_id, '')`).
+- A SQLite file created before 0.5.0 keeps its old global unique constraint, because SQLite cannot drop it without rebuilding the table. On such a file two tenants using one key still cannot both create a run. The second raises `IdempotencyConflictError` **without a run id**, never leaking the other tenant's run. Create a fresh file (or move to Postgres) if you need per-tenant keys on SQLite.
+
+See [Runs](/docs/architecture/runs) for what a key does.
+
+## Errors you will see
+
+| Situation | Error |
+| --- | --- |
+| Run missing, or in another tenant, on any `Agent` or `RunStore` path | `RunNotFoundError(run_id)` (a `LookupError`) |
+| `strict_tenancy=True` and `tenant_id` omitted | `TenantScopeRequiredError` |
+| `tenant_id=""`, or an id or tenant that is too long or holds NUL on a read | `ValueError` (a fixed message, no echo) |
+| `get_pending` or `follow` without `tenant_id` | `TypeError` |
+| Strict tenancy and the module-level `dendrux.run` with no tenant | `TenantScopeRequiredError` (`tenant_id=None` passed explicitly is fine) |
+| Delegating to a child with a different explicit tenant | `ValueError` |
+
+Map `RunNotFoundError` to 404 for both missing and foreign runs. That is what stops callers learning which run ids exist in other tenants.
+
+## Writing a custom `StateStore`
+
+Treat `UNSCOPED` as "no filter" and `None` as `tenant_id IS NULL` in `list_runs` and `count_runs`. Keep the tenant predicate in the same query as the read.
+
+## Erasing a tenant
+
+Dendrux 0.5 does not ship a tenant erasure API; it is the first priority for 0.6. Until then, use the manual recipe in [Erasing a tenant's data](/docs/recipes/erasing-tenant-data).
+
+## Where this fits
+
+- [Build your own read routes](/docs/recipes/build-your-own-read-routes): tenant scope, ownership checks and event projection.
+- [RunStore](/docs/reference/run-store): the read methods and their scope.
+- [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).

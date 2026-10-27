@@ -42,3 +42,19 @@ class _UnsetType:
 
     def __repr__(self) -> str:
         return "<UNSET>"
+
+
+class _OmittedType:
+    """Type of ``_OMITTED``: the caller did not pass ``tenant_id`` at all.
+
+    Distinct from ``None`` (untenanted) and ``UNSCOPED`` (all tenants), so
+    strict tenancy can tell an omitted tenant from an explicit one.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<OMITTED>"
+
+
+_OMITTED = _OmittedType()

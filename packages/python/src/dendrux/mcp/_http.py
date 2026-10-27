@@ -13,6 +13,7 @@ import httpx2
 
 from dendrux.mcp._destination import MCPDestination, MCPDestinationPolicy
 from dendrux.mcp._errors import MCPDestinationDeniedError
+from dendrux.tools._limits import current_image_allowance, current_result_cap
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
@@ -134,6 +135,54 @@ async def _map_errors() -> AsyncIterator[None]:
             if isinstance(exc, core):
                 raise public(str(exc)) from exc
         raise
+
+
+# JSON escaping and SSE framing can make the wire form of text several times
+# its decoded size.
+_TEXT_WIRE_FACTOR = 4
+
+
+def wire_cap(source_max_result_bytes: int) -> int:
+    """Byte cap for reading one ``tools/call`` response body.
+
+    ``4 × text cap`` plus, only in a run that can ingest images, room for one
+    image block at the run's ``ImagePolicy.max_source_bytes`` (base64). The
+    text cap is the source's ``max_result_bytes``, or the running Agent's
+    ``Limits.max_tool_result_bytes`` when smaller. The decoded result is still
+    checked against the text cap; this bound only keeps an oversized or
+    hostile response from being read into memory in full. It counts the
+    whole response body, including SSE framing and progress notifications.
+    """
+    text_cap = source_max_result_bytes
+    agent_cap = current_result_cap()
+    if agent_cap is not None:
+        text_cap = min(text_cap, agent_cap)
+    return text_cap * _TEXT_WIRE_FACTOR + current_image_allowance()
+
+
+class ResponseTooLargeError(httpx2.StreamError):
+    """A response body passed its read cap; reading stopped there."""
+
+
+class CappedResponseStream(httpx2.AsyncByteStream):
+    """Count body bytes as they are read and stop at ``limit``."""
+
+    def __init__(self, stream: Any, limit: int) -> None:
+        self._stream = stream
+        self.limit = limit
+        self.read = 0
+        self.exceeded = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            self.read += len(chunk)
+            if self.read > self.limit:
+                self.exceeded = True
+                raise ResponseTooLargeError("MCP response body exceeded its read limit.")
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
 
 
 class _ResponseStream(httpx2.AsyncByteStream):

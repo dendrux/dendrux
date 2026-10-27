@@ -1,4 +1,4 @@
-"""Anthropic strict-mode fallback (0.4.1 T2 fix round).
+"""Anthropic strict-mode fallback.
 
 A request that carried a strict entry and got a 400 pointing at the strict
 schema is retried once with every strict entry reverted to its 0.4.0 payload.
@@ -16,7 +16,7 @@ import anthropic
 import httpx
 import pytest
 
-from dendrux.errors import ImageRejectedError, ProviderError
+from dendrux.errors import ImageRejectedError, ProviderError, ProviderUnavailableError
 from dendrux.llm import anthropic as anthropic_mod
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.types import Message, Role, StreamEventType, ToolDef
@@ -175,6 +175,7 @@ class TestBatchFallback:
         assert json.dumps(result.provider_request["tools"]) == json.dumps(wire.tools(1))
         warned = _warnings(caplog)
         assert len(warned) == 1 and "lookup_code" in warned[0]
+        assert message[:40] not in caplog.text
 
     @pytest.mark.parametrize(
         "message",
@@ -198,7 +199,9 @@ class TestBatchFallback:
         assert wire.tools(2)[1]["strict"] is True  # not remembered
         assert not anthropic_mod._STRICT_REJECTED
         warned = _warnings(caplog)
-        assert len(warned) == 1 and message[:40] in warned[0] and "lookup_code" in warned[0]
+        assert len(warned) == 1 and "lookup_code" in warned[0] and "error ref" in warned[0]
+        # Vendor error text never reaches the logs (it can quote schema details).
+        assert message[:40] not in caplog.text
 
     async def test_unmatched_400_second_failure_raises_second(
         self, claude: AnthropicProvider, caplog: pytest.LogCaptureFixture
@@ -206,10 +209,13 @@ class TestBatchFallback:
         wire = Wire(claude, (400, _error(UNRELATED)), (400, _error(THINKING_FORCED)))
         with (
             caplog.at_level(logging.WARNING, logger="dendrux.llm.anthropic"),
-            pytest.raises(anthropic.BadRequestError) as info,
+            pytest.raises(ProviderError) as info,
         ):
             await claude.complete(TEXT, tools=[STRICT_TOOL])
-        assert THINKING_FORCED in str(info.value)
+        assert info.value.category == "rejected"
+        assert isinstance(info.value.__cause__, anthropic.BadRequestError)
+        assert THINKING_FORCED in str(info.value.__cause__)
+        assert THINKING_FORCED not in str(info.value)
         assert UNRELATED not in _chained(info.value)
         assert len(wire.bodies) == 2
         assert not anthropic_mod._STRICT_REJECTED
@@ -227,30 +233,32 @@ class TestBatchFallback:
 
     async def test_non_400_errors_raise_unchanged(self, claude: AnthropicProvider) -> None:
         wire = Wire(claude, (529, _error(GRAMMAR_TOO_LARGE, "overloaded_error")))
-        with pytest.raises(anthropic.APIStatusError) as info:
+        with pytest.raises(ProviderUnavailableError) as info:
             await claude.complete(TEXT, tools=[PLAIN_TOOL, STRICT_TOOL])
-        assert GRAMMAR_TOO_LARGE in str(info.value)
+        assert info.value.status_code == 529
+        assert GRAMMAR_TOO_LARGE in str(info.value.__cause__)
         assert len(wire.bodies) == 1
 
     async def test_no_strict_entries_never_retry(self, claude: AnthropicProvider) -> None:
         wire = Wire(claude, (400, _error(GRAMMAR_TOO_LARGE)))
-        with pytest.raises(anthropic.BadRequestError):
+        with pytest.raises(ProviderError) as info:
             await claude.complete(TEXT, tools=[PLAIN_TOOL])
+        assert isinstance(info.value.__cause__, anthropic.BadRequestError)
         assert len(wire.bodies) == 1
 
     async def test_retries_once_then_raises_second_error(self, claude: AnthropicProvider) -> None:
         wire = Wire(claude, (400, _error(GRAMMAR_TOO_LARGE)), (400, _error(UNRELATED)))
-        with pytest.raises(anthropic.BadRequestError) as info:
+        with pytest.raises(ProviderError) as info:
             await claude.complete(TEXT, tools=[STRICT_TOOL])
-        assert UNRELATED in str(info.value)
-        assert "grammar" not in _chained(info.value)
+        assert UNRELATED in str(info.value.__cause__)
+        assert "grammar" not in _chained(info.value.__cause__)
         assert len(wire.bodies) == 2
 
     async def test_second_strict_like_error_is_not_retried_again(
         self, claude: AnthropicProvider
     ) -> None:
         wire = Wire(claude, (400, _error(GRAMMAR_TOO_LARGE)), (400, _error(GRAMMAR_TOO_LARGE)))
-        with pytest.raises(anthropic.BadRequestError):
+        with pytest.raises(ProviderError, match="rejected the request"):
             await claude.complete(TEXT, tools=[STRICT_TOOL])
         assert len(wire.bodies) == 2
 
@@ -344,22 +352,26 @@ class TestStreamFallback:
 
     async def test_no_strict_stream_error_raises(self, claude: AnthropicProvider) -> None:
         wire = Wire(claude, (400, _error(UNRELATED)))
-        with pytest.raises(anthropic.BadRequestError):
+        with pytest.raises(ProviderError) as info:
             await drain(claude.complete_stream(TEXT, tools=[PLAIN_TOOL]))
+        assert isinstance(info.value.__cause__, anthropic.BadRequestError)
         assert len(wire.bodies) == 1
 
     async def test_retries_once_then_raises(self, claude: AnthropicProvider) -> None:
         wire = Wire(claude, (400, _error(GRAMMAR_TOO_LARGE)), (400, _error(GRAMMAR_TOO_LARGE)))
-        with pytest.raises(anthropic.BadRequestError) as info:
+        with pytest.raises(ProviderError) as info:
             await drain(claude.complete_stream(TEXT, tools=[STRICT_TOOL]))
-        assert "grammar" not in _chained(info.value)
+        assert isinstance(info.value.__cause__, anthropic.BadRequestError)
+        assert "grammar" not in _chained(info.value.__cause__)
         assert len(wire.bodies) == 2
 
     async def test_mid_stream_error_is_not_retried(self, claude: AnthropicProvider) -> None:
         body = sse(*_anthropic_head(), ("error", _error(GRAMMAR_TOO_LARGE)))
         wire = Wire(claude, (200, body))
-        with pytest.raises(anthropic.APIError):
+        with pytest.raises(ProviderError) as info:
             await drain(claude.complete_stream(TEXT, tools=[STRICT_TOOL]))
+        assert info.value.category == "rejected"
+        assert isinstance(info.value.__cause__, anthropic.APIError)
         assert len(wire.bodies) == 1
 
     async def test_image_stream_second_failure_is_typed_and_clean(
@@ -461,8 +473,9 @@ class TestStrictOptOut:
     async def test_strict_false_never_retries(self) -> None:
         claude = AnthropicProvider(model="claude-sonnet-4-6", api_key="test-key", strict=False)
         wire = Wire(claude, (400, _error(GRAMMAR_TOO_LARGE)))
-        with pytest.raises(anthropic.BadRequestError):
+        with pytest.raises(ProviderError) as info:
             await claude.complete(TEXT, tools=[STRICT_TOOL])
+        assert isinstance(info.value.__cause__, anthropic.BadRequestError)
         assert len(wire.bodies) == 1
 
 
@@ -511,6 +524,7 @@ async def test_fallback_warning_redacts_echoed_image_data(
     with caplog.at_level(logging.DEBUG, logger="dendrux.llm.anthropic"):
         await claude.complete(USER_IMAGE, tools=[STRICT_TOOL])
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "[redacted]" in logged
+    # No vendor text is logged at all (0.5.0), only a digest to correlate.
+    assert "error ref" in logged and "bad request near" not in logged
     for marker in LEAK_MARKERS:
         assert marker not in logged

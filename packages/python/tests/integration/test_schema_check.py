@@ -1,7 +1,7 @@
 """Schema-currency check on Postgres: a database behind the models fails fast.
 
-Uses its own database (``<name>_schema_test``, derived from
-``DENDRUX_TEST_PG_URL``) because it builds deliberately out-of-date schemas.
+Uses a temporary schema inside ``DENDRUX_TEST_PG_URL`` for deliberately
+out-of-date schemas; it never connects to a second database.
 Skipped when that variable is unset. SQLite is covered at the end: it upgrades
 itself and must never raise ``SchemaOutOfDateError``.
 """
@@ -9,22 +9,19 @@ itself and must never raise ``SchemaOutOfDateError``.
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse, urlunparse
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from dendrux import Agent
 from dendrux.db import session as db_session
 from dendrux.db.models import Base
-from dendrux.errors import SchemaNotInitializedError, SchemaOutOfDateError
+from dendrux.errors import PersistenceError, SchemaNotInitializedError, SchemaOutOfDateError
 from dendrux.llm.mock import MockLLM
 from dendrux.runtime.sweep import sweep
 from dendrux.store import RunStore
@@ -33,6 +30,10 @@ from dendrux.types import LLMResponse
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+from tests.integration._migration_schema import (
+    migration_schema,
+)
+
 pytestmark = pytest.mark.asyncio
 
 PRIOR = "a4b5c6d7e8f9"
@@ -40,6 +41,23 @@ _MIGRATIONS = Path(__file__).resolve().parents[2] / "src" / "dendrux" / "db" / "
 # 0.2.0a23 shape: no run control (0.3.0) and no image blob tables (0.4.0).
 _MISSING = {"agent_runs.pause_requested", "run_inbox", "dendrux_blobs", "dendrux_blob_refs"}
 _MISSING_TABLES = {"run_inbox", "dendrux_blobs", "dendrux_blob_refs"}
+# A database migrated to an earlier revision also lacks 0.5.0's R1: claim_epoch
+# and the two agent_runs indexes (the index check runs on Postgres only).
+_R1_INDEXES = {
+    "agent_runs.uq_agent_runs_tenant_idempotency_key (index)",
+    "agent_runs.ix_agent_runs_tenant_id_created_at (index)",
+}
+_SWEEP_INDEXES = {
+    "agent_runs.ix_agent_runs_sweep_running (index)",
+    "agent_runs.ix_agent_runs_sweep_waiting (index)",
+    "run_events.ix_run_events_started (index)",
+}
+_MISSING_AT_PRIOR = (
+    _MISSING
+    | {"agent_runs.claim_epoch", "agent_runs.status_changed_at"}
+    | _R1_INDEXES
+    | _SWEEP_INDEXES
+)
 RUN_CONTROL = "b5c6d7e8f9a0"  # 0.3.0 head: everything but the 0.4.0 image blob tables
 
 
@@ -53,44 +71,15 @@ def _alembic(url: str, rev: str) -> None:
     command.upgrade(cfg, rev)
 
 
-def _schema_pg_url() -> str | None:
-    raw = os.environ.get("DENDRUX_TEST_PG_URL")
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    name = parsed.path.lstrip("/").removesuffix("_test") + "_schema_test"
-    return urlunparse(parsed._replace(path=f"/{name}"))
-
-
 @pytest_asyncio.fixture
-async def pg_url(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
-    url = _schema_pg_url()
-    if url is None:
-        pytest.skip("DENDRUX_TEST_PG_URL not set")
-    name = urlparse(url).path.lstrip("/")
-    assert name.endswith("_schema_test")
+async def pg_url(monkeypatch: pytest.MonkeyPatch, pg_test_url: str) -> AsyncIterator[str]:
+    url = pg_test_url
     monkeypatch.delenv("DENDRUX_SKIP_SCHEMA_CHECK", raising=False)
-
-    maintenance = create_async_engine(
-        urlunparse(urlparse(url)._replace(path="/postgres")),
-        isolation_level="AUTOCOMMIT",
-        poolclass=NullPool,
-    )
-    async with maintenance.connect() as conn:
-        exists = (
-            await conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name})
-        ).first()
-        if exists is None:
-            await conn.execute(text(f'CREATE DATABASE "{name}"'))
-    await maintenance.dispose()
-
-    admin = create_async_engine(url, poolclass=NullPool)
-    async with admin.begin() as conn:
-        await conn.execute(text("DROP SCHEMA public CASCADE"))
-        await conn.execute(text("CREATE SCHEMA public"))
-    await admin.dispose()
-    yield url
-    await db_session.reset_engine()
+    async with migration_schema(url, "schema_check"):
+        try:
+            yield url
+        finally:
+            await db_session.reset_engine()
 
 
 def _admin(url: str) -> AsyncEngine:
@@ -157,7 +146,7 @@ async def test_agent_recovers_after_alembic_upgrade(pg_url: str) -> None:
     try:
         with pytest.raises(SchemaOutOfDateError) as info:
             await agent.run("hi")
-        assert set(info.value.missing) == _MISSING
+        assert set(info.value.missing) == _MISSING_AT_PRIOR
 
         await asyncio.to_thread(_alembic, pg_url, "head")
         # A failed init is not cached: the same agent works after migrating.
@@ -177,19 +166,36 @@ async def test_current_schema_passes(pg_url: str) -> None:
         await agent.close()
 
 
-async def test_extra_table_column_and_missing_index_are_fine(pg_url: str) -> None:
+async def test_extra_table_column_and_index_are_fine(pg_url: str) -> None:
     await _build_current_schema(pg_url)
     engine = _admin(pg_url)
     async with engine.begin() as conn:
         await conn.execute(text("ALTER TABLE agent_runs ADD COLUMN app_owned text"))
         await conn.execute(text("CREATE TABLE app_owned (id int primary key)"))
-        await conn.execute(text("DROP INDEX ix_run_inbox_run_pending"))
+        await conn.execute(text("CREATE INDEX app_owned_ix ON agent_runs (agent_name)"))
     await engine.dispose()
     agent = _agent(pg_url)
     try:
         assert (await agent.run("hi")).answer == "ok"
     finally:
         await agent.close()
+
+
+async def test_missing_model_index_is_reported(pg_url: str) -> None:
+    """0.5.0: named model indexes are required on Postgres (an un-migrated DB fails)."""
+    await _build_current_schema(pg_url)
+    engine = _admin(pg_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP INDEX ix_run_inbox_run_pending"))
+    await engine.dispose()
+    agent = _agent(pg_url)
+    try:
+        with pytest.raises(SchemaOutOfDateError) as info:
+            await agent.run("hi")
+    finally:
+        await agent.close()
+    assert info.value.missing == ("run_inbox.ix_run_inbox_run_pending (index)",)
+    assert await _count_runs(pg_url) == 0
 
 
 async def test_skip_env_var_bypasses_the_check(
@@ -199,7 +205,7 @@ async def test_skip_env_var_bypasses_the_check(
     monkeypatch.setenv("DENDRUX_SKIP_SCHEMA_CHECK", "1")
     agent = _agent(pg_url)
     try:
-        with pytest.raises(DBAPIError) as info:
+        with pytest.raises(PersistenceError) as info:
             await agent.run("hi")
     finally:
         await agent.close()
@@ -322,7 +328,7 @@ async def test_check_is_read_only(pg_url: str) -> None:
     await engine.dispose()
     assert statements
     assert {s.lstrip().split(None, 1)[0].upper() for s in statements} <= {"SELECT", "WITH"}
-    assert len(statements) <= 4
+    assert len(statements) <= 5  # catalog reads plus one pg_indexes read
 
 
 async def test_agent_reflects_once_per_engine(pg_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,7 +393,8 @@ async def test_v030_schema_names_both_blob_tables(pg_url: str) -> None:
             await agent.run("hi")
         err = info.value
         assert set(err.missing_tables) == {"dendrux_blobs", "dendrux_blob_refs"}
-        assert err.missing_columns == ()
+        assert err.missing_columns == ("agent_runs.claim_epoch", "agent_runs.status_changed_at")
+        assert set(err.missing_indexes) == _R1_INDEXES | _SWEEP_INDEXES
         assert "dendrux_blobs" in str(err) and "dendrux_blob_refs" in str(err)
         assert "dendrux db migrate" in str(err)
 

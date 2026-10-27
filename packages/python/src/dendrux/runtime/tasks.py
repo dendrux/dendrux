@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
+from dendrux.errors import safe_exception_info
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -64,6 +66,16 @@ class RunTaskManager:
         task: asyncio.Task[T] = asyncio.create_task(
             self._run_wrapper(run_id, coro), name=f"run:{run_id}"
         )
+
+        def finished(done: asyncio.Task[T]) -> None:
+            # A cancelled task may never enter its wrapper. Close the unused
+            # inner coroutine and release tracking in that case as well.
+            coro.close()
+            if self._tasks.get(run_id) is done:
+                self._tasks.pop(run_id, None)
+            _retrieve_exception(done)
+
+        task.add_done_callback(finished)
         self._tasks[run_id] = task
         return task
 
@@ -72,8 +84,14 @@ class RunTaskManager:
             return await coro
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Run %s failed with exception", run_id)
+        except Exception as exc:
+            logger.error(
+                "Run %s failed: code=run_failed error_type=%s",
+                run_id,
+                type(exc).__name__,
+                extra={"run_id": run_id, "code": "run_failed"},
+                exc_info=safe_exception_info(),
+            )
             raise
         finally:
             self._tasks.pop(run_id, None)
@@ -81,14 +99,18 @@ class RunTaskManager:
     def cancel(self, run_id: str) -> bool:
         """Cancel the tracked task and/or set the interrupt signal for ``run_id``.
 
-        Returns True if at least one signal was delivered (a background
-        task was cancelled or a streamed run's interrupt was set); False
+        A spawned coroutine that has not entered the runner's ownership
+        guard is left alive to observe the durable cancellation request.
+        Cancelling it before that guard could discard a committed claim.
+
+        Returns True if a task is tracked or an interrupt was set; False
         if nothing is tracked for this run in this process.
         """
         delivered = False
         task = self._tasks.get(run_id)
-        if task is not None:
-            task.cancel()
+        if task is not None and self._owned.get(run_id) is not task:
+            # A committed claim may exist before its coroutine has entered
+            # the runner's cancellation guard. Let it reach that guard first.
             delivered = True
         signal = self._interrupts.get(run_id)
         if signal is not None:
@@ -174,3 +196,9 @@ class RunTaskManager:
 
     def __len__(self) -> int:
         return len(self._tasks)
+
+
+def _retrieve_exception(task: asyncio.Task[Any]) -> None:
+    """Consume failures without changing what a later awaiter receives."""
+    if not task.cancelled():
+        task.exception()

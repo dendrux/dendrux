@@ -22,9 +22,25 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License: Apache 2.0" /></a>
 </p>
 
-> `v0.4.1` - core API stabilizing, actively developed.
+> `v0.5.0` - core API stabilizing, actively developed.
+
 
 ---
+
+## What's new in 0.5.0
+
+0.5.0 ("Trust") makes Dendrux safe by default for multi-tenant, production use. Read the [upgrade guide](docs/upgrading-to-0.5.0.mdx) before you deploy: run `dendrux db migrate`, then roll your workers (rolling deploys are supported).
+
+- **Tenant-scoped reads.** Pass `tenant_id=` on every RunStore read and Agent write. A foreign run looks like a missing one. Your routes authenticate the actor and authorize user-level run ownership. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
+- **Payloads hidden by default.** `RunStore.follow` and `get_event_view` show only enumerated codes, generated ids, numbers and declared names; free text, past tool call ids and tool names they cannot prove are hidden. This protects readers from untrusted data, not from hostile code in your own process. Active client calls remain actionable and may contain personal data; authorize the actor before returning them. `RunResult.to_dict()` is the versioned browser envelope; raw RunStore reads require your own response projection. See [RunStore](docs/reference/run-store.mdx#redacted-views).
+- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. The packaged read router (`make_read_router`) and the embedded dashboard are **removed**. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx) and the endpoint map in the [upgrade guide](docs/upgrading-to-0.5.0.mdx#removed-in-050).
+- **No more silent provider failures.** Every failed request is a typed `ProviderError` (`.category`, `.retryable`, `.safe_message`); empty streams, refusals and failed Responses calls end the run `error` with `RunResult.error_info` instead of an empty `success`. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](docs/recipes/handling-provider-errors.mdx).
+- **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
+- **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
+- **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. The default is unchanged. See [PII restore](docs/architecture/pii-restore.mdx).
+- **Run integrity.** Claims are fenced. Every pause has a `pause_id`, and **approving requires `expected_pause_id=`** so a stale tab cannot approve a newer pause. A resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
+- **Bounded everything.** Followers, the tool queue, MCP discovery, `sweep()`, inputs, metadata, notes and tool results all have limits. Build the store once at startup; see [Scaling workers](docs/guides/scaling.mdx).
+- **Migration.** Run `dendrux db migrate` once, as a deploy job over a direct connection (revisions `d7e8f9a0b1c2` and `e8f9a0b1c2d3`). Several defaults flip in 0.6; 0.5 prints a `FutureWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
 
 ## What's new in 0.4.1
 
@@ -40,7 +56,7 @@
 
 ## What's new in 0.3.0
 
-- **Per-call approvals**: `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve() | .deny(reason)})` decides each gated call on its own. Client-target calls are never executed server-side on approval (a security fix).
+- **Per-call approvals**: `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve() | .deny(reason)}, expected_pause_id=pause_id)` decides each gated call on its own (since 0.5.0 any approval needs the pause id; this 0.3.0 note is kept for history). Client-target calls are never executed server-side on approval (a security fix).
 - **`before_tool` policy hook**: one function sees each parsed tool call (local, MCP, skill) that passes static `deny=` and skill preflight, before approval, and returns allow, deny, require approval or a substituted result. Fails closed.
 - **Run control**: `agent.request_pause(run_id)` parks a running run as `paused` and `agent.submit_resume(run_id)` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too, and `cancel_run` now interrupts an in-flight `run()` in the same process.
 - **Inbox notes**: `agent.submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next iteration.
@@ -73,6 +89,7 @@ async def main():
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         prompt="You are a calculator.",
         tools=[add],
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is 15 + 27?")
         print(result.answer)
@@ -87,6 +104,8 @@ ANTHROPIC_API_KEY=sk-... python my_agent.py
 Three concepts: `Agent`, `@tool()`, provider. Everything else is opt-in.
 
 Production agent in 10 lines. Add PII redaction, tool deny, human approval, and budget tracking in 5 more:
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
 ```python
 agent = Agent(
@@ -105,7 +124,7 @@ agent = Agent(
 ## Install
 
 ```bash
-pip install "dendrux[all]"            # everything (Anthropic + OpenAI + DB + http)
+pip install "dendrux[all]"            # everything (Anthropic, OpenAI, Postgres driver, MCP, Presidio, OpenTelemetry)
 pip install "dendrux[anthropic]"      # Anthropic + core runtime
 pip install "dendrux[openai]"         # OpenAI + core runtime
 pip install "dendrux[mcp]"            # managed MCP client runtime
@@ -147,7 +166,7 @@ Runs crash. Processes die. Dendrux handles it.
 
 **Durable persistence**: every trace, tool call, and lifecycle event is written through a durability layer with retry and exponential backoff. Transient DB failures (connection drops, lock timeouts, SQLite busy) are retried automatically. Logical errors propagate immediately. LLM interactions and token usage are persisted best-effort.
 
-**Sweep stale runs**: call `sweep()` at app startup to detect runs that were RUNNING when the process died or WAITING when no one came back. They're marked ERROR with structured failure reasons.
+**Sweep stale runs**: call `sweep()` at app startup (or on a schedule you own) to detect runs that were RUNNING when the process died or WAITING when no one came back. They're marked ERROR with structured failure reasons. Claims are fenced with an epoch, so a worker whose run was taken over stops instead of overwriting the new owner.
 
 ```python
 from dendrux import sweep
@@ -162,11 +181,15 @@ results = await sweep(
 
 **Retry terminal runs**: a failed, cancelled, or timed-out run can be retried with prior context from persisted traces. The DB stores raw values (guardrails redact at the LLM boundary only), so retry replays the full original conversation. Same agent or a different one, different model, different tools.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.retry("01JR...")
 ```
 
-**Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`.
+**Idempotency**: pass a key to prevent duplicate runs. Same key + same input returns the existing run. Same key + different input raises `IdempotencyConflictError`. Keys are unique per tenant.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.run(
@@ -202,6 +225,8 @@ async def write_to_db(data: str) -> str: ...
 
 Four layers of runtime governance, all opt-in via kwargs on `Agent`:
 
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
 ```python
 from dendrux import Agent, Budget
 from dendrux.guardrails import PII, SecretDetection, Pattern
@@ -222,14 +247,14 @@ agent = Agent(
 
 **Tool deny**: `deny=["tool_name"]` blocks tools deterministically. The model gets a synthesized error and adapts. The tool never executes.
 
-**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True)`, reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `decisions={call_id: ApprovalDecision.approve()}`.
+**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)` (the pause id the approver was shown), reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve()}, expected_pause_id=pause_id)`.
 
 **Tool policy**: `before_tool=hook` decides each call from its arguments: `ToolDecision.deny(...)`, `.require_approval(...)`, `.substitute(result)` or `None` to allow.
 
 **Budget**: `budget=Budget(max_tokens=N, max_cost_usd=D)` fires governance events at configurable thresholds (50%, 75%, 90%) and when usage reaches a limit, counting delegated child runs. By default (`on_exceed="warn"`) it is advisory and the run continues; `on_exceed="pause"` parks the run for a person to raise the limit and resume, and `"cancel"` ends it. Pause and cancel take effect at the next iteration boundary.
 
 **Guardrails**: `guardrails=[PII(), SecretDetection()]` scans content crossing the LLM boundary. Three actions:
-- `redact` - PII replaced with `<<EMAIL_ADDRESS_1>>` placeholders. Tools receive real values (deanonymized). Run-scoped mapping persisted for audit.
+- `redact` - PII replaced with `<<EMAIL_ADDRESS_1>>` placeholders. Tools receive real values (deanonymized); with `PII(restore="allowlisted")` only tools marked `@tool(receives_pii=...)` do. Run-scoped mapping persisted for audit.
 - `block` - run terminates immediately. The LLM never sees the content.
 - `warn` - findings logged, content unchanged. Shadow rollout before promoting to redact.
 
@@ -270,6 +295,8 @@ Two event seams, separated by design:
 - **Recorder** (internal): authoritative persistence. Fail-closed with durability retry. If a trace can't be written, the run stops.
 - **Notifier** (external): best-effort UI notifications. Exceptions swallowed. Never kills a run.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.notifiers.console import ConsoleNotifier
 
@@ -278,7 +305,7 @@ result = await agent.run("do the thing", notifier=ConsoleNotifier())
 
 Every run persists: traces with full message content, tool calls with parameters and results, LLM interactions with request/response payloads, token usage, timing, delegation links, and lifecycle events.
 
-**PII policy**: the DB is the authoritative execution record and stores raw values. Guardrails redact at the LLM boundary only — what the provider API sees — and the placeholder→real bijection is persisted on `agent_runs.pii_mapping` as the audit key, so dashboards can replay either view from the same rows. See [PII redaction](docs/architecture/pii-redaction.mdx).
+**PII policy**: the DB is the authoritative execution record and stores raw values. Guardrails redact at the LLM boundary only — what the provider API sees — and the placeholder→real bijection is persisted on `agent_runs.pii_mapping` as the audit key, so inspection tools can replay either view from the same rows. See [PII redaction](docs/architecture/pii-redaction.mdx).
 
 ### 🌳 Coordinate Agents
 
@@ -292,16 +319,19 @@ async def research(query: str) -> str:
         provider=OpenAIProvider(model="gpt-4o"),
         prompt="You are a research specialist...",
         tools=[web_search],
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as sub_agent:
         result = await sub_agent.run(query)
         return result.answer
 ```
 
-The state store links parent and child runs. The dashboard shows the full delegation tree. Depth guards prevent runaway recursion.
+The state store links parent and child runs. Read the delegation tree with `RunStore.get_subtree(..., tenant_id=...)` and render it in your app. Depth guards prevent runaway recursion.
 
 ### 📚 Skills
 
 Package instructions, reference files, and scripts as a skill. The model sees a catalogue, pulls a body only when it needs it, and reads files or runs scripts on demand.
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import Agent, Skill, SkillExecutionResult, SkillExecutor
@@ -323,14 +353,15 @@ Skills build from code, `SKILL.md` text, or a directory. Scripts under `scripts/
 
 **Client-side tools**: define tools that run on the client (browser, mobile, Excel). The agent pauses and waits.
 
+[//]: # "docs-test: skip - fragment: relies on `db_url`, defined by setup shown elsewhere"
+
 ```python
 @tool(target="client")
 async def read_excel_range(sheet: str, range: str) -> str:
     """Read cells from the user's spreadsheet."""
     return ""
 
-# Dendrux ships reads + SSE. You wire the writes around agent methods.
-from dendrux.http import make_read_router
+# Dendrux gives you the reads as library calls. You own the routes.
 from dendrux.store import RunStore
 from dendrux.types import ToolResult
 from pydantic import BaseModel
@@ -344,7 +375,12 @@ class ResultsBody(BaseModel):
     results: list[ResultItem]
 
 store = RunStore.from_database_url(db_url)
-app.include_router(make_read_router(store=store, authorize=require_user), prefix="/api")
+
+@app.get("/runs/{run_id}/pending")
+async def pending(run_id: str, user=Depends(require_user)):
+    # What is the run waiting on? The tenant is required; a foreign run is a 404.
+    pause = await store.get_pending(run_id, tenant_id=user.org_id)   # or UNSCOPED
+    return pause.to_dict() if pause is not None else None
 
 @app.post("/runs/{run_id}/tool-results")
 async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
@@ -354,14 +390,16 @@ async def submit(run_id: str, body: ResultsBody, user=Depends(require_user)):
         ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
         for r in body.results
     ]
-    return await agent.submit_tool_results(run_id, results)
+    return await agent.submit_tool_results(run_id, results, tenant_id=user.org_id)
 ```
 
-Pause/resume orchestration, CAS-safe claim, and SSE transport are Dendrux's job. Auth, schema, error shape, and framework choice are yours.
+Pause/resume orchestration and the CAS-safe claim are Dendrux's job. Auth, schema, error shape, and framework choice are yours; for the client's side, build `GET /runs/{id}/pending` over `RunStore.get_pending`, and add live updates with `RunStore.follow` if you want them (see [Client-side tools](docs/recipes/client-tools.mdx)). Never pipe `agent.stream()` into a browser SSE response: closing the tab cancels the run.
 
 ### 🔀 Streaming
 
 Stream events as they happen: token-by-token text, tool calls, lifecycle events:
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 # Full event stream
@@ -419,7 +457,7 @@ from dendrux.llm.openai_responses import OpenAIResponsesProvider
 provider = OpenAIResponsesProvider(model="gpt-4o", builtin_tools=["web_search_preview"])
 ```
 
-All providers accept `max_tokens`, `temperature`, `timeout`, and `max_retries` at construction or per-call.
+All providers accept `max_tokens`, `temperature`, `max_retries`, and the deadlines `call_timeout` and `stream_idle_timeout` (default 600 s each) at construction or per-call.
 
 > **Note:** Reasoning models (o-series, GPT-5) with multi-turn tool calling have a [known limitation](packages/python/src/dendrux/llm/openai_responses.py). Reasoning items are not preserved between turns. Use OpenAIProvider (Chat Completions) for reasoning model tool loops.
 
@@ -428,6 +466,8 @@ All providers accept `max_tokens`, `temperature`, `timeout`, and `max_retries` a
 ## Database
 
 SQLite works with zero config. Tables auto-create on first use.
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 agent = Agent(
@@ -438,28 +478,25 @@ agent = Agent(
 )
 ```
 
-Postgres supported via Alembic migrations: `dendrux db migrate`
+Postgres supported via Alembic migrations: `dendrux db migrate` (check with `dendrux db check`).
 
-Set `DENDRUX_DATABASE_URL` once to skip passing `database_url` to every agent.
+In a server, create one state store at startup and pass `state_store=` to every agent; do not pass `database_url=` per request. Falling back to the `DENDRUX_DATABASE_URL` environment variable is deprecated in 0.5.0 (the CLI still reads it).
 
 Omit `database_url` entirely for ephemeral runs. No persistence, no overhead.
 
 ---
 
-## CLI and Dashboard
+## CLI and inspection
 
 ```bash
-dendrux runs                    # list all runs
-dendrux runs --status error     # filter by status
-dendrux traces <run_id>         # full conversation trace
-dendrux traces <run_id> --tools # with tool call details
-dendrux db migrate              # run Alembic migrations (Postgres)
-dendrux dashboard               # launch web dashboard at :8001
+dendrux runs --tenant acme --limit 50
+dendrux traces RUN_ID --limit 100
+dendrux db check
 ```
 
-The dashboard shows runs, timelines, tool calls, token usage, delegation trees, and LLM payloads. All data is read-only. Traces and tool calls are rendered raw; when a PII guardrail is active, `agent_runs.pii_mapping` carries the bijection the LLM saw and can be applied at render time to produce an LLM-eye view.
-
----
+Use RunStore reads plus your own tracing and inspection tools. See
+[Observability](docs/recipes/observability.mdx) for bounded inspection and
+[HTTP integration](docs/reference/http-api.mdx) for app-owned routes.
 
 ## Examples
 
@@ -481,7 +518,7 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`14_skills/`](packages/python/examples/14_skills/) | Skills with files and a script executor: model-driven and explicit activation, deny policy |
 | [`15_cache_efficiency.py`](packages/python/examples/15_cache_efficiency.py) | Anthropic prompt-cache hit measurement |
 | [`16_cache_efficiency_openai.py`](packages/python/examples/16_cache_efficiency_openai.py) | OpenAI prompt-cache hit measurement |
-| [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** read router + dashboard + all 4 governance layers + 4 agent methods in one FastAPI app |
+| [`17_full_stack_app/`](packages/python/examples/17_full_stack_app/) | **Canonical full-stack recipe:** developer-owned routes, header auth, RunStore pending reads and governance |
 | [`30_mcp_agent.py`](packages/python/examples/30_mcp_agent.py) | Local tools + an SDK v2 MCP source with shared `MCPHost` lifecycle |
 | [`36_run_control.py`](packages/python/examples/36_run_control.py) | Per-call approvals, a `before_tool` policy hook and `request_pause` / `submit_resume`, with a mock provider (no API key) |
 | [`37_images.py`](packages/python/examples/37_images.py) | A user image plus a tool that returns an image, stored and inspected (mock provider by default, no API key) |
@@ -491,7 +528,6 @@ The dashboard shows runs, timelines, tool calls, token usage, delegation trees, 
 | [`governance/02_approval.py`](packages/python/examples/governance/02_approval.py) | Human-in-the-loop approval with approve/reject CLI |
 | [`governance/03_budget.py`](packages/python/examples/governance/03_budget.py) | Token budget with threshold warnings |
 | [`governance/04_guardrails.py`](packages/python/examples/governance/04_guardrails.py) | PII redaction, secret detection, warn mode |
-| [`governance/05_dashboard.py`](packages/python/examples/governance/05_dashboard.py) | Dashboard pointed at a seeded run database |
 
 ```bash
 cd packages/python/examples
@@ -504,22 +540,22 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 | Metric | Value |
 |--------|-------|
-| Source code | 17,600+ lines |
-| Test code | 25,200+ lines |
-| Test functions | 1,225 |
-| Test-to-source ratio | 1.43 : 1 |
+| Source code | 65,000+ lines |
+| Test code | 110,000+ lines |
+| Test cases | 9,000+ (the Postgres integration cases skip without a database) |
+| Test-to-source ratio | 1.7 : 1 |
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
-| CI checks | lint, format, types, tests |
-| Alembic migrations | 10 |
-| Examples | 17 runnable scripts + 4 HTTP demos |
+| CI checks | lint, format, types, architecture, tests, API-break check |
+| Alembic migrations | 17 |
+| Examples | 39 runnable scripts + 5 example apps |
 | Development started | March 11, 2026 |
 
 ---
 
 ## Status
 
-Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore`, and `make_read_router` are the public surface and unlikely to break. Internal modules may still change.
+Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent`, `tool`, `run`, `stream`, `retry`, `resume`, `submit_tool_results`, `submit_input`, `submit_approval`, `cancel_run`, `sweep`, `RunStore` are the public surface and unlikely to break. Internal modules may still change.
 
 | Layer | Status |
 |-------|--------|
@@ -534,15 +570,16 @@ Dendrux is in active development (`v0.1.0a5`). The core API is stabilizing. `Age
 | Delegation context (parent-child linking) | Stabilizing |
 | Governance (deny, approval, budget, guardrails) | Stabilizing |
 | Recorder/Notifier split | Stable |
-| CLI + Dashboard | Stabilizing |
+| CLI | Stabilizing |
 | Client-side tool pause/resume | Stabilizing |
-| Public HTTP surface (`make_read_router`, `RunStore`) | Stabilizing |
+| Public read API (`RunStore`) | Stabilizing |
 
-Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 1,225 tests, strict types, Apache 2.0.
+Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 9,000+ tests, strict types, Apache 2.0.
+
 
 ## What Dendrux Is Not
 
-Dendrux is not a hosted platform, a task queue, or a deployment tool. You own your server, your auth, your infra. Dendrux gives you `agent.run()` and gets out of the way.
+Dendrux is not a hosted platform, a task queue, or a deployment tool. You own your server, your auth, your infra. Dendrux gives you `agent.run()` and gets out of the way. It provides developer-called recovery primitives (sweep, heartbeat, fencing) but never runs background workers or schedules them.
 
 ## License
 

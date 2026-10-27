@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from dendrux.errors import RunNotFoundError
 from dendrux.llm.mock import MockLLM
 from dendrux.types import LLMResponse, RunStatus, ToolCall
 
@@ -137,14 +138,14 @@ class TestRetryBasic:
             await retry("run1", agent=agent, provider=mock, state_store=store)
 
     async def test_retry_rejects_nonexistent_run(self, store):
-        """retry() raises ValueError for unknown run_id."""
+        """retry() raises RunNotFoundError (a LookupError) for an unknown run_id (B13)."""
         from dendrux.agent import Agent
         from dendrux.runtime.runner import retry
 
         mock = MockLLM([LLMResponse(text="done")])
         agent = Agent(provider=mock, prompt="test")
 
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(RunNotFoundError, match="not found"):
             await retry("nonexistent", agent=agent, provider=mock, state_store=store)
 
     async def test_retry_rejects_no_traces(self, store):

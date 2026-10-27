@@ -23,6 +23,8 @@ missing entry never masquerades as a free call.
 
 from __future__ import annotations
 
+import warnings
+import weakref
 from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Literal
@@ -30,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from dendrux.agent import Agent
     from dendrux.types import UsageStats
 
 __all__ = ["CostSource", "ModelPricing", "PriceTable", "price_usage"]
@@ -126,11 +129,16 @@ class PriceTable:
 
     def lookup(self, model: str | None) -> ModelPricing | None:
         """Return the rates for ``model``, or ``None`` if the table has no entry."""
+        return self.lookup_exact(model) or self.lookup_glob(model)
+
+    def lookup_exact(self, model: str | None) -> ModelPricing | None:
+        """Rates for an entry spelled exactly ``model`` (no globs)."""
+        return self._exact.get(model) if model else None
+
+    def lookup_glob(self, model: str | None) -> ModelPricing | None:
+        """Rates of the longest glob entry matching ``model``."""
         if not model:
             return None
-        exact = self._exact.get(model)
-        if exact is not None:
-            return exact
         for pattern, pricing in self._globs:
             if fnmatchcase(model, pattern):
                 return pricing
@@ -156,14 +164,19 @@ def price_usage(
     *,
     model: str | None,
     pricing: PriceTable | None,
+    fallback_models: tuple[str | None, ...] = (),
 ) -> UsageStats:
     """Return ``usage`` with ``cost_usd`` and ``cost_source`` resolved.
 
     Resolution order:
 
-    1. A provider-reported cost is kept and tagged ``"provider"``.
-    2. Otherwise, if ``pricing`` covers ``model``, the cost is computed and
-       tagged ``"table"``.
+    1. A provider-reported cost is kept and tagged ``"provider"``. A call the
+       provider flagged ``cost_unknown`` (a charge no table can price) stays
+       unpriced.
+    2. Otherwise, if ``pricing`` covers ``model`` (or, failing that, the first
+       of ``fallback_models`` it covers, e.g. the requested model when the
+       vendor returned a dated snapshot id), the cost is computed and tagged
+       ``"table"``.
     3. Otherwise the usage is returned unpriced (``cost_usd=None``,
        ``cost_source=None``).
 
@@ -173,12 +186,101 @@ def price_usage(
         if usage.cost_source is not None:
             return usage
         return replace(usage, cost_source="provider")
-    if pricing is None or not usage.usage_reported:
+    if usage.cost_unknown or pricing is None or not usage.usage_reported:
         return usage
-    cost = pricing.cost_for(model, usage)
+    cost = pricing.cost_for(resolve_priced_model(pricing, model, *fallback_models), usage)
     if cost is None:
         return usage
     return replace(usage, cost_usd=cost, cost_source="table")
+
+
+def resolve_priced_model(pricing: PriceTable | None, *models: str | None) -> str | None:
+    """Pick which of ``models`` to price a call under.
+
+    Callers pass ``(response.model, requested_model)``: vendors return dated
+    snapshot ids (``gpt-5-2025-08-07``) for a requested alias (``gpt-5``), and
+    a table written for the alias must still price the call. Order, first hit
+    wins:
+
+    1. an exact entry for ``response.model``;
+    2. an exact entry for the requested model;
+    3. a glob entry for ``response.model``;
+    4. a glob entry for the requested model.
+
+    So a specific entry for what was requested is never outranked by a
+    catch-all glob that happens to match the vendor's longer id. With no hit,
+    the first non-empty model is returned.
+    """
+    candidates = [m for m in models if m]
+    if pricing is not None:
+        for model in candidates:
+            if pricing.lookup_exact(model) is not None:
+                return model
+        for model in candidates:
+            if pricing.lookup_glob(model) is not None:
+                return model
+    return candidates[0] if candidates else None
+
+
+def check_budget_config(agent: Agent, *, model: str | None = None) -> None:
+    """Fail fast when a dollar budget cannot be priced (B4).
+
+    A ``Budget(max_cost_usd=...)`` needs a pricing source for the model the
+    run will request: a provider that reports cost (``reports_cost``) or a
+    :class:`PriceTable` entry (exact id or glob, same lookup as pricing the
+    calls). Otherwise the limit would silently never trip.
+
+    Called from ``Agent.__init__`` (``model=None``: the provider's configured
+    model) and at every ``run`` / ``stream`` / ``retry`` entry with the
+    per-call ``model=`` override when one was passed.
+
+    Raises:
+        BudgetConfigurationError: ``reason="unpriced_model"``.
+    """
+    budget = agent.budget
+    if budget is None:
+        return
+    if budget.max_tokens is not None and budget.count_cache_tokens is None:
+        _warn_cache_tokens_not_chosen(agent)
+    if budget.max_cost_usd is None:
+        return
+    provider = agent.provider
+    if provider is None:
+        return
+    if provider.reports_cost:
+        return
+    requested = model or provider.model
+    if agent.pricing is not None and agent.pricing.lookup(requested) is not None:
+        return
+    from dendrux.errors import BudgetConfigurationError
+
+    raise BudgetConfigurationError(model=requested or None, reason="unpriced_model")
+
+
+_checked_agents: weakref.WeakSet[Agent] = weakref.WeakSet()
+
+
+def _warn_cache_tokens_not_chosen(agent: Agent) -> None:
+    """Warn when an Agent is built with a token budget that did not choose (B17).
+
+    ``FutureWarning`` so it shows by default; the warnings module dedups per
+    call site. Only the first check of an Agent (its construction) warns, and
+    ``stacklevel=4`` (helper, ``check_budget_config``, ``Agent.__init__``) points at
+    the ``Agent(...)`` line.
+    """
+    try:
+        if agent in _checked_agents:
+            return
+        _checked_agents.add(agent)
+    except TypeError:  # unhashable Agent subclass
+        return
+    warnings.warn(
+        "Budget(max_tokens=...) did not choose count_cache_tokens. Cache read and write "
+        "tokens do not count toward max_tokens today; from 0.6 they will. Choose explicitly "
+        "with Budget(count_cache_tokens=True) (and raise max_tokens) or count_cache_tokens=False.",
+        FutureWarning,
+        stacklevel=4,
+    )
 
 
 def _is_glob(key: str) -> bool:

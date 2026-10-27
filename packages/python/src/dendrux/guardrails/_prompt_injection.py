@@ -32,9 +32,12 @@ defaults to extend, and this guardrail does not.
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from dendrux.guardrails._protocol import Finding, Pattern
+from dendrux.guardrails._detectors import Detector, run_scan, scan_detectors
+
+if TYPE_CHECKING:
+    from dendrux.guardrails._protocol import Finding, Pattern
 
 Engine = Literal["regex"]
 
@@ -82,23 +85,11 @@ class PromptInjection:
         self.action: Literal["block", "warn"] = action
         self.engine: Engine = engine
         self._patterns: list[Pattern] = list(patterns)
-        self._compiled: list[tuple[str, re.Pattern[str]]] = [
-            (p.name, re.compile(p.regex)) for p in self._patterns
-        ]
+        self._detectors: list[Detector] = [Detector(p.name, re.compile(p.regex)) for p in patterns]
+
+    def _scan_sync(self, text: str) -> list[Finding]:
+        return scan_detectors(text, self._detectors)
 
     async def scan(self, text: str) -> list[Finding]:
         """Detect injection patterns in text. Framework applies the action."""
-        findings: list[Finding] = []
-        for entity_type, pattern in self._compiled:
-            for match in pattern.finditer(text):
-                findings.append(
-                    Finding(
-                        entity_type=entity_type,
-                        start=match.start(),
-                        end=match.end(),
-                        score=1.0,
-                        text=match.group(),
-                    )
-                )
-        findings.sort(key=lambda f: f.start)
-        return findings
+        return await run_scan(self._scan_sync, text)

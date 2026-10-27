@@ -632,7 +632,7 @@ async def test_injected_deadlock_retries_whole_transaction(engine, store, monkey
             blob_refs=sub,
             blob_refs_scope="-",
         )
-        is True
+        == 1
     )
     async with engine.connect() as conn:
         runs = (await conn.execute(text("SELECT count(*) FROM agent_runs"))).scalar_one()

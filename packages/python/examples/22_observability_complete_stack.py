@@ -331,7 +331,7 @@ async def main() -> None:
     )
     console.print()
 
-    # ---- Read back via RunStore — same source as the dashboard would use ----
+    # ---- Read back via RunStore for inspection tools you build ----
     async with RunStore.from_database_url(db_url) as store:
         detail = await store.get_run(result.run_id)
         assert detail is not None

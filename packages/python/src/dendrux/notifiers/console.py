@@ -18,9 +18,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from dendrux.errors import ProviderError
 from dendrux.loops.base import BaseNotifier
+from dendrux.types import ErrorInfo, Message, Role, ToolCall, ToolResult
 from dendrux.types import GovernanceEventType as _GovType
-from dendrux.types import Message, Role, ToolCall, ToolResult
 
 if TYPE_CHECKING:
     from dendrux.types import LLMResponse, RunResult, ToolDef
@@ -105,7 +106,7 @@ class ConsoleNotifier(BaseNotifier):
         _console.print(
             Panel(
                 f"[bold red]{type(error).__name__}[/bold red]: "
-                f"[white]{_truncate(str(error), 240)}[/white]",
+                f"[white]{_truncate(_error_message(error), 240)}[/white]",
                 title="[bold]run failed[/bold]",
                 border_style="red",
                 width=min(76, _console.width),
@@ -159,7 +160,7 @@ class ConsoleNotifier(BaseNotifier):
         duration_str = f" [dim]after {duration_ms / 1000:.1f}s[/dim]" if duration_ms else ""
         _console.print(
             f"  [red]  llm[/red]    [bold]{type(error).__name__}[/bold]{duration_str} "
-            f"[dim]{_truncate(str(error), 100)}[/dim]"
+            f"[dim]{_truncate(_error_message(error), 100)}[/dim]"
         )
 
     async def on_tool_started(self, run_id: str, tool_call: ToolCall, iteration: int) -> None:
@@ -423,3 +424,9 @@ def _format_params(params: dict[str, Any]) -> str:
     if len(result) > 60:
         result = result[:57] + "..."
     return result
+
+
+def _error_message(error: BaseException) -> str:
+    return (
+        ErrorInfo.from_error(error).safe_message if isinstance(error, ProviderError) else str(error)
+    )

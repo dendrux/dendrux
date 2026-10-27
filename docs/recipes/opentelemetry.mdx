@@ -28,6 +28,8 @@ That pulls `opentelemetry-api` only. Your application installs whatever SDK + ex
 
 If your app already has OTel wired up (most do, via the auto-instrumentors for FastAPI / SQLAlchemy / requests / etc.), the entire integration is one extra notifier:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 from dendrux.notifiers.otel import OpenTelemetryNotifier
 
@@ -38,6 +40,8 @@ result = await agent.run(
 ```
 
 If you're already passing a `ConsoleNotifier`, compose:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 from dendrux.notifiers import CompositeNotifier, ConsoleNotifier
@@ -90,6 +94,7 @@ async def main() -> None:
         prompt="You are a calculator. Use the add tool.",
         tools=[add],
         database_url="sqlite+aiosqlite:///otel.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         await agent.run("What is 15 + 27?", notifier=OpenTelemetryNotifier())
 
@@ -147,6 +152,7 @@ This means a single click in your tracing UI shows the full audit story for a ru
 | Tool returns `success=False` | `execute_tool` span closes with `Status.ERROR`; `dendrux.tool.success=false` |
 | Provider raises          | `chat` span closes with `Status.ERROR`; exception recorded via `record_exception` |
 | Run errors out           | `invoke_agent` span closes with `Status.ERROR`; exception recorded            |
+| Run finishes with `RunResult.error_info` | `invoke_agent` closes with `Status.ERROR` (it was `OK` before 0.5.0), the safe `dendrux.error.*` attributes (category, retryable, status code and so on) and a `provider.error` span event. No vendor text is recorded. Update dashboards that counted these runs as successful |
 | Stream consumer abandons | `invoke_agent` closes as `cancelled`; any in-flight `chat` / `execute_tool` spans get swept and marked ERROR with `dendrux.span.orphan_close_reason` |
 
 That last row is the subtle one. Stream cancellation (`asyncio.CancelledError`, `GeneratorExit`) is a `BaseException` and bypasses the loop's `except Exception` paths, so `on_llm_call_completed` / `on_llm_call_failed` may not fire. The notifier sweeps any open child spans on the run-level terminal hook so they never leak as never-ending operations in your backend.

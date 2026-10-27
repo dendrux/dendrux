@@ -1,4 +1,4 @@
-"""Dollar/token budget with child roll-up and hard actions (0.3.0 Track F).
+"""Dollar/token budget with child roll-up and hard actions.
 
 SQLite + Postgres via the ``store`` matrix fixture. Covers: pause/cancel at
 the next top-of-iteration checkpoint, both limits independently, the
@@ -33,6 +33,14 @@ from tests.integration.test_run_control_races import Pre03Store
 pytestmark = pytest.mark.asyncio
 
 NAME = "Budgeted"
+
+
+class _CostReportingLLM(ScriptedLLM):
+    """Scripted responses carry their own ``cost_usd``, like a provider that reports cost."""
+
+    @property
+    def reports_cost(self) -> bool:
+        return True
 
 
 def _usage(tokens: int, cost: float | None) -> UsageStats:
@@ -94,7 +102,7 @@ def _agent(
     tools: list[Any] | None = None,
     **kwargs: Any,
 ) -> tuple[Agent, ScriptedLLM]:
-    llm = ScriptedLLM(responses)
+    llm = _CostReportingLLM(responses)
     agent = Agent(
         name=NAME,
         provider=llm,
@@ -300,15 +308,13 @@ class TestBudgetLimits:
                 _call("work", "t4", tokens=10, cost=0.02),
                 _text("done"),
             ],
-            Budget(max_cost_usd=0.05, on_exceed="pause"),
+            Budget(max_cost_usd=0.05, on_exceed="warn"),
             tools=[_work_tool(_Counter())],
         )
         result = await agent.run("go")
 
-        assert result.status == RunStatus.PAUSED
-        assert llm.calls == 4
-        (breach,) = result.meta["budget_exceeded"]
-        assert breach["used"] == pytest.approx(0.06)  # priced part only
+        assert result.status == RunStatus.SUCCESS
+        assert llm.calls == 5
         (unpriced,) = await _events(store, result.run_id, "budget.unpriced")
         assert unpriced.data == {
             "metric": "cost_usd",
@@ -317,8 +323,29 @@ class TestBudgetLimits:
             "unpriced_calls": 1,
             "known_cost_usd": 0.0,
         }
+        (exceeded,) = await _events(store, result.run_id, "budget.exceeded")
+        assert exceeded.data["used"] == pytest.approx(0.06)  # priced part only
+        assert exceeded.data["reason"] == "budget_exceeded"
         # Run total stays unknown (one call unpriced); persisted as None.
         assert (await store.get_run(result.run_id)).total_cost_usd is None
+
+    @pytest.mark.parametrize("on_exceed", ["pause", "cancel"])
+    async def test_unpriced_call_counts_as_exceeded_when_enforcing(self, store, on_exceed) -> None:
+        agent, llm = _agent(
+            store,
+            [_call("work", "t1", tokens=10, cost=None), _text("never")],
+            Budget(max_cost_usd=0.05, on_exceed=on_exceed),
+            tools=[_work_tool(_Counter())],
+        )
+        result = await agent.run("go")
+
+        assert result.status == (RunStatus.PAUSED if on_exceed == "pause" else RunStatus.CANCELLED)
+        assert llm.calls == 1
+        assert result.meta["budget_exceeded"] == [{"metric": "cost_usd", "used": 0.0, "max": 0.05}]
+        (exceeded,) = await _events(store, result.run_id, "budget.exceeded")
+        assert exceeded.data["reason"] == "unpriced_call"
+        assert exceeded.data["action"] == on_exceed
+        assert len(await _events(store, result.run_id, "budget.unpriced")) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +356,7 @@ class TestBudgetLimits:
 def _delegating_parent(
     store: Any, child_response: LLMResponse, budget: Budget
 ) -> tuple[Agent, ScriptedLLM, ScriptedLLM]:
-    child_llm = ScriptedLLM([child_response])
+    child_llm = _CostReportingLLM([child_response])
     child = Agent(name="Child", provider=child_llm, prompt="C.", state_store=store)
 
     @tool()
@@ -386,15 +413,19 @@ class TestBudgetChildren:
 
         assert result.status == RunStatus.PAUSED
         assert parent_llm.calls == 1
-        assert result.meta["budget_exceeded"] == [{"metric": "tokens", "used": 1100, "max": 500}]
+        assert result.meta["budget_exceeded"] == [
+            {"metric": "tokens", "used": 1100, "max": 500},
+            {"metric": "cost_usd", "used": pytest.approx(0.01), "max": 1.0},
+        ]
         (unpriced,) = await _events(store, result.run_id, "budget.unpriced")
         assert unpriced.data["unpriced_calls"] == 1
         assert unpriced.data["known_cost_usd"] == pytest.approx(0.01)
-        assert not [
-            e
+        # The unknown child spend stands in for the cost limit while enforcing.
+        reasons = {
+            e.data["metric"]: e.data["reason"]
             for e in await _events(store, result.run_id, "budget.exceeded")
-            if e.data["metric"] == "cost_usd"
-        ]
+        }
+        assert reasons == {"tokens": "budget_exceeded", "cost_usd": "unpriced_call"}
 
     async def test_warn_budget_reports_child_spend_after_next_response(self, store) -> None:
         parent, _, _ = _delegating_parent(
@@ -460,6 +491,50 @@ class TestBudgetResume:
         record = await store.get_run(run_id)
         assert record.total_input_tokens + record.total_output_tokens == 700
 
+    async def test_unpriced_pause_resumes_without_changing_the_policy(self, store) -> None:
+        budget = Budget(max_cost_usd=5.0, on_exceed="pause", count_cache_tokens=False)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10, cost=None)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        paused = await agent.run("go")
+        assert paused.status == RunStatus.PAUSED
+        state = await _pause_state(store, paused.run_id)
+        assert state.budget_unpriced_calls == 1
+
+        same, llm = _agent(
+            store,
+            [_text("done", tokens=10, cost=0.01)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        result = await same.resume(paused.run_id)
+        assert result.status == RunStatus.SUCCESS
+        assert llm.calls == 1
+
+    async def test_a_new_unpriced_call_after_resume_pauses_again(self, store) -> None:
+        budget = Budget(max_cost_usd=5.0, on_exceed="pause", count_cache_tokens=False)
+        agent, _ = _agent(
+            store,
+            [_call("work", "t1", tokens=10, cost=None)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        paused = await agent.run("go")
+        again, llm = _agent(
+            store,
+            [_call("work", "t2", tokens=10, cost=None), _text("never", cost=0.0)],
+            budget,
+            tools=[_work_tool(_Counter())],
+        )
+        result = await again.resume(paused.run_id)
+        assert result.status == RunStatus.PAUSED
+        assert llm.calls == 1
+        state = await _pause_state(store, paused.run_id)
+        assert state.budget_unpriced_calls == 2
+
     async def test_resume_stream_repauses(self, store) -> None:
         run_id = await self._paused(store)
         same, llm = _agent(
@@ -492,7 +567,9 @@ class TestBudgetResume:
         assert waiting.status == RunStatus.WAITING_APPROVAL
         assert (await _pause_state(store, waiting.run_id)).budget_fired == [("tokens", 0.5)]
 
-        done = await agent.submit_approval(waiting.run_id, approved=True)
+        done = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert done.status == RunStatus.SUCCESS
         fractions = [
             e.data["fraction"] for e in await _events(store, waiting.run_id, "budget.threshold")
@@ -572,7 +649,9 @@ class TestBudgetPrecedence:
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_APPROVAL
 
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert ran.n == 1
         assert result.status == RunStatus.PAUSED
         assert llm.calls == 1
@@ -617,7 +696,7 @@ class TestBudgetStreamingAndDegrade:
 
     @pytest.mark.parametrize("on_exceed", ["pause", "cancel"])
     async def test_single_call_degrades_to_warn(self, store, on_exceed) -> None:
-        llm = ScriptedLLM([_text("classified", tokens=900, cost=0.2)])
+        llm = _CostReportingLLM([_text("classified", tokens=900, cost=0.2)])
         agent = Agent(
             provider=llm,
             prompt="Classify.",
@@ -767,7 +846,7 @@ class TestBudgetResumeGate:
 
 
 def _track_e_store(inner: Any) -> Any:
-    """A store with Track E's atomic signatures (no total_usage / failure_reason)."""
+    """A store with the atomic store signatures (no total_usage / failure_reason)."""
 
     class TrackEStore:
         def __getattr__(self, name: str) -> Any:
@@ -865,7 +944,7 @@ class TestLegacyAccounting:
             """Refund."""
             return "refunded"
 
-        budget = Budget(max_cost_usd=0.05, on_exceed="pause")
+        budget = Budget(max_tokens=10_000, max_cost_usd=0.05, on_exceed="pause")
         agent, _ = _agent(
             legacy,
             [
@@ -880,11 +959,17 @@ class TestLegacyAccounting:
         )
         waiting = await agent.run("go")
         assert waiting.status == RunStatus.WAITING_APPROVAL
-        result = await agent.submit_approval(waiting.run_id, approved=True)
+        result = await agent.submit_approval(
+            waiting.run_id, approved=True, expected_pause_id=waiting.pause_id
+        )
         assert result.status == RunStatus.PAUSED
+        # The unpriced refund call stops the run; the priced part is carried.
         assert result.meta["budget_exceeded"] == [
-            {"metric": "cost_usd", "used": pytest.approx(0.06), "max": 0.05}
+            {"metric": "cost_usd", "used": pytest.approx(0.04), "max": 0.05}
         ]
+        state = await _pause_state(legacy, result.run_id)
+        assert state.budget_known_cost_usd == pytest.approx(0.04)
+        assert state.budget_unpriced_calls == 1
 
 
 def _count_reads(store: Any) -> dict[str, int]:

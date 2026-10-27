@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ import pytest
 
 openai = pytest.importorskip("openai", reason="openai extra not installed")
 
+from dendrux.errors import ProviderUnavailableError  # noqa: E402
 from dendrux.llm.openai_responses import OpenAIResponsesProvider  # noqa: E402
 from dendrux.types import (  # noqa: E402
     REASONING_MODEL_META_KEY,
@@ -268,7 +270,7 @@ class TestNormalizeResponse:
         tc = result.tool_calls[0]
         assert tc.params == {}
         assert tc.raw_arguments == '{"bad":'
-        assert tc.parse_error == "Expecting value at char 7"
+        assert tc.parse_error == "arguments must be valid JSON"
 
     def test_empty_arguments(self, provider: OpenAIResponsesProvider) -> None:
         response = FakeResponse(
@@ -317,7 +319,7 @@ class TestComplete:
         provider._client.responses.create = AsyncMock(
             side_effect=openai.APITimeoutError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(TimeoutError, match="timed out.*timeout=300"):
+        with pytest.raises(TimeoutError, match="timed out.*call_timeout"):
             await provider.complete([Message(role=Role.USER, content="Hi")])
 
     async def test_builtin_tools_included(
@@ -783,17 +785,20 @@ class TestCompleteStream:
                 pass  # pragma: no cover
 
     async def test_stream_failed_event_raises(self, provider: OpenAIResponsesProvider) -> None:
-        """response.failed event raises RuntimeError."""
-        stream_events = [
-            FakeStreamEvent(type="response.failed", error="something went wrong"),
-        ]
+        """response.failed raises a typed error from ``response.error`` (its real code)."""
+        failed = SimpleNamespace(
+            status="failed", error=SimpleNamespace(code="server_error", message="boom")
+        )
+        stream_events = [FakeStreamEvent(type="response.failed", response=failed)]
         provider._client.responses.create = AsyncMock(return_value=MockAsyncStream(stream_events))
 
-        with pytest.raises(RuntimeError, match="stream failed"):
+        with pytest.raises(ProviderUnavailableError) as info:
             async for _ in provider.complete_stream(
                 [Message(role=Role.USER, content="Hi")],
             ):
                 pass  # pragma: no cover
+        assert info.value.provider_code == "server_error"
+        assert "boom" not in str(info.value)
 
     async def test_stream_forwards_kwargs(self, provider: OpenAIResponsesProvider) -> None:
         """Supported kwargs are forwarded alongside stream flag."""
@@ -843,10 +848,7 @@ class TestCompleteStream:
         end = next(e for e in events if e.type == StreamEventType.TOOL_USE_END)
         assert end.tool_call.params == {}
         assert end.tool_call.raw_arguments == "{bad json"
-        assert (
-            end.tool_call.parse_error
-            == "Expecting property name enclosed in double quotes at char 1"
-        )
+        assert end.tool_call.parse_error == "arguments must be valid JSON"
 
     async def test_stream_provider_response_populated(
         self, provider: OpenAIResponsesProvider
@@ -949,7 +951,7 @@ class TestBoundaryHardening:
         provider._client.responses.create = AsyncMock(
             side_effect=openai.APIConnectionError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(ConnectionError, match="Connection to OpenAI Responses API failed"):
+        with pytest.raises(ConnectionError, match="Could not reach the provider"):
             await provider.complete([Message(role=Role.USER, content="Hi")])
 
     async def test_stream_connection_error_mapped(self, provider: OpenAIResponsesProvider) -> None:
@@ -957,7 +959,7 @@ class TestBoundaryHardening:
         provider._client.responses.create = AsyncMock(
             side_effect=openai.APIConnectionError(request=None),  # type: ignore[arg-type]
         )
-        with pytest.raises(ConnectionError, match="Connection to OpenAI Responses API failed"):
+        with pytest.raises(ConnectionError, match="Could not reach the provider"):
             async for _ in provider.complete_stream(
                 [Message(role=Role.USER, content="Hi")],
             ):

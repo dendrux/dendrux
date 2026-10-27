@@ -114,7 +114,9 @@ class TestBatchApproveRoutesByTarget:
         paused = await agent.run("refund and read")
         assert paused.status == RunStatus.WAITING_APPROVAL
 
-        result = await agent.submit_approval(paused.run_id, approved=True)
+        result = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
 
         assert CLIENT_SIDE_EFFECTS == []
         assert SERVER_SIDE_EFFECTS == ["refund:7"]
@@ -138,7 +140,7 @@ class TestBatchApproveRoutesByTarget:
         llm = MockLLM([LLMResponse(tool_calls=_mixed_batch()), LLMResponse(text="done")])
         agent = _agent(llm, store)
         paused = await agent.run("refund and read")
-        result = await agent.resume(paused.run_id)
+        result = await agent.resume(paused.run_id, expected_pause_id=paused.pause_id)
         assert result.status == RunStatus.WAITING_CLIENT_TOOL
         assert CLIENT_SIDE_EFFECTS == []
 
@@ -146,7 +148,9 @@ class TestBatchApproveRoutesByTarget:
         llm = MockLLM([LLMResponse(tool_calls=_mixed_batch()), LLMResponse(text="done")])
         agent = _agent(llm, store)
         paused = await agent.run("refund and read")
-        events = [e async for e in agent.resume_stream(paused.run_id)]
+        events = [
+            e async for e in agent.resume_stream(paused.run_id, expected_pause_id=paused.pause_id)
+        ]
         assert CLIENT_SIDE_EFFECTS == []
         assert SERVER_SIDE_EFFECTS == ["refund:7"]
         assert [e.type for e in events] == [
@@ -165,7 +169,10 @@ class TestBatchApproveRoutesByTarget:
         agent = _agent(llm, store)
         paused = await agent.run("refund and read")
         result = await agent.submit_approval(
-            paused.run_id, approved=False, rejection_reason="Not authorized."
+            paused.run_id,
+            approved=False,
+            rejection_reason="Not authorized.",
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.SUCCESS
         assert SERVER_SIDE_EFFECTS == [] and CLIENT_SIDE_EFFECTS == []
@@ -211,6 +218,7 @@ class TestPerCallDecisions:
                 ids[0]: ApprovalDecision.deny("Too large"),
                 ids[3]: ApprovalDecision.approve(),
             },
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.WAITING_CLIENT_TOOL
         assert SERVER_SIDE_EFFECTS == ["search:q", "refund:2"]
@@ -249,7 +257,9 @@ class TestPerCallDecisions:
         pause = await store.get_pause_state(paused.run_id)
         gated = list(pause["approval_gates"])
         result = await agent.submit_approval(
-            paused.run_id, decisions={g: ApprovalDecision.deny() for g in gated}
+            paused.run_id,
+            decisions={g: ApprovalDecision.deny() for g in gated},
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.WAITING_CLIENT_TOOL
         assert SERVER_SIDE_EFFECTS == ["search:q"]
@@ -267,7 +277,9 @@ class TestPerCallDecisions:
         pause = await store.get_pause_state(paused.run_id)
         [gid] = list(pause["approval_gates"])
         result = await agent.submit_approval(
-            paused.run_id, decisions={gid: ApprovalDecision.approve()}
+            paused.run_id,
+            decisions={gid: ApprovalDecision.approve()},
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.SUCCESS
         [decided] = await _events(store, paused.run_id, "approval.decided")
@@ -286,7 +298,9 @@ class TestPerCallDecisions:
         else:
             decisions[ids[1]] = ApprovalDecision.approve()
         with pytest.raises(ValueError, match=problem if problem != "non_gated" else "unknown"):
-            await agent.submit_approval(paused.run_id, decisions=decisions)
+            await agent.submit_approval(
+                paused.run_id, decisions=decisions, expected_pause_id=paused.pause_id
+            )
         record = await store.get_run(paused.run_id)
         assert record.status == RunStatus.WAITING_APPROVAL.value
         assert "submitted_decisions" not in await store.get_pause_state(paused.run_id)
@@ -295,19 +309,27 @@ class TestPerCallDecisions:
     async def test_argument_validation(self, store) -> None:
         agent, _, paused, _ = await self._pause_three(store)
         with pytest.raises(ValueError, match="exactly one"):
-            await agent.submit_approval(paused.run_id)
+            await agent.submit_approval(paused.run_id, expected_pause_id=paused.pause_id)
         with pytest.raises(ValueError, match="exactly one"):
-            await agent.submit_approval(paused.run_id, approved=True, decisions={})
+            await agent.submit_approval(
+                paused.run_id, approved=True, decisions={}, expected_pause_id=paused.pause_id
+            )
         with pytest.raises(ValueError, match="rejection_reason"):
-            await agent.submit_approval(paused.run_id, decisions={}, rejection_reason="x")
+            await agent.submit_approval(
+                paused.run_id, decisions={}, rejection_reason="x", expected_pause_id=paused.pause_id
+            )
         with pytest.raises(ValueError, match="ApprovalDecision"):
-            await agent.submit_approval(paused.run_id, decisions={"a": True})
+            await agent.submit_approval(
+                paused.run_id, decisions={"a": True}, expected_pause_id=paused.pause_id
+            )
         with pytest.raises(ValueError, match="mapping"):
-            await agent.submit_approval(paused.run_id, decisions=[("a", True)])
+            await agent.submit_approval(
+                paused.run_id, decisions=[("a", True)], expected_pause_id=paused.pause_id
+            )
         record = await store.get_run(paused.run_id)
         assert record.status == RunStatus.WAITING_APPROVAL.value
 
-    async def test_duplicate_ids_in_claimed_blob_finalize_error(self, store) -> None:
+    async def test_duplicate_ids_in_claimed_blob_release_claim(self, store) -> None:
         agent, _, paused, _ = await self._pause_three(store)
         pause = await store.get_pause_state(paused.run_id)
         gated = list(pause["approval_gates"])
@@ -328,7 +350,8 @@ class TestPerCallDecisions:
             )
         assert SERVER_SIDE_EFFECTS == []
         record = await store.get_run(paused.run_id)
-        assert record.status == RunStatus.ERROR.value
+        assert record.status == RunStatus.WAITING_APPROVAL.value
+        assert not await _events(store, paused.run_id, "run.error")
 
     async def test_wrong_pause_status(self, store) -> None:
         from dendrux.errors import PauseStatusMismatchError
@@ -340,7 +363,9 @@ class TestPerCallDecisions:
         paused = await agent.run("go")
         assert paused.status == RunStatus.WAITING_CLIENT_TOOL
         with pytest.raises(PauseStatusMismatchError):
-            await agent.submit_approval(paused.run_id, decisions={})
+            await agent.submit_approval(
+                paused.run_id, decisions={}, expected_pause_id=paused.pause_id
+            )
 
     async def test_legacy_pause_without_gate_snapshot(self, store) -> None:
         """Pauses persisted before 0.3.0: every server call needs a decision."""
@@ -355,6 +380,7 @@ class TestPerCallDecisions:
             await agent.submit_approval(
                 paused.run_id,
                 decisions={ids[0]: ApprovalDecision.approve(), ids[3]: ApprovalDecision.approve()},
+                expected_pause_id=paused.pause_id,
             )
         result = await agent.submit_approval(
             paused.run_id,
@@ -363,6 +389,7 @@ class TestPerCallDecisions:
                 ids[1]: ApprovalDecision.deny("skip"),
                 ids[3]: ApprovalDecision.approve(),
             },
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.WAITING_CLIENT_TOOL
         assert SERVER_SIDE_EFFECTS == ["refund:1", "refund:2"]
@@ -422,9 +449,12 @@ class TestHookGatedResumeOnNewAgent:
                     ids[0]: ApprovalDecision.approve(),
                     ids[1]: ApprovalDecision.approve(),
                 },
+                expected_pause_id=paused.pause_id,
             )
         result = await resumer.submit_approval(
-            paused.run_id, decisions={ids[0]: ApprovalDecision.approve()}
+            paused.run_id,
+            decisions={ids[0]: ApprovalDecision.approve()},
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.SUCCESS
         # The hook is not re-run for approved or held calls on resume.
@@ -434,7 +464,9 @@ class TestHookGatedResumeOnNewAgent:
     async def test_new_agent_batch_approve(self, store) -> None:
         llm, paused, _ = await self._pause(store)
         resumer = _agent(llm, store, require_approval=None)
-        result = await resumer.submit_approval(paused.run_id, approved=True)
+        result = await resumer.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
         assert result.status == RunStatus.SUCCESS
         [decided] = await _events(store, paused.run_id, "approval.decided")
         assert [d["decision"] for d in decided["decisions"]] == ["approved", "not_gated_executed"]
@@ -477,7 +509,9 @@ class TestResumeBarrier:
             await store.request_cancel(paused.run_id)
 
         CANCEL_HOOK["after_refund"] = cancel
-        result = await agent.submit_approval(paused.run_id, approved=True)
+        result = await agent.submit_approval(
+            paused.run_id, approved=True, expected_pause_id=paused.pause_id
+        )
         assert result.status == RunStatus.CANCELLED
         assert SERVER_SIDE_EFFECTS == ["refund:1"]
         assert len(llm.call_history) == 1
@@ -487,7 +521,9 @@ class TestResumeBarrier:
         agent = _agent(llm, store)
         paused = await agent.run("go")
         await store.request_cancel(paused.run_id)
-        events = [e async for e in agent.resume_stream(paused.run_id)]
+        events = [
+            e async for e in agent.resume_stream(paused.run_id, expected_pause_id=paused.pause_id)
+        ]
         assert events[-1].type == RunEventType.RUN_CANCELLED
         assert SERVER_SIDE_EFFECTS == []
 
@@ -560,7 +596,12 @@ class TestRejectionViaResumeStream:
             ToolResult(name=tc["name"], call_id=tc["id"], payload='"no"', success=False, error="no")
             for tc in pause["pending_tool_calls"]
         ]
-        events = [e async for e in agent.resume_stream(paused.run_id, tool_results=results)]
+        events = [
+            e
+            async for e in agent.resume_stream(
+                paused.run_id, tool_results=results, expected_pause_id=paused.pause_id
+            )
+        ]
         assert events[-1].run_result.status == RunStatus.SUCCESS
         assert SERVER_SIDE_EFFECTS == [] and CLIENT_SIDE_EFFECTS == []
         [decided] = await _events(store, paused.run_id, "approval.decided")
@@ -585,7 +626,7 @@ class TestRejectionViaResumeStream:
 
 class TestStalePauseGeneration:
     async def test_decisions_for_replaced_pause_fail_before_claim(self, store) -> None:
-        """ABA: the pause is replaced between validation and claim (review P1)."""
+        """ABA: the pause is replaced between validation and claim."""
         import copy
 
         llm = MockLLM(
@@ -614,9 +655,11 @@ class TestStalePauseGeneration:
 
         store.submit_and_claim = replace_pause_then_claim
         try:
-            with pytest.raises(ValueError, match="new-pause-call"):
+            with pytest.raises(ValueError, match="unknown"):
                 await agent.submit_approval(
-                    paused.run_id, decisions={old_id: ApprovalDecision.approve()}
+                    paused.run_id,
+                    decisions={old_id: ApprovalDecision.approve()},
+                    expected_pause_id=paused.pause_id,
                 )
         finally:
             store.submit_and_claim = original
@@ -628,7 +671,9 @@ class TestStalePauseGeneration:
 
         # The newer pause is still healthy and accepts its own decisions.
         result = await agent.submit_approval(
-            paused.run_id, decisions={new_id: ApprovalDecision.approve()}
+            paused.run_id,
+            decisions={new_id: ApprovalDecision.approve()},
+            expected_pause_id=paused.pause_id,
         )
         assert result.status == RunStatus.SUCCESS
         assert SERVER_SIDE_EFFECTS == ["refund:1"]

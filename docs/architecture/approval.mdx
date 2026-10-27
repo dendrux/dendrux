@@ -32,6 +32,7 @@ async def main() -> None:
         tools=[refund],
         require_approval=["refund"],     # refund cannot execute without submit_approval
         database_url="sqlite+aiosqlite:///demo.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("Refund order 42 using the refund tool.")
         print(result.status.value)       # waiting_approval
@@ -51,29 +52,35 @@ The [Quickstart](/docs/quickstart) already walks through this, with real DB stat
 
 ```
 seq=0  run.started
-seq=1  llm.completed         (model emits refund(order_id=42))
-seq=2  approval.requested    corr=01KPFXPAT8ZF7MNGJNW2Y6S8GZ
-seq=3  run.paused            status=waiting_approval
+seq=1  tools.declared        local_tool_names=["refund"]
+seq=2  llm.completed         (model emits refund(order_id=42))
+seq=3  approval.requested    corr=01M5Y7MRAR1SFRK68BK369YRXZ
+seq=4  run.paused            status=waiting_approval
          <-- starter process exits here -->
-         <-- a later process calls submit_approval(run_id, approved=True) -->
-seq=4  run.resumed
-seq=5  tool.completed        refund executed, success=True
-seq=6  approval.decided      decision=approved
-seq=7  llm.completed         (model writes the final user-facing answer)
-seq=8  run.completed
+         <-- a later process calls submit_approval(run_id, approved=True, expected_pause_id=...) -->
+seq=5  run.resumed
+seq=6  tools.declared        local_tool_names=["refund"]
+seq=7  tool.completed        refund executed, success=True
+seq=8  approval.decided      decision=approved
+seq=9  llm.completed         (model writes the final user-facing answer)
+seq=10 run.completed
 ```
+
+Captured on Dendrux 0.5.0 with claude-haiku-4-5.
 
 Five things to notice:
 
-1. The `approval.requested` event (seq=2) and the `tool.completed` event (seq=5) share the same `correlation_id`. That id is the `tool_call.id`, so a reader can join the approval decision to the specific call it authorized.
-2. The pause at seq=3 and the resume at seq=4 are adjacent in the log but written by two different processes. [Event ordering](/docs/architecture/event-ordering) explains why `sequence_index` still runs straight through.
-3. The tool function ran only once, between seq=4 and seq=5, after the approval was in hand. No speculative execution.
-4. `approval.decided` (seq=6) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "...", "decisions": [...]}`, with one entry per pending call (see [What `approval.decided` records](#what-approvaldecided-records)). This row is the audit record of the human's choice.
+1. The `approval.requested` event (seq=3) and the `tool.completed` event (seq=7) share the same `correlation_id`. That id is the `tool_call.id`, so a reader can join the approval decision to the specific call it authorized.
+2. The pause at seq=4 and the resume at seq=5 are adjacent in the log but written by two different processes. [Event ordering](/docs/architecture/event-ordering) explains why `sequence_index` still runs straight through.
+3. The tool function ran only once, between seq=6 and seq=7, after the approval was in hand. No speculative execution.
+4. `approval.decided` (seq=8) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "...", "decisions": [...]}`, with one entry per pending call (see [What `approval.decided` records](#what-approvaldecided-records)). This row is the audit record of the human's choice.
 5. The run finishes as `status=success`. Approval did not need to be terminal.
 
 ## The reject path
 
 `submit_approval(run_id, approved=False, rejection_reason="...")` is the other branch. It resumes the run, skips the tool, and feeds a synthetic failed tool result (carrying the reason) back to the model:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 paused = await agent.run("Refund order 42 using the refund tool.")
@@ -87,24 +94,27 @@ done = await agent.submit_approval(
 print(done.status.value)     # success  (the run finishes; the model handles the rejection)
 ```
 
-A live capture with the same `refund` agent, rejected with that reason:
+Captured on Dendrux 0.5.0 with claude-haiku-4-5, with the same `refund` agent, rejected with that reason:
 
 ```text
 first: status=waiting_approval
 after reject: status=success
 refund function actually called? False
-final answer preview: "I attempted to process the refund for order 42, but it was declined because
-the refund amount exceeds the automatic threshold. This means that..."
+final answer preview: "The refund for order 42 has been declined because the amount exceeds
+the automatic threshold. This refund requires manager approval. You may need to: ..."
 
 run_events:
   seq=0  run.started
-  seq=1  llm.completed
-  seq=2  approval.requested
-  seq=3  run.paused
-  seq=4  run.resumed
-  seq=5  tool.completed         success=False
-  seq=6  llm.completed
-  seq=7  run.completed
+  seq=1  tools.declared
+  seq=2  llm.completed
+  seq=3  approval.requested
+  seq=4  run.paused
+  seq=5  run.resumed
+  seq=6  tools.declared
+  seq=7  tool.completed         success=False
+  seq=8  approval.decided       decision=rejected
+  seq=9  llm.completed
+  seq=10 run.completed
 
 tool_calls:
   refund  success=0  error="Manager declined: amount exceeds automatic threshold."
@@ -131,11 +141,13 @@ async def submit_approval(
     decisions: Mapping[str, ApprovalDecision] | None = None,
     rejection_reason: str | None = None,
     notifier: LoopNotifier | None = None,
+    tenant_id: TenantScope = ...,
+    expected_pause_id: str | None = None,   # required when approving
 ) -> RunResult:
     """Pass exactly one of approved= (whole batch) or decisions= (per call)."""
 ```
 
-Pass exactly one of `approved=` or `decisions=`; passing both or neither raises `ValueError`, as does `rejection_reason` together with `decisions=`.
+Pass exactly one of `approved=` or `decisions=`; passing both or neither raises `ValueError`, as does `rejection_reason` together with `decisions=`. `approved` must be a real `bool`. Approving (`approved=True`, or any `ApprovalDecision.approve()`) also requires `expected_pause_id=`; see [Approving the right pause](#approving-the-right-pause).
 
 | Form | What happens |
 | --- | --- |
@@ -143,7 +155,34 @@ Pass exactly one of `approved=` or `decisions=`; passing both or neither raises 
 | `approved=False` | Every pending call receives a synthetic failed `ToolResult` whose payload is `rejection_reason` as a JSON string (default `"User declined to run this tool."`). Same bytes as before 0.3. |
 | `decisions={call_id: ApprovalDecision.approve() \| ApprovalDecision.deny(reason)}` | Each gated call is decided on its own. A denied call gets a failed result whose payload is `{"denied": reason}`. |
 
+## What the reviewer approves is what runs
+
+The approval view (`approval.requested`, and any approval view that is stored or shown) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when a PII guardrail redacted them, before any coercion, and without defaults Dendrux filled in. Execution uses the coerced real values (see [How arguments are checked](/docs/reference/tools#how-arguments-are-checked)). Coercion is deterministic, so the arguments a person approves still decide what runs. `before_tool` hooks receive real values in process, as before. The call is validated before the pause: an invalid call is returned to the model, never put in front of a person.
+
+The active pause's arguments stay visible in redacted views, in `run.paused`, `RunStore.get_pause_page` and `RunStore.get_pending`, because they are the thing being approved. Past pauses' arguments are hidden unless the reader asks for payloads. In your own approval screen, load them with `get_pending` (see [Build your own read routes](/docs/recipes/build-your-own-read-routes)); everything else payload-like stays hidden unless you opt in.
+
+## Approving the right pause
+
+A decision can arrive late, from a tab left open or a retried request. Every pause has a `pause_id`, and **approving requires it**: pass the id the approver was shown as `expected_pause_id=`.
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
+```python
+await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
+```
+
+- Get the id from `RunResult.pause_id`, `RunStore.get_pending(...).pause_id` or the `run.paused` event, send it to the client with the approval request, and send it back with the decision.
+- If the run's current pause is a different one, nothing is claimed or written and the call raises `PauseStatusMismatchError` with `reason="pause_id"` (answer 409). Fetch the pending pause again and ask the actor again; do not retry the old decision.
+- Without a token, approving raises `InputValidationError` (code `pause_id_required`) before anything is claimed. Rejecting does not need one.
+- The check runs before the claim and again inside the claim transaction, so a decision aimed at an older pause can never approve the newer one.
+
+See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+On resume the run re-checks `deny` and the per-tool call limits before executing approved calls, so a tool denied or capped after the pause is not run.
+
 ## Per-call decisions
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 from dendrux import ApprovalDecision
@@ -154,6 +193,7 @@ await agent.submit_approval(
         call_a: ApprovalDecision.approve(),
         call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
     },
+    expected_pause_id=pause_id,      # required: this batch approves call_a
 )
 ```
 
@@ -210,6 +250,8 @@ Each entry's `decision` is one of `approved`, `denied`, `not_gated_executed` or 
 
 The decision belongs to the pause. Once a run has moved on, there is no way to approve a call after the fact. When "not now, but maybe later" is a real workflow (a review queue, a daily batch), deny the call with a reason that says so, and let your application run the action itself when someone signs it off:
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 # 1. Hold the call now. The model is told the action is queued.
 await agent.submit_approval(
@@ -249,7 +291,7 @@ The pause-and-resume flow is a superset of the callback flow: anything a callbac
 
 - Declared on `Agent(require_approval=[...], tools=[...])`.
 - Enforced in `dendrux.runtime.runner` and `dendrux.loops.react.ReActLoop` (the pause and re-dispatch logic).
-- Resolved with `agent.submit_approval(run_id, approved=...)` or `agent.submit_approval(run_id, decisions={...})`.
+- Resolved with `agent.submit_approval(run_id, approved=..., expected_pause_id=...)` or `agent.submit_approval(run_id, decisions={...}, expected_pause_id=...)`.
 - Gates can also come from a [`before_tool` policy hook](/docs/architecture/tool-policy).
 - Emits `approval.requested` (one per gated call, on pause) and `approval.decided` (once, on resume) on `run_events`.
 - Persists the pending batch in `agent_runs.pause_data` until resume. See [Pause and resume](/docs/architecture/pause-resume) for the state-machine side.

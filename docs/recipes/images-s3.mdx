@@ -25,6 +25,8 @@ class BlobStore(Protocol):
 
 This uses `boto3` (`pip install boto3`) and moves its blocking calls to a thread:
 
+[//]: # "docs-test: skip - needs the optional package `boto3`"
+
 ```python
 import asyncio
 
@@ -76,6 +78,8 @@ The IAM policy needs `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on the
 
 Use the same store everywhere bytes are read, stored or purged: every `Agent`, every `RunStore`, every worker. Rows record that their bytes are external, not which store holds them, so a process configured without it cannot read them (`ImagePersistenceUnsupportedError`, `reason="blob_store_not_configured"`).
 
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
+
 ```python
 from dendrux import Agent
 from dendrux.store import RunStore
@@ -91,6 +95,8 @@ A paused run started by one process resumes in another as long as both use the s
 ## Garbage collection and erasure work the same
 
 `await agent.blobs.collect_garbage()` and `await agent.blobs.purge(sha256, tenant_id=...)` call your `delete`. Run garbage collection on a schedule (hourly or daily, at least one hour of grace) from any process:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 from datetime import timedelta

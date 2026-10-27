@@ -1,0 +1,155 @@
+{
+ "_comment": "Allowed public API breaks against the last release (v0.4.1). Each entry names the spec section 2 B-item whose migration note documents it. b_item null = a gap: a break with no migration note. The check fails on gaps by default; `api_breaks.py --allow-gaps` lists them without failing (informational only, never in CI).",
+ "known_b_items": [
+  "B1",
+  "B2",
+  "B3",
+  "B4",
+  "B5",
+  "B6",
+  "B7",
+  "B8",
+  "B9",
+  "B10",
+  "B11",
+  "B12",
+  "B13",
+  "B14",
+  "B15",
+  "B16",
+  "B17",
+  "B18",
+  "B19",
+  "B20",
+  "B21",
+  "B22",
+  "B23",
+  "B24",
+  "B25",
+  "B26",
+  "B27",
+  "B28",
+  "B29",
+  "B30",
+  "B31",
+  "B32"
+ ],
+ "entries": [
+  {
+   "kind": "parameter-changed-default",
+   "paths": [
+    "dendrux.agent.Agent.run",
+    "dendrux.agent.Agent.retry",
+    "dendrux.agent.Agent.resume",
+    "dendrux.agent.Agent.submit_tool_results",
+    "dendrux.agent.Agent.submit_input",
+    "dendrux.agent.Agent.submit_approval",
+    "dendrux.agent.Agent.cancel_run",
+    "dendrux.agent.Agent.request_pause",
+    "dendrux.agent.Agent.submit_resume",
+    "dendrux.agent.Agent.submit_note",
+    "dendrux.agent.Agent.stream",
+    "dendrux.agent.Agent.resume_stream",
+    "dendrux.runtime.runner.run",
+    "dendrux.runtime.runner.retry",
+    "dendrux.runtime.runner.run_stream"
+   ],
+   "param": "tenant_id",
+   "b_item": "B19",
+   "note": "tenant_id now defaults to a sentinel so that omitting it can emit the B19 FutureWarning (strict_tenancy flips to True in 0.6). Behaviour when omitted is unchanged in 0.5."
+  },
+  {
+   "kind": "parameter-changed-default",
+   "paths": [
+    "dendrux.store.RunStore.list_runs",
+    "dendrux.store.RunStore.count_runs",
+    "dendrux.runtime.state.StateStore.list_runs",
+    "dendrux.runtime.state.StateStore.count_runs",
+    "dendrux.runtime.state.SQLAlchemyStateStore.list_runs",
+    "dendrux.runtime.state.SQLAlchemyStateStore.count_runs"
+   ],
+   "param": "tenant_id",
+   "b_item": "B11",
+   "note": "tenant_id defaults to UNSCOPED; None now means untenanted only."
+  },
+  {
+   "kind": "parameter-changed-default",
+   "paths": [
+    "dendrux.llm.anthropic.AnthropicProvider.__init__",
+    "dendrux.llm.openai.OpenAIProvider.__init__",
+    "dendrux.llm.openai_responses.OpenAIResponsesProvider.__init__"
+   ],
+   "param": "timeout",
+   "b_item": "B18",
+   "note": "timeout= defaults to the TIMEOUT_UNSET sentinel: provider deadlines are call_timeout / connect settings (B18, spec section 5.2), and passing timeout= is deprecated with a DeprecationWarning."
+  },
+  {
+   "kind": "parameter-removed",
+   "paths": [
+    "dendrux.runtime.state.StateStore.save_run_event",
+    "dendrux.runtime.state.SQLAlchemyStateStore.save_run_event"
+   ],
+   "param": "sequence_index",
+   "b_item": "B15",
+   "note": "save_run_event no longer takes sequence_index; it allocates and returns it."
+  },
+  {
+   "kind": "parameter-removed",
+   "paths": [
+    "dendrux.runtime.persistence.PersistenceRecorder.__init__"
+   ],
+   "param": "event_sequencer",
+   "b_item": "B15",
+   "note": "event_sequencer removed together with EventSequencer. PersistenceRecorder is internal in practice, but griffe sees it as public."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.runtime.runner.EventSequencer"
+   ],
+   "b_item": "B15",
+   "note": "EventSequencer is removed."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.errors.ProviderError.provider",
+    "dendrux.errors.ProviderError.model",
+    "dendrux.errors.ProviderError.status_code",
+    "dendrux.errors.ProviderError.provider_code",
+    "dendrux.errors.ProviderError.error_type",
+    "dendrux.errors.ProviderError.message",
+    "dendrux.errors.ContextLengthExceededError.status_code",
+    "dendrux.errors.ContextLengthExceededError.provider_code",
+    "dendrux.errors.ContextLengthExceededError.model"
+   ],
+   "b_item": "B10",
+   "note": "Static-analysis artifact: the attributes still exist at runtime but are now set in ProviderError._set_provider_fields, so griffe no longer sees them. ContextLengthExceededError now subclasses ProviderError (B10). Fix in src: declare the attributes as class-level annotations."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.http"
+   ],
+   "b_item": "B20",
+   "note": "make_read_router and dendrux.http are removed (B20). docs/upgrading-to-0.5.0.mdx maps each old endpoint to a RunStore method."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.dashboard",
+    "dendrux.cli.main.dashboard"
+   ],
+   "b_item": "B20",
+   "note": "The embedded dashboard and the `dendrux dashboard` command are removed (B20); build your own views on RunStore."
+  },
+  {
+   "kind": "object-removed",
+   "paths": [
+    "dendrux.cli.traces.app"
+   ],
+   "b_item": "B20",
+   "note": "cli.traces.app, the internal Typer sub-app, is removed (B20). `dendrux traces RUN_ID` is a plain command now and still works; options may follow the run id."
+  }
+ ]
+}

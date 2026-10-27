@@ -35,15 +35,16 @@ async def main() -> None:
         provider=AnthropicProvider(model="claude-haiku-4-5"),
         prompt="Answer in one short sentence.",
         # A deliberately tiny cap so the thresholds fire on one short call.
-        budget=Budget(max_tokens=10, warn_at=(0.5, 0.75, 0.9)),
+        budget=Budget(max_tokens=10, warn_at=(0.5, 0.75, 0.9), count_cache_tokens=False),  # keep the 0.4 count; see below
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is the capital of France?")
 
     store = RunStore.from_database_url(url)
     async with store:
         print([e.event_type for e in await store.get_events(result.run_id)])
-        # ['run.started', 'llm.completed', 'budget.threshold', 'budget.threshold',
+        # ['run.started', 'tools.declared', 'llm.completed', 'budget.threshold', 'budget.threshold',
         #  'budget.threshold', 'budget.exceeded', 'run.completed']
     print(result.status.value)   # success  (on_exceed defaults to "warn")
 
@@ -59,51 +60,81 @@ All the arguments:
 | `max_cost_usd` | Dollar cap. Positive number, or `None`. | `None` |
 | `warn_at` | Fractions of each limit at which `budget.threshold` fires, each in `(0, 1)` exclusive. | `(0.5, 0.75, 0.9)` |
 | `on_exceed` | `"warn"`, `"pause"` or `"cancel"`. | `"warn"` |
+| `count_cache_tokens` | `True` counts cache read and cache write tokens in the token total. `False` keeps the 0.4 count (fresh input plus output). `None` means "not chosen": the 0.4 count, plus a `FutureWarning` when `max_tokens` is set. | `None` |
 | `include_children` | Count delegated descendant runs' usage. | `True` |
 
 At least one of `max_tokens` and `max_cost_usd` is required; `Budget()` raises `ValueError`. So does a non-positive limit, a `warn_at` fraction outside `(0, 1)`, or an unknown `on_exceed`.
 
-Tokens are `input_tokens + output_tokens`, summed over the LLM calls. `input_tokens` counts fresh (non-cached) input, so cache reads and writes are not in the token total. The dollar limit is where caching shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes.
+### How tokens are counted
+
+By default tokens are `input_tokens + output_tokens`, summed over the LLM calls. `input_tokens` counts fresh (non-cached) input, so cache reads and writes are not in that total.
+
+With `Budget(count_cache_tokens=True)` the total is `input + output + cache_read + cache_write` tokens, which matches what the context window and most provider rate limits count. If you opt in, expect budgets to trip sooner on agents with large cached prompts, and raise `max_tokens` to match.
+
+In 0.5 the default stays the 0.4 count and a token budget without an explicit `count_cache_tokens` prints a `FutureWarning`. In 0.6 counting cache tokens becomes the default. Choose explicitly now:
+
+```python
+Budget(max_tokens=200_000, count_cache_tokens=True)    # the 0.6 behaviour
+Budget(max_tokens=200_000, count_cache_tokens=False)   # keep the 0.4 count, silence the warning
+```
+
+The dollar limit is where caching always shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes. A delegated child can still spend past a parent's limit within one of its own iterations; tightening that is planned for 0.6.
 
 ## Dollar limits
 
-`max_cost_usd` needs a cost per call, from the provider (OpenRouter reports it) or from a `PriceTable` on the agent. A call with neither is **unpriced**. The dollar check counts the priced calls only, and the first time it sees an unpriced call in a run it writes one `budget.unpriced` event:
+`max_cost_usd` needs a cost per call, from the provider (OpenRouter reports it) or from a `PriceTable` on the agent.
 
+**It is checked up front.** If the agent's model has neither, `Budget(max_cost_usd=...)` raises `BudgetConfigurationError` when the `Agent` is built, and again when a run starts for the model actually used (a per-call `model=` override can change it). A dollar budget that could never fire is a configuration error, not a silent no-op. Fix it by adding a `PriceTable` entry for the model you request (globs such as `"gpt-5*"` work), or by using a provider that reports cost.
+
+Vendors often return a dated snapshot id (`claude-haiku-4-5-20251001`) rather than the alias you asked for. Pricing looks for an exact match on the returned model, then an exact match on the requested model, then a glob on the returned model, then a glob on the requested model, so a table entry for the alias still prices the call (see [Cost and pricing](/docs/architecture/pricing)). A cost the provider marks unknown is never filled in from the table.
+
+Within a run, a call can still be **unpriced** (a model that is not in the table, or a provider that stopped reporting cost). What happens depends on `on_exceed`:
+
+| `on_exceed` | An unpriced call under `max_cost_usd` |
+| --- | --- |
+| `"pause"` or `"cancel"` | counts as exceeding the limit (the budget cannot prove it is within it) |
+| `"warn"` | writes one `budget.unpriced` event per run and the call adds no amount to the comparison |
+
+Under `"warn"` the first unpriced call writes the event: 
 ```json
 {"metric": "cost_usd", "used": 0.0132, "max": 0.5, "unpriced_calls": 1, "known_cost_usd": 0.0132}
 ```
 
-An unpriced call contributes no amount to the dollar comparison. `budget.unpriced` exposes that gap; without complete provider pricing or a `PriceTable`, `max_cost_usd` can under-count. Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
+Give the agent a price table for every model it uses. See [Cost and pricing](/docs/architecture/pricing).
+
+**Invalid usage numbers.** A provider response whose token counts or cost are negative, non-finite or out of range is recorded as unreported and cost-unknown (a `usage_invalid` log line carries no values), and it cannot be re-priced from the table. A budget with `on_exceed="pause"` or `"cancel"` stops at its next checkpoint instead of treating the call as free; a `"warn"` budget keeps its warn behaviour, and a response that ends the run still completes it.
 
 ## What the events look like
 
-A real run, captured against a mock provider: a two-iteration agent with `Budget(max_tokens=500, on_exceed="pause")` whose first LLM call uses 600 tokens and requests a tool:
+A run captured on Dendrux 0.5.0 with claude-haiku-4-5: a two-iteration agent with `Budget(max_tokens=500, on_exceed="pause")` whose first LLM call uses 638 tokens and requests a tool:
 
 ```text
-status: paused            meta["budget_exceeded"] = [{"metric": "tokens", "used": 600, "max": 500}]
+status: paused            meta["budget_exceeded"] = [{"metric": "tokens", "used": 638, "max": 500}]
 
 run_events:
   seq=0  run.started
-  seq=1  llm.completed        (first call, 600 tokens)
-  seq=2  budget.threshold     {"metric": "tokens", "fraction": 0.5,  "used": 600, "max": 500, "reason": "threshold_crossed"}
-  seq=3  budget.threshold     {"metric": "tokens", "fraction": 0.75, "used": 600, "max": 500, "reason": "threshold_crossed"}
-  seq=4  budget.threshold     {"metric": "tokens", "fraction": 0.9,  "used": 600, "max": 500, "reason": "threshold_crossed"}
-  seq=5  budget.exceeded      {"metric": "tokens", "used": 600, "max": 500, "reason": "budget_exceeded", "action": "pause"}
-  seq=6  tool.completed       (the tool from the same response still runs)
-  seq=7  run.paused           {"status": "paused", "pending_tool_calls": [], "reason": "budget",
-                               "exceeded": [{"metric": "tokens", "used": 600, "max": 500}]}
+  seq=1  tools.declared       {"local_tool_names": [...]}
+  seq=2  llm.completed        (first call, 638 tokens)
+  seq=3  budget.threshold     {"metric": "tokens", "fraction": 0.5,  "used": 638, "max": 500, "reason": "threshold_crossed"}
+  seq=4  budget.threshold     {"metric": "tokens", "fraction": 0.75, "used": 638, "max": 500, "reason": "threshold_crossed"}
+  seq=5  budget.threshold     {"metric": "tokens", "fraction": 0.9,  "used": 638, "max": 500, "reason": "threshold_crossed"}
+  seq=6  budget.exceeded      {"metric": "tokens", "used": 638, "max": 500, "reason": "budget_exceeded", "action": "pause"}
+  seq=7  tool.completed       (the tool from the same response still runs)
+  seq=8  run.paused           {"status": "paused", "pause_id": "01M5Y7RDKAE5TGK4J6S3X311BH", "pending_tool_calls": [], "reason": "budget",
+                               "exceeded": [{"metric": "tokens", "used": 638, "max": 500}]}
          <-- later: submit_resume with a higher limit -->
-  seq=8  run.resumed          {"resumed_from": "paused"}
-  seq=9  llm.completed
-  seq=10 run.completed
+  seq=9  run.resumed          {"resumed_from": "paused"}
+  seq=10 tools.declared       {"local_tool_names": [...]}
+  seq=11 llm.completed
+  seq=12 run.completed
 ```
 
 Things to read out of the trace:
 
-1. **Every fraction fired in one tick.** The first call returned at 600 tokens, past every threshold. The runtime fires each threshold the usage crossed, so a reader gets the whole "50, 75, 90, exceeded" story.
+1. **Every fraction fired in one tick.** The first call used more tokens than the limit, so it was past every threshold. The runtime fires each threshold the usage crossed, so a reader gets the whole "50, 75, 90, exceeded" story.
 2. **Each event fires once per run.** Events are keyed by `(metric, threshold)`, and the keys are saved with every pause. A run that pauses for approval or for the budget and later resumes does not repeat them.
 3. **Payloads say which metric.** `metric` is `"tokens"` or `"cost_usd"`; `used` and `max` are in that metric's unit (dollars as a float). `budget.exceeded` also carries `action`: the `on_exceed` that applies (`warn`, `pause` or `cancel`).
-4. **The tool at seq=6 still ran.** The pause came after the response that crossed the limit had been fully handled.
+4. **The tool at seq=7 still ran.** The pause came after the response that crossed the limit had been fully handled.
 
 ## When a pause or cancel takes effect
 
@@ -122,6 +153,8 @@ A budget pause is a `paused` run, so it resumes with `submit_resume(run_id)`. Re
 > The run continues only if the resuming `Agent`'s limits are **strictly above** current usage for every metric that was exceeded. Otherwise it pauses again immediately, with the same reason.
 
 Current usage is read live, not from the pause snapshot, so spending by child runs since the pause counts. If the resuming `Agent` has no limit on a metric that was exceeded (or no budget at all), that metric is not checked. The gate does not look at `on_exceed`: a run that paused for the budget re-pauses until the limit is raised, even if the resuming agent now says `"warn"`.
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 # The budget pause
@@ -151,7 +184,8 @@ A child run is a run with its own `Agent`, and its own budget if it has one. Eac
 
 ## Usage source and persistence
 
-- **With persistence** (a database or `state_store`), usage is read live from successfully recorded `llm_interactions`. Those writes are best-effort, so a failed write can make the rollup under-count; if the live read itself raises, the tracker falls back to in-memory usage.
+- **With persistence** (a database or `state_store`), the run's own usage is tracked in memory as calls complete, and the subtree rollup of children is read from successfully recorded `llm_interactions`. A failed usage write is retried and never switches enforcement off. If the live read of the subtree fails or lags, the tracker keeps enforcing the last spend it observed for the children plus the run's own growth since, so a transient database error cannot hide spend.
+
 - **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
 
 Paused runs write their running totals (tokens and `total_cost_usd`) to the row when they pause, so a paused run no longer reads as zero spend.
@@ -181,7 +215,7 @@ class StopOnBudget:
     async def on_tool_completed(self, *a, **k): pass
 ```
 
-**Out-of-process, via the read router or SSE.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
+**Out-of-process, via RunStore.follow.** The events also land on `run_events`, so an external service streaming the run can watch for `budget.threshold` / `budget.exceeded` and act. `request_pause` and `cancel_run` work from any process with a DB handle.
 
 ## Where this fits
 
@@ -190,3 +224,7 @@ class StopOnBudget:
 - Emits `budget.threshold`, `budget.exceeded` and `budget.unpriced` on `run_events`.
 - Pauses and cancels through the same machinery as [Pause and resume](/docs/architecture/pause-resume) and [Cancellation](/docs/architecture/cancellation).
 - Costs come from [Cost and pricing](/docs/architecture/pricing); child usage from `RunStore.get_subtree` (see [RunStore](/docs/reference/run-store)).
+
+### Subtree accounting bound
+
+The SQL store limits a root-inclusive budget rollup to 10,000 nodes. Configure `Budget(max_tokens=100000, max_subtree_nodes=20000)` for larger trees. Exceeding the bound raises `BudgetConfigurationError` with reason `subtree_limit`, rather than using a partial spend total.

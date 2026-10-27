@@ -127,12 +127,18 @@ async def test_approved_non_skill_calls_match_main(policy):
     )
     a = Agent(prompt="test", tools=[srv, cli], deny=["srv"] if policy == "deny" else None)
     approval = await _execute_approved_tools(a, state, BaseRecorder(), None, "run")
-    assert [(tc.name, tr.success, json.loads(tr.payload)) for tc, tr in approval.results] == [
-        ("srv", True, "server"),
-    ]
+    assert [tc.name for tc, _ in approval.results] == ["srv"]
+    result = approval.results[0][1]
+    assert result.success == (policy == "plain")
+    if policy == "plain":
+        assert json.loads(result.payload) == "server"
+    elif policy == "deny":
+        assert "denied" in json.loads(result.payload)
+    else:
+        assert result.meta["code"] == "max_calls"
     # A client-target call is never executed server-side on approval (A-P0-1).
     assert [tc.name for tc in approval.client_pending] == ["cli"]
-    assert order == ["srv-start", "srv-end"]
+    assert order == (["srv-start", "srv-end"] if policy == "plain" else [])
     assert [m.name for m in state.history[-1:]] == ["srv"]
 
 

@@ -14,6 +14,8 @@ Dendrux gives you both with two existing primitives. No new types, no chatbot su
 
 ## Sending history into a turn
 
+[//]: # "docs-test: skip - placeholder database URL, not a real host"
+
 ```python
 from dendrux import Agent
 from dendrux.chat import ChatMessage
@@ -32,6 +34,10 @@ history.append(ChatMessage.user("Hi"))
 history.append(ChatMessage.assistant(result.answer))
 ```
 
+### History is the previous transcript only
+
+`history=` holds the turns **before** this one. The current message goes in `user_input=`. Do not also append it to `history`: the model would read it twice. If you rebuild `history` from your database on every request, build it **before** you save the new message (or leave that row out), and skip assistant turns that failed or are still streaming. A helper that does this is in [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary#the-history-rule).
+
 `ChatMessage` is intentionally narrower than the internal `Message` — only `role` and text (a user turn may also carry images, see [Images](/docs/recipes/images#history-and-follow-up-turns)). Tool calls, call IDs, and runtime metadata are hidden so the dev can't accidentally inject malformed runtime state.
 
 **Storage of the conversation is the dev's job.** Dendrux only reads `history=` as input for the next turn. Persist the chat log in your own table — this preserves the library-not-platform boundary. The chatbot example at `examples/18_chatbot.py` keeps `history` in a Python list; a real app would load it from `messages` in your DB before each turn. For the full picture of which data lives in your DB vs Dendrux's, a minimal app schema, and the per-turn request lifecycle, see [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary).
@@ -43,6 +49,8 @@ history.append(ChatMessage.assistant(result.answer))
 ## Tagging runs with a thread_id
 
 Pass `metadata={"thread_id": "..."}` on each turn:
+
+[//]: # "docs-test: skip - fragment: relies on `user_text`, defined by setup shown elsewhere"
 
 ```python
 result = await agent.run(
@@ -60,6 +68,8 @@ result = await agent.run(
 
 `RunStore.list_runs(metadata_filter=...)` returns every run whose `metadata` contains all the given key/value pairs (AND across keys):
 
+[//]: # "docs-test: skip - placeholder database URL, not a real host"
+
 ```python
 from dendrux.store import RunStore
 
@@ -71,6 +81,8 @@ for r in runs:
 ```
 
 Combines with the existing filters:
+
+[//]: # "docs-test: skip - placeholder database URL, not a real host"
 
 ```python
 # Only failed runs in this thread
@@ -93,6 +105,8 @@ total = sum(r.total_cost_usd or 0 for r in runs)
 
 Once you have a run from the listing, every other read API on `RunStore` is keyed by `run_id` and works exactly as it does for non-chat runs:
 
+[//]: # "docs-test: skip - fragment: relies on `run`, defined by setup shown elsewhere"
+
 ```python
 events = await store.get_events(run.run_id)            # full event log
 llm_calls = await store.get_llm_calls(run.run_id)      # prompts, responses, usage, cache
@@ -101,7 +115,7 @@ traces = await store.get_traces(run.run_id)            # ReAct thoughts/actions
 pauses = await store.get_pauses(run.run_id)            # HITL approval cycles
 ```
 
-The full audit/tracing surface is the same one [the read router](/docs/recipes/mount-read-router) exposes — just call it from your own code if you want a custom thread inspector instead of the generic dashboard.
+The full audit/tracing surface is available through RunStore; see [Build your own read routes](/docs/recipes/build-your-own-read-routes) — just call it from your own code if you want a custom thread inspector.
 
 ## Backend semantics
 
@@ -122,6 +136,6 @@ If you need any of those, file an issue with the use case. The current shape cov
 
 ## Where this fits
 
-- Recipes: [Mount the read router](/docs/recipes/mount-read-router) to expose all of this over HTTP for a frontend.
+- Recipes: [Build your own read routes](/docs/recipes/build-your-own-read-routes) to expose all of this over HTTP for a frontend.
 - Architecture: [Runs](/docs/architecture/runs) explains the `meta` column and other persisted run fields.
-- Reference: [HTTP API surface](/docs/reference/http-api) for the read endpoints (HTTP exposure of `metadata_filter` is not in the read router today — wrap `RunStore.list_runs` in your own thin endpoint if you need it).
+- Reference: [HTTP API surface](/docs/reference/http-api) for the read endpoints (wrap `RunStore.list_runs` in your own endpoint if you need `metadata_filter` over HTTP).

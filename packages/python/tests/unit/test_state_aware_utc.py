@@ -96,7 +96,6 @@ class TestStoreReadsAreAwareUtc:
         await store.save_run_event(
             "run-3",
             event_type="run.started",
-            sequence_index=0,
             iteration_index=0,
         )
         events = await store.get_run_events("run-3")

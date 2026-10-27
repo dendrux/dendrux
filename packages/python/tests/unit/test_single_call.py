@@ -281,20 +281,15 @@ class TestSingleCallRun:
             "next",
         ]
 
-    async def test_handles_none_text(self) -> None:
-        """If provider returns None text, answer should be None."""
+    async def test_empty_normal_response_is_rejected(self) -> None:
+        from dendrux.errors import ProviderResponseError
+
         llm = MockLLM([LLMResponse(text=None)])
-        agent = _make_agent()
-
-        result = await SingleCall().run(
-            agent=agent,
-            provider=llm,
-            strategy=NativeToolCalling(),
-            user_input="test",
-        )
-
-        assert result.status == RunStatus.SUCCESS
-        assert result.answer is None
+        with pytest.raises(ProviderResponseError) as caught:
+            await SingleCall().run(
+                agent=_make_agent(), provider=llm, strategy=NativeToolCalling(), user_input="test"
+            )
+        assert caught.value.provider_code == "empty_completion"
 
 
 # ------------------------------------------------------------------

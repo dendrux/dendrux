@@ -1,0 +1,152 @@
+---
+title: Handling provider errors
+description: The typed ProviderError family in 0.5.0, what each category means, whether to retry, the call and stream deadlines, and how a failed run reports its error without leaking vendor text.
+---
+
+# Handling provider errors
+
+In 0.5.0 every failure of an LLM request is a `ProviderError` (or a subclass). Before, some failures were SDK exceptions, some were builtin `TimeoutError` or `ConnectionError`, and some were silent: an empty stream, a refusal or a failed Responses call ended the run with an empty answer and status `success`. Now each of these raises, and the run ends `error`.
+
+```python
+from dendrux.errors import ProviderError
+```
+
+All of these are also importable from `dendrux`.
+
+## The taxonomy
+
+| Class | `category` | `retryable` | Also a |
+| --- | --- | --- | --- |
+| `ProviderAuthError` | `auth` | no | |
+| `ProviderRateLimitError` (has `retry_after`) | `rate_limit` | yes | |
+| `ProviderUnavailableError` | `unavailable` | yes | `ConnectionError` |
+| `ProviderTimeoutError` | `timeout` | no by default | `TimeoutError` |
+| `ProviderResponseError` | `rejected` | no | |
+| `ProviderStreamIncompleteError` | `stream_incomplete` | no | |
+| `ModelRefusalError` | `refusal` | no | |
+| `ContentFilteredError` | `content_filter` | no | |
+| `ContextLengthExceededError` | `context_length` | no | |
+| `ProviderError` (base) | `credits`, `rejected` or `unknown` | per error | `RuntimeError` |
+
+Every error carries:
+
+| Attribute | Meaning |
+| --- | --- |
+| `provider`, `model` | which provider and model were called |
+| `status_code` | the HTTP status, if there was a response |
+| `provider_code` | the vendor error code or a stable local response code |
+| `category` | one of the categories above |
+| `retryable` | whether trying the same request again can succeed |
+| `timeout_reason` | for timeouts: `connect`, `call_deadline`, `stream_idle`, `stream_total` or `deadline_during_backoff` |
+| `safe_message` | a fixed-format summary that is safe to log, show and store |
+
+`safe_message` is built from a template, `"{provider} {category} (HTTP {status}, code {provider_code})"`, with `n/a` where a part is unknown. It never contains the vendor's message text, your prompt, or anything the model said.
+
+The original SDK exception is on `__cause__`, and the vendor's own message text goes only into the debug trace and the stored provider evidence, which your app must keep behind operator authorization. A refusal's text is available in process as `ModelRefusalError.refusal_text`; it is never persisted or put on an event.
+
+## Catching them
+
+A provider failure inside a run is recorded first and raised second. The run ends `error`, `error_info` is stored with it and a `run.error` event is written; then `run()` raises the `ProviderError`. The exception carries the `run_id`, so the stored result is one call away:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
+```python
+from dendrux.errors import ProviderError
+
+try:
+    result = await agent.run(text, tenant_id=tenant)
+except ProviderError as err:
+    err.category                      # "rate_limit"
+    err.retryable                     # True
+    err.safe_message                  # "anthropic rate_limit (HTTP 429, code rate_limit_error)"
+    stored = await agent.get_result(err.run_id, tenant_id=tenant)
+    stored.status                     # RunStatus.ERROR
+    stored.error_info                 # the same summary, persisted
+```
+
+`stream()` does not raise: it ends with a `RUN_ERROR` event that carries the same `error_info`.
+
+When you call a provider directly (`await provider.complete(...)`, or a custom loop), the `ProviderError` itself is raised:
+
+[//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
+
+```python
+from dendrux.errors import ProviderError, ProviderRateLimitError
+
+try:
+    response = await provider.complete(messages)
+except ProviderRateLimitError as err:
+    await asyncio.sleep(err.retry_after or 5)
+except ProviderError as err:
+    log.warning("llm failed: %s", err.safe_message)
+```
+
+`ErrorInfo` has `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. It is also stored with the run (`RunDetail.error_info`), put on the `run.error` event, and `RunResult.error`, `agent_runs.error` and `RunDetail.error` now hold the `safe_message`.
+
+Each failed provider call also writes an `llm.failed` event with the `error_info`, the `timeout_reason` and the call's duration; no billed usage is invented for it. A database failure uses the same envelope with `category="persistence_error"` and no provider fields. Provider failures are logged with `run_id`, category, status and code only, never a traceback or vendor text, so diagnose from `ErrorInfo`, not log text. Inside a custom provider, raise the `ProviderError` taxonomy: Dendrux recognises it through cause and context chains and grouped worker failures, and normalises it at its own call sites. Vendor text that your own code copies into an unrelated exception message, or into a notifier's message, is outside that protection.
+
+## Should I retry?
+
+Use `retryable`, then add your own policy:
+
+- `rate_limit` and `unavailable`: yes, with backoff. Respect `retry_after`.
+- `timeout`: the call may have done work on the vendor side. Retrying re-bills a long generation, so Dendrux marks deadline timeouts non-retryable by default. A `connect` timeout never reached the model and is safe to retry.
+- `stream_incomplete`: Dendrux already retries once inside the provider when nothing had been delivered to you yet. If it reaches you, text may already have been streamed.
+- `auth`, `credits`, `rejected`: fix the configuration or the request. Retrying will fail the same way.
+- `refusal` and `content_filter`: the model or the vendor declined. Change the input; do not loop.
+- `context_length`: shorten the history or switch model.
+
+For a failed run, `agent.retry(run_id)` starts a fresh run with the earlier context.
+
+## Deadlines
+
+Providers now give up instead of hanging. Three deadline keyword arguments exist on `AnthropicProvider`, `OpenAIProvider`, `OpenAIResponsesProvider` and `OpenRouterProvider`:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `call_timeout` | 600 seconds | Total wall-clock time for one non-streaming call, including the SDK's own retries |
+| `stream_idle_timeout` | 600 seconds | Longest gap between meaningful stream events. Keep-alive pings do not reset it |
+| `stream_total_timeout` | `None` | Optional cap on a whole stream |
+
+```python
+from dendrux.llm.anthropic import AnthropicProvider
+
+AnthropicProvider(model="claude-sonnet-4-6", call_timeout=120, stream_idle_timeout=60)
+AnthropicProvider(model="claude-sonnet-4-6", call_timeout=None)   # no total deadline
+```
+
+> **`call_timeout=None` removes the cap on retries too.** The deadline is also what stops the SDK's own retries from re-running a call. With `None`, a slow or failing request can be retried by the SDK after it has already produced (and been billed for) output, so one logical call can be paid for more than once. Keep a deadline unless you have a reason not to; the network read timeout is still set a little above the longest deadline.
+
+When a deadline fires the call is abandoned and not retried again, and you get `ProviderTimeoutError`. The network read timeout is always set a little above the longest deadline, so a stalled connection cannot hang for hours even with `call_timeout=None`.
+
+The old `timeout=` argument still works as a shorthand that sets both `call_timeout` and `stream_idle_timeout`, and prints a `DeprecationWarning`.
+
+### Stream response limits
+
+The same provider constructors accept local response bounds:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `max_stream_bytes` | 16 MiB | Retained UTF-8 text, reasoning, refusal and tool arguments, with small event/data charges. Cumulative SDK snapshots are not charged again. |
+| `max_stream_tool_calls` | 1,000 | Maximum retained tool-call slots and completed calls. |
+
+Exceeding either closes upstream and raises `ProviderResponseError` with category `rejected` and code `stream_size_limit` or `stream_tool_call_limit`. An empty normal completion uses the same class with code `empty_completion`. These failures are not retried. Token-limited empty output keeps `truncated=True`, and tool-only output remains valid.
+
+## Mapping to HTTP
+
+| Error | Suggested status |
+| --- | --- |
+| `ProviderRateLimitError` | 429 (pass `Retry-After`) |
+| `ProviderAuthError`, `category="credits"` | 502 and alert your operators; the end user cannot fix it |
+| `ProviderResponseError` | 502 |
+| `ProviderTimeoutError` | 504 |
+| `ProviderUnavailableError`, `ProviderStreamIncompleteError` | 503 |
+| `ContextLengthExceededError` | 413 |
+| `ModelRefusalError`, `ContentFilteredError` | 422 |
+| everything else | 502 |
+
+## Where this fits
+
+- [Errors](/docs/reference/errors): the full exception reference.
+- [Models and providers](/docs/architecture/models): provider configuration.
+- [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).

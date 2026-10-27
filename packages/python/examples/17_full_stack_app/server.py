@@ -1,272 +1,191 @@
-"""Full-stack Dendrux demo — read router, dashboard, governance, all in one app.
+"""Developer-owned HTTP routes over Agent and RunStore.
 
-What's in this app:
-  - ``make_read_router``      mounted at /api/dendrux   (Dendrux)
-  - ``create_dashboard_api``  mounted at /dashboard     (Dendrux)
-  - dev-written write routes  /chat, /runs/{id}/..      (this file)
-  - all 4 governance layers   (see ``agent_setup.py``)
-
-What the dev owns:
-  - routing, auth, request/response schemas, UI
-  - ownership checks + rate limiting (see TODO(production) markers)
-
-Two providers, one agent definition per provider. The browser picks
-anthropic or openai at session start; same routes, same governance.
-
-Streaming is intentionally out of scope here: guardrails require the
-full LLM response to scan, so they're incompatible with the current
-``agent.stream()`` path. See example 09 for the streaming client-tool
-pattern without governance.
-
-Run:
-    ANTHROPIC_API_KEY=... OPENAI_API_KEY=... \
-        python examples/17_full_stack_app/server.py
-
-Open http://localhost:8000
+This single-user demo authenticates every API call with X-App-Token.
+The one demo actor owns the dedicated demo tenant. Production apps must
+resolve identity, tenant, run ownership and approval authority separately.
 """
 
+import hmac
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux.dashboard.api import create_dashboard_api
+from dendrux import Agent
 from dendrux.db.models import Base
 from dendrux.errors import (
     InvalidToolResultError,
     PauseStatusMismatchError,
-    PersistenceNotConfiguredError,
     RunAlreadyClaimedError,
     RunAlreadyTerminalError,
     RunNotFoundError,
     RunNotPausedError,
 )
-from dendrux.http import make_read_router
-from dendrux.runtime.state import SQLAlchemyStateStore
 from dendrux.store import RunStore
 from dendrux.types import ToolResult
 
-from agent_setup import build_anthropic_agent, build_openai_agent  # type: ignore[import-not-found]  # isort: skip
-
-
-# ---------------------------------------------------------------------------
-# Request / response schemas (module-scope — FastAPI needs resolvable types)
-# ---------------------------------------------------------------------------
-
 Provider = Literal["anthropic", "openai"]
+TENANT = "demo-user"
 
 
 class ChatIn(BaseModel):
-    input: str
+    input: str = Field(min_length=1, max_length=10_000)
     provider: Provider = "anthropic"
 
 
 class ToolResultItem(BaseModel):
     tool_call_id: str
     tool_name: str
-    payload: str  # JSON-encoded string
+    payload: str = Field(max_length=100_000)
 
 
 class ToolResultsIn(BaseModel):
-    results: list[ToolResultItem]
-    provider: Provider = "anthropic"
+    results: list[ToolResultItem] = Field(min_length=1, max_length=100)
 
 
 class ApprovalIn(BaseModel):
     approved: bool
-    rejection_reason: str | None = None
-    provider: Provider = "anthropic"
+    expected_pause_id: str | None = Field(default=None, max_length=26)
+    rejection_reason: str | None = Field(default=None, max_length=2000)
 
 
-# ---------------------------------------------------------------------------
-# Auth dep — shared across read router, dashboard, and write routes
-# ---------------------------------------------------------------------------
-
-_DEMO_TOKEN = os.environ.get("DENDRUX_DEMO_TOKEN", "dev-secret-abc")
+def browser_result(result: Any) -> dict[str, Any]:
+    """Allowlist the response; answer is intended for this authenticated actor."""
+    return {"run_id": result.run_id, "status": result.status.value, "answer": result.answer}
 
 
-async def require_caller(
-    request: Request,
-    x_app_token: Annotated[str | None, Header()] = None,
-) -> str:
-    """Verify the caller's shared-secret token.
+def build_agents(database_url: str) -> dict[str, Agent]:
+    """Use the same governance configuration with either provider."""
+    from agent_setup import build_anthropic_agent, build_openai_agent
 
-    Accepts the token from either the ``X-App-Token`` header (normal
-    requests) or a ``?token=`` query param (EventSource / SSE, which
-    can't send custom headers).
-
-    TODO(production): replace with your real auth (JWT, signed cookies,
-    API key lookup). For SSE, prefer signed cookies on the same origin
-    over a URL query param — query params leak into access logs.
-    """
-    token = x_app_token or request.query_params.get("token")
-    if token != _DEMO_TOKEN:
-        raise HTTPException(status_code=401, detail="missing or invalid X-App-Token")
-    return "demo-user"
-
-
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
-
-def _run_result_body(result: Any) -> dict[str, Any]:
-    """Shape a RunResult for the HTTP response.
-
-    We ship ``answer`` verbatim (the LLM's output with redaction placeholders
-    intact) AND the ``pii_mapping`` so the UI can deanonymize for display.
-    This keeps the teaching split visible: LLM saw placeholders, user sees
-    real values, audit trail is explicit.
-    """
-    meta = result.meta or {}
     return {
-        "run_id": result.run_id,
-        "status": result.status.value,
-        "answer": result.answer,
-        "pii_mapping": meta.get("pii_mapping") or {},
-        "error": result.error,
+        "anthropic": build_anthropic_agent(database_url=database_url),
+        "openai": build_openai_agent(database_url=database_url),
     }
 
 
-# ---------------------------------------------------------------------------
-# App factory
-# ---------------------------------------------------------------------------
-
-
-def create_demo_app() -> FastAPI:
-    load_dotenv(Path(__file__).resolve().parents[4] / ".env")
-    db_path = Path.home() / ".dendrux" / "dendrux_example17.db"
-    db_url = f"sqlite+aiosqlite:///{db_path}"
-
-    engine = create_async_engine(db_url)
-    state_store = SQLAlchemyStateStore(engine)
+def create_demo_app(*, database_url: str | None = None) -> FastAPI:
+    """Build routes owned by this app, with a dedicated demo tenant."""
+    if database_url is None:
+        output = Path(__file__).parent / "output"
+        output.mkdir(exist_ok=True)
+        database_url = f"sqlite+aiosqlite:///{output / 'demo.db'}"
+    engine = create_async_engine(database_url)
+    store = RunStore.from_engine(engine)
+    agents = build_agents(database_url)
+    token = os.environ.get("DENDRUX_DEMO_TOKEN", "dev-secret-abc").encode()
+    # App-owned identity/provider association. Persist it in your app DB for
+    # recovery across server restarts; Dendrux does not own this association.
+    owners: dict[str, str] = {}
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI):  # noqa: ARG001 — FastAPI contract
+    async def lifespan(_: FastAPI):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        yield
-        await engine.dispose()
+        try:
+            yield
+        finally:
+            for agent in agents.values():
+                await agent.close()
+            await store.close()
+            await engine.dispose()
 
-    app = FastAPI(title="Dendrux — Full Stack Demo", lifespan=lifespan)
+    app = FastAPI(title="Dendrux developer routes demo", lifespan=lifespan)
 
-    # --- Translate Dendrux exceptions to HTTP status codes -----------------
-    # Dendrux never imposes an HTTP contract; the dev maps each exception to
-    # the status code their app uses. These are the suggested mappings from
-    # ``dendrux.errors``. Adjust per your app's conventions if you'd like.
+    async def caller(
+        x_app_token: Annotated[str | None, Header()] = None,
+    ) -> str:
+        if not token or not hmac.compare_digest((x_app_token or "").encode(), token):
+            raise HTTPException(401, "missing or invalid X-App-Token")
+        return TENANT
+
+    async def owned_run(run_id: str, tenant: Annotated[str, Depends(caller)]) -> str:
+        if run_id not in owners or await store.get_run(run_id, tenant_id=tenant) is None:
+            raise HTTPException(404, "run not found")
+        return owners[run_id]
+
+    async def conflict(_: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": type(exc).__name__})
+
+    for error in (
+        RunNotPausedError,
+        PauseStatusMismatchError,
+        RunAlreadyClaimedError,
+        RunAlreadyTerminalError,
+    ):
+        app.add_exception_handler(error, conflict)
+
     @app.exception_handler(RunNotFoundError)
-    async def _h_not_found(_req: Request, exc: RunNotFoundError) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": str(exc)})
-
-    @app.exception_handler(RunAlreadyTerminalError)
-    async def _h_terminal(_req: Request, exc: RunAlreadyTerminalError) -> JSONResponse:
-        return JSONResponse(
-            status_code=409,
-            content={"detail": str(exc), "status": exc.current_status.value},
-        )
-
-    @app.exception_handler(RunNotPausedError)
-    async def _h_not_paused(_req: Request, exc: RunNotPausedError) -> JSONResponse:
-        return JSONResponse(
-            status_code=409,
-            content={"detail": str(exc), "status": exc.current_status.value},
-        )
-
-    @app.exception_handler(PauseStatusMismatchError)
-    async def _h_pause_mismatch(_req: Request, exc: PauseStatusMismatchError) -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": str(exc)})
-
-    @app.exception_handler(RunAlreadyClaimedError)
-    async def _h_claimed(_req: Request, exc: RunAlreadyClaimedError) -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": str(exc)})
+    async def not_found(_: Request, exc: RunNotFoundError) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "run not found"})
 
     @app.exception_handler(InvalidToolResultError)
-    async def _h_invalid(_req: Request, exc: InvalidToolResultError) -> JSONResponse:
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.exception_handler(PersistenceNotConfiguredError)
-    async def _h_no_db(_req: Request, exc: PersistenceNotConfiguredError) -> JSONResponse:
-        return JSONResponse(status_code=500, content={"detail": str(exc)})
-
-    agents = {
-        "anthropic": build_anthropic_agent(database_url=db_url),
-        "openai": build_openai_agent(database_url=db_url),
-    }
-    # Reuse the shared state_store so agents, routes, and dashboard all
-    # hit one connection pool.
-    for a in agents.values():
-        a._state_store = state_store  # noqa: SLF001 — demo wiring
-
-    # --- Dendrux-provided surfaces --------------------------------------
-    store = RunStore.from_engine(engine)
-    app.include_router(
-        make_read_router(store=store, authorize=require_caller),
-        prefix="/api/dendrux",
-    )
-    app.mount("/dashboard", create_dashboard_api(state_store))
-
-    # --- Static UI -------------------------------------------------------
-    client_html = Path(__file__).parent / "client.html"
+    async def invalid(_: Request, exc: InvalidToolResultError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": "invalid tool results"})
 
     @app.get("/")
     async def index() -> FileResponse:
-        return FileResponse(client_html, media_type="text/html")
-
-    # --- Write routes (dev-owned) ---------------------------------------
-    # Every write route takes ``Depends(require_caller)``. Production apps
-    # additionally fetch the run and verify ownership before mutating.
+        return FileResponse(Path(__file__).parent / "client.html")
 
     @app.post("/chat")
-    async def start_chat(body: ChatIn, _: Annotated[str, Depends(require_caller)]) -> JSONResponse:
-        # TODO(production): stamp identity onto the run via metadata= so
-        # later write routes can verify ownership.
-        result = await agents[body.provider].run(body.input)
-        return JSONResponse(_run_result_body(result))
+    async def start(body: ChatIn, tenant: Annotated[str, Depends(caller)]) -> dict[str, Any]:
+        if body.provider not in agents:
+            raise HTTPException(400, "provider unavailable")
+        result = await agents[body.provider].run(body.input, tenant_id=tenant)
+        owners[result.run_id] = body.provider
+        return browser_result(result)
+
+    @app.get("/runs/{run_id}/pending")
+    async def pending(
+        run_id: str,
+        tenant: Annotated[str, Depends(caller)],
+        _: Annotated[str, Depends(owned_run)],
+    ) -> Any:
+        pause = await store.get_pending(run_id, tenant_id=tenant)
+        return pause.to_dict() if pause is not None else None
 
     @app.post("/runs/{run_id}/tool-results")
-    async def submit_tool_results(
+    async def tool_results(
         run_id: str,
         body: ToolResultsIn,
-        _: Annotated[str, Depends(require_caller)],
-    ) -> JSONResponse:
-        # TODO(production): fetch run, compare owner_id to authenticated identity.
+        tenant: Annotated[str, Depends(caller)],
+        provider: Annotated[str, Depends(owned_run)],
+    ) -> dict[str, Any]:
         results = [
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        result = await agents[body.provider].submit_tool_results(run_id, results)
-        return JSONResponse(_run_result_body(result))
+        result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
+        return browser_result(result)
 
     @app.post("/runs/{run_id}/approvals")
-    async def submit_approval(
+    async def approval(
         run_id: str,
         body: ApprovalIn,
-        _: Annotated[str, Depends(require_caller)],
-    ) -> JSONResponse:
-        # TODO(production): ownership check as above.
-        result = await agents[body.provider].submit_approval(
+        tenant: Annotated[str, Depends(caller)],
+        provider: Annotated[str, Depends(owned_run)],
+    ) -> dict[str, Any]:
+        # The single demo actor is also the approver. Production must check
+        # the actor's approval role and record the decision in app audit data.
+        pause = await store.get_pending(run_id, tenant_id=tenant)
+        if pause is None or pause.kind != "approval":
+            raise HTTPException(409, "not waiting for approval")
+        if any(call.args_hidden for call in pause.tool_calls):
+            raise HTTPException(409, "approval arguments unavailable; resolve on the server")
+        # Bind the decision to the pause generation reviewed by the client.
+        result = await agents[provider].submit_approval(
             run_id,
             approved=body.approved,
+            expected_pause_id=body.expected_pause_id,
             rejection_reason=body.rejection_reason,
+            tenant_id=tenant,
         )
-        return JSONResponse(_run_result_body(result))
-
-    @app.delete("/runs/{run_id}")
-    async def cancel_run(
-        run_id: str,
-        request: Request,
-        _: Annotated[str, Depends(require_caller)],
-    ) -> JSONResponse:
-        # TODO(production): ownership check as above.
-        provider: Provider = request.query_params.get("provider", "anthropic")  # type: ignore[assignment]
-        result = await agents[provider].cancel_run(run_id)
-        return JSONResponse(_run_result_body(result))
+        return browser_result(result)
 
     return app
 
@@ -274,4 +193,4 @@ def create_demo_app() -> FastAPI:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(create_demo_app(), host="0.0.0.0", port=8000)
+    uvicorn.run(create_demo_app(), host="127.0.0.1", port=8000)

@@ -22,9 +22,11 @@ Building the `Agent` object is essentially free. The cost is in the resources it
 
 | Resource | Cost if rebuilt per request | What to do |
 | --- | --- | --- |
-| DB engine | A new connection pool every request | Share one: set `DENDRUX_DATABASE_URL` or inject a `state_store`. |
+| DB engine | A new connection pool every request | Build the store once at startup: create one `state_store` per process and pass it to every Agent. Since 0.5.0 an `Agent(database_url=...)` with the same URL and options shares one reference-counted pool, so per-request Agents no longer multiply pools, but you must close every Agent and you lose control of the pool size. Do not rely on `DENDRUX_DATABASE_URL` (deprecated in 0.5.0, removed in 0.6). See [Scaling workers](/docs/guides/scaling). |
 | MCP source | Re-spawns a subprocess / reconnects + re-lists tools | Share one process-wide `MCPRuntime`; `bind()` per request with the requester's `tenant_key`. |
 | Provider client | Loses connection keep-alive | Use a request-owned provider unless your application has an explicit non-Agent owner for a shared provider. |
+
+[//]: # "docs-test: skip - fragment: relies on `os`, defined by setup shown elsewhere"
 
 ```python
 # ---- once per worker (startup) ----
@@ -32,7 +34,7 @@ from dendrux.db.session import get_engine
 from dendrux.mcp import MCPRuntime, MCPSource
 from dendrux.runtime.state import SQLAlchemyStateStore
 
-engine = await get_engine(os.environ["DENDRUX_DATABASE_URL"])  # shared singleton
+engine = await get_engine(os.environ["DATABASE_URL"])  # shared singleton
 STORE  = SQLAlchemyStateStore(engine)
 MCP_RUNTIME = MCPRuntime()                                     # one per worker process
 MCP_SOURCES = {
@@ -78,11 +80,17 @@ async def chat(req):
         return {"answer": result.answer}
 ```
 
+Build the store once at startup and pass it everywhere. An `Agent` built with `database_url=` reuses one reference-counted engine per normalised URL and `database_options` (close every Agent so the pool is released), but you cannot size that pool yourself. An `Agent` with neither `state_store=` nor `database_url=` falls back to a process-global engine built from `DENDRUX_DATABASE_URL`; that fallback warns in 0.5.0 and goes away in 0.6. The global engine is also bound to one event loop: using it from a second loop raises a clear `RuntimeError` instead of asyncpg's "another operation is in progress". Pass `state_store=STORE` and none of this applies. Pool sizing, PgBouncer and the migration job are on [Scaling workers](/docs/guides/scaling).
+
+In a multi-tenant service, pass the authenticated caller's `tenant_id=` on every call (`run`, `stream`, `submit_*`, `cancel_run`), or build the Agent with `strict_tenancy=True` so that forgetting it is an error. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+
 ### Ownership at request shutdown
 
 `MCPRuntime` makes MCP ownership explicit: `agent.close()` releases the agent's MCP leases but does not close shared MCP connections. Always close every request-scoped Agent (the `async with` above guarantees it), or its lease can pin a connection and delay runtime shutdown. The runtime keeps each tenant's connection warm for the next request, retires it after `idle_timeout`, and the application closes the runtime during worker shutdown. See [MCP](/docs/architecture/mcp) for tenancy, credentials, capacity, and telemetry.
 
 An Agent owns and closes the provider passed to it, so this example uses a provider recipe string to create one per request. Do not hand an Agent a shared provider unless your application has deliberately coordinated that provider's ownership outside the Agent lifecycle. Close application-owned pools at worker shutdown:
+
+[//]: # "docs-test: skip - fragment: relies on `app`, defined by setup shown elsewhere"
 
 ```python
 @app.on_event("shutdown")
@@ -95,7 +103,9 @@ async def shutdown():
 For a one-off script (not a pooled server) you can skip constructing the provider yourself:
 
 ```python
-async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...") as agent:
+from dendrux import Agent
+
+async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...", strict_tenancy=False) as agent:
     print((await agent.run("hi")).answer)
 ```
 
@@ -106,6 +116,8 @@ async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...") as agent:
 For a "pick your model per message" chatbot:
 
 - **Model (same vendor):** pass it to `run()`. No new Agent needed.
+
+  [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
   ```python
   await agent.run(req.text, history=req.transcript, model="claude-opus-4-1")
@@ -122,7 +134,9 @@ A long-running task usually **pauses and resumes** rather than finishing in one 
 - **New turn** → `agent.run(...)` starts a new run.
 - **Continue a paused run** → `agent.submit_tool_results()` / `submit_input()` / `submit_approval()` / `resume()` on the existing `run_id`.
 
-Both work with a freshly built Agent, possibly in a different process. One thing to know: on resume, dendrux replays the conversation from the DB but takes the **provider, model, prompt, and tools from the Agent you resume with** — not from a saved snapshot. So keep the config consistent across the resume. The clean way is to stash a config key when you start the run and read it back:
+Both work with a freshly built Agent, possibly in a different process. One thing to know: on resume, dendrux replays the conversation from the DB but takes the **provider, model, prompt, and tools from the Agent you resume with** — not from a saved snapshot. So keep the config consistent across the resume. The per-call generation settings of the run (`model`, `max_tokens`, `temperature`, `thinking` and `effort`) are the exception: a pause keeps them and the resume reuses them. The clean way is to stash a config key when you start the run and read it back:
+
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
 # start

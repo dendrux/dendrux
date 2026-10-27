@@ -1092,7 +1092,7 @@ def test_token_parser_never_raises() -> None:
     from dendrux.mcp._oauth import _parse_token
 
     for body in (
-        b'{"access_token": "x", "expires_in": "\u00b2"}',
+        b'{"access_token": "x", "expires_in": "\\u00b2"}',
         b'{"access_token": "x", "expires_in": 1e400}',
         b'{"access_token": "x", "scope": 7}',
         b'{"access_token": "x", "token_type": null}',

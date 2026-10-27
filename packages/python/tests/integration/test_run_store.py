@@ -258,9 +258,9 @@ class TestGetEvents:
         self, store, internal_store
     ) -> None:
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
-        await internal_store.save_run_event("r1", event_type="llm.completed", sequence_index=1)
-        await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=2)
+        await internal_store.save_run_event("r1", event_type="run.started")
+        await internal_store.save_run_event("r1", event_type="llm.completed")
+        await internal_store.save_run_event("r1", event_type="run.completed")
 
         events = await store.get_events("r1")
         assert len(events) == 3
@@ -270,8 +270,8 @@ class TestGetEvents:
 
     async def test_cursor(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
-        for i in range(5):
-            await internal_store.save_run_event("r1", event_type="tick", sequence_index=i)
+        for _i in range(5):
+            await internal_store.save_run_event("r1", event_type="tick")
 
         rest = await store.get_events("r1", after_sequence_index=2)
         assert [e.sequence_index for e in rest] == [3, 4]
@@ -303,7 +303,7 @@ class TestStreamEvents:
 
     async def test_yields_existing_then_new(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
+        await internal_store.save_run_event("r1", event_type="run.started")
 
         collected: list[StoredEvent] = []
 
@@ -318,7 +318,7 @@ class TestStreamEvents:
 
         async def _write_later() -> None:
             await asyncio.sleep(0.05)
-            await internal_store.save_run_event("r1", event_type="run.completed", sequence_index=1)
+            await internal_store.save_run_event("r1", event_type="run.completed")
 
         await asyncio.wait_for(asyncio.gather(_consume(), _write_later()), timeout=10.0)
 
@@ -348,8 +348,8 @@ class TestStreamEvents:
 
     async def test_resumes_from_cursor(self, store, internal_store) -> None:
         await internal_store.create_run("r1", "Agent")
-        for i in range(3):
-            await internal_store.save_run_event("r1", event_type="tick", sequence_index=i)
+        for _i in range(3):
+            await internal_store.save_run_event("r1", event_type="tick")
 
         stream = store.stream_events("r1", after_sequence_index=1, poll_interval_s=0.01)
         first = await stream.__anext__()
@@ -441,7 +441,6 @@ class TestGetLLMCalls:
         await internal_store.save_run_event(
             "r1",
             event_type="llm.completed",
-            sequence_index=0,
             correlation_id="01JJOINKEYLLMINTERACTION00",
         )
 
@@ -573,7 +572,6 @@ class TestGetPauses:
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=0,
             data={
                 "status": "waiting_client_tool",
                 "pending_tool_calls": [{"id": "tc_1", "name": "read_file", "target": "client"}],
@@ -582,7 +580,6 @@ class TestGetPauses:
         await internal_store.save_run_event(
             "r1",
             event_type="run.resumed",
-            sequence_index=1,
             data={
                 "resumed_from": "waiting_client_tool",
                 "submitted_results": [{"call_id": "tc_1", "name": "read_file", "success": True}],
@@ -597,7 +594,15 @@ class TestGetPauses:
         assert pause.pause_sequence_index == 0
         assert pause.resume_sequence_index == 1
         assert pause.resume_at is not None
-        assert pause.pending_tool_calls == [{"id": "tc_1", "name": "read_file", "target": "client"}]
+        # Redacted by default since 0.5.0: a past pause's call ids are hidden
+        # (a custom provider may choose them); trusted readers see them.
+        # ...and a tool name shows only with positive evidence.
+        assert pause.pending_tool_calls == [{"name": "<unknown_tool>", "target": "client"}]
+        assert pause.submitted_results == [{"name": "<unknown_tool>", "success": True}]
+        (trusted,) = await store.get_pauses("r1", include_payloads=True)
+        assert trusted.pending_tool_calls == [
+            {"id": "tc_1", "name": "read_file", "target": "client"}
+        ]
 
     async def test_unpaired_pause_is_active(self, store, internal_store) -> None:
         """A run.paused event with no following run.resumed is still pending."""
@@ -605,7 +610,6 @@ class TestGetPauses:
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=0,
             data={
                 "status": "waiting_approval",
                 "pending_tool_calls": [],
@@ -636,7 +640,6 @@ class TestGetPauses:
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=0,
             data={"status": "waiting_client_tool", "pending_tool_calls": []},
         )
 
@@ -651,20 +654,17 @@ class TestGetPauses:
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=0,
             data={"status": "waiting_client_tool", "pending_tool_calls": []},
         )
         await internal_store.save_run_event(
             "r1",
             event_type="run.resumed",
-            sequence_index=1,
             data={"resumed_from": "waiting_client_tool"},
         )
         # Second pause, still pending.
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=2,
             data={"status": "waiting_approval", "pending_tool_calls": []},
         )
 
@@ -676,9 +676,7 @@ class TestGetPauses:
     async def test_paused_with_no_status_data(self, store, internal_store) -> None:
         """A paused event without ``status`` in ``data`` still produces a pair."""
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event(
-            "r1", event_type="run.paused", sequence_index=0, data={}
-        )
+        await internal_store.save_run_event("r1", event_type="run.paused", data={})
 
         pauses = await store.get_pauses("r1")
         assert len(pauses) == 1
@@ -689,17 +687,14 @@ class TestGetPauses:
         """get_pauses filters by event_type at the SQL layer; non-pause/resume
         events do not appear in the pair derivation."""
         await internal_store.create_run("r1", "Agent")
-        await internal_store.save_run_event("r1", event_type="run.started", sequence_index=0)
+        await internal_store.save_run_event("r1", event_type="run.started")
         await internal_store.save_run_event(
             "r1",
             event_type="run.paused",
-            sequence_index=1,
             data={"status": "waiting_approval"},
         )
-        await internal_store.save_run_event("r1", event_type="llm.completed", sequence_index=2)
-        await internal_store.save_run_event(
-            "r1", event_type="run.resumed", sequence_index=3, data={}
-        )
+        await internal_store.save_run_event("r1", event_type="llm.completed")
+        await internal_store.save_run_event("r1", event_type="run.resumed", data={})
 
         pauses = await store.get_pauses("r1")
         assert len(pauses) == 1

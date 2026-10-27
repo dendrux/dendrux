@@ -1,4 +1,4 @@
-"""Unit tests for per-call approval helpers and types (Track A1, A-P0-2)."""
+"""Unit tests for per-call approval helpers and types."""
 
 from __future__ import annotations
 

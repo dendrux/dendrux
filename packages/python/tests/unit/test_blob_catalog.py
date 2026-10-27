@@ -1,4 +1,4 @@
-"""Track B unit tests: in-memory blob catalog, resolver, accessor, recorder shapes.
+"""in-memory blob catalog, resolver, accessor, recorder shapes.
 
 The SQL catalog and the fault/race matrix live in
 ``tests/integration/test_image_persistence.py`` and
@@ -24,6 +24,7 @@ from dendrux.errors import (
     ImageLimitError,
     ImagePersistenceUnsupportedError,
     InvalidImageError,
+    PersistenceError,
 )
 from dendrux.media import (
     BlobCatalog,
@@ -675,7 +676,7 @@ async def test_retry_treats_deadlock_and_serialization_as_transient(monkeypatch)
             calls.append(1)
             raise exc
 
-        with pytest.raises(type(exc)):
+        with pytest.raises(PersistenceError):
             await durability.retry_transient_db(fails, label="t", run_id="r")
         assert len(calls) == 1
     assert durability.is_transient_db_error(DBAPIError("x", None, _PgError("40P01")))

@@ -1,205 +1,77 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dendrux — Client Tool Demo</title>
+<meta charset="utf-8">
+<title>Dendrux developer routes demo</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 2rem; max-width: 720px; margin: 0 auto; }
-  h1 { font-size: 1.4rem; margin-bottom: 0.5rem; color: #fff; }
-  .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
-  #input-section { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
-  #user-input { flex: 1; padding: 0.6rem; border: 1px solid #333; border-radius: 6px; background: #1a1a1a; color: #e0e0e0; font-size: 0.9rem; }
-  button { padding: 0.6rem 1.2rem; border: none; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; font-size: 0.9rem; }
-  button:hover { background: #1d4ed8; }
-  button:disabled { background: #333; cursor: not-allowed; }
-  #events { margin-bottom: 1.5rem; }
-  .event { padding: 0.5rem 0.75rem; margin-bottom: 0.25rem; border-radius: 4px; font-size: 0.82rem; font-family: monospace; }
-  .event-started { background: #1a2332; color: #60a5fa; }
-  .event-step { background: #1a1a2e; color: #a78bfa; }
-  .event-paused { background: #2e2a1a; color: #fbbf24; }
-  .event-completed { background: #1a2e1a; color: #4ade80; }
-  .event-error { background: #2e1a1a; color: #f87171; }
-  .event-cancelled { background: #2e1a1a; color: #fb923c; }
-  #tool-form { display: none; padding: 1rem; border: 1px solid #fbbf24; border-radius: 8px; background: #1a1a0f; margin-bottom: 1rem; }
-  #tool-form h3 { font-size: 0.95rem; color: #fbbf24; margin-bottom: 0.5rem; }
-  #tool-form .params { font-family: monospace; font-size: 0.82rem; color: #aaa; margin-bottom: 0.75rem; }
-  #tool-result-input { width: 100%; padding: 0.5rem; border: 1px solid #333; border-radius: 4px; background: #1a1a1a; color: #e0e0e0; font-size: 0.85rem; margin-bottom: 0.5rem; }
-  #status { font-size: 0.8rem; color: #666; margin-top: 1rem; }
+body { font: 16px system-ui; max-width: 800px; margin: 3rem auto; padding: 1rem; }
+input, textarea, select, button { font: inherit; margin: .4rem; padding: .5rem; }
+textarea { display: block; width: 90%; min-height: 80px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #eee; padding: 1rem; }
 </style>
-</head>
-<body>
+<h1>Developer-owned client tools</h1>
+<label>App token <input id="token" type="password" value="dev-secret-abc"></label>
+<label>Provider <select id="provider"><option>anthropic</option></select></label>
+<textarea id="input" placeholder="Ask the agent to use a tool"></textarea>
+<button id="start">Start</button>
+<label>Recover run <input id="run"></label><button id="recover">Get pending</button>
+<pre id="status">Ready</pre>
+<section id="pause" hidden>
+<pre id="calls"></pre>
+<textarea id="result" placeholder="Client tool result (a client assertion)"></textarea>
+<button id="submit">Submit tool results</button>
 
-<h1>Dendrux Client Tool Demo</h1>
-<p class="subtitle">Agent pauses for client-side tools, you provide the result, agent resumes.</p>
-
-<div id="input-section">
-  <input id="user-input" type="text" placeholder="e.g. Look up AAPL price, then read cell A1 from my spreadsheet" />
-  <button id="start-btn" onclick="startRun()">Start</button>
-</div>
-
-<div id="events"></div>
-<div id="tool-form">
-  <h3>Tool needed: <span id="tool-name"></span></h3>
-  <div class="params">Call ID: <span id="tool-call-id"></span></div>
-  <input id="tool-result-input" type="text" placeholder="Paste the tool result here..." />
-  <button onclick="submitToolResult()">Submit Result</button>
-</div>
-
-<div id="status"></div>
-
+</section>
 <script>
-  let currentRunId = null;
-  let pendingToolCalls = [];
-  let eventSource = null;
+let runId = null;
+let currentPause = null;
+const el = id => document.getElementById(id);
+async function api(path, body) {
+  const headers = {"X-App-Token": el("token").value};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, {method: body === undefined ? "GET" : "POST",
+    headers, ...(body === undefined ? {} : {body: JSON.stringify(body)})});
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+  return response.json();
+}
+async function pending() {
+  currentPause = await api(`/runs/${encodeURIComponent(runId)}/pending`);
+  el("pause").hidden = !currentPause;
+  if (!currentPause) return;
+  el("calls").textContent = JSON.stringify(currentPause, null, 2);
+  const hidden = (currentPause.pending_tool_calls || []).some(call => call.args_hidden);
+  el("submit").hidden = currentPause.kind !== "client_tool";
 
-  function log(text, cls) {
-    const el = document.createElement("div");
-    el.className = "event " + cls;
-    el.textContent = text;
-    document.getElementById("events").appendChild(el);
-    el.scrollIntoView({ behavior: "smooth" });
+  if (hidden) el("status").textContent = "Arguments unavailable. Request server-side resolution.";
+}
+async function showResult(data) {
+  runId = data.run_id;
+  el("run").value = runId;
+  el("status").textContent = JSON.stringify(data, null, 2);
+  await pending();
+}
+async function action(work) {
+  for (const button of document.querySelectorAll("button")) button.disabled = true;
+  try { await work(); }
+  catch (error) {
+    el("status").textContent = error.message + " Re-fetch pending before deciding again.";
+    el("pause").hidden = true;
+  } finally {
+    for (const button of document.querySelectorAll("button")) button.disabled = false;
   }
+}
+el("start").onclick = () => action(async () => showResult(await api("/chat", {
+  input: el("input").value, provider: el("provider").value,
+})));
+el("recover").onclick = () => action(async () => {
+  runId = el("run").value.trim();
+  await pending();
+});
+el("submit").onclick = () => action(async () => {
+  const results = currentPause.pending_tool_calls.map(call => ({
+    tool_call_id: call.id, tool_name: call.name, payload: JSON.stringify(el("result").value),
+  }));
+  await showResult(await api(`/runs/${encodeURIComponent(runId)}/tool-results`, {results}));
+});
 
-  function setStatus(text) {
-    document.getElementById("status").textContent = text;
-  }
-
-  // Connect to the read-router SSE. The router emits a single SSE event type
-  // ("message") and puts the Dendrux event_type inside the JSON payload, so
-  // the client dispatches on payload.event_type.
-  function connectSSE(runId) {
-    if (eventSource) eventSource.close();
-    eventSource = new EventSource("/api/runs/" + runId + "/events/stream");
-
-    eventSource.onmessage = async (e) => {
-      const env = JSON.parse(e.data);
-      const type = env.event_type;
-      const data = env.data || {};
-
-      if (type === "run.started") {
-        log("Run started", "event-started");
-      } else if (type === "run.paused") {
-        handlePause(data.pending_tool_calls || [], data.status);
-      } else if (type === "run.completed") {
-        log("COMPLETED", "event-completed");
-        eventSource.close();
-        try {
-          const poll = await fetch("/api/runs/" + runId);
-          if (poll.ok) {
-            const run = await poll.json();
-            if (run.answer) {
-              log("Answer: " + run.answer, "event-completed");
-            }
-          }
-        } catch (_) { /* ignore */ }
-        setStatus("Done");
-        document.getElementById("start-btn").disabled = false;
-      } else if (type === "run.error") {
-        log("ERROR: " + (data.error || "unknown"), "event-error");
-        eventSource.close();
-        setStatus("Error");
-        document.getElementById("start-btn").disabled = false;
-      } else if (type === "run.cancelled") {
-        log("CANCELLED", "event-cancelled");
-        eventSource.close();
-        setStatus("Cancelled");
-        document.getElementById("start-btn").disabled = false;
-      }
-      // Other event types (run.step, run.tool_done, etc.) are ignored for
-      // this demo — add a case here if you want to render them.
-    };
-
-    eventSource.onerror = () => {
-      setStatus("SSE connection lost");
-    };
-  }
-
-  function handlePause(toolCalls, status) {
-    pendingToolCalls = toolCalls;
-    setStatus("PAUSED — waiting for client tool");
-
-    if (pendingToolCalls.length > 0) {
-      const tc = pendingToolCalls[0];
-      document.getElementById("tool-name").textContent = tc.name;
-      document.getElementById("tool-call-id").textContent = tc.id;
-      document.getElementById("tool-form").style.display = "block";
-      log("PAUSED: agent needs " + tc.name, "event-paused");
-    }
-  }
-
-  async function startRun() {
-    const input = document.getElementById("user-input").value.trim();
-    if (!input) return;
-
-    document.getElementById("events").innerHTML = "";
-    document.getElementById("tool-form").style.display = "none";
-    document.getElementById("start-btn").disabled = true;
-    setStatus("Starting...");
-
-    const resp = await fetch("/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ input: input }),
-    });
-
-    if (!resp.ok) {
-      log("Failed to start run: " + resp.status, "event-error");
-      document.getElementById("start-btn").disabled = false;
-      return;
-    }
-
-    const data = await resp.json();
-    currentRunId = data.run_id;
-    log("Run started: " + currentRunId + " (status=" + data.status + ")", "event-started");
-
-    if (data.status === "success") {
-      log("Answer: " + (data.answer || ""), "event-completed");
-      setStatus("Done");
-      document.getElementById("start-btn").disabled = false;
-      return;
-    }
-
-    // Connect SSE so we see the pause (and any subsequent events) live.
-    connectSSE(currentRunId);
-  }
-
-  async function submitToolResult() {
-    if (!currentRunId || pendingToolCalls.length === 0) return;
-
-    const resultText = document.getElementById("tool-result-input").value.trim();
-    if (!resultText) return;
-
-    document.getElementById("tool-form").style.display = "none";
-    setStatus("Submitting tool result...");
-
-    const results = pendingToolCalls.map((tc) => ({
-      tool_call_id: tc.id,
-      tool_name: tc.name,
-      payload: JSON.stringify(resultText),
-    }));
-
-    const resp = await fetch("/runs/" + currentRunId + "/tool-results", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ results: results }),
-    });
-
-    if (!resp.ok) {
-      log("Failed to submit tool result: " + resp.status, "event-error");
-      document.getElementById("start-btn").disabled = false;
-      return;
-    }
-
-    log("Tool result submitted, resuming...", "event-step");
-    setStatus("Resumed — watching SSE...");
-    pendingToolCalls = [];
-    if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
-      connectSSE(currentRunId);
-    }
-  }
 </script>
-
-</body>
 </html>

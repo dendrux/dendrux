@@ -8,13 +8,37 @@ tool call without results; the cost is an overshoot of at most one iteration.
 
 Usage source:
 
-- With a recording state store, usage is read live from ``llm_interactions``:
-  the root-inclusive subtree rollup when ``include_children`` is set, the
-  run's own rollup otherwise. Tokens are input + output; the cost limit uses
-  ``known_cost_usd`` (priced calls only).
+- In-memory own usage is an enforcement floor. With a recording state store,
+  persisted own usage fills gaps, and descendants are added from the
+  root-inclusive subtree rollup when ``include_children`` is set. Tokens are
+  input + output, plus cache read and
+  cache write tokens when ``Budget(count_cache_tokens=True)``; the cost limit
+  uses ``known_cost_usd`` (priced calls only).
 - Without one (or a store predating the rollup reads), usage is the loop's
   in-memory total; ``include_children`` cannot be honoured and is ignored
   with a one-time warning.
+
+Token formula (``max_tokens``)::
+
+    input + output                                  count_cache_tokens False / None (0.4.1)
+    input + output + cache_read + cache_write       count_cache_tokens True
+
+``input`` is fresh input only (providers report cached tokens separately), so
+the default undercounts what a cache-heavy run really sends. Choosing
+``count_cache_tokens`` explicitly is recommended in 0.5.0; ``True`` becomes the
+default in 0.6, and a token budget without a choice emits a one-time
+``DeprecationWarning``.
+
+Unpriced calls (no provider cost, no ``PriceTable`` entry) under
+``max_cost_usd``: with ``on_exceed`` ``"pause"`` or ``"cancel"`` they count as
+the limit being reached (``budget.exceeded`` with ``reason="unpriced_call"``),
+because the spend is unknown; with ``"warn"`` they only emit
+``budget.unpriced``. Resuming a pause that an unpriced call caused does not need
+a policy change: the unpriced calls counted at the pause are accepted, and only a
+new one stops the run again. With ``include_children`` the count covers delegated
+descendants too, so an unpriced child call stops the parent (child agents are not
+checked by the parent's ``check_budget_config``). Misconfigured agents are
+normally caught earlier by ``pricing.check_budget_config``.
 """
 
 from __future__ import annotations
@@ -41,6 +65,8 @@ EXCEEDED = 1.0
 BUDGET_EXCEEDED = "budget_exceeded"
 # Persisted cost precision (llm_interactions.cost_usd is Numeric(10, 6)).
 _COST_DECIMALS = 6
+# ``budget.exceeded`` reason when an unpriced call stands in for the cost limit.
+UNPRICED_CALL = "unpriced_call"
 
 
 @dataclass(frozen=True)
@@ -89,6 +115,30 @@ class _Usage:
     known_cost_usd: float
     unpriced_calls: int
 
+    def observe(self, measured: _Usage, local: _Usage, previous: _Usage) -> _Usage:
+        """Keep known spend plus subsequent local growth through read failures."""
+        return _Usage(
+            max(measured.tokens, self.tokens + max(0, local.tokens - previous.tokens)),
+            max(
+                measured.known_cost_usd,
+                self.known_cost_usd + max(0.0, local.known_cost_usd - previous.known_cost_usd),
+            ),
+            max(
+                measured.unpriced_calls,
+                self.unpriced_calls + max(0, local.unpriced_calls - previous.unpriced_calls),
+            ),
+        )
+
+
+def _invalid_accounting(usage: UsageStats) -> bool:
+    return not usage.usage_reported and usage.cost_unknown
+
+
+def _breach_reason(reached: bool, unknown_reason: str | None) -> str | None:
+    if unknown_reason == "usage_invalid":
+        return unknown_reason
+    return BUDGET_EXCEEDED if reached else unknown_reason
+
 
 class BudgetTracker:
     """Per-loop budget state: fired keys, in-memory spend and the usage source.
@@ -111,6 +161,7 @@ class BudgetTracker:
         fresh: bool = False,
     ) -> None:
         self.budget = budget
+        self._count_cache = budget is not None and budget.count_cache_tokens is True
         self._run_id = run_id
         self._usage = usage
         self._recorder = recorder
@@ -120,6 +171,14 @@ class BudgetTracker:
         self.fired: list[tuple[str, float]] = list(carry.fired) if carry else []
         self.unpriced_reported = carry.unpriced_reported if carry else False
         self._gate = carry.gate if carry else ()
+        # Unpriced calls a budget pause already stopped for: resuming accepts
+        # them (the spend is unknown and stays so); a new unpriced call stops again.
+        self._ack_unpriced = carry.unpriced_calls if carry and COST_USD in carry.gate else 0
+        # Highest unpriced-call count measured (rollup includes children).
+        self._seen_unpriced = 0
+        self._floor = _Usage(0, 0.0, 0)
+        self._last_local = _Usage(0, 0.0, 0)
+        self._invalid_usage = False
         self._fresh = fresh
         self._first_checkpoint = True
         # Breaches from the latest post-response evaluation (None: none yet).
@@ -137,6 +196,11 @@ class BudgetTracker:
             self._known_cost = 0.0
             self._unpriced = 1 if usage.cost_unknown or usage.total_tokens else 0
         self._store_reader = self._pick_reader(budget, state_store, recorder)
+        self._own_reader = (
+            getattr(state_store, "run_usage", None)
+            if budget is not None and budget.include_children
+            else None
+        )
 
     @property
     def action(self) -> str:
@@ -166,7 +230,8 @@ class BudgetTracker:
 
     def add_response(self, usage: UsageStats) -> None:
         """Account one LLM response in the in-memory spend."""
-        if usage.cost_usd is None:
+        self._invalid_usage |= _invalid_accounting(usage)
+        if usage.cost_unknown or usage.cost_usd is None:
             self._unpriced += 1
         else:
             self._known_cost = round(self._known_cost + usage.cost_usd, _COST_DECIMALS)
@@ -183,7 +248,9 @@ class BudgetTracker:
         }
         if self._unpriced:
             fields["budget_known_cost_usd"] = self._known_cost
-            fields["budget_unpriced_calls"] = self._unpriced
+        unpriced = max(self._unpriced, self._seen_unpriced)
+        if unpriced:
+            fields["budget_unpriced_calls"] = unpriced
         return fields
 
     async def _emit(self, event_type: str, iteration: int, data: dict[str, Any]) -> None:
@@ -192,27 +259,59 @@ class BudgetTracker:
             self._notifier, self._run_id, event_type, iteration, data, warnings=self._warnings
         )
 
+    def _tokens(self, usage: Any, *, rollup: bool = False) -> int:
+        tokens = usage.input_tokens + usage.output_tokens
+        if not rollup and not self._count_cache:
+            tokens = max(tokens, usage.total_tokens)
+        if self._count_cache:
+            tokens += (
+                usage.cache_read_tokens + usage.cache_write_tokens
+                if rollup
+                else (usage.cache_read_input_tokens or 0) + (usage.cache_creation_input_tokens or 0)
+            )
+        return int(tokens)
+
     async def _measure(self) -> _Usage:
+        # Persisted own usage is a lower bound, never a replacement for spend
+        # already observed in this execution. Descendants remain DB-coordinated.
+        local = _Usage(self._tokens(self._usage), self._known_cost, self._unpriced)
+        measured = local
         if self._store_reader is not None:
             try:
-                rollup = await self._store_reader(self._run_id)
-            except Exception:
+                import inspect
+
+                if (
+                    self.budget
+                    and self.budget.include_children
+                    and "max_nodes" in inspect.signature(self._store_reader).parameters
+                ):
+                    rollup = await self._store_reader(
+                        self._run_id, max_nodes=self.budget.max_subtree_nodes
+                    )
+                else:
+                    rollup = await self._store_reader(self._run_id)
+                own = await self._own_reader(self._run_id) if self._own_reader else rollup
+                measured = _Usage(
+                    tokens=max(local.tokens, self._tokens(own, rollup=True))
+                    + max(0, self._tokens(rollup, rollup=True) - self._tokens(own, rollup=True)),
+                    known_cost_usd=max(local.known_cost_usd, own.known_cost_usd)
+                    + max(0.0, rollup.known_cost_usd - own.known_cost_usd),
+                    unpriced_calls=max(local.unpriced_calls, own.unpriced_calls)
+                    + max(0, rollup.unpriced_calls - own.unpriced_calls),
+                )
+            except Exception as exc:
+                from dendrux.errors import BudgetConfigurationError
+
+                if isinstance(exc, BudgetConfigurationError):
+                    raise
                 logger.warning(
                     "Live budget usage read failed for run %s; using in-memory usage",
                     self._run_id,
-                    exc_info=True,
                 )
-            else:
-                return _Usage(
-                    tokens=rollup.input_tokens + rollup.output_tokens,
-                    known_cost_usd=rollup.known_cost_usd,
-                    unpriced_calls=rollup.unpriced_calls,
-                )
-        return _Usage(
-            tokens=self._usage.total_tokens,
-            known_cost_usd=self._known_cost,
-            unpriced_calls=self._unpriced,
-        )
+        measured = self._floor.observe(measured, local, self._last_local)
+        self._floor, self._last_local = measured, local
+        self._seen_unpriced = max(self._seen_unpriced, measured.unpriced_calls)
+        return measured
 
     async def evaluate(self, iteration: int) -> list[BudgetBreach]:
         """Measure usage, emit newly crossed budget events, return reached limits."""
@@ -256,7 +355,11 @@ class BudgetTracker:
                             "reason": "threshold_crossed",
                         },
                     )
-            if used >= limit:
+            reached = used >= limit
+            # An unpriced call hides spend: when the run is told to stop on
+            # exceeding the cost limit it must stop here too (fail closed).
+            unknown_reason = self._unknown_reason(metric, usage)
+            if reached or unknown_reason:
                 breaches.append(BudgetBreach(metric=metric, used=used, max=limit))
                 if (metric, EXCEEDED) not in self.fired:
                     self.fired.append((metric, EXCEEDED))
@@ -267,12 +370,21 @@ class BudgetTracker:
                             "metric": metric,
                             "used": used,
                             "max": limit,
-                            "reason": "budget_exceeded",
+                            "reason": _breach_reason(reached, unknown_reason),
                             "action": self.action,
                         },
                     )
         self._last = breaches
         return breaches
+
+    def _unknown_reason(self, metric: str, usage: _Usage) -> str | None:
+        if self.action == "warn":
+            return None
+        if self._invalid_usage:
+            return "usage_invalid"
+        if metric == COST_USD and usage.unpriced_calls > self._ack_unpriced:
+            return UNPRICED_CALL
+        return None
 
     async def checkpoint(self, iteration: int) -> tuple[str, list[BudgetBreach]]:
         """Top-of-iteration check: ``(action, breaches)``; act when breaches is non-empty.
@@ -313,7 +425,12 @@ class BudgetTracker:
         for metric in gated:
             limit = limits[metric]
             assert limit is not None
-            if not limit > used[metric]:
+            unpriced = (
+                metric == COST_USD
+                and usage.unpriced_calls > self._ack_unpriced
+                and self.action != "warn"
+            )
+            if unpriced or not limit > used[metric]:
                 breaches.append(BudgetBreach(metric=metric, used=used[metric], max=limit))
         return breaches
 

@@ -1,4 +1,4 @@
-"""Provider wire mapping for image parts (0.4.0 Track C, spec §4).
+"""Provider wire mapping for image parts.
 
 Goldens U-04..U-07: Anthropic native, OpenAI Chat portable, OpenAI Responses
 native + portable override, OpenRouter (Chat portable). Covers user images,

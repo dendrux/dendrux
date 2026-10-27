@@ -562,7 +562,7 @@ async def test_leaked_tool_syntax_argument_is_rejected_before_tool_runs(store):
 
     result = await agent.run("hello")
 
-    expected = "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result."
+    expected = "show has 1 unknown argument. Valid arguments: kind, title, result."
     assert result.status == RunStatus.SUCCESS
     assert calls == []
     tool_msg = [m for m in provider.call_history[1]["messages"] if m.role.value == "tool"][0]
@@ -580,7 +580,7 @@ _MALFORMED_WRITE_ARGS = (
     + _DRAFT_MARKER
     + '"""\\n"}'
 )
-_MALFORMED_ERROR = "Expecting ',' delimiter at char 63"
+_MALFORMED_ERROR = "arguments must be valid JSON"
 _VALID_WRITE_PARAMS = {
     "path": "build_deck.py",
     "content": '#!/usr/bin/env python3\n"""Build the deck"""\n',

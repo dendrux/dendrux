@@ -38,6 +38,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
+    literal_column,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -122,8 +125,9 @@ class AgentRun(Base):
     )
     failure_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
-    # Idempotency columns — duplicate run prevention
-    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    # Idempotency columns — duplicate run prevention. Unique per tenant through
+    # ``uq_agent_runs_tenant_idempotency_key`` (below the class), not globally.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     idempotency_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Cooperative cancellation flag — runner observes at checkpoints,
@@ -136,10 +140,21 @@ class AgentRun(Base):
     pause_requested: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )
+    # Fencing epoch: every claim increments it, and status writes check it, so
+    # a worker that lost its claim cannot finalize the run. A server default
+    # lets the SQLite sync add it to existing files and lets 0.4.1 writers
+    # insert rows during a rolling deploy.
+    claim_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now
+    )
+
+    status_changed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utc_now, server_default=func.now()
     )
 
     # Relationships
@@ -173,7 +188,28 @@ class AgentRun(Base):
         Index("ix_agent_runs_parent_run_id", "parent_run_id"),
         Index("ix_agent_runs_status", "status"),
         Index("ix_agent_runs_created_at", "created_at"),
+        Index("ix_agent_runs_retry_of_run_id", "retry_of_run_id"),
     )
+
+
+TENANT_IDEMPOTENCY_INDEX = "uq_agent_runs_tenant_idempotency_key"
+"""Unique ``(COALESCE(tenant_id, ''), idempotency_key)`` for keyed runs (R1, 0.5.0)."""
+
+# An idempotency key is unique within a tenant (untenanted runs share the ''
+# scope). Queries must spell the same expression, ``coalesce(tenant_id, '')``
+# with a literal, for the planner to use the index.
+Index(
+    TENANT_IDEMPOTENCY_INDEX,
+    func.coalesce(AgentRun.tenant_id, literal_column("''")),
+    AgentRun.idempotency_key,
+    unique=True,
+    postgresql_where=AgentRun.idempotency_key.isnot(None),
+    sqlite_where=AgentRun.idempotency_key.isnot(None),
+)
+# Tenant-scoped run listings, newest first.
+Index("ix_agent_runs_tenant_id_created_at", AgentRun.tenant_id, AgentRun.created_at.desc())
+Index("ix_agent_runs_sweep_running", AgentRun.status, AgentRun.id)
+Index("ix_agent_runs_sweep_waiting", AgentRun.status, AgentRun.status_changed_at, AgentRun.id)
 
 
 class ReactTrace(Base):
@@ -248,7 +284,7 @@ class TokenUsage(Base):
     """Per-LLM-call token counts and cost.
 
     One row per provider.complete() call — iteration-level granularity.
-    Powers cost dashboards and optimization decisions.
+    Powers cost inspection tools and optimization decisions.
     """
 
     __tablename__ = "token_usage"
@@ -332,7 +368,7 @@ class RunEvent(Base):
     Records durable timestamps for every lifecycle event in a run:
     started, LLM calls, tool calls, paused, resumed, completed, etc.
 
-    This table exists specifically so the dashboard can reconstruct
+    This table lets inspection tools reconstruct
     exact pause/resume timing without inferring from mutable columns
     or cleared pause_data. Every event has an immutable created_at.
 
@@ -344,7 +380,7 @@ class RunEvent(Base):
     back to the tool_call_id, run.resumed to the original run.paused).
     This avoids ambiguity in multi-tool, multi-pause runs.
 
-    Privacy: dashboard renders only observable data from this table.
+    Privacy: inspection tools must authorize access to event data.
     pause_data (unredacted execution state) is never exposed here.
 
     Event types:
@@ -373,6 +409,12 @@ class RunEvent(Base):
     __table_args__ = (
         Index("ix_run_events_agent_run_id_seq", "agent_run_id", "sequence_index"),
         Index("ix_run_events_event_type", "event_type"),
+        Index(
+            "ix_run_events_started",
+            "agent_run_id",
+            postgresql_where=text("((event_type)::text = 'run.started'::text)"),
+            sqlite_where=text("event_type = 'run.started'"),
+        ),
     )
 
 

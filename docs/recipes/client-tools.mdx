@@ -41,6 +41,7 @@ agent = Agent(
     ),
     tools=[lookup_price, read_excel_range],
     database_url="sqlite+aiosqlite:///app.db",
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 ```
 
@@ -55,18 +56,18 @@ result = await agent.run("Add up Q3 sales from Sheet1!A1:A12 and tell me if it b
 1. The LLM emits two tool calls in one batch: `read_excel_range(sheet="Sheet1", range="A1:A12")` and `lookup_price(ticker="AAPL")`.
 2. Dendrux runs `lookup_price` server-side; the result is recorded.
 3. Dendrux pauses on `read_excel_range`. The run row transitions to `waiting_client_tool`. The pending call's id, name, target, and params land in `pause_data`. `result.status == "waiting_client_tool"`.
-4. Your HTTP layer surfaces the pending call to the client, the client executes it, and POSTs the answer back.
+4. Your `GET /runs/{id}/pending` route returns the pending call (from `RunStore.get_pending`), the client executes it, and POSTs the answer to your `tool-results` route.
 5. `agent.submit_tool_results(run_id, results)` claims the pause via CAS, feeds the result to the LLM, and the run continues until the next pause or terminal.
 
-The whole sequence is recorded in `run_events` and visible in the dashboard. See [Pause and resume](/docs/architecture/pause-resume) for the wire shape.
+The whole sequence is recorded in `run_events` and visible in your inspection tools. See [Pause and resume](/docs/architecture/pause-resume) for the wire shape.
 
-The full cycle in one runnable script, with the browser step simulated in Python. `RunStore.get_pauses` is the public way to read the pending call (your HTTP layer would instead surface it from the `run.paused` SSE frame):
+The full cycle in one runnable script, with the browser step simulated in Python. `RunStore.get_pending` is the public way to read what the run is waiting on (your HTTP layer exposes it through a `GET /runs/{id}/pending` route, shown below):
 
 ```python
 import asyncio
 import json
 
-from dendrux import Agent, tool
+from dendrux import UNSCOPED, Agent, tool
 from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.store import RunStore
 from dendrux.types import ToolResult
@@ -87,24 +88,28 @@ async def main() -> None:
         prompt="Use read_excel_range (a client tool) to read spreadsheet cells when asked.",
         tools=[read_excel_range],
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         paused = await agent.run("Read Sheet1 range A1:A3 with read_excel_range.")
         print(paused.status.value)                       # waiting_client_tool
 
-        # The pending call (id + params) is in the pause. Your client executes it.
+        # What the run waits on (ids + params). Your client executes it.
         store = RunStore.from_database_url(url)
         async with store:
-            pending = (await store.get_pauses(paused.run_id))[-1].pending_tool_calls[0]
-            # {'id': '...', 'name': 'read_excel_range', 'target': 'client', 'params': {...}}
+            pause = await store.get_pending(paused.run_id, tenant_id=UNSCOPED)
+            call = pause.tool_calls[0]
+            # call.id, call.name, call.target == 'client', call.params
 
         results = [
             ToolResult(
-                name=pending["name"],
-                call_id=pending["id"],            # use the dendrux ULID, not the provider id
+                name=call.name,
+                call_id=call.id,                  # use the dendrux ULID, not the provider id
                 payload=json.dumps([[1], [2], [3]]),  # whatever the client read
             )
         ]
-        done = await agent.submit_tool_results(paused.run_id, results)
+        done = await agent.submit_tool_results(
+            paused.run_id, results, expected_pause_id=pause.pause_id
+        )
         print(done.status.value)                         # success
         print(done.answer)                               # references the submitted cell values
 
@@ -114,133 +119,174 @@ asyncio.run(main())
 
 ## HTTP routes
 
-A minimal FastAPI app that mounts the read router for observation and exposes three write routes. Lifted from `examples/03_client_tools/server.py`:
+Three routes of your own carry the whole flow. Dendrux provides the reads you need as library calls (`RunStore.get_pending`, and optionally `RunStore.follow`); the routes, the auth and the tenant are yours. This is the recommended shape since 0.5.0. The full runnable version is `examples/17_full_stack_app/`.
+
+[//]: # "docs-test: skip - fragment: relies on `current_tenant`, defined by setup shown elsewhere"
 
 ```python
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from dendrux.http import make_read_router
+from dendrux.errors import (
+    InvalidToolResultError, PauseStatusMismatchError, RunAlreadyClaimedError, RunNotFoundError,
+)
 from dendrux.store import RunStore
 from dendrux.types import ToolResult
 
-class StartChatIn(BaseModel):
+app = FastAPI()
+store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")   # one per process
+
+class ChatIn(BaseModel):
     input: str
 
-class ToolResultItem(BaseModel):
+class ResultItem(BaseModel):
     tool_call_id: str
     tool_name: str
-    payload: str  # JSON-encoded string
+    payload: str                       # JSON-encoded string
+    success: bool = True
 
-class SubmitToolResultsIn(BaseModel):
-    results: list[ToolResultItem]
+class ResultsIn(BaseModel):
+    pause_id: str | None = None        # the pause_id the client was shown by /pending
+    results: list[ResultItem]
 
-app = FastAPI()
-store = RunStore.from_database_url("sqlite+aiosqlite:///app.db")
-
-async def authorize() -> None:
-    return None  # plug your auth here
-
-app.include_router(make_read_router(store=store, authorize=authorize), prefix="/api")
+# current_tenant authenticates the header credential and resolves the tenant.
+# owned_run verifies this actor owns the run within that tenant, or raises 404.
 
 @app.post("/chat")
-async def start(body: StartChatIn) -> JSONResponse:
-    result = await agent.run(body.input)
-    return JSONResponse({
-        "run_id": result.run_id,
-        "status": result.status.value,
-        "answer": result.answer,
-    })
+async def chat(body: ChatIn, tenant: str = Depends(current_tenant)):
+    result = await agent.run(body.input, tenant_id=tenant)
+    return {"run_id": result.run_id, "status": result.status.value, "answer": result.answer}
+
+@app.get("/runs/{run_id}/pending")
+async def pending(run_id: str = Depends(owned_run), tenant: str = Depends(current_tenant)):
+    try:
+        pause = await store.get_pending(run_id, tenant_id=tenant)
+    except RunNotFoundError:
+        raise HTTPException(404, "run not found")      # missing and foreign look the same
+    return JSONResponse(pause.to_dict() if pause is not None else None)
 
 @app.post("/runs/{run_id}/tool-results")
-async def submit_tool_results(run_id: str, body: SubmitToolResultsIn) -> JSONResponse:
+async def tool_results(body: ResultsIn, run_id: str = Depends(owned_run),
+                       tenant: str = Depends(current_tenant)):
     results = [
-        ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
+        ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload, success=r.success)
         for r in body.results
     ]
-    result = await agent.submit_tool_results(run_id, results)
-    return JSONResponse({
-        "run_id": result.run_id,
-        "status": result.status.value,
-        "answer": result.answer,
-    })
-
-@app.delete("/runs/{run_id}")
-async def cancel(run_id: str) -> JSONResponse:
-    result = await agent.cancel_run(run_id)
-    return JSONResponse({"run_id": result.run_id, "status": result.status.value})
+    try:
+        result = await agent.submit_tool_results(
+            run_id, results, tenant_id=tenant,
+            expected_pause_id=body.pause_id,     # a stale submit raises PauseStatusMismatchError
+        )
+    except RunNotFoundError:
+        raise HTTPException(404, "run not found")
+    except (PauseStatusMismatchError, RunAlreadyClaimedError):
+        raise HTTPException(409, "this pause was already answered; re-fetch /pending")
+    except (InvalidToolResultError, ValueError):
+        raise HTTPException(400, "invalid tool results")
+    return {"run_id": result.run_id, "status": result.status.value, "answer": result.answer}
 ```
 
-Three routes, three agent methods. No middleware. The read router handles list/detail/events/SSE; you write the actions because every team's auth and request shape is different. See [HTTP API surface](/docs/reference/http-api) for the full reference.
+`get_pending` returns `None` when the run is not paused, so the client can call it on every reload without special cases. `tenant_id` is required: leaving it out is a `TypeError`, and a foreign run raises the same `RunNotFoundError` as a missing one. Use a dedicated tenant for the authenticated actor; `UNSCOPED` is an explicit all-tenant operator view.
+
+Add a `DELETE /runs/{run_id}` route over `agent.cancel_run(run_id, tenant_id=tenant)` the same way.
+
+Send `pause_id` down with the pending calls and back with the results. `expected_pause_id=` makes a delayed or replayed submit fail with `PauseStatusMismatchError` (409) instead of answering a newer pause; it is optional for tool results, but you should always pass it. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
+
+A submission is checked before the run is claimed: every pending call must be answered once by id and tool name, payloads must be finite JSON or plain text within `Limits.max_tool_result_bytes`, and text may not contain NUL or lone surrogates. A bad submission raises `InvalidToolResultError` (or another `ValueError`, such as `InputValidationError`) and leaves the run paused, so the client can correct it and send it again.
+
+Keep result metadata, traces, provider bodies, arbitrary output and PII mappings
+out of browser responses. The answer in this allowlist is intended for the authenticated
+actor. Client-tool params can contain real personal data. Results are client assertions;
+server-side auth and approval authority cannot be replaced by JS callbacks.
+Stop on `args_hidden=True` and request server-side resolution; never approve `{}`.
+Start waits for `agent.run`: a request timeout may lose the run ID and cancellation
+may cancel the run. Persist an app request ID and own execution/recovery outside
+the request when your application needs that guarantee.
+
+### What `get_pending` returns
+
+```json
+{
+  "run_id": "01J...",
+  "status": "waiting_client_tool",
+  "kind": "client_tool",
+  "pause_id": "01J...",
+  "pending_tool_calls": [
+    {"id": "01J...", "name": "read_excel_range", "target": "client",
+     "params": {"sheet": "Sheet1", "range": "A1:A12"}, "approval": null}
+  ],
+  "question": null, "options": [], "reason": null, "message": null, "exceeded": null
+}
+```
+
+`kind` is `client_tool`, `approval`, `input` (a question, with suggested `options`) or `paused` (a requested or budget pause). It is one bounded read; the run's history is never loaded. The `params` of a client-tool call are the arguments in the form a client tool receives them, so with the default `PII(restore="all")` they hold real values. They remain visible in default event views because they are instructions to the client. A past pause's arguments, tool results and server-tool parameters stay hidden from readers without payload access.
+
+A run that delegated to child runs pauses in the child, not the parent. To find those calls, list the tree with `store.get_subtree(run_id, tenant_id=tenant)` and call `get_pending` for each node whose status is a waiting one.
 
 ## The client side
 
-The browser opens an SSE connection on the run's event stream and reacts to `run.paused` events:
+The client does not need a live connection. It submits, looks at the status it gets back, and asks what the run is waiting for:
 
 ```javascript
+// sessionToken comes from your app's login flow; never embed a server credential.
+const authHeaders = () => ({"X-App-Token": sessionToken, "Content-Type": "application/json"});
+
+async function drive(run_id, status) {
+  while (status === "waiting_client_tool") {
+    const pending = await (await fetch(`/runs/${run_id}/pending`, {headers: authHeaders()})).json();
+    if (!pending) break;                                   // nothing to do (resumed elsewhere)
+    const results = await Promise.all(
+      pending.pending_tool_calls.map(async (call) => ({
+        tool_call_id: call.id,                             // the dendrux ULID, not the provider id
+        tool_name: call.name,
+        payload: JSON.stringify(await executeLocally(call.name, call.params)),
+      }))
+    );
+    const r = await fetch(`/runs/${run_id}/tool-results`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({pause_id: pending.pause_id, results}),
+    });
+    if (!r.ok) throw new Error("Submit failed; re-fetch pending before retrying");
+    ({status} = await r.json());                           // the next status: another pause, or done
+  }
+  return status;
+}
+
 async function startChat(input) {
   const r = await fetch("/chat", {
     method: "POST",
-    headers: {"content-type": "application/json"},
+    headers: authHeaders(),
     body: JSON.stringify({input}),
   });
   const {run_id, status, answer} = await r.json();
   if (status === "success") return show(answer);
-  if (status === "waiting_client_tool") subscribe(run_id);
-}
-
-function subscribe(run_id) {
-  const es = new EventSource(`/api/runs/${run_id}/events/stream`);
-  es.addEventListener("message", async (e) => {
-    const frame = JSON.parse(e.data);
-    if (frame.event_type === "run.paused" && frame.data.status === "waiting_client_tool") {
-      const results = await Promise.all(
-        frame.data.pending_tool_calls.map(async (call) => ({
-          tool_call_id: call.id,
-          tool_name: call.name,
-          payload: JSON.stringify(await executeLocally(call.name, call.params)),
-        }))
-      );
-      await fetch(`/runs/${run_id}/tool-results`, {
-        method: "POST",
-        headers: {"content-type": "application/json"},
-        body: JSON.stringify({results}),
-      });
-    }
-    if (frame.event_type === "run.completed") {
-      es.close();
-      // refetch the run to get the final answer
-    }
-  });
-}
-
-async function executeLocally(name, params) {
-  if (name === "read_excel_range") {
-    return await Excel.run(async (ctx) => {
-      const range = ctx.workbook.worksheets.getItem(params.sheet).getRange(params.range);
-      range.load("values");
-      await ctx.sync();
-      return range.values;
-    });
-  }
-  throw new Error(`unknown client tool: ${name}`);
+  return drive(run_id, status);
 }
 ```
 
-`call.id` is the dendrux-owned ULID for the tool call. Use it (not the provider's id) when shipping back the result. The runtime correlates by `call_id`.
+After a page reload, a dropped request or a retried idempotent call, call `GET /runs/{id}/pending` to rebuild the form or the tool call. Nothing is lost, because the pause lives in your database.
 
-`payload` is a JSON-encoded string. Encode whatever the LLM should see; dendrux passes it through as the tool message content.
+`call.id` is the dendrux-owned ULID for the tool call. Use it (not the provider's id) when shipping back the result. The runtime correlates by `call_id`. `payload` is a JSON-encoded string. Encode whatever the LLM should see; dendrux passes it through as the tool message content.
+
+### Optional: live updates with `follow`
+
+If you want progress in the UI while the model works, add a route over `RunStore.follow` and let the client subscribe. It is an addition; the flow above works without it. See [Build your own read routes](/docs/recipes/build-your-own-read-routes) for the route, redaction, caps and how to authenticate an SSE connection.
+
+> **Never pipe `agent.stream()` into a browser's SSE response.** The run then lives exactly as long as that connection, and closing the tab, a mobile network change or a proxy timeout cancels the run (the stream is closed, so the run is cancelled). Start the run with `agent.run(...)` (or consume `agent.stream()` on the server only) and let the browser follow the database log with `follow`. The log survives disconnects; the run does not survive a dropped socket.
 
 ## Notes
 
 - **Persistence is required.** Client tools rely on the run being safely pausable across requests, processes, and crashes. No DB means no client tools.
 - **Whole batch pauses.** If the LLM emits four tool calls and any one is a client tool, the batch waits. Server tools that ran before the pause are still recorded and their results are kept; the rest of the batch sits in `pause_data` until the client returns.
 - **Submit must cover every pending call.** `submit_tool_results` raises `InvalidToolResultError` on missing or unknown ids. No partial claim. Decide what to do with a call you cannot fulfill before submitting.
-- **Cancel works at any time.** `agent.cancel_run(run_id)` on a `waiting_client_tool` run finalizes it as `CANCELLED` atomically. The client should treat a `run.cancelled` SSE frame as the end of the conversation.
+- **Cancel works at any time.** `agent.cancel_run(run_id, tenant_id=tenant)` on a `waiting_client_tool` run finalizes it as `CANCELLED` atomically. A client following the log sees `run.cancelled` and the `end` frame.
+- **`get_pauses` is the history view.** `RunStore.get_pauses(run_id)` lists past and current pauses for an inspector; use `get_pending` to act on the current one.
 
 ## Where this fits
 
 - Architecture: [Pause and resume](/docs/architecture/pause-resume), [Cancellation](/docs/architecture/cancellation).
-- Example: `examples/03_client_tools/` in the dendrux repo (this recipe is the explainer for that example).
+- Recipes: [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+- Example: `examples/17_full_stack_app/` in the dendrux repo (the full version of these routes) and `examples/03_client_tools/`.
 - Reference: [HTTP API surface](/docs/reference/http-api).

@@ -679,9 +679,9 @@ class TestUsageAccounting:
             _usage(prompt_tokens_details={"cached_tokens": 40, "cache_write_tokens": 10})
         )
         assert stats.cache_creation_input_tokens == 10
-        # base mapping still holds: cached-read + fresh-input normalization
+        # Fresh input excludes both cache reads and cache writes.
         assert stats.cache_read_input_tokens == 40
-        assert stats.input_tokens == 60
+        assert stats.input_tokens == 50
 
     def test_missing_cost_leaves_none(self) -> None:
         """A compatible backend that omits cost must not fabricate a number."""

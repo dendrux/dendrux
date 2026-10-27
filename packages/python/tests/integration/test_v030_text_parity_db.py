@@ -1,4 +1,4 @@
-"""v0.3.0 text-only parity for persisted rows (Dendrux 0.4.0 Track O: U-01, R-02, P-06).
+"""v0.3.0 text-only parity for persisted rows.
 
 Runs the same R-05 scenario matrix as ``tests/unit/test_v030_text_parity.py``
 on the integration ``engine`` matrix (in-memory SQLite always; Postgres

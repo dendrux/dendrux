@@ -11,6 +11,8 @@ description: Pass the run ids of a conversation and Dendrux replays its own trac
 
 Your app already stores something Dendrux does not: the order of runs in a conversation. Dendrux already stores something your app does not: what each run actually did. `runs=` joins the two.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run(
     user_text,
@@ -79,6 +81,8 @@ Dendrux adds one extra Anthropic cache breakpoint at the end of the replayed reg
 
 ## Observability
 
+[//]: # "docs-test: skip - fragment: relies on `result`, defined by setup shown elsewhere"
+
 ```python
 result.replay
 # ReplaySummary(runs_full=[...], runs_text=[...],
@@ -86,6 +90,6 @@ result.replay
 #               warnings=["run 01J…: reasoning dropped (seed changed since the run was created)"])
 ```
 
-`result.replay` is `None` when `runs=` was not used. The same summary, plus the knobs, is stored in `agent_runs.meta["dendrux.replay"]` and surfaced on `RunStore.list_runs()` / `get_run()` as `RunSummary.replay` / `RunDetail.replay`; the dashboard run list carries `continued_from`. Warnings are also logged on the `dendrux.runtime.replay` logger.
+`result.replay` is `None` when `runs=` was not used. The same summary, plus the knobs, is stored in `agent_runs.meta["dendrux.replay"]` and surfaced on `RunStore.list_runs()` / `get_run()` as `RunSummary.replay` / `RunDetail.replay`; your app can display the source run IDs from that summary. Warnings are also logged on the `dendrux.runtime.replay` logger.
 
 A runnable walkthrough printing per-turn cache reads and writes is in `examples/34_run_replay.py`.

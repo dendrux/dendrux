@@ -81,6 +81,14 @@ class LLMProvider(ABC):
         """True when this provider sends thinking/reasoning blocks by default."""
         return False
 
+    @property
+    def reports_cost(self) -> bool:
+        """True when responses carry the vendor's own cost (``UsageStats.cost_usd``).
+
+        A dollar budget needs either this or a ``PriceTable`` entry.
+        """
+        return False
+
     def many_image_rule(self, model: str) -> tuple[int, int] | None:
         """``(max_images, max_long_side)`` rule for many-image requests, or None.
 

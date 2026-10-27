@@ -28,6 +28,23 @@ class ToolLookups(NamedTuple):
     parallel: dict[str, bool]
     meta: dict[str, dict[str, Any]]
     defs: dict[str, ToolDef]
+    # Per-Agent tool concurrency limiter (``Agent(tool_threads=...)``); None
+    # means no limit. Built by :func:`make_call_limiter`.
+    call_limiter: Any = None
+
+
+def make_call_limiter(tool_threads: int, *, max_waiters: int | None = None) -> Any:
+    """Build the per-Agent tool call limiter for ``Agent(tool_threads=...)``.
+
+    It caps the Agent's concurrently running sync tool calls on the shared
+    tool pool (see :mod:`dendrux.tools._pool`). It is thread-safe and not
+    bound to an event loop. At most ``max_waiters`` calls wait for a slot
+    (default 256, or ``DENDRUX_TOOL_QUEUE_LIMIT``); more are refused with
+    :class:`~dendrux.tools._pool.ToolQueueFullError`.
+    """
+    from dendrux.tools._pool import ToolCallLimiter
+
+    return ToolCallLimiter(tool_threads, max_waiters=max_waiters)
 
 
 def build_tool_lookups(
@@ -35,6 +52,7 @@ def build_tool_lookups(
     *,
     mcp_executors: dict[str, Callable[..., Any]] | None = None,
     mcp_tool_defs: list[ToolDef] | None = None,
+    call_limiter: Any = None,
 ) -> ToolLookups:
     """Build all tool lookups from local tools and optional MCP tools.
 
@@ -44,6 +62,8 @@ def build_tool_lookups(
             to their executor callables.
         mcp_tool_defs: Optional list of ToolDefs for MCP tools.
             Must be provided alongside mcp_executors.
+        call_limiter: The agent's tool call limiter (see
+            :func:`make_call_limiter`), carried on the result unchanged.
     """
     fn: dict[str, Callable[..., Any]] = {}
     target: dict[str, ToolTarget] = {}
@@ -102,4 +122,6 @@ def build_tool_lookups(
             meta[td.name] = td.meta
             defs[td.name] = td
 
-    return ToolLookups(fn, target, timeout, explicit_timeout, max_calls, parallel, meta, defs)
+    return ToolLookups(
+        fn, target, timeout, explicit_timeout, max_calls, parallel, meta, defs, call_limiter
+    )

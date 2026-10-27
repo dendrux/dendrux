@@ -45,11 +45,11 @@ tool_calls (proof of side effect):
   send_email  params={"to": "jane.doe@example.com", "body": "..."}
 ```
 
-The DB stores ground truth. The `pii_mapping` column is the audit key that lets a dashboard reconstruct what the LLM saw at any point.
+The DB stores ground truth. The `pii_mapping` column is the audit key that lets inspection tools you build reconstruct what the LLM saw at any point.
 
 ## Where the redaction boundary actually sits
 
-The core invariant: **redaction applies to the provider API wire, not to the database**. The LLM is the only untrusted boundary. Everything else — the DB, the dashboard, traces, logs — is inside the developer's infrastructure.
+The core invariant: **redaction applies to the provider API wire, not to the database**. Backend storage, traces and logs still need access controls. A browser is a separate trust boundary: authenticate the actor, authorize run ownership, and project an allowlisted response. Never send PII mappings or raw backend records to a general browser client. Client-tool params may intentionally carry real personal data to the authorized actor.
 
 | Location | What is stored | Why |
 | --- | --- | --- |
@@ -92,6 +92,7 @@ async def main() -> None:
         prompt="Reply in one short sentence.",
         guardrails=[PII(engine="presidio")],
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("My name is Anmol and my email is anmol@example.com.")
 
@@ -108,9 +109,11 @@ Three invariants this mapping enforces:
 
 1. **Stable tokens.** If the same email appears in two different messages, the same `<<EMAIL_ADDRESS_1>>` token is used both times. The guardrail engine checks the reverse index before minting a new placeholder.
 2. **Pause-safe.** On resume, the runner reads `pii_mapping` off the row and reinitializes the guardrail engine with it. A second-iteration scan picks up the same placeholder for the same email, so the LLM never sees a redaction jitter between pause and resume.
-3. **Audit-replayable.** With raw history in `react_traces` and the mapping on the run row, a dashboard can render every event in two views: LLM-eye (apply the mapping) and ground-truth (raw). The mapping is the key that links them.
+3. **Audit-replayable.** With raw history in `react_traces` and the mapping on the run row, inspection tools you build can render every event in two views: LLM-eye (apply the mapping) and ground-truth (raw). The mapping is the key that links them.
 
 From `dendrux/runtime/runner.py`:
+
+[//]: # "docs-test: skip - placeholder: `...` stands for your other arguments"
 
 ```python
 # Load pii_mapping for guardrail continuity across pause/resume
@@ -141,23 +144,29 @@ Three things that make this robust in practice:
 2. **Tolerant of model corruption.** If the LLM hallucinates a placeholder that does not exist in the mapping (e.g. `<<EMAIL_ADDRESS_42>>` when only `<<EMAIL_ADDRESS_1>>` was ever minted), the string passes through unchanged. The loop emits a warning rather than crashing.
 3. **Non-mutating.** Returns a new dict. Nothing the tool does to its params dict back-contaminates the LLM's view of the conversation.
 
+**Which tools get real values.** By default (`PII(restore="all")`, the behaviour of every earlier release) any tool can receive a restored value. If your agent reads content you do not control, use `PII(restore="allowlisted")` and mark the tools that may handle real values with `@tool(receives_pii=...)`; every other tool receives the placeholder text. See [PII restore](/docs/architecture/pii-restore) for the trade-off, the recommendation and how validation errors avoid echoing values.
+
 The tool runs with the real values. The tool result goes into the DB raw, via `on_message_appended` and `on_tool_completed`. The next iteration's `scan_incoming` walks the full history and re-applies placeholders for the LLM — so the DB keeps ground truth while the provider API keeps seeing placeholders.
 
 ## Deanonymization: the user-facing answer
 
 The LLM only ever sees placeholders, so its raw text response naturally contains them too — `"Nice to meet you, <<PERSON_1>>!"`. That string is what gets persisted to `agent_runs.answer` (the DB-stores-raw invariant is intact). On the way back to the developer, the runner reverses the mapping one more time so `RunResult.answer` reads `"Nice to meet you, anmol!"` — what the user actually wants to see in a chatbot reply.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 result = await agent.run(user_input="my name is anmol")
 result.answer            # "Nice to meet you, anmol!" — for the user
 ```
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
 run = await store.get_run(result.run_id)
 run.answer               # "Nice to meet you, <<PERSON_1>>!" — DB row, audit
 ```
 
-Two consumers, two views, one mapping. The dashboard renders the persisted (placeholder-faithful) version because it is an operator/audit surface; the dev's app gets the deanonymized version because it is a user-facing surface. Apply `run.pii_mapping` in reverse yourself if you ever need the user-facing view from a re-loaded run.
+Two consumers, two views, one mapping. Your operator/audit UI can render the persisted (placeholder-faithful) version; the dev's app gets the deanonymized version because it is a user-facing surface. Apply `run.pii_mapping` in reverse yourself if you ever need the user-facing view from a re-loaded run.
 
 If the LLM hallucinates a placeholder that was never minted (`<<PERSON_99>>`), it passes through unchanged and the runner emits a `guardrail.unmapped_placeholder` event so the leak is visible in the timeline.
 
@@ -172,11 +181,23 @@ PII()                       # regex, default
 PII(engine="presidio")      # NLP-backed; requires dendrux[presidio]
 ```
 
-Entity names are canonical to Presidio's vocabulary across both engines, so dashboards and tests see one set of names regardless of backend. The `pii_mapping`, deanonymize behavior, pause/resume continuity, and governance events are identical.
+Entity names are canonical to Presidio's vocabulary across both engines, so inspection tools and tests see one set of names regardless of backend. The `pii_mapping`, deanonymize behavior, pause/resume continuity, and governance events are identical.
 
 Presidio's recall comes with statistical false positives — its `PERSON` recognizer can flag tool names or other non-PII tokens in prompt text. This is benign when the misclassified token is not something the LLM needs to reason about as a concrete string, which fits most prompts. When it matters, use the regex engine or stack both via the hybrid pattern.
 
 See [Guardrails — Choosing regex vs Presidio](/docs/architecture/guardrails#choosing-regex-vs-presidio) for the full trade-off table, false-positive walkthrough, and the stacked-engine recipe.
+
+## Reading redacted data back
+
+Redaction at the provider boundary is one half. The other half is what your own readers see. `RunStore.follow`, `get_event_view`, `get_pause_page` and `RunResult.to_dict()` are built for code that serves untrusted viewers, and they follow these rules:
+
+- **Redacted views protect against untrusted data.** With `include_payloads=False` (the default) a reader sees only Dendrux's enumerated codes, Dendrux-generated ids and digests, numbers and booleans, and developer configuration that the run proves. Text written by a model, a provider, a tool, an MCP server, a hook or a client is hidden or replaced (`<unknown_tool>`, `<mcp_tool>`, `<custom_kind>`, `<custom_provider>`). The full rule and the placeholder table are in [RunStore: redacted views](/docs/reference/run-store#redacted-views).
+- **They do not protect against hostile in-process code.** A custom provider, strategy, state store or hook runs with your server's full privileges. Review it like the rest of your server.
+- **The active pause is the exception.** A client must be able to act on the pause a run is waiting on, so its call ids, tool names and arguments stay visible. Client-tool arguments follow the PII restore policy (real values under `restore="all"`), so authorize the actor before you send them. Approval and input prompts and arguments are shown in placeholder form, exactly as the model sent them.
+- **The wire envelope mirrors the in-process policy.** `RunResult.to_dict()` restores client-tool arguments only for the tools that [PII restore](/docs/architecture/pii-restore) would restore into a server tool, shows approval and input prompts as placeholders, and never includes `pii_mapping`. See [RunResult](/docs/reference/agent#runresult).
+- **`get_result` leaves the mapping out.** `Agent.get_result(run_id, tenant_id=...)` returns the stored answer restored through the run's mapping, as `run()` did, but adds `meta["pii_mapping"]` only with `include_pii=True`. A result straight from `run()` still carries the mapping, so never return `meta` wholesale.
+
+> **Limit: very large PII maps.** When a user's input contains a very large number of PII entities (around a thousand), Dendrux does not try to mask every one of them inside a large approval argument for the wire. The display fails closed: the pending call keeps its id and `pause_id`, `params` is `None` and `args_hidden` is `True`, and an approver sees that the arguments are hidden and must be resolved on the server. Fetch the authorized `RunStore.get_pending` view when a fuller review is needed, and never approve arguments nobody has seen.
 
 ## Where this fits with the rest of the system
 

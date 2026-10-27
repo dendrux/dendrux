@@ -1,4 +1,4 @@
-"""Contention between run owners, finalizers and the sweeper (Track E fix round).
+"""Contention between run owners, finalizers and the sweeper.
 
 Deterministic hook tests, run on ``sqlite_file`` and Postgres (independent
 connections). Covers:
@@ -31,6 +31,7 @@ from dendrux.db.models import AgentRun
 from dendrux.errors import (
     PauseStatusMismatchError,
     RunAlreadyClaimedError,
+    RunAlreadyTerminalError,
     RunNotPausedError,
 )
 from dendrux.runtime.context import get_delegation_context
@@ -230,7 +231,8 @@ class TestFinalizerContention:
 
     async def test_cancel_vs_abandoned_sweep_one_transition(self, store) -> None:
         run_id = await _paused_run(store)
-        await _set_row(store, run_id, updated_at=dt.datetime(2000, 1, 1, tzinfo=dt.UTC))
+        old = dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
+        await _set_row(store, run_id, status_changed_at=old, updated_at=old)
         await asyncio.gather(
             _other(store).cancel_run(run_id),
             store.sweep_abandoned_runs(older_than=dt.timedelta(minutes=1)),
@@ -274,7 +276,11 @@ class TestFinalizerContention:
         assert len(wins) == 1 and wins[0].status == RunStatus.SUCCESS
         assert len(losses) == 1
         assert isinstance(
-            losses[0], RunAlreadyClaimedError | RunNotPausedError | PauseStatusMismatchError
+            losses[0],
+            RunAlreadyClaimedError
+            | RunAlreadyTerminalError
+            | RunNotPausedError
+            | PauseStatusMismatchError,
         )
         delivered = [
             m.content
@@ -425,7 +431,7 @@ class TestPre03Store:
 
         waiting = await agent.run("read")
         assert waiting.status == RunStatus.WAITING_CLIENT_TOOL
-        call_id = waiting.meta["pause_state"].pending_tool_calls[0].id
+        call_id = waiting.pending.tool_calls[0].id
         done = await agent.submit_tool_results(
             waiting.run_id, [ToolResult(name="client_read", call_id=call_id, payload='"x"')]
         )
@@ -433,7 +439,11 @@ class TestPre03Store:
 
         approval = await agent.run("refund")
         assert approval.status == RunStatus.WAITING_APPROVAL
-        assert (await agent.submit_approval(approval.run_id, approved=True)).answer == "refunded"
+        assert (
+            await agent.submit_approval(
+                approval.run_id, approved=True, expected_pause_id=approval.pause_id
+            )
+        ).answer == "refunded"
 
         to_cancel = await agent.run("read again")
         cancelled = await agent.cancel_run(to_cancel.run_id)

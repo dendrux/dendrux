@@ -1,0 +1,161 @@
+"""OpenAI-wire usage normalisation (Chat Completions, Responses, OpenRouter).
+
+``input_tokens`` in :class:`~dendrux.types.UsageStats` always means fresh
+input: the vendor's prompt count minus cache reads and cache writes. A field
+the vendor did not report stays ``None``; a reported zero stays ``0``.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import replace
+from typing import Any
+
+from dendrux.types import UsageStats
+
+logger = logging.getLogger(__name__)
+
+
+def extra_field(obj: Any, name: str) -> Any:
+    """A usage field that may be typed, untyped (``model_extra``) or a dict key."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    value = getattr(obj, name, None)
+    if value is not None:
+        return value
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(name)
+    return None
+
+
+_INT32_MAX = 2**31 - 1
+
+
+def invalid_usage() -> UsageStats:
+    logger.warning(
+        "Provider usage is invalid; accounting is unknown", extra={"code": "usage_invalid"}
+    )
+    return UsageStats(usage_reported=False, cost_unknown=True)
+
+
+def _count(value: Any) -> int | None:
+    if type(value) is not int or not 0 <= value <= _INT32_MAX:
+        return None
+    return value
+
+
+def normalize_usage(usage: UsageStats) -> UsageStats:
+    """Validate vendor accounting before arithmetic, pricing or persistence."""
+    required = (usage.input_tokens, usage.output_tokens, usage.total_tokens)
+    optional = (
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        usage.reasoning_tokens,
+    )
+    if any(_count(value) is None for value in required):
+        return invalid_usage()
+    if any(value is not None and _count(value) is None for value in optional):
+        return invalid_usage()
+    cost = usage.cost_usd
+    if cost is not None and (
+        type(cost) not in (int, float) or not 0 <= cost <= 9999.999999 or not math.isfinite(cost)
+    ):
+        return invalid_usage()
+    return usage
+
+
+def normalize_token_totals(usage: UsageStats) -> UsageStats:
+    checked = normalize_usage(usage)
+    if not checked.usage_reported:
+        return checked
+    return normalize_usage(
+        replace(checked, total_tokens=checked.input_tokens + checked.output_tokens)
+    )
+
+
+def _count_or_zero(value: Any) -> int:
+    return _count(value) or 0
+
+
+def _invalid_wire_counts(
+    usage: Any, input_field: str, output_field: str, details_field: str, output_details_field: str
+) -> bool:
+    details = extra_field(usage, details_field)
+    raw_counts = (
+        extra_field(usage, input_field),
+        extra_field(usage, output_field),
+        extra_field(details, "cached_tokens"),
+        extra_field(details, "cache_write_tokens"),
+        extra_field(extra_field(usage, output_details_field), "reasoning_tokens"),
+    )
+    return any(value is not None and _count(value) is None for value in raw_counts)
+
+
+def _has_long_ttl_writes(details: Any) -> bool:
+    """True when any ``ttl_12h_tokens`` under the input details is above zero.
+
+    Long-TTL cache-write rates are not in :class:`~dendrux.pricing.PriceTable`
+    until 0.6, so such a call is marked ``cost_unknown``. Read defensively:
+    the field may sit on the details or one level down.
+    """
+    if details is None:
+        return False
+    if (_count(extra_field(details, "ttl_12h_tokens")) or 0) > 0:
+        return True
+    children: list[Any] = []
+    if isinstance(details, dict):
+        children = list(details.values())
+    else:
+        dumped = getattr(details, "model_dump", None)
+        if callable(dumped):
+            try:
+                children = list(dumped().values())
+            except Exception:
+                children = []
+    return any(
+        isinstance(child, dict) and (_count(child.get("ttl_12h_tokens")) or 0) > 0
+        for child in children
+    )
+
+
+def openai_wire_usage(
+    usage: Any,
+    *,
+    input_field: str,
+    output_field: str,
+    details_field: str,
+    output_details_field: str,
+) -> UsageStats:
+    """UsageStats from a Chat (``prompt_tokens``) or Responses (``input_tokens``) usage.
+
+    Cache reads come from ``<details>.cached_tokens`` and cache writes from
+    ``<details>.cache_write_tokens`` (typed or not). Fresh input is the
+    vendor count minus both, clamped at zero.
+    """
+    if _invalid_wire_counts(usage, input_field, output_field, details_field, output_details_field):
+        return invalid_usage()
+    raw_input = _count_or_zero(extra_field(usage, input_field))
+    output_tokens = _count_or_zero(extra_field(usage, output_field))
+    details = extra_field(usage, details_field)
+    cache_read = _count(extra_field(details, "cached_tokens"))
+    cache_write = _count(extra_field(details, "cache_write_tokens"))
+    reasoning = _count(extra_field(extra_field(usage, output_details_field), "reasoning_tokens"))
+    fresh_input = max(0, raw_input - (cache_read or 0) - (cache_write or 0))
+    long_ttl = _has_long_ttl_writes(details)
+    if long_ttl:
+        logger.info("provider.usage long-TTL cache writes reported; call marked cost_unknown")
+    return normalize_usage(
+        UsageStats(
+            input_tokens=fresh_input,
+            output_tokens=output_tokens,
+            total_tokens=fresh_input + output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_write,
+            reasoning_tokens=reasoning,
+            cost_unknown=long_ttl,
+        )
+    )
