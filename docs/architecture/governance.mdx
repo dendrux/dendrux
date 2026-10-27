@@ -66,7 +66,7 @@ GUARDRAIL_IMAGE_UNSCANNED = 'guardrail.image_unscanned'
 
 The six image events (`image.*` and `guardrail.image_unscanned`) record what happened to images the runtime sent, dropped, replaced or could not scan. Their payloads carry ids, counts and verdicts, never image bytes. See [Images](/docs/recipes/images#what-is-recorded).
 
-`guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction, an error string and the findings' kind, count and location; since 0.5.0 it never contains the matched text. `guardrail.restore_skipped` records, as counts only, that [PII restore](/docs/architecture/pii-restore) kept a placeholder out of a tool that is not allowlisted. `governance.changed` is described [below](#detecting-changed-governance-on-resume). A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
+`guardrail.detected` carries direction, finding count, and entity-type names. `guardrail.blocked` carries direction, an error string, the finding kinds with their counts and a location; since 0.5.0 it never contains the matched text. `guardrail.restore_skipped` records, as counts only, that [PII restore](/docs/architecture/pii-restore) kept a placeholder out of a tool that is not allowlisted. `governance.changed` is described [below](#detecting-changed-governance-on-resume). A single set of event types covers PII, secrets, prompt injection, and any custom guardrail without per-detector event proliferation.
 
 Every one of these lands in `run_events` with the same row shape as a lifecycle event: `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data` (JSON), `created_at`. See [Event ordering](/docs/architecture/event-ordering) for how sequencing works.
 
@@ -196,9 +196,9 @@ Agent(..., on_governance_change="warn")    # default in 0.5: emit governance.cha
 Agent(..., on_governance_change="raise")   # raise GovernanceMismatchError; the run stays paused
 ```
 
-`governance.changed` names the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `FutureWarning` if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
+`governance.changed` carries `expected_digest`, `actual_digest` and `changed`, the names of the parts that differ (for example `guardrails`, `deny`), never their contents. `GovernanceMismatchError(run_id, expected_digest, actual_digest, changed)` carries the same names. In 0.6 the default becomes `"raise"`; 0.5 prints a `FutureWarning` if you have not chosen. To resume deliberately under new rules, build the Agent with `on_governance_change="warn"`.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: the digest and mismatch handling are T7; recheck the covered parts, the event payload and the FutureWarning against the merged code"
 
 ## Why one pipeline instead of four subsystems
 

@@ -194,12 +194,12 @@ from agent_def import build_agent
 async def main():
     async with build_agent() as agent:
         result = await agent.run("Please refund order 42.")
-    print(result.status.value, result.run_id)
+    print(result.status.value, result.run_id, result.pause_id)
 
 asyncio.run(main())
 ```
 
-Real output:
+Real output (captured before 0.5.0, so it has no pause id; 0.5 prints one more value):
 
 ```
 waiting_approval 01KPFXP9M96CXNR9JYT8KJ27J0
@@ -214,7 +214,9 @@ from agent_def import build_agent
 
 async def main():
     async with build_agent() as agent:
-        result = await agent.submit_approval(sys.argv[1], approved=True)
+        result = await agent.submit_approval(
+            sys.argv[1], approved=True, expected_pause_id=sys.argv[2]
+        )
     print(result.status.value, "-", result.answer)
 
 asyncio.run(main())

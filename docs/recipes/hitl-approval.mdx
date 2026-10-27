@@ -121,6 +121,7 @@ result = await agent.submit_approval(
         call_a: ApprovalDecision.approve(),
         call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
     },
+    expected_pause_id=first.pause_id,      # required when any call is approved
 )
 ```
 
@@ -149,9 +150,12 @@ async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
             run_id,
             approved=body["approved"],
             rejection_reason=body.get("rejection_reason"),
+            expected_pause_id=body.get("pause_id"),    # send it down with the form
         )
     except RunNotFoundError:
         raise HTTPException(404, "run not found")
+    except ValueError:    # a non-bool "approved", or approving without a pause_id
+        raise HTTPException(400, "invalid request")
     except (RunNotPausedError, PauseStatusMismatchError,
             RunAlreadyClaimedError, RunAlreadyTerminalError) as e:
         raise HTTPException(409, str(e))
@@ -160,14 +164,13 @@ async def approval_route(run_id: str, body: dict, _=Depends(authorize)):
     return {"status": result.status.value, "answer": result.answer}
 ```
 
-See [HTTP API surface](/docs/reference/http-api) for the full set of write routes you would build alongside this one.
+See [HTTP integration](/docs/reference/http-api) for the full set of write routes you would build alongside this one.
 
 ## Notes
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
-
 - **Approval requires persistence.** No `database_url` or `state_store` (or the deprecated `DENDRUX_DATABASE_URL`) means the pause cannot survive across the request that started the run. Approval is a multi-request flow by definition.
 - **The agent instance does not have to be the same one that started the run.** Any agent process with the same DB and same tool definitions can serve the approval. That is what makes pause/resume crash-resilient and worker-friendly.
+- **Send the `pause_id` back with the decision.** Hand `result.pause_id` to your client with the pending approval and pass it as `expected_pause_id=` when you submit. Approving without it raises `InputValidationError` (answer 400), and a stale decision fails with `PauseStatusMismatchError` (409) instead of approving a later pause. Rejecting does not need it. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 - **One decision per pause.** Decide the batch with `approved=`, or each gated call with `decisions=`; either way the whole pause resolves in one `submit_approval` call.
 - **Client tools never run server-side on approval.** If the batch also holds client-target calls, the run moves on to `waiting_client_tool` for them.
 - **Server tools only.** `require_approval` rejects client tools at construction. Approval is about human judgement before a server-side action; client-tool execution already involves the user.
@@ -175,4 +178,4 @@ See [HTTP API surface](/docs/reference/http-api) for the full set of write route
 ## Where this fits
 
 - Architecture: [Approval](/docs/architecture/approval), [Governance](/docs/architecture/governance), [Pause and resume](/docs/architecture/pause-resume).
-- Reference: [HTTP API surface](/docs/reference/http-api) for `submit_approval` and the matching errors.
+- Reference: [HTTP integration](/docs/reference/http-api) for `submit_approval` and the matching errors.

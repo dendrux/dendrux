@@ -120,6 +120,7 @@ async def main() -> None:
 
     print(f"Status:    {result.status.value}")
     print(f"Run ID:    {result.run_id}")
+    print(f"Pause ID:  {result.pause_id}")
     print(f"Iteration: {result.iteration_count}")
 
 
@@ -140,6 +141,8 @@ Run ID:    01KPFXP9M96CXNR9JYT8KJ27J0
 Iteration: 1
 ```
 
+Since 0.5.0 the script also prints a `Pause ID:` line (a ULID); the capture above was taken on an earlier release and omits it. Keep that id: approving a pause needs it.
+
 The agent called the LLM, the LLM decided to call `refund`, dendrux saw the approval policy, paused the run, and persisted everything to `quickstart.db`. The Python process exits. The database row remains.
 
 ## 5. Resume from a different process
@@ -155,9 +158,9 @@ from agent_def import build_agent
 
 
 async def main() -> None:
-    run_id = sys.argv[1]
+    run_id, pause_id = sys.argv[1], sys.argv[2]
     async with build_agent() as agent:
-        result = await agent.submit_approval(run_id, approved=True)
+        result = await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
 
     print(f"Status:    {result.status.value}")
     print(f"Iteration: {result.iteration_count}")
@@ -167,10 +170,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Run it with the run ID from step 4:
+Run it with the run ID and the pause ID from step 4. The pause ID proves the approver is answering the pause they were shown; approving without it raises an error:
 
 ```bash
-python resumer.py 01KPFXP9M96CXNR9JYT8KJ27J0
+python resumer.py 01KPFXP9M96CXNR9JYT8KJ27J0 <pause id from step 4>
 ```
 
 Real output:

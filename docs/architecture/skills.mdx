@@ -330,7 +330,7 @@ Both errors extend `SkillContinuityError` and carry `run_id`, `missing` (sorted 
 from dendrux.errors import SkillMismatchError, SkillMissingError
 
 try:
-    result = await agent.submit_approval(run_id, approved=True)
+    result = await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
 except SkillMissingError as exc:
     print("attach these skills:", exc.missing)
 except SkillMismatchError as exc:

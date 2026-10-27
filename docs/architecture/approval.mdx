@@ -55,7 +55,7 @@ seq=1  llm.completed         (model emits refund(order_id=42))
 seq=2  approval.requested    corr=01KPFXPAT8ZF7MNGJNW2Y6S8GZ
 seq=3  run.paused            status=waiting_approval
          <-- starter process exits here -->
-         <-- a later process calls submit_approval(run_id, approved=True) -->
+         <-- a later process calls submit_approval(run_id, approved=True, expected_pause_id=...) -->
 seq=4  run.resumed
 seq=5  tool.completed        refund executed, success=True
 seq=6  approval.decided      decision=approved
@@ -133,11 +133,13 @@ async def submit_approval(
     decisions: Mapping[str, ApprovalDecision] | None = None,
     rejection_reason: str | None = None,
     notifier: LoopNotifier | None = None,
+    tenant_id: TenantScope = ...,
+    expected_pause_id: str | None = None,   # required when approving
 ) -> RunResult:
     """Pass exactly one of approved= (whole batch) or decisions= (per call)."""
 ```
 
-Pass exactly one of `approved=` or `decisions=`; passing both or neither raises `ValueError`, as does `rejection_reason` together with `decisions=`.
+Pass exactly one of `approved=` or `decisions=`; passing both or neither raises `ValueError`, as does `rejection_reason` together with `decisions=`. `approved` must be a real `bool`. Approving (`approved=True`, or any `ApprovalDecision.approve()`) also requires `expected_pause_id=`; see [Approving the right pause](#approving-the-right-pause).
 
 | Form | What happens |
 | --- | --- |
@@ -149,15 +151,24 @@ Pass exactly one of `approved=` or `decisions=`; passing both or neither raises 
 
 The approval view (`approval.requested`, and any approval view that is stored or shown) carries the arguments exactly as the model sent them: after JSON parsing, in placeholder form when a PII guardrail redacted them, before any coercion, and without defaults Dendrux filled in. Execution uses the coerced real values (see [How arguments are checked](/docs/reference/tools#how-arguments-are-checked)). Coercion is deterministic, so the arguments a person approves still decide what runs. `before_tool` hooks receive real values in process, as before. The call is validated before the pause: an invalid call is returned to the model, never put in front of a person.
 
-The active pause's arguments stay visible by default, in `run.paused`, `/pauses` and `RunStore.get_pending`, because they are the thing being approved. In your own approval screen, load them with `get_pending` (see [Build your own read routes](/docs/recipes/build-your-own-read-routes)); everything else payload-like stays hidden unless you opt in.
+The active pause's arguments stay visible in redacted views, in `run.paused`, `RunStore.get_pause_page` and `RunStore.get_pending`, because they are the thing being approved. Past pauses' arguments are hidden unless the reader asks for payloads. In your own approval screen, load them with `get_pending` (see [Build your own read routes](/docs/recipes/build-your-own-read-routes)); everything else payload-like stays hidden unless you opt in.
 
 ## Approving the right pause
 
-A decision can arrive late, from a tab left open or a retried request. Re-fetch
-pending state before asking the actor again. A read/check does not itself provide
-an atomic guarantee that the decision still targets the displayed pause.
+A decision can arrive late, from a tab left open or a retried request. Every pause has a `pause_id`, and **approving requires it**: pass the id the approver was shown as `expected_pause_id=`.
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
+```python
+await agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)
+```
+
+- Get the id from `RunResult.pause_id`, `RunStore.get_pending(...).pause_id` or the `run.paused` event, send it to the client with the approval request, and send it back with the decision.
+- If the run's current pause is a different one, nothing is claimed or written and the call raises `PauseStatusMismatchError` with `reason="pause_id"` (answer 409). Fetch the pending pause again and ask the actor again; do not retry the old decision.
+- Without a token, approving raises `InputValidationError` (code `pause_id_required`) before anything is claimed. Rejecting does not need one.
+- The check runs before the claim and again inside the claim transaction, so a decision aimed at an older pause can never approve the newer one.
+
+See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
 On resume the run re-checks `deny` and the per-tool call limits before executing approved calls, so a tool denied or capped after the pause is not run.
 
@@ -176,6 +187,7 @@ await agent.submit_approval(
         call_a: ApprovalDecision.approve(),
         call_b: ApprovalDecision.deny("Order 2 is outside the refund window"),
     },
+    expected_pause_id=pause_id,      # required: this batch approves call_a
 )
 ```
 
@@ -273,7 +285,7 @@ The pause-and-resume flow is a superset of the callback flow: anything a callbac
 
 - Declared on `Agent(require_approval=[...], tools=[...])`.
 - Enforced in `dendrux.runtime.runner` and `dendrux.loops.react.ReActLoop` (the pause and re-dispatch logic).
-- Resolved with `agent.submit_approval(run_id, approved=...)` or `agent.submit_approval(run_id, decisions={...})`.
+- Resolved with `agent.submit_approval(run_id, approved=..., expected_pause_id=...)` or `agent.submit_approval(run_id, decisions={...}, expected_pause_id=...)`.
 - Gates can also come from a [`before_tool` policy hook](/docs/architecture/tool-policy).
 - Emits `approval.requested` (one per gated call, on pause) and `approval.decided` (once, on resume) on `run_events`.
 - Persists the pending batch in `agent_runs.pause_data` until resume. See [Pause and resume](/docs/architecture/pause-resume) for the state-machine side.

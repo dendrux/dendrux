@@ -51,10 +51,12 @@ Every `event_type` that can land on the stream. Lifecycle events come from the r
 | `run.resumed` | Submit method claims a paused run | `{"resumed_from": str, "submitted_results": [{"call_id", "name", "success"}]}` or `{"resumed_from": str, "user_input": str}`; a result that carried images adds `"image_count"` to its entry, and an input with images adds `"image_count"` to the payload; `resumed_from` is `"paused"` after `submit_resume` |
 | `run.completed` | Terminal success, error, or max_iterations returned by the loop | `{"status": str, "stop_reason": str \| null, "truncated": bool}`. `stop_reason` is the normalized reason the final LLM call stopped (`end_turn`, `max_tokens`, ...) and is `null` on `max_iterations` or when the provider reported none; `truncated` is true when it is `max_tokens`. Events written before 0.4.1 have `status` only |
 | `run.cancelled` | Paused-run CAS cancel, in-flight run observes the flag, run or stream interrupted, or a budget cancel | `{"reason": "cancel_requested"}`; adds `"interrupted": true, "partial_output": bool` when `cancel_run` abandoned a model call (`partial_output` is always `false` for batch `run()`); `{"reason": "task_cancelled"}` when the task awaiting `run()` was cancelled; `{"reason": "stream_closed", "partial_output": bool}` when the consumer closed the stream; `{"reason": "budget_exceeded", "exceeded": [{"metric", "used", "max"}]}` for `Budget(on_exceed="cancel")` |
-| `run.error` | Terminal failure | `{"error": str}` (truncated to 500 chars). For a provider failure `error` is the fixed `safe_message`, never the vendor's text, and the payload adds `"error_info": {"category", "retryable", "safe_message", ...}` |
+| `run.error` | Terminal failure, including a run stopped by a guardrail | `{"error": str}` (truncated to 500 chars). For a provider failure `error` is the fixed `safe_message`, never the vendor's text, and the payload adds `"error_info": {"category", "retryable", "safe_message", "error_type", "provider", "model", "status_code", "provider_code", "timeout_reason"}` (fields that are unknown are omitted). A database failure adds `"code": "persistence_error"` and an `error_info` with that category. A guardrail block ends the run here, with `failure_reason="guardrail_blocked"` on the run row |
 | `run.interrupted` | `sweep(stale_running=...)` finalized a stale `running` run | `{"failure_reason": "stale_running" \| "never_started"}` |
+| `llm.failed` | A provider call failed with a typed `ProviderError` (no billed usage is invented for it) | `{"error_info": {...}, "timeout_reason": str \| null, "duration_ms": int \| null}` |
 | `llm.completed` | `provider.complete()` returns | `{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens", "cost_usd", "cost_source", "usage_reported", "model", "has_tool_calls", "phase"}` |
-| `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}` (plus `"image_count"` when the result has images); malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
+| `tools.declared` | Start of every run segment: `run`, `stream`, `retry`, `resume` and `resume_stream` | `{"local_tool_names": [str]}`: the sorted names of the tools declared in code (client tools included), at most 1,000, each a valid identifier of at most 64 characters. MCP-discovered and model-supplied names are never listed. Redacted readers use it to prove which tool names are developer-declared |
+| `tool.completed` | Server tool or submitted client/approval tool finishes | `{"tool_name", "target", "success", "duration_ms"}`; plus `"code"` when the result carries one (`invalid_params`, `size_limit`, `timeout_not_started`, `timeout_outcome_unknown`, `tool_pool_saturated`, `unknown_tool`, `cancelled` and others) and `"zombie_threads"` after a sync-tool timeout; plus `"image_count"` when the result has images; malformed calls also add `"parse_error"` and `"raw_length"`. `correlation_id` = tool call id |
 
 ### Governance events
 
@@ -66,7 +68,7 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `policy.substituted` | The `before_tool` hook returned `ToolDecision.substitute(...)`; the tool did not run | `{"tool_name", "call_id"}`, `correlation_id` = tool call id |
 | `policy.hook_error` | The hook raised, returned a non-decision, or substituted a non-JSON value; the call was denied | `{"tool_name", "call_id", "error_type": str}` (exception type only), `correlation_id` = tool call id |
 | `policy.hook_warning` | The hook asked for approval on a client-target tool; the call was denied | `{"tool_name", "call_id", "warning": "approval is not supported for client tools"}`, `correlation_id` = tool call id |
-| `approval.requested` | A gated call reached the approval gate: a tool in `require_approval=`, or a hook `require_approval` | Static: `{"tool_name", "call_id", "reason": "requires_approval"}`. Hook: `{"tool_name", "call_id", "reason": str, "source": "hook"}`. One event per gated call; `correlation_id` = tool call id |
+| `approval.requested` | A gated call reached the approval gate: a tool in `require_approval=`, or a hook `require_approval` | Static: `{"tool_name", "call_id", "reason": "requires_approval", "params"}`. Hook: `{"tool_name", "call_id", "reason": str, "source": "hook", "params"}`. `params` is what is being approved: the arguments exactly as the model sent them (placeholders under PII redaction, before coercion). One event per gated call; `correlation_id` = tool call id |
 | `approval.decided` | Human submitted approval decision | `{"decision": "approved" \| "rejected" \| "mixed", "run_id": str, "decisions": [{"call_id", "tool_name", "decision": "approved" \| "denied" \| "not_gated_executed" \| "client_pending", "reason": str \| null}]}`. `decisions` lists every pending call, in order |
 | `inbox.delivered` | The runner delivered an inbox note to the model | `{"note_id": str}`, `correlation_id` = note id. Never carries the note text |
 | `budget.threshold` | Usage crossed a `warn_at` fraction of a limit | `{"metric": "tokens" \| "cost_usd", "fraction": float, "used": number, "max": number, "reason": "threshold_crossed"}` |
@@ -74,15 +76,15 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `budget.unpriced` | A `max_cost_usd` budget met its first unpriced LLM call in the run (once per run) | `{"metric": "cost_usd", "used": float, "max": float, "unpriced_calls": int, "known_cost_usd": float}` |
 | `guardrail.detected` | Guardrail engine found entities | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "findings_count": int, "entities": list[str]}` |
 | `guardrail.redacted` | Incoming scan replaced entities with placeholders before the LLM call | `{"direction": "incoming", "entities": list[str]}` |
-| `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "error": str, "findings": [{"kind", "count", "location"}]}`. Never contains the matched text; `location` is the message index, role and tool call id |
+| `guardrail.blocked` | Guardrail blocked a request or response | `{"direction": "incoming" \| "incoming_image" \| "outgoing", "error": str, "code": "guardrail_blocked", "kinds": [str], "counts": {kind: int}, "location": str}`. Never contains the matched text; `location` names the message index, role and tool call id (for example `message 3 (role=tool, tool_call_id=...)`) |
 | `guardrail.image_unscanned` | Guardrails are configured, a request carries images, and none scans images (once per run) | `{"count": int}` |
 | `image.rejected` | The provider refused an image; one event per candidate image | `{"image_id", "sha256", "tenant_scope", "provider", "model", "status_code", "located": bool, "retried": bool}` |
 | `image.state` | A request recorded new image descriptions, guardrail verdicts or placeholders | `{"tenant_scope", "described": [{"sha256", "text"}], "guardrail_verdicts": [{"sha256", "guardrail_id", "guardrail_version", "origin", "tool_name", "action", "entities"}], "placeholders": [{"slot", "reason"}]}` |
 | `image.view_changed` | The drop-old-images window advanced | `{"epoch": int, "dropped_through": int, "visible": int}` (`visible` = eligible images still shown) |
 | `image.degraded` | Images were replaced by placeholders | `{"reason": "purged" \| "policy" \| "rejected" \| "unsupported" \| "described" \| "guardrail" \| "drop", "count": int, "slots": [int]}`; once per image slot |
 | `image.warning` | Drop policy combined with provider thinking (Anthropic, or OpenAI Responses `thinking=True`; once per run) | `{"warning": "drop_with_thinking"}` |
-| `guardrail.restore_skipped` | `PII(restore="allowlisted")` kept a placeholder because the tool is not marked `receives_pii` | `{"tool_name", "entities": list[str], "count": int}`. Counts and entity types only |
-| `governance.changed` | A resume found different governance from the run's start (guardrails, `deny`, `require_approval`, `before_tool`, limits) | `{"changed": list[str], "action": "warn" \| "raise"}`. Names the parts that changed, never their contents |
+| `guardrail.restore_skipped` | `PII(restore="allowlisted")` kept a placeholder because the tool is not marked `receives_pii` | `{"tool_name", "call_id", "entities": {kind: int}, "count": int, "code"}`. Counts and entity types only |
+| `governance.changed` | A resume found different governance from the run's start (guardrails, `deny`, `require_approval`, `before_tool`, limits) and `on_governance_change="warn"` | `{"expected_digest": str, "actual_digest": str, "changed": list[str]}`. Names the parts that changed, never their contents. With `"raise"` the resume raises `GovernanceMismatchError` instead and no event is written |
 | `guardrail.unmapped_placeholder` | Final output contains placeholders that cannot be deanonymized | `{"placeholders": list[str]}` |
 | `skill.catalog_resolved` | Run start, when skills are configured | `{"delivery": "progressive" \| "inlined", "skills": [{"name", "revision", "digest"}], "denied": list[str]}` |
 | `skill.activated` | A skill's body was delivered to the model | `{"name": str, "digest": str, "origin": "model" \| "explicit" \| "inlined"}` |
@@ -96,7 +98,7 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 | `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: payload shapes for guardrail.blocked findings, guardrail.restore_skipped, governance.changed and run.error error_info are inferred from the spec (counts and kinds only); T3 and T7 own the exact field names"
 
 Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and `budget.exceeded` at most once per metric. Every pause persists the fired set, so resumed runs do not re-fire.
 
@@ -104,11 +106,11 @@ Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and 
 
 Dendrux does not ship HTTP write routes. You wrap these methods in your own endpoints so auth, validation, and transport stay yours.
 
-### `agent.submit_tool_results(run_id, results, *, notifier=None, tenant_id=...) -> RunResult`
+### `agent.submit_tool_results(run_id, results, *, notifier=None, tenant_id=..., expected_pause_id=None) -> RunResult`
 
 Submit results for a run paused in `WAITING_CLIENT_TOOL`. Race-safe: persist-first handoff + CAS claim in one atomic step. Blocks until the next pause or terminal state.
 
-`results` is `list[ToolResult]`. Every pending call id must be covered; unknown or missing ids raise `InvalidToolResultError` and nothing is claimed. `ToolResult` fields:
+`results` is `list[ToolResult]`. Every pending call must be covered exactly once by matching id **and** tool name; unknown, duplicate or missing ids, a wrong name, or a payload that is not finite JSON or text within the size cap raise `InvalidToolResultError` (or `InputValidationError` for NUL, lone surrogates or non-finite numbers) and nothing is claimed. Pass `expected_pause_id=` (the `pause_id` the client was shown) to reject a stale submit with `PauseStatusMismatchError`. To parse results arriving from a browser, use `ToolResult.from_dict` / `list_from_dict`. `ToolResult` fields:
 
 [//]: # "docs-test: skip - fragment: relies on `dataclass`, defined by setup shown elsewhere"
 
@@ -125,13 +127,13 @@ class ToolResult:
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `InvalidToolResultError`.
 
-### `agent.submit_input(run_id, text, *, notifier=None, tenant_id=...) -> RunResult`
+### `agent.submit_input(run_id, text, *, notifier=None, tenant_id=..., expected_pause_id=None) -> RunResult`
 
 Submit a clarification for a run paused in `WAITING_HUMAN_INPUT`. Same race-safety as `submit_tool_results`. Blocks until next pause or terminal.
 
 Raises: `PersistenceNotConfiguredError`, `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`.
 
-### `agent.submit_approval(run_id, *, approved=None, decisions=None, rejection_reason=None, notifier=None, tenant_id=...) -> RunResult`
+### `agent.submit_approval(run_id, *, approved=None, decisions=None, rejection_reason=None, notifier=None, tenant_id=..., expected_pause_id=None) -> RunResult`
 
 Submit an approval decision for a run paused in `WAITING_APPROVAL`. Pass exactly one of `approved=` and `decisions=`.
 
@@ -141,9 +143,11 @@ Submit an approval decision for a run paused in `WAITING_APPROVAL`. Pass exactly
 
 Client-target calls in the batch never execute on the server in any form; the run pauses again as `waiting_client_tool` for them.
 
-Raises: the same set as the other submit methods, plus `ValueError` for an invalid argument combination or decision ids.
+`expected_pause_id` is **required when approving** (`approved=True`, or any approved entry in `decisions`) and optional otherwise. It is the `pause_id` the approver was shown. A different current pause raises `PauseStatusMismatchError` (`reason="pause_id"`); a missing token on an approval raises `InputValidationError`.
 
-### `agent.submit_resume(run_id, *, notifier=None, tenant_id=...) -> RunResult`
+Raises: the same set as the other submit methods, plus `ValueError` for an invalid argument combination, decision ids or a non-`bool` `approved`, and `InputValidationError` (a `ValueError`) for a missing pause id on an approval.
+
+### `agent.submit_resume(run_id, *, notifier=None, tenant_id=..., expected_pause_id=None) -> RunResult`
 
 Continue a run in status `PAUSED` (a requested or budget pause) with its full history. Same race-safety as the other submit methods. Blocks until the next pause or terminal state.
 
@@ -171,7 +175,7 @@ Behavior by current state:
 - **Running** (any process, persisted): sets `cancel_requested=True`. The runner observes the flag at the top of the next iteration and at the pre-pause checkpoint. Tool calls complete; cancel is observed between steps.
 - **Batch `run()` on this agent instance**: also cancels the awaiting task. The in-flight model call or tool is interrupted, and `run()` returns `CANCELLED` with `meta["interrupted"] = True`.
 - **Streamed run on this agent instance** (`stream()` / `resume_stream()`): also fires an in-process interrupt. The in-flight model stream is abandoned immediately and the stream yields `RUN_CANCELLED` with the partial `answer` (persisted on the row). Once the model's final event is in hand, completion wins.
-- **In-process submit/resume task on this agent instance**: the asyncio task is also cancelled synchronously.
+- **In-process submit/resume task on this agent instance**: the run is interrupted and the awaiting `submit_*` or `resume` call returns a `CANCELLED` `RunResult` (check `meta["dendrux.cancel_persisted"]`). Cancelling the awaiting task yourself still raises `CancelledError`.
 - **Terminal**: no-op. Returns current persisted state. Does not raise.
 - **Non-persisted**: unsupported. Raises `PersistenceNotConfiguredError`.
 
@@ -187,10 +191,11 @@ From `dendrux.errors`. Suggested HTTP mappings in the docstring there; use whate
 | --- | --- | --- | --- |
 | `RunNotFoundError` | `LookupError` | 404 | `run_id` does not exist, or is outside the `tenant_id` you passed. One class for `Agent`, `RunStore` and `retry`; the same error for a foreign run as for a missing one. |
 | `RunNotPausedError` | `RuntimeError` | 409 | Run is not in any paused state. |
-| `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused for a different kind of signal than this method expects. |
+| `PauseStatusMismatchError` | `RuntimeError` | 409 | Run is paused for a different kind of signal than this method expects (`reason="status"`), or the call carried an `expected_pause_id` that is no longer current (`reason="pause_id"`, a stale submit). |
 | `RunAlreadyClaimedError` | `RuntimeError` | 409 | Concurrent submit won the CAS. Poll for completion; do not retry the submit. |
 | `RunAlreadyTerminalError` | `RuntimeError` | 409 | Run is already terminal; cannot resume. `cancel_run` does **not** raise this; terminal cancel is a silent no-op. |
-| `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids). No partial claim. |
+| `InvalidToolResultError` | `ValueError` | 400 | Submitted results don't match pending calls (unknown / duplicate / missing ids, wrong name, bad payload). No partial claim. |
+| `InputValidationError` | `ValueError` | 400 | A value cannot be accepted or stored (NUL, lone surrogate, non-finite JSON, bad identifier), or an approval has no `expected_pause_id`. Carries a fixed `field` and `code`, never the value. |
 | `PersistenceNotConfiguredError` | `RuntimeError` | 500 | Agent has no DB. Configuration bug, not runtime condition. |
 | `TenantScopeRequiredError` | `ValueError` | 500 | `strict_tenancy=True` and the call omitted `tenant_id`. A bug in your route, not a client error. |
 | `NoteLimitExceededError` | `ValueError` | 409 or 429 | `submit_note` on a run that already has `max_notes_per_run` notes. |

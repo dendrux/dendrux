@@ -150,6 +150,8 @@ The atomic claim guarantees one winner, but it cannot tell whether the winner wa
 - **Approving requires it.** `submit_approval(approved=True)`, a `decisions=` batch that approves any call, and `resume` of a `waiting_approval` run all raise `InputValidationError` (field `expected_pause_id`, code `pause_id_required`, a `ValueError`) when the token is missing, before anything is claimed. Rejecting (`approved=False`, or only denials) does not need it. Tool results, input answers and plain continues take it as an option; under `Agent(strict_tenancy=True)` leaving it out prints a `FutureWarning`.
 - A token must be a non-empty string of at most 26 characters without NUL or lone surrogates; anything else raises `InputValidationError` and never reaches the database.
 
+[//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
+
 ```python
 paused = await agent.run("Refund order 42")
 await agent.submit_approval(
