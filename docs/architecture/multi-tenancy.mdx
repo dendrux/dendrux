@@ -89,7 +89,6 @@ await agent.cancel_run(run_id, tenant_id=UNSCOPED)   # ok, explicitly an operato
 - Strict tenancy is opt-in in 0.5.0. It becomes the default in 0.6, and 0.5 prints a `FutureWarning` when you have not chosen. Choose with `strict_tenancy=True` or `strict_tenancy=False`.
 - It applies to `Agent` methods. Code that calls the lower-level `dendrux.run(agent, ...)` function directly is not covered.
 
-
 ### Metadata
 
 Top-level metadata keys starting with `dendrux.` are reserved and raise `ValueError`. Metadata is capped at 64 KiB (`Limits(max_metadata_bytes=...)`).

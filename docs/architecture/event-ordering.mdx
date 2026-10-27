@@ -20,7 +20,6 @@ The only guarantee readers need is the first one: **within a run, `sequence_inde
 
 A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every worker is on 0.5.0 or later. Until then, a fleet that mixes 0.4.1 and 0.5 workers can in rare races write one duplicate index, and an SSE cursor can miss that one event. That window closes with the 0.5.1 index.
 
-
 ## A real event timeline
 
 The timeline below is the `run_events` log from the quickstart run, dumped from `quickstart.db`. Captured on Dendrux 0.5.0 with claude-haiku-4-5. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
@@ -38,7 +37,6 @@ The timeline below is the `run_events` log from the quickstart run, dumped from 
 | 8 | `approval.decided` | 1 | Governance row records who decided and how. |
 | 9 | `llm.completed` | 2 | Second LLM turn (668 input, 28 output). No tool calls this time. |
 | 10 | `run.completed` | 0 | Terminal event. status=success. |
-
 
 Notice that `sequence_index` runs straight through pause and resume. `seq=4` and `seq=5` are written in two separate processes (the starter and the resumer), but they are adjacent in the log. On resume the runtime reads `max(sequence_index)` from the DB and continues counting from there, so there is no gap and no collision once every writer is on 0.5.0 or later.
 

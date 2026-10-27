@@ -72,7 +72,6 @@ An empty result is therefore never proof that a run exists. Check `get_run` (or 
 from dendrux import UNSCOPED
 ```
 
-
 ### Arguments are validated
 
 Every read, `get_pending` and `follow` checks its arguments before it queries, and refuses with a `ValueError` whose message is fixed and never echoes the rejected value. Every such rejection, including the `list_runs` offset cap, the pause-page `limit` and the `stream_events` poll interval, logs `code=read_argument_invalid` with the argument name. A route can map it to HTTP 400.
@@ -297,10 +296,10 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`PausePair`** (from `get_pauses` and `get_pause_page`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`, and (0.5.0) `pause_id`. `pending_tool_calls` carries the pending calls' ids, names and parameters, so `get_pauses` is the public way to read a client tool's call ids when you are not holding the original `RunResult` (see [Client-side tools](/docs/recipes/client-tools)). `pause_id` is `None` for pauses recorded before 0.5.0. By default past pauses' arguments, call ids and `user_input` are hidden; pass `include_payloads=True` for a trusted view.
 
+A requested pause that retains server-target or approval-gated calls uses recorded placeholder arguments, or `args_hidden=True` when the current pause has no such evidence. This applies to pending reads and redacted event views, including follow.
+
 ## Where this fits
 
 - [State persistence](/docs/architecture/state-persistence): the tables behind these records.
 - [Build your own read routes](/docs/recipes/build-your-own-read-routes): the same reads over HTTP.
 - [HTTP integration](/docs/reference/http-api): what your routes call, and the old endpoint map.
-
-A requested pause that retains server-target or approval-gated calls uses recorded placeholder arguments, or `args_hidden=True` when the current pause has no such evidence. This applies to pending reads and redacted event views, including follow.

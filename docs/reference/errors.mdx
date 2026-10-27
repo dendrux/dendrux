@@ -109,6 +109,7 @@ Every failed LLM request raises a `ProviderError` subclass (inside a run it ends
 | `ProviderRateLimitError` (`retry_after`) | `rate_limit` | yes | |
 | `ProviderUnavailableError` | `unavailable` | yes | `ConnectionError` |
 | `ProviderTimeoutError` | `timeout` | no | `TimeoutError` |
+| `ProviderResponseError` | `rejected` | no | |
 | `ProviderStreamIncompleteError` | `stream_incomplete` | no | |
 | `ModelRefusalError` (`refusal_text`, in process only) | `refusal` | no | |
 | `ContentFilteredError` | `content_filter` | no | |
@@ -119,6 +120,9 @@ Every failed LLM request raises a `ProviderError` subclass (inside a run it ends
 
 Database failures use the same envelope: `ErrorInfo(category="persistence_error")` has no provider fields, and the run's `error` is a fixed message. A provider failure inside a custom provider, a grouped worker failure or a failed stream close is normalised to the `ProviderError` taxonomy at Dendrux's call sites; raise `ProviderError` subclasses from your own providers. Provider and model identifiers on these errors are bounded and control-free, and `provider_code` appears only when it looks like a code.
 
+`ProviderResponseError` reports an empty normal completion (`empty_completion`) or a local stream bound (`stream_size_limit`, `stream_tool_call_limit`). It is not retryable. Tool-only output remains valid, and token-limit emptiness keeps its truncation flag.
+
+A fenced stream observing a still-running owner ends its local feed with `RUN_ERROR` and `ErrorInfo(category="run_fenced", retryable=False)`. The result preserves the durable run status; this observation does not fail or mutate the winning run. Read its current state with `Agent.get_result` or `RunStore`. If the winner paused, the stale feed ends with `RUN_PAUSED` instead.
 
 ## MCP errors
 

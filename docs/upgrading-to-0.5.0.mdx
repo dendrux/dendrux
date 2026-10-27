@@ -39,9 +39,8 @@ Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [E
 
    SQLite files are brought up to date automatically on first use.
 2. **Roll your workers.** Rolling deploys are allowed. 0.5 writes are readable by 0.4.1 workers, pause state readers tolerate unknown keys, and event numbering is compatible with old workers. Do not run abandoned-waiting sweeps until the migration has finished.
-3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing or the revision is unknown (use `--allow-unstamped` if you build your schema with `create_all`; it then checks tables, columns and indexes). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query. For an unstamped Postgres database built with 0.4.1 `create_all`, first verify that its schema matches the 0.4.1 baseline, stamp `c6d7e8f9a0b1` with the migration job's Alembic configuration, then run the full chain with `dendrux db migrate`. Adding indexes alone does not perform this upgrade.
+3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing or the revision is unknown (use `--allow-unstamped` if you build your schema with `create_all`; it then checks tables, columns and indexes). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query. For an unstamped Postgres database built with 0.4.1 `create_all`, first verify that its schema matches the 0.4.1 baseline, stamp `c6d7e8f9a0b1` with `alembic stamp c6d7e8f9a0b1` from `packages/python` using the migration job's Alembic configuration. For an installed distribution, use an `alembic.ini` whose `script_location` points to the installed package's `dendrux/db/migrations` directory. Then run the full chain with `dendrux db migrate`. Adding indexes alone does not perform this upgrade.
 4. **Read the warnings.** Run your tests with warnings visible (`python -W default`). Every default that changes in 0.6 prints a `FutureWarning` in 0.5 (visible by default), and a renamed or removed setting prints a `DeprecationWarning`. Python shows each warning once per call site.
-
 
 ### Mixed fleets during a rolling deploy
 
@@ -65,10 +64,9 @@ alembic downgrade c6d7e8f9a0b1
 
 That includes a key shared by a write that lands while the downgrade runs. The downgrade has the same 5-second lock bound and concurrent index steps as the upgrade, and the same retry message.
 
- In a rehearsal on 5,000 runs both steps took about 1 second.
+In a rehearsal on 5,000 runs both steps took about 1 second.
 
 Downgrading drops `status_changed_at` and its history. A later `dendrux db migrate` adds the column again and backfills every row from `updated_at`, so the time of the last status change is not preserved across a downgrade and re-upgrade. Alembic migrations are validated on Postgres; SQLite files are upgraded in place by Dendrux and are not downgraded this way. Without a checkout, point an `alembic.ini` at the installed package's `dendrux/db/migrations` directory as its `script_location`.
-
 
 ## Every change at a glance
 
@@ -190,7 +188,6 @@ agent = Agent(
 
 See [Budget](/docs/architecture/budget) and [Cost and pricing](/docs/architecture/pricing).
 
-
 ### 2. Provider failures are typed errors
 
 Silent empty answers are gone. A stream that ends with no terminal event, a Responses `error` or `response.failed`, a refusal and a content filter each raise a `ProviderError` subclass, and the run ends `error` with `RunResult.error_info`.
@@ -198,7 +195,7 @@ Silent empty answers are gone. A stream that ends with no terminal event, a Resp
 - Catch `ProviderError`. It has `.category`, `.status_code`, `.retryable` and `.safe_message`; the SDK exception is on `__cause__`.
 - `ProviderTimeoutError` also subclasses `TimeoutError`, and `ProviderUnavailableError` also subclasses `ConnectionError`, so existing `except TimeoutError:` clauses keep working. SDK exception types no longer escape. Code that caught an SDK exception class directly must catch `ProviderError` instead.
 - A completed response with neither text nor tool calls raises `ProviderResponseError` (`category="rejected"`, `provider_code="empty_completion"`). Batch `run` and `resume` raise the typed error after persisting it; streams yield an error outcome. Tool-only responses remain valid. A token-limited empty response keeps `truncated=True`. A serialized empty structured object (`{}`) remains valid for SingleCall batch output; SingleCall does not support structured streaming or resume.
-- Provider streams have a cumulative local bound of 16 MiB (`max_stream_bytes`), including UTF-8 text, reasoning, refusal, tool arguments and structural overhead, plus at most 1,000 tool-call slots (`max_stream_tool_calls`). Configure these on the provider alongside deadlines. Exceeding either closes the upstream and raises `ProviderResponseError` with category `rejected` and code `stream_size_limit` or `stream_tool_call_limit`. The Anthropic SDK may accumulate the current event before yielding it; the bound is checked before Dendrux retains it.
+- Provider streams have a cumulative local bound of 16 MiB (`max_stream_bytes`), including retained UTF-8 text, reasoning, refusal, tool arguments and small event/data charges, plus at most 1,000 tool-call slots (`max_stream_tool_calls`). Configure these on the provider alongside deadlines. Exceeding either closes the upstream and raises `ProviderResponseError` with category `rejected` and code `stream_size_limit` or `stream_tool_call_limit`. SDK events are parsed before the local check. Dendrux charges retained fragments; Anthropic helper snapshots and the final Responses output snapshot are not charged again.
 - New deadlines can fail calls that used to hang: `call_timeout=600` for a non-streaming call and `stream_idle_timeout=600` between stream events. Pass `None` to opt out. An old `timeout=X` still works and sets both, with a `DeprecationWarning`. `call_timeout=None` also removes the bound on the SDK's own retries, so a paid call can be re-run; keep a deadline unless you have a reason not to.
 - `error_info` is also set for database failures, with `category="persistence_error"` (`dendrux.errors.PersistenceError`). SQL, bound parameters and driver text never appear in the error, the logs or the event.
 - Provider failures are logged with safe fields only (`run_id`, category, status, code) and no traceback or vendor text. Ordinary non-provider failures keep their tracebacks. Diagnose provider failures from `run_id` and `ErrorInfo`, not from log text.
@@ -307,7 +304,6 @@ Run fencing needs more from a store, and a store that does not provide it keeps 
 - A store without bounded event-filter reads cannot establish a verified approval or input view; the arguments are then hidden (`args_hidden=True`) rather than shown unverified.
 - A 0.4.1 `claim_paused_run(run_id, *, expected_status)` stays usable on a best-effort basis: Dendrux validates before and right after the claim, but it cannot give atomic validation or full fencing there. Upgrade the store for those guarantees.
 
-
 ### 11. Guardrail findings no longer carry matched text
 
 `guardrail.blocked` events and guardrail errors report the kind, the count and the location (message index, role, tool call id), never the matched text. If you parsed text out of `guardrail.blocked`, use `kind` and `location`.
@@ -335,7 +331,6 @@ needs to keep following beyond terminal status.
 
 Your application chooses its HTTP statuses, framing and pagination schema. See
 [Build your own read routes](/docs/recipes/build-your-own-read-routes).
-
 
 ### 13. Approving needs a pause id
 
@@ -464,7 +459,6 @@ Every new bound in 0.5.0, for capacity planning:
 | `sweep` candidates per category | 10,000 (ceiling 100,000) | `sweep_cap_reached` warning |
 | Pending pause display on the wire | about 1,000 PII values | `args_hidden=True` for that pause |
 
-
 ## What you may notice
 
 These need no change but are visible.
@@ -499,7 +493,6 @@ These need no change but are visible.
 Approving without `expected_pause_id` is **not** in this table: it is already an error in 0.5 (see [item 13](#13-approving-needs-a-pause-id)).
 
 To silence a warning, make the choice explicit. For example, `Budget(max_tokens=200_000, count_cache_tokens=False)` keeps 0.4 counting, and `count_cache_tokens=True` counts `input + output + cache read + cache write` tokens (raise `max_tokens` if you opt in).
-
 
 ## Checklist
 

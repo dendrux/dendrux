@@ -23,6 +23,18 @@ for every change below.
 - **Typed provider errors and deadlines.** Silent empty answers are errors,
   `ProviderError` subclasses carry a category and a safe message, and calls have
   deadlines.
+- **Provider response limits.** `ProviderResponseError` reports empty normal
+  completions and local stream-limit failures with category `rejected`.
+  `max_stream_bytes` defaults to 16 MiB of retained fragments plus small event
+  charges; SDK snapshots are not charged again. `max_stream_tool_calls`
+  defaults to 1,000. Overflow closes upstream; tool-only responses and
+  token-limit truncation remain supported.
+- **Delegation bounds.** `Budget.max_subtree_nodes` defaults to 10,000;
+  incomplete accounting fails closed. Cascade cancellation signals pages of
+  descendant ids. Its bounded detail uses the `cascade_count` and
+  `cascade_truncated` metadata keys to report how much was processed.
+- **Explicit wire omission.** `answer_omitted` distinguishes an answer omitted
+  by the wire display bound from a real empty answer, within wire version 1.
 - **Run integrity.** Claims are fenced by an epoch, every pause has a
   `pause_id`, and approving requires `expected_pause_id`.
 - **Bounded everything.** Input, metadata, notes, tool results, MCP discovery,

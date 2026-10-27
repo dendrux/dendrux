@@ -31,7 +31,6 @@ A **library**, not a service. Dendrux doesn't run a server, doesn't manage worke
 | llm_interactions | Per-LLM-call, full payloads |
 | run_events | Audit log, ordered by sequence_index |
 
-
 The `agent_runs` table is the anchor. Everything else cascades from it: delete a run row and all its traces, tool calls, and events go with it.
 
 > **New in 0.4.0:** two image tables, `dendrux_blobs` (content-addressed image bytes and metadata, keyed by tenant scope and SHA-256) and `dendrux_blob_refs` (which run uses which blob). They hold images only; a deployment that never uses images has them empty. See [Images](/docs/recipes/images#storage). Postgres needs `dendrux db migrate` (revision `c6d7e8f9a0b1`) even if you never use images; see [Upgrading](#upgrading).
@@ -338,7 +337,6 @@ If the tables are missing when a run starts, dendrux raises `SchemaNotInitialize
 ### Upgrading
 
 Upgrading to 0.5.0 applies two revisions. `d7e8f9a0b1c2` adds `agent_runs.claim_epoch`, the tenant-scoped idempotency index and the `(tenant_id, created_at)` index. `e8f9a0b1c2d3` adds `agent_runs.status_changed_at` (backfilled online from `updated_at`) and the three `sweep()` indexes. Run `dendrux db migrate` once, as a single deploy job over a direct Postgres connection (not PgBouncer, not from every pod), before you start 0.5 workers; short exclusive steps give up after 5 seconds and can be retried. A Postgres database that has not been migrated raises `SchemaOutOfDateError` on first use, and the schema check now also verifies the named indexes. `dendrux db check` compares the database with this version's migration head (exit 0 current, 1 behind, 2 unknown; `--allow-unstamped` for schemas built with `create_all`). The full procedure, including mixed-fleet rules, is in [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).
-
 
 Upgrading to 0.4.0 adds the two image tables; a Postgres database that has not been migrated raises `SchemaOutOfDateError` naming `dendrux_blobs` and `dendrux_blob_refs` on first use. SQLite files create them on startup.
 

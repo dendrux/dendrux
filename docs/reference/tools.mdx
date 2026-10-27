@@ -135,7 +135,6 @@ Details:
 - MCP tools and client tools are not coerced: their arguments and results are unchanged from 0.4.
 - Tool schemas are part of the prompt, so adding constraint keywords can change a prompt-cache key once, on the first request after you upgrade.
 
-
 ## Timeouts and the thread pool
 
 `timeout_seconds` bounds each server tool call. How a timeout behaves depends on whether the call had started:
@@ -152,7 +151,6 @@ A sync tool that has timed out cannot be killed; it keeps its thread until it re
 **Waiting calls are bounded too.** Each Agent runs at most `tool_threads` tool calls at once, and at most **256 more may wait** for a slot. A call that arrives when the queue is full is not started: the model gets a retryable `code: "tool_pool_saturated"` result and the tool never runs, so a burst of calls cannot build an unbounded backlog. Change the bound for the process with the `DENDRUX_TOOL_QUEUE_LIMIT` environment variable (a positive integer, read the first time a call has to wait). There is no `Agent` argument for it in 0.5.
 
 If a parallel batch ends the run (a failure that stops the run), the async siblings are cancelled and recorded as `cancelled`; sibling sync tools that had already started are recorded with an unknown outcome.
-
 
 ## Result size limits
 

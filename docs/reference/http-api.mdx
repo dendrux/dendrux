@@ -98,7 +98,6 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 | `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
 
-
 Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and `budget.exceeded` at most once per metric. Every pause persists the fired set, so resumed runs do not re-fire.
 
 ## Write-side agent methods
@@ -231,7 +230,6 @@ async with RunStore.from_database_url("postgresql+asyncpg://...") as store:
 # Caller-owned engine (when your app already has one)
 store = RunStore.from_engine(engine)
 ```
-
 
 Use `follow` for redacted, bounded live events and always close the follower.
 Do not return `agent.stream()` directly to a browser: disconnecting cancels it.

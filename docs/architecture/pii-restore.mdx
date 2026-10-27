@@ -39,7 +39,6 @@ async def web_search(query: str) -> str: ...   # sees <<EMAIL_ADDRESS_1>>, never
 
 MCP tools cannot be marked `receives_pii` in 0.5.0, so under `"allowlisted"` they always receive the placeholder text. If an MCP tool must act on a real value, wrap it in a local `@tool(receives_pii=...)` function that calls `connection.call_tool(...)` after your own authorization, or keep `restore="all"` for that agent.
 
-
 Under `"allowlisted"`, when Dendrux declines to restore a value into a tool, it records a `guardrail.restore_skipped` event. The event carries counts and entity types only, never values.
 
 ## Why this choice exists
@@ -82,7 +81,6 @@ This matters because the error goes back to the model, and a restored value in i
 - [ ] Under `"allowlisted"`, mark each tool that needs real values with `@tool(receives_pii=...)`.
 - [ ] Keep approval on tools that send data outside your system.
 - [ ] Remember that the database still stores raw values and the `pii_mapping`. Restore controls what tools receive, not what is stored.
-
 
 ## Where this fits
 

@@ -116,7 +116,6 @@ their stored cost but may have no source information.
 - **Budget.** A `Budget(max_cost_usd=...)` uses these prices, and since 0.5.0 it refuses to start when the model has none (`BudgetConfigurationError`). See [Dollar limits](/docs/architecture/budget#dollar-limits).
 - **Long cache lifetimes.** A call that wrote the long (12 hour) cache tier is marked cost-unknown, because its write rate differs from the default tier; the rate table for it arrives in 0.6.
 
-
 ## Where this fits
 
 - [Models and providers](/docs/architecture/models): what each provider reports in `UsageStats`.

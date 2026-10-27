@@ -286,7 +286,6 @@ governance events:
 
 The blocked event, a terminal `run.error` (not `run.completed`, which a blocked run ended with before 0.5.0) and no LLM call. The run row gets the same safe `error` and `failure_reason="guardrail_blocked"`. The message carries the pattern name, a count and a location (message index counting the system prompt as message 0, role, and the tool call id for tool results), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the stored events.
 
-
 ## Prompt injection — domain-specific by design
 
 `PromptInjection` is the third built-in. It targets the "ignore previous instructions" / "reveal the system prompt" / hidden-comment / ChatML-token class of attacks, and it covers two boundaries simultaneously:
@@ -364,7 +363,6 @@ If a guardrail cannot examine some content (text over 4 Mi characters, tool-call
 Like every finding, it carries a kind, a count and a location, never the content itself.
 
 A message made of several text parts, and a tool result, is scanned as the one text the model would read (the parts joined by a blank line), so a pattern whose context sits in a neighbouring part is still found. Redaction is mapped back to each part. Tool-call parameters are scanned leaf by leaf and also as one joined `key=value` text in walk order and in reverse order, so an ancestor key such as `{"aws secret": {"value": TOKEN}}` supplies context to its children. A pattern's own context window still applies, so a context key separated from its value by many long keys can be missed. More parts can mean more blocks and redactions than in 0.4.1, never fewer. Joined text over the 4 Mi limit is `unscannable`.
-
 
 ## Multiple guardrails compose
 
