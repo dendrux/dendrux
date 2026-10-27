@@ -247,7 +247,7 @@ class TestAgentPersistence:
 
 
 # ------------------------------------------------------------------
-# Persistence: private engine (finding 2 + 3)
+# Persistence: private engine
 # ------------------------------------------------------------------
 
 

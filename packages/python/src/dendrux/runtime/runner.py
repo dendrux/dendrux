@@ -4329,13 +4329,35 @@ async def ingest_submitted_user_parts(
 
 
 def _fenced_stream_event(run_id: str, result: RunResult) -> RunEvent:
+    from dataclasses import replace
+
     from dendrux.types import RunEvent, RunEventType
 
+    types = {
+        RunStatus.ERROR: RunEventType.RUN_ERROR,
+        RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+        RunStatus.SUCCESS: RunEventType.RUN_COMPLETED,
+        RunStatus.MAX_ITERATIONS: RunEventType.RUN_COMPLETED,
+        RunStatus.PAUSED: RunEventType.RUN_PAUSED,
+        RunStatus.WAITING_CLIENT_TOOL: RunEventType.RUN_PAUSED,
+        RunStatus.WAITING_APPROVAL: RunEventType.RUN_PAUSED,
+        RunStatus.WAITING_HUMAN_INPUT: RunEventType.RUN_PAUSED,
+    }
+    if result.status not in types:
+        info = ErrorInfo(
+            category="run_fenced",
+            retryable=False,
+            safe_message="Execution ownership changed; read the run's current state.",
+            error_type="RunFencedError",
+        )
+        return RunEvent(
+            type=RunEventType.RUN_ERROR,
+            run_id=run_id,
+            run_result=replace(result, error_info=info),
+            error=info.safe_message,
+        )
     return RunEvent(
-        type={
-            RunStatus.ERROR: RunEventType.RUN_ERROR,
-            RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
-        }.get(result.status, RunEventType.RUN_COMPLETED),
+        type=types[result.status],
         run_id=run_id,
         run_result=result,
         error=result.error if result.status == RunStatus.ERROR else None,

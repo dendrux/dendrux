@@ -777,7 +777,7 @@ class TestResponsesFailures:
     async def test_agent_run_fails_instead_of_empty_success(self) -> None:
         """the run no longer reports success with an empty answer.
 
-        (Persisting ``ErrorInfo`` on the run is T7's wiring.)
+        Persisted runs carry ``ErrorInfo`` for the failure.
         """
         from dendrux.agent import Agent
 

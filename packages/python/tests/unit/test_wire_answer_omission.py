@@ -21,3 +21,32 @@ def test_wire_answer_has_omission_marker(answer, omitted, caplog):
             and getattr(record, "run_id", None) == "r"
             for record in caplog.records
         )
+
+
+@pytest.mark.parametrize(
+    "target,approval,hidden",
+    [("server", None, True), ("client", {"source": "static"}, True), ("client", None, False)],
+)
+def test_paused_wire_masks_raw_server_and_gated_arguments(target, approval, hidden):
+    from dendrux.store import PendingPause, PendingToolCall
+
+    pending = PendingPause(
+        run_id="r",
+        status="paused",
+        kind="paused",
+        pause_id="p",
+        tool_calls=[
+            PendingToolCall(
+                id="c",
+                name="send",
+                target=target,
+                params={"secret": "PRIVATE_ARGUMENT"},
+                approval=approval,
+            )
+        ],
+    )
+    result = RunResult(run_id="r", status=RunStatus.PAUSED, pending=pending)
+    projected = result.to_dict()["pending"]["pending_tool_calls"][0]
+    assert projected["params"] == (None if hidden else {"secret": "PRIVATE_ARGUMENT"})
+    assert projected.get("args_hidden", False) is hidden
+    assert pending.tool_calls[0].params == {"secret": "PRIVATE_ARGUMENT"}

@@ -841,34 +841,42 @@ class StreamClock:
         if count > self._slot_limit:
             self._reject("stream_tool_call_limit")
 
-    def account(self, value: Any, depth: int = 0) -> None:
-        """Charge raw event text and structural overhead before adapter accumulation.
+    def account(self, value: Any = None, *, credited_bytes: int = 0) -> int:
+        """Charge retained fragments and eight bytes per accounting event.
 
-        Walk SDK fields without serializing or copying the event. Structural
-        charges also bound streams made entirely of empty fragments or nodes.
+        Adapters supply only newly retained data, never an SDK event or its
+        cumulative snapshot. A final argument value credits its prior deltas.
         """
-        self._remaining -= 64
-        if self._remaining < 0 or depth > 64:
+        self._remaining -= 8
+        if self._remaining < 0:
+            self._reject("stream_size_limit")
+        size = self._retained_size(value, self._remaining + credited_bytes)
+        self._remaining -= max(0, size - credited_bytes)
+        if self._remaining < 0:
+            self._reject("stream_size_limit")
+        return size
+
+    def _retained_size(self, value: Any, maximum: int, depth: int = 0) -> int:
+        if maximum < 0 or depth > 64:
             self._reject("stream_size_limit")
         if isinstance(value, str):
-            if len(value) > self._remaining:
+            if len(value) > maximum:
                 self._reject("stream_size_limit")
+            size = 0
             for start in range(0, len(value), 65536):
-                self._remaining -= len(value[start : start + 65536].encode("utf-8"))
-                if self._remaining < 0:
+                size += len(value[start : start + 65536].encode("utf-8"))
+                if size > maximum:
                     self._reject("stream_size_limit")
-        elif isinstance(value, dict):
-            for key, item in value.items():
-                self.account(key, depth + 1)
-                self.account(item, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                self.account(item, depth + 1)
-        elif hasattr(value, "__dict__"):
-            self.account(vars(value), depth + 1)
-            extra = getattr(value, "__pydantic_extra__", None)
-            if extra:
-                self.account(extra, depth + 1)
+            return size
+        if isinstance(value, (dict, list, tuple)):
+            size = 8
+            values = value.items() if isinstance(value, dict) else value
+            for item in values:
+                size += self._retained_size(item, maximum - size, depth + 1)
+            if size > maximum:
+                self._reject("stream_size_limit")
+            return size
+        return 8 if value is not None else 0
 
     def mark_semantic(self) -> None:
         if self._idle is not None:

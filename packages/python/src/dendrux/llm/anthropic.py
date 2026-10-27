@@ -783,7 +783,38 @@ class AnthropicProvider(LLMProvider):
                         event = await clock.step(iterator.__anext__())
                     except StopAsyncIteration:
                         break
-                    clock.account(event)
+                    if event.type not in {
+                        "message_start",
+                        "message_delta",
+                        "message_stop",
+                        "content_block_start",
+                        "content_block_delta",
+                        "content_block_stop",
+                    }:
+                        continue
+                    if event.type == "content_block_delta":
+                        clock.account(
+                            [
+                                getattr(event.delta, field, None)
+                                for field in ("text", "thinking", "partial_json", "signature")
+                            ]
+                        )
+                    elif event.type == "content_block_start":
+                        clock.account(
+                            [
+                                getattr(event.content_block, field, None)
+                                for field in (
+                                    "text",
+                                    "thinking",
+                                    "signature",
+                                    "input",
+                                    "id",
+                                    "name",
+                                )
+                            ]
+                        )
+                    else:
+                        clock.account()
                     if event.type == "content_block_start":
                         block = event.content_block
                         if block.type == "tool_use":

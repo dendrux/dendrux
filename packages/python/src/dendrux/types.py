@@ -1096,13 +1096,17 @@ class Limits:
 
 @dataclass(frozen=True)
 class ErrorInfo:
-    """Structured, safe description of a provider or persistence failure.
+    """Structured, safe description of a provider, persistence or ownership failure.
 
     Provider fields come from :class:`dendrux.errors.ProviderError`.
     Database failures use ``category="persistence_error"`` and omit provider
-    fields. Every field is a code, number or name: ``safe_message`` is a
-    fixed template, never vendor text or SQL. Persisted under
-    ``agent_runs.meta["dendrux.error_info"]``.
+    fields. ``category="run_fenced"`` on a stream means that execution lost
+    ownership; the result keeps the current owner's actual status. This
+    observation does not change the durable run. Every field is a code,
+    number or name: ``safe_message`` is a fixed template, never vendor text
+    or SQL. Provider and database failures are persisted under
+    ``agent_runs.meta["dendrux.error_info"]``; ownership-loss info belongs only
+    to the observing stream.
 
     Attributes:
         category: The error's ``category`` (``"rate_limit"``, ``"timeout"``, ...).

@@ -1631,7 +1631,7 @@ class TestD1Seams:
 
 
 # ---------------------------------------------------------------------------
-# Review fix round (review-D2.md)
+# Image validation before persistence
 # ---------------------------------------------------------------------------
 
 JPG = (FIXTURES / "zebra42.jpg").read_bytes()

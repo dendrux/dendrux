@@ -1,4 +1,4 @@
-"""Anthropic strict-mode fallback (0.4.1 T2 fix round).
+"""Anthropic strict-mode fallback.
 
 A request that carried a strict entry and got a 400 pointing at the strict
 schema is retried once with every strict entry reverted to its 0.4.0 payload.

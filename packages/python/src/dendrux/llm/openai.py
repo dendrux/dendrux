@@ -765,7 +765,6 @@ class OpenAIProvider(LLMProvider):
                         chunk = await clock.step(chunk_iter.__anext__())
                     except StopAsyncIteration:
                         break
-                    clock.account(chunk)
                     semantic = False
 
                     # Usage arrives in the final chunk (``include_usage``: no
@@ -777,28 +776,32 @@ class OpenAIProvider(LLMProvider):
                         semantic = True
 
                     if not chunk.choices:
+                        clock.account()
                         if semantic:
                             clock.mark_semantic()
                         continue
 
                     choice = chunk.choices[0]
                     delta = choice.delta
+                    reasoning_delta = _reasoning_text_from(delta)
+                    reasoning_detail_delta = _reasoning_details_from(delta)
+                    refusal_delta = getattr(delta, "refusal", None)
+                    clock.account(
+                        [delta.content, reasoning_delta, reasoning_detail_delta, refusal_delta]
+                    )
 
                     # --- Reasoning deltas (OpenRouter/compatible; inert on pure OpenAI) ---
                     # Reasoning streams before content, so emit it first.
-                    reasoning_delta = _reasoning_text_from(delta)
                     if reasoning_delta:
                         semantic = True
                         reasoning_parts.append(reasoning_delta)
                         yield StreamEvent(
                             type=StreamEventType.REASONING_DELTA, text=reasoning_delta
                         )
-                    reasoning_detail_delta = _reasoning_details_from(delta)
                     if reasoning_detail_delta:
                         semantic = True
                         reasoning_block_acc.extend(reasoning_detail_delta)
 
-                    refusal_delta = getattr(delta, "refusal", None)
                     if isinstance(refusal_delta, str) and refusal_delta:
                         semantic = True
                         refusal_parts.append(refusal_delta)
@@ -821,6 +824,15 @@ class OpenAIProvider(LLMProvider):
                                 _tool_buffers[idx] = _ToolCallBuffer()
 
                             buf = _tool_buffers[idx]
+                            clock.account(
+                                [
+                                    delta_tc.id if buf.tool_call_id is None else None,
+                                    delta_tc.function.name
+                                    if delta_tc.function and buf.name is None
+                                    else None,
+                                    delta_tc.function.arguments if delta_tc.function else None,
+                                ]
+                            )
 
                             # Capture id (first occurrence)
                             if delta_tc.id and buf.tool_call_id is None:

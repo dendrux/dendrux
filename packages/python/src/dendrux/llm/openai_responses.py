@@ -776,6 +776,7 @@ class OpenAIResponsesProvider(LLMProvider):
 
         # Track active function calls: item_id → (name, call_id)
         _active_calls: dict[str, tuple[str, str]] = {}
+        argument_bytes: dict[str, int] = {}
         # Native message phase ("commentary" | "final_answer"): item_id → phase
         _message_phase: dict[str, str | None] = {}
         _completed_response: Any = None
@@ -791,8 +792,23 @@ class OpenAIResponsesProvider(LLMProvider):
                         event = await clock.step(iterator.__anext__())
                     except StopAsyncIteration:
                         break
-                    clock.account(event)
                     event_type = getattr(event, "type", None)
+                    if event_type in {
+                        "response.output_text.delta",
+                        "response.refusal.delta",
+                        "response.reasoning_summary_text.delta",
+                    }:
+                        clock.account(event.delta)
+                    elif event_type == "response.function_call_arguments.delta":
+                        clock.tool_slot(event.item_id)
+                        size = clock.account(event.delta)
+                        argument_bytes[event.item_id] = argument_bytes.get(event.item_id, 0) + size
+                    elif event_type == "response.function_call_arguments.done":
+                        clock.account(
+                            event.arguments, credited_bytes=argument_bytes.pop(event.item_id, 0)
+                        )
+                    else:
+                        clock.account()
 
                     # --- Failures (they may follow deltas already yielded) ---
                     if event_type in ("error", "response.failed"):
@@ -834,9 +850,11 @@ class OpenAIResponsesProvider(LLMProvider):
                     elif event_type == "response.output_item.added":
                         item = event.item
                         if getattr(item, "type", None) == "message":
+                            clock.account(item.id)
                             _message_phase[item.id] = getattr(item, "phase", None)
                         elif getattr(item, "type", None) == "function_call":
-                            clock.tool_slot((len(tool_calls), item.id))
+                            clock.tool_slot(item.id)
+                            clock.account([item.name, item.id, getattr(item, "call_id", None)])
                             item_id = item.id
                             name = item.name
                             call_id = getattr(item, "call_id", item_id)

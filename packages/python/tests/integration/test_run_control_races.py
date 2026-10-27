@@ -31,6 +31,7 @@ from dendrux.db.models import AgentRun
 from dendrux.errors import (
     PauseStatusMismatchError,
     RunAlreadyClaimedError,
+    RunAlreadyTerminalError,
     RunNotPausedError,
 )
 from dendrux.runtime.context import get_delegation_context
@@ -275,7 +276,11 @@ class TestFinalizerContention:
         assert len(wins) == 1 and wins[0].status == RunStatus.SUCCESS
         assert len(losses) == 1
         assert isinstance(
-            losses[0], RunAlreadyClaimedError | RunNotPausedError | PauseStatusMismatchError
+            losses[0],
+            RunAlreadyClaimedError
+            | RunAlreadyTerminalError
+            | RunNotPausedError
+            | PauseStatusMismatchError,
         )
         delivered = [
             m.content
