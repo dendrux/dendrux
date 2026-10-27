@@ -32,6 +32,7 @@ agent = Agent(
     provider="anthropic:claude-sonnet-4-6",
     prompt="Answer briefly.",
     pricing=pricing,
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 result = await agent.run("What is the capital of France?")
 print(result.usage.cost_usd)      # e.g. 0.000312

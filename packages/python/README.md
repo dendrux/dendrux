@@ -30,6 +30,7 @@ async def main():
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         prompt="You are a calculator.",
         tools=[add],
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is 15 + 27?")
         print(result.answer)

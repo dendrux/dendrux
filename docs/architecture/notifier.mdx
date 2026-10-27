@@ -148,6 +148,7 @@ async def main() -> None:
         prompt="You are a calculator. Use the add tool.",
         tools=[add],
         database_url="sqlite+aiosqlite:///demo.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         await agent.run("What is 15 + 27?", notifier=capture)   # notifier is per-call
 

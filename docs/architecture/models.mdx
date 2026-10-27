@@ -22,7 +22,7 @@ from dendrux.llm.anthropic import AnthropicProvider
 from dendrux.llm.openai import OpenAIProvider
 from dendrux.llm.openai_responses import OpenAIResponsesProvider
 
-agent = Agent(prompt="…", provider=AnthropicProvider(model="claude-opus-4-8"))
+agent = Agent(prompt="…", provider=AnthropicProvider(model="claude-opus-4-8"), strict_tenancy=False)  # single-tenant example; see Multi-tenancy
 ```
 
 ## Picking a provider

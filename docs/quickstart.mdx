@@ -89,10 +89,11 @@ def build_agent() -> Agent:
         tools=[refund],
         require_approval=["refund"],
         database_url="sqlite+aiosqlite:///./quickstart.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     )
 ```
 
-Three things worth noticing:
+Four things worth noticing:
 
 1. The tool is just a Python function. No registry, no schema. Dendrux reads the type hints and docstring (see [Tools](/docs/reference/tools) for supported types, descriptions, and strict mode).
 2. `require_approval=["refund"]` tells dendrux: when the LLM tries to call `refund`, pause the run and wait for a human to approve or reject.
@@ -100,6 +101,7 @@ Three things worth noticing:
    - **Omit it** → in-memory only. Fine for one-shot scripts and tests; the run dies with the process.
    - **SQLite** → `sqlite+aiosqlite:///./quickstart.db` writes to a single file. Zero setup — dendrux auto-creates tables on first connect. Ideal for local dev and small single-node apps. The `.db` file is what you back up.
    - **Postgres** → `postgresql+asyncpg://user:pass@host/db` for multi-process or production. Same code path. Run `dendrux db migrate` once to apply the schema (Alembic) before first use.
+4. `strict_tenancy=False` says this is a single-tenant app, so calls need no `tenant_id`. Without a choice, Dendrux 0.5 prints a `FutureWarning`, because strict tenancy becomes the default in 0.6. A multi-user app passes `tenant_id=` on every call instead; see [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ## 4. Start a run
 

@@ -29,6 +29,7 @@ agent = Agent(
     provider=AnthropicProvider(model="claude-haiku-4-5"),
     prompt="You are a support assistant.",
     skills=[triage],
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 ```
 

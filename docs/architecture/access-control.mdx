@@ -49,6 +49,7 @@ async def main() -> None:
         tools=[refund, delete_user],
         deny=["delete_user"],                 # delete_user can never execute
         database_url="sqlite+aiosqlite:///admin.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("Delete user 42 using the delete_user tool.")
         print(result.status.value)            # success  (deny is a gate, not a run-killer)
@@ -81,7 +82,7 @@ tool_calls table:
 Four things to pull out of that trace:
 
 1. **The tool function never ran.** `DELETE_CALLED` is empty. No DB row landed in `tool_calls` (that table only records actual executions, not blocked attempts).
-2. **A `policy.denied` event landed on the timeline.** `seq=2`, same `correlation_id` as the LLM's tool-call id, so a reader can join the denial to the call that triggered it.
+2. **A `policy.denied` event landed on the timeline.** `seq=3`, same `correlation_id` as the LLM's tool-call id, so a reader can join the denial to the call that triggered it.
 3. **The model was told.** A synthetic tool result with `{"denied": "Tool 'delete_user' is denied by policy."}` was appended to history. The next LLM turn saw it and produced a sensible user-facing answer.
 4. **The run still succeeded.** `status=success`. Deny is not a run-killer; it is a gate that the loop routes around.
 

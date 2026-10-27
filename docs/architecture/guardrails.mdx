@@ -257,6 +257,7 @@ async def main() -> None:
         prompt="You are a helpful assistant.",
         guardrails=[SecretDetection()],   # action='block' by default
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("Here is my key: AKIAIOSFODNN7EXAMPLE, please store it.")
         print(result.status.value)        # error  (the secret never reaches the model)
@@ -340,7 +341,7 @@ This action is the right choice when you want a signal that something matched wi
 
 ## Incoming and outgoing are both scanned — with different jobs
 
-Look closely at the `warn` run above. `seq=1` has `"direction": "incoming"`, `seq=2` has `"direction": "outgoing"`. Guardrails run at both ends of every LLM turn, but they do different work.
+Look closely at the `warn` run above. `seq=2` has `"direction": "incoming"`, `seq=3` has `"direction": "outgoing"` (`seq=1` is the `tools.declared` row). The outgoing `findings_count` can be higher than the incoming one: here it is 2 because the model's reply repeats the matched value, and each occurrence is a finding. Guardrails run at both ends of every LLM turn, but they do different work.
 
 The **incoming scan** happens before the messages list is handed to `provider.complete()`. Every message the strategy built gets scanned. `redact` replaces entities with placeholders at this point; this is the only place in the system where the content going to the LLM is mutated. If any guardrail decides to `block`, the LLM is never called.
 

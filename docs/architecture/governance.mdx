@@ -72,7 +72,7 @@ Every one of these lands in `run_events` with the same row shape as a lifecycle 
 
 ## Producing and reading a governance event
 
-Turn on a guardrail and the governance events land on the same `run_events` stream you read with `RunStore.get_events`. Here a PII guardrail redacts an email from the incoming message:
+Turn on a guardrail and the governance events land on the same `run_events` stream you read with `RunStore.get_events`. Here a PII guardrail redacts an email from the incoming message. `PII(engine="presidio")` needs the optional extra (`pip install "dendrux[presidio]"` and a spaCy model); the default regex engine, `PII()`, needs nothing extra:
 
 ```python
 import asyncio
@@ -92,6 +92,7 @@ async def main() -> None:
         prompt="You are a support agent. Reply briefly.",
         guardrails=[PII(engine="presidio")],   # redact PII before it reaches the model
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("My email is jane.doe@example.com, can you confirm it?")
 
@@ -100,10 +101,11 @@ async def main() -> None:
         for e in await store.get_events(result.run_id):
             print(e.sequence_index, e.event_type)
         # 0 run.started
-        # 1 guardrail.detected
-        # 2 guardrail.redacted
-        # 3 llm.completed
-        # 4 run.completed
+        # 1 tools.declared
+        # 2 guardrail.detected
+        # 3 guardrail.redacted
+        # 4 llm.completed
+        # 5 run.completed
 
 
 asyncio.run(main())

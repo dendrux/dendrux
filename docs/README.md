@@ -37,6 +37,7 @@ Adding a page here does not add it to the site's sidebar. The navigation is hand
 - No HTML comments (`<!-- -->`): MDX rejects them. To leave an invisible reviewer note, use a Markdown reference definition on its own line, with the text in double quotes: `[//]: # "note text"` (no double quotes or backslashes inside; parentheses in parentheses-delimited titles break the build). Notes that start `VERIFY-0.5.0:` mark text that depends on code not yet verified; remove them once it is.
 - Code blocks use triple backticks with a language tag (` ```python`, ` ```bash`). Shiki highlights them at build time.
 - One H1 per page (the title). Use H2/H3 for sections.
+- Examples that run in CI and examples a reader will paste must run without warnings. Single-tenant examples pass `strict_tenancy=False  # single-tenant example; see Multi-tenancy` on the `Agent`; multi-tenant ones pass `tenant_id=`. Token budgets pass `count_cache_tokens=` explicitly.
 - Do not name or compare with other agent frameworks.
 - Describe the secure behaviour a release ships, not the weakness it replaced.
 - Verify before you push: build the site against this directory (`DENDRUX_DOCS_PATH=<this dir> npm run build` in the docs site repo).

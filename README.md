@@ -90,6 +90,7 @@ async def main():
         provider=AnthropicProvider(model="claude-sonnet-4-6"),
         prompt="You are a calculator.",
         tools=[add],
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is 15 + 27?")
         print(result.answer)
@@ -319,6 +320,7 @@ async def research(query: str) -> str:
         provider=OpenAIProvider(model="gpt-4o"),
         prompt="You are a research specialist...",
         tools=[web_search],
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as sub_agent:
         result = await sub_agent.run(query)
         return result.answer

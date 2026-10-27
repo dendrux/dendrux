@@ -73,6 +73,7 @@ async def main() -> None:
         provider=AnthropicProvider(model="claude-haiku-4-5"),
         prompt=big_prompt,
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         r1 = await agent.run("What is 2+2?")
         r2 = await agent.run("What is 3+3?")

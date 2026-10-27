@@ -29,7 +29,7 @@ from dendrux.llm.anthropic import AnthropicProvider
 
 @tool(target="server")
 async def refund(order_id: int) -> str:
-    """Issue a refund for an order."""
+    """Refund an order by its id."""
     return f"Refunded order {order_id}"
 
 
@@ -41,6 +41,7 @@ async def main() -> None:
         tools=[refund],
         require_approval=["refund"],
         database_url="sqlite+aiosqlite:///cancel.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         paused = await agent.run("Refund order 42 using the refund tool.")
         print(paused.status.value)                       # waiting_approval

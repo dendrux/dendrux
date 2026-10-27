@@ -9,8 +9,6 @@ A **loop** is the piece of dendrux that decides how many LLM turns to do and whe
 
 Two loops ship in the box: `ReActLoop` (the default) and `SingleCall`. They target two different shapes of work. This page covers what each one is, when to pick it, and how `iteration_count` behaves under each. Every claim below is read from the Dendrux source.
 
-[//]: # "VERIFY-0.5.0: stale-version cleanup: Recheck the claims on this page against the 0.5.0 loops"
-
 ## What a loop actually does
 
 When you call `agent.run(input)`, the runner hands the request to the loop. The loop then:
@@ -114,7 +112,7 @@ The cycle inside one iteration, taken from `dendrux/loops/react.py`:
    - `ToolCall` → execute server tools, pause for client tools or approval, then go around.
 5. If `max_iterations` is hit without a `Finish`, return `status=max_iterations`.
 
-That last bullet is the safety cap. `Agent(max_iterations=...)` defaults to 10, with a hard ceiling validated in the constructor.
+That last bullet is the safety cap. `Agent(max_iterations=...)` defaults to 10 and must be at least 1.
 
 ### What `iteration_count` means here
 
@@ -142,6 +140,7 @@ async def main() -> None:
         prompt="You are a calculator. Use the add tool.",
         tools=[add],                         # ReActLoop is the default
         database_url="sqlite+aiosqlite:///calc.db",
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is 15 + 27?")
         print(result.iteration_count)        # 2  (one turn to call add, one to answer)
@@ -188,7 +187,7 @@ When the LLM emits a tool call that runs in the browser (target `client`), or on
 
 Before any tool runs, `ReActLoop` checks the call's arguments against the tool's JSON schema (`ToolDef.parameters`). This applies to every tool: local `@tool` functions, MCP tools (using the schema the server published), client tools (checked before the run pauses), and approval-gated tools (checked again when the run resumes after approval). The checks are:
 
-- **Unknown argument names.** Any name not in `properties` is rejected, unless the schema sets `additionalProperties` to something other than `false`.
+- **Unknown argument names.** Any name not in `properties` is rejected, unless the schema sets `additionalProperties` to something other than `false`. The message gives a count and the valid names, never the names the model sent.
 - **Missing required arguments.** Anything listed in `required`.
 - **Basic types and `enum`.** Top-level arguments are checked against `string`, `integer`, `number`, `boolean`, `array`, `object` and `null`, including type arrays like `["string", "null"]`. `integer` rejects booleans. Optional arguments may be `null`.
 
@@ -199,7 +198,7 @@ The validator only rejects what it understands. A property that uses `anyOf`, `o
 Messages name the argument and the problem, never the value the model sent. If the arguments fail validation, the tool's code does not run. The model gets one failed tool result that lists every problem it found:
 
 ```json
-{"error": "show has no argument 'r4<|\"|>,split'. Valid arguments: kind, title, result.", "code": "invalid_params"}
+{"error": "show has 1 unknown argument. Valid arguments: kind, title, result.", "code": "invalid_params"}
 ```
 
 ```text
@@ -229,11 +228,12 @@ summarization, extraction, one-turn Q&A.
 """
 ```
 
-Three constraints are enforced at construction or at run time:
+Four constraints are enforced at construction or at run time:
 
 1. **Zero tools.** The `Agent` constructor raises `ValueError` if `tools` is non-empty and `loop=SingleCall()`. Same for `tool_sources` (MCP). Skills are the exception: instruction-only skills are allowed and are written into the system prompt (see [Skills](/docs/architecture/skills#singlecall)), while a skill that carries files is rejected.
-2. **No resume.** If the runner ever passes resume-shaped parameters (`initial_history`, `initial_steps`, `iteration_offset`, `initial_usage`), `SingleCall.run()` raises `RuntimeError`. SingleCall has no waiting states to resume from.
-3. **No tool calls from the provider.** If the provider unexpectedly returns `tool_calls`, `SingleCall` raises `RuntimeError` rather than silently swallow them.
+2. **No resume.** If the runner ever passes resume-shaped parameters (`initial_steps`, `iteration_offset`, `initial_usage`), `SingleCall.run()` raises `RuntimeError`. SingleCall has no waiting states to resume from.
+3. **`before_tool` and structured output with guardrails are refused.** `Agent(before_tool=...)` with `SingleCall` raises `ValueError` (there are no tool calls to gate), and so does `output_type` together with `guardrails` (the typed model would bypass redaction).
+4. **No tool calls from the provider.** If the provider unexpectedly returns `tool_calls`, `SingleCall` raises `RuntimeError` rather than silently swallow them.
 
 ### What `iteration_count` means here
 
@@ -270,6 +270,8 @@ async def main() -> None:
         provider=AnthropicProvider(model="claude-haiku-4-5"),
         prompt="Classify the sentiment. Reply with one word: positive, negative, or neutral.",
         loop=SingleCall(),                   # no tools, exactly one LLM call
+        database_url="sqlite+aiosqlite:///classifier.db",   # so the rows below are written
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("I love this product!")
         print(result.answer)                 # "positive"

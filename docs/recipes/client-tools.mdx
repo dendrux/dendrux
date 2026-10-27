@@ -41,6 +41,7 @@ agent = Agent(
     ),
     tools=[lookup_price, read_excel_range],
     database_url="sqlite+aiosqlite:///app.db",
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 ```
 
@@ -87,6 +88,7 @@ async def main() -> None:
         prompt="Use read_excel_range (a client tool) to read spreadsheet cells when asked.",
         tools=[read_excel_range],
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         paused = await agent.run("Read Sheet1 range A1:A3 with read_excel_range.")
         print(paused.status.value)                       # waiting_client_tool

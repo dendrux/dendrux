@@ -28,6 +28,7 @@ agent = Agent(
     tools=[refund],
     require_approval=["refund"],
     database_url="sqlite+aiosqlite:///support.db",
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 ```
 

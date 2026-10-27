@@ -105,7 +105,7 @@ For a one-off script (not a pooled server) you can skip constructing the provide
 ```python
 from dendrux import Agent
 
-async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...") as agent:
+async with Agent(provider="anthropic:claude-haiku-4-5", prompt="...", strict_tenancy=False) as agent:
     print((await agent.run("hi")).answer)
 ```
 

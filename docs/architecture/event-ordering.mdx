@@ -91,6 +91,7 @@ async def main() -> None:
         provider=AnthropicProvider(model="claude-haiku-4-5"),
         prompt="Answer in one short sentence.",
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is the capital of France?")
 

@@ -92,6 +92,7 @@ async def main() -> None:
         prompt="Reply in one short sentence.",
         guardrails=[PII(engine="presidio")],
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("My name is Anmol and my email is anmol@example.com.")
 

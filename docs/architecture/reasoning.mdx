@@ -9,8 +9,6 @@ Modern Anthropic and OpenAI models can spend extra tokens "thinking" before they
 
 It is **off by default**. Every existing app keeps its exact behavior until you opt in. Everything below is read from the Dendrux source.
 
-[//]: # "VERIFY-0.5.0: stale-version cleanup: This page was last checked against 0.2.0a4; recheck against 0.5.0, especially the Anthropic thinking plus structured output request shape"
-
 ## The controls
 
 The reasoning knobs are constructor arguments on the provider, and every one of them can also be overridden per call via `agent.run(...)` / `agent.stream(...)` kwargs.
@@ -29,6 +27,7 @@ from dendrux.llm.anthropic import AnthropicProvider
 agent = Agent(
     prompt="…",
     provider=AnthropicProvider(model="claude-opus-4-8", thinking=True, effort="high"),
+    strict_tenancy=False,  # single-tenant example; see Multi-tenancy
 )
 
 # Per-call override — turn thinking up for one hard question, off for the rest.

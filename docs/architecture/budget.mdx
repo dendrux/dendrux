@@ -35,15 +35,16 @@ async def main() -> None:
         provider=AnthropicProvider(model="claude-haiku-4-5"),
         prompt="Answer in one short sentence.",
         # A deliberately tiny cap so the thresholds fire on one short call.
-        budget=Budget(max_tokens=10, warn_at=(0.5, 0.75, 0.9)),
+        budget=Budget(max_tokens=10, warn_at=(0.5, 0.75, 0.9), count_cache_tokens=False),  # keep the 0.4 count; see below
         database_url=url,
+        strict_tenancy=False,  # single-tenant example; see Multi-tenancy
     ) as agent:
         result = await agent.run("What is the capital of France?")
 
     store = RunStore.from_database_url(url)
     async with store:
         print([e.event_type for e in await store.get_events(result.run_id)])
-        # ['run.started', 'llm.completed', 'budget.threshold', 'budget.threshold',
+        # ['run.started', 'tools.declared', 'llm.completed', 'budget.threshold', 'budget.threshold',
         #  'budget.threshold', 'budget.exceeded', 'run.completed']
     print(result.status.value)   # success  (on_exceed defaults to "warn")
 
@@ -132,7 +133,7 @@ run_events:
 
 Things to read out of the trace:
 
-1. **Every fraction fired in one tick.** The first call returned at 600 tokens, past every threshold. The runtime fires each threshold the usage crossed, so a reader gets the whole "50, 75, 90, exceeded" story.
+1. **Every fraction fired in one tick.** The first call used more tokens than the limit, so it was past every threshold. The runtime fires each threshold the usage crossed, so a reader gets the whole "50, 75, 90, exceeded" story.
 2. **Each event fires once per run.** Events are keyed by `(metric, threshold)`, and the keys are saved with every pause. A run that pauses for approval or for the budget and later resumes does not repeat them.
 3. **Payloads say which metric.** `metric` is `"tokens"` or `"cost_usd"`; `used` and `max` are in that metric's unit (dollars as a float). `budget.exceeded` also carries `action`: the `on_exceed` that applies (`warn`, `pause` or `cancel`).
 4. **The tool at seq=7 still ran.** The pause came after the response that crossed the limit had been fully handled.
