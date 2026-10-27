@@ -66,7 +66,16 @@ class RunTaskManager:
         task: asyncio.Task[T] = asyncio.create_task(
             self._run_wrapper(run_id, coro), name=f"run:{run_id}"
         )
-        task.add_done_callback(_retrieve_exception)
+
+        def finished(done: asyncio.Task[T]) -> None:
+            # A cancelled task may never enter its wrapper. Close the unused
+            # inner coroutine and release tracking in that case as well.
+            coro.close()
+            if self._tasks.get(run_id) is done:
+                self._tasks.pop(run_id, None)
+            _retrieve_exception(done)
+
+        task.add_done_callback(finished)
         self._tasks[run_id] = task
         return task
 

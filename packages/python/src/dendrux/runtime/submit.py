@@ -12,6 +12,9 @@ not need to interpret store return values.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import weakref
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
@@ -1094,7 +1097,7 @@ async def prepare_client_results(
 
     from dendrux.loops.react import _apply_result_transform
 
-    results = _validated_client_results(agent, run_id, results)
+    results = await _validate_client_results(agent, run_id, results)
     validate_result_names(run_id, pause, results, json_payload=False)
     try:
         capped = [
@@ -1134,7 +1137,7 @@ async def prepare_client_results(
                 result = replace(result, payload=payload)
             except Exception as exc:
                 raise _invalid_tool_result(run_id, "client tool result transform failed") from exc
-            result = _validated_client_results(agent, run_id, [result])[0]
+            result = (await _validate_client_results(agent, run_id, [result]))[0]
             result = _cap_client_result(result, agent._limits.max_tool_result_bytes)
         prepared.append(result)
     return prepared
@@ -1155,7 +1158,7 @@ async def prepare_resume_results(
 ) -> list[ToolResult]:
     if await _resume_status(store, run_id) == RunStatus.WAITING_APPROVAL.value:
         results = legacy_approval_denial(
-            run_id, pause, _validated_client_results(agent, run_id, results)
+            run_id, pause, await _validate_client_results(agent, run_id, results)
         )
     return await prepare_client_results(agent, run_id, pause, results)
 
@@ -1179,6 +1182,66 @@ def _check_result_identities(run_id: str, results: list[ToolResult]) -> None:
             raise _invalid_tool_result(run_id, "invalid tool result identity")
 
 
+_CLIENT_VALIDATION_THREAD_BYTES = 65536
+_VALIDATION_GATES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+_VALIDATION_GATES_LOCK = threading.Lock()
+
+
+def _validation_gate() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    with _VALIDATION_GATES_LOCK:
+        reference = _VALIDATION_GATES.get(loop)
+        gate = reference() if reference is not None else None
+        if gate is None:
+            gate = asyncio.Lock()
+            _VALIDATION_GATES[loop] = weakref.ref(gate)
+        return gate
+
+
+async def _finish_validation(worker: asyncio.Task[list[ToolResult]]) -> None:
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    if not worker.cancelled():
+        worker.exception()
+
+
+async def _thread_client_results(
+    agent: Agent, run_id: str, results: list[ToolResult]
+) -> list[ToolResult]:
+    async with _validation_gate():
+        worker = asyncio.create_task(
+            asyncio.to_thread(_validated_client_results, agent, run_id, results)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Hold the admission slot until the CPU job really ends. Cancelling
+            # an asyncio waiter cannot stop a running default-executor thread.
+            await _finish_validation(worker)
+            raise
+
+
+async def _validate_client_results(
+    agent: Agent, run_id: str, results: list[ToolResult]
+) -> list[ToolResult]:
+    _check_result_identities(run_id, results)
+    size = sum(
+        len(result.payload) * (1 if result.payload.isascii() else 4)
+        for result in results
+        if isinstance(result.payload, str)
+    )
+    if size >= _CLIENT_VALIDATION_THREAD_BYTES:
+        return await _thread_client_results(agent, run_id, results)
+    return _validated_client_results(agent, run_id, results)
+
+
 def _validated_client_results(
     agent: Agent, run_id: str, results: list[ToolResult]
 ) -> list[ToolResult]:
@@ -1197,7 +1260,11 @@ def _validated_client_results(
                 "error": result.error,
                 "duration_ms": result.duration_ms,
             }
-            parsed = ToolResult.from_dict(data, limits=agent._limits)
+            from dendrux._wire import tool_result_from_dict
+
+            parsed = tool_result_from_dict(
+                data, agent._limits, _validated_payload=result._validated_payload
+            )
             total += len(parsed.payload.encode("utf-8"))
             if total > agent._limits.max_input_bytes:
                 raise ValueError("batch limit")

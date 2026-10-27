@@ -208,8 +208,31 @@ def _tool_result_fields(data: Any, limits: Limits) -> tuple[Any, Any, Any, Any, 
     return success, error, duration, images, metadata
 
 
-def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
-    from dendrux.types import ImageRef, ToolResult, _validate_persistable
+def _payload_int(value: str) -> int:
+    # A Python callback keeps a large integer array from monopolizing the GIL
+    # inside the C JSON scanner, even when decoding is on a worker thread.
+    return int(value)
+
+
+def _validate_payload_json(payload: str, validated_payload: str | None) -> None:
+    from dendrux.types import _validate_persistable
+
+    if validated_payload is payload:
+        return
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(
+            payload,
+            parse_constant=_invalid_constant,
+            parse_float=_finite_float,
+            parse_int=_payload_int,
+        )
+        _validate_persistable(parsed, "payload")
+
+
+def tool_result_from_dict(
+    data: Any, limits: Limits, *, _validated_payload: str | None = None
+) -> ToolResult:
+    from dendrux.types import ImageRef, ToolResult
 
     success, error, duration, images, metadata = _tool_result_fields(data, limits)
     try:
@@ -226,15 +249,11 @@ def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
                 meta={"code": "size_limit", "bytes": size},
             )
         # Legacy plain text is preserved byte-for-byte like submit_tool_results.
-        with contextlib.suppress(json.JSONDecodeError):
-            parsed = json.loads(
-                data["payload"], parse_constant=_invalid_constant, parse_float=_finite_float
-            )
-            _validate_persistable(parsed, "payload")
+        _validate_payload_json(data["payload"], _validated_payload)
         refs = tuple(ImageRef.from_dict(image) for image in images)
     except (TypeError, UnicodeError, RecursionError, KeyError) as exc:
         raise ValueError("Tool result must contain valid JSON and image descriptors") from exc
-    return ToolResult(
+    result = ToolResult(
         data["name"],
         data["call_id"],
         data["payload"],
@@ -243,6 +262,9 @@ def tool_result_from_dict(data: Any, limits: Limits) -> ToolResult:
         duration_ms=duration,
         images=refs,
     )
+
+    object.__setattr__(result, "_validated_payload", result.payload)
+    return result
 
 
 def tool_results_from_dict(data: Any, limits: Limits, max_results: int) -> list[ToolResult]:

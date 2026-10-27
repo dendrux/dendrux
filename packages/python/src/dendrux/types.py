@@ -17,7 +17,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
@@ -552,6 +552,8 @@ class ToolResult:
     # Per-image ingest notes (lenient MCP results): rendered as text after the payload.
     notes: tuple[str, ...] = field(default=(), compare=False)
 
+    _validated_payload: str | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if type(self.images) is not tuple:
             if isinstance(self.images, (str, bytes, bytearray)):
@@ -567,6 +569,10 @@ class ToolResult:
         """Validate a client object; replace oversized payloads using B12 caps.
 
         Only image references are accepted, never inline bytes or trusted meta.
+        This converter is synchronous: in an async route, offload large input
+        with ``await asyncio.to_thread(ToolResult.from_dict, data)``. Submission
+        reuses its private immutable-payload validation, while checking current
+        metadata and limits again.
         """
         from dendrux._wire import tool_result_from_dict
 
@@ -2192,6 +2198,27 @@ class InputValidationError(ValueError):
 _PERSISTABLE_NODE_LIMIT = 1048576 // 2
 
 
+def _persistable_nodes(value: Any, field: str) -> Iterator[tuple[Any, int]]:
+    from itertools import chain
+
+    stack: list[Iterator[Any]] = [iter((value,))]
+    visited = 0
+    while stack:
+        try:
+            item = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        visited += 1
+        if visited > _PERSISTABLE_NODE_LIMIT:
+            raise InputValidationError(field, "structure_limit")
+        yield item, len(stack) - 1
+        if isinstance(item, dict):
+            stack.append(chain.from_iterable(item.items()))
+        elif isinstance(item, (list, tuple)):
+            stack.append(iter(item))
+
+
 def _validate_persistable(value: Any, field: str = "input") -> None:
     """Reject unpersistable JSON without echoing it, with depth and work bounds.
 
@@ -2201,12 +2228,8 @@ def _validate_persistable(value: Any, field: str = "input") -> None:
     """
     import math
 
-    stack = [(value, 0)]
-    visited = 0
-    while stack:
-        item, depth = stack.pop()
-        visited += 1
-        if depth > 32 or visited + len(stack) > _PERSISTABLE_NODE_LIMIT:
+    for item, depth in _persistable_nodes(value, field):
+        if depth > 32:
             raise InputValidationError(field, "structure_limit")
         if isinstance(item, str):
             if "\x00" in item:
@@ -2219,14 +2242,12 @@ def _validate_persistable(value: Any, field: str = "input") -> None:
         elif isinstance(item, dict):
             if len(item) > _PERSISTABLE_NODE_LIMIT // 2:
                 raise InputValidationError(field, "structure_limit")
-            for key, child in item.items():
+            for key in item:
                 if not isinstance(key, str):
                     raise InputValidationError(field, "invalid_json")
-                stack.extend(((key, depth + 1), (child, depth + 1)))
         elif isinstance(item, (list, tuple)):
             if len(item) > _PERSISTABLE_NODE_LIMIT:
                 raise InputValidationError(field, "structure_limit")
-            stack.extend((child, depth + 1) for child in item)
         elif isinstance(item, float):
             if not math.isfinite(item):
                 raise InputValidationError(field, "nonfinite_json")

@@ -1617,6 +1617,25 @@ class Agent:
             expected_pause_id=expected_pause_id,
         )
 
+    async def _await_claimed_task(
+        self, task: asyncio.Task[RunResult], store: StateStore, run_id: str
+    ) -> RunResult:
+        from dendrux.runtime.runner import _persist_task_cancellation
+
+        try:
+            return await task
+        except asyncio.CancelledError:
+            # The awaited task can be cancelled before its first step. Its
+            # runner guard has not run, so finish the epoch-bound claim here.
+            cleanup = asyncio.create_task(_persist_task_cancellation(store, run_id))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise
+
     async def submit_tool_results(
         self,
         run_id: str,
@@ -1726,7 +1745,7 @@ class Agent:
                     pre_claim_status=RunStatus.WAITING_CLIENT_TOOL.value,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def submit_input(
         self,
@@ -1815,7 +1834,7 @@ class Agent:
                     pre_claim_status=RunStatus.WAITING_HUMAN_INPUT.value,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def submit_approval(
         self,
@@ -1973,7 +1992,7 @@ class Agent:
                         pre_claim_status=RunStatus.WAITING_APPROVAL.value,
                     ),
                 )
-                return await task
+                return await self._await_claimed_task(task, store, run_id)
 
             if approved is True:
                 epoch = await claim_or_raise(
@@ -1997,7 +2016,7 @@ class Agent:
                         extra_notifier=notifier,
                     ),
                 )
-                return await task
+                return await self._await_claimed_task(task, store, run_id)
 
             # Rejection path — fabricate one failed result per pending tool call,
             # then submit-and-claim so the runner's resume_claimed sees them as
@@ -2033,7 +2052,7 @@ class Agent:
                     pre_claim_status=RunStatus.WAITING_APPROVAL.value,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def get_result(
         self, run_id: str, *, tenant_id: str | None, include_pii: bool = False
@@ -2425,7 +2444,7 @@ class Agent:
                     extra_notifier=notifier,
                 ),
             )
-            return await task
+            return await self._await_claimed_task(task, store, run_id)
 
     async def submit_note(
         self,
