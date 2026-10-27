@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
@@ -312,3 +313,90 @@ async def test_trusted_backfill_reads_past_arguments_in_pages(store: Any, engine
     # Per follower: about one statement per 100 events (event pages) plus one per
     # 1000 pause-related events (argument pages), never one per pause.
     assert count[0] <= followers * (events // 100 + events // 1000 + 8), count[0]
+
+
+# ---------------------------------------------------------------------------
+# One Follow holds at most one slot, whatever start()/aclose() interleave
+# ---------------------------------------------------------------------------
+
+
+def _counts(feed: EventFeed) -> tuple[int, dict[Any, int]]:
+    return feed.followers, dict(feed._by_scope)
+
+
+async def test_concurrent_starts_on_one_follow_take_one_slot(store: Any, engine: Any) -> None:
+    run_store = RunStore.from_engine(engine)
+    run_none = await _paused_run(store, None)
+    feed = EventFeed(run_store, max_followers=10, max_followers_per_tenant=5)
+    follow = feed.follow(run_none, tenant_id=None)
+    await asyncio.gather(*(follow.start() for _ in range(5)))
+    assert _counts(feed) == (1, {("untenanted",): 1})
+    await follow.aclose()
+    assert _counts(feed) == (0, {})
+
+
+async def test_close_during_an_in_flight_start_takes_no_slot(store: Any, engine: Any) -> None:
+    run_store = RunStore.from_engine(engine)
+    run_none = await _paused_run(store, None)
+    feed = EventFeed(run_store, max_followers=10)
+    gate, entered = asyncio.Event(), asyncio.Event()
+    original = run_store._status
+
+    async def slow_status(*args: Any) -> Any:
+        entered.set()
+        await gate.wait()
+        return await original(*args)
+
+    run_store._status = slow_status  # type: ignore[method-assign]
+    follow = feed.follow(run_none, tenant_id=UNSCOPED)
+    starting = asyncio.create_task(follow.start())
+    await entered.wait()
+    await follow.aclose()  # closes while start() waits on the store
+    gate.set()
+    with pytest.raises(RuntimeError, match="closed"):
+        await starting
+    await follow.aclose()
+    assert _counts(feed) == (0, {})
+
+
+async def test_close_after_start_releases_the_slot(store: Any, engine: Any) -> None:
+    run_store = RunStore.from_engine(engine)
+    run_t = await _paused_run(store, "T")
+    feed = EventFeed(run_store, max_followers=10)
+    follow = feed.follow(run_t, tenant_id="T")
+    await follow.start()
+    assert _counts(feed) == (1, {("tenant", "T"): 1})
+    await asyncio.gather(follow.aclose(), follow.aclose())
+    assert _counts(feed) == (0, {})
+
+
+async def test_random_start_close_interleavings_never_leak(store: Any, engine: Any) -> None:
+    """200 random start/aclose interleavings over shared Follow objects: the
+    global and per-scope counters never exceed their caps and return to 0."""
+    import random
+
+    run_store = RunStore.from_engine(engine)
+    run_none = await _paused_run(store, None)
+    run_t = await _paused_run(store, "T")
+    rng = random.Random(1234)
+    feed = EventFeed(run_store, max_followers=8, max_followers_per_tenant=3)
+    scopes: list[Any] = [None, UNSCOPED, "T"]
+    follows = [
+        feed.follow(run_t if scope == "T" else run_none, tenant_id=scope)
+        for scope in (rng.choice(scopes) for _ in range(30))
+    ]
+
+    async def op(follow: Any) -> None:
+        await asyncio.sleep(rng.random() / 200)
+        if rng.random() < 0.6:
+            with contextlib.suppress(FollowCapacityError, RuntimeError):
+                await follow.start()
+        else:
+            await follow.aclose()
+        total, buckets = _counts(feed)
+        assert total <= 8 and all(n <= 3 for n in buckets.values())
+        assert total == sum(buckets.values())
+
+    await asyncio.gather(*(op(rng.choice(follows)) for _ in range(200)))
+    await asyncio.gather(*(f.aclose() for f in follows))
+    assert _counts(feed) == (0, {})

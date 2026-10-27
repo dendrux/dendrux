@@ -595,6 +595,7 @@ class Follow:
         self._started = False
         self._holds_slot = False
         self._closed = False
+        self._start_lock = asyncio.Lock()
         self._feed: _RunFeed | None = None
         self._follower: _Follower | None = None
         self._deadline: float | None = None
@@ -606,14 +607,35 @@ class Follow:
     async def start(self) -> None:
         """Check the scope and take a follower slot; idempotent.
 
+        Concurrent calls on one ``Follow`` take one slot. A :meth:`aclose`
+        that lands while a start is waiting on the store wins: the start
+        raises ``RuntimeError`` and takes no slot.
+
         Raises:
             RunNotFoundError: the run does not exist or is outside the tenant.
             FollowCapacityError: the feed is full.
         """
         if self._started:
             return
+        async with self._start_lock:
+            if self._started:
+                return
+            self._raise_if_closed()
+            await self._check_run()
+            self._raise_if_closed()  # closed while waiting on the store: take no slot
+            # No await from here to the slot: aclose() cannot interleave.
+            self._owner._acquire(self._tenant_id)
+            self._holds_slot = True
+            self._started = True
+            if self._max_duration_s is not None:
+                self._deadline = asyncio.get_running_loop().time() + self._max_duration_s
+
+    def _raise_if_closed(self) -> None:
         if self._closed:
             raise RuntimeError("This follow is closed.")
+
+    async def _check_run(self) -> None:
+        """Scope check, terminal drain check and wait for a closing feed (all awaits)."""
         store = self._owner.store
         status = await store._status(self.run_id, self._tenant_id)
         if status is None:
@@ -624,11 +646,6 @@ class Follow:
             )
             self.drained_terminal = not pending
         await self._owner._wait_for_closing(self.run_id)
-        self._owner._acquire(self._tenant_id)
-        self._holds_slot = True
-        self._started = True
-        if self._max_duration_s is not None:
-            self._deadline = asyncio.get_running_loop().time() + self._max_duration_s
 
     async def __aiter__(self) -> AsyncIterator[FollowItem]:
         # A separate generator gets finalized when an async-for is abandoned,
