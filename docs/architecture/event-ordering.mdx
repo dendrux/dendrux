@@ -20,7 +20,7 @@ The only guarantee readers need is the first one: **within a run, `sequence_inde
 
 A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every worker is on 0.5.0 or later. Until then, a fleet that mixes 0.4.1 and 0.5 workers can in rare races write one duplicate index, and an SSE cursor can miss that one event. That window closes with the 0.5.1 index.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T1 implements the allocation; confirm the statement shape and that the return value reaches the recorder"
 
 ## A real event timeline
 
@@ -116,4 +116,4 @@ Dendrux keeps the log in the `run_events` table and polls it. The tradeoff is a 
 2. **No message bus.** Clients watching the same run in one process share one polling query that fans out in memory, and nothing is shared between processes, so adding a second server instance needs no shared state.
 3. **Events are durable.** If the runner crashes mid-iteration, events written before the crash are still visible to readers. Nothing lives only in memory.
 
-The poll interval and a periodic `: keepalive` comment are tuned so idle connections do not get closed by reverse proxies, but the wire format is plain SSE with no dendrux-specific framing. Any client that can read `EventSource` can read this stream.
+`RunStore.follow` yields heartbeats when a run is quiet so your route can send a periodic keepalive and keep reverse proxies from closing idle connections. Dendrux ships no SSE endpoint and no wire framing of its own: your route chooses the frames, and a browser client that must send an authorization header reads them with `fetch` rather than the native `EventSource`. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).

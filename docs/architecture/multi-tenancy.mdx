@@ -33,11 +33,12 @@ runs = await store.list_runs()                      # same as UNSCOPED
 
 ## Reads: `RunStore`
 
-Every `RunStore` read takes `tenant_id: TenantScope = UNSCOPED`: `get_run`, `get_events`, `stream_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pii_mapping`, `get_pauses`, `list_runs` and `count_runs`. (`get_subtree`, `get_notes` and `read_image` already took a tenant.)
+Every `RunStore` read takes `tenant_id: TenantScope = UNSCOPED`: `get_run`, `get_events`, `stream_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pii_mapping`, `get_pauses`, `get_pause_page`, `list_runs` and `count_runs`. (`get_subtree`, `get_notes` and `read_image` already took a tenant.) `get_pending`, `follow` and `get_event_view` are different on purpose: they **require** `tenant_id` and raise `TypeError` when it is left out, so omitting it can never read across tenants. `Agent.get_result` also requires an explicit tenant and refuses `UNSCOPED`.
 
 - A run outside the scope is reported exactly like a missing one: `get_run` returns `None`, and the other reads raise `RunNotFoundError` or return nothing, with no way to tell the two cases apart.
 - The scope is part of the same SQL query as the read, not a second lookup, so it cannot race.
 - `RunSummary` and `RunDetail` carry `tenant_id`.
+- Live readers are counted per scope. `RunStore.follow` admits 500 followers per store and, by default, 100 per tenant scope, so one tenant cannot take every slot. The cap is per scope, not per user: each string tenant is one scope, all untenanted (`None`) followers together are one scope and all `UNSCOPED` followers together are one. A single-tenant app with more than 100 live readers per process builds its own `EventFeed(store, max_followers_per_tenant=None)`. See [RunStore](/docs/reference/run-store#pending-and-live-reads).
 
 In your own routes, pass the caller's tenant on every read:
 
@@ -109,7 +110,9 @@ See [Runs](/docs/architecture/runs) for what a key does.
 | --- | --- |
 | Run missing, or in another tenant, on any `Agent` or `RunStore` path | `RunNotFoundError(run_id)` (a `LookupError`) |
 | `strict_tenancy=True` and `tenant_id` omitted | `TenantScopeRequiredError` |
-| `tenant_id=""` | `ValueError` |
+| `tenant_id=""`, or an id or tenant that is too long or holds NUL on a read | `ValueError` (a fixed message, no echo) |
+| `get_pending` or `follow` without `tenant_id` | `TypeError` |
+| Strict tenancy and the module-level `dendrux.run` with no tenant | `TenantScopeRequiredError` (`tenant_id=None` passed explicitly is fine) |
 | Delegating to a child with a different explicit tenant | `ValueError` |
 
 Map `RunNotFoundError` to 404 for both missing and foreign runs. That is what stops callers learning which run ids exist in other tenants.

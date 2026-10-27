@@ -2,7 +2,7 @@
 
 > Python SDK for Dendrux — the framework for building agents with tools, persistence, and observability.
 
-**Version:** 0.4.1
+**Version:** 0.5.0
 
 ## Install
 
@@ -109,7 +109,6 @@ async with Agent(
     prompt="...",                        # Required: system prompt
     tools=[add],                         # Optional: tool functions
     database_url=f"sqlite+aiosqlite:///{Path.home() / '.dendrux' / 'dendrux.db'}",
-    redact=my_scrubber,                  # Optional: scrub persisted strings
 ) as agent:
     result = await agent.run(
         "What is 15 + 27?",
@@ -130,7 +129,12 @@ result.steps           # list[AgentStep] — full reasoning chain
 result.iteration_count # int — how many loop iterations ran
 result.usage           # UsageStats — input_tokens, output_tokens, total_tokens
 result.run_id          # str — unique run identifier (ULID)
-result.error           # str | None — error message if status is ERROR
+result.error           # str | None — safe error message if status is ERROR
+result.error_info      # ErrorInfo | None — category, retryable, safe_message of a provider or database failure
+result.stop_reason     # StopReason | None — why the answer call stopped; result.truncated is True at max_tokens
+result.pause_id        # str | None — id of the current pause; pass it as expected_pause_id= (required to approve)
+result.pending         # PendingPause | None — what a paused run is waiting on
+result.to_dict()       # versioned, allowlisted browser envelope (never meta, traces or PII mappings)
 ```
 
 ### Tool Options
@@ -144,6 +148,10 @@ result.error           # str | None — error message if status is ERROR
 @tool(timeout_seconds=120)               # Custom timeout (default 120s)
 @tool(parallel=False)                    # Run alone, not concurrently
 ```
+
+## Upgrading
+
+See [Upgrading to 0.5.0](https://www.dendrux.dev/docs/upgrading-to-0.5.0) for every change from 0.4.1 with an action for each, the migration steps, and a map from the removed read router to `RunStore`.
 
 ## Full Documentation
 

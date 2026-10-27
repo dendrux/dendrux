@@ -33,16 +33,15 @@
 0.5.0 ("Trust") makes Dendrux safe by default for multi-tenant, production use. Read the [upgrade guide](docs/upgrading-to-0.5.0.mdx) before you deploy: run `dendrux db migrate`, then roll your workers (rolling deploys are supported).
 
 - **Tenant-scoped reads.** Pass `tenant_id=` on every RunStore read and Agent write. A foreign run looks like a missing one. Your routes authenticate the actor and authorize user-level run ownership. See [Multi-tenancy](docs/architecture/multi-tenancy.mdx).
-- **Payloads hidden by default.** `RunStore.follow` and `get_event_view` hide historical payloads by default. Active client calls remain actionable and may contain personal data; authorize the actor before returning them. Raw RunStore reads require your own response projection.
-- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx).
+- **Payloads hidden by default.** `RunStore.follow` and `get_event_view` show only enumerated codes, generated ids, numbers and declared names; free text, past tool call ids and tool names they cannot prove are hidden. This protects readers from untrusted data, not from hostile code in your own process. Active client calls remain actionable and may contain personal data; authorize the actor before returning them. `RunResult.to_dict()` is the versioned browser envelope; raw RunStore reads require your own response projection. See [RunStore](docs/reference/run-store.mdx#redacted-views).
+- **Build your own read routes.** `RunStore.get_pending` (what a run is waiting on) and `RunStore.follow` (a hardened live feed that closes when the run does, shares one poller per run and is bounded) are library calls for routes you own. The packaged read router (`make_read_router`) and the embedded dashboard are **removed**. See [Build your own read routes](docs/recipes/build-your-own-read-routes.mdx) and the endpoint map in the [upgrade guide](docs/upgrading-to-0.5.0.mdx#removed-in-050).
 - **No more silent provider failures.** Every failed request is a typed `ProviderError` (`.category`, `.retryable`, `.safe_message`); empty streams, refusals and failed Responses calls end the run `error` with `RunResult.error_info` instead of an empty `success`. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](docs/recipes/handling-provider-errors.mdx).
 - **Dollar budgets must be priceable.** A `max_cost_usd` budget for a model with no price raises `BudgetConfigurationError` instead of never firing. `Budget(count_cache_tokens=True)` opts into counting cache tokens.
 - **Tools are validated and coerced.** Model-typed parameters arrive as model instances, `Field(...)` constraints are enforced, and what a person approves is exactly what runs. Sync tools run on a bounded thread pool, and results, inputs, metadata and notes have size caps (`Agent(limits=Limits(...))`).
 - **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. The default is unchanged. See [PII restore](docs/architecture/pii-restore.mdx).
-- **Run integrity.** Claims are fenced, and a resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
-- **Migration.** Run `dendrux db migrate` (revision `d7e8f9a0b1c2`). Several defaults flip in 0.6; 0.5 prints a `FutureWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
-
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support before documenting stale-submit protection."
+- **Run integrity.** Claims are fenced. Every pause has a `pause_id`, and **approving requires `expected_pause_id=`** so a stale tab cannot approve a newer pause. A resume under changed governance emits `governance.changed` (or raises with `on_governance_change="raise"`).
+- **Bounded everything.** Followers, the tool queue, MCP discovery, `sweep()`, inputs, metadata, notes and tool results all have limits. Build the store once at startup; see [Scaling workers](docs/guides/scaling.mdx).
+- **Migration.** Run `dendrux db migrate` once, as a deploy job over a direct connection (revisions `d7e8f9a0b1c2` and `e8f9a0b1c2d3`). Several defaults flip in 0.6; 0.5 prints a `FutureWarning` for each. See the [CHANGELOG](packages/python/CHANGELOG.md).
 
 ## What's new in 0.4.1
 
@@ -125,7 +124,7 @@ agent = Agent(
 ## Install
 
 ```bash
-pip install "dendrux[all]"            # everything (Anthropic + OpenAI + DB + http)
+pip install "dendrux[all]"            # everything (Anthropic, OpenAI, Postgres driver, MCP, Presidio, OpenTelemetry)
 pip install "dendrux[anthropic]"      # Anthropic + core runtime
 pip install "dendrux[openai]"         # OpenAI + core runtime
 pip install "dendrux[mcp]"            # managed MCP client runtime
@@ -248,7 +247,7 @@ agent = Agent(
 
 **Tool deny**: `deny=["tool_name"]` blocks tools deterministically. The model gets a synthesized error and adapts. The tool never executes.
 
-**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True)`, reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `decisions={call_id: ApprovalDecision.approve()}`.
+**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)` (the pause id the approver was shown), reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `decisions={call_id: ApprovalDecision.approve()}`.
 
 **Tool policy**: `before_tool=hook` decides each call from its arguments: `ToolDecision.deny(...)`, `.require_approval(...)`, `.substitute(result)` or `None` to allow.
 
@@ -494,7 +493,7 @@ dendrux traces RUN_ID --limit 100
 dendrux db check
 ```
 
-Use RunStore reads plus your own tracing and operator UI. See
+Use RunStore reads plus your own tracing and inspection tools. See
 [Observability](docs/recipes/observability.mdx) for bounded inspection and
 [HTTP integration](docs/reference/http-api.mdx) for app-owned routes.
 
@@ -540,15 +539,15 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 
 | Metric | Value |
 |--------|-------|
-| Source code | 55,000+ lines |
-| Test code | 90,000+ lines |
-| Test cases | 6,100+ (about 5,400 run on SQLite alone; the rest need Postgres) |
-| Test-to-source ratio | 1.6 : 1 |
+| Source code | 65,000+ lines |
+| Test code | 110,000+ lines |
+| Test cases | 9,000+ (the Postgres integration cases skip without a database) |
+| Test-to-source ratio | 1.7 : 1 |
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
 | CI checks | lint, format, types, tests |
-| Alembic migrations | 16 |
-| Examples | 34 runnable scripts + 6 example apps |
+| Alembic migrations | 17 |
+| Examples | 39 runnable scripts + 5 example apps |
 | Development started | March 11, 2026 |
 
 ---
@@ -574,7 +573,7 @@ Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent
 | Client-side tool pause/resume | Stabilizing |
 | Public read API (`RunStore`) | Stabilizing |
 
-Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 6,100+ tests, strict types, Apache 2.0.
+Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 9,000+ tests, strict types, Apache 2.0.
 
 <!-- VERIFY-0.5.0: refresh the counts in The Numbers (lines of code, test cases, migrations, examples) from the release candidate -->
 

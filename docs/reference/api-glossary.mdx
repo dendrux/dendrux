@@ -86,7 +86,8 @@ The guide is [Images](/docs/recipes/images).
 | `RunStore` | `from dendrux.store import RunStore` | Read-only facade over the six tables. See [RunStore](/docs/reference/run-store). |
 | `PendingPause` / `PendingToolCall` | `from dendrux.store import PendingPause, PendingToolCall` | What a paused run waits on, from `RunStore.get_pending`. See [Build your own read routes](/docs/recipes/build-your-own-read-routes). |
 | `Follow` / `FollowEnd` / `FollowHeartbeat` / `FollowCapacityError` / `EventFeed` | `from dendrux.store import ...` | The hardened live feed behind `RunStore.follow`. |
-| `redact_event` | `from dendrux.store import redact_event` | Conservative standalone event projection; use `RunStore.get_event_view` for verified active approval arguments. |
+| `redact_event` | `from dendrux.store import redact_event` | Conservative standalone event projection; use `RunStore.get_event_view` for verified active approval arguments. See [redacted views](/docs/reference/run-store#redacted-views). |
+| `EventFeed(store, max_followers=, max_followers_per_tenant=)` | `from dendrux.store import EventFeed` | Build your own feed when you need other follower caps (500 per store and 100 per tenant scope by default). |
 | `tool_pool_stats` | `from dendrux import tool_pool_stats` | Process-wide tool threads, queued calls and timed-out calls still running. |
 
 `RunStore` read methods return these record types (all from `dendrux.store`): `RunSummary`, `RunDetail`, `StoredEvent`, `LLMCall`, `ToolInvocation`, `TraceEntry`, `PausePair`, plus `RunSubtree`, `SubtreeNode`, `RunUsage` (from `get_subtree`) and `RunNote` (from `get_notes`). Fields are documented on the [RunStore](/docs/reference/run-store) page.
@@ -98,6 +99,7 @@ The guide is [Images](/docs/recipes/images).
 | `MCPSource` | `from dendrux.mcp import MCPSource` | Immutable HTTP or stdio source configuration. See [MCP](/docs/architecture/mcp). |
 | `MCPRuntime` | `from dendrux.mcp import MCPRuntime` | Process-wide managed owner of MCP connections: tenancy, capacity, circuit breaking, telemetry. Recommended for production. |
 | `MCPConnection` | `runtime.bind(...)` / `await runtime.rebind(...)` | Lazy handle for one `(tenant_key, connection_key)` identity; `connection.tools()` creates agent views, `await connection.discover()` returns the server's catalog without an Agent. |
+| `MCPDiscoveryLimitError` / `MCPInvalidToolSchemaError` | `from dendrux.mcp import MCPDiscoveryLimitError, MCPInvalidToolSchemaError` | `tools/list` passed a page, tool, byte, cursor or time bound (code `discovery_limit`); a strict view found a malformed argument schema (code `invalid_tool_schema`). See [MCP: discovery limits](/docs/architecture/mcp#discovery-limits). |
 | `MCPToolNotFoundError` | `from dendrux.mcp import MCPToolNotFoundError` | Raised by `await connection.call_tool(name, arguments)` for a tool the server does not list. `call_tool` runs a server tool directly and bypasses Agent governance; see [MCP](/docs/architecture/mcp#calling-a-tool-directly). |
 | `MCPDiscovery` | `await connection.discover()` | Server name, version, protocol version, instructions, and the raw `MCPToolInfo` catalog of one connection. |
 | `MCPToolView` | `connection.tools(...)` | Namespace and tool policy one agent consumes via `tool_sources=`. |
@@ -110,13 +112,14 @@ The guide is [Images](/docs/recipes/images).
 
 | Symbol | Import | What it is |
 | --- | --- | --- |
-| `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`. Fields include `error_info` and `pause_id`. |
+| `RunResult` | `from dendrux.types import RunResult` | Returned by `run`/`resume`/`submit_*`/`cancel_run`/`get_result`. Fields include `error_info`, `pause_id` and `pending`; `to_dict()` is the versioned browser envelope. See [RunResult](/docs/reference/agent#runresult). |
 | `ErrorInfo` | `from dendrux import ErrorInfo` | The safe, structured summary of a provider failure on `RunResult.error_info` and `RunDetail.error_info`. See [Handling provider errors](/docs/recipes/handling-provider-errors). |
 | `RunStatus` | `from dendrux.types import RunStatus` | `pending`, `running`, `waiting_*`, `paused`, `success`, `error`, `cancelled`, `max_iterations`. |
 | `StopReason` | `from dendrux import StopReason` | Why the final LLM call stopped: `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `content_filter`, `refusal`, `pause_turn`, `other`. On `RunResult.stop_reason`; `RunResult.truncated` is true for `max_tokens`. See [Truncated answers](/docs/architecture/runs#truncated-answers). |
 | `RunStream` | `from dendrux.types import RunStream` | Async iterable returned by `stream()`/`resume_stream()`. |
 | `RunEvent` / `RunEventType` | `from dendrux.types import RunEvent, RunEventType` | Streaming events (`text_delta`, `tool_use_*`, `run_*`). |
-| `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. |
+| `ToolResult` | `from dendrux.types import ToolResult` | A tool result you submit via `submit_tool_results`. `ToolResult.from_dict` and `list_from_dict` validate results that arrive from a browser. |
+| `InputValidationError` | `from dendrux.types import InputValidationError` | A `ValueError` for a value Dendrux cannot accept or store, or an approval with no `expected_pause_id`; carries a fixed `field` and `code`. |
 | `ToolResultContext` / `ToolResultTransform` | `from dendrux import ToolResultContext, ToolResultTransform` | Input and type of `Agent(tool_result_transform=...)`. See [Transforming tool results](/docs/reference/agent#transforming-tool-results). |
 | `GovernanceEventType` | `from dendrux import GovernanceEventType` | The 33 governance event types. See [Governance](/docs/architecture/governance). |
 | `ApprovalDecision` | `from dendrux import ApprovalDecision` | One human decision for `submit_approval(decisions=...)`: `approve()` or `deny(reason)`. See [Approval](/docs/architecture/approval#per-call-decisions). |
@@ -134,4 +137,5 @@ Run-control, skill-continuity, schema, and context-length exceptions live in `de
 - [RunStore](/docs/reference/run-store): every read method and record type.
 - [Build your own read routes](/docs/recipes/build-your-own-read-routes): the HTTP read surface.
 - [Errors](/docs/reference/errors): the exception hierarchy and HTTP mappings.
-- [HTTP API surface](/docs/reference/http-api): the Python methods and application-owned HTTP boundary.
+- [HTTP integration](/docs/reference/http-api): the Python methods and application-owned HTTP boundary.
+- [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0): every change from 0.4.1, with an action for each.

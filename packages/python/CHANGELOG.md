@@ -1,5 +1,185 @@
 # Changelog
 
+## 0.5.0 - unreleased
+
+"Trust". Reads are tenant-scoped and hide payloads by default, provider
+failures are typed, every queue and payload has a bound, paused runs are
+fenced and bound to a pause id, and the read router and embedded dashboard are
+gone in favour of read primitives on `RunStore`. Run `dendrux db migrate` once,
+as a deploy job, before starting 0.5 workers. See
+[Upgrading to 0.5.0](https://dendrux.dev/docs/upgrading-to-0.5.0) for an action
+for every change below.
+
+### Highlights
+
+- **Tenant-scoped reads and strict tenancy.** Every `RunStore` read takes
+  `tenant_id=`; `get_pending` and `follow` require it. `Agent(strict_tenancy=True)`
+  makes every entry point require one. Idempotency keys are unique per tenant.
+- **Safe live and pending reads.** `RunStore.get_pending`, `follow`,
+  `get_event_view` and `redact_event` replace the router. Redacted views show
+  only enumerated codes, generated ids, numbers and declared names; the active
+  pause stays actionable.
+- **Typed provider errors and deadlines.** Silent empty answers are errors,
+  `ProviderError` subclasses carry a category and a safe message, and calls have
+  deadlines.
+- **Run integrity.** Claims are fenced by an epoch, every pause has a
+  `pause_id`, and approving requires `expected_pause_id`.
+- **Bounded everything.** Input, metadata, notes, tool results, MCP discovery,
+  followers, the tool queue and `sweep()` all have limits with overrides.
+- **Scale.** Equal `database_url` Agents share one reference-counted pool,
+  non-SQLite pools default to pre-ping and recycling, and a
+  [scaling guide](https://dendrux.dev/docs/guides/scaling) covers PgBouncer,
+  the migration job and sweep cadence.
+
+### Breaking changes
+
+Each item links to a before/after note on the upgrade page.
+
+- `make_read_router`, `dendrux.http`, the embedded dashboard, the
+  `dendrux dashboard` command and the `http` extra are removed (see Removed).
+- Approving a pause requires `expected_pause_id=`; without it
+  `submit_approval(approved=True)` raises `InputValidationError`.
+- `Budget(max_cost_usd=...)` on a model with no price raises
+  `BudgetConfigurationError` at construction and at run start.
+- Provider failures raise `ProviderError` subclasses, not SDK, `TimeoutError`
+  or `ConnectionError` instances; a run that ended `success` with an empty
+  answer now ends `error`. New deadlines: `call_timeout=600` and
+  `stream_idle_timeout=600`.
+- Local `@tool` arguments are validated and coerced; model-typed parameters
+  receive model instances.
+- Metadata keys starting with `dendrux.` are rejected.
+- `RunNotFoundError` takes a run id and is one class everywhere; `retry()` and
+  `submit_*` raise it for missing and foreign runs.
+- `RunStore` and `StateStore` `list_runs` / `count_runs`: `tenant_id=None` means
+  untenanted runs only; omit it or pass `UNSCOPED` for all tenants.
+- Size caps: `ValueError` for oversized input text, metadata and notes;
+  oversized tool results are replaced by a `size_limit` result.
+- Guardrail events and errors carry kinds, counts and locations, never matched
+  text; unscannable content blocks under `block` and `redact`. A guardrail-blocked
+  run ends with `run.error`, not `run.completed`.
+- Custom `StateStore`s: `save_run_event` allocates and returns the index
+  (`EventSequencer` is removed); claims, epochs and sweeps have new methods.
+- Redacted views hide free text, past tool call ids and tool names they cannot
+  prove; `get_pauses` hides past arguments and `user_input` by default.
+- `Agent.get_result(include_pii=False)` leaves `pii_mapping` out;
+  `RunResult.meta` has no `pause_state`.
+- Read flags and control booleans must be real `bool` values; reads validate ids,
+  cursors, filters and dates and raise `ValueError` with a fixed message.
+- NUL and lone surrogates are rejected in input text, keys and metadata; JSON
+  must be finite; client tool results are checked against the pending calls.
+- `RunStore.follow` admits 500 followers per store and 100 per tenant scope;
+  single-tenant apps with more live readers set `max_followers_per_tenant=None`.
+- In-process `cancel_run` on a resumed run returns a `CANCELLED` result instead
+  of raising `CancelledError`.
+- MCP discovery is bounded, and tools with malformed argument schemas are
+  skipped or rejected.
+- Migrations `d7e8f9a0b1c2` and `e8f9a0b1c2d3`.
+- The OpenTelemetry run span is `ERROR` when `RunResult.error_info` is set.
+
+### Added
+
+- **Read primitives.** `RunStore.get_pending`, `follow`, `get_event_view`,
+  `get_pause_page`, `EventFeed`, `redact_event`, `PendingPause`,
+  `PendingToolCall`, `Follow`, `FollowEnd`, `FollowHeartbeat` and
+  `FollowCapacityError`. `get_pauses` takes `limit` and `include_payloads`.
+- **Results.** `RunResult.pending`, `RunResult.pause_id`, `RunResult.error_info`,
+  `RunResult.to_dict()` (a versioned browser envelope, `wire_version` 1),
+  `Agent.get_result(run_id, tenant_id=, include_pii=)`, and
+  `ToolResult.from_dict` / `list_from_dict` for results coming back from a client.
+- **Pause ids.** `pause_id` on `RunResult`, `PendingPause`, `PausePair` and the
+  `run.paused` event; `expected_pause_id=` on every `submit_*`, `resume` and
+  `resume_stream`; `PauseStatusMismatchError(reason="pause_id")`. Pause state is
+  versioned (`schema_version`).
+- **Tenancy and limits.** `UNSCOPED`, `Agent(strict_tenancy=, limits=,
+  tool_threads=, on_governance_change=)`, `Limits`, `TenantScopeRequiredError`,
+  `NoteLimitExceededError`, `GovernanceMismatchError` and the `governance.changed`
+  event.
+- **Provider errors.** `ProviderError` and `ProviderAuthError`,
+  `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderUnavailableError`,
+  `ProviderStreamIncompleteError`, `ModelRefusalError`, `ContentFilteredError`
+  and `ContextLengthExceededError` with `.category`, `.retryable` and
+  `.safe_message`; `call_timeout`, `stream_idle_timeout` and
+  `stream_total_timeout`; `llm.failed` events; `PersistenceError` for database
+  failures.
+- **Budget and PII.** `Budget(count_cache_tokens=)`, dollar-budget price lookup
+  (exact, then glob, response model before requested model),
+  `PII(restore="allowlisted")` with `@tool(receives_pii=...)` and the
+  `guardrail.restore_skipped` event.
+- **Operations.** `dendrux db check [--allow-unstamped]`,
+  `SchemaOutOfDateError.missing_indexes`, `sweep(batch_size=, max_runs=,
+  database_options=)` with a `sweep_cap_reached` warning, `database_options=` on
+  `RunStore.from_database_url`, `sweep` and `get_engine`, `dendrux.tool_pool_stats()`
+  and `DENDRUX_TOOL_THREADS` / `DENDRUX_TOOL_QUEUE_LIMIT`.
+- **MCP.** `MCPSource(max_discovery_pages=, max_discovery_tools=,
+  discovery_timeout=, max_discovery_bytes=)`, `MCPDiscoveryLimitError` (code
+  `discovery_limit`), `MCPInvalidToolSchemaError` (code `invalid_tool_schema`),
+  skip reason `invalid_schema`, `MCPSessionExpiredError`, and a single reopen of an
+  expired session.
+- **Events.** `tools.declared` at the start of every run segment, `llm.failed`,
+  `governance.changed`, and `approval.requested.params`.
+- **Docs.** [Upgrading to 0.5.0](https://dendrux.dev/docs/upgrading-to-0.5.0),
+  [Scaling workers](https://dendrux.dev/docs/guides/scaling), multi-tenancy, PII
+  restore, handling provider errors, build your own read routes, and a
+  tenant-erasure recipe. Every Python snippet in the docs runs in CI.
+
+### Changed
+
+- Implicit `DENDRUX_DATABASE_URL` engines warn (`DeprecationWarning`) and are
+  removed in 0.6; the shared engine refuses use from a second event loop.
+- `Agent(database_url=...)` Agents with equal URL and options share one pool.
+  Non-SQLite pools default to `pool_pre_ping=True` and `pool_recycle=1800`.
+- Event numbering is allocated inside the insert; concurrent writers no longer
+  read the event log first.
+- `sweep()` is bounded (`max_runs` 10,000, ceiling 100,000 per category) and ages
+  waiting runs by the time of their last status change; a waiting run is
+  abandoned only when both that time and `updated_at` are stale. Swept waiting
+  runs carry a safe error and a failure reason.
+- Guardrails scan a multi-part message, and each tool result, as one text; phone,
+  card, IP and AWS-key detection is stricter.
+- Resuming under changed governance emits `governance.changed`; resume re-applies
+  `deny` and the per-run tool call limits.
+- Sync tools run on a bounded process-wide thread pool; a call that times out
+  reports `timeout_not_started` or `timeout_outcome_unknown`.
+- Cache writes on OpenAI-wire providers count as cache-creation tokens, not fresh
+  input.
+- FutureWarnings announce the 0.6 flips: strict tenancy, `on_governance_change`,
+  `count_cache_tokens` and (under strict tenancy) a missing pause id on non-approval
+  submits.
+
+### Fixed
+
+- Failed streams, Responses `error` / `response.failed`, refusals and content
+  filters no longer return silent empty answers.
+- Anthropic thinking with structured output uses `output_config.format`.
+- A provider reused across event loops rebuilds its HTTP transport; streams close
+  their upstream request on cancel; a custom HTTP client keeps the SDK's
+  connection limits.
+- Duplicate and stale submits cannot finalize another worker's run; cancellation
+  cleanup survives anyio cancellation.
+- Error paths, usage writes and budget reads no longer disable enforcement when
+  a database write fails once.
+- Pending reads on Postgres no longer fail when stored pause state holds U+0000
+  or a lone surrogate, and convert the pause state once per read.
+- Redacted feeds no longer expose a past approval's arguments, a person's answer,
+  exception text or image descriptions.
+- Hostile ids, cursors and filters given to `RunStore` raise `ValueError`
+  instead of a database error.
+- Tool-argument validation errors no longer echo input keys or values.
+- Followers of one run share their active-pause read, so a follower's cost no
+  longer grows with the run's past pauses; one tenant cannot take every follower slot.
+- MCP discovery stops on a repeated cursor, a page, tool or byte cap, or a
+  deadline, and a malformed tool schema no longer raises from the validator.
+- Provider failures are logged with safe fields only, without tracebacks or vendor
+  text; database failures never expose SQL or bound parameters.
+
+### Removed
+
+- `make_read_router` and the `dendrux.http` package.
+- The embedded dashboard (`dendrux.dashboard`, `packages/dashboard`) and the
+  `dendrux dashboard` command.
+- The `http` extra (install your web framework and server directly).
+- `EventSequencer`.
+
 ## 0.4.1 - 2026-10-18
 
 Truncation is now visible, Anthropic gets strict mode, and run-control writes
