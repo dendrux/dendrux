@@ -7,9 +7,7 @@ description: The six tables dendrux writes to, what each one stores, and why the
 
 Everything dendrux knows about a run lives in your database. Not in memory, not in a queue, not in a sidecar process. **Six SQLAlchemy tables, one ULID per row.** When a run pauses, it persists. When a different process resumes it, it reads those rows.
 
-This page walks through each table with real row contents from a vetted run against SQLite. Every value below was copied from a real `quickstart.db` produced by the [Quickstart](/docs/quickstart) example. Newer releases add columns (for example `agent_runs.claim_epoch` in 0.5.0) that the captured rows predate.
-
-[//]: # "VERIFY-0.5.0: stale-version cleanup: Re-capture the sample rows on the release candidate"
+This page walks through each table with real row contents from a vetted run against SQLite. Every value below was copied from a real `quickstart.db` produced by the [Quickstart](/docs/quickstart) example. Captured on Dendrux 0.5.0 with claude-haiku-4-5; long JSON values are shortened with `...`.
 
 > **Building a product on top of this?** These six tables are Dendrux's run-state and audit surface, not your product database. If you are building a chat app, store your user-visible chats and messages in your own tables and link to Dendrux by run ID. See [Your app DB vs the Dendrux DB](/docs/recipes/app-database-boundary) for the boundary, a minimal schema, and the request lifecycle.
 
@@ -47,12 +45,13 @@ All IDs are **26-character ULIDs** (time-sortable, see [Runs and the lifecycle](
 One row per `agent.run()` call. Holds the run's identity, status, configuration, and roll-up totals. Real row from the quickstart example:
 
 ```text
-id:                   01KPFXP9M96CXNR9JYT8KJ27J0
+id:                   01M5Y7MQ7STANG3S4GGAJ40T8Y
 tenant_id:            None
 agent_name:           Agent
 status:               success
 input_data:           {"input": "Please refund order 42."}
-output_data:          {"answer": "I've successfully issued a refund..."}
+output_data:          {"answer": "I've successfully processed a refund for order 42. ...",
+                       "usage": {"input_tokens": 1262, "output_tokens": 83, ...}}
 iteration_count:      2
 model:                claude-haiku-4-5
 strategy:             NativeToolCalling
@@ -60,23 +59,30 @@ parent_run_id:        None
 delegation_level:     0
 retry_of_run_id:      None
 total_input_tokens:   1262
-total_output_tokens:  82
+total_output_tokens:  83
 total_cost_usd:       None
 total_cache_read_tokens:     0
 total_cache_creation_tokens: 0
-meta:                 {"dendrux.loop": "ReActLoop", "dendrux.max_delegation_depth": 10}
+total_reasoning_tokens:      0
+meta:                 {"dendrux.loop": "ReActLoop",
+                       "dendrux.governance": {"version": 1, "digest": "d2d14e68...", "parts": {...}},
+                       "dendrux.max_delegation_depth": 10,
+                       "dendrux.prefix": {"provider": "AnthropicProvider@https://api.anthropic.com",
+                                          "model": "claude-haiku-4-5", ...},
+                       "dendrux.stop_reason": "end_turn"}
 pause_data:           null
 pii_mapping:          None
 error:                None
-last_progress_at:     2026-04-18 09:13:35.342991
+last_progress_at:     2026-10-27 08:29:28.621776
 failure_reason:       None
 idempotency_key:      None
 idempotency_fingerprint: None
 cancel_requested:     0
 pause_requested:      0
-claim_epoch:          0
-created_at:           2026-04-18 09:10:32
-updated_at:           2026-04-18 09:13:35
+claim_epoch:          1
+created_at:           2026-10-27 08:29:16.417726
+updated_at:           2026-10-27 08:29:28.629075
+status_changed_at:    2026-10-27 08:29:28.624966
 ```
 
 A few columns deserve a closer look:
@@ -102,13 +108,13 @@ The chronological message history shipped to the LLM on every iteration. One row
 For the quickstart's two-iteration run, this table has 4 rows: the user's question, the assistant's tool call, the tool result, and the assistant's final answer. Here's the first row:
 
 ```text
-id:           01KPFXP9MYZNYTV09FHEBYFKXF
-agent_run_id: 01KPFXP9M96CXNR9JYT8KJ27J0
+id:           01M5Y7MQ8AZ3Z26W0Z1DQABEVE
+agent_run_id: 01M5Y7MQ7STANG3S4GGAJ40T8Y
 role:         user
 content:      Please refund order 42.
 order_index:  0
 meta:         {"iteration": 0}
-created_at:   2026-04-18 09:10:32
+created_at:   2026-10-27 08:29:16.427239
 ```
 
 The `order_index` is what guarantees stable ordering. SQL timestamps aren't precise enough (two messages in the same millisecond would tie); `order_index` is monotonic per run.
@@ -122,10 +128,10 @@ Sub-agent isolation is **structural**: a sub-agent has its own `agent_run_id`, s
 One row per tool invocation. Captures the call identity, parameters, result, success/failure, and timing.
 
 ```text
-id:                     01KPFXVTPB7M86Z2GZ5G52V4D8
-agent_run_id:           01KPFXP9M96CXNR9JYT8KJ27J0
-tool_call_id:           01KPFXPAT8ZF7MNGJNW2Y6S8GZ
-provider_tool_call_id:  toolu_01AKnswC3GgaRwf1gkZSNdbh
+id:                     01M5Y7N250SBXNAM4CVVE8S11B
+agent_run_id:           01M5Y7MQ7STANG3S4GGAJ40T8Y
+tool_call_id:           01M5Y7MRAR1SFRK68BK369YRXZ
+provider_tool_call_id:  toolu_016hKDrTQTV7krcYYWDrg5wG
 tool_name:              refund
 target:                 server
 params:                 {"order_id": 42}
@@ -134,7 +140,8 @@ success:                1
 duration_ms:            0
 iteration_index:        1
 error_message:          None
-created_at:             2026-04-18 09:13:34
+meta:                   null
+created_at:             2026-10-27 08:29:27.585586
 ```
 
 Two ID columns are not a duplicate. `tool_call_id` is dendrux's stable ULID, used everywhere internally. `provider_tool_call_id` is whatever Anthropic or OpenAI assigned (`toolu_...` here). Storing both means dendrux can round-trip tool results back to the provider on the next iteration without ever depending on the provider's ID format being parseable or stable.
@@ -146,22 +153,24 @@ Two ID columns are not a duplicate. `tool_call_id` is dendrux's stable ULID, use
 One row per `provider.complete()` call. This is the table that exists for the **evidence layer**: it stores both dendrux's normalized view and the exact vendor-specific wire format.
 
 ```text
-id:                01KPFXPAT8ZF7MNGJNW2Y6S8H0
-agent_run_id:      01KPFXP9M96CXNR9JYT8KJ27J0
+id:                01M5Y7MRASN1TNJC2KWM4RW4XK
+agent_run_id:      01M5Y7MQ7STANG3S4GGAJ40T8Y
 iteration_index:   1
 model:             claude-haiku-4-5
 provider:          AnthropicProvider
 semantic_request:  {"messages": [...], "tools": [...]}     ← dendrux-normalized
 semantic_response: {"tool_calls": [...], "usage": {...}}   ← dendrux-normalized
 provider_request:  {"model": "claude-haiku-4-5", "max_tokens": 16000, ...}  ← raw Anthropic kwargs
-provider_response: {"id": "msg_01XAzX8uRdmy8qiL242Q8kK8", ...}              ← raw Anthropic dump
+provider_response: {"id": "msg_011CgSRkQZ2Ph7wEoDNDDxst", ...}              ← raw Anthropic dump
 input_tokens:      594
 output_tokens:     55
-duration_ms:       1190
+cost_usd:          None
+duration_ms:       1100
 cache_read_input_tokens:     0
 cache_creation_input_tokens: 0
+reasoning_tokens:  None
 guardrail_findings: null
-created_at:        2026-04-18 09:10:34
+created_at:        2026-10-27 08:29:17.531681
 ```
 
 The `semantic_*` columns let you ask "what did dendrux think it sent?" The `provider_*` columns let you ask "what actually went over the wire?" Both matter for compliance, debugging, and replay. If a provider does something unexpected, the raw response is preserved verbatim.
@@ -173,15 +182,16 @@ The `semantic_*` columns let you ask "what did dendrux think it sent?" The `prov
 Same shape as the token columns on `llm_interactions`, one row per LLM call. Older versions of dendrux only had this table; `llm_interactions` superseded it but `token_usage` is still written so existing inspection tools keep working.
 
 ```text
-id:               01KPFXPATDNPK7KX68QYKVMXDX
-agent_run_id:     01KPFXP9M96CXNR9JYT8KJ27J0
+id:               01M5Y7MRAXA0YVZBZ20V2G8WTV
+agent_run_id:     01M5Y7MQ7STANG3S4GGAJ40T8Y
 iteration_index:  1
 model:            claude-haiku-4-5
 provider:         AnthropicProvider
 input_tokens:     594
 output_tokens:    55
+cost_usd:         None
 duration_ms:      None
-created_at:       2026-04-18 09:10:34
+created_at:       2026-10-27 08:29:17.534805
 ```
 
 If you're starting fresh, query `llm_interactions` instead.
@@ -191,29 +201,32 @@ If you're starting fresh, query `llm_interactions` instead.
 Append-only event log for everything observable about a run: lifecycle transitions, LLM completions, tool completions, governance decisions. Your inspection UI and live routes can read this table through RunStore.
 
 ```text
-id:               01KPFXP9MXHCM94YH8EAV79YKK
-agent_run_id:     01KPFXP9M96CXNR9JYT8KJ27J0
+id:               01M5Y7MQ84XK6AT4D45TNE4GF3
+agent_run_id:     01M5Y7MQ7STANG3S4GGAJ40T8Y
 event_type:       run.started
 sequence_index:   0
 iteration_index:  0
 correlation_id:   None
 data:             {"agent_name": "Agent",
                    "system_prompt": "You are a support agent..."}
-created_at:       2026-04-18 09:10:32
+created_at:       2026-10-27 08:29:16.420963
 ```
 
-The two-iteration quickstart run produced 9 events:
+The two-iteration quickstart run produced 11 events (captured on Dendrux 0.5.0 with claude-haiku-4-5):
 
 | seq | event_type      | iteration |
 |-----|-----------------|-----------|
-| 0   | `run.started`   | 0         |
-| 1   | `llm.completed` | 1         |
-| 2   | `run.paused`    | 1         |
-| 3   | `run.resumed`   | 2         |
-| 4   | `tool.completed`| 1         |
-| 5   | `llm.completed` | 2         |
-| 6   | `run.completed` | 2         |
-| ... | (init events)   | 0         |
+| 0 | `run.started` | 0 |
+| 1 | `tools.declared` | 0 |
+| 2 | `llm.completed` | 1 |
+| 3 | `approval.requested` | 1 |
+| 4 | `run.paused` | 1 |
+| 5 | `run.resumed` | 0 |
+| 6 | `tools.declared` | 0 |
+| 7 | `tool.completed` | 1 |
+| 8 | `approval.decided` | 1 |
+| 9 | `llm.completed` | 2 |
+| 10 | `run.completed` | 0 |
 
 The **`sequence_index`** column is the canonical ordering key inside a run. Two events created in the same millisecond would tie on `created_at`, but `sequence_index` is strictly monotonic per run. The composite index `(agent_run_id, sequence_index)` makes "give me everything after sequence N" a single indexed range scan, which is what powers SSE resume. See [Event ordering](/docs/architecture/event-ordering) for the full mechanism.
 

@@ -107,22 +107,22 @@ Give the agent a price table for every model it uses. See [Cost and pricing](/do
 
 ## What the events look like
 
-A run captured against a mock provider on 0.4.1 (the two `tools.declared` rows that 0.5.0 adds, one after `run.started` and one after `run.resumed`, are inserted by hand and later numbers shifted): a two-iteration agent with `Budget(max_tokens=500, on_exceed="pause")` whose first LLM call uses 600 tokens and requests a tool:
+A run captured on Dendrux 0.5.0 with claude-haiku-4-5: a two-iteration agent with `Budget(max_tokens=500, on_exceed="pause")` whose first LLM call uses 638 tokens and requests a tool:
 
 ```text
-status: paused            meta["budget_exceeded"] = [{"metric": "tokens", "used": 600, "max": 500}]
+status: paused            meta["budget_exceeded"] = [{"metric": "tokens", "used": 638, "max": 500}]
 
 run_events:
   seq=0  run.started
   seq=1  tools.declared       {"local_tool_names": [...]}
-  seq=2  llm.completed        (first call, 600 tokens)
-  seq=3  budget.threshold     {"metric": "tokens", "fraction": 0.5,  "used": 600, "max": 500, "reason": "threshold_crossed"}
-  seq=4  budget.threshold     {"metric": "tokens", "fraction": 0.75, "used": 600, "max": 500, "reason": "threshold_crossed"}
-  seq=5  budget.threshold     {"metric": "tokens", "fraction": 0.9,  "used": 600, "max": 500, "reason": "threshold_crossed"}
-  seq=6  budget.exceeded      {"metric": "tokens", "used": 600, "max": 500, "reason": "budget_exceeded", "action": "pause"}
+  seq=2  llm.completed        (first call, 638 tokens)
+  seq=3  budget.threshold     {"metric": "tokens", "fraction": 0.5,  "used": 638, "max": 500, "reason": "threshold_crossed"}
+  seq=4  budget.threshold     {"metric": "tokens", "fraction": 0.75, "used": 638, "max": 500, "reason": "threshold_crossed"}
+  seq=5  budget.threshold     {"metric": "tokens", "fraction": 0.9,  "used": 638, "max": 500, "reason": "threshold_crossed"}
+  seq=6  budget.exceeded      {"metric": "tokens", "used": 638, "max": 500, "reason": "budget_exceeded", "action": "pause"}
   seq=7  tool.completed       (the tool from the same response still runs)
-  seq=8  run.paused           {"status": "paused", "pending_tool_calls": [], "reason": "budget",
-                               "exceeded": [{"metric": "tokens", "used": 600, "max": 500}]}
+  seq=8  run.paused           {"status": "paused", "pause_id": "01M5Y7RDKAE5TGK4J6S3X311BH", "pending_tool_calls": [], "reason": "budget",
+                               "exceeded": [{"metric": "tokens", "used": 638, "max": 500}]}
          <-- later: submit_resume with a higher limit -->
   seq=9  run.resumed          {"resumed_from": "paused"}
   seq=10 tools.declared       {"local_tool_names": [...]}

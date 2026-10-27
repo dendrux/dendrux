@@ -7,9 +7,7 @@ description: Install dendrux and run an agent that pauses for human approval, th
 
 In five minutes you'll install dendrux, build an agent that pauses to wait for a human's approval, and resume it from a different process. By the end you'll have seen the one thing dendrux does that other agent libraries don't: survive a process restart mid-run.
 
-The outputs below were captured from real runs on an earlier release. Ids and timestamps will differ on your machine.
-
-[//]: # "VERIFY-0.5.0: stale-version cleanup: The old claim of verification against 0.2.0a1 was removed because it was stale. Re-run this quickstart on the 0.5.0 release candidate in a fresh env and re-state the verified version here"
+The outputs below were captured from real runs on Dendrux 0.5.0 with claude-haiku-4-5. Ids and timestamps will differ on your machine, and so will the model's wording.
 
 ## 1. Install
 
@@ -133,15 +131,16 @@ Run it:
 python starter.py
 ```
 
-Real output:
+Captured on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```
 Status:    waiting_approval
-Run ID:    01KPFXP9M96CXNR9JYT8KJ27J0
+Run ID:    01M5Y7MQ7STANG3S4GGAJ40T8Y
+Pause ID:  01M5Y7MRBF9R9HKDRVZCVDK0D9
 Iteration: 1
 ```
 
-Since 0.5.0 the script also prints a `Pause ID:` line (a ULID); the capture above was taken on an earlier release and omits it. Keep that id: approving a pause needs it.
+Keep the pause id (a ULID): approving a pause needs it.
 
 The agent called the LLM, the LLM decided to call `refund`, dendrux saw the approval policy, paused the run, and persisted everything to `quickstart.db`. The Python process exits. The database row remains.
 
@@ -173,15 +172,15 @@ asyncio.run(main())
 Run it with the run ID and the pause ID from step 4. The pause ID proves the approver is answering the pause they were shown; approving without it raises an error:
 
 ```bash
-python resumer.py 01KPFXP9M96CXNR9JYT8KJ27J0 <pause id from step 4>
+python resumer.py 01M5Y7MQ7STANG3S4GGAJ40T8Y <pause id from step 4>
 ```
 
-Real output:
+Captured on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```
 Status:    success
 Iteration: 2
-Answer:    I've successfully issued a refund for order 42. The refund has been processed and is pending manager approval.
+Answer:    I've successfully processed a refund for order 42. The refund has been issued and requires manager approval to complete.
 ```
 
 The agent picked up where it left off, executed the `refund` tool now that the human had approved it, made one more LLM call to summarize, and finished. The starter process never knew the answer; the resumer process never saw the original question. They communicated through `quickstart.db`.

@@ -61,18 +61,18 @@ print(result.answer)         # "I've successfully refunded order 42..."
 
 `submit_approval` is race-safe: persist-first plus CAS claim plus blocking until the run reaches the next pause or terminal. The pending tool runs server-side; its result is fed back into the LLM; the LLM responds to the user.
 
-Event sequence (captured on 0.4.1; the two `tools.declared` rows that 0.5.0 writes for each run segment are added by hand and later numbers shifted; `approval.requested` also carries `params` in 0.5):
+Event sequence (captured on Dendrux 0.5.0 with claude-haiku-4-5):
 
 ```text
 seq=0  run.started
 seq=1  tools.declared        {"local_tool_names": ["refund"]}
 seq=2  llm.completed         (LLM emits refund tool call)
-seq=3  approval.requested    {"tool_name": "refund", "call_id": "01KP...", "reason": "requires_approval", "params": {...}}
-seq=4  run.paused            {"status": "waiting_approval", "pending_tool_calls": [...], "pause_id": "01KP..."}
+seq=3  approval.requested    {"tool_name": "refund", "call_id": "01M5Y7MRAR1SFRK68BK369YRXZ", "reason": "requires_approval", "params": {"order_id": 42}}
+seq=4  run.paused            {"status": "waiting_approval", "pause_id": "01M5Y7MRBF9R9HKDRVZCVDK0D9", "pending_tool_calls": [...]}
 seq=5  run.resumed           {"resumed_from": "waiting_approval"}
 seq=6  tools.declared        {"local_tool_names": ["refund"]}
 seq=7  tool.completed        {"tool_name": "refund", "target": "server", "success": true}
-seq=8  approval.decided      {"decision": "approved", "run_id": "..."}
+seq=8  approval.decided      {"decision": "approved", "run_id": "01M5Y7MQ7STANG3S4GGAJ40T8Y", "decisions": [...]}
 seq=9  llm.completed         (LLM responds with the refund confirmation)
 seq=10 run.completed
 ```

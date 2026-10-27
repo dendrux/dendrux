@@ -61,7 +61,7 @@ asyncio.run(main())
 
 ### Paused run (`waiting_client_tool` / `waiting_human_input` / `waiting_approval`)
 
-Atomic CAS finalize to `CANCELLED` in one round-trip. Deterministic. The run row transitions, `run.cancelled` is emitted with `{"reason": "cancel_requested"}`, and the call returns. Captured trace from a refund-approval pause:
+Atomic CAS finalize to `CANCELLED` in one round-trip. Deterministic. The run row transitions, `run.cancelled` is emitted with `{"reason": "cancel_requested"}`, and the call returns. Captured trace from a refund-approval pause, on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```text
 STATE AT PAUSE (waiting_approval)
@@ -77,7 +77,7 @@ STATE AT PAUSE (waiting_approval)
 
 STATE AFTER CANCEL
   status: cancelled
-  cancel_requested: 1
+  cancel_requested: 0
   pause_data: null
   run_events:
     seq=0  run.started

@@ -371,23 +371,24 @@ Skills write seven governance events to `run_events`. Their payloads carry names
 
 > These replace the earlier `skill.registered`, `skill.denied` and `skill.invoked` events. If you filter on those names, switch to `skill.catalog_resolved` (which lists denied names), `skill.activated` and `skill.activation_failed`. A query on the `skill.` prefix keeps working.
 
-A run that activates a skill, reads a file and runs a script looks like this in `run_events`. Captured on 0.4.1. Since 0.5.0 every run segment also records a `tools.declared` event right after `run.started` (and again after `run.resumed`), so every later `seq` below is one higher, and two higher after a resume.
+A run that activates a skill, reads a file and runs a script looks like this in `run_events`. Captured on Dendrux 0.5.0 with claude-haiku-4-5.
 
 ```text
 seq=0   run.started
-seq=1   skill.catalog_resolved  delivery=progressive, skills=[ticket-triage ...], denied=[]
-seq=2   llm.completed           (model calls use_skill)
-seq=3   skill.activated         name=ticket-triage, origin=model
-seq=4   tool.completed          tool_name=use_skill
-seq=5   llm.completed           (model calls read_skill_resource)
-seq=6   skill.resource_read     path=references/policy.md, chars=62, truncated=false
-seq=7   tool.completed
-seq=8   llm.completed           (model calls run_skill_script)
-seq=9   skill.script_requested  path=scripts/priority.py, argc=1
-seq=10  skill.script_completed  exit_code=0, duration_ms=17, stdout_chars=16
-seq=11  tool.completed
-seq=12  llm.completed
-seq=13  run.completed
+seq=1   tools.declared
+seq=2   skill.catalog_resolved  delivery=progressive, skills=[ticket-triage ...], denied=[]
+seq=3   llm.completed           (model calls use_skill)
+seq=4   skill.activated         name=ticket-triage, origin=model
+seq=5   tool.completed          tool_name=use_skill
+seq=6   llm.completed           (model calls read_skill_resource)
+seq=7   skill.resource_read     path=references/policy.md, chars=59, truncated=false
+seq=8   tool.completed
+seq=9   llm.completed           (model calls run_skill_script)
+seq=10  skill.script_requested  path=scripts/priority.py, argc=1
+seq=11  skill.script_completed  exit_code=0, duration_ms=23, stdout_chars=12
+seq=12  tool.completed
+seq=13  llm.completed
+seq=14  run.completed
 ```
 
 The tool calls themselves, including their parameters and the results the model saw, are in `tool_calls` and the message traces like any other tool. The skill tools skip `tool_result_transform`: your transform never sees skill bodies or script output.

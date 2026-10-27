@@ -24,7 +24,7 @@ A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every
 
 ## A real event timeline
 
-The timeline below is the `run_events` log from the quickstart run, dumped from `quickstart.db` on 0.4.1; the two `tools.declared` rows that 0.5.0 writes (one after `run.started` and one after `run.resumed`, on every run segment) are added by hand and the later numbers shifted. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
+The timeline below is the `run_events` log from the quickstart run, dumped from `quickstart.db`. Captured on Dendrux 0.5.0 with claude-haiku-4-5. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
 
 | Sequence | Event | Iteration | Note |
 | --- | --- | --- | --- |
@@ -32,12 +32,12 @@ The timeline below is the `run_events` log from the quickstart run, dumped from 
 | 1 | `tools.declared` | 0 | The tools declared in code, recorded once per run segment (0.5.0). |
 | 2 | `llm.completed` | 1 | First LLM turn. 594 input tokens, 55 output, has_tool_calls=true. |
 | 3 | `approval.requested` | 1 | refund was declared require_approval. Correlated by call_id. |
-| 4 | `run.paused` | 0 | Runtime persists waiting_approval and exits. Client reconnect point. |
+| 4 | `run.paused` | 1 | Runtime persists waiting_approval and exits. Client reconnect point. |
 | 5 | `run.resumed` | 0 | submit_approval loads the run and re-enters the loop. |
 | 6 | `tools.declared` | 0 | Recorded again for the resumed segment (0.5.0). |
 | 7 | `tool.completed` | 1 | refund actually executes now. Same iteration as the approval request. |
 | 8 | `approval.decided` | 1 | Governance row records who decided and how. |
-| 9 | `llm.completed` | 2 | Second LLM turn. No tool calls this time. |
+| 9 | `llm.completed` | 2 | Second LLM turn (668 input, 28 output). No tool calls this time. |
 | 10 | `run.completed` | 0 | Terminal event. status=success. |
 
 

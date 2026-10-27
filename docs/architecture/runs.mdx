@@ -7,9 +7,7 @@ description: The state machine every dendrux agent moves through, in plain terms
 
 A **run** is one execution of an agent, from the moment you call `agent.run(input)` to the moment it produces a final answer (or pauses, fails, or is cancelled). Everything dendrux does is in service of making that run resumable, observable, and safe.
 
-This page covers the four things you need to know about runs: their identity, their status, their shape, and how they move between statuses. Every output shown below was captured from a real run on an earlier release; ids and timestamps will differ.
-
-[//]: # "VERIFY-0.5.0: stale-version cleanup: Re-capture the outputs on the release candidate"
+This page covers the four things you need to know about runs: their identity, their status, their shape, and how they move between statuses. Every output shown below was captured from a real run on Dendrux 0.5.0 with claude-haiku-4-5; ids and timestamps will differ.
 
 ## A run has an ID and an owner
 
@@ -22,10 +20,10 @@ result = await agent.run("What is 15 + 27?")
 print(result.run_id)
 ```
 
-Real output:
+Captured on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```
-01KPFX9PWP8GGJAPPF0R53Y05Y
+01M5Y7XFFTB34A7QNW9GMX47WX
 ```
 
 Why ULID and not UUIDv4? Two reasons:
@@ -199,10 +197,10 @@ async def main():
 asyncio.run(main())
 ```
 
-Real output (captured before 0.5.0, so it has no pause id; 0.5 prints one more value):
+Captured on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```
-waiting_approval 01KPFXP9M96CXNR9JYT8KJ27J0
+waiting_approval 01M5Y7NNDT6H1J0K8N1FW1XZW3 01M5Y7NPFAMVK623NDKMT6EWEH
 ```
 
 [//]: # "docs-test: skip - imports the reader's own module `agent_def`, created in an earlier step"
@@ -222,10 +220,10 @@ async def main():
 asyncio.run(main())
 ```
 
-Real output:
+Captured on Dendrux 0.5.0 with claude-haiku-4-5:
 
 ```
-success - I've successfully issued a refund for order 42. The refund has been processed and is pending manager approval.
+success - I've processed a refund for order 42. The refund has been submitted and requires manager approval to complete.
 ```
 
 Two processes, one database, one logical run. That's the whole pause-resume model in one example.

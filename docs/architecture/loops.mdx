@@ -151,12 +151,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The DB rows afterward:
+The DB rows afterward (captured on Dendrux 0.5.0 with claude-haiku-4-5; the model's wording varies):
 
 ```text
 ==== ReActLoop ====
   status: success
-  answer: "15 + 27 = **42**"
+  answer: "The answer is **42**."
   iteration_count: 2
   steps_len: 2
 
@@ -167,7 +167,9 @@ react_traces:
   order= 3  role=assistant  iter=2
 
 agent_runs.iteration_count = 2
-agent_runs.meta            = {"dendrux.loop": "ReActLoop", "dendrux.max_delegation_depth": 10}
+agent_runs.meta            = {"dendrux.loop": "ReActLoop", "dendrux.governance": {...},
+                              "dendrux.max_delegation_depth": 10, "dendrux.prefix": {...},
+                              "dendrux.stop_reason": "end_turn"}
 ```
 
 Two iterations. First turn: the LLM emitted the `add` tool call (assistant row at `iter=1`, then the tool result). Second turn: it read the tool result and produced the final answer (assistant row at `iter=2`). The loop name is persisted in `meta["dendrux.loop"]` so you can filter old runs by which loop produced them.
@@ -277,7 +279,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The DB rows afterward:
+The DB rows afterward (captured on Dendrux 0.5.0 with claude-haiku-4-5):
 
 ```text
 ==== SingleCall ====
@@ -291,7 +293,9 @@ react_traces:
   order= 1  role=assistant  iter=1
 
 agent_runs.iteration_count = 1
-agent_runs.meta            = {"dendrux.loop": "SingleCall", "dendrux.max_delegation_depth": 10}
+agent_runs.meta            = {"dendrux.loop": "SingleCall", "dendrux.governance": {...},
+                              "dendrux.max_delegation_depth": 10, "dendrux.prefix": {...},
+                              "dendrux.stop_reason": "end_turn"}
 ```
 
 One user row, one assistant row, and we are done. No tool iterations, no pause states.

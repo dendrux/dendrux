@@ -58,7 +58,7 @@ class LoopRecorder(Protocol):
 
 ## What the hooks wrote, for a real run
 
-This is the actual DB state from the [Quickstart](/docs/quickstart) run (the HITL refund flow). Each section is the tables one hook populated:
+This is the actual DB state from the [Quickstart](/docs/quickstart) run (the HITL refund flow), captured on Dendrux 0.5.0 with claude-haiku-4-5. Each section is the tables one hook populated:
 
 ```text
 react_traces (on_message_appended — FAIL-CLOSED)
@@ -72,22 +72,24 @@ tool_calls (on_tool_completed — FAIL-CLOSED)
 
 llm_interactions (on_llm_call_completed — BEST-EFFORT)
   iter=1  model=claude-haiku-4-5  provider=AnthropicProvider  input=594  output=55
-  iter=2  model=claude-haiku-4-5  provider=AnthropicProvider  input=668  output=27
+  iter=2  model=claude-haiku-4-5  provider=AnthropicProvider  input=668  output=28
 
 token_usage (on_llm_call_completed — BEST-EFFORT)
   iter=1  input=594  output=55  model=claude-haiku-4-5
-  iter=2  input=668  output=27  model=claude-haiku-4-5
+  iter=2  input=668  output=28  model=claude-haiku-4-5
 
-run_events (lifecycle + on_governance_event — FAIL-CLOSED; captured on 0.4.1, 0.5.0 adds a tools.declared row after run.started and after run.resumed and shifts later seq values)
+run_events (lifecycle + on_governance_event — FAIL-CLOSED)
   seq=0  iter=0  run.started
-  seq=1  iter=1  llm.completed
-  seq=2  iter=1  approval.requested
-  seq=3  iter=0  run.paused
-  seq=4  iter=0  run.resumed
-  seq=5  iter=1  tool.completed
-  seq=6  iter=1  approval.decided
-  seq=7  iter=2  llm.completed
-  seq=8  iter=0  run.completed
+  seq=1  iter=0  tools.declared
+  seq=2  iter=1  llm.completed
+  seq=3  iter=1  approval.requested
+  seq=4  iter=1  run.paused
+  seq=5  iter=0  run.resumed
+  seq=6  iter=0  tools.declared
+  seq=7  iter=1  tool.completed
+  seq=8  iter=1  approval.decided
+  seq=9  iter=2  llm.completed
+  seq=10 iter=0  run.completed
 ```
 
 Five tables, one coherent history. The `react_traces` rows are the messages the LLM saw. The `tool_calls` row is the proof the refund actually executed. The `llm_interactions` and `token_usage` rows are cost telemetry. The `run_events` rows are the timeline. Every row came from one of the four hooks, and every one carries `iteration_index` so readers can reconstruct what belonged to which turn.

@@ -53,7 +53,7 @@ The [Quickstart](/docs/quickstart) already walks through this, with real DB stat
 seq=0  run.started
 seq=1  tools.declared        local_tool_names=["refund"]
 seq=2  llm.completed         (model emits refund(order_id=42))
-seq=3  approval.requested    corr=01KPFXPAT8ZF7MNGJNW2Y6S8GZ
+seq=3  approval.requested    corr=01M5Y7MRAR1SFRK68BK369YRXZ
 seq=4  run.paused            status=waiting_approval
          <-- starter process exits here -->
          <-- a later process calls submit_approval(run_id, approved=True, expected_pause_id=...) -->
@@ -65,7 +65,7 @@ seq=9  llm.completed         (model writes the final user-facing answer)
 seq=10 run.completed
 ```
 
-Captured on 0.4.1; the two `tools.declared` rows (one after `run.started`, one after `run.resumed`, added by 0.5.0 for every run segment) are inserted by hand and the later numbers shifted.
+Captured on Dendrux 0.5.0 with claude-haiku-4-5.
 
 Five things to notice:
 
@@ -93,24 +93,27 @@ done = await agent.submit_approval(
 print(done.status.value)     # success  (the run finishes; the model handles the rejection)
 ```
 
-A live capture with the same `refund` agent, rejected with that reason:
+Captured on Dendrux 0.5.0 with claude-haiku-4-5, with the same `refund` agent, rejected with that reason:
 
 ```text
 first: status=waiting_approval
 after reject: status=success
 refund function actually called? False
-final answer preview: "I attempted to process the refund for order 42, but it was declined because
-the refund amount exceeds the automatic threshold. This means that..."
+final answer preview: "The refund for order 42 has been declined because the amount exceeds
+the automatic threshold. This refund requires manager approval. You may need to: ..."
 
 run_events:
   seq=0  run.started
-  seq=1  llm.completed
-  seq=2  approval.requested
-  seq=3  run.paused
-  seq=4  run.resumed
-  seq=5  tool.completed         success=False
-  seq=6  llm.completed
-  seq=7  run.completed
+  seq=1  tools.declared
+  seq=2  llm.completed
+  seq=3  approval.requested
+  seq=4  run.paused
+  seq=5  run.resumed
+  seq=6  tools.declared
+  seq=7  tool.completed         success=False
+  seq=8  approval.decided       decision=rejected
+  seq=9  llm.completed
+  seq=10 run.completed
 
 tool_calls:
   refund  success=0  error="Manager declined: amount exceeds automatic threshold."
