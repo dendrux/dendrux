@@ -12,7 +12,13 @@ from contextlib import nullcontext
 import sqlalchemy as sa
 from alembic import op
 
-from dendrux.db._index_check import index_matches, read_pg_indexes
+from dendrux.db._index_check import index_matches
+from dendrux.db._migration_ddl import (
+    bounded_step,
+    build_index_concurrently,
+    drop_index_concurrently,
+    online,
+)
 
 revision = "e8f9a0b1c2d3"
 down_revision = "d7e8f9a0b1c2"
@@ -39,16 +45,12 @@ def upgrade() -> None:
             "UPDATE agent_runs SET status_changed_at = updated_at WHERE status_changed_at IS NULL"
         )
         _alter_clock(drop=False)
-    with op.get_context().autocommit_block() if pg else nullcontext():
+    with online(op.get_context()) if pg else nullcontext():
         for name, table, keys, predicate in _INDEXES:
-            if pg:
-                entry = read_pg_indexes(bind, tables=[table]).get(name)
-                if entry is not None and not entry[2]:
-                    _exclusive_pg_step(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
             concurrent = " CONCURRENTLY" if pg else ""
             statement = f"CREATE INDEX{concurrent} IF NOT EXISTS {name} ON {table} ({keys}){predicate}"
             if pg:
-                _exclusive_pg_step(statement)
+                build_index_concurrently(bind, name, table, statement, revision=revision)
             else:
                 op.execute(statement)
             expected_predicate = predicate
@@ -68,39 +70,16 @@ def upgrade() -> None:
                 )
 
 
-def _exclusive_pg_step(statement: str, *, transactional: bool = False) -> None:
-    """Bound DDL lock waits, including concurrent-index virtualxid waits."""
-    bind = op.get_bind()
-    previous = bind.execute(sa.text("SHOW lock_timeout")).scalar_one()
-    try:
-        if transactional:
-            # A later revision may refuse a multi-revision downgrade. Keep the
-            # column drop and revision stamp in that enclosing transaction.
-            # A savepoint restores SET LOCAL on timeout before we translate it.
-            with bind.begin_nested():
-                bind.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
-                op.execute(statement)
-                bind.execute(
-                    sa.text("SELECT set_config('lock_timeout', :previous, true)"),
-                    {"previous": previous},
-                )
-        else:
-            bind.execute(sa.text("SET lock_timeout = '5s'"))
-            try:
-                op.execute(statement)
-            finally:
-                bind.execute(
-                    sa.text("SELECT set_config('lock_timeout', :previous, false)"),
-                    {"previous": previous},
-                )
-    except sa.exc.DBAPIError as error:
-        state = getattr(error.orig, "sqlstate", None) or getattr(error.orig, "pgcode", None)
-        if state == "55P03":
-            raise RuntimeError(
-                "Timed out acquiring the Dendrux migration lock after 5 seconds. "
-                "Retry the migration operation after the blocking transaction finishes."
-            ) from None
-        raise
+def _exclusive_pg_step(statement: str, step: str, *, transactional: bool = False) -> None:
+    """Bound DDL lock waits, including concurrent-index virtualxid waits.
+
+    ``transactional`` keeps the statement in the enclosing transaction: a later
+    revision may refuse a multi-revision downgrade, and the column drop and revision
+    stamp must roll back with it.
+    """
+    bounded_step(
+        op.get_bind(), statement, revision=revision, step=step, transactional=transactional
+    )
 
 
 def _online_pg_clock() -> None:
@@ -111,10 +90,11 @@ def _online_pg_clock() -> None:
     backfill never overwrites one. A validated CHECK avoids SET NOT NULL's
     table scan under ACCESS EXCLUSIVE (Postgres 12+).
     """
-    with op.get_context().autocommit_block():
+    with online(op.get_context()):
         _exclusive_pg_step(
             "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ, "
-            "ALTER COLUMN status_changed_at SET DEFAULT now()"
+            "ALTER COLUMN status_changed_at SET DEFAULT now()",
+            "add_status_changed_at",
         )
         # Freeze the initial high-water mark so continual inserts cannot
         # extend the migration indefinitely. Later inserts have the default.
@@ -159,24 +139,33 @@ def _online_pg_clock() -> None:
         if exists is None:
             _exclusive_pg_step(
                 f"ALTER TABLE agent_runs ADD CONSTRAINT {constraint} "
-                "CHECK (status_changed_at IS NOT NULL) NOT VALID"
+                "CHECK (status_changed_at IS NOT NULL) NOT VALID",
+                "add_status_clock_check",
             )
         op.execute(f"ALTER TABLE agent_runs VALIDATE CONSTRAINT {constraint}")
-        _exclusive_pg_step("ALTER TABLE agent_runs ALTER COLUMN status_changed_at SET NOT NULL")
-        _exclusive_pg_step(f"ALTER TABLE agent_runs DROP CONSTRAINT {constraint}")
+        _exclusive_pg_step(
+            "ALTER TABLE agent_runs ALTER COLUMN status_changed_at SET NOT NULL",
+            "set_status_changed_at_not_null",
+        )
+        _exclusive_pg_step(
+            f"ALTER TABLE agent_runs DROP CONSTRAINT {constraint}", "drop_status_clock_check"
+        )
 
 
 def downgrade() -> None:
     pg = op.get_bind().dialect.name == "postgresql"
-    with op.get_context().autocommit_block() if pg else nullcontext():
+    with online(op.get_context()) if pg else nullcontext():
         for name, _, _, _ in reversed(_INDEXES):
-            concurrent = " CONCURRENTLY" if pg else ""
             if pg:
-                _exclusive_pg_step(f"DROP INDEX{concurrent} IF EXISTS {name}")
+                drop_index_concurrently(op.get_bind(), name, revision=revision)
             else:
-                op.execute(f"DROP INDEX{concurrent} IF EXISTS {name}")
+                op.execute(f"DROP INDEX IF EXISTS {name}")
     if pg:
-        _exclusive_pg_step("ALTER TABLE agent_runs DROP COLUMN status_changed_at", transactional=True)
+        _exclusive_pg_step(
+            "ALTER TABLE agent_runs DROP COLUMN status_changed_at",
+            "drop_status_changed_at",
+            transactional=True,
+        )
     else:
         _alter_clock(drop=True)
 

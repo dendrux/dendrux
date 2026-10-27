@@ -46,7 +46,14 @@ from typing import Union
 from alembic import op
 import sqlalchemy as sa
 
-from dendrux.db._index_check import read_pg_indexes, require_index
+from dendrux.db._index_check import require_index
+from dendrux.db._migration_ddl import (
+    bounded_step,
+    build_index_concurrently,
+    drop_index_concurrently,
+    online,
+    sqlstate,
+)
 
 revision: str = "d7e8f9a0b1c2"
 down_revision: Union[str, None] = "c6d7e8f9a0b1"
@@ -92,47 +99,18 @@ def _shared_keys_error(count: int) -> RuntimeError:
     )
 
 
-def _pg_step(statement: str) -> None:
-    """Run one DDL statement with a 5 s lock wait on the autocommit connection.
-
-    Bounds the exclusive lock of ``ALTER TABLE`` and the waits of concurrent index
-    builds and drops for open transactions. Same message as ``e8f9a0b1c2d3``.
-    """
-    bind = op.get_bind()
-    previous = bind.execute(sa.text("SHOW lock_timeout")).scalar_one()
-    try:
-        bind.execute(sa.text("SET lock_timeout = '5s'"))
-        try:
-            op.execute(statement)
-        finally:
-            bind.execute(
-                sa.text("SELECT set_config('lock_timeout', :previous, false)"),
-                {"previous": previous},
-            )
-    except sa.exc.DBAPIError as error:
-        if _sqlstate(error) == "55P03":
-            raise RuntimeError(
-                "Timed out acquiring the Dendrux migration lock after 5 seconds. "
-                "Retry the migration operation after the blocking transaction finishes."
-            ) from None
-        raise
-
-
-def _sqlstate(error: sa.exc.DBAPIError) -> str | None:
-    return getattr(error.orig, "sqlstate", None) or getattr(error.orig, "pgcode", None)
-
-
 def _concurrently(ddl: str) -> str:
     return ddl.replace(" INDEX IF NOT EXISTS ", " INDEX CONCURRENTLY IF NOT EXISTS ", 1)
 
 
+def _step(statement: str, step: str) -> None:
+    bounded_step(op.get_bind(), statement, revision=revision, step=step)
+
+
 def _pg_build_index(name: str, ddl: str) -> None:
-    """Build ``ddl`` concurrently, first dropping an invalid leftover of the same name."""
-    entry = read_pg_indexes(op.get_bind(), tables=[_TABLE]).get(name)
-    if entry is not None and not entry[2]:
-        _pg_step(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
-    _pg_step(_concurrently(ddl))
-    require_index(op.get_bind(), name, _TABLE, ddl)
+    bind = op.get_bind()
+    build_index_concurrently(bind, name, _TABLE, _concurrently(ddl), revision=revision)
+    require_index(bind, name, _TABLE, ddl)
 
 
 def _pg_has_constraint(name: str) -> bool:
@@ -147,40 +125,44 @@ def _pg_has_constraint(name: str) -> bool:
 
 
 def _upgrade_pg() -> None:
-    with op.get_context().autocommit_block():
+    with online(op.get_context()):
         if not _has_column(_TABLE, "claim_epoch"):
-            _pg_step(
+            _step(
                 "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS claim_epoch "
-                "INTEGER NOT NULL DEFAULT 0"
+                "INTEGER NOT NULL DEFAULT 0",
+                "add_claim_epoch",
             )
         _pg_build_index("uq_agent_runs_tenant_idempotency_key", _TENANT_KEY_INDEX)
         _pg_build_index("ix_agent_runs_tenant_id_created_at", _TENANT_CREATED_INDEX)
         # The tenant-scoped unique index is valid, so uniqueness is never unenforced.
-        _pg_step("DROP INDEX CONCURRENTLY IF EXISTS ix_agent_runs_idempotency_key")
+        drop_index_concurrently(op.get_bind(), "ix_agent_runs_idempotency_key", revision=revision)
         if _pg_has_constraint("agent_runs_idempotency_key_key"):
-            _pg_step(
-                "ALTER TABLE agent_runs DROP CONSTRAINT IF EXISTS agent_runs_idempotency_key_key"
+            _step(
+                "ALTER TABLE agent_runs DROP CONSTRAINT IF EXISTS agent_runs_idempotency_key_key",
+                "drop_constraint.agent_runs_idempotency_key_key",
             )
         # Present on every migrated database already; the models now declare it too.
-        _pg_step(_concurrently(_RETRY_OF_INDEX))
+        _step(_concurrently(_RETRY_OF_INDEX), "build_index.ix_agent_runs_retry_of_run_id")
 
 
 def _downgrade_pg() -> None:
-    with op.get_context().autocommit_block():
+    with online(op.get_context()):
         try:
             _pg_build_index("ix_agent_runs_idempotency_key", _GLOBAL_KEY_INDEX)
         except sa.exc.DBAPIError as error:
-            if _sqlstate(error) != "23505":
+            if sqlstate(error) != "23505":
                 raise
             # A writer shared a key after the check. The failed build left an invalid
             # unique index that would still reject cross-tenant keys: remove it.
-            _pg_step("DROP INDEX CONCURRENTLY IF EXISTS ix_agent_runs_idempotency_key")
+            drop_index_concurrently(
+                op.get_bind(), "ix_agent_runs_idempotency_key", revision=revision
+            )
             shared = op.get_bind().execute(sa.text(_SHARED_KEYS)).scalar_one()
             raise _shared_keys_error(shared) from None
-        _pg_step("DROP INDEX CONCURRENTLY IF EXISTS uq_agent_runs_tenant_idempotency_key")
-        _pg_step("DROP INDEX CONCURRENTLY IF EXISTS ix_agent_runs_tenant_id_created_at")
+        for name in ("uq_agent_runs_tenant_idempotency_key", "ix_agent_runs_tenant_id_created_at"):
+            drop_index_concurrently(op.get_bind(), name, revision=revision)
         if _has_column(_TABLE, "claim_epoch"):
-            _pg_step("ALTER TABLE agent_runs DROP COLUMN IF EXISTS claim_epoch")
+            _step("ALTER TABLE agent_runs DROP COLUMN IF EXISTS claim_epoch", "drop_claim_epoch")
 
 
 def upgrade() -> None:

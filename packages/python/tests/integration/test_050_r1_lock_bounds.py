@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from typing import Any
@@ -28,6 +29,26 @@ R1 = "d7e8f9a0b1c2"
 HEAD = "e8f9a0b1c2d3"
 _TIMEOUT = "Timed out acquiring the Dendrux migration lock after 5 seconds"
 _R1_INDEXES = ("uq_agent_runs_tenant_idempotency_key", "ix_agent_runs_tenant_id_created_at")
+
+
+def _lock_timeout_records(caplog: Any) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "code", None) == "migration_lock_timeout"]
+
+
+def _assert_lock_timeout_logged(caplog: Any, revision: str, step: str) -> None:
+    """Exactly one structured line, with stable fields and no SQL text."""
+    records = _lock_timeout_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    record = records[0]
+    assert record.levelno == logging.WARNING
+    assert (record.revision, record.step, record.timeout_seconds) == (revision, step, 5)
+    text_seen = (
+        record.getMessage()
+        + " "
+        + " ".join(str(v) for k, v in vars(record).items() if k in {"revision", "step", "code"})
+    )
+    for sql in ("ALTER", "INDEX ", "DROP ", "CREATE", "agent_runs ("):
+        assert sql not in text_seen, text_seen
 
 
 @pytest.fixture
@@ -60,8 +81,9 @@ async def _invalid_indexes(engine: Any) -> int:
         ).scalar_one()
 
 
-async def test_upgrade_from_041_refuses_behind_an_open_transaction(pg: Any) -> None:
+async def test_upgrade_from_041_refuses_behind_an_open_transaction(pg: Any, caplog: Any) -> None:
     """A long application transaction must not make R1 wait without bound."""
+    caplog.set_level(logging.WARNING)
     url, engine = pg
     await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
     await _seed(engine)
@@ -81,6 +103,7 @@ async def test_upgrade_from_041_refuses_behind_an_open_transaction(pg: Any) -> N
                 task.result()
             assert error.value.__suppress_context__, "no raw driver error chained"
             assert 4.5 < elapsed < 10, elapsed
+            _assert_lock_timeout_logged(caplog, R1, "add_claim_epoch")
         finally:
             await transaction.rollback()
             await asyncio.gather(task, return_exceptions=True)
@@ -152,6 +175,16 @@ async def test_writers_proceed_while_r1_builds_its_indexes(pg: Any) -> None:
 # builds and drops wait for any open writer transaction.
 _READ = "SELECT id FROM agent_runs LIMIT 1"
 _WRITE = "UPDATE agent_runs SET iteration_count = 3 WHERE id = 'r4'"
+_STEPS = {
+    "add_column": "add_claim_epoch",
+    "tenant_key_index": "build_index.uq_agent_runs_tenant_idempotency_key",
+    "tenant_created_index": "build_index.ix_agent_runs_tenant_id_created_at",
+    "drop_global_index": "drop_index.ix_agent_runs_idempotency_key",
+    "drop_global_constraint": "drop_constraint.agent_runs_idempotency_key_key",
+    "restore_global_index": "build_index.ix_agent_runs_idempotency_key",
+    "drop_tenant_index": "drop_index.uq_agent_runs_tenant_idempotency_key",
+    "drop_column": "drop_claim_epoch",
+}
 _PHASES = {
     "add_column": ("upgrade", "add column if not exists claim_epoch", _READ),
     "tenant_key_index": (
@@ -190,8 +223,9 @@ _PHASES = {
 
 @pytest.mark.parametrize("phase", list(_PHASES))
 async def test_every_exclusive_step_is_bounded_and_retry_completes(
-    pg: Any, phase: str, record_property: Any
+    pg: Any, phase: str, record_property: Any, caplog: Any
 ) -> None:
+    caplog.set_level(logging.WARNING)
     url, engine = pg
     action, marker, blocker_sql = _PHASES[phase]
     await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
@@ -257,6 +291,7 @@ async def test_every_exclusive_step_is_bounded_and_retry_completes(
             assert elapsed < 10, elapsed
             assert observed == ["5s"], observed
             assert restored == initial, "the migration connection's lock_timeout is restored"
+            _assert_lock_timeout_logged(caplog, R1, _STEPS[phase])
             record_property(f"r1_lock_timeout_{phase}", json.dumps({"seconds": elapsed}))
         finally:
             release.set()
@@ -403,3 +438,24 @@ async def test_r1_runs_on_an_empty_database_and_reruns_are_no_ops(pg: Any) -> No
     await asyncio.to_thread(_alembic, url, "downgrade", PRIOR)
     assert await _indexes(engine) == downgraded
     assert "claim_epoch" not in await _columns(engine)
+
+
+async def test_second_revision_logs_the_same_lock_timeout_line(pg: Any, caplog: Any) -> None:
+    """``e8f9a0b1c2d3`` refuses with the same message and the same structured line."""
+    caplog.set_level(logging.WARNING)
+    url, engine = pg
+    await asyncio.to_thread(_alembic, url, "upgrade", PRIOR)
+    await _seed(engine)
+    await asyncio.to_thread(_alembic, url, "upgrade", R1)
+    async with engine.connect() as blocker:
+        transaction = await blocker.begin()
+        await blocker.execute(text("SELECT id FROM agent_runs LIMIT 1"))
+        try:
+            with pytest.raises(RuntimeError, match=_TIMEOUT):
+                await asyncio.wait_for(asyncio.to_thread(_alembic, url, "upgrade", "head"), 15)
+        finally:
+            await transaction.rollback()
+    _assert_lock_timeout_logged(caplog, HEAD, "add_status_changed_at")
+    assert await _version(engine) == R1
+    await asyncio.to_thread(_alembic, url, "upgrade", "head")
+    assert await _version(engine) == HEAD
