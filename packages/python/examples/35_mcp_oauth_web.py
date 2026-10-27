@@ -85,11 +85,16 @@ class EventPrinter:
 
     def on_event(self, event: MCPRuntimeEvent) -> None:
         """Report OAuth and tool-call events."""
+        # Print named fields rather than the whole event: these events carry no
+        # tokens, but an explicit list is the habit to copy into your own app.
         if isinstance(event, MCPOAuthRequired):
             self.last_oauth_required = event
-            print(f"    event: {event!r}")
+            print(
+                f"    event: oauth required for {event.connection_key} "
+                f"({event.reason}, {event.scope_count} scopes)"
+            )
         elif isinstance(event, (MCPOAuthRefreshed, MCPOAuthRefreshFailed, MCPOAuthRevoked)):
-            print(f"    event: {event!r}")
+            print(f"    event: {type(event).__name__} for {event.connection_key}")
         elif isinstance(event, MCPToolCallCompleted):
             print(f"    event: MCP tool {event.tool} completed")
 

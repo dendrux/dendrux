@@ -58,7 +58,7 @@ def bounded_step(
     statement stays in the enclosing transaction: a savepoint scopes ``SET LOCAL`` and
     restores it on timeout.
     """
-    previous = conn.execute(text("SHOW lock_timeout")).scalar_one()
+    previous: str = str(conn.execute(text("SHOW lock_timeout")).scalar_one())
     try:
         if transactional:
             with conn.begin_nested():

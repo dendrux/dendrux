@@ -238,10 +238,12 @@ def create_demo_app():
                 )
                 for r in raw_results
             ]
-        except (KeyError, TypeError) as exc:
+        except (KeyError, TypeError):
+            # Keep exception text out of the response: a fixed message is enough
+            # for the client, and never leaks payload fragments.
             return JSONResponse(
                 status_code=400,
-                content={"error": f"Invalid tool_results: {exc}"},
+                content={"error": "Invalid tool_results: each item needs call_id and result"},
             )
 
         stream = agent.resume_stream(run_id, tool_results=tool_results)
