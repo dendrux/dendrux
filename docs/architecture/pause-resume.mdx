@@ -16,7 +16,7 @@ A run can be paused in four ways. Each maps to a status on the `agent_runs` row 
 | Status | Triggered by | Resume method |
 | --- | --- | --- |
 | `waiting_client_tool` | A tool declared with `target="client"` is called. The runtime stops before executing it and expects the client to run it and submit the result. | `submit_tool_results(run_id, results=...)` |
-| `waiting_human_input` | The loop returns a `Clarification` action, signalling that the model needs free-text input from a human to continue. | `submit_input(run_id, text=...)` |
+| `waiting_human_input` | The loop returns a `Clarification` action, signalling that the model needs free-text input from a human to continue. The built-in tool-calling strategy never returns one on its own (a text-only reply is a final answer), so this pause needs a strategy that does; a built-in ask-the-user tool is planned. | `submit_input(run_id, text=...)` |
 | `waiting_approval` | A tool declared in `require_approval=[...]`, or a call the [`before_tool` hook](/docs/architecture/tool-policy) gated, is about to run. The runtime pauses to gate the call. | `submit_approval(run_id, approved=True, expected_pause_id=...)` or `submit_approval(run_id, decisions={...}, expected_pause_id=...)` (rejecting needs no pause id) |
 | `paused` | `request_pause(run_id)` was called, or a [budget](/docs/architecture/budget) with `on_exceed="pause"` was reached. Nothing is pending; the run simply stopped at a checkpoint. | `submit_resume(run_id)` |
 

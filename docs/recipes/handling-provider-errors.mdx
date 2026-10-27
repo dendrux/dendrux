@@ -45,18 +45,25 @@ The original SDK exception is on `__cause__`, and the vendor's own message text 
 
 ## Catching them
 
-A provider failure inside a run ends the run `error` and `run()` returns a `RunResult`; the typed error is summarised on the result:
+A provider failure inside a run is recorded first and raised second. The run ends `error`, `error_info` is stored with it and a `run.error` event is written; then `run()` raises the `ProviderError`. The exception carries the `run_id`, so the stored result is one call away:
 
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-result = await agent.run(text, tenant_id=tenant)
-if result.status == RunStatus.ERROR and result.error_info:
-    info = result.error_info          # ErrorInfo
-    info.category                     # "rate_limit"
-    info.retryable                    # True
-    info.safe_message                 # "anthropic rate_limit (HTTP 429, code rate_limit_error)"
+from dendrux.errors import ProviderError
+
+try:
+    result = await agent.run(text, tenant_id=tenant)
+except ProviderError as err:
+    err.category                      # "rate_limit"
+    err.retryable                     # True
+    err.safe_message                  # "anthropic rate_limit (HTTP 429, code rate_limit_error)"
+    stored = await agent.get_result(err.run_id, tenant_id=tenant)
+    stored.status                     # RunStatus.ERROR
+    stored.error_info                 # the same summary, persisted
 ```
+
+`stream()` does not raise: it ends with a `RUN_ERROR` event that carries the same `error_info`.
 
 When you call a provider directly (`await provider.complete(...)`, or a custom loop), the `ProviderError` itself is raised:
 
