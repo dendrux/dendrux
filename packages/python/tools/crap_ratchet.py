@@ -455,6 +455,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="update: waive rule violations; each is listed as WAIVED and marked in the baseline",
     )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="check: list violations but exit 0; the hotspot list feeds refactor tickets",
+    )
     return parser
 
 
@@ -531,6 +536,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"CRAP {v.kind}: {v.key}: {v.message}")
     if violations:
         print(f"{len(violations)} CRAP violation(s)")
+        if args.report_only:
+            print("CRAP report only: not blocking")
+            return 0
         return 1
     print("CRAP ratchet ok")
     return 0

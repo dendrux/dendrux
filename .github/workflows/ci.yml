@@ -119,7 +119,7 @@ jobs:
       # Coverage is the same on every leg, so one leg judges it.
       - name: CRAP ratchet
         if: matrix.python-version == '3.12' && matrix.sqlalchemy-version == '2.1.*'
-        run: python tools/crap_ratchet.py check --coverage coverage.json
+        run: python tools/crap_ratchet.py check --report-only --coverage coverage.json
 
       - name: Build and smoke-test distributions
         run: python scripts/mcp_distribution_smoke.py

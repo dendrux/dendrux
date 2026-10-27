@@ -698,6 +698,22 @@ class TestCli:
         assert "branchy" in out
         assert "worse" in out
 
+    def test_report_only_lists_regressions_but_passes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        pkg, root, cov = self._setup(tmp_path)
+        base = root / "baseline.json"
+        common = ["--src", str(pkg), "--repo-root", str(root), "--coverage", str(cov)]
+        assert cr.main(["update", *common, "--baseline", str(base)]) == 0
+        lost = _all_executed(SRC)["files"]["src/pkg/mod.py"]["executed_lines"]
+        _write_cov(root, cov, _cov([], lost))
+        rc = cr.main(["check", "--report-only", *common, "--baseline", str(base)])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "branchy" in out
+        assert "CRAP violation(s)" in out
+        assert "not blocking" in out
+
     def test_check_without_baseline_is_an_error(self, tmp_path: Path) -> None:
         pkg, root, cov = self._setup(tmp_path)
         rc = cr.main(

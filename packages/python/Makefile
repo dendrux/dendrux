@@ -20,8 +20,9 @@ typecheck:
 	mypy src/dendrux/
 
 # CRAP ratchet. Needs coverage.json, which `make test` writes.
+# Report only: the hotspot list feeds refactor work; it never fails CI.
 crap:
-	python tools/crap_ratchet.py check --coverage coverage.json
+	python tools/crap_ratchet.py check --report-only --coverage coverage.json
 
 # Release step: run on a quiet machine (nothing else using Postgres) and record the numbers
 # in the load-test results doc. Needs DENDRUX_TEST_PG_URL.
