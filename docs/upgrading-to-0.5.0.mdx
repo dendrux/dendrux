@@ -70,6 +70,11 @@ One line per change, with the action to take. The numbers link to the detailed n
 | The OpenTelemetry run span is `ERROR` when `RunResult.error_info` is set ([23](#23-opentelemetry-run-spans)) | Update trace dashboards that counted those runs as OK. |
 | `tools.declared` is a new event recorded at the start of every run segment ([24](#24-the-toolsdeclared-event)) | Nothing; redacted feeds use it to prove tool names. |
 | Migrations `d7e8f9a0b1c2` and `e8f9a0b1c2d3` ([steps](#the-upgrade-in-four-steps)) | Run `dendrux db migrate` once, as a deploy job, over a direct connection. |
+| Resuming under changed governance emits `governance.changed`; `on_governance_change="raise"` stops it ([what you may notice](#what-you-may-notice)) | Choose `"warn"` or `"raise"` explicitly before 0.6 makes `"raise"` the default. |
+| Token budgets can count cache read and write tokens: `Budget(count_cache_tokens=...)` ([warnings](#warnings-that-announce-06)) | Choose `True` (and raise `max_tokens`) or `False` to silence the `FutureWarning`. |
+| Idempotency keys are unique per tenant; `tenant_id=""` is rejected; `Agent(strict_tenancy=True)` is available ([what you may notice](#what-you-may-notice)) | Opt in to strict tenancy now; pass `tenant_id=` everywhere. |
+| Provider failures log safe fields only (no traceback or vendor text) ([2](#2-provider-failures-are-typed-errors)) | Diagnose from `run_id` and `ErrorInfo`, not log text. |
+| Sync tools run on a bounded pool; timeouts report `timeout_not_started` or `timeout_outcome_unknown` ([what you may notice](#what-you-may-notice)) | Treat `timeout_outcome_unknown` as "may have run"; give sync tools their own client timeouts. |
 
 ## Removed in 0.5.0
 
