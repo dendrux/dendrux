@@ -352,7 +352,7 @@ A run that enters `waiting_approval` and later resumes will scan again on the ne
 
 ## Content that cannot be scanned fails closed
 
-If a guardrail cannot examine some content (it is nested too deeply, larger than the scanner's limit, has more than 20,000 distinct values to redact in one run, or arrives while 16 Presidio scans are already running), it reports an `unscannable` finding instead of silently letting the content through. What happens next follows the action:
+If a guardrail cannot examine some content (text over 4 Mi characters, tool-call parameters nested more than 50 levels or holding more than 10,000 nodes, more than 20,000 distinct values to redact in one run, or a scan that arrives while 16 Presidio scans are already running), it reports an `unscannable` finding (kind `UNSCANNABLE`) instead of silently letting the content through. What happens next follows the action:
 
 | Action | `unscannable` content |
 | --- | --- |
@@ -362,7 +362,9 @@ If a guardrail cannot examine some content (it is nested too deeply, larger than
 
 Like every finding, it carries a kind, a count and a location, never the content itself.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+A message made of several text parts, and a tool result, is scanned as the one text the model would read (the parts joined by a blank line), so a pattern whose context sits in a neighbouring part is still found. Redaction is mapped back to each part. Tool-call parameters are scanned leaf by leaf and also as one joined `key=value` text in walk order and in reverse order, so an ancestor key such as `{"aws secret": {"value": TOKEN}}` supplies context to its children. A pattern's own context window still applies, so a context key separated from its value by many long keys can be missed. More parts can mean more blocks and redactions than in 0.4.1, never fewer. Joined text over the 4 Mi limit is `unscannable`.
+
+[//]: # "VERIFY-0.5.0: T3 owns this; confirm the kind name is unscannable and the depth and size limits worth documenting"
 
 ## Multiple guardrails compose
 

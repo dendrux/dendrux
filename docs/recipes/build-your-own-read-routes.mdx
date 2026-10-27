@@ -18,6 +18,10 @@ FastAPI; install your web framework separately if you use the example below.
 | redact_event(event) | Conservative standalone event projection; unverified active approval arguments fail closed |
 | get_subtree(run_id, tenant_id=...) | Delegated runs; inspect pending state on each waiting child |
 
+Reads validate their arguments before they query: a malformed id, tenant, cursor,
+filter or flag raises `ValueError` with a fixed message, which your route maps to
+400 (see [RunStore](/docs/reference/run-store#arguments-are-validated)).
+
 Pass an explicit `tenant_id` on every call: a nonempty string selects that tenant,
 `None` selects untenanted runs, and `UNSCOPED` is an explicit operator-only all-tenant
 view. Missing and foreign runs raise the same `RunNotFoundError`. Most older reads
@@ -51,17 +55,25 @@ and can contain real personal data. Approval and input calls use model-sent argu
 (PII placeholders when applicable). If `args_hidden=True`, stop and request resolution
 on the server; never replace unavailable args with `{}` or approve blind.
 
-Use the matching Agent submit method for each kind. Re-fetch pending after a
-conflict before asking the actor again. A read/check alone cannot guarantee that
-a delayed decision still targets the pause that actor saw.
+Use the matching Agent submit method for each kind, and send the pause back with
+the answer. Send `pause_id` down with the form and pass it as `expected_pause_id=`
+when the actor decides. A decision aimed at an older pause then raises
+`PauseStatusMismatchError` (answer 409) instead of acting on the newer one, and
+approving without a pause id raises `InputValidationError` (answer 400). After a
+409, call `get_pending` again before asking the actor again; never retry the old
+decision. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
 [//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
 
 ## Optional live feed over SSE
 
 `follow` has a shared poller per watched run, terminal drain, redaction, heartbeats,
-capacity (500 followers per store by default) and a maximum iteration duration
-(default 900 seconds). `EventFeed(store, max_followers=...)` customizes capacity.
+capacity (500 followers per store by default, and 100 per tenant scope) and a
+maximum iteration duration (default 900 seconds). The per-scope cap counts each
+tenant, all untenanted followers together and all `UNSCOPED` followers together,
+so a single-tenant app with more than 100 live readers per process builds
+`EventFeed(store, max_followers_per_tenant=None)` and calls `feed.follow(...)`.
+`EventFeed(store, max_followers=...)` customizes the store cap.
 A feed yields a `FollowEnd` with a cursor on terminal drain, lag or duration expiry.
 Reconnect using `Last-Event-ID`; rerun authentication and ownership on every request.
 

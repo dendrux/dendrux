@@ -186,6 +186,18 @@ Presidio's recall comes with statistical false positives — its `PERSON` recogn
 
 See [Guardrails — Choosing regex vs Presidio](/docs/architecture/guardrails#choosing-regex-vs-presidio) for the full trade-off table, false-positive walkthrough, and the stacked-engine recipe.
 
+## Reading redacted data back
+
+Redaction at the provider boundary is one half. The other half is what your own readers see. `RunStore.follow`, `get_event_view`, `get_pause_page` and `RunResult.to_dict()` are built for code that serves untrusted viewers, and they follow these rules:
+
+- **Redacted views protect against untrusted data.** With `include_payloads=False` (the default) a reader sees only Dendrux's enumerated codes, Dendrux-generated ids and digests, numbers and booleans, and developer configuration that the run proves. Text written by a model, a provider, a tool, an MCP server, a hook or a client is hidden or replaced (`<unknown_tool>`, `<mcp_tool>`, `<custom_kind>`, `<custom_provider>`). The full rule and the placeholder table are in [RunStore: redacted views](/docs/reference/run-store#redacted-views).
+- **They do not protect against hostile in-process code.** A custom provider, strategy, state store or hook runs with your server's full privileges. Review it like the rest of your server.
+- **The active pause is the exception.** A client must be able to act on the pause a run is waiting on, so its call ids, tool names and arguments stay visible. Client-tool arguments follow the PII restore policy (real values under `restore="all"`), so authorize the actor before you send them. Approval and input prompts and arguments are shown in placeholder form, exactly as the model sent them.
+- **The wire envelope mirrors the in-process policy.** `RunResult.to_dict()` restores client-tool arguments only for the tools that [PII restore](/docs/architecture/pii-restore) would restore into a server tool, shows approval and input prompts as placeholders, and never includes `pii_mapping`. See [RunResult](/docs/reference/agent#runresult).
+- **`get_result` leaves the mapping out.** `Agent.get_result(run_id, tenant_id=...)` returns the stored answer restored through the run's mapping, as `run()` did, but adds `meta["pii_mapping"]` only with `include_pii=True`. A result straight from `run()` still carries the mapping, so never return `meta` wholesale.
+
+> **Limit: very large PII maps.** When a user's input contains a very large number of PII entities (around a thousand), Dendrux does not try to mask every one of them inside a large approval argument for the wire. The display fails closed: the pending call keeps its id and `pause_id`, `params` is `None` and `args_hidden` is `True`, and an approver sees that the arguments are hidden and must be resolved on the server. Fetch the authorized `RunStore.get_pending` view when a fuller review is needed, and never approve arguments nobody has seen.
+
 ## Where this fits with the rest of the system
 
 PII redaction is not a standalone component. It is the interaction of three pieces:

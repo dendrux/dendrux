@@ -59,7 +59,19 @@ A run outside the scope behaves exactly like a missing one: `get_run` returns `N
 from dendrux import UNSCOPED
 ```
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T1 adds tenant_id to these RunStore methods; the signatures below follow spec section 5.1"
+
+### Arguments are validated
+
+Every read, `get_pending` and `follow` checks its arguments before it queries, and refuses with a `ValueError` whose message is fixed and never echoes the value (Dendrux logs `code=read_argument_invalid` with the argument name). A route can map it to HTTP 400.
+
+- Run ids and string tenant ids are non-empty strings of at most 255 characters with no NUL and no unpaired surrogate. `get_run(None)` therefore raises (it used to return `None`).
+- Cursors fit a 32-bit integer; `limit` and `offset` are integers (not `bool`); `offset` is at most 10,000.
+- `event_types` and `status` hold at most 100 entries.
+- `metadata_filter` is a dict of at most 32 keys matching `[A-Za-z0-9_-]{1,128}`, with scalar values (strings up to 4096 characters, finite numbers, `bool` or `None`). Nested values are not supported.
+- Date filters (`started_after`, `started_before`, `before`) are timezone-aware `datetime` values.
+- Boolean flags (`include_payloads`, `until_terminal`, `active_pause`, `undelivered_only`) must be real `bool` values. A string such as `"false"` raises instead of being read as true.
+- `read_image` with a value that is not a SHA-256 hex digest raises `BlobNotFoundError`, like a missing image.
 
 ## Read methods
 
@@ -95,7 +107,8 @@ async def get_llm_calls(run_id: str, *, iteration=None, limit=None, offset=0,
 async def get_tool_invocations(run_id: str, *, iteration=None, limit=None, offset=0,
                                before: datetime | None = None) -> list[ToolInvocation]
 async def get_traces(run_id: str, *, limit=None, offset=0) -> list[TraceEntry]
-async def get_pauses(run_id: str) -> list[PausePair]
+async def get_pauses(run_id: str, *, limit: int = 100, include_payloads: bool = False) -> list[PausePair]
+async def get_pause_page(run_id: str, *, limit: int = 100, include_payloads: bool = False) -> tuple[list[PausePair], bool]
 async def get_pii_mapping(run_id: str) -> dict[str, str]
 async def get_subtree(run_id: str, *, tenant_id: str | None = ...) -> RunSubtree
 async def get_notes(run_id: str, *, undelivered_only: bool = False,
@@ -114,8 +127,9 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False,
 | `get_llm_calls` | `LLMCall` list | Per-LLM-call usage, cache, raw payloads. |
 | `get_tool_invocations` | `ToolInvocation` list | Per tool execution: params, result, success. |
 | `get_traces` | `TraceEntry` list | Conversation messages in order. |
-| `get_pauses` | `PausePair` list | HITL pause/resume cycles. |
-| `get_pii_mapping` | `dict[str, str]` | Placeholder to real value. See [PII redaction](/docs/architecture/pii-redaction). |
+| `get_pauses` | `PausePair` list | HITL pause/resume cycles, first `limit` pairs (1 to 1000). Past pauses' arguments and the person's `user_input` are hidden unless `include_payloads=True`. |
+| `get_pause_page` | `(pairs, truncated)` | Same, plus an honest flag for more pairs than `limit`. |
+| `get_pii_mapping` | `dict[str, str]` | Placeholder to real value. Real personal data: for trusted server code only. See [PII redaction](/docs/architecture/pii-redaction). |
 | `get_subtree` | `RunSubtree` | A run, its delegated descendants and live rolled-up usage. |
 | `get_notes` | `RunNote` list | Inbox notes submitted with `submit_note`, delivered or not. |
 
@@ -133,28 +147,66 @@ def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | N
            max_duration_s: float | None = 900.0) -> Follow
 ```
 
-**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params` and `approval`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is one bounded read; the run's history is never loaded. `params` are the active pause's arguments, visible by default (the instruction to the client). It reports the run you ask about: for a run that delegated, list the tree with `get_subtree` and call `get_pending` for each waiting node.
+**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params`, `approval` and `args_hidden`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is one bounded read; the run's history is never loaded, and on Postgres a stored pause is converted to JSON once per read whatever its size. `params` depend on the kind:
 
-**`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. A shared poller serves every follower of a run in your process, at most 500 followers per store (`FollowCapacityError`, answer 503), 900 s per follow by default. Events pass through `redact_event`: with `include_payloads=False` the system prompt, provider bodies, the PII mapping and past pauses' arguments are removed, and the active pause's arguments stay.
+| Kind | `params` |
+| --- | --- |
+| `client_tool` | The arguments the client tool receives. With the default `PII(restore="all")` these hold real values. Authorize the actor before you show them. |
+| `approval`, `input` | The arguments exactly as the model sent them (PII placeholders), which is what a person approves. If the recorded model arguments are unavailable, `params` is `None` and `args_hidden` is `True`: resolve that pause on the server, never approve an empty object. |
 
-**`get_event_view(run_id, event, *, tenant_id, include_payloads=False)`** verifies that the run is in scope. Pass only events read from that same run;
-StoredEvent has no run ID for verifying event association. It resolves the active pause and uses recorded
-model-sent approval arguments. Prefer it when paging raw `get_events` rows for a UI.
-`follow` applies this contextual projection automatically. Neither makes raw traces,
-run details or provider records suitable for a browser without your field allowlist.
+`get_pending` reports the run you ask about: for a run that delegated, list the tree with `get_subtree` and call `get_pending` for each waiting node.
 
-**`redact_event(event, *, include_payloads=False, active_pause=False)`** is a conservative
-standalone filter with no database context. Unverified active approval/input params
-are hidden (`params=None`, `args_hidden=True`); never replace them with empty args.
-Use `get_event_view` for the verified model-sent values. All feed and pending types,
-`EventFeed`, `redact_event` and `RunStore` are importable from `dendrux.store`.
+**`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. `follow.drained_terminal` is `True` when the run is already finished and has nothing left to send; a route can answer 204 without iterating. A shared poller serves every follower of a run in your process, so database load grows with watched runs, not with open connections, and one follower costs a small constant number of statements however many pauses the run has. Events pass through the [redacted view](#redacted-views) unless `include_payloads=True`.
 
-Client-tool params may contain real personal data under the default PII restore
-policy. Authenticate and authorize user-level run ownership before exposing them.
-The feed bounds iteration; your HTTP transport must bound blocked sends and call
-`aclose()` in `finally`, including if no generator iteration begins.
+Follower limits (`FollowCapacityError`, answer 503 with a short `Retry-After`):
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
+- at most **500 followers per store** (`RunStore.follow` uses one `EventFeed` per store);
+- at most **100 per tenant scope** by default, a fifth of the store cap. The cap is per scope, not per user: each string `tenant_id` is one scope, all untenanted (`tenant_id=None`) followers together are one scope, and all `UNSCOPED` followers together are one scope. `FollowCapacityError.per_tenant` tells the two caps apart;
+- **900 seconds** per follow by default (`max_duration_s`), ending with a resume cursor.
+
+A single-tenant app that serves more than 100 live readers per process builds its own feed, and calls `feed.follow(...)` instead of `store.follow(...)`:
+
+[//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
+
+```python
+from dendrux.store import EventFeed
+
+feed = EventFeed(store, max_followers=2000, max_followers_per_tenant=None)
+```
+
+`max_followers_per_tenant=None` turns the per-scope cap off; a number sets it. The caps are per process: size them with your worker count and database pool.
+
+**`get_event_view(run_id, event, *, tenant_id, include_payloads=False)`** verifies that the run is in scope. Pass only events read from that same run; `StoredEvent` has no run ID to verify the association. It resolves the active pause and uses the recorded model-sent approval arguments. Prefer it when paging raw `get_events` rows for a UI. Each call costs one status query plus, for a pause event, an active-pause read, so keep pages small and use `follow` for live delivery.
+
+**`redact_event(event, *, include_payloads=False, active_pause=False)`** is a conservative standalone filter with no database context. It cannot prove which names are declared tools, so it shows `<unknown_tool>` for them, and unverified active approval or input arguments are hidden (`params=None`, `args_hidden=True`); never replace them with empty args. All feed and pending types, `EventFeed`, `redact_event` and `RunStore` are importable from `dendrux.store`.
+
+The feed bounds iteration; your HTTP transport must bound blocked sends and call `aclose()` in `finally`, including if no generator iteration begins.
+
+### Redacted views
+
+`follow`, `get_event_view`, `redact_event`, `get_pauses` and `get_pause_page` take `include_payloads` (default `False`). With the default, a stored event is shown through a field allowlist: every event type has a rule, and a field survives only if it is one of these:
+
+- a Dendrux enumeration or constant code (a run status, a stop reason, a pause reason, a budget metric, a tool result code);
+- a Dendrux-generated id or digest (run, pause and note ids, content hashes);
+- a number or a boolean;
+- a developer-declared name that Dendrux can prove from configuration (the agent name, skill names, guardrail ids and the tool names the run recorded in its `tools.declared` event, plus Dendrux's own skill tools).
+
+Everything else is hidden or replaced with a placeholder: text written by a model, a provider, a tool, an MCP server, a hook or a client. In practice that means the system prompt, provider requests and responses, tool arguments and results, PII mappings, free text such as a person's answer (`run.resumed.user_input`), a reviewer's denial reason, exception text (`run.error.error`; use `error_info`), image descriptions and a pause's `message`. `error_info` keeps only `category`, `retryable`, `error_type`, a built-in `provider` label, `status_code` and `timeout_reason`; `safe_message`, `model` and `provider_code` are hidden because they can carry vendor text. Tool call ids are hidden too, apart from the active pause's. Placeholders you may see:
+
+| Placeholder | Meaning |
+| --- | --- |
+| `<unknown_tool>` | A tool name Dendrux cannot prove is a declared tool (a name the model invented, a run with no `tools.declared` record, or `redact_event` without database context). |
+| `<mcp_tool>` | A name the run recorded as coming from an MCP server. |
+| `<custom_kind>` | A guardrail finding kind that is not one of Dendrux's built-in detectors. |
+| `<custom_provider>` | A provider label that is not one of Dendrux's built-in adapters. |
+| `<unknown_code>` | A tool result code that is not one Dendrux writes. |
+| `<unknown_skill>` | A skill name the model invented. |
+
+**The active pause is the exception.** A client has to act on it, so the arguments, call ids and tool names of the pause the run is waiting on stay visible in `run.paused`, in `get_pending` and in the matching `approval.requested` event. Authorize the actor first: client-tool arguments can hold real personal data. Past pauses are redacted like everything else. `include_payloads=True` is for trusted operators.
+
+**What this protects against.** Redacted readers protect against untrusted *data*: text supplied by models, provider responses, tool results, MCP servers, hook return values and clients. They do not protect against hostile code running in your process. A custom provider, strategy, state store or hook is Python with the full privileges of your server, so it could write any record or read around the redactor, and no library can defend against that. Review that code as you review the rest of your server.
+
+> **Known limit.** A tool name is shown only when the run's `tools.declared` event lists it; that event is written by Dendrux at the start of each run segment from the tools declared in code, never from MCP discovery or model output. Records written by in-process code you control are inside the boundary above. Runs created before 0.5.0 have no such event and show `<unknown_tool>` for tool names outside the active pause.
 
 ### `get_subtree`
 
@@ -232,10 +284,10 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 
 **`RunSubtree`**, **`SubtreeNode`**, **`RunUsage`** (from `get_subtree`) and **`RunNote`** (from `get_notes`) are described under [`get_subtree`](#get_subtree) and [`get_notes`](#get_notes).
 
-**`PausePair`** (from `get_pauses`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`, and (0.5.0) `pause_id`. `pending_tool_calls` carries the pending calls' ids, names and parameters, so `get_pauses` is the public way to read a client tool's call ids when you are not holding the original `RunResult` (see [Client-side tools](/docs/recipes/client-tools)). `pause_id` is `None` for pauses recorded before 0.5.0.
+**`PausePair`** (from `get_pauses` and `get_pause_page`): `pause_sequence_index`, `pause_at`, `resume_sequence_index`, `resume_at`, `reason`, `pending_tool_calls`, `submitted_results`, `user_input`, and (0.5.0) `pause_id`. `pending_tool_calls` carries the pending calls' ids, names and parameters, so `get_pauses` is the public way to read a client tool's call ids when you are not holding the original `RunResult` (see [Client-side tools](/docs/recipes/client-tools)). `pause_id` is `None` for pauses recorded before 0.5.0. By default past pauses' arguments, call ids and `user_input` are hidden; pass `include_payloads=True` for a trusted view.
 
 ## Where this fits
 
 - [State persistence](/docs/architecture/state-persistence): the tables behind these records.
 - [Build your own read routes](/docs/recipes/build-your-own-read-routes): the same reads over HTTP.
-- [HTTP API surface](/docs/reference/http-api): the endpoint shapes.
+- [HTTP integration](/docs/reference/http-api): what your routes call, and the old endpoint map.
