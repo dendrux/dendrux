@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 - unreleased
+## 0.5.0 - 2026-10-28
 
 "Trust". Pending and live reads require a tenant scope and hide payloads by default; provider
 failures are typed, every queue and payload has a bound, paused runs are

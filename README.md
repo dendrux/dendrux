@@ -546,7 +546,7 @@ ANTHROPIC_API_KEY=sk-... python 01_hello_world.py
 | Test-to-source ratio | 1.7 : 1 |
 | Min coverage enforced | 80% |
 | Python versions tested | 3.11, 3.12, 3.13 |
-| CI checks | lint, format, types, tests |
+| CI checks | lint, format, types, architecture, tests, API-break check |
 | Alembic migrations | 17 |
 | Examples | 39 runnable scripts + 5 example apps |
 | Development started | March 11, 2026 |
