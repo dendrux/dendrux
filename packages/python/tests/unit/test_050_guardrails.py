@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import time
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -730,13 +729,27 @@ class TestIndirectInjectionEndToEnd:
 
 class TestParamsWalkIsBounded:
     async def test_long_key_with_many_items_is_fast(self) -> None:
-        engine = GuardrailEngine([SecretDetection(action="block"), PII(action="warn")])
+        scanned = {"chars": 0, "calls": 0}
+        budget = 6_000_000
+
+        class _Meter:
+            action: Literal["redact", "block", "warn"] = "warn"
+
+            async def scan(self, text: str) -> list[Finding]:
+                scanned["chars"] += len(text)
+                scanned["calls"] += 1
+                if scanned["chars"] > budget:
+                    raise AssertionError(f"scanned {scanned['chars']} characters, budget {budget}")
+                return []
+
+        engine = GuardrailEngine([_Meter(), SecretDetection(action="block"), PII(action="warn")])
         params = {"k" * 100_000: ["x"] * 2000}
-        start = time.perf_counter()
         findings, block = await engine.scan_outgoing("ok", [params])
-        assert time.perf_counter() - start < 1.0
         assert block is None
         assert findings == []
+        # Only the last characters of a key join a value's context scan, so the 100,000
+        # character key is not repeated 2,000 times (that would be about 200 million).
+        assert scanned["chars"] <= budget
 
     async def test_oversize_key_is_unscannable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(engine_mod, "MAX_SCAN_CHARS", 1000)
@@ -823,39 +836,204 @@ def _ips(n: int) -> str:
     return " ".join(f"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}" for i in range(n))
 
 
+class _WorkBudgetError(AssertionError):
+    pass
+
+
+class _Work:
+    """Characters copied through slicing, concatenation and ``replace`` on a ``_CopyCountingStr``.
+
+    Operation counts do not depend on machine load, unlike wall-clock time. The
+    budget fails fast, so a quadratic implementation stops at its first big copy
+    instead of running for minutes.
+    """
+
+    chars = 0
+    budget = 0
+
+    @classmethod
+    def reset(cls, budget: int) -> None:
+        cls.chars = 0
+        cls.budget = budget
+
+    @classmethod
+    def add(cls, n: int) -> None:
+        cls.chars += n
+        if cls.chars > cls.budget:
+            raise _WorkBudgetError(f"copied {cls.chars} characters, budget {cls.budget}")
+
+
+class _CopyCountingStr(str):
+    def __getitem__(self, key: Any) -> _CopyCountingStr:
+        out = str.__getitem__(self, key)
+        _Work.add(len(out))
+        return _CopyCountingStr(out)
+
+    def __add__(self, other: Any) -> _CopyCountingStr:
+        out = str.__add__(self, other)
+        _Work.add(len(out))
+        return _CopyCountingStr(out)
+
+    def __radd__(self, other: str) -> _CopyCountingStr:
+        out = other + str(self)
+        _Work.add(len(out))
+        return _CopyCountingStr(out)
+
+    def replace(self, *args: Any, **kwargs: Any) -> _CopyCountingStr:  # type: ignore[override]
+        out = str.replace(self, *args, **kwargs)
+        _Work.add(len(out))
+        return _CopyCountingStr(out)
+
+
+class _CountingDict(dict[str, str]):
+    """A dict that counts keyed reads and, separately, every element visited by iteration."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.reads = 0
+        self.visits = 0
+        self.max_visits: int | None = None
+
+    def _visit(self) -> None:
+        self.visits += 1
+        if self.max_visits is not None and self.visits > self.max_visits:
+            raise AssertionError(f"mapping walked element by element ({self.visits} visits)")
+
+    def __getitem__(self, key: str) -> str:
+        self.reads += 1
+        return super().__getitem__(key)
+
+    def __contains__(self, key: object) -> bool:
+        self.reads += 1
+        return super().__contains__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self.reads += 1
+        return super().get(key, default)
+
+    def __iter__(self) -> Any:
+        for key in super().__iter__():
+            self._visit()
+            yield key
+
+    def items(self) -> Any:  # type: ignore[override]
+        for pair in super().items():
+            self._visit()
+            yield pair
+
+    def values(self) -> Any:  # type: ignore[override]
+        for value in super().values():
+            self._visit()
+            yield value
+
+    def keys(self) -> Any:  # type: ignore[override]
+        for key in super().keys():  # noqa: SIM118
+            self._visit()
+            yield key
+
+
+def _count_calls(
+    monkeypatch: pytest.MonkeyPatch, name: str, limit: int | None = None
+) -> dict[str, int]:
+    """Wrap ``GuardrailEngine.<name>``, count its calls and fail fast past ``limit``."""
+    calls = {"n": 0}
+    original = getattr(GuardrailEngine, name)
+
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if limit is not None and calls["n"] > limit:
+            raise AssertionError(f"{name} called more than {limit} times")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(GuardrailEngine, name, wrapper)
+    return calls
+
+
+def _snapshot(engine: GuardrailEngine) -> dict[str, str]:
+    """``get_pii_mapping`` after the walk limit is lifted (reading it walks the mapping)."""
+    for table in (engine._pii_mapping, engine._reverse):
+        if isinstance(table, _CountingDict):
+            table.max_visits = None
+    return engine.get_pii_mapping()
+
+
+def _counting_engine() -> GuardrailEngine:
+    engine = GuardrailEngine([PII(action="redact")])
+    engine._pii_mapping = _CountingDict(engine._pii_mapping)
+    engine._reverse = _CountingDict(engine._reverse)
+    engine._pii_mapping.max_visits = engine._reverse.max_visits = 0
+    return engine
+
+
 class TestRedactionIsBounded:
-    async def test_mebibyte_of_distinct_ips_fails_closed_quickly(self) -> None:
-        text = _ips(88_000)
-        assert len(text) > 1_000_000
-        engine = GuardrailEngine([PII(action="redact")])
-        start = time.perf_counter()
+    async def test_mebibyte_of_distinct_ips_fails_closed_quickly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = _ips(88_000)
+        assert len(raw) > 1_000_000
+        _Work.reset(len(raw))
+        text = _CopyCountingStr(raw)
+        created = _count_calls(monkeypatch, "_get_or_create_placeholder", limit=0)
+        applied = _count_calls(monkeypatch, "_apply_redaction", limit=0)
+        engine = _counting_engine()
         _, findings, block = await engine.scan_incoming(text)
-        assert time.perf_counter() - start < 3.0
         assert block is not None
         assert UNSCANNABLE in block
-        assert len(engine.get_pii_mapping()) == 0
+        # Failing closed means no redaction work at all, not redaction followed by a check.
+        assert created["n"] == 0
+        assert applied["n"] == 0
+        assert _Work.chars <= len(raw)
+        assert len(_snapshot(engine)) == 0
 
-    async def test_many_distinct_values_below_the_cap_redact_in_linear_time(self) -> None:
-        text = _ips(10_000)
-        engine = GuardrailEngine([PII(action="redact")])
-        start = time.perf_counter()
+    async def test_many_distinct_values_below_the_cap_redact_in_linear_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = _ips(10_000)
+        _Work.reset(len(raw))
+        text = _CopyCountingStr(raw)
+        created = _count_calls(monkeypatch, "_get_or_create_placeholder")
+        minted = _count_calls(monkeypatch, "_next_placeholder")
+        applied = _count_calls(monkeypatch, "_apply_redaction")
+        engine = _counting_engine()
         out, findings, block = await engine.scan_incoming(text)
-        assert time.perf_counter() - start < 2.0
         assert block is None
         assert len(findings) == 10_000
         assert "10." not in out
-        assert len(engine.get_pii_mapping()) == 10_000
+        # One pass over the text, one placeholder lookup per finding, no scan of the mapping.
+        assert applied["n"] == 1
+        assert created["n"] == 10_000
+        assert minted["n"] == 10_000
+        assert _Work.chars <= len(raw)
+        reverse, mapping = engine._reverse, engine._pii_mapping
+        assert isinstance(reverse, _CountingDict) and isinstance(mapping, _CountingDict)
+        assert reverse.visits == 0 and mapping.visits == 0
+        assert reverse.reads <= 4 * 10_000
+        assert len(_snapshot(engine)) == 10_000
 
-    async def test_repeated_value_dedupes_to_one_mapping_entry(self) -> None:
-        text = "192.168.1.1 " * 90_000
-        engine = GuardrailEngine([PII(action="redact")])
-        start = time.perf_counter()
+    async def test_repeated_value_dedupes_to_one_mapping_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = "192.168.1.1 " * 90_000
+        _Work.reset(len(raw))
+        text = _CopyCountingStr(raw)
+        created = _count_calls(monkeypatch, "_get_or_create_placeholder")
+        minted = _count_calls(monkeypatch, "_next_placeholder")
+        applied = _count_calls(monkeypatch, "_apply_redaction")
+        engine = _counting_engine()
         out, findings, block = await engine.scan_incoming(text)
-        assert time.perf_counter() - start < 3.0
         assert block is None
         assert len(findings) == 90_000
         assert set(out.split()) == {"<<IP_ADDRESS_1>>"}
-        assert engine.get_pii_mapping() == {"<<IP_ADDRESS_1>>": "192.168.1.1"}
+        # 90,000 sightings: one text pass, one placeholder minted, no scan of the mapping.
+        assert applied["n"] == 1
+        assert created["n"] == 90_000
+        assert minted["n"] == 1
+        assert _Work.chars <= len(raw)
+        reverse, mapping = engine._reverse, engine._pii_mapping
+        assert isinstance(reverse, _CountingDict) and isinstance(mapping, _CountingDict)
+        assert reverse.visits == 0 and mapping.visits == 0
+        assert reverse.reads <= 4 * 90_000
+        assert _snapshot(engine) == {"<<IP_ADDRESS_1>>": "192.168.1.1"}
 
     async def test_mapping_cap_blocks_under_redact_and_reports_under_warn(
         self, monkeypatch: pytest.MonkeyPatch
@@ -903,12 +1081,17 @@ class TestRedactionIsBounded:
     async def test_restore_of_many_placeholders_is_linear(self) -> None:
         engine = GuardrailEngine([PII(action="redact")])
         await engine.scan_incoming(_ips(5_000))
+        counting = _CountingDict(engine._pii_mapping)
+        counting.max_visits = 0
+        engine._pii_mapping = counting
         params = {"items": [f"value=<<IP_ADDRESS_{i}>>!" for i in range(1, 2001)]}
-        start = time.perf_counter()
         out = engine.deanonymize(params)
-        assert time.perf_counter() - start < 1.0
         assert "<<" not in str(out)
         assert all(item.startswith("value=10.") and item.endswith("!") for item in out["items"])
+        # One keyed lookup per placeholder (plus the whole-value check); never a walk
+        # over the 5,000 mapping entries for each item.
+        assert counting.visits == 0
+        assert counting.reads <= 2 * 2000
 
 
 class TestGuardrailReportedUnscannable:
