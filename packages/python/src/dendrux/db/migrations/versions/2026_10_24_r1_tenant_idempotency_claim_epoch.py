@@ -14,7 +14,7 @@
   never unenforced. Existing rows always fit: globally unique keys are unique
   per tenant too.
 - Adds ``ix_agent_runs_tenant_id_created_at`` on ``(tenant_id, created_at DESC)``
-  for tenant-scoped listings (D-124).
+  for tenant-scoped listings.
 
 Every index step is idempotent (``IF [NOT] EXISTS``). A database stamped at
 this revision by an earlier build that only added ``claim_epoch`` recovers
