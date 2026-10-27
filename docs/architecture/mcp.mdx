@@ -20,7 +20,7 @@ pip install "dendrux[mcp]"
 Dendrux runs MCP clients, never remote MCP servers itself:
 
 - **Remote HTTP servers** are hosted by their vendor (a SaaS MCP endpoint), by your platform team, or behind an MCP gateway you deploy. Dendrux connects to them over streamable HTTP.
-- **Stdio servers** are subprocesses that Dendrux spawns on your machine, with your process's operating-system privileges. You own what they can touch. MCP is not a sandbox: run only trusted stdio servers directly, and put untrusted ones in a container or isolated MCP server or gateway reached over HTTP.
+- **Stdio servers** are subprocesses that Dendrux spawns on your machine, with your process's operating-system privileges. You own what they can touch. MCP is not a sandbox: run only trusted stdio servers directly, and put untrusted ones in a container or isolated MCP server or gateway reached over HTTP. A stdio server is inside your trust boundary, so Dendrux bounds its discovery by pages, tools, cursor length and time but does not byte-cap its responses (see [Discovery limits](#discovery-limits)); the HTTP server is the untrusted case, and its responses are byte-capped before they are decoded.
 - Dendrux does not help you build MCP servers. Use the official MCP SDKs for that, then consume the result from Dendrux.
 
 Pin subprocess package versions, as these examples do, instead of executing an unreviewed future `latest` release.
@@ -505,7 +505,7 @@ view = connection.tools(prefix=False, rename={"search_code": "gh_search"})
 
 Rename values must match `[a-zA-Z0-9_-]` and be at most 64 characters, including the `namespace__` prefix when `prefix=True`, and must be unique; a bad value raises `ValueError` when the view is created. A rename value that equals another tool's sanitized name makes whichever of the two comes later in server order the `duplicate_name` skip, which may be the renamed tool itself; pick a value no other tool sanitizes to. Rules (`deny`, `require_approval`) and telemetry use the exposed name; the server is always called by its own name, which stays in `ToolDef.meta["mcp_tool_name"]` next to `meta["exposed_name"]`.
 
-**`strict=True`** restores raising at discovery. By default one bad tool no longer drops its whole source: a tool whose exposed name is not provider-safe or whose base name is empty (`name_unsafe`), a tool whose exposed name an earlier tool in server order already took (`duplicate_name`), and a name in `allowed_tools`, `force_serial_tools`, or `rename` that the server does not list (`unknown_tool`) are skipped and reported in `RunResult.meta["mcp_skipped_tools"]` (see [Failure modes at discovery](#failure-modes-at-discovery)). With `strict=True` the first of these raises `ValueError` instead:
+**`strict=True`** restores raising at discovery. By default one bad tool no longer drops its whole source: a tool whose exposed name is not provider-safe or whose base name is empty (`name_unsafe`), a tool whose exposed name an earlier tool in server order already took (`duplicate_name`), a tool whose argument schema has a shape Dendrux cannot validate against (`invalid_schema`), and a name in `allowed_tools`, `force_serial_tools`, or `rename` that the server does not list (`unknown_tool`) are skipped and reported in `RunResult.meta["mcp_skipped_tools"]` (see [Failure modes at discovery](#failure-modes-at-discovery)). With `strict=True` the first of these raises instead: `ValueError` for names, and `MCPInvalidToolSchemaError` (also a `ValueError`) for a malformed schema.
 
 [//]: # "docs-test: skip - fragment: relies on `connection`, defined by setup shown elsewhere"
 
@@ -748,6 +748,36 @@ async def call_tool(
 
 A malicious or buggy server can advertise a tool whose name echoes the credential it was just sent. Dendrux's own logs, error messages and telemetry scrub credential-shaped tool names. The MCP SDK's own DEBUG logging is outside Dendrux's control and may echo raw tool names, so keep SDK loggers above DEBUG in production.
 
+## Discovery limits
+
+A server decides how many tools it lists, how large they are and how it pages them, so Dendrux bounds `tools/list` instead of trusting it. Discovery stops with `MCPDiscoveryLimitError` (a subclass of `MCPConnectionError`, error code `discovery_limit`) when any bound is passed. Its `reason` says which one:
+
+| `reason` | Bound | Option (default) | Applies to |
+| --- | --- | --- | --- |
+| `page_cap` | Pages of `tools/list` | `max_discovery_pages` (100) | HTTP and stdio |
+| `repeated_cursor` | A page cursor the server already returned, so paging would never end | none | HTTP and stdio |
+| `cursor_length` | A cursor longer than 4096 characters | none (constant) | HTTP and stdio |
+| `tool_cap` | Tools across all pages | `max_discovery_tools` (2000) | HTTP and stdio |
+| `deadline` | Total discovery time | `discovery_timeout` (60.0 seconds) | HTTP and stdio |
+| `byte_cap` | Bytes of `tools/list` response bodies across all pages, counted on the wire before decoding | `max_discovery_bytes` (16 MiB) | **HTTP only** |
+
+The options are fields of `MCPSource` and are accepted by `MCPSource.http(...)` and `MCPServer(...)`; `MCPSource.stdio(...)` takes the page, tool and time options but not `max_discovery_bytes`, and setting a non-default byte cap on a stdio source raises `ValueError` at construction. A stdio server is a local process you launch, inside your trust boundary, and the HTTP client is the only place Dendrux can cap response bodies before the SDK decodes them. The error text names the source and the reason only, never a cursor, and Dendrux logs `mcp_discovery_<reason>` with the source name and page count. An outer cancellation is never swallowed.
+
+The failure then follows the source's [failure mode](#failure-modes-at-discovery): `strict` stops the run, `best_effort` records the source in `mcp_skipped_sources` with code `discovery_limit` and continues. A server that really needs more room raises the limit on its own source:
+
+[//]: # "docs-test: skip - needs a live MCP server"
+
+```python
+source = MCPSource.http(
+    "catalog",
+    url="https://mcp.example.com/mcp",
+    max_discovery_tools=5000,
+    max_discovery_bytes=32 * 1024 * 1024,
+)
+```
+
+A tool whose argument schema is malformed (for example `required` that is not a list of strings, including `required: null`, or a `properties` that is not an object, anywhere in the schema, or a schema nested deeper than 32 levels or with more than 10,000 sub-schemas) is skipped at discovery with reason `invalid_schema`, or raises `MCPInvalidToolSchemaError` in a `strict=True` view. The log line names the source and the tool, never the schema text.
+
 ## Failure modes at discovery
 
 Each source chooses how discovery failure affects the run:
@@ -777,12 +807,14 @@ Branch on `code`, never on `error` text. It is derived from the exception class 
 | `MCPAuthenticationError` | `authentication_failed` |
 | `MCPCredentialError`, including `MCPOAuthRefreshError` | `credential_error` |
 | `MCPDestinationDeniedError` | `destination_denied` |
+| `MCPDiscoveryLimitError` (`tools/list` passed a page, tool, byte, cursor or time bound; its `reason` says which) | `discovery_limit` |
 | `MCPCircuitOpenError` | `circuit_open` |
 | `MCPConnectionCapacityError`, `MCPCallCapacityError` | `capacity` |
 | `MCPConnectionLostError`, any other `MCPConnectionError` | `connection_failed` |
 | `MCPStaleConnectionError`, `MCPConnectionEvictingError`, any other `MCPConnectionStateError` | `connection_state` |
 | `MCPToolNameCollisionError` (an exposed name equals another source's tool, a local tool, or a reserved skill tool name) | `tool_name_collision` |
 | `MCPToolNotFoundError` (`connection.call_tool` named an unlisted tool) | `tool_not_found` |
+| `MCPInvalidToolSchemaError` (a `strict=True` view found a tool whose argument schema is malformed) | `invalid_tool_schema` |
 | `ValueError` from tool naming with `strict=True` | `invalid_tool_names` |
 | anything else | `unknown` |
 
@@ -795,7 +827,7 @@ Individual tools a view skipped (see [Views and tool policy](#views-and-tool-pol
 ```python
 for skipped in result.meta.get("mcp_skipped_tools", []):
     skipped["source_name"], skipped["namespace"], skipped["tool"], skipped["reason"]
-    # reason: "name_unsafe" | "duplicate_name" | "unknown_tool"
+    # reason: "name_unsafe" | "duplicate_name" | "unknown_tool" | "invalid_schema"
 ```
 
 When the list is non-empty the run also records one `mcp.tools_skipped` governance event at initialization, with the same entries under `skipped`. Entries hold names only, never arguments or results.
@@ -919,8 +951,11 @@ Common options on `MCPSource.http(...)` and `MCPSource.stdio(...)`:
 | `call_timeout` | `120.0` | Per-tool SDK and Dendrux execution timeout. |
 | `max_result_bytes` | `1_000_000` | Maximum normalized result size. |
 | `failure_mode` | `"strict"` | `"strict"` or `"best_effort"`. |
+| `max_discovery_pages` | `100` | Most `tools/list` pages before discovery stops. |
+| `max_discovery_tools` | `2000` | Most tools across all pages. |
+| `discovery_timeout` | `60.0` | Total seconds allowed for discovery. |
 
-HTTP-only options are `url`, `headers`, and `auth`. Stdio-only options are `command`, `env`, and `cwd`; mixing transport-specific options raises `ValueError` during construction.
+HTTP-only options are `url`, `headers`, `auth` and `max_discovery_bytes` (default 16 MiB, the cap on `tools/list` response bodies). See [Discovery limits](#discovery-limits). Stdio-only options are `command`, `env`, and `cwd`; mixing transport-specific options raises `ValueError` during construction.
 
 `MCPRuntime` constructor options are listed under [process-local ownership](#process-local-ownership).
 

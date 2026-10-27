@@ -127,13 +127,15 @@ async def ship(order_id: int, to: Address) -> str:
 
 Details:
 
-- Error messages name the field and the constraint that failed, never the value, so personal data cannot flow back to the model provider through an error.
+- Error messages name the field and the constraint that failed, never the value, so personal data cannot flow back to the model provider through an error. Dictionary keys and unknown argument names are not echoed either: a key shows as `<key>`, and an unexpected top-level argument is reported as a count with the list of valid arguments (`ship has 1 unknown argument. Valid arguments: order_id, to`). A few Pydantic messages that quote the input (a bad discriminator tag, UUID, base64 or embedded JSON) are replaced with fixed text.
+- Arguments that cannot be stored are refused before any hook, approval or execution, for known, unknown and client tools alike: a string or key holding NUL or a lone surrogate, a non-finite number, or a structure too large to persist returns `code: "invalid_params"` to the model. The message names the tool and the rule, never the content.
+- A tool whose own argument schema is malformed (for example `required` that is not a list of strings, including `required: null`) returns `code: "invalid_tool_schema"` instead of raising. The log line names the tool, not the schema. MCP tools with such a schema are skipped at discovery (see [MCP](/docs/architecture/mcp#discovery-limits)).
 - `*args` and `**kwargs` are left out of the generated schema.
 - A tool with an explicit `parameters=` schema keeps JSON Schema validation only. There is no coercion, and your function receives the plain JSON values.
 - MCP tools and client tools are not coerced: their arguments and results are unchanged from 0.4.
 - Tool schemas are part of the prompt, so adding constraint keywords can change a prompt-cache key once, on the first request after you upgrade.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T4 owns validation and coercion; confirm the order of operations, the error wording rule, that the approval view is the model-sent form (exclude_unset) and that the approval fingerprint uses it"
 
 ## Timeouts and the thread pool
 
@@ -146,11 +148,13 @@ Details:
 
 Sync tools (plain `def` functions) run on one process-wide, bounded thread pool, created on first use. Size it with `DENDRUX_TOOL_THREADS` (default 32). Limit what one `Agent` can occupy with `Agent(tool_threads=8)` (default 8), so one agent or tenant cannot starve the others. Pool threads are daemon threads: a hung sync tool never blocks interpreter exit, but its side effect may be cut off at exit.
 
-A sync tool that has timed out cannot be killed; it keeps its thread until it returns. Dendrux counts these and reports them in a log line and on the `tool.completed` event, and a public helper returns the current number so you can export it as a gauge. Async tools are cancelled at the timeout.
+A sync tool that has timed out cannot be killed; it keeps its thread until it returns. Dendrux counts these and reports them in a log line and as `zombie_threads` on the `tool.completed` event. `dendrux.tool_pool_stats()` returns a snapshot (`max_threads`, `threads`, `busy`, `queued`, `zombies`) so you can export it as a gauge; restart the process if `zombies` keeps growing toward `max_threads`. Async tools are cancelled at the timeout.
+
+**Waiting calls are bounded too.** Each Agent runs at most `tool_threads` tool calls at once, and at most **256 more may wait** for a slot. A call that arrives when the queue is full is not started: the model gets a retryable `code: "tool_pool_saturated"` result and the tool never runs, so a burst of calls cannot build an unbounded backlog. Change the bound for the process with the `DENDRUX_TOOL_QUEUE_LIMIT` environment variable (a positive integer, read the first time a call has to wait). There is no `Agent` argument for it in 0.5.
 
 If a parallel batch ends the run (a failure that stops the run), the async siblings are cancelled and recorded as `cancelled`; sibling sync tools that had already started are recorded with an unknown outcome.
 
-[//]: # "VERIFY-0.5.0: Confirm the API names, behavior and examples against the release candidate."
+[//]: # "VERIFY-0.5.0: T4 owns the pool; confirm the helper's public name and import path for the hung-thread gauge, the tool.completed field name for zombie counts, and the default tool_threads"
 
 ## Result size limits
 
@@ -247,7 +251,7 @@ The call does not run. The model gets a failed tool result that lists what it ca
 Unknown tool: bash. Available tools: read_file, write_file
 ```
 
-Names are sorted and capped at 50, then `, … and N more`. If no tools were offered, the text is `Unknown tool: bash. No tools are available.` The `Unknown tool: <name>` prefix is stable.
+Names are sorted and capped at 50, then `, … and N more`. If no tools were offered, the text is `Unknown tool: bash. No tools are available.` The `Unknown tool: <name>` prefix is stable. The rejection is recorded with `code: "unknown_tool"` on the result and the `tool.completed` event, and happens before `before_tool` and approval, so neither sees it. A name too long to store is not echoed back.
 
 ## MCP tools
 
