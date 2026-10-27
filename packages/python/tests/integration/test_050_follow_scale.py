@@ -16,7 +16,14 @@ import pytest
 from sqlalchemy import event
 
 from dendrux.agent import Agent
-from dendrux.store import EventFeed, FollowCapacityError, FollowEnd, FollowHeartbeat, RunStore
+from dendrux.store import (
+    UNSCOPED,
+    EventFeed,
+    FollowCapacityError,
+    FollowEnd,
+    FollowHeartbeat,
+    RunStore,
+)
 from dendrux.tool import tool
 from dendrux.types import LLMResponse, ToolResult
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
@@ -163,27 +170,78 @@ async def test_one_tenant_cannot_take_every_slot(store: Any, engine: Any) -> Non
     assert feed.followers == 0
 
 
-async def test_default_cap_is_a_fifth_and_untenanted_share_the_global_cap(
-    store: Any, engine: Any
-) -> None:
-    run_store = RunStore.from_engine(engine)
+async def test_default_cap_is_a_fifth_of_the_feed() -> None:
+    run_store = RunStore(None)  # type: ignore[arg-type]  # no reads needed
     assert EventFeed(run_store).max_followers_per_tenant == 100
     assert EventFeed(run_store, max_followers=3).max_followers_per_tenant == 1
     assert EventFeed(run_store, max_followers_per_tenant=None).max_followers_per_tenant is None
+
+
+@pytest.mark.parametrize("scope", [None, UNSCOPED], ids=["untenanted", "unscoped"])
+async def test_untenanted_and_unscoped_scopes_are_capped_like_a_tenant(
+    store: Any, engine: Any, scope: Any
+) -> None:
+    """The cap is per scope: ``None`` (every user of a single-tenant app) and
+    ``UNSCOPED`` are each one scope, so they cannot take every slot either."""
+    run_store = RunStore.from_engine(engine)
     run_none = await _paused_run(store, None)
-    feed = EventFeed(run_store, max_followers=5)  # per tenant: 1
+    run_b = await _paused_run(store, "B")
+    feed = EventFeed(run_store, max_followers=10, max_followers_per_tenant=4)
     held = []
     try:
-        for _ in range(5):  # untenanted followers are not one tenant
+        for _ in range(4):
+            f = feed.follow(run_none, tenant_id=scope)
+            await f.start()
+            held.append(f)
+        with pytest.raises(FollowCapacityError) as info:
+            await feed.follow(run_none, tenant_id=scope).start()
+        assert info.value.per_tenant is True and info.value.limit == 4
+        victim = feed.follow(run_b, tenant_id="B")
+        await victim.start()
+        held.append(victim)
+    finally:
+        for f in held:
+            await f.aclose()
+    assert feed.followers == 0 and feed._by_scope == {}
+
+
+async def test_single_tenant_apps_keep_an_override(store: Any, engine: Any) -> None:
+    """``max_followers_per_tenant=None`` lets one scope use the whole feed again."""
+    run_store = RunStore.from_engine(engine)
+    run_none = await _paused_run(store, None)
+    feed = EventFeed(run_store, max_followers=6, max_followers_per_tenant=None)
+    held = []
+    try:
+        for _ in range(6):
             f = feed.follow(run_none, tenant_id=None)
             await f.start()
             held.append(f)
         with pytest.raises(FollowCapacityError) as info:
             await feed.follow(run_none, tenant_id=None).start()
-        assert info.value.per_tenant is False and info.value.limit == 5
+        assert info.value.per_tenant is False and info.value.limit == 6
     finally:
         for f in held:
             await f.aclose()
+
+
+async def test_concurrent_untenanted_flood_leaves_room_for_tenants(store: Any, engine: Any) -> None:
+    """60 untenanted followers start at once: exactly the cap (20) get a slot,
+    the rest fail with the per-scope error, and tenant B still gets in."""
+    run_store = RunStore.from_engine(engine)
+    run_none = await _paused_run(store, None)
+    run_b = await _paused_run(store, "B")
+    feed = EventFeed(run_store, max_followers=100, max_followers_per_tenant=20)
+    follows = [feed.follow(run_none, tenant_id=None) for _ in range(60)]
+    results = await asyncio.gather(*(f.start() for f in follows), return_exceptions=True)
+    started = [f for f, r in zip(follows, results, strict=True) if r is None]
+    refused = [r for r in results if isinstance(r, FollowCapacityError)]
+    assert len(started) == 20 and len(refused) == 40
+    assert all(r.per_tenant for r in refused)
+    victim = feed.follow(run_b, tenant_id="B")
+    await victim.start()
+    for f in [*started, victim]:
+        await f.aclose()
+    assert feed.followers == 0 and feed._by_scope == {}
 
 
 @pytest.mark.parametrize("bad", [0, -1, True, 1.5, "3"])

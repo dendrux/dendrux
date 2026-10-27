@@ -317,7 +317,7 @@ class TestSharing:
 
     async def test_capacity_is_enforced_and_released(self, state: Any, store: RunStore) -> None:
         await state.create_run("r1", "a")
-        feed = _feed(store, max_followers=2)
+        feed = _feed(store, max_followers=2, max_followers_per_tenant=None)  # global cap only
         a, b = feed.follow("r1", tenant_id=None), feed.follow("r1", tenant_id=None)
         await a.start()
         await b.start()

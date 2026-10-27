@@ -104,11 +104,18 @@ class FollowCapacityError(RuntimeError):
         return (_capacity_error, (self.limit, self.per_tenant))
 
 
-_CAPACITY_SCOPE = {False: "followers", True: "followers for one tenant"}
+_CAPACITY_SCOPE = {False: "followers", True: "followers for one tenant scope"}
 
 
 def _capacity_error(limit: int, per_tenant: bool) -> FollowCapacityError:
     return FollowCapacityError(limit, per_tenant=per_tenant)
+
+
+def _scope_key(tenant_id: TenantScope) -> tuple[str, ...]:
+    """The cap bucket of a scope: a tenant, all untenanted, or all unscoped followers."""
+    if isinstance(tenant_id, str):
+        return ("tenant", tenant_id)
+    return ("untenanted",) if tenant_id is None else ("unscoped",)
 
 
 def _tenant_cap(max_followers: int, value: object) -> int | None:
@@ -366,10 +373,14 @@ class EventFeed:
         max_followers: Most concurrent followers; :meth:`Follow.start`
             raises :class:`FollowCapacityError` beyond it.
         max_followers_per_tenant: Most concurrent followers for one tenant
-            (a string ``tenant_id``), so one tenant cannot take every slot.
-            Defaults to a fifth of ``max_followers`` (100 of 500), at least 1;
-            ``None`` turns it off. Untenanted (``None``) and ``UNSCOPED``
-            followers are not one tenant and share only ``max_followers``.
+            scope, so no scope can take every slot. The cap is per scope,
+            not per user: each string ``tenant_id`` is one scope, all
+            untenanted followers (``tenant_id=None``, every user of a
+            single-tenant app) are one scope, and all ``UNSCOPED`` followers
+            are one scope. Defaults to a fifth of ``max_followers`` (100 of
+            500), at least 1; ``None`` turns it off. A single-tenant app that
+            needs more followers passes ``max_followers_per_tenant=None`` (or
+            a larger number) to its own ``EventFeed(store, ...)``.
         poll_interval_s / poll_max_s: idle polling starts at the first and
             doubles up to the second; a new event resets it.
         heartbeat_s: idle time before a :class:`FollowHeartbeat` is yielded.
@@ -409,7 +420,7 @@ class EventFeed:
         self.stop_timeout_s = stop_timeout_s
         self._closed = False
         self._open = 0
-        self._by_tenant: dict[str, int] = {}
+        self._by_scope: dict[tuple[str, ...], int] = {}
         self._feeds: dict[str, _RunFeed] = {}
 
     @property
@@ -482,11 +493,12 @@ class EventFeed:
         self._open += 1
 
     def _take_tenant_slot(self, tenant_id: TenantScope) -> None:
-        """Count a string tenant's follower; refuse beyond the per-tenant cap."""
+        """Count the follower against its scope; refuse beyond the per-scope cap."""
         cap = self.max_followers_per_tenant
-        if not isinstance(tenant_id, str) or cap is None:
+        if cap is None:
             return
-        held = self._by_tenant.get(tenant_id, 0)
+        key = _scope_key(tenant_id)
+        held = self._by_scope.get(key, 0)
         if held >= cap:
             # The tenant id is caller data: never logged.
             logger.warning(
@@ -495,18 +507,17 @@ class EventFeed:
                 extra={"code": "follow_tenant_capacity"},
             )
             raise FollowCapacityError(cap, per_tenant=True)
-        self._by_tenant[tenant_id] = held + 1
+        self._by_scope[key] = held + 1
 
     def _release(self, tenant_id: TenantScope) -> None:
         self._open = max(0, self._open - 1)
         self._give_tenant_slot(tenant_id)
 
     def _give_tenant_slot(self, tenant_id: TenantScope) -> None:
-        if not isinstance(tenant_id, str):
-            return
-        held = self._by_tenant.pop(tenant_id, 0)
+        key = _scope_key(tenant_id)
+        held = self._by_scope.pop(key, 0)
         if held > 1:
-            self._by_tenant[tenant_id] = held - 1
+            self._by_scope[key] = held - 1
 
     def _drop(self, feed: _RunFeed) -> None:
         if self._feeds.get(feed.run_id) is feed:
