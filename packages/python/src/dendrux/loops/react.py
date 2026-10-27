@@ -32,7 +32,12 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from dendrux.errors import ImageError, ImagePersistenceUnsupportedError
 from dendrux.guardrails._engine import GuardrailEngine
 from dendrux.llm._calls import complete_call, stream_call
-from dendrux.llm._evidence import RejectedArguments, persistable_call, persistable_response
+from dendrux.llm._evidence import (
+    RejectedArguments,
+    RejectedToolName,
+    persistable_call,
+    persistable_response,
+)
 from dendrux.llm._retry_telemetry import telemetry_context, telemetry_stream
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
@@ -658,17 +663,21 @@ async def _init_loop_state(
     )
 
 
+def _rejected_call_result(tc: ToolCall) -> ToolResult:
+    from dendrux.tools._validate import invalid_params_result
+
+    if isinstance(tc, RejectedToolName):
+        return _unknown_tool_result(tc, None)
+    return invalid_params_result(tc, "Tool arguments must contain persistable text and JSON.")
+
+
 def _persistable_argument_validator(validator: Any) -> Any:
     from functools import wraps
 
     @wraps(validator)
     def validate(tc: ToolCall, *args: Any, **kwargs: Any) -> Any:
-        from dendrux.tools._validate import invalid_params_result
-
-        if isinstance(tc, RejectedArguments):
-            return invalid_params_result(
-                tc, "Tool arguments must contain persistable text and JSON."
-            )
+        if isinstance(tc, (RejectedToolName, RejectedArguments)):
+            return _rejected_call_result(tc)
         return validator(tc, *args, **kwargs)
 
     return validate
@@ -2889,8 +2898,14 @@ def _unknown_tool_message(name: str, lookups: ToolLookups) -> str:
     return f"Unknown tool: {name}. Available tools: {listed}"
 
 
-def _unknown_tool_result(tool_call: ToolCall, lookups: ToolLookups) -> ToolResult:
-    message = _unknown_tool_message(tool_call.name, lookups)
+def _tool_failure_message(name: str, lookups: ToolLookups | None) -> str:
+    if lookups is None:
+        return "Unknown tool: name exceeds the supported length."
+    return _unknown_tool_message(name, lookups)
+
+
+def _unknown_tool_result(tool_call: ToolCall, lookups: ToolLookups | None) -> ToolResult:
+    message = _tool_failure_message(tool_call.name, lookups)
     return ToolResult(
         name=tool_call.name,
         call_id=tool_call.id,

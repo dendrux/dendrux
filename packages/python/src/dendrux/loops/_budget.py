@@ -130,6 +130,16 @@ class _Usage:
         )
 
 
+def _invalid_accounting(usage: UsageStats) -> bool:
+    return not usage.usage_reported and usage.cost_unknown
+
+
+def _breach_reason(reached: bool, unknown_reason: str | None) -> str | None:
+    if unknown_reason == "usage_invalid":
+        return unknown_reason
+    return BUDGET_EXCEEDED if reached else unknown_reason
+
+
 class BudgetTracker:
     """Per-loop budget state: fired keys, in-memory spend and the usage source.
 
@@ -168,6 +178,7 @@ class BudgetTracker:
         self._seen_unpriced = 0
         self._floor = _Usage(0, 0.0, 0)
         self._last_local = _Usage(0, 0.0, 0)
+        self._invalid_usage = False
         self._fresh = fresh
         self._first_checkpoint = True
         # Breaches from the latest post-response evaluation (None: none yet).
@@ -219,6 +230,7 @@ class BudgetTracker:
 
     def add_response(self, usage: UsageStats) -> None:
         """Account one LLM response in the in-memory spend."""
+        self._invalid_usage |= _invalid_accounting(usage)
         if usage.cost_unknown or usage.cost_usd is None:
             self._unpriced += 1
         else:
@@ -331,12 +343,8 @@ class BudgetTracker:
             reached = used >= limit
             # An unpriced call hides spend: when the run is told to stop on
             # exceeding the cost limit it must stop here too (fail closed).
-            unpriced = (
-                metric == COST_USD
-                and usage.unpriced_calls > self._ack_unpriced
-                and self.action != "warn"
-            )
-            if reached or unpriced:
+            unknown_reason = self._unknown_reason(metric, usage)
+            if reached or unknown_reason:
                 breaches.append(BudgetBreach(metric=metric, used=used, max=limit))
                 if (metric, EXCEEDED) not in self.fired:
                     self.fired.append((metric, EXCEEDED))
@@ -347,12 +355,21 @@ class BudgetTracker:
                             "metric": metric,
                             "used": used,
                             "max": limit,
-                            "reason": BUDGET_EXCEEDED if reached else UNPRICED_CALL,
+                            "reason": _breach_reason(reached, unknown_reason),
                             "action": self.action,
                         },
                     )
         self._last = breaches
         return breaches
+
+    def _unknown_reason(self, metric: str, usage: _Usage) -> str | None:
+        if self.action == "warn":
+            return None
+        if self._invalid_usage:
+            return "usage_invalid"
+        if metric == COST_USD and usage.unpriced_calls > self._ack_unpriced:
+            return UNPRICED_CALL
+        return None
 
     async def checkpoint(self, iteration: int) -> tuple[str, list[BudgetBreach]]:
         """Top-of-iteration check: ``(action, breaches)``; act when breaches is non-empty.

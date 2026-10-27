@@ -90,14 +90,18 @@ class RunTaskManager:
     def cancel(self, run_id: str) -> bool:
         """Cancel the tracked task and/or set the interrupt signal for ``run_id``.
 
-        Returns True if at least one signal was delivered (a background
-        task was cancelled or a streamed run's interrupt was set); False
+        A spawned coroutine that has not entered the runner's ownership
+        guard is left alive to observe the durable cancellation request.
+        Cancelling it before that guard could discard a committed claim.
+
+        Returns True if a task is tracked or an interrupt was set; False
         if nothing is tracked for this run in this process.
         """
         delivered = False
         task = self._tasks.get(run_id)
         if task is not None and self._owned.get(run_id) is not task:
-            task.cancel()
+            # A committed claim may exist before its coroutine has entered
+            # the runner's cancellation guard. Let it reach that guard first.
             delivered = True
         signal = self._interrupts.get(run_id)
         if signal is not None:

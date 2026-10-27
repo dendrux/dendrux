@@ -140,9 +140,13 @@ def _pending_wire(pending: Any, mapping: Any) -> Any:
     }
 
 
+def _result_mapping(result: RunResult) -> Any:
+    return result._wire_pii_mapping or result.meta.get("pii_mapping")
+
+
 def result_to_dict(result: RunResult) -> dict[str, Any]:
     """Browser DTO, deliberately independent of dataclass/package versions."""
-    mapping = result.meta.get("pii_mapping")
+    mapping = _result_mapping(result)
     pending = result.pending if result.status.value in _PAUSED else None
     return {
         "wire_version": WIRE_VERSION,

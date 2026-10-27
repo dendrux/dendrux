@@ -1221,6 +1221,9 @@ class RunResult:
     pause_id: str | None = None
 
     pending: PendingPause | None = None
+    _wire_pii_mapping: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def to_dict(self) -> dict[str, Any]:
         """Version-1 browser DTO; excludes arbitrary objects, traces and payloads.
@@ -2186,8 +2189,16 @@ class InputValidationError(ValueError):
         return type(self), (self.field, self.code)
 
 
+_PERSISTABLE_NODE_LIMIT = 1048576 // 2
+
+
 def _validate_persistable(value: Any, field: str = "input") -> None:
-    """Bounded JSON walk; reject text PostgreSQL cannot store, without echoing it."""
+    """Reject unpersistable JSON without echoing it, with depth and work bounds.
+
+    The node budget admits even compact JSON within the 1 MiB client cap
+    (one scalar per two bytes), including spreadsheet ranges. Byte limits
+    remain the responsibility of each API boundary.
+    """
     import math
 
     stack = [(value, 0)]
@@ -2195,7 +2206,7 @@ def _validate_persistable(value: Any, field: str = "input") -> None:
     while stack:
         item, depth = stack.pop()
         visited += 1
-        if depth > 32 or visited + len(stack) > 10000:
+        if depth > 32 or visited + len(stack) > _PERSISTABLE_NODE_LIMIT:
             raise InputValidationError(field, "structure_limit")
         if isinstance(item, str):
             if "\x00" in item:
@@ -2206,14 +2217,14 @@ def _validate_persistable(value: Any, field: str = "input") -> None:
             except UnicodeError:
                 raise InputValidationError(field, "invalid_text") from None
         elif isinstance(item, dict):
-            if len(item) > 5000:
+            if len(item) > _PERSISTABLE_NODE_LIMIT // 2:
                 raise InputValidationError(field, "structure_limit")
             for key, child in item.items():
                 if not isinstance(key, str):
                     raise InputValidationError(field, "invalid_json")
                 stack.extend(((key, depth + 1), (child, depth + 1)))
         elif isinstance(item, (list, tuple)):
-            if len(item) > 10000:
+            if len(item) > _PERSISTABLE_NODE_LIMIT:
                 raise InputValidationError(field, "structure_limit")
             stack.extend((child, depth + 1) for child in item)
         elif isinstance(item, float):

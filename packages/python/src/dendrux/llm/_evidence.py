@@ -1,10 +1,12 @@
 """Normalize model text and reject unsafe arguments before any callback."""
 
+import hashlib
 import math
 import re
 from dataclasses import replace
 from typing import Any, overload
 
+from dendrux.llm._usage import normalize_usage
 from dendrux.types import (
     InputValidationError,
     LLMResponse,
@@ -69,6 +71,38 @@ def _evidence(value: Any) -> Any:
         return None
 
 
+@overload
+def _bounded_id(value: str, maximum: int) -> str: ...
+
+
+@overload
+def _bounded_id(value: None, maximum: int) -> None: ...
+
+
+def _bounded_id(value: str | None, maximum: int) -> str | None:
+    cleaned = _text(value)
+    if cleaned is not None and len(cleaned) > maximum:
+        return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:maximum]
+    return cleaned
+
+
+@overload
+def _tool_name(value: str) -> str: ...
+
+
+@overload
+def _tool_name(value: None) -> None: ...
+
+
+def _tool_name(value: str | None) -> str | None:
+    cleaned = _text(value)
+    return "<unknown_tool>" if cleaned is not None and len(cleaned) > 255 else cleaned
+
+
+class RejectedToolName(ToolCall):
+    """A call whose model-supplied name exceeds the storage boundary."""
+
+
 class RejectedArguments(ToolCall):
     """Persistable call identity whose arguments failed the text/JSON boundary."""
 
@@ -84,15 +118,25 @@ def persistable_call(call: None) -> None: ...
 def persistable_call(call: ToolCall | None) -> ToolCall | None:
     if call is None:
         return None
-    name = _text(call.name)
-    call_id = _text(call.id)
-    provider_id = _text(call.provider_tool_call_id)
+    bounded = _call_identity(call)
     try:
-        _validate_persistable(call.params, "params")
+        _validate_persistable(bounded.params, "params")
     except InputValidationError:
         return RejectedArguments(
-            name=name, id=call_id, provider_tool_call_id=provider_id, params={}
+            name=bounded.name,
+            id=bounded.id,
+            provider_tool_call_id=bounded.provider_tool_call_id,
+            params={},
         )
+    return bounded
+
+
+def _call_identity(call: ToolCall) -> ToolCall:
+    name = _tool_name(call.name)
+    call_id = _bounded_id(call.id, 26)
+    provider_id = _bounded_id(call.provider_tool_call_id, 255)
+    if isinstance(call, RejectedToolName) or len(call.name) > 255:
+        return RejectedToolName(name=name, id=call_id, provider_tool_call_id=provider_id, params={})
     return replace(call, name=name, id=call_id, provider_tool_call_id=provider_id)
 
 
@@ -111,6 +155,8 @@ def persistable_response(response: LLMResponse) -> LLMResponse:
     return replace(
         response,
         text=_text(response.text),
+        usage=normalize_usage(response.usage),
+        model=_bounded_id(response.model, 255),
         reasoning=_text(response.reasoning),
         tool_calls=calls if response.tool_calls is not None else None,
         raw_stop_reason=_text(response.raw_stop_reason),
@@ -122,8 +168,8 @@ def persistable_event(event: StreamEvent) -> StreamEvent:
     return replace(
         event,
         text=_text(event.text),
-        tool_name=_text(event.tool_name),
-        tool_call_id=_text(event.tool_call_id),
+        tool_name=_tool_name(event.tool_name),
+        tool_call_id=_bounded_id(event.tool_call_id, 255),
         tool_call=persistable_call(event.tool_call),
         raw=persistable_response(event.raw) if isinstance(event.raw, LLMResponse) else None,
     )

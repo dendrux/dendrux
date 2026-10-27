@@ -19,7 +19,7 @@ def test_tool_preflight_rejects_every_unpersistable_shape_without_echo(known, ki
         "nan": float("nan"),
         "infinity": float("inf"),
         "depth": None,
-        "nodes": ["PRIVATE_PARAMS"] * 10001,
+        "nodes": ["PRIVATE_PARAMS"] * (1048576 // 2 + 1),
         "key": {17: "PRIVATE_PARAMS"},
         "opaque": object(),
     }[kind]

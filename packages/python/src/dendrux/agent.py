@@ -2065,6 +2065,7 @@ class Agent:
         result = _record_to_run_result(record)
         mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
         result.answer = deanonymize_text(record.answer, mapping)[0]
+        result._wire_pii_mapping = mapping
         if include_pii:
             result.meta.update(_public_meta({"pii_mapping": mapping}))
         if result.status.value == "success":
@@ -2115,8 +2116,9 @@ class Agent:
         - **In-process submit/resume task on this Agent instance:** the
           asyncio task spawned by :meth:`submit_tool_results`,
           :meth:`submit_input`, :meth:`submit_approval` or
-          :meth:`submit_resume` is cancelled synchronously in addition to
-          the DB-level cancel signal.
+          :meth:`submit_resume` is cancelled after entering the runner's
+          ownership guard. Before that guard, it stays alive to observe the
+          durable DB cancellation request and finalize its claim.
         - **Terminal run:** no-op; returns the current persisted state.
           Does not raise.
         - **Non-persisted runs:** unsupported. ``cancel_run`` requires a

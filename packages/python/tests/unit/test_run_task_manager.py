@@ -56,6 +56,7 @@ class TestCancel:
         observed = asyncio.Event()
 
         async def long_work() -> None:
+            mgr.register_current("r1")
             try:
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
@@ -125,6 +126,7 @@ class TestInterruptSignals:
         started = asyncio.Event()
 
         async def work() -> None:
+            mgr.register_current("r1")
             started.set()
             await asyncio.sleep(10)
 

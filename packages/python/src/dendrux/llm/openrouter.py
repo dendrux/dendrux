@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import os
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -661,15 +660,11 @@ class OpenRouterProvider(OpenAIProvider):
         """
         base = super()._normalize_usage(usage)
         cost = _read_usage_extra(usage, "cost")
-        if isinstance(cost, bool) or not isinstance(cost, (int, float, str)):
+        from dendrux.llm._usage import normalize_usage
+
+        if cost is None or not base.usage_reported:
             return base
-        try:
-            value = float(cost)
-        except ValueError:
-            return base
-        if not math.isfinite(value) or value < 0:
-            return base
-        return replace(base, cost_usd=value, cost_source="provider")
+        return normalize_usage(replace(base, cost_usd=cost, cost_source="provider"))
 
     async def complete(
         self,

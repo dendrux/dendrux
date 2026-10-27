@@ -8,6 +8,8 @@ the vendor did not report stays ``None``; a reported zero stays ``0``.
 from __future__ import annotations
 
 import logging
+import math
+from dataclasses import replace
 from typing import Any
 
 from dendrux.types import UsageStats
@@ -30,10 +32,67 @@ def extra_field(obj: Any, name: str) -> Any:
     return None
 
 
+_INT32_MAX = 2**31 - 1
+
+
+def invalid_usage() -> UsageStats:
+    logger.warning(
+        "Provider usage is invalid; accounting is unknown", extra={"code": "usage_invalid"}
+    )
+    return UsageStats(usage_reported=False, cost_unknown=True)
+
+
 def _count(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is not int or not 0 <= value <= _INT32_MAX:
         return None
-    return max(0, int(value))
+    return value
+
+
+def normalize_usage(usage: UsageStats) -> UsageStats:
+    """Validate vendor accounting before arithmetic, pricing or persistence."""
+    required = (usage.input_tokens, usage.output_tokens, usage.total_tokens)
+    optional = (
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        usage.reasoning_tokens,
+    )
+    if any(_count(value) is None for value in required):
+        return invalid_usage()
+    if any(value is not None and _count(value) is None for value in optional):
+        return invalid_usage()
+    cost = usage.cost_usd
+    if cost is not None and (
+        type(cost) not in (int, float) or not 0 <= cost <= 9999.999999 or not math.isfinite(cost)
+    ):
+        return invalid_usage()
+    return usage
+
+
+def normalize_token_totals(usage: UsageStats) -> UsageStats:
+    checked = normalize_usage(usage)
+    if not checked.usage_reported:
+        return checked
+    return normalize_usage(
+        replace(checked, total_tokens=checked.input_tokens + checked.output_tokens)
+    )
+
+
+def _count_or_zero(value: Any) -> int:
+    return _count(value) or 0
+
+
+def _invalid_wire_counts(
+    usage: Any, input_field: str, output_field: str, details_field: str, output_details_field: str
+) -> bool:
+    details = extra_field(usage, details_field)
+    raw_counts = (
+        extra_field(usage, input_field),
+        extra_field(usage, output_field),
+        extra_field(details, "cached_tokens"),
+        extra_field(details, "cache_write_tokens"),
+        extra_field(extra_field(usage, output_details_field), "reasoning_tokens"),
+    )
+    return any(value is not None and _count(value) is None for value in raw_counts)
 
 
 def _has_long_ttl_writes(details: Any) -> bool:
@@ -77,8 +136,10 @@ def openai_wire_usage(
     ``<details>.cache_write_tokens`` (typed or not). Fresh input is the
     vendor count minus both, clamped at zero.
     """
-    raw_input = _count(extra_field(usage, input_field)) or 0
-    output_tokens = _count(extra_field(usage, output_field)) or 0
+    if _invalid_wire_counts(usage, input_field, output_field, details_field, output_details_field):
+        return invalid_usage()
+    raw_input = _count_or_zero(extra_field(usage, input_field))
+    output_tokens = _count_or_zero(extra_field(usage, output_field))
     details = extra_field(usage, details_field)
     cache_read = _count(extra_field(details, "cached_tokens"))
     cache_write = _count(extra_field(details, "cache_write_tokens"))
@@ -87,12 +148,14 @@ def openai_wire_usage(
     long_ttl = _has_long_ttl_writes(details)
     if long_ttl:
         logger.info("provider.usage long-TTL cache writes reported; call marked cost_unknown")
-    return UsageStats(
-        input_tokens=fresh_input,
-        output_tokens=output_tokens,
-        total_tokens=fresh_input + output_tokens,
-        cache_read_input_tokens=cache_read,
-        cache_creation_input_tokens=cache_write,
-        reasoning_tokens=reasoning,
-        cost_unknown=long_ttl,
+    return normalize_usage(
+        UsageStats(
+            input_tokens=fresh_input,
+            output_tokens=output_tokens,
+            total_tokens=fresh_input + output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_write,
+            reasoning_tokens=reasoning,
+            cost_unknown=long_ttl,
+        )
     )

@@ -1356,13 +1356,17 @@ class AnthropicProvider(LLMProvider):
         """
         details = getattr(usage, "output_tokens_details", None)
         reasoning_tokens = _reasoning_tokens_from_details(details)
-        return UsageStats(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            total_tokens=usage.input_tokens + usage.output_tokens,
-            cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", None),
-            cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", None),
-            reasoning_tokens=reasoning_tokens,
+        from dendrux.llm._usage import normalize_token_totals
+
+        return normalize_token_totals(
+            UsageStats(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                total_tokens=0,
+                cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", None),
+                cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", None),
+                reasoning_tokens=reasoning_tokens,
+            )
         )
 
     @staticmethod
