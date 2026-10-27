@@ -37,6 +37,8 @@ dependencies = [
     # dependency so `import dendrux` works without a provider extra — e.g.
     # a read-only consumer using RunStore.
     "httpx>=0.27,<1.0",
+    # Imported directly by tools/_typing.py (Python 3.11 TypedDict support).
+    "typing_extensions>=4.6.1,<5",
 ]
 
 [project.optional-dependencies]

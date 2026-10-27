@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests._helpers.nlp_models import configure_models
 from tests._helpers.xdist_pg import worker_scoped_pg_url
 
 if TYPE_CHECKING:
@@ -23,6 +24,7 @@ def pytest_configure(config: pytest.Config) -> None:
     would wipe each other's rows. Runs in each worker process before any test module
     reads the variable.
     """
+    configure_models(config)
     url = os.environ.get(_PG_URL_ENV)
     worker = getattr(config, "workerinput", {}).get("workerid") or os.environ.get(
         "PYTEST_XDIST_WORKER"

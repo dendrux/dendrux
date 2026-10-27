@@ -55,6 +55,7 @@ jobs:
           --health-retries 10
 
     env:
+      PYTHON_DOTENV_DISABLED: "1"
       DENDRUX_TEST_PG_URL: postgresql+asyncpg://dendrux:dendrux@localhost:5432/dendrux_test
 
     steps:
@@ -70,6 +71,10 @@ jobs:
 
       - name: Install dependencies
         run: pip install -e ".[dev,all]"
+
+      # Presidio loads this model by default. Install it once before workers.
+      - name: Install pinned NLP test model
+        run: make test-model-install
 
       - name: Pin SQLAlchemy ${{ matrix.sqlalchemy-version }}
         run: |

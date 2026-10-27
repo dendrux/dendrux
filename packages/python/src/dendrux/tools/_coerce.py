@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, get_type_hints
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from dendrux.tool import _VARIADIC_KINDS, _is_optional, _strip_annotated
+from dendrux.tools._typing import normalize_tool_hints
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection
@@ -184,7 +185,7 @@ def build_args_spec(fn: Callable[..., Any]) -> ArgsSpec:
     generated schema, which does not mark it required.
     """
     sig = inspect.signature(fn)
-    hints = get_type_hints(fn, include_extras=True)
+    hints = normalize_tool_hints(get_type_hints(fn, include_extras=True), sig)
     fields: dict[str, Any] = {}
     params: list[tuple[str, str, bool]] = []
     for index, (name, param) in enumerate(sig.parameters.items()):

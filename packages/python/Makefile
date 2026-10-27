@@ -1,9 +1,16 @@
-.PHONY: test bench lint typecheck arch crap api-check format package-smoke ci clean
+.PHONY: test test-model-check test-model-install bench lint typecheck arch crap api-check format package-smoke ci clean
 
 # Benchmarks measure the server, not the code, so they are not part of the gates.
-test:
+test: test-model-check
 	pytest tests/ -v -n auto -m "not benchmark" --cov=src/dendrux --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80
 	python tools/crap_ratchet.py stamp --coverage coverage.json
+
+# Installed explicitly before xdist workers start; tests never fetch model data.
+test-model-check:
+	python -m tests._helpers.nlp_models
+
+test-model-install:
+	python -m tests._helpers.nlp_models --install
 
 lint:
 	ruff check .

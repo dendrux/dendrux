@@ -1,4 +1,4 @@
-.PHONY: ci ci-python test lint typecheck format package-smoke clean
+.PHONY: ci ci-python test test-model-check test-model-install lint typecheck format package-smoke clean
 
 # Default: run CI for all packages
 ci: ci-python
@@ -10,6 +10,12 @@ ci-python:
 # Shortcuts that delegate to Python package
 test:
 	$(MAKE) -C packages/python test
+
+test-model-check:
+	$(MAKE) -C packages/python test-model-check
+
+test-model-install:
+	$(MAKE) -C packages/python test-model-install
 
 lint:
 	$(MAKE) -C packages/python lint
