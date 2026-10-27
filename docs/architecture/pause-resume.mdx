@@ -166,13 +166,11 @@ Validation (agent name, `pause_id`, call ids) runs before the claim and again in
 
 Pause state is versioned (`schema_version`, currently `1`). A reader ignores keys it does not know and defaults ones that are missing, which is what lets 0.4.1 and 0.5 workers share runs during a rolling deploy. Pause state also keeps the generation settings the run used (`model`, `max_tokens`, `temperature`, `thinking`, `effort`) so a resume continues with them; request headers and other provider options are never stored.
 
-[//]: # "VERIFY-0.5.0: pause_id, expected_pause_id, validate-then-claim and the release-on-failure rule are T7 (wave 2); the field names are T0's contract. Recheck everything in this section after T7 merges. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Fencing: which worker owns a run
 
 `agent_runs.claim_epoch` counts claims. Every claim raises it and every status change (finish, pause, release) is conditional on the worker's own value. If a sweep takes over a run, or a slow worker wakes up after another has claimed the run, the old worker finds its epoch stale at its next checkpoint (top of an iteration, before a tool, before a pause) and stops without writing. Fencing protects runs claimed by 0.5 workers; during a rolling deploy a run claimed by a 0.4.1 worker has no epoch to compare.
 
-[//]: # "VERIFY-0.5.0: fencing is T7 wave 2; the column is T0's. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Requesting a pause
 

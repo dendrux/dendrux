@@ -2,7 +2,7 @@
 
 ## 0.5.0 - unreleased
 
-"Trust". Reads are tenant-scoped and hide payloads by default, provider
+"Trust". Pending and live reads require a tenant scope and hide payloads by default; provider
 failures are typed, every queue and payload has a bound, paused runs are
 fenced and bound to a pause id, and the read router and embedded dashboard are
 gone in favour of read primitives on `RunStore`. Run `dendrux db migrate` once,
@@ -12,8 +12,9 @@ for every change below.
 
 ### Highlights
 
-- **Tenant-scoped reads and strict tenancy.** Every `RunStore` read takes
-  `tenant_id=`; `get_pending` and `follow` require it. `Agent(strict_tenancy=True)`
+- **Explicit scopes for pending and live reads.** Every `RunStore` read takes
+  `tenant_id=`; `get_pending` and `follow` require it. Trusted historical reads
+  default to `UNSCOPED` (all tenants); pass a tenant to narrow them. `Agent(strict_tenancy=True)`
   makes every entry point require one. Idempotency keys are unique per tenant.
 - **Safe live and pending reads.** `RunStore.get_pending`, `follow`,
   `get_event_view` and `redact_event` replace the router. Redacted views show

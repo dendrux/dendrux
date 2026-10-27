@@ -98,7 +98,6 @@ From `dendrux.types.GovernanceEventType`. The values below are deliverable throu
 | `mcp.tools_skipped` | A view skipped individual tools at discovery | `{"skipped": [{"source_name", "namespace", "tool", "reason"}]}` |
 | `provider.retry` | A provider transport response has a retryable status | `{"status_code": int, "endpoint": str \| null, "attempt": int, "retry_after": str \| null}` |
 
-[//]: # "VERIFY-0.5.0: payload shapes for guardrail.blocked findings, guardrail.restore_skipped, governance.changed and run.error error_info are inferred from the spec (counts and kinds only); T3 and T7 own the exact field names. Checked against the merged code in the 0.5.0 docs pass."
 
 Each `(metric, fraction)` of `budget.threshold` fires at most once per run, and `budget.exceeded` at most once per metric. Every pause persists the fired set, so resumed runs do not re-fire.
 

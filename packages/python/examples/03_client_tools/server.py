@@ -181,7 +181,6 @@ def create_demo_app(*, database_url: str | None = None) -> FastAPI:
             ToolResult(name=r.tool_name, call_id=r.tool_call_id, payload=r.payload)
             for r in body.results
         ]
-        # VERIFY-0.5.0: Confirm expected_pause_id support before adding pause-ID validation.
         result = await agents[provider].submit_tool_results(run_id, results, tenant_id=tenant)
         return browser_result(result)
 

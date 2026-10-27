@@ -72,7 +72,6 @@ An empty result is therefore never proof that a run exists. Check `get_run` (or 
 from dendrux import UNSCOPED
 ```
 
-[//]: # "VERIFY-0.5.0: T1 adds tenant_id to these RunStore methods; the signatures below follow spec section 5.1. Checked against the merged code in the 0.5.0 docs pass."
 
 ### Arguments are validated
 
@@ -159,7 +158,7 @@ def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | N
            max_duration_s: float | None = 900.0) -> Follow
 ```
 
-**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params`, `approval` and `args_hidden`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is bounded: the run's history is never loaded, and on Postgres a stored pause is converted to JSON once per read whatever its size. A client-tool or requested pause costs one projected read; an approval or input pause adds the active-pause sequence and the recorded model arguments, three bounded reads in all. `params` depend on the kind:
+**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params`, `approval` and `args_hidden`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is bounded: the run's history is never loaded, and on Postgres a stored pause is converted to JSON once per read whatever its size. A client-tool or requested pause without pending server calls costs one projected read; an approval, input, or requested pause retaining server calls adds the active-pause sequence and the recorded model arguments, three bounded reads in all. `params` depend on the kind:
 
 | Kind | `params` |
 | --- | --- |
@@ -303,3 +302,5 @@ All returned from `dendrux.store`. Fields, exact as persisted:
 - [State persistence](/docs/architecture/state-persistence): the tables behind these records.
 - [Build your own read routes](/docs/recipes/build-your-own-read-routes): the same reads over HTTP.
 - [HTTP integration](/docs/reference/http-api): what your routes call, and the old endpoint map.
+
+A requested pause that retains server-target or approval-gated calls uses recorded placeholder arguments, or `args_hidden=True` when the current pause has no such evidence. This applies to pending reads and redacted event views, including follow.

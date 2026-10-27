@@ -42,5 +42,3 @@ budgets. UI callbacks are UX only. The in-memory run/provider association must m
 to your application DB to survive server restarts. Persist an app request ID before
 starting work; a request timeout before the first response may lose the run ID and
 cancellation may cancel the run. Own any background execution and recovery lifecycle.
-
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."

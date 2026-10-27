@@ -5,26 +5,47 @@ description: What changes in Dendrux 0.5.0 ("Trust"), the migration step, the ro
 
 # Upgrading to 0.5.0
 
-0.5.0 makes Dendrux safer by default: reads are tenant-scoped, payloads are hidden unless you ask for them, provider failures are typed instead of silent, and size and time limits exist everywhere they were missing. Most of that needs no code change. A handful of things do, and each has a note below.
+0.5.0 makes Dendrux safer by default: pending and live reads require a tenant scope, payloads are hidden unless you ask for them, provider failures are typed instead of silent, and size and time limits exist everywhere they were missing. Most of that needs no code change. A handful of things do, and each has a note below.
 
-Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [Every change at a glance](#every-change-at-a-glance) for the rows that touch your code, and follow its links. If you only use Dendrux in scripts with `agent.run(...)`, the short version is: run `dendrux db migrate`, then upgrade.
+Read [The upgrade in four steps](#the-upgrade-in-four-steps) first. Then scan [Every change at a glance](#every-change-at-a-glance) for the rows that touch your code, and follow its links. Scripts without persistence need no database migration; install 0.5.0 and run your tests. Applications with persistence follow the migration procedure below.
 
 > **Three defaults change in 0.6, and 0.5 warns first.** Strict tenancy, the hard stop on changed governance and the cache-token budget count ship as opt-ins or `FutureWarning`s in 0.5; the implicit `DENDRUX_DATABASE_URL` engine and the old `timeout=` argument print a `DeprecationWarning`. See [Warnings that announce 0.6](#warnings-that-announce-06). **One change is not gradual:** approving a pause now requires `expected_pause_id` (see [Approving needs a pause id](#13-approving-needs-a-pause-id)).
 
 ## The upgrade in four steps
 
-1. **Back up, then migrate.** Run `dendrux db migrate` against your database, **once, as a single deploy job, over a direct Postgres connection** (not through PgBouncer, and not from every pod at startup). Do it before you start 0.5 workers. From a 0.4.1 database (head `c6d7e8f9a0b1`) it applies exactly two revisions, in this order, and ends at head `e8f9a0b1c2d3`:
+1. **Install the migration distribution, back up, then migrate.** Install 0.5.0 in the migration job environment first (`python -m pip install 'dendrux[postgres]==0.5.0'`). Keep application workers on their existing version while the job runs. Back up the database, then run `dendrux db migrate` against your database, **once, as a single deploy job, over a direct Postgres connection** (not through PgBouncer, and not from every pod at startup). Do it before you start 0.5 workers. From a 0.4.1 database (head `c6d7e8f9a0b1`) it applies exactly two revisions, in this order, and ends at head `e8f9a0b1c2d3`:
    - `d7e8f9a0b1c2` adds `agent_runs.claim_epoch` (`INTEGER NOT NULL DEFAULT 0`), replaces the global idempotency-key unique index with a tenant-scoped one, and adds an index on `agent_runs(tenant_id, created_at DESC)`.
    - `e8f9a0b1c2d3` adds `agent_runs.status_changed_at` (backfilled from `updated_at`, `NOT NULL`, default `now()`) and three indexes that keep `sweep()` cheap: `ix_agent_runs_sweep_running (status, id)`, `ix_agent_runs_sweep_waiting (status, status_changed_at, id)` and a partial index on `run_events` for `run.started` (`ix_run_events_started`, `WHERE event_type = 'run.started'`).
 
-   Timing guidance: a rehearsal on Postgres with 5,000 runs (about 35,000 events) upgraded both revisions in about 1 second. Larger tables take longer, because the backfill runs in batches and the indexes are built concurrently: expect roughly 20 seconds at a million runs, and minutes for a very large `run_events` table. Rehearse on a copy of your own data. On Postgres the short exclusive steps wait at most 5 seconds for each lock and then fail with a retry message; finish the blocking transaction and run the job again. The backfill commits in 5,000-row batches and works best on Postgres 12 or later, and the concurrent index build on a large `run_events` table can take minutes. A second concurrent migration runner refuses with a retry message. SQLite files are brought up to date automatically on first use.
+   Timing guidance: a rehearsal on Postgres with 5,000 runs (about 35,000 events) upgraded both revisions in about 1 second. Larger tables take longer, because the backfill runs in batches and the indexes are built concurrently: expect roughly 20 seconds at a million runs, and minutes for a very large `run_events` table. Rehearse on a copy of your own data.
+
+   **Both revisions run online on Postgres; no manual pre-build step is needed.** Each step commits on its own over the direct connection. Adding a column and dropping the old constraint wait at most 5 seconds for their table lock (`lock_timeout`). Every index is built or dropped with `CONCURRENTLY`, so 0.4.1 workers keep reading and writing during the migration. The backfill commits in 5,000-row batches and works best on Postgres 12 or later. On a large `run_events` table the concurrent index build can take minutes.
+
+   If a step cannot get its lock within 5 seconds, the job exits with code 1 and prints:
+
+   ```
+   Migration failed: Timed out acquiring the Dendrux migration lock after 5 seconds. Retry the migration operation after the blocking transaction finishes.
+   ```
+
+   The database stays at its last completed revision (`dendrux db check` exits 1 and names it), so 0.5 workers still refuse to start. Steps that already finished are harmless to 0.4.1 workers. End the blocking transaction and run `dendrux db migrate` again. It skips finished steps and rebuilds any index that an interrupted concurrent build left invalid. The 5-second bound applies to each wait, so a busy table with short transactions migrates normally. A second migration runner started at the same time refuses with a retry message.
+
+   Two kinds of session cause a refusal. Any open transaction that has touched `agent_runs` blocks the column and constraint steps. A concurrent index build also waits for every older transaction in the same database, even one that never touched Dendrux's tables, including sessions left "idle in transaction". Before you start, look for them:
+
+   ```sql
+   SELECT pid, state, now() - xact_start AS open_for, left(query, 60) AS query
+   FROM pg_stat_activity
+   WHERE datname = current_database() AND xact_start < now() - interval '5 seconds';
+   ```
+
+   SQLite files are brought up to date automatically on first use.
 2. **Roll your workers.** Rolling deploys are allowed. 0.5 writes are readable by 0.4.1 workers, pause state readers tolerate unknown keys, and event numbering is compatible with old workers. Do not run abandoned-waiting sweeps until the migration has finished.
-3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing or the revision is unknown (use `--allow-unstamped` if you build your schema with `create_all`; it then checks tables, columns and indexes). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query. If you built Postgres with `create_all` on 0.4.1, create the new indexes by hand, or stamp `c6d7e8f9a0b1` and run `dendrux db migrate`.
+3. **Check.** `dendrux db check` compares the database with this version's head. Exit code 0 means current, 1 means behind, 2 means the version table is missing or the revision is unknown (use `--allow-unstamped` if you build your schema with `create_all`; it then checks tables, columns and indexes). A Postgres database that has not been migrated fails at startup with `SchemaOutOfDateError` instead of failing on the first query. For an unstamped Postgres database built with 0.4.1 `create_all`, first verify that its schema matches the 0.4.1 baseline, stamp `c6d7e8f9a0b1` with the migration job's Alembic configuration, then run the full chain with `dendrux db migrate`. Adding indexes alone does not perform this upgrade.
 4. **Read the warnings.** Run your tests with warnings visible (`python -W default`). Every default that changes in 0.6 prints a `FutureWarning` in 0.5 (visible by default), and a renamed or removed setting prints a `DeprecationWarning`. Python shows each warning once per call site.
 
-[//]: # "VERIFY-0.5.0: revision id d7e8f9a0b1c2 and the exact index list come from T1's R1 revision, and e8f9a0b1c2d3 from the sweep revision; re-check after integration. Checked against the migration files in the 0.5.0 docs pass."
 
 ### Mixed fleets during a rolling deploy
+
+- **Keep idempotency keys globally unique until all workers run 0.5.0.** Do not reuse an idempotency key across tenants while any 0.4.1 worker can read the database. Old workers look keys up without a tenant filter; tenant-scoped reuse is supported only after the fleet has finished rolling.
 
 - **Fencing is partial.** Run fencing (`claim_epoch`) protects only runs that a 0.5 worker claimed. While 0.4.1 and 0.5 workers share a database, a run claimed by an old worker is not fenced.
 - **Waiting runs written by old workers are protected.** A waiting run is abandoned by `sweep()` only when both its last status change and its `updated_at` are stale, so a pause written by a 0.4.1 worker is not swept early.
@@ -40,11 +61,14 @@ export DENDRUX_DATABASE_URL="postgresql+asyncpg://user:password@host/dbname"
 alembic downgrade c6d7e8f9a0b1
 ```
 
-`c6d7e8f9a0b1` is 0.4.1's head. The command runs two steps: `e8f9a0b1c2d3` to `d7e8f9a0b1c2` (drops `status_changed_at` and the sweep indexes), then `d7e8f9a0b1c2` to `c6d7e8f9a0b1` (drops `claim_epoch` and the 0.5 indexes and restores the global idempotency-key index). **`alembic downgrade -1` from head lands on `d7e8f9a0b1c2`, not on 0.4.1**: the schema is still 0.5-shaped. After the full downgrade `dendrux db status` shows `c6d7e8f9a0b1` and the schema matches a fresh 0.4.1 database. The last step refuses, and changes nothing, if two tenants already share an idempotency key, because 0.4.1's global unique index cannot be rebuilt over them. In a rehearsal on 5,000 runs both steps took about 1 second.
+`c6d7e8f9a0b1` is 0.4.1's head. The command runs two steps: `e8f9a0b1c2d3` to `d7e8f9a0b1c2` (drops `status_changed_at` and the sweep indexes), then `d7e8f9a0b1c2` to `c6d7e8f9a0b1` (drops `claim_epoch` and the 0.5 indexes and restores the global idempotency-key index). **`alembic downgrade -1` from head lands on `d7e8f9a0b1c2`, not on 0.4.1**: the schema is still 0.5-shaped. After the full downgrade `dendrux db status` shows `c6d7e8f9a0b1` and the schema matches a fresh 0.4.1 database. The last step refuses, and changes nothing, if two tenants already share an idempotency key, because 0.4.1's global unique index cannot be rebuilt over them.
+
+That includes a key shared by a write that lands while the downgrade runs. The downgrade has the same 5-second lock bound and concurrent index steps as the upgrade, and the same retry message.
+
+ In a rehearsal on 5,000 runs both steps took about 1 second.
 
 Downgrading drops `status_changed_at` and its history. A later `dendrux db migrate` adds the column again and backfills every row from `updated_at`, so the time of the last status change is not preserved across a downgrade and re-upgrade. Alembic migrations are validated on Postgres; SQLite files are upgraded in place by Dendrux and are not downgraded this way. Without a checkout, point an `alembic.ini` at the installed package's `dendrux/db/migrations` directory as its `script_location`.
 
-[//]: # "VERIFY-0.5.0: there is no dendrux db downgrade command (cli/db.py has migrate and status only); confirm the supported downgrade invocation, the failure on shared keys, and that dendrux db check exists (T1, AGT-210). Checked against the merged code in the 0.5.0 docs pass."
 
 ## Every change at a glance
 
@@ -166,7 +190,6 @@ agent = Agent(
 
 See [Budget](/docs/architecture/budget) and [Cost and pricing](/docs/architecture/pricing).
 
-[//]: # "VERIFY-0.5.0: T3 owns this; the snippet uses ModelPricing(input=, output=) as in 0.4.1; B4 may add nothing to the constructor. Checked against the merged code in the 0.5.0 docs pass."
 
 ### 2. Provider failures are typed errors
 
@@ -174,7 +197,8 @@ Silent empty answers are gone. A stream that ends with no terminal event, a Resp
 
 - Catch `ProviderError`. It has `.category`, `.status_code`, `.retryable` and `.safe_message`; the SDK exception is on `__cause__`.
 - `ProviderTimeoutError` also subclasses `TimeoutError`, and `ProviderUnavailableError` also subclasses `ConnectionError`, so existing `except TimeoutError:` clauses keep working. SDK exception types no longer escape. Code that caught an SDK exception class directly must catch `ProviderError` instead.
-- A run that used to end `success` with an empty answer now ends `error`.
+- A completed response with neither text nor tool calls raises `ProviderResponseError` (`category="rejected"`, `provider_code="empty_completion"`). Batch `run` and `resume` raise the typed error after persisting it; streams yield an error outcome. Tool-only responses remain valid. A token-limited empty response keeps `truncated=True`. A serialized empty structured object (`{}`) remains valid for SingleCall batch output; SingleCall does not support structured streaming or resume.
+- Provider streams have a cumulative local bound of 16 MiB (`max_stream_bytes`), including UTF-8 text, reasoning, refusal, tool arguments and structural overhead, plus at most 1,000 tool-call slots (`max_stream_tool_calls`). Configure these on the provider alongside deadlines. Exceeding either closes the upstream and raises `ProviderResponseError` with category `rejected` and code `stream_size_limit` or `stream_tool_call_limit`. The Anthropic SDK may accumulate the current event before yielding it; the bound is checked before Dendrux retains it.
 - New deadlines can fail calls that used to hang: `call_timeout=600` for a non-streaming call and `stream_idle_timeout=600` between stream events. Pass `None` to opt out. An old `timeout=X` still works and sets both, with a `DeprecationWarning`. `call_timeout=None` also removes the bound on the SDK's own retries, so a paid call can be re-run; keep a deadline unless you have a reason not to.
 - `error_info` is also set for database failures, with `category="persistence_error"` (`dendrux.errors.PersistenceError`). SQL, bound parameters and driver text never appear in the error, the logs or the event.
 - Provider failures are logged with safe fields only (`run_id`, category, status, code) and no traceback or vendor text. Ordinary non-provider failures keep their tracebacks. Diagnose provider failures from `run_id` and `ErrorInfo`, not from log text.
@@ -283,7 +307,6 @@ Run fencing needs more from a store, and a store that does not provide it keeps 
 - A store without bounded event-filter reads cannot establish a verified approval or input view; the arguments are then hidden (`args_hidden=True`) rather than shown unverified.
 - A 0.4.1 `claim_paused_run(run_id, *, expected_status)` stays usable on a best-effort basis: Dendrux validates before and right after the claim, but it cannot give atomic validation or full fencing there. Upgrade the store for those guarantees.
 
-[//]: # "VERIFY-0.5.0: T1 owns the store; confirm the save_run_event return type and the add_note max_notes signature. Checked against the merged code in the 0.5.0 docs pass."
 
 ### 11. Guardrail findings no longer carry matched text
 
@@ -313,7 +336,6 @@ needs to keep following beyond terminal status.
 Your application chooses its HTTP statuses, framing and pagination schema. See
 [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
-[//]: # "VERIFY-0.5.0: T1 owns follow; the router-era SSE checks (end frame name, follow=true, 503 when full, llm-calls paging) no longer apply. Recheck FollowEnd reasons, drained_terminal, 500 per store and 100 per tenant scope, 900 s and the offset ValueError against store/_follow.py. Checked in the 0.5.0 docs pass."
 
 ### 13. Approving needs a pause id
 
@@ -336,7 +358,7 @@ Round-trip `pause_id` through your client (it is on `RunResult.pause_id`, `Pendi
 - `Agent.get_result(run_id, tenant_id=..., include_pii=False)` is new. It needs an explicit tenant (`None` for untenanted runs), refuses `UNSCOPED`, restores the answer exactly as `run()` returned it, and leaves `pii_mapping` out of `meta` unless you pass `include_pii=True`.
 - A result straight from `run()` still carries `meta["pii_mapping"]`. Do not return `meta` wholesale.
 - `RunResult.meta` no longer has a `pause_state` key. The internal pause state is not public. Read the current pause with `RunResult.pending` (a `PendingPause`) or `RunStore.get_pending`.
-- `RunResult.to_dict()` is the browser envelope: `wire_version` (1), `run_id`, `status`, `pending`, `answer`, `output` and `error_info`, and nothing else. Client-tool arguments follow the PII restore policy; approval and input prompts and arguments are placeholders; `pii_mapping` is never included. `ToolResult.from_dict` and `list_from_dict` validate results coming back from a client. See [RunResult](/docs/reference/agent#runresult).
+- `RunResult.to_dict()` is the browser envelope: `wire_version` (1), `run_id`, `status`, `pending`, `answer`, `answer_omitted`, `output` and `error_info`, and nothing else. Client-tool arguments follow the PII restore policy; approval and input prompts and arguments are placeholders; `pii_mapping` is never included. `ToolResult.from_dict` and `list_from_dict` validate results coming back from a client. See [RunResult](/docs/reference/agent#runresult).
 
 ### 15. Redacted views show less
 
@@ -442,7 +464,6 @@ Every new bound in 0.5.0, for capacity planning:
 | `sweep` candidates per category | 10,000 (ceiling 100,000) | `sweep_cap_reached` warning |
 | Pending pause display on the wire | about 1,000 PII values | `args_hidden=True` for that pause |
 
-[//]: # "VERIFY-0.5.0: coordinator section 8 caps (20,000 PII values, 16 Presidio scans, 4 MiB MCP read, offset 10,000 as a ValueError) come from T3, T4 and T1 worktrees; the MCP behaviour on exceeding is T4's and the wording here is inferred. Recheck all rows at merge. Checked against the merged code in the 0.5.0 docs pass."
 
 ## What you may notice
 
@@ -479,7 +500,6 @@ Approving without `expected_pause_id` is **not** in this table: it is already an
 
 To silence a warning, make the choice explicit. For example, `Budget(max_tokens=200_000, count_cache_tokens=False)` keeps 0.4 counting, and `count_cache_tokens=True` counts `input + output + cache read + cache write` tokens (raise `max_tokens` if you opt in).
 
-[//]: # "VERIFY-0.5.0: confirm each warning text and trigger once the tracks land; approving without expected_pause_id is now an InputValidationError, and only non-approval submits under strict tenancy warn. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Checklist
 
@@ -507,3 +527,15 @@ To silence a warning, make the choice explicit. For example, `Budget(max_tokens=
 - [Erasing a tenant's data](/docs/recipes/erasing-tenant-data): the manual recipe until 0.6.
 - [HTTP integration](/docs/reference/http-api): the library and transport boundary.
 - [Scaling workers](/docs/guides/scaling): pools, PgBouncer, migrations, sweeps and every bound.
+
+### Bounded continuation and delegation reads
+
+SQL persistence reads the next trace index as one scalar using the existing run/order index. Custom stores can add `get_next_trace_index(run_id)`; stores without it retain the full `get_traces` compatibility read.
+
+`Budget(include_children=True)` accounts at most 10,000 nodes including the root. Set `max_subtree_nodes` on `Budget` to change the bound. Larger trees raise `BudgetConfigurationError(reason="subtree_limit")`; partial totals are never used. Custom accounting stores should accept `subtree_usage(run_id, *, max_nodes=10000)` to enforce the bound. Legacy implementations without that parameter retain their existing accounting behavior.
+
+Cascade cancellation reads and signals descendant ids in pages of 500 before reading the next page. `meta["cascade"]` contains at most 1,000 outcomes including the root; `cascade_count` gives the number processed, and `cascade_truncated` indicates omitted detail. Custom stores can implement `get_descendant_page(run_id, *, after=None, limit=500, tenant_id=UNSCOPED)` to enable paging; legacy stores retain their `get_subtree` compatibility path.
+
+Approval denial results are validated before claiming, including their encoded per-result size, metadata and the expanded batch size. Oversized denials raise `InvalidToolResultError` and leave the pause waiting. Client submissions continue to replace oversized individual results with a size-limit result.
+
+`Limits.max_input_bytes` applies to the combined caller-supplied text in `user_input`, `history` and `context`. NUL and lone surrogates are rejected before a run is created.

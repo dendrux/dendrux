@@ -80,7 +80,6 @@ Budget(max_tokens=200_000, count_cache_tokens=False)   # keep the 0.4 count, sil
 
 The dollar limit is where caching always shows up: cost is what the provider reported, or what your [`PriceTable`](/docs/architecture/pricing) computes. A delegated child can still spend past a parent's limit within one of its own iterations; tightening that is planned for 0.6.
 
-[//]: # "VERIFY-0.5.0: T3 owns count_cache_tokens; confirm the formula, the warning trigger, and the child overshoot note. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Dollar limits
 
@@ -188,7 +187,6 @@ A child run is a run with its own `Agent`, and its own budget if it has one. Eac
 
 - **With persistence** (a database or `state_store`), the run's own usage is tracked in memory as calls complete, and the subtree rollup of children is read from successfully recorded `llm_interactions`. A failed usage write is retried and never switches enforcement off. If the live read of the subtree fails or lags, the tracker keeps enforcing the last spend it observed for the children plus the run's own growth since, so a transient database error cannot hide spend.
 
-[//]: # "VERIFY-0.5.0: the budget read is T7 wave 2; recheck this bullet against the final budget reads. Checked against the merged code in the 0.5.0 docs pass."
 
 - **Without persistence**, usage is the loop's in-memory total. `include_children` cannot be honored (there is no store to roll up) and is ignored, with a one-time log warning. A pause can only be resumed from persisted state, so use `on_exceed="pause"` with a database.
 
@@ -228,3 +226,7 @@ class StopOnBudget:
 - Emits `budget.threshold`, `budget.exceeded` and `budget.unpriced` on `run_events`.
 - Pauses and cancels through the same machinery as [Pause and resume](/docs/architecture/pause-resume) and [Cancellation](/docs/architecture/cancellation).
 - Costs come from [Cost and pricing](/docs/architecture/pricing); child usage from `RunStore.get_subtree` (see [RunStore](/docs/reference/run-store)).
+
+### Subtree accounting bound
+
+The SQL store limits a root-inclusive budget rollup to 10,000 nodes. Configure `Budget(max_tokens=100000, max_subtree_nodes=20000)` for larger trees. Exceeding the bound raises `BudgetConfigurationError` with reason `subtree_limit`, rather than using a partial spend total.

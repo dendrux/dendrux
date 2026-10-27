@@ -365,7 +365,6 @@ Like every finding, it carries a kind, a count and a location, never the content
 
 A message made of several text parts, and a tool result, is scanned as the one text the model would read (the parts joined by a blank line), so a pattern whose context sits in a neighbouring part is still found. Redaction is mapped back to each part. Tool-call parameters are scanned leaf by leaf and also as one joined `key=value` text in walk order and in reverse order, so an ancestor key such as `{"aws secret": {"value": TOKEN}}` supplies context to its children. A pattern's own context window still applies, so a context key separated from its value by many long keys can be missed. More parts can mean more blocks and redactions than in 0.4.1, never fewer. Joined text over the 4 Mi limit is `unscannable`.
 
-[//]: # "VERIFY-0.5.0: T3 owns this; confirm the kind name is unscannable and the depth and size limits worth documenting. Checked against the merged code in the 0.5.0 docs pass."
 
 ## Multiple guardrails compose
 

@@ -116,7 +116,6 @@ agent = Agent(provider=provider, prompt="...", limits=Limits(max_input_bytes=4 *
 
 The note cap is enforced by one conditional insert in the store, so concurrent `submit_note` calls cannot exceed it. A custom `StateStore` whose `add_note` has no `max_notes` keyword keeps working without the cap.
 
-[//]: # "VERIFY-0.5.0: caps are enforced by T4 (inputs, tool results) and T1 (notes, metadata); T0 only stores them. Recheck the replacement JSON and the ValueError behaviour. Checked against the merged code in the 0.5.0 docs pass."
 
 ### Transforming tool results
 
@@ -180,7 +179,6 @@ for runs with no narration, and for idempotent cached results. Persisted traces
 carry the same split as `TraceEntry.phase`. A paused run may instead carry a
 clarification question.
 
-[//]: # "VERIFY-0.5.0: AGT-209 item 5 (RunResult fields listed plainly, including stop_reason, truncated, error_info, pause_id) is written in the RunResult section above; recheck the field table and the to_dict envelope against types.RunResult and _wire.py at the release candidate. Checked against the merged code in the 0.5.0 docs pass."
 
 ### Truncated answers
 
@@ -260,6 +258,7 @@ class RunResult:
 
 | Key | Content |
 | --- | --- |
+| `answer_omitted` | True when the wire display bound omits an answer; `answer` is then null. |
 | `wire_version` | Integer, currently `1`. Clients should reject a version they do not know and ignore extra keys within a version they do. |
 | `run_id`, `status` | As on the result. |
 | `pending` | The active pause (`kind`, `pause_id`, `pending_tool_calls`, `question`, `options`, `reason`, `message`, `exceeded`), or `None`. A terminal result never shows a stale pause. |
@@ -550,3 +549,7 @@ Close directly owned MCP sources, the provider, and any agent-owned engine. Call
 - [Runs and the lifecycle](/docs/architecture/runs): the status state machine these methods move through.
 - [RunStore](/docs/reference/run-store): read back what a run produced.
 - [Errors](/docs/reference/errors): the exceptions the submit family raises.
+
+### Wire answer display bound
+
+`RunResult.to_dict()` keeps wire version 1 and includes `answer_omitted`. It is `true` when the answer cannot be safely projected within the wire display bound and `answer` is `null`. It is `false` for a successfully projected answer, including an empty string. Omission logs the run id with code `wire_answer_omitted`; trusted in-process results retain their original answer.

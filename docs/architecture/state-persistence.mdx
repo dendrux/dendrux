@@ -339,7 +339,6 @@ If the tables are missing when a run starts, dendrux raises `SchemaNotInitialize
 
 Upgrading to 0.5.0 applies two revisions. `d7e8f9a0b1c2` adds `agent_runs.claim_epoch`, the tenant-scoped idempotency index and the `(tenant_id, created_at)` index. `e8f9a0b1c2d3` adds `agent_runs.status_changed_at` (backfilled online from `updated_at`) and the three `sweep()` indexes. Run `dendrux db migrate` once, as a single deploy job over a direct Postgres connection (not PgBouncer, not from every pod), before you start 0.5 workers; short exclusive steps give up after 5 seconds and can be retried. A Postgres database that has not been migrated raises `SchemaOutOfDateError` on first use, and the schema check now also verifies the named indexes. `dendrux db check` compares the database with this version's migration head (exit 0 current, 1 behind, 2 unknown; `--allow-unstamped` for schemas built with `create_all`). The full procedure, including mixed-fleet rules, is in [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0).
 
-[//]: # "VERIFY-0.5.0: T1 builds dendrux db check and the index check in _schema_check; confirm names and exit codes, and that CLI error output masks database URL passwords. Checked against the merged code in the 0.5.0 docs pass."
 
 Upgrading to 0.4.0 adds the two image tables; a Postgres database that has not been migrated raises `SchemaOutOfDateError` naming `dendrux_blobs` and `dendrux_blob_refs` on first use. SQLite files create them on startup.
 

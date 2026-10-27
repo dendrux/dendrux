@@ -888,7 +888,6 @@ The integration preserves:
 
 **Session loss.** If a `tools/call` POST itself comes back as HTTP 404 "Session not found", the runtime re-initialises the session and retries that call once. After any other loss in the middle of a call (a dropped connection, a timeout) the server may have applied the call, so it is reported as `MCPOutcomeUnknownError` and never retried automatically. Servers on the stateless protocol revision have no session at all. After an error that closes a connection, the runtime rebinds its executors so the next call starts clean.
 
-[//]: # "VERIFY-0.5.0: T4 owns MCP; confirm the streaming cap lives in mcp/_http.py, the single 404 retry and the executor rebind after a classified loss. Checked against the merged code in the 0.5.0 docs pass."
 
 Errors an application should be ready to handle:
 

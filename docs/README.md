@@ -34,7 +34,6 @@ Adding a page here does not add it to the site's sidebar. The navigation is hand
 
 - Each `.mdx` file starts with frontmatter (`title`, `description`).
 - **Plain Markdown only.** The docs site provides no custom components: no `<Callout>`, no JSX tags, no `{...}` expressions in prose. A single unknown component fails the whole site deploy. For a note, use a blockquote with a bold lead: `> **Note.** text`. Anything with `<` or `{` that is not code goes in backticks or a fenced block.
-- No HTML comments (`<!-- -->`): MDX rejects them. To leave an invisible reviewer note, use a Markdown reference definition on its own line, with the text in double quotes: `[//]: # "note text"` (no double quotes or backslashes inside; parentheses in parentheses-delimited titles break the build). Notes that start `VERIFY-0.5.0:` mark text that depends on code not yet verified; remove them once it is.
 - Code blocks use triple backticks with a language tag (` ```python`, ` ```bash`). Shiki highlights them at build time.
 - One H1 per page (the title). Use H2/H3 for sections.
 - Examples that run in CI and examples a reader will paste must run without warnings. Single-tenant examples pass `strict_tenancy=False  # single-tenant example; see Multi-tenancy` on the `Agent`; multi-tenant ones pass `tenant_id=`. Token budgets pass `count_cache_tokens=` explicitly.
@@ -57,3 +56,5 @@ Use it for signature listings, fragments that rely on setup shown elsewhere, pla
 ## When you change a public API
 
 If you rename, add, or remove anything in `dendrux/__init__.py`, update the corresponding page in `docs/reference/` (and the [API glossary](reference/api-glossary.mdx)) in the same PR. Reviewers will check.
+
+- MDX pages use plain Markdown. Avoid HTML comments; invisible authoring notes can use Markdown reference definitions on their own line.

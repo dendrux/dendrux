@@ -246,7 +246,6 @@ And in `run_events`:
 
 Since 0.5.0 a block never copies the matched text into the error, the event or the logs. It reports the kind, how many, and where (message index, with the system prompt as message 0, role, and the tool call id for tool results). The run then ends with `run.error`, and the run row carries `failure_reason="guardrail_blocked"`. That keeps a leaked secret or a person's data from being written into the stored events by the very guardrail that caught it. Look up the message by its location if you need to see what matched.
 
-[//]: # "VERIFY-0.5.0: T3 owns the block message format and the findings/location field names; replace the example strings with the real output (replaced with a captured run in the 0.5.0 docs pass)"
 
 Inspection tools you build can group these events by entity type and iteration.
 

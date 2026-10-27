@@ -5,7 +5,7 @@ description: How to run Dendrux across many processes: build the store once at s
 
 # Scaling workers
 
-Dendrux is a library. You own the processes, the database pool, the migration job and the schedule. The database is the coordinator: any worker can resume any run, and Dendrux keeps no state that matters in process memory. This page lists what to build once, what to size, and which limits bound the work a process accepts.
+Dendrux is a library. You own the processes, the database pool, the migration job and the schedule. The database coordinates claims: any worker can resume any run, and Dendrux keeps no state that matters in process memory. This page lists what to build once, what to size, and which limits bound the work a process accepts.
 
 ## Build the store once at startup
 

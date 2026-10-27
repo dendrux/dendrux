@@ -24,7 +24,6 @@
 
 > `v0.5.0` - core API stabilizing, actively developed.
 
-<!-- VERIFY-0.5.0: the version banner and the 'What's new in 0.5.0' block are written ahead of the release PR; confirm the version number and the release date when the four version sites are bumped -->
 
 ---
 
@@ -577,7 +576,6 @@ Dendrux is in active development (`v0.5.0`). The core API is stabilizing. `Agent
 
 Built with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/codex). 9,000+ tests, strict types, Apache 2.0.
 
-<!-- VERIFY-0.5.0: refresh the counts in The Numbers (lines of code, test cases, migrations, examples) from the release candidate -->
 
 ## What Dendrux Is Not
 

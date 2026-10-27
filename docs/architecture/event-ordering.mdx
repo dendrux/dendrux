@@ -20,7 +20,6 @@ The only guarantee readers need is the first one: **within a run, `sequence_inde
 
 A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every worker is on 0.5.0 or later. Until then, a fleet that mixes 0.4.1 and 0.5 workers can in rare races write one duplicate index, and an SSE cursor can miss that one event. That window closes with the 0.5.1 index.
 
-[//]: # "VERIFY-0.5.0: T1 implements the allocation; confirm the statement shape and that the return value reaches the recorder. Checked against the merged code in the 0.5.0 docs pass."
 
 ## A real event timeline
 
