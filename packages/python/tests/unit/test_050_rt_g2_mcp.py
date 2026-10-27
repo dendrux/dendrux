@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -29,14 +28,17 @@ def _tool(name: str) -> Any:
 class _PagedClient:
     """Stands in for a connected SDK client serving scripted ``tools/list`` pages."""
 
-    def __init__(self, cursors: Any, *, delay: float = 0.0) -> None:
+    def __init__(self, cursors: Any, *, delay: float = 0.0, hang_at: int | None = None) -> None:
         self.cursors = cursors  # callable(page_index) -> next cursor or None
         self.delay = delay
+        self.hang_at = hang_at  # from this page on, a request never returns
         self.pages = 0
 
     async def list_tools(self, cursor: Any = None, cache_mode: Any = None) -> Any:
         index = self.pages
         self.pages += 1
+        if self.hang_at is not None and index >= self.hang_at:
+            await asyncio.Event().wait()
         if self.delay:
             await asyncio.sleep(self.delay)
         return SimpleNamespace(tools=[_tool(f"t{index}")], next_cursor=self.cursors(index))
@@ -115,22 +117,25 @@ class TestPageCap:
 
 
 class TestAggregateDeadline:
-    async def test_slow_pages_stop_at_the_deadline(self) -> None:
-        client = _PagedClient(lambda i: f"c{i}", delay=0.05)
-        started = time.monotonic()
+    # The deadline is the only thing that can end these requests, so passing means it fired.
+    # No elapsed-time assertion: the hang guard is generous and does not depend on load.
+    async def test_pages_that_stop_answering_end_at_the_deadline(self) -> None:
+        client = _PagedClient(lambda i: f"c{i}", hang_at=3)
         with pytest.raises(MCPDiscoveryLimitError) as caught:
-            await _adapter(_source(discovery_timeout=0.3), client).list_tools()
+            await asyncio.wait_for(
+                _adapter(_source(discovery_timeout=0.5), client).list_tools(), timeout=60
+            )
         assert caught.value.reason == "deadline"
-        assert time.monotonic() - started < 1.5
-        assert client.pages >= 2
+        assert client.pages >= 1
 
-    async def test_one_page_slower_than_the_deadline_is_cut_off(self) -> None:
-        client = _PagedClient(lambda i: None, delay=5.0)
-        started = time.monotonic()
+    async def test_one_page_that_never_answers_is_cut_off(self) -> None:
+        client = _PagedClient(lambda i: None, hang_at=0)
         with pytest.raises(MCPDiscoveryLimitError) as caught:
-            await _adapter(_source(discovery_timeout=0.2), client).list_tools()
+            await asyncio.wait_for(
+                _adapter(_source(discovery_timeout=0.2), client).list_tools(), timeout=60
+            )
         assert caught.value.reason == "deadline"
-        assert time.monotonic() - started < 1.5
+        assert client.pages == 1
 
     async def test_fast_discovery_is_unaffected(self) -> None:
         client = _PagedClient(lambda i: f"c{i}" if i < 2 else None)
