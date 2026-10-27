@@ -61,18 +61,20 @@ print(result.answer)         # "I've successfully refunded order 42..."
 
 `submit_approval` is race-safe: persist-first plus CAS claim plus blocking until the run reaches the next pause or terminal. The pending tool runs server-side; its result is fed back into the LLM; the LLM responds to the user.
 
-Captured event sequence (real run):
+Event sequence (captured on 0.4.1; the two `tools.declared` rows that 0.5.0 writes for each run segment are added by hand and later numbers shifted; `approval.requested` also carries `params` in 0.5):
 
 ```text
 seq=0  run.started
-seq=1  llm.completed         (LLM emits refund tool call)
-seq=2  approval.requested    {"tool_name": "refund", "call_id": "01KP...", "reason": "requires_approval"}
-seq=3  run.paused            {"status": "waiting_approval", "pending_tool_calls": [...]}
-seq=4  run.resumed           {"resumed_from": "waiting_approval"}
-seq=5  tool.completed        {"tool_name": "refund", "target": "server", "success": true}
-seq=6  approval.decided      {"decision": "approved", "run_id": "..."}
-seq=7  llm.completed         (LLM responds with the refund confirmation)
-seq=8  run.completed
+seq=1  tools.declared        {"local_tool_names": ["refund"]}
+seq=2  llm.completed         (LLM emits refund tool call)
+seq=3  approval.requested    {"tool_name": "refund", "call_id": "01KP...", "reason": "requires_approval", "params": {...}}
+seq=4  run.paused            {"status": "waiting_approval", "pending_tool_calls": [...], "pause_id": "01KP..."}
+seq=5  run.resumed           {"resumed_from": "waiting_approval"}
+seq=6  tools.declared        {"local_tool_names": ["refund"]}
+seq=7  tool.completed        {"tool_name": "refund", "target": "server", "success": true}
+seq=8  approval.decided      {"decision": "approved", "run_id": "..."}
+seq=9  llm.completed         (LLM responds with the refund confirmation)
+seq=10 run.completed
 ```
 
 The `tool_calls` table now has one row for the refund: `tool_name=refund`, `success=1`.

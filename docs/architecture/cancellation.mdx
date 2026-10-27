@@ -69,7 +69,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The DB state before and after, pulled directly from SQLite, shows the single-statement transition:
+The DB state before and after, pulled directly from SQLite, shows the single-statement transition (captured on 0.4.1, with the 0.5.0 `tools.declared` row added by hand):
 
 ```text
 first.run returned: status=waiting_approval
@@ -81,9 +81,10 @@ STATE AT PAUSE (waiting_approval)
   pause_data: <set>
   run_events:
     seq=0  run.started
-    seq=1  llm.completed
-    seq=2  approval.requested
-    seq=3  run.paused
+    seq=1  tools.declared
+    seq=2  llm.completed
+    seq=3  approval.requested
+    seq=4  run.paused
 
 cancel_run returned: status=cancelled
 
@@ -94,17 +95,18 @@ STATE AFTER CANCEL
   pause_data: null
   run_events:
     seq=0  run.started
-    seq=1  llm.completed
-    seq=2  approval.requested
-    seq=3  run.paused
-    seq=4  run.cancelled
+    seq=1  tools.declared
+    seq=2  llm.completed
+    seq=3  approval.requested
+    seq=4  run.paused
+    seq=5  run.cancelled
 ```
 
 Three things worth noting in that diff.
 
 1. `status` went straight from `waiting_approval` to `cancelled` without an intermediate `running` state. One SQL statement made the transition.
 2. `pause_data` was cleared to JSON null as part of the same UPDATE. There is no stale handoff data sitting on a terminal row.
-3. A `run.cancelled` event was appended at `seq=4`, continuing the existing per-run monotonic sequence. SSE clients that were streaming this run see the cancel arrive as a normal event.
+3. A `run.cancelled` event was appended at `seq=5`, continuing the existing per-run monotonic sequence. SSE clients that were streaming this run see the cancel arrive as a normal event.
 
 ## Cancelling a running run
 

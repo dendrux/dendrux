@@ -57,7 +57,7 @@
 
 ## What's new in 0.3.0
 
-- **Per-call approvals**: `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve() | .deny(reason)})` decides each gated call on its own. Client-target calls are never executed server-side on approval (a security fix).
+- **Per-call approvals**: `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve() | .deny(reason)}, expected_pause_id=pause_id)` decides each gated call on its own (since 0.5.0 any approval needs the pause id; this 0.3.0 note is kept for history). Client-target calls are never executed server-side on approval (a security fix).
 - **`before_tool` policy hook**: one function sees each parsed tool call (local, MCP, skill) that passes static `deny=` and skill preflight, before approval, and returns allow, deny, require approval or a substituted result. Fails closed.
 - **Run control**: `agent.request_pause(run_id)` parks a running run as `paused` and `agent.submit_resume(run_id)` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too, and `cancel_run` now interrupts an in-flight `run()` in the same process.
 - **Inbox notes**: `agent.submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next iteration.
@@ -247,7 +247,7 @@ agent = Agent(
 
 **Tool deny**: `deny=["tool_name"]` blocks tools deterministically. The model gets a synthesized error and adapts. The tool never executes.
 
-**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)` (the pause id the approver was shown), reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `decisions={call_id: ApprovalDecision.approve()}`.
+**Approval (HITL)**: `require_approval=["tool_name"]` pauses the run for human sign-off. Approve with `agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)` (the pause id the approver was shown), reject with `agent.submit_approval(run_id, approved=False, rejection_reason="...")`, or decide each call with `agent.submit_approval(run_id, decisions={call_id: ApprovalDecision.approve()}, expected_pause_id=pause_id)`.
 
 **Tool policy**: `before_tool=hook` decides each call from its arguments: `ToolDecision.deny(...)`, `.require_approval(...)`, `.substitute(result)` or `None` to allow.
 

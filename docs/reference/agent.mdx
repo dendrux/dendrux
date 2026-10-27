@@ -84,7 +84,7 @@ Agent(
 | `guardrails` | List of guardrails scanned each turn. See [Guardrails](/docs/architecture/guardrails). |
 | `skills_dir` / `skills` / `deny_skills` | Skill loading and filtering. `skills_dir` is read lazily at the first run. See [Skills](/docs/architecture/skills). |
 | `skill_executor` | A `SkillExecutor` subclass instance that runs skill scripts. Without it, `run_skill_script` is not offered to the model. See [Running scripts](/docs/architecture/skills#running-scripts). |
-| `tool_result_transform` | Callable that rewrites a server tool's result before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
+| `tool_result_transform` | Callable that rewrites a successful server tool's result, or a successful result your client submits, before it is persisted or sent to the model. See [Transforming tool results](#transforming-tool-results). |
 | `before_tool` | Sync or async policy hook, run once for each parsed tool call that passes static `deny=` and skill preflight, before approval; called with a `ToolCallContext`, returns a `ToolDecision` or `None`. Not supported with `SingleCall`. See [Tool policy hook](/docs/architecture/tool-policy). |
 | `images` | An `ImagePolicy`: size and count caps, non-vision handling, the drop-old-images window, URL fetching and the ingest hook. `None` uses the defaults (vendor limits). Readable as `agent.image_policy`. See [Images](/docs/recipes/images). |
 | `strict_tenancy` | `True` makes every entry point (`run`, `stream`, `retry`, `resume*`, `submit_*`, `cancel_run`, `request_pause`, `submit_note`) require an explicit `tenant_id` and raise `TenantScopeRequiredError` otherwise. Default `False` in 0.5; becomes the default in 0.6 (a `FutureWarning` fires if you have not chosen). See [Multi-tenancy](/docs/architecture/multi-tenancy). |
@@ -120,7 +120,7 @@ The note cap is enforced by one conditional insert in the store, so concurrent `
 
 ### Transforming tool results
 
-`tool_result_transform` runs after every successful server-executed tool call — local `@tool` functions and MCP tools alike — and before the result is serialized. Whatever it returns becomes the result: the persisted `ToolInvocation.result`, the `TOOL` message the model sees, and the notifier/stream events all carry the transformed value.
+`tool_result_transform` runs after every successful server-executed tool call — local `@tool` functions and MCP tools alike — and, since 0.5.0, on every successful result a client submits through `submit_tool_results` or `resume`; it runs before the result is serialized. Whatever it returns becomes the result: the persisted `ToolInvocation.result`, the `TOOL` message the model sees, and the notifier/stream events all carry the transformed value.
 
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
 
@@ -144,7 +144,8 @@ agent = Agent(provider=provider, prompt="...", tools=[query_sales],
 
 - The return value always replaces the result. Return `ctx.result` to leave it unchanged — `None` is a real result, not "no change".
 - If the transform raises, the tool call fails (`success=False`) with an error naming `tool_result_transform`; the model sees it as a tool error.
-- It is not applied to failed tool calls, nor to results your client submits via `submit_tool_results`.
+- It is not applied to failed tool calls or failed client results.
+- For a client result, `ctx.result` is the submitted payload parsed as JSON (plain text arrives as a string) and `ctx.target` is `"client"`; branch on `ctx.target` if the hook is meant for server tools only. The submitted result is validated and capped first, the transform runs, and the output is validated and capped again. If the transform raises or returns something that cannot be stored, the submission is rejected with `InvalidToolResultError`, the run stays paused and unclaimed, and the client can resubmit.
 - It also runs for tools executed on resume after `submit_approval`.
 - It runs on the raw result; guardrails scan the serialized tool message afterwards. MCP results arrive in their adapted form (e.g. `structuredContent` as `{"result": ...}`).
 - Sync transforms run on the event loop, so keep them cheap.

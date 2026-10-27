@@ -24,13 +24,14 @@ async with store:
 
 ```python
 @classmethod
-def from_database_url(database_url: str) -> RunStore     # store owns the engine
+def from_database_url(database_url: str, *, blob_store: BlobStore | None = None,
+                      database_options: dict[str, Any] | None = None) -> RunStore   # store owns the engine
 @classmethod
-def from_engine(engine: AsyncEngine) -> RunStore         # caller owns the engine
+def from_engine(engine: AsyncEngine, *, blob_store: BlobStore | None = None) -> RunStore   # caller owns the engine
 async def close() -> None
 ```
 
-Both constructors also take `blob_store=` (a `BlobStore`) when the deployment keeps image bytes outside the database; use the same store as the `Agent`. Two members relate to images:
+Both constructors take `blob_store=` (a `BlobStore`) when the deployment keeps image bytes outside the database; use the same store as the `Agent`. `from_database_url` also takes `database_options=` (extra `create_async_engine` options; non-SQLite engines default to `pool_pre_ping=True` and `pool_recycle=1800`). Two members relate to images:
 
 [//]: # "docs-test: skip - API signature listing, not runnable code"
 
@@ -45,7 +46,7 @@ async def read_image(run_id: str, sha256: str, *, tenant_id=...) -> bytes
 
 ## Tenant scope
 
-Every read takes a keyword-only `tenant_id: TenantScope = UNSCOPED`, where `TenantScope` is `str | None | UNSCOPED`:
+Every read takes a keyword-only `tenant_id`, where `TenantScope` is `str | None | UNSCOPED`. The older reads (`list_runs`, `count_runs`, `get_run`, `get_events`, `stream_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pii_mapping`, `get_pauses`, `get_pause_page`, `get_subtree`, `get_notes`, `read_image`) default to `UNSCOPED`. `get_pending`, `follow` and `get_event_view` have **no default**: leaving `tenant_id` out is a `TypeError`.
 
 | Value | Reads |
 | --- | --- |
@@ -53,7 +54,19 @@ Every read takes a keyword-only `tenant_id: TenantScope = UNSCOPED`, where `Tena
 | `None` | untenanted runs only (changed in 0.5.0: `None` used to mean "all" on `list_runs` and `count_runs`) |
 | `UNSCOPED` (the default) | every tenant |
 
-A run outside the scope behaves exactly like a missing one: `get_run` returns `None`, and the other per-run reads raise `RunNotFoundError`. The scope is part of the same query as the read. `get_subtree`, `get_notes` and `read_image` already took a tenant and work the same way. Pass the authenticated caller's tenant from every route of your own; see [Multi-tenancy](/docs/architecture/multi-tenancy).
+A run outside the scope behaves exactly like a missing one, and what "missing" looks like depends on the method:
+
+| Method | Missing or foreign run |
+| --- | --- |
+| `get_run` | returns `None` |
+| `get_events`, `get_llm_calls`, `get_tool_invocations`, `get_traces`, `get_pauses` | return `[]` |
+| `get_pause_page` | returns `([], False)` |
+| `get_pii_mapping` | returns `{}` |
+| `get_notes` | unscoped: returns `[]`; with a `tenant_id`: raises `RunNotFoundError` |
+| `get_subtree`, `get_pending`, `follow` (on start), `get_event_view` | raise `RunNotFoundError` |
+| `read_image` | raises `BlobNotFoundError`, the same error as for a missing blob |
+
+An empty result is therefore never proof that a run exists. Check `get_run` (or `get_pending`) first when your route needs a 404. The scope is part of the same query as the read. Pass the authenticated caller's tenant from every route of your own; see [Multi-tenancy](/docs/architecture/multi-tenancy).
 
 ```python
 from dendrux import UNSCOPED
@@ -63,7 +76,7 @@ from dendrux import UNSCOPED
 
 ### Arguments are validated
 
-Every read, `get_pending` and `follow` checks its arguments before it queries, and refuses with a `ValueError` whose message is fixed and never echoes the value (Dendrux logs `code=read_argument_invalid` with the argument name). A route can map it to HTTP 400.
+Every read, `get_pending` and `follow` checks its arguments before it queries, and refuses with a `ValueError` whose message is fixed and does not echo the rejected value (Dendrux logs `code=read_argument_invalid` with the argument name). One exception: the `offset` cap on `list_runs` and `count_runs` names the cap and the integer you passed, because the value is a number you chose. A route can map it to HTTP 400.
 
 - Run ids and string tenant ids are non-empty strings of at most 255 characters with no NUL and no unpaired surrogate. `get_run(None)` therefore raises (it used to return `None`).
 - Cursors fit a 32-bit integer; `limit` and `offset` are integers (not `bool`); `offset` is at most 10,000.
@@ -110,9 +123,8 @@ async def get_traces(run_id: str, *, limit=None, offset=0) -> list[TraceEntry]
 async def get_pauses(run_id: str, *, limit: int = 100, include_payloads: bool = False) -> list[PausePair]
 async def get_pause_page(run_id: str, *, limit: int = 100, include_payloads: bool = False) -> tuple[list[PausePair], bool]
 async def get_pii_mapping(run_id: str) -> dict[str, str]
-async def get_subtree(run_id: str, *, tenant_id: str | None = ...) -> RunSubtree
-async def get_notes(run_id: str, *, undelivered_only: bool = False,
-                    tenant_id: str | None = ...) -> list[RunNote]
+async def get_subtree(run_id: str) -> RunSubtree
+async def get_notes(run_id: str, *, undelivered_only: bool = False) -> list[RunNote]
 ```
 
 | Method | Returns | Notes |
@@ -147,7 +159,7 @@ def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | N
            max_duration_s: float | None = 900.0) -> Follow
 ```
 
-**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params`, `approval` and `args_hidden`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is one bounded read; the run's history is never loaded, and on Postgres a stored pause is converted to JSON once per read whatever its size. `params` depend on the kind:
+**`get_pending`** returns `None` when the run is not paused and raises `RunNotFoundError` for a missing or foreign run. A `PendingPause` has `run_id`, `status`, `kind` (`client_tool`, `approval`, `input` or `paused`), `pause_id`, `tool_calls` (a list of `PendingToolCall` with `id`, `name`, `target`, `params`, `approval` and `args_hidden`), `question`, `options`, `reason`, `message` and `budget_exceeded`; `to_dict()` gives the `run.paused` event shape plus those fields. It is bounded: the run's history is never loaded, and on Postgres a stored pause is converted to JSON once per read whatever its size. A client-tool or requested pause costs one projected read; an approval or input pause adds the active-pause sequence and the recorded model arguments, three bounded reads in all. `params` depend on the kind:
 
 | Kind | `params` |
 | --- | --- |
@@ -255,7 +267,7 @@ old = await store.get_llm_calls(run_id, before=datetime(2026, 10, 1, tzinfo=UTC)
 
 ### `metadata_filter`
 
-`list_runs` and `count_runs` accept `metadata_filter: dict[str, Any]` (the HTTP router does not expose this). It does exact-match equality across every key in the run's `meta` JSON, AND across keys (`jsonb @>` on Postgres, repeated `json_extract` on SQLite). Keys are restricted to `^[A-Za-z0-9_-]+$`; nested paths are out of scope. The canonical use is per-conversation observability:
+`list_runs` and `count_runs` accept `metadata_filter: dict[str, Any]`. It does exact-match equality across every key in the run's `meta` JSON, AND across keys (`jsonb @>` on Postgres, repeated `json_extract` on SQLite). Keys are restricted to `^[A-Za-z0-9_-]+$`; nested paths are out of scope. The canonical use is per-conversation observability:
 
 [//]: # "docs-test: skip - fragment: continues after a step that closed the store"
 

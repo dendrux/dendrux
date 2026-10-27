@@ -11,10 +11,10 @@ Every run emits a stream of events, and every event lands in the `run_events` ta
 
 | Column | Scope | What it means |
 | --- | --- | --- |
-| `sequence_index` | Run | A global per-run counter. Starts at 0 on `run.started`, increments by exactly 1 for every event the run writes, and never resets, not even across pause and resume. |
+| `sequence_index` | Run | A global per-run counter. Starts at 0 on `run.started`, increments by 1 for every event the run writes, and never resets, not even across pause and resume (on a database where every writer is on 0.5.0 or later; during a mixed 0.4.1 and 0.5 fleet one duplicate index is possible, see below). |
 | `iteration_index` | Loop turn | The LLM iteration the event belongs to. Loop-level events (`run.started`, `run.paused`, `run.resumed`, `run.completed`) record iteration 0. Events produced inside an LLM turn (like `llm.completed`, `tool.completed`, `approval.requested`) record the turn number they came from. |
 
-The only guarantee readers need is the first one: **within a run, `sequence_index` is strictly monotonic**. Order events by it and you get the exact order the runtime observed them.
+The only guarantee readers need is the first one: **within a run, `sequence_index` is monotonic, and strictly so once every writer is on 0.5.0 or later**. Order events by it and you get the exact order the runtime observed them.
 
 **How the number is allocated.** Since 0.5.0 the database assigns it in the same statement that inserts the event (`INSERT ... SELECT COALESCE(MAX(sequence_index), -1) + 1`), and the store returns it. There is no counter in your process, so several workers writing to one run (a resume in another process, for example) cannot interleave to reuse a number. A custom `StateStore` must do the same; see [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0#10-custom-statestore-changes).
 
@@ -24,22 +24,24 @@ A unique index on `(agent_run_id, sequence_index)` arrives in 0.5.1, after every
 
 ## A real event timeline
 
-The timeline below is the literal `run_events` log from the quickstart run, dumped from `quickstart.db`. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
+The timeline below is the `run_events` log from the quickstart run, dumped from `quickstart.db` on 0.4.1; the two `tools.declared` rows that 0.5.0 writes (one after `run.started` and one after `run.resumed`, on every run segment) are added by hand and the later numbers shifted. The run paused for approval after iteration 1, then resumed and finished in iteration 2.
 
 | Sequence | Event | Iteration | Note |
 | --- | --- | --- | --- |
 | 0 | `run.started` | 0 | Loop-level. Agent name and system prompt recorded. |
-| 1 | `llm.completed` | 1 | First LLM turn. 594 input tokens, 55 output, has_tool_calls=true. |
-| 2 | `approval.requested` | 1 | refund was declared require_approval. Correlated by call_id. |
-| 3 | `run.paused` | 0 | Runtime persists waiting_approval and exits. Client reconnect point. |
-| 4 | `run.resumed` | 0 | submit_approval loads the run and re-enters the loop. |
-| 5 | `tool.completed` | 1 | refund actually executes now. Same iteration as the approval request. |
-| 6 | `approval.decided` | 1 | Governance row records who decided and how. |
-| 7 | `llm.completed` | 2 | Second LLM turn. No tool calls this time. |
-| 8 | `run.completed` | 0 | Terminal event. status=success. |
+| 1 | `tools.declared` | 0 | The tools declared in code, recorded once per run segment (0.5.0). |
+| 2 | `llm.completed` | 1 | First LLM turn. 594 input tokens, 55 output, has_tool_calls=true. |
+| 3 | `approval.requested` | 1 | refund was declared require_approval. Correlated by call_id. |
+| 4 | `run.paused` | 0 | Runtime persists waiting_approval and exits. Client reconnect point. |
+| 5 | `run.resumed` | 0 | submit_approval loads the run and re-enters the loop. |
+| 6 | `tools.declared` | 0 | Recorded again for the resumed segment (0.5.0). |
+| 7 | `tool.completed` | 1 | refund actually executes now. Same iteration as the approval request. |
+| 8 | `approval.decided` | 1 | Governance row records who decided and how. |
+| 9 | `llm.completed` | 2 | Second LLM turn. No tool calls this time. |
+| 10 | `run.completed` | 0 | Terminal event. status=success. |
 
 
-Notice that `sequence_index` runs straight through pause and resume. `seq=3` and `seq=4` are written in two separate processes (the starter and the resumer), but they are adjacent in the log. On resume the runtime reads `max(sequence_index)` from the DB and continues counting from there, so there is no gap and no collision.
+Notice that `sequence_index` runs straight through pause and resume. `seq=4` and `seq=5` are written in two separate processes (the starter and the resumer), but they are adjacent in the log. On resume the runtime reads `max(sequence_index)` from the DB and continues counting from there, so there is no gap and no collision once every writer is on 0.5.0 or later.
 
 `iteration_index` behaves differently: it jumps between 0, 1, and 2 depending on whether the event is loop-level or turn-scoped. That is by design. Loop-level events belong to no single LLM turn.
 
@@ -61,17 +63,17 @@ Your application chooses its cursor policy. One possible reconnect order is:
 
 The resolved cursor is passed into `RunStore.get_events(run_id, after_sequence_index=cursor)`, which emits a SQL `WHERE sequence_index > cursor` and orders by `sequence_index`. The strict `>` is the critical piece: the event the client already saw is excluded, and every event after it is included.
 
-A client that last saw `seq=3` and reconnects gets the rest of the run, no duplicates and no gaps:
+A client that last saw `seq=4` and reconnects gets the rest of the run, no duplicates and no gaps (on a database where every writer is on 0.5.0 or later; see the mixed-fleet note above):
 
 [//]: # "docs-test: skip - fragment: relies on `store`, defined by setup shown elsewhere"
 
 ```python
-events = await store.get_events(RUN_ID, after_sequence_index=3)
+events = await store.get_events(RUN_ID, after_sequence_index=4)
 print([e.sequence_index for e in events])
-# [4, 5, 6, 7, 8]
+# [5, 6, 7, 8, 9, 10]
 ```
 
-A complete, self-contained version you can run. A short run produces a three-event log; reading it back with `after_sequence_index` excludes the event the client already saw:
+A complete, self-contained version you can run. A short run produces a four-event log (`run.started`, `tools.declared`, `llm.completed`, `run.completed`); reading it back with `after_sequence_index` excludes the event the client already saw:
 
 ```python
 import asyncio
@@ -95,12 +97,12 @@ async def main() -> None:
     store = RunStore.from_database_url(url)
     async with store:
         print([e.sequence_index for e in await store.get_events(result.run_id)])
-        # [0, 1, 2]
+        # [0, 1, 2, 3]
 
         # A client that already saw seq=0 reconnects: strict > cursor, no replay of seq 0.
         resumed = await store.get_events(result.run_id, after_sequence_index=0)
         print([e.sequence_index for e in resumed])
-        # [1, 2]
+        # [1, 2, 3]
 
 
 asyncio.run(main())

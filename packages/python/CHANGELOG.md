@@ -64,7 +64,7 @@ Each item links to a before/after note on the upgrade page.
 - `Agent.get_result(include_pii=False)` leaves `pii_mapping` out;
   `RunResult.meta` has no `pause_state`.
 - Read flags and control booleans must be real `bool` values; reads validate ids,
-  cursors, filters and dates and raise `ValueError` with a fixed message.
+  cursors, filters and dates and raise `ValueError` with a fixed message (the `offset` cap also names the integer passed).
 - NUL and lone surrogates are rejected in input text, keys and metadata; JSON
   must be finite; client tool results are checked against the pending calls.
 - `RunStore.follow` admits 500 followers per store and 100 per tenant scope;
@@ -73,6 +73,10 @@ Each item links to a before/after note on the upgrade page.
   of raising `CancelledError`.
 - MCP discovery is bounded, and tools with malformed argument schemas are
   skipped or rejected.
+- Provider output is bounded before it is stored: opaque evidence is dropped
+  past 1 MiB, 10,000 nodes, 32 levels or 5,000 keys; overlong ids are hashed and
+  an overlong tool name is rejected as unknown. Custom providers can see shortened
+  raw records.
 - Migrations `d7e8f9a0b1c2` and `e8f9a0b1c2d3`.
 - The OpenTelemetry run span is `ERROR` when `RunResult.error_info` is set.
 
@@ -147,6 +151,12 @@ Each item links to a before/after note on the upgrade page.
   submits.
 
 ### Fixed
+
+- Large structured client results (above about 64 KiB) are validated off the
+  event loop, one job per loop; `ToolResult.from_dict` stays synchronous, so async
+  routes that parse large wire objects call it through `asyncio.to_thread`.
+- A caller cancelled right after claiming a paused run still has the run finalised
+  as `cancelled` before `CancelledError` propagates.
 
 - Failed streams, Responses `error` / `response.failed`, refusals and content
   filters no longer return silent empty answers.

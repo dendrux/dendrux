@@ -69,6 +69,8 @@ One line per change, with the action to take. The numbers link to the detailed n
 | Per-Agent tool calls waiting for a slot are capped at 256 ([22](#22-tool-calls-waiting-for-a-slot-are-capped)) | Handle the retryable `tool_pool_saturated` result; set `DENDRUX_TOOL_QUEUE_LIMIT` to change the bound. |
 | The OpenTelemetry run span is `ERROR` when `RunResult.error_info` is set ([23](#23-opentelemetry-run-spans)) | Update trace dashboards that counted those runs as OK. |
 | `tools.declared` is a new event recorded at the start of every run segment ([24](#24-the-toolsdeclared-event)) | Nothing; redacted feeds use it to prove tool names. |
+| Provider output is bounded before it is stored: opaque evidence, model and tool-call identities ([25](#25-provider-output-is-bounded-before-it-is-stored)) | Custom providers: keep ids within 26 characters (Dendrux ids) and 255 (provider ids), tool names within 255; do not rely on raw response artifacts beyond the bounds. |
+| Large structured client results (above about 64 KiB) are validated off the event loop; a caller cancelled after the claim still has the run finalised as cancelled ([26](#26-large-client-results-and-caller-cancellation)) | Async routes that parse large wire objects call `ToolResult.from_dict` through `asyncio.to_thread`. |
 | Migrations `d7e8f9a0b1c2` and `e8f9a0b1c2d3` ([steps](#the-upgrade-in-four-steps)) | Run `dendrux db migrate` once, as a deploy job, over a direct connection. |
 | Resuming under changed governance emits `governance.changed`; `on_governance_change="raise"` stops it ([what you may notice](#what-you-may-notice)) | Choose `"warn"` or `"raise"` explicitly before 0.6 makes `"raise"` the default. |
 | Token budgets can count cache read and write tokens: `Budget(count_cache_tokens=...)` ([warnings](#warnings-that-announce-06)) | Choose `True` (and raise `max_tokens`) or `False` to silence the `FutureWarning`. |
@@ -335,7 +337,7 @@ What this does and does not protect is written down on [RunStore: redacted views
 
 ### 16. Strict flags and validated read arguments
 
-Read flags (`include_payloads`, `until_terminal`, `active_pause`, `undelivered_only`) and control flags (`approved`, `cascade`, `include_pii`) must be exactly `True` or `False`; `"false"`, `0` or `1` raise `ValueError` instead of being read as truthy. `follow(max_duration_s=...)` must be a finite positive number or `None`. `RunStore` reads, `get_pending` and `follow` also validate ids, tenants, cursors, limits, offsets, filters and dates before they query, and raise `ValueError` with a fixed message that never echoes the value: map it to 400. `get_run(None)` now raises instead of returning `None`. See [RunStore](/docs/reference/run-store#arguments-are-validated).
+Read flags (`include_payloads`, `until_terminal`, `active_pause`, `undelivered_only`) and control flags (`approved`, `cascade`, `include_pii`) must be exactly `True` or `False`; `"false"`, `0` or `1` raise `ValueError` instead of being read as truthy. `follow(max_duration_s=...)` must be a finite positive number or `None`. `RunStore` reads, `get_pending` and `follow` also validate ids, tenants, cursors, limits, offsets, filters and dates before they query, and raise `ValueError` with a fixed message that does not echo the rejected value (the `offset` cap names the cap and the integer you passed): map it to 400. `get_run(None)` now raises instead of returning `None`. See [RunStore](/docs/reference/run-store#arguments-are-validated).
 
 ### 17. Client results and unstorable text
 
@@ -377,6 +379,33 @@ Each Agent keeps at most 256 tool calls waiting for one of its `tool_threads` sl
 
 Every run segment (`run`, `stream`, `retry`, `resume` and `resume_stream`) now records one `tools.declared` governance event whose data is `local_tool_names`: the sorted names of the tools declared in code, client tools included, at most 1,000 and each at most 64 identifier characters. MCP discovery and model output never add to it. Redacted readers use it to prove which tool names are developer-declared; consumers that assert on the exact event count of a run will see one more event.
 
+### 25. Provider output is bounded before it is stored
+
+Everything a provider (yours or a built-in one) returns is normalised before it reaches callbacks, events or the database. Built-in providers already satisfy this; a custom provider can see differences from 0.4.1:
+
+- **Text.** NUL and lone surrogates in model text, tool names, tool-call ids and questions are replaced with U+FFFD.
+- **Identities.** A Dendrux tool-call id longer than 26 characters, or a provider tool-call id or response model longer than 255, is replaced by a deterministic SHA-256 hex digest (cut to that length at most). Valid identities of up to those lengths are unchanged. A tool name longer than 255 characters is not stored or echoed: the call is rejected as an unknown tool (`code="unknown_tool"`) and shown as `<unknown_tool>` in redacted views.
+- **Opaque evidence.** `provider_response` and `reasoning_blocks` are copied as bounded JSON: at most 1 MiB of text, 10,000 nodes, 32 levels and 5,000 keys per object. Past a bound that evidence is dropped (stored as null) instead of failing the run; non-finite numbers become null and objects other than JSON values are never serialised.
+- **Rejected arguments.** If a model's tool arguments cannot be stored (NUL, lone surrogate, non-finite number, oversized structure), the call returns `invalid_params` to the model with empty stored params, and that response's raw artifacts (`raw`, `provider_response`, `reasoning_blocks`) are not stored at all.
+
+Raw provider records in `llm_interactions` and traces can therefore be missing or shortened for oversized or hostile responses. Dendrux never fails a valid answer because of this.
+
+### 26. Large client results and caller cancellation
+
+- **Large structured results are validated off the event loop.** A client result whose payload is above about 64 KiB (an upper UTF-8 estimate; ASCII uses the exact length) is validated in a worker thread before the run is claimed, with at most one such job per event loop at a time; smaller payloads are validated inline. `ToolResult.from_dict` and `list_from_dict` stay **synchronous**, so an async route that parses a large wire object should offload it:
+
+  [//]: # "docs-test: skip - fragment: relies on `data`, `agent` and `run_id`, defined by setup shown elsewhere"
+
+  ```python
+  import asyncio
+
+  result = await asyncio.to_thread(ToolResult.from_dict, data)
+  finished = await agent.submit_tool_results(run_id, [result], tenant_id=tenant_id)
+  ```
+
+  A result you convert with `from_dict` is validated once; `submit_tool_results` re-checks the current identity, metadata, image and size limits and does not parse the payload a second time. A result changed with `dataclasses.replace` is validated again. Do not send the private validation marker over the wire; Dendrux never accepts it from a wire object.
+- **Cancelling a submit caller after the claim.** If the task awaiting `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume` or `resume` is cancelled right after the run was claimed, Dendrux still finalises the run as `cancelled` (fenced by the claim epoch) before it re-raises that `CancelledError`, so the run is never left `running`. `cancel_run` continues to return its typed `CANCELLED` result as in [item 19](#19-in-process-cancellation-returns-a-result).
+
 ## Limits at a glance
 
 Every new bound in 0.5.0, for capacity planning:
@@ -396,6 +425,8 @@ Every new bound in 0.5.0, for capacity planning:
 | `list_runs` offset | 10,000 | `ValueError` |
 | Concurrent `follow` readers | 500 per store, 100 per tenant scope by default | `FollowCapacityError` (`per_tenant=True` for the scope cap) |
 | One `follow` reader | 900 s by default (`max_duration_s`) | `FollowEnd("max_duration", cursor)` |
+| Provider evidence stored per response | 1 MiB of text, 10,000 nodes, 32 levels, 5,000 keys per object; ids 26 / 255 characters, tool names 255 | the evidence is dropped; an id is hashed; a long tool name is rejected as unknown |
+| Structured client result validated inline | up to about 64 KiB; larger is validated in a worker thread, one job per event loop | none (backpressure) |
 | Provider call deadline | 600 s call, 600 s between stream events | `ProviderTimeoutError` |
 | Sync-tool threads | 32 per process, 8 per Agent | calls queue |
 | Tool calls waiting per Agent | 256 (`DENDRUX_TOOL_QUEUE_LIMIT`) | retryable `tool_pool_saturated` result |

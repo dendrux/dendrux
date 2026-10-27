@@ -66,7 +66,7 @@ delete_user actually called?  False
 final answer preview: "I'm unable to delete user 42. The delete_user action has been denied
 by policy, which means I don't have permission to permanently delete..."
 
-run_events:
+run_events (captured on 0.4.1; 0.5.0 adds a tools.declared row after run.started and shifts later seq values by one):
   [lifecycle] seq=0  run.started
   [lifecycle] seq=1  llm.completed       (model emits delete_user(user_id=42))
   [GOV]       seq=2  policy.denied       data={"tool_name": "delete_user", "call_id": "...", "reason": "denied_by_policy"}

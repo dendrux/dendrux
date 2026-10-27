@@ -56,7 +56,7 @@ Four of those, `waiting_client_tool`, `waiting_human_input`, `waiting_approval` 
 
 - `waiting_client_tool`: `agent.submit_tool_results(run_id, [...])`
 - `waiting_human_input`: `agent.submit_input(run_id, "text")`
-- `waiting_approval`: `agent.submit_approval(run_id, approved=True)` (or `decisions={...}` per call)
+- `waiting_approval`: `agent.submit_approval(run_id, approved=True, expected_pause_id=pause_id)` (or `decisions={...}` per call; approving always needs the pause id)
 - `paused`: `agent.submit_resume(run_id)`
 
 The runtime checks the pause type before accepting a submission. Submitting an approval to a run that's waiting for tool results raises `PauseStatusMismatchError`. This isn't pedantry; it catches a whole class of bugs where the wrong submit endpoint fires and silently corrupts the run.

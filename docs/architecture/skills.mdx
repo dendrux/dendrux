@@ -371,7 +371,7 @@ Skills write seven governance events to `run_events`. Their payloads carry names
 
 > These replace the earlier `skill.registered`, `skill.denied` and `skill.invoked` events. If you filter on those names, switch to `skill.catalog_resolved` (which lists denied names), `skill.activated` and `skill.activation_failed`. A query on the `skill.` prefix keeps working.
 
-A run that activates a skill, reads a file and runs a script looks like this in `run_events`:
+A run that activates a skill, reads a file and runs a script looks like this in `run_events`. Captured on 0.4.1. Since 0.5.0 every run segment also records a `tools.declared` event right after `run.started` (and again after `run.resumed`), so every later `seq` below is one higher, and two higher after a resume.
 
 ```text
 seq=0   run.started

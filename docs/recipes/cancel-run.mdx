@@ -70,9 +70,10 @@ STATE AT PAUSE (waiting_approval)
   pause_data: <set>
   run_events:
     seq=0  run.started
-    seq=1  llm.completed
-    seq=2  approval.requested
-    seq=3  run.paused
+    seq=1  tools.declared
+    seq=2  llm.completed
+    seq=3  approval.requested
+    seq=4  run.paused
 
 STATE AFTER CANCEL
   status: cancelled
@@ -80,10 +81,11 @@ STATE AFTER CANCEL
   pause_data: null
   run_events:
     seq=0  run.started
-    seq=1  llm.completed
-    seq=2  approval.requested
-    seq=3  run.paused
-    seq=4  run.cancelled
+    seq=1  tools.declared
+    seq=2  llm.completed
+    seq=3  approval.requested
+    seq=4  run.paused
+    seq=5  run.cancelled
 ```
 
 `pause_data` is cleared on finalize. The cancel event is sequenced after the existing paused event so an SSE client reading by `after_sequence_index` cannot miss it.

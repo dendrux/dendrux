@@ -15,7 +15,7 @@ A minimal application uses these routes (names are your choice):
 | --- | --- |
 | `POST /chat` | `Agent.run(input, tenant_id=tenant)` |
 | `POST /runs/{id}/tool-results` | `Agent.submit_tool_results(id, results, tenant_id=tenant)` |
-| `POST /runs/{id}/approvals` | `Agent.submit_approval(id, approved=decision, tenant_id=tenant)` |
+| `POST /runs/{id}/approvals` | `Agent.submit_approval(id, approved=decision, expected_pause_id=pause_id, tenant_id=tenant)` (the pause id is required when approving) |
 | `GET /runs/{id}/pending` | `RunStore.get_pending(id, tenant_id=tenant)` |
 | Optional `GET /runs/{id}/live` | `RunStore.follow(id, tenant_id=tenant)` |
 

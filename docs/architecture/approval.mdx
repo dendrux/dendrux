@@ -51,24 +51,28 @@ The [Quickstart](/docs/quickstart) already walks through this, with real DB stat
 
 ```
 seq=0  run.started
-seq=1  llm.completed         (model emits refund(order_id=42))
-seq=2  approval.requested    corr=01KPFXPAT8ZF7MNGJNW2Y6S8GZ
-seq=3  run.paused            status=waiting_approval
+seq=1  tools.declared        local_tool_names=["refund"]
+seq=2  llm.completed         (model emits refund(order_id=42))
+seq=3  approval.requested    corr=01KPFXPAT8ZF7MNGJNW2Y6S8GZ
+seq=4  run.paused            status=waiting_approval
          <-- starter process exits here -->
          <-- a later process calls submit_approval(run_id, approved=True, expected_pause_id=...) -->
-seq=4  run.resumed
-seq=5  tool.completed        refund executed, success=True
-seq=6  approval.decided      decision=approved
-seq=7  llm.completed         (model writes the final user-facing answer)
-seq=8  run.completed
+seq=5  run.resumed
+seq=6  tools.declared        local_tool_names=["refund"]
+seq=7  tool.completed        refund executed, success=True
+seq=8  approval.decided      decision=approved
+seq=9  llm.completed         (model writes the final user-facing answer)
+seq=10 run.completed
 ```
+
+Captured on 0.4.1; the two `tools.declared` rows (one after `run.started`, one after `run.resumed`, added by 0.5.0 for every run segment) are inserted by hand and the later numbers shifted.
 
 Five things to notice:
 
-1. The `approval.requested` event (seq=2) and the `tool.completed` event (seq=5) share the same `correlation_id`. That id is the `tool_call.id`, so a reader can join the approval decision to the specific call it authorized.
-2. The pause at seq=3 and the resume at seq=4 are adjacent in the log but written by two different processes. [Event ordering](/docs/architecture/event-ordering) explains why `sequence_index` still runs straight through.
-3. The tool function ran only once, between seq=4 and seq=5, after the approval was in hand. No speculative execution.
-4. `approval.decided` (seq=6) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "...", "decisions": [...]}`, with one entry per pending call (see [What `approval.decided` records](#what-approvaldecided-records)). This row is the audit record of the human's choice.
+1. The `approval.requested` event (seq=3) and the `tool.completed` event (seq=7) share the same `correlation_id`. That id is the `tool_call.id`, so a reader can join the approval decision to the specific call it authorized.
+2. The pause at seq=4 and the resume at seq=5 are adjacent in the log but written by two different processes. [Event ordering](/docs/architecture/event-ordering) explains why `sequence_index` still runs straight through.
+3. The tool function ran only once, between seq=6 and seq=7, after the approval was in hand. No speculative execution.
+4. `approval.decided` (seq=8) carries the decision in its `data` payload: `{"decision": "approved", "run_id": "...", "decisions": [...]}`, with one entry per pending call (see [What `approval.decided` records](#what-approvaldecided-records)). This row is the audit record of the human's choice.
 5. The run finishes as `status=success`. Approval did not need to be terminal.
 
 ## The reject path

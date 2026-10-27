@@ -73,7 +73,7 @@ All built-in patterns run in linear time, so a hostile megabyte of text cannot s
 
 After redaction, `PII(restore=...)` decides which tools get real values back. See [PII restore](/docs/architecture/pii-restore). Entity names are canonical to Presidio's vocabulary so the same names appear regardless of which engine is active.
 
-A real run with the input `"Send the receipt to jane.doe@example.com please."` produced these governance rows, plus the PII mapping:
+A real run with the input `"Send the receipt to jane.doe@example.com please."` produced these governance rows, plus the PII mapping. Captured on 0.4.1. Since 0.5.0 every run segment also records a `tools.declared` event right after `run.started` (and again after `run.resumed`), so every later `seq` below is one higher, and two higher after a resume.
 
 ```text
 status: success
@@ -283,7 +283,7 @@ governance events:
   seq=3  run.error          data={"error": "Guardrail 'SecretDetection' blocked: 1 AWS_ACCESS_KEY at message 1 (role=user)", "status": "error", ...}
 ```
 
-The blocked event, a terminal `run.error` (not `run.completed`, which a blocked run ended with before 0.5.0) and no LLM call. The run row gets the same safe `error` and `failure_reason="guardrail_blocked"`. The message carries the pattern name, a count and a location (message index counting the system prompt as message 0, role, and the tool call id for tool results), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the audit trail.
+The blocked event, a terminal `run.error` (not `run.completed`, which a blocked run ended with before 0.5.0) and no LLM call. The run row gets the same safe `error` and `failure_reason="guardrail_blocked"`. The message carries the pattern name, a count and a location (message index counting the system prompt as message 0, role, and the tool call id for tool results), and never the matched text, so a reader can see which rule fired and where without the secret being copied into the stored events.
 
 [//]: # "VERIFY-0.5.0: T3 owns the exact message wording; replace the example strings with real output (replaced with a captured run in the 0.5.0 docs pass)"
 
@@ -325,7 +325,7 @@ PII(
 )
 ```
 
-Input `"Please look up ticket ACME-4242 for me."`, captured from a real run:
+Input `"Please look up ticket ACME-4242 for me."`, captured from a real run on 0.4.1. Captured on 0.4.1. Since 0.5.0 every run segment also records a `tools.declared` event right after `run.started` (and again after `run.resumed`), so every later `seq` below is one higher, and two higher after a resume.
 
 ```text
 status: success

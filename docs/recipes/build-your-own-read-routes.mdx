@@ -116,18 +116,23 @@ async def live(
     tenant: str = Depends(current_tenant),
 ):
     last = request.headers.get("last-event-id")
-    if last is not None and (not last.isascii() or not last.isdigit() or len(last) > 18):
-        raise HTTPException(400, "invalid Last-Event-ID")
+    if last is not None and (
+        not last.isascii() or not last.isdigit() or len(last) > 10 or int(last) > 2**31 - 1
+    ):
+        raise HTTPException(400, "invalid Last-Event-ID")   # cursors must fit 32 bits
     cursor = int(last) if last is not None else None
     duration = 900
     deadline = asyncio.get_running_loop().time() + duration
-    follow = store.follow(run_id, tenant_id=tenant,
-                          after_sequence_index=cursor, max_duration_s=duration)
+    follow = None
     try:
+        follow = store.follow(run_id, tenant_id=tenant,
+                              after_sequence_index=cursor, max_duration_s=duration)
         await follow.start()
         if follow.drained_terminal:
             await follow.aclose()
             return Response(status_code=204)
+    except ValueError:      # a malformed id or cursor is refused before any slot is taken
+        raise HTTPException(400, "invalid request")
     except RunNotFoundError:
         await follow.aclose()
         raise HTTPException(404, "run not found")
@@ -135,7 +140,8 @@ async def live(
         await follow.aclose()
         raise HTTPException(503, "busy", headers={"Retry-After": "5"})
     except BaseException:
-        await follow.aclose()
+        if follow is not None:
+            await follow.aclose()
         raise
 
     async def frames():
