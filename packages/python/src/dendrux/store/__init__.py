@@ -71,7 +71,9 @@ from dendrux.runtime._pending import (
     _PendingReader,
     check_metadata_filter,
     check_read_bool,
+    check_read_bounded,
     check_read_datetime,
+    check_read_duration,
     check_read_int,
     check_read_names,
     check_read_scope,
@@ -589,8 +591,7 @@ class RunStore:
         )
         check_read_int("limit", limit, wide=True, optional=False)
         check_read_int("offset", offset, wide=True, optional=False)
-        if offset > MAX_LIST_OFFSET:
-            raise ValueError(f"offset must be at most {MAX_LIST_OFFSET}, got {offset}.")
+        check_read_bounded("offset", max(offset, 0), 0, MAX_LIST_OFFSET)  # negatives clamp to 0
         records = await self._state.list_runs(
             limit=limit,
             offset=offset,
@@ -743,6 +744,7 @@ class RunStore:
             _warn_stream_events_unscoped()
             tenant_id = UNSCOPED
         check_read_int("after_sequence_index", after_sequence_index)
+        check_read_duration("poll_interval_s", poll_interval_s, optional=False)
         run = await self._scoped_run(run_id, tenant_id)
         if run is None:
             raise RunNotFoundError(run_id)
@@ -926,8 +928,7 @@ class RunStore:
         With ``include_payloads=False`` past pauses' arguments are hidden and
         ``user_input`` (a person's answer) is None.
         """
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
-            raise ValueError("limit must be an int between 1 and 1000.")
+        check_read_bounded("limit", limit, 1, 1000)
         check_read_bool("include_payloads", include_payloads)
         method = self._state.get_run_events
         kwargs: dict[str, Any] = {}

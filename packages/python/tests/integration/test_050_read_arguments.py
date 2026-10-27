@@ -173,3 +173,28 @@ async def test_valid_edge_values_still_work(engine: Any, paused: str) -> None:
     after = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
     assert len(await store.list_runs(started_after=after)) == 1
     assert await store.count_runs(agent_name="x" * 255) == 0
+
+
+@pytest.mark.parametrize(
+    ("label", "call", "value"),
+    [
+        ("list_runs offset over the cap", lambda s, r: s.list_runs(offset=123_456), "123456"),
+        ("get_pause_page limit too big", lambda s, r: s.get_pause_page(r, limit=98_765), "98765"),
+        ("get_pause_page limit bool", lambda s, r: s.get_pause_page(r, limit=True), "True"),
+        ("get_pauses limit zero", lambda s, r: s.get_pauses(r, limit=0), "got 0"),
+        (
+            "stream_events bad poll interval",
+            lambda s, r: anext(s.stream_events(r, poll_interval_s="77777", tenant_id="A")),
+            "77777",
+        ),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+async def test_bounded_read_arguments_use_the_fixed_message_path(
+    engine: Any, paused: str, label: str, call: Call, value: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = RunStore.from_engine(engine)
+    with caplog.at_level(logging.WARNING), pytest.raises(ValueError) as info:
+        await call(store, paused)
+    assert value not in str(info.value), label
+    assert any(getattr(r, "code", None) == "read_argument_invalid" for r in caplog.records), label

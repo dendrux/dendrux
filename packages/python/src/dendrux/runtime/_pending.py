@@ -252,14 +252,18 @@ def check_read_datetime(argument: str, value: object) -> None:
         raise _invalid(argument, "must be timezone-aware (for example datetime.now(UTC)).")
 
 
-def check_read_duration(argument: str, value: object) -> None:
-    """None, or a finite positive number of seconds."""
-    if value is None:
+def check_read_duration(argument: str, value: object, *, optional: bool = True) -> None:
+    """A finite positive number of seconds (None passes when ``optional``)."""
+    if value is None and optional:
         return
+    if not _positive_seconds(value):
+        raise _invalid(argument, "must be a positive number of seconds.")
+
+
+def _positive_seconds(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise _invalid(argument, "must be a positive number of seconds or None.")
-    if not math.isfinite(value) or value <= 0:
-        raise _invalid(argument, "must be a positive number of seconds or None.")
+        return False
+    return math.isfinite(value) and value > 0
 
 
 UNKNOWN_TOOL_PREFIX = "Unknown tool:"
@@ -315,6 +319,12 @@ def check_read_int(
     low, high = _INT64 if wide else _INT32
     if not low <= value <= high:
         raise _invalid(argument, f"must be between {low} and {high}.")
+
+
+def check_read_bounded(argument: str, value: object, low: int, high: int) -> None:
+    """An int (not bool) between ``low`` and ``high``; the message never echoes it."""
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise _invalid(argument, f"must be an int between {low} and {high}.")
 
 
 def check_read_names(argument: str, values: object, *, allow_str: bool = False) -> None:

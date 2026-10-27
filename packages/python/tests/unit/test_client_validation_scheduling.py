@@ -202,7 +202,10 @@ async def test_cancelled_validation_waits_for_cpu_job_before_releasing_slot(
 
     def work(*args):
         loop.call_soon_threadsafe(entered.set)
-        release.wait()
+        # Bounded: if validation ran on the event loop, this blocks the loop, so
+        # the test must fail after the timeout instead of hanging.
+        if not release.wait(timeout=5):
+            raise AssertionError("validation ran on the event loop, not in a worker")
         if worker_fails:
             raise ValueError("invalid payload")
         return []
@@ -212,7 +215,7 @@ async def test_cancelled_validation_waits_for_cpu_job_before_releasing_slot(
     async with Agent(prompt="p", tools=[read_range]) as agent:
         caller = asyncio.create_task(submit._validate_client_results(agent, "r", [result]))
         try:
-            await entered.wait()
+            await asyncio.wait_for(entered.wait(), timeout=10)
             caller.cancel()
             await asyncio.sleep(0)
             await asyncio.sleep(0)

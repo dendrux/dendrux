@@ -1190,6 +1190,9 @@ _VALIDATION_GATES_LOCK = threading.Lock()
 
 
 def _validation_gate() -> asyncio.Lock:
+    """The per-loop gate for off-loop client-result validation. Its wait queue
+    is bounded by the caller's own concurrency (one waiter per in-flight submit
+    call), so it needs no separate cap."""
     loop = asyncio.get_running_loop()
     with _VALIDATION_GATES_LOCK:
         reference = _VALIDATION_GATES.get(loop)
