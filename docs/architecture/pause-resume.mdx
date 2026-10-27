@@ -143,11 +143,27 @@ This collapses "check the status is something I can finalize, then finalize it" 
 
 ## Pause ids and stale submits
 
-The atomic claim guarantees one winner, but cannot tell whether that caller is
-answering the pause they actually saw. Re-fetch pending state before displaying a
-decision again, and avoid automatically retrying a decision from an old form.
+The atomic claim guarantees one winner, but it cannot tell whether the winner was answering the pause they actually saw. A browser tab left open for an hour can approve a pause that has since been replaced by a newer one on the same run. Since 0.5.0 every pause has a `pause_id` (a ULID) to close that gap.
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
+- The id is stored in the run's pause state and exposed on `RunResult.pause_id`, on `PendingPause.pause_id` (`RunStore.get_pending`), on `PausePair.pause_id` (`RunStore.get_pause_page`) and on the `run.paused` event. Pauses recorded before 0.5.0 have none.
+- Every `submit_*` method, `resume` and `resume_stream` accepts `expected_pause_id=`. If the run's current pause has a different id, nothing is claimed, nothing is written, and the call raises `PauseStatusMismatchError` with `reason="pause_id"` (HTTP 409). The error carries `expected_pause_id` and `current_pause_id`.
+- **Approving requires it.** `submit_approval(approved=True)`, a `decisions=` batch that approves any call, and `resume` of a `waiting_approval` run all raise `InputValidationError` (field `expected_pause_id`, code `pause_id_required`, a `ValueError`) when the token is missing, before anything is claimed. Rejecting (`approved=False`, or only denials) does not need it. Tool results, input answers and plain continues take it as an option; under `Agent(strict_tenancy=True)` leaving it out prints a `FutureWarning`.
+- A token must be a non-empty string of at most 26 characters without NUL or lone surrogates; anything else raises `InputValidationError` and never reaches the database.
+
+```python
+paused = await agent.run("Refund order 42")
+await agent.submit_approval(
+    paused.run_id, approved=True, expected_pause_id=paused.pause_id,
+)
+```
+
+Round-trip the id through your client: send it down with the approval request and send it back with the decision. After a `PauseStatusMismatchError`, fetch the pending pause again with `RunStore.get_pending` and ask the actor again; do not retry the old decision.
+
+Validation (agent name, `pause_id`, call ids) runs before the claim and again inside the claim transaction, and a failure after the claim releases it back to the paused status, so a rejected submit never leaves the run stuck as `running`.
+
+Pause state is versioned (`schema_version`, currently `1`). A reader ignores keys it does not know and defaults ones that are missing, which is what lets 0.4.1 and 0.5 workers share runs during a rolling deploy. Pause state also keeps the generation settings the run used (`model`, `max_tokens`, `temperature`, `thinking`, `effort`) so a resume continues with them; request headers and other provider options are never stored.
+
+[//]: # "VERIFY-0.5.0: pause_id, expected_pause_id, validate-then-claim and the release-on-failure rule are T7 (wave 2); the field names are T0's contract. Recheck everything in this section after T7 merges"
 
 ## Fencing: which worker owns a run
 

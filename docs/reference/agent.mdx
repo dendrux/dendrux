@@ -169,7 +169,7 @@ async def run(
 
 `UserContent` is `str | Sequence[str | Image | ImageRef | ImagePart]`: a plain string as before, or a list of text and images in the order the model should see them. Image problems raise `InvalidImageError`, `ImageLimitError`, `ImageFetchError` or `UnsupportedModalityError` before a run exists. See [Images](/docs/recipes/images).
 
-Start a new run. Returns a [`RunResult`](/docs/reference/run-store#record-types) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries (top-level keys starting with `dendrux.` are reserved and raise `ValueError`; at most `Limits.max_metadata_bytes`); `idempotency_key` requires persistence and is unique per tenant, so two tenants can reuse a key ([Multi-tenancy](/docs/architecture/multi-tenancy#idempotency-keys)). `tenant_id=""` raises `ValueError`. `activate_skills` names skills to deliver in the run's first message instead of waiting for the model to call `use_skill`; unknown or denied names raise `ValueError` before any run is created ([Skills](/docs/architecture/skills#explicit-activate_skills)).
+Start a new run. Returns a [`RunResult`](#runresult) whose `status` is terminal (`success`, `error`, `cancelled`, `max_iterations`) or paused (`waiting_*`). `history` seeds prior conversation turns ([Chatbot threads](/docs/recipes/chatbot-threads)); `metadata` is opaque JSON stored on the run for your queries (top-level keys starting with `dendrux.` are reserved and raise `ValueError`; at most `Limits.max_metadata_bytes`); `idempotency_key` requires persistence and is unique per tenant, so two tenants can reuse a key ([Multi-tenancy](/docs/architecture/multi-tenancy#idempotency-keys)). `tenant_id=""` raises `ValueError`. `activate_skills` names skills to deliver in the run's first message instead of waiting for the model to call `use_skill`; unknown or denied names raise `ValueError` before any run is created ([Skills](/docs/architecture/skills#explicit-activate_skills)).
 
 On success, `RunResult.answer` contains only the final answer turn after tool
 use, not all assistant text produced during the run. `RunResult.commentary` is
@@ -212,6 +212,79 @@ See [Cancellation](/docs/architecture/cancellation#interrupting-run).
 A finished run's `RunResult.meta["undelivered_notes"]` lists inbox note ids it
 never delivered (present only when there are any); see
 [Inbox notes](/docs/architecture/inbox).
+
+## `RunResult`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
+```python
+@dataclass
+class RunResult:
+    run_id: str
+    status: RunStatus
+    answer: str | None
+    output: Any                  # the validated output_type model, when one is configured
+    steps: list[AgentStep]
+    iteration_count: int
+    usage: UsageStats
+    error: str | None
+    meta: dict[str, Any]
+    commentary: list[str]
+    replay: ReplaySummary | None
+    stop_reason: StopReason | None
+    error_info: ErrorInfo | None
+    pause_id: str | None
+    pending: PendingPause | None
+
+    @property
+    def truncated(self) -> bool
+    def to_dict(self) -> dict[str, Any]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `success`, `error`, `cancelled`, `max_iterations`, or a pause status (`waiting_client_tool`, `waiting_human_input`, `waiting_approval`, `paused`). |
+| `answer` | The final answer turn on success. A paused run may carry a clarification question. |
+| `output` | The parsed `output_type` model on a `SingleCall` run; `None` otherwise. |
+| `stop_reason` / `truncated` | Why the call that produced the answer stopped; `truncated` is `True` for `max_tokens`. See [Truncated answers](#truncated-answers). |
+| `error` | A safe one-line description when the run ended `error`. It never carries provider text. |
+| `error_info` | An [`ErrorInfo`](/docs/reference/errors#provider-errors) when a provider or database failure ended the run: `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. Every field is a code, number or name; `None` for other outcomes. |
+| `pause_id` | The id of the current pause of a paused run; pass it back as `expected_pause_id=`. |
+| `pending` | The active pause as a `PendingPause` (the same object `RunStore.get_pending` returns), or `None`. |
+| `meta` | Run metadata such as `meta["undelivered_notes"]`, `meta["interrupted"]` and `meta["mcp_skipped_sources"]`. A fresh result from `run()` includes `meta["pii_mapping"]` (placeholder to real value) when guardrails redacted anything; treat it as sensitive and never return `meta` wholesale. It never contains the internal pause state. |
+
+### `to_dict()`: the browser envelope
+
+`RunResult.to_dict()` is the one result shape meant to leave your server. It is an allowlist, not a serializer of the dataclass, and it carries its own version so the shape does not change with the package version:
+
+| Key | Content |
+| --- | --- |
+| `wire_version` | Integer, currently `1`. Clients should reject a version they do not know and ignore extra keys within a version they do. |
+| `run_id`, `status` | As on the result. |
+| `pending` | The active pause (`kind`, `pause_id`, `pending_tool_calls`, `question`, `options`, `reason`, `message`, `exceeded`), or `None`. A terminal result never shows a stale pause. |
+| `answer` | The answer text, equal to `RunResult.answer` under your configured PII output policy. `None` while the run waits for approval or input. |
+| `output` | The configured `output_type` model as bounded JSON, or `None`. Arbitrary objects are never serialized. |
+| `error_info` | The safe `ErrorInfo` fields, or `None`. |
+
+The PII policy matches the in-process one:
+
+- **Client-tool arguments** hold real values only where the PII restore policy would restore them for a server tool: always with `restore="all"` (the default), and only for the tools listed with `receives_pii` under `restore="allowlisted"`. Other tools show placeholders. Client arguments can still be sensitive, so authorize the actor as well as the tenant and run before you send them.
+- **Approval and input prompts and arguments** are placeholders, taken from the model-sent form that `RunStore.get_pending` returns. If the verified arguments are not available, or the display would exceed its bounds, `params` is `None` and `args_hidden` is `True`: resolve that pause on the server and never approve an empty object.
+- **Never included:** `pii_mapping`, the internal origin map, prompts, steps, traces, `meta`, tool payloads, provider bodies and image bytes.
+
+> **Display limit.** When a user's input holds a very large number of PII values (around a thousand), a large approval argument can be hidden on the wire. This fails closed: the approver sees `args_hidden=True` and "arguments hidden; resolve on the server", the pause keeps its id and call ids, and the server-side `get_pending` view is still available for a fuller review.
+
+The matching inbound parsers are `ToolResult.from_dict(data, limits=None)` and `ToolResult.list_from_dict(items, limits=None, max_results=1000)`. They accept only `name`, `call_id`, `payload`, `success`, `error`, `duration_ms` and `images` (image references, never bytes), require finite JSON or bounded plain text, replace an oversized payload with the `size_limit` failure, reject duplicate call ids, and hold the whole batch to `Limits.max_input_bytes`. They do not replace your HTTP body limit or the call-id checks that `submit_tool_results` runs. A browser's tool result is an assertion by the client, not proof the tool ran.
+
+### `get_result`
+
+[//]: # "docs-test: skip - API signature listing, not runnable code"
+
+```python
+async def get_result(run_id: str, *, tenant_id: str | None, include_pii: bool = False) -> RunResult
+```
+
+Rebuilds the `RunResult` of a stored run for a route that did not hold the original object: a reload, a reconnect, or a different worker. `tenant_id` is required and keyword-only (`None` means untenanted runs); `UNSCOPED` is refused. A missing run, a foreign run and a run of another agent all raise the same `RunNotFoundError`, and a malformed id or tenant raises `ValueError` before any query. `pending` and `pause_id` are filled for a paused run, `answer` is restored with the run's PII mapping exactly as `run()` returned it, and `output` is rebuilt when an `output_type` is configured. `meta["pii_mapping"]` is **not** included unless you pass `include_pii=True` (a trusted, server-side caller). It checks tenant scope, not the actor: authorize the actor separately.
 
 ## `stream`
 
@@ -312,10 +385,12 @@ The submit family resumes a paused run. Each one matches a pause status (see [Pa
 async def submit_tool_results(
     run_id: str, results: list[ToolResult], *, notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED, unless strict_tenancy
+    expected_pause_id: str | None = None,
 ) -> RunResult
 async def submit_input(
     run_id: str, text: UserContent, *, notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED, unless strict_tenancy
+    expected_pause_id: str | None = None,
 ) -> RunResult
 async def submit_approval(
     run_id: str,
@@ -325,25 +400,30 @@ async def submit_approval(
     rejection_reason: str | None = None,
     notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED, unless strict_tenancy
+    expected_pause_id: str | None = None,   # required when approving
 ) -> RunResult
 async def submit_resume(
     run_id: str, *, notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED, unless strict_tenancy
+    expected_pause_id: str | None = None,
 ) -> RunResult
 async def resume(
     run_id: str, *, tool_results=None, user_input=None, notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED, unless strict_tenancy
+    expected_pause_id: str | None = None,   # required when approving
 ) -> RunResult
 ```
 
 Every method takes a keyword-only `tenant_id=`, like `cancel_run` and `submit_note`. Pass the tenant your request is authenticated for. The run must belong to exactly that tenant (`None` matches untenanted runs only), otherwise `RunNotFoundError` is raised, the same error as a missing run, so existence never leaks across tenants. The check runs before anything is written: no tool results, input, approval decisions, claim, status change or event. Omit it (or pass `UNSCOPED`) to skip the check; with `Agent(strict_tenancy=True)` omitting it raises `TenantScopeRequiredError`. See [Multi-tenancy](/docs/architecture/multi-tenancy).
 
-[//]: # "VERIFY-0.5.0: Confirm expected_pause_id support and pause-ID round-tripping before documenting submit protection."
+Each method also takes `expected_pause_id=`: the `pause_id` of the pause the caller was shown (`RunResult.pause_id`, `PendingPause.pause_id` or the `run.paused` event). If the run's current pause has a different id, the call raises `PauseStatusMismatchError` (`reason="pause_id"`) and writes nothing, which stops a stale client from answering a newer pause. **Approving requires it**: `approved=True`, a `decisions=` batch that approves any call, and `resume` of an approval pause raise `InputValidationError` (a `ValueError`, code `pause_id_required`) without it. For tool results, input and plain continues it is optional, and under `strict_tenancy=True` omitting it prints a `FutureWarning`. Control flags such as `approved` and `cascade` must be real `bool` values; `"false"` or `1` raises `ValueError`. See [Pause ids and stale submits](/docs/architecture/pause-resume#pause-ids-and-stale-submits).
 
 [//]: # "docs-test: skip - fragment: relies on `agent`, defined by setup shown elsewhere"
 
 ```python
-await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
+await agent.submit_tool_results(
+    run_id, results, tenant_id=current_tenant, expected_pause_id=pause_id,
+)
 ```
 
 | Method | Resumes | Raises |
@@ -360,6 +440,8 @@ await agent.submit_tool_results(run_id, results, tenant_id=current_tenant)
 
 If the run was created with skills, these methods first compare them with the skills on this agent and raise `SkillMissingError` or `SkillMismatchError` (leaving the run paused) when they differ; `resume_stream` ends with a `RUN_ERROR` instead. See [Resume contract](/docs/architecture/skills#resume-contract).
 
+Client results are checked before the run is claimed. Each result must name a pending call (matching id **and** tool name), the batch must cover every pending call once, payloads must be finite JSON or plain text within `Limits.max_tool_result_bytes`, and text must not contain NUL or lone surrogates. A bad submission raises `InvalidToolResultError` (or `InputValidationError` for an unpersistable value) and leaves the run paused and unclaimed. `tool_result_transform` runs on client results as well as server results. Passing `tool_results` to `resume` for an approval pause is a denial path: each result must be a failed result, and Dendrux replaces its text with its own denial wording so a client can never record a success for a call that did not run.
+
 Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMismatchError`, `RunAlreadyClaimedError`, `RunAlreadyTerminalError`, `PersistenceNotConfiguredError`. See [Errors](/docs/reference/errors).
 
 ## `resume_stream`
@@ -370,10 +452,11 @@ Shared resume errors: `RunNotFoundError`, `RunNotPausedError`, `PauseStatusMisma
 def resume_stream(
     run_id: str, *, tool_results=None, user_input=None, notifier=None,
     tenant_id: TenantScope = ...,    # omitted = UNSCOPED, unless strict_tenancy
+    expected_pause_id: str | None = None,
 ) -> RunStream
 ```
 
-Streaming variant of resume: returns a `RunStream` for the resumed run. Image errors in the submitted `tool_results[i].images` or `user_input` are raised from the first iteration, leaving the run paused.
+Streaming variant of resume: returns a `RunStream` for the resumed run. Image errors in the submitted `tool_results[i].images` or `user_input` are raised from the first iteration, leaving the run paused. A rejected client result ends the attempt with a `RUN_ERROR` event whose `run_result.meta["error_type"]` is `InvalidToolResultError`; the durable run stays waiting with its pause id, so the client can correct the submission and resubmit. Do not read that event as the run having ended.
 
 `tenant_id=` works as for the other methods, with one difference in how it fails. Without it, setup failures such as a missing run come back as a `RUN_ERROR` event. With it, a run outside the tenant raises `RunNotFoundError` from the first iteration, before any event, and a store error from the tenant check (a database outage, say) is raised the same way instead of becoming `RUN_ERROR`. The run is left untouched. Catch the exception around the `async for`. If the agent has no persistence, the check is skipped and the usual "requires persistence" `RUN_ERROR` follows.
 
@@ -390,7 +473,7 @@ async def cancel_run(
 ) -> RunResult
 ```
 
-Request cancellation. Works for paused runs (atomic CAS to `cancelled`, including `paused`), running runs (cooperative flag), batch `run()` calls and streamed runs this instance owns (in-process interrupt: the in-flight model call or tool is abandoned; `run()` returns `CANCELLED` with `meta["interrupted"]`, a stream ends with `RUN_CANCELLED` carrying the partial `answer`), and terminal runs (no-op, never raises). Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped".
+Request cancellation. Works for paused runs (atomic CAS to `cancelled`, including `paused`), running runs (cooperative flag), batch `run()` calls and streamed runs this instance owns (in-process interrupt: the in-flight model call or tool is abandoned; `run()` returns `CANCELLED` with `meta["interrupted"]`, a stream ends with `RUN_CANCELLED` carrying the partial `answer`), and terminal runs (no-op, never raises). Since 0.5.0 the same in-process interrupt also applies to a run that a `submit_*` or `resume` call is executing: that call returns a `CANCELLED` `RunResult` instead of raising `CancelledError`. Cancelling the task that is awaiting the call still raises. When the durable `cancelled` status could not be confirmed, `meta["dendrux.cancel_persisted"]` is `False`; check it before treating the cancellation as saved. Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped".
 
 `cascade=True` also cancels every non-terminal descendant, deepest first and `run_id` last, over a point-in-time snapshot; per-run outcomes are in `meta["cascade"]`. `tenant_id=` requires the run to belong to exactly that tenant (`None` = untenanted) or `RunNotFoundError` is raised, and limits the cascade to the same tenant. A cancel that arrives after the run's last checkpoint does not stop a run that then completes successfully. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
 
