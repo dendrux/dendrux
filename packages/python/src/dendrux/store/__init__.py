@@ -1351,7 +1351,7 @@ def _tool_to_public(record: Any) -> ToolInvocation:
 def _derive_pauses(events: list[Any]) -> list[PausePair]:
     """Pair ``run.paused`` with the nearest following ``run.resumed``.
 
-    Known limitation (hardening H-007): pairing is order-based, not
+    Pairing limitation: pairing is order-based, not
     correlation-id-based. An id-based fix will upgrade this function once
     correlation IDs are added to the pause/resume pair.
     """

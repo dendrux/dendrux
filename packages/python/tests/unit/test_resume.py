@@ -592,7 +592,7 @@ class TestResumeWithInput:
 
 
 class TestAgentIdentityOnResume:
-    """H-003: resume must verify agent_name matches the paused run."""
+    """resume must verify agent_name matches the paused run."""
 
     async def test_mismatched_agent_name_raises(self) -> None:
         """Resume with a different agent name fails closed."""

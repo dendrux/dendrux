@@ -1,9 +1,8 @@
 """0.5.0 B7: tool argument validation, lax coercion and normalised arguments.
 
-Covers D-049 (typed parameters coerced), D-050 (constraints enforced, Optional
-without default), D-073 (validation before hooks and approval), D-099
-(``*args`` / ``**kwargs`` excluded), the loop half of D-021 (``max_calls``
-before approval) and the order of operations in spec §5.4.
+Covers typed parameters coerced, constraints enforced, Optional
+without default, validation before hooks and approval, variadics excluded,
+``max_calls`` before approval, and the order of operations.
 """
 
 from __future__ import annotations
@@ -292,7 +291,7 @@ class TestSchema:
 
 
 # ------------------------------------------------------------------
-# Coercion (D-049) and validation (D-050)
+# Coercion and validation
 # ------------------------------------------------------------------
 
 
@@ -859,7 +858,7 @@ class TestFixRound:
 
 
 # ------------------------------------------------------------------
-# Fix round 2: the approval view is the model-sent arguments, verbatim
+# the approval view is the model-sent arguments, verbatim
 # ------------------------------------------------------------------
 
 

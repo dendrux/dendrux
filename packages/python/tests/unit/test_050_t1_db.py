@@ -1,4 +1,4 @@
-"""0.5.0 T1: schema — the R1 model indexes, SQLite sync of expression/partial
+"""0.5.0: schema — the R1 model indexes, SQLite sync of expression/partial
 indexes and the legacy UNIQUE, the Postgres index check and ``dendrux db check``.
 
 Postgres-only behaviour (``pg_indexes``, the migration itself) is covered in

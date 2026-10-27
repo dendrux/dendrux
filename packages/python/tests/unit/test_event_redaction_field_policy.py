@@ -1,4 +1,4 @@
-"""Redacted views are a field-level allowlist (round 2).
+"""Redacted views are a field-level allowlist.
 
 - Provider-reported text (``llm.completed.model``, ``error_info.model`` /
   ``provider_code`` / ``safe_message``, ``image.rejected.model``) and text

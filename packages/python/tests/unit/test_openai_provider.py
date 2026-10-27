@@ -398,7 +398,7 @@ class TestEdgeCases:
         assert tc.name == "broken"
         assert tc.params == {}
         assert tc.raw_arguments == '{"a": 1, "b":'
-        assert tc.parse_error == "Expecting value at char 13"
+        assert tc.parse_error == "arguments must be valid JSON"
         assert tc.provider_tool_call_id == "call_1"
 
     def test_duplicate_call_id_raises(self, provider: OpenAIProvider) -> None:

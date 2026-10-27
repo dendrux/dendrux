@@ -1,4 +1,4 @@
-"""``tenant_id=`` on the run-control write methods (0.4.1, Oreo #31).
+"""``tenant_id=`` on the run-control write methods.
 
 ``submit_tool_results``, ``submit_input``, ``submit_approval``,
 ``submit_resume``, ``resume`` and ``resume_stream`` take the same optional

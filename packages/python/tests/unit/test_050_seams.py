@@ -192,6 +192,8 @@ class TestRunnerEntrySeam:
             ]
             assert runner_calls[0][4] == {
                 "user_input": "hi",
+                "history": None,
+                "context": None,
                 "provider_kwargs": {},
                 "idempotency_key": None,
                 "provider": agent.provider,
@@ -207,6 +209,8 @@ class TestRunnerEntrySeam:
             ]
             assert runner_calls[0][4] == {
                 "user_input": "again",
+                "history": None,
+                "context": None,
                 "provider_kwargs": {},
                 "idempotency_key": None,
                 "provider": agent.provider,

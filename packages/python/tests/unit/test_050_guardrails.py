@@ -1,4 +1,4 @@
-"""0.5.0 T3: guardrail hardening (scan limits, detector quality, safe errors, PII restore)."""
+"""0.5.0: guardrail hardening (scan limits, detector quality, safe errors, PII restore)."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def _nested(value: object, depth: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# D-030: no matched text in block errors
+# no matched text in block errors
 # ---------------------------------------------------------------------------
 
 
@@ -111,7 +111,7 @@ class TestBlockMessagesCarryNoMatchedText:
 
 
 # ---------------------------------------------------------------------------
-# D-027: scan limits fail closed
+# scan limits fail closed
 # ---------------------------------------------------------------------------
 
 
@@ -198,7 +198,7 @@ class TestUnscannableFailsClosed:
 
 
 # ---------------------------------------------------------------------------
-# D-029: PII restore
+# PII restore
 # ---------------------------------------------------------------------------
 
 
@@ -602,7 +602,7 @@ class TestRestoreNotice:
 
 
 # ---------------------------------------------------------------------------
-# D-029 end to end: an indirect-injection attempt through the ReAct loop
+#  end to end: an indirect-injection attempt through the ReAct loop
 # ---------------------------------------------------------------------------
 
 _received: list[str] = []

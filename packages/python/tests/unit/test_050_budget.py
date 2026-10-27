@@ -1,4 +1,4 @@
-"""0.5.0 T3: budget configuration (B4), cache-token budgets (B17) and unpriced calls."""
+"""0.5.0: budget configuration (B4), cache-token budgets (B17) and unpriced calls."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""0.5.0 T1: store resolution (B6 deprecation) and DB-URL masking in ``db/session.py``.
+"""0.5.0: store resolution (B6 deprecation) and DB-URL masking in ``db/session.py``.
 
 The Postgres event-loop guard is tested in
 ``tests/integration/test_050_t1_r1_migration.py``.

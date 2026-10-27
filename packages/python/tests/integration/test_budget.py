@@ -1,4 +1,4 @@
-"""Dollar/token budget with child roll-up and hard actions (0.3.0 Track F).
+"""Dollar/token budget with child roll-up and hard actions.
 
 SQLite + Postgres via the ``store`` matrix fixture. Covers: pause/cancel at
 the next top-of-iteration checkpoint, both limits independently, the
@@ -846,7 +846,7 @@ class TestBudgetResumeGate:
 
 
 def _track_e_store(inner: Any) -> Any:
-    """A store with Track E's atomic signatures (no total_usage / failure_reason)."""
+    """A store with the atomic store signatures (no total_usage / failure_reason)."""
 
     class TrackEStore:
         def __getattr__(self, name: str) -> Any:

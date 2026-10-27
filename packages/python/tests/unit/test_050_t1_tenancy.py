@@ -1,7 +1,7 @@
-"""0.5.0 T1: entry-point tenancy and run-metadata checks (``runtime/_tenant_checks.py``).
+"""0.5.0: entry-point tenancy and run-metadata checks (``runtime/_tenant_checks.py``).
 
-Strict tenancy (D-005), ``tenant_id=""`` rejection, reserved ``dendrux.``
-metadata keys (B8, D-060) and the metadata size cap, on every entry point,
+Strict tenancy, ``tenant_id=""`` rejection, reserved ``dendrux.``
+metadata keys (B8) and the metadata size cap, on every entry point,
 before any I/O. Delegated children inherit the parent's tenant and never
 raise under strict tenancy.
 """

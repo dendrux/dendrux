@@ -37,9 +37,8 @@ def parse_tool_json(raw_json: str | dict[str, Any]) -> tuple[dict[str, Any], str
     """Parse a tool call's arguments into ``(params, parse_error)``.
 
     Never raises. On failure ``params`` is ``{}`` and ``parse_error`` is a
-    short, model-readable description built from the decoder error (for
-    example ``"Expecting ',' delimiter at char 1234"``); it never contains
-    the raw text. Empty or whitespace-only input and JSON ``null`` (sent by
+    fixed, model-readable rejection that never contains the raw text.
+    Empty or whitespace-only input and JSON ``null`` (sent by
     some backends for argument-less calls) are ``{}`` with no error.
 
     Accepts an already-parsed dict as-is: some OpenAI-compatible backends
@@ -52,8 +51,8 @@ def parse_tool_json(raw_json: str | dict[str, Any]) -> tuple[dict[str, Any], str
         return {}, None
     try:
         params = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        return {}, f"{exc.msg} at char {exc.pos}"
+    except (ValueError, RecursionError):
+        return {}, "arguments must be valid JSON"
     if params is None:
         return {}, None
     if not isinstance(params, dict):

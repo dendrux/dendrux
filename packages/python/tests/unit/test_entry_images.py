@@ -1,4 +1,4 @@
-"""Track D2: image input at the runtime entry points (run/stream/submit/resume/retry).
+"""image input at the runtime entry points (run/stream/submit/resume/retry).
 
 The blob catalog, resolver and loop image pipeline belong to other tracks; these
 tests use small fakes for them (``ImageStore`` = the real SQLAlchemy store plus an
@@ -1827,7 +1827,7 @@ class TestResumeStreamValidatesFirst:
                 ToolResult("take_screenshot", "wrong", '"x"', images=(Image.from_bytes(PNG),))
             ],
         )
-        with pytest.raises(ValueError, match="call_ids"):
+        with pytest.raises(ValueError, match="call ids"):
             async for _ in stream:
                 pass
         assert store.rows == {}

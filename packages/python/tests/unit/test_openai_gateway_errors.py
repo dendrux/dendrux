@@ -1,4 +1,4 @@
-"""Gateway bug fixes on the OpenAI-compatible path (Dendrux 0.3.0 Track C).
+"""Gateway bug fixes on the OpenAI-compatible path.
 
 B1  a stream 400 is only "streaming rejected" when it says so
 B2  streamed tool calls survive a stream that never sends finish_reason
@@ -235,7 +235,7 @@ class TestContextLengthStream:
 
 
 class TestFalsePositiveVetoes:
-    """Codex review P1-1: explicit non-context signals beat the message patterns."""
+    """Codex explicit non-context signals beat the message patterns."""
 
     @pytest.mark.parametrize(
         "name", ["review_rate_limit_413", "review_permission_403", "review_output_cap_400"]

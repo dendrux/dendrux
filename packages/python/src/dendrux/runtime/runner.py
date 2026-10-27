@@ -1522,6 +1522,8 @@ async def run(
             tenant_id=tenant_id,
             metadata=metadata,
             user_input=user_input,
+            history=history,
+            context=context,
             provider_kwargs=kwargs,
             idempotency_key=idempotency_key,
             provider=provider,
@@ -1705,7 +1707,7 @@ async def run(
                     owned = True
 
                     # The run is durable: from here cancel_run in this process
-                    # interrupts this task (E-P0-4).
+                    # interrupts this task.
                     if task_manager is not None:
                         task_manager.register_current(run_id)
                         registered = True
@@ -2389,6 +2391,8 @@ async def retry(
         "retry",
         tenant_id=tenant_id,
         metadata=metadata,
+        history=kwargs.get("history"),
+        context=kwargs.get("context"),
         provider_kwargs=kwargs,
         provider=provider,
     )
@@ -2894,6 +2898,8 @@ def run_stream(
                 tenant_id=entry_tenant,
                 metadata=metadata,
                 user_input=entry_user_input,
+                history=history,
+                context=context,
                 provider_kwargs=provider_kwargs,
                 idempotency_key=idempotency_key,
                 provider=provider,
@@ -3253,6 +3259,12 @@ def run_stream(
                         _track_partial_text(_shared, event)
                         yield event
 
+        except RunFencedError:
+            assert store is not None
+            result = await _build_cached_result(store, run_id)
+            await _finish_fenced_lifecycle(run_id, result, recorder, extra_notifier)
+            yield _fenced_stream_event(run_id, result)
+
         except Exception as exc:
             # Persist error, yield RUN_ERROR, return cleanly. No re-raise.
             # Covers both setup failures and loop execution errors.
@@ -3584,8 +3596,13 @@ async def _prepare_resume(
         history.append(Message(role=Role.USER, content=user_input))
 
     # 4. Create recorder with correct trace offset
-    traces = await state_store.get_traces(run_id)
-    trace_order_offset = max((t.order_index for t in traces), default=-1) + 1
+    next_index = getattr(state_store, "get_next_trace_index", None)
+    if next_index is not None:
+        trace_order_offset = await next_index(run_id)
+    else:
+        # Compatibility for custom stores predating the scalar index read.
+        traces = await state_store.get_traces(run_id)
+        trace_order_offset = max((t.order_index for t in traces), default=-1) + 1
 
     target_lookup = {}
     for fn in agent.tools:
@@ -3698,7 +3715,7 @@ async def _resume_pause_barrier(state_store: StateStore, run_id: str) -> RunStat
 
 
 async def _resume_barrier(state_store: StateStore | None, run_id: str) -> RunStatus | None:
-    """Cancel-then-pause check before an approved side effect (E-P0-3).
+    """Cancel-then-pause check before an approved side effect.
 
     Runs after a resume claim, before each approved/held server call.
     Cancellation wins over pause.
@@ -4311,6 +4328,20 @@ async def ingest_submitted_user_parts(
     }
 
 
+def _fenced_stream_event(run_id: str, result: RunResult) -> RunEvent:
+    from dendrux.types import RunEvent, RunEventType
+
+    return RunEvent(
+        type={
+            RunStatus.ERROR: RunEventType.RUN_ERROR,
+            RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
+        }.get(result.status, RunEventType.RUN_COMPLETED),
+        run_id=run_id,
+        run_result=result,
+        error=result.error if result.status == RunStatus.ERROR else None,
+    )
+
+
 async def _finish_fenced_lifecycle(
     run_id: str,
     result: RunResult,
@@ -4509,7 +4540,7 @@ async def _resume_core(
         # 1a. Load pii_mapping for guardrail continuity across pause/resume
         _saved_pii_mapping = await state_store.get_pii_mapping(run_id)
 
-        # 1b. Verify agent identity — fail closed on mismatch (H-003)
+        # 1b. Verify agent identity — fail closed on mismatch
         if pause_state.agent_name and pause_state.agent_name != agent.name:
             raise ValueError(
                 f"Agent name mismatch: run '{run_id}' was paused by "
@@ -4875,6 +4906,7 @@ def resume_stream(
         stream_results = tool_results
         user_parts: tuple[ContentPart, ...] | None = None
 
+        results_prepared = False
         if image_input:
             # Image setup raises (the run stays waiting; no RUN_ERROR event).
             if store is None and state_store_resolver is not None:
@@ -4883,13 +4915,25 @@ def resume_stream(
                 from dendrux.errors import PersistenceNotConfiguredError
 
                 raise PersistenceNotConfiguredError()
+            raw = await store.get_pause_state(run_id)
+            if raw is None:
+                raise ValueError("Run has no pause state")
+            media_pause = PauseState.from_dict(raw)
+            if media_pause.agent_name and media_pause.agent_name != agent.name:
+                raise ValueError("Agent name mismatch on resume")
+            if stream_results is not None:
+                validate_result_names(run_id, media_pause, stream_results, json_payload=False)
+                stream_results = await prepare_resume_results(
+                    agent, store, run_id, media_pause, stream_results
+                )
+                results_prepared = True
             stream_results, user_parts = await _ingest_resume_images(
                 agent,
                 provider,
                 store,
                 run_id,
                 loop=None,
-                tool_results=tool_results,
+                tool_results=stream_results,
                 input_items=input_items,
                 loop_method="run_stream",
             )
@@ -4925,9 +4969,10 @@ def resume_stream(
 
             if stream_results is not None:
                 validate_result_names(run_id, pause_state, stream_results, json_payload=False)
-                stream_results = await prepare_resume_results(
-                    agent, store, run_id, pause_state, stream_results
-                )
+                if not results_prepared:
+                    stream_results = await prepare_resume_results(
+                        agent, store, run_id, pause_state, stream_results
+                    )
 
             # 4. Determine expected status and claim
             if stream_results is not None:
@@ -5174,6 +5219,16 @@ def resume_stream(
                     else:
                         _track_partial_text(_shared, event)
                         yield event
+
+        except RunFencedError:
+            store = _shared["state_store"]
+            result = await _build_cached_result(store, run_id)
+            fenced_ctx = _shared.get("ctx")
+            if fenced_ctx is not None:
+                await _finish_fenced_lifecycle(
+                    run_id, result, fenced_ctx.recorder, fenced_ctx.notifier
+                )
+            yield _fenced_stream_event(run_id, result)
 
         except Exception as exc:
             store = _shared.get("state_store")

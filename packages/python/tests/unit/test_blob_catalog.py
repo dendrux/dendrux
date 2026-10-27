@@ -1,4 +1,4 @@
-"""Track B unit tests: in-memory blob catalog, resolver, accessor, recorder shapes.
+"""in-memory blob catalog, resolver, accessor, recorder shapes.
 
 The SQL catalog and the fault/race matrix live in
 ``tests/integration/test_image_persistence.py`` and

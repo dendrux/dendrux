@@ -1,4 +1,4 @@
-"""0.5.0 D-048: bounded sync-tool execution.
+"""0.5.0 bounded sync-tool execution.
 
 One process-wide pool of daemon threads, a per-Agent limiter
 (``Agent(tool_threads=)``), ``timeout_not_started`` vs

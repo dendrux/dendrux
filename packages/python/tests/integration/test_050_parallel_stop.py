@@ -1,6 +1,6 @@
-"""D-014 on a real store: a run-ending failure in a parallel batch stops siblings.
+"""on a real store: a run-ending failure in a parallel batch stops siblings.
 
-The audit repro (``d014_parallel_gather_orphan_tools.py``): a tool-call row
+The parallel execution scenario (parallel tool execution): a tool-call row
 write fails for one call while its sibling is still running. Before 0.5 the
 sibling kept running, applied its side effect and wrote its row after
 ``run()`` had already raised.

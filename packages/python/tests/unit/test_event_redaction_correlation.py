@@ -1,4 +1,4 @@
-"""Call ids and image tool names keep their provenance (round 4).
+"""Call ids and image tool names keep their provenance.
 
 Threat model: custom providers, strategies, tools, hooks and MCP servers are
 untrusted text sources for redacted readers.
@@ -139,7 +139,7 @@ async def test_image_verdict_tool_name_checked_against_recorded_calls(stores: An
         {"sha256": "ab" * 32, "action": "block", "tool_name": "screenshot"},
         {"sha256": "cd" * 32, "action": "block", "tool_name": SECRET},
     ]
-    # Positive evidence that "screenshot" is a declared, non-MCP tool (round 6).
+    # Positive evidence that "screenshot" is a declared, non-MCP tool.
     await state.save_run_event(
         "r1", event_type="tools.declared", data={"local_tool_names": ["screenshot", SECRET]}
     )

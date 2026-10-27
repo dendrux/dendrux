@@ -1,8 +1,8 @@
 """0.5.0 T1 real-concurrency tests (spec §1a), on the backend matrix.
 
 N parallel callers per test, asserting exactly one winner, no lost updates and
-no orphan rows, for: tenant-scoped idempotency (D-001), store-side event index
-allocation (D-011) and the note cap. On Postgres the callers really run in
+no orphan rows, for: tenant-scoped idempotency, store-side event index
+allocation and the note cap. On Postgres the callers really run in
 parallel (separate pooled connections); on SQLite they serialize on the
 database lock. Also checks, on Postgres, that the hot queries can use their
 indexes (``EXPLAIN`` with sequential scans disabled).

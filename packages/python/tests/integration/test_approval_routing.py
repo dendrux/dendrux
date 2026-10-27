@@ -626,7 +626,7 @@ class TestRejectionViaResumeStream:
 
 class TestStalePauseGeneration:
     async def test_decisions_for_replaced_pause_fail_before_claim(self, store) -> None:
-        """ABA: the pause is replaced between validation and claim (review P1)."""
+        """ABA: the pause is replaced between validation and claim."""
         import copy
 
         llm = MockLLM(

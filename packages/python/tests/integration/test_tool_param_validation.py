@@ -100,7 +100,7 @@ def _decoder_error(raw: str) -> str:
     raise AssertionError(f"expected invalid JSON: {raw!r}")
 
 
-BAD_REFUND_ERROR = _decoder_error(BAD_REFUND_ARGS)
+BAD_REFUND_ERROR = "arguments must be valid JSON"
 
 
 def _bad_refund() -> ToolCall:

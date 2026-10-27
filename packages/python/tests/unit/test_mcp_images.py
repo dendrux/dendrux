@@ -1,4 +1,4 @@
-"""Track D1: MCP image content as parts (§5.3, §5.16, N-11, P1-8)."""
+"""MCP image content as parts (§5.3, §5.16, N-11, P1-8)."""
 
 from __future__ import annotations
 

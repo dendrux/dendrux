@@ -6,7 +6,7 @@
 - Hook-written reasons, unknown skill names, a pause's message, MCP-server
   tool names that were skipped and vendor header text are hidden.
 - Malformed stored shapes (a dict reason, a dict status) never crash a reader.
-- Every event type Dendrux writes is listed in the redaction review registry.
+- Every event type Dendrux writes is listed in the redaction event registry.
 """
 
 from __future__ import annotations

@@ -270,7 +270,7 @@ class TestNormalizeResponse:
         tc = result.tool_calls[0]
         assert tc.params == {}
         assert tc.raw_arguments == '{"bad":'
-        assert tc.parse_error == "Expecting value at char 7"
+        assert tc.parse_error == "arguments must be valid JSON"
 
     def test_empty_arguments(self, provider: OpenAIResponsesProvider) -> None:
         response = FakeResponse(
@@ -848,10 +848,7 @@ class TestCompleteStream:
         end = next(e for e in events if e.type == StreamEventType.TOOL_USE_END)
         assert end.tool_call.params == {}
         assert end.tool_call.raw_arguments == "{bad json"
-        assert (
-            end.tool_call.parse_error
-            == "Expecting property name enclosed in double quotes at char 1"
-        )
+        assert end.tool_call.parse_error == "arguments must be valid JSON"
 
     async def test_stream_provider_response_populated(
         self, provider: OpenAIResponsesProvider

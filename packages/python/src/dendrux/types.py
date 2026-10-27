@@ -860,6 +860,8 @@ class Budget:
         max_cost_usd: Dollar limit (> 0), or None.
         on_exceed: ``"warn"``, ``"pause"`` or ``"cancel"``.
         include_children: Count delegated descendant runs' usage.
+        max_subtree_nodes: Root-inclusive accounting cap (default 10,000).
+            Larger trees raise BudgetConfigurationError instead of using partial usage.
         count_cache_tokens: Count cache read and write tokens toward
             ``max_tokens``. ``None`` (default) means not chosen.
 
@@ -874,8 +876,15 @@ class Budget:
     on_exceed: BudgetAction = "warn"
     include_children: bool = True
     count_cache_tokens: bool | None = None
+    max_subtree_nodes: int = 10000
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_subtree_nodes, bool)
+            or not isinstance(self.max_subtree_nodes, int)
+            or self.max_subtree_nodes < 1
+        ):
+            raise ValueError("Budget max_subtree_nodes must be a positive integer.")
         if self.max_tokens is None and self.max_cost_usd is None:
             raise ValueError("Budget needs max_tokens and/or max_cost_usd.")
         if self.max_tokens is not None and (

@@ -1,4 +1,4 @@
-"""Contention between run owners, finalizers and the sweeper (Track E fix round).
+"""Contention between run owners, finalizers and the sweeper.
 
 Deterministic hook tests, run on ``sqlite_file`` and Postgres (independent
 connections). Covers:

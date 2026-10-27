@@ -1,4 +1,4 @@
-"""Image-request error classification, locating and exception hygiene (0.4.0 Track C).
+"""Image-request error classification, locating and exception hygiene.
 
 Spec §5.5 (hygiene), §5.6 (IMAGE_UNSUPPORTED), §5.7 (IMAGE_REJECTED + locating).
 Recorded-style vendor bodies are served through fake httpx transports and the

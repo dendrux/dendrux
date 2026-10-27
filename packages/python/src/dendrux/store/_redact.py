@@ -33,9 +33,9 @@ from dendrux.media._policy import Origin as ImageOrigin
 from dendrux.pricing import CostSource
 from dendrux.runtime._limit_checks import INPUT_SIZE_LIMIT_CODE
 from dendrux.runtime._pending import (
-    approval_calls,
     check_read_bool,
     declared_tool_names,
+    pause_display_calls,
     pause_window_start,
     unknown_tool_calls,
 )
@@ -69,7 +69,7 @@ UNKNOWN_SKILL = "<unknown_skill>"
 """Shown instead of a skill name the model invented."""
 
 # Pauses whose arguments are shown to a human as the model sent them.
-_PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input"})
+_PLACEHOLDER_PAUSES = frozenset({"waiting_approval", "waiting_human_input", "paused"})
 # Dendrux's own fixed reasons; any other reason is someone's text.
 _CONSTANT_DENIAL_REASONS = frozenset(
     {"denied_by_policy", DEFAULT_DENIAL_REASON, _HOOK_ERROR_REASON, _CLIENT_APPROVAL_REASON}
@@ -491,7 +491,7 @@ _SCHEMAS: dict[str, dict[str, Check]] = {
         "error_type": _enum(_SKILL_FAILURES),
     },
     # runtime/runner.py MCP: source names are configuration; exposed tool names
-    # are the run's tool set (approved, round 2); error text and class hidden
+    # are the run's declared tool set; error text and class hidden
     "mcp.connected": {
         "source_name": _declared,
         "namespace": _declared,
@@ -593,7 +593,9 @@ def _active_paused(
         for call, original in zip(
             shown.get("pending_tool_calls", []), _dicts(raw.get("pending_tool_calls")), strict=False
         ):
-            call.update({k: original[k] for k in ("id", "name", "params") if k in original})
+            call.update(
+                {k: original[k] for k in ("id", "name", "params", "args_hidden") if k in original}
+            )
 
 
 def _active_request(
@@ -861,7 +863,7 @@ def _with_recorded_args(
         and is_one_of(data.get("status"), _PLACEHOLDER_PAUSES)
         and isinstance(data.get("pending_tool_calls"), list)
     ):
-        data["pending_tool_calls"] = approval_calls(data["pending_tool_calls"], approval_params)
+        data["pending_tool_calls"] = pause_display_calls(data, approval_params)
     return data
 
 

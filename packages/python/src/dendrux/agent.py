@@ -112,7 +112,7 @@ MAX_ITERATIONS_CEILING = 200
 
 _UNSET = _UnsetType()
 
-# Inbox note limits (E-P2-3): text is UTF-8 bytes; metadata is encoded JSON.
+# Inbox note limits: text is UTF-8 bytes; metadata is encoded JSON.
 MAX_NOTE_TEXT_BYTES = 32 * 1024
 MAX_NOTE_METADATA_BYTES = 8 * 1024
 MAX_PAUSE_REASON_CHARS = 1000
@@ -1496,6 +1496,8 @@ class Agent:
             default_tenant=None,
             run_id=run_id,
             metadata=metadata,
+            history=kwargs.get("history"),
+            context=kwargs.get("context"),
             provider_kwargs=kwargs,
         )
         provider = self._require_provider()
@@ -1910,12 +1912,14 @@ class Agent:
         from dendrux.runtime.submit import (
             build_rejection_results,
             claim_or_raise,
+            decision_denial_results,
             normalize_decisions,
             preflight_status,
             raise_for_non_paused_status,
             serialize_decisions,
             serialize_tool_results,
             validate_approval_decisions,
+            validate_denial_results,
             warn_missing_pause_id,
         )
         from dendrux.types import PauseState, RunStatus
@@ -1950,6 +1954,9 @@ class Agent:
                     run_id, pause_state, pairs, target_lookup
                 )
 
+                validate_denial_results(
+                    self, run_id, decision_denial_results(pause_state, decision_map)
+                )
                 warn_missing_pause_id(
                     self,
                     expected_pause_id,
@@ -2027,6 +2034,7 @@ class Agent:
             pause_state = PauseState.from_dict(raw_pause)
             warn_missing_pause_id(self, expected_pause_id, pause_id=pause_state.pause_id)
             synthetic = build_rejection_results(pause_state, rejection_reason)
+            validate_denial_results(self, run_id, synthetic)
             epoch = await claim_or_raise(
                 store,
                 run_id,
@@ -2190,19 +2198,55 @@ class Agent:
             raise RunNotFoundError(run_id)
 
         outcomes: list[dict[str, str]] = []
-        # Descendants are signalled together with the root, after every
-        # durable request: a parent and child sharing one task must both
-        # register their interrupt before the task sees the cancellation.
+        cascade_count = 0
         to_signal: list[str] = []
+        root_outcome = None
+        root_signalled = False
+        if cascade and record.status not in _TERMINAL_STATUS_VALUES:
+            # A child can share its task with the root. Persist the root's
+            # request before the first page can interrupt that shared task.
+            root_outcome = await self._cancel_one(store, run_id, signal=False)
         if cascade:
-            get_subtree = require_store_method(store, "get_subtree")
-            subtree = await get_subtree(run_id, tenant_id=tenant_id)
-            if subtree is not None:
-                for rid in _cascade_order(subtree)[:-1]:
-                    outcome = await self._cancel_one(store, rid, signal=False)
-                    outcomes.append({"run_id": rid, "outcome": outcome})
-                    if outcome != "terminal":
-                        to_signal.append(rid)
+            page_reader = getattr(store, "get_descendant_page", None)
+            if page_reader is not None:
+                after = None
+                while True:
+                    page = await page_reader(run_id, after=after, tenant_id=tenant_id)
+                    for rid in page:
+                        outcome = await self._cancel_one(store, rid, signal=False)
+                        cascade_count += 1
+                        if len(outcomes) < 999:
+                            outcomes.append({"run_id": rid, "outcome": outcome})
+                        if outcome != "terminal":
+                            to_signal.append(rid)
+                    # Register both root and child interrupts before the shared
+                    # task reaches its next checkpoint.
+                    if (
+                        root_outcome is not None
+                        and root_outcome != "terminal"
+                        and not root_signalled
+                    ):
+                        self._task_manager.cancel(run_id)
+                        root_signalled = True
+                    for rid in to_signal:
+                        self._task_manager.cancel(rid)
+                    to_signal.clear()
+                    if len(page) < 500:
+                        break
+                    after = page[-1]
+            else:
+                # Compatibility with stores predating paged descendant reads.
+                subtree = await require_store_method(store, "get_subtree")(
+                    run_id, tenant_id=tenant_id
+                )
+                if subtree is not None:
+                    for rid in _cascade_order(subtree)[:-1]:
+                        outcome = await self._cancel_one(store, rid, signal=False)
+                        cascade_count += 1
+                        if len(outcomes) < 999:
+                            outcomes.append({"run_id": rid, "outcome": outcome})
+                        if outcome != "terminal":
+                            to_signal.append(rid)
 
         if record.status in _TERMINAL_STATUS_VALUES:
             for rid in to_signal:
@@ -2210,7 +2254,7 @@ class Agent:
             result = _record_to_run_result(record)
             outcomes.append({"run_id": run_id, "outcome": "terminal"})
         else:
-            outcome = await self._cancel_one(store, run_id, signal=False)
+            outcome = root_outcome or await self._cancel_one(store, run_id, signal=False)
             outcomes.append({"run_id": run_id, "outcome": outcome})
             record = await store.get_run(run_id)
             if record is None:  # pragma: no cover — we just preflight-checked
@@ -2222,7 +2266,8 @@ class Agent:
             # meta.cancel_requested) rather than racing the loop's own finalize.
             for rid in to_signal:
                 self._task_manager.cancel(rid)
-            self._task_manager.cancel(run_id)
+            if not root_signalled:
+                self._task_manager.cancel(run_id)
             result = _record_to_run_result(record)
         if result.status.value in _TERMINAL_STATUS_VALUES:
             from dendrux.runtime.runner import _attach_undelivered_notes
@@ -2230,6 +2275,8 @@ class Agent:
             await _attach_undelivered_notes(store, run_id, result)
         if cascade:
             result.meta["cascade"] = outcomes
+            result.meta["cascade_count"] = cascade_count + 1
+            result.meta["cascade_truncated"] = cascade_count + 1 > len(outcomes)
         return result
 
     async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
@@ -2532,6 +2579,12 @@ class Agent:
         note_kwargs: dict[str, Any] = {}
         if _accepts_kwarg(add_note, "max_notes"):  # custom stores written before 0.5.0
             note_kwargs["max_notes"] = self._limits.max_notes_per_run
+        else:
+            _agent_logger.warning(
+                "Custom store does not enforce the note cap: run_id=%s code=note_cap_unenforced",
+                run_id,
+                extra={"run_id": run_id, "code": "note_cap_unenforced"},
+            )
         note_id = generate_ulid()
         if await add_note(
             run_id,

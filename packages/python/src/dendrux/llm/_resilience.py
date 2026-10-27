@@ -41,6 +41,7 @@ from dendrux.errors import (
     ProviderAuthError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
     ProviderStreamIncompleteError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -111,6 +112,8 @@ class Deadlines:
     call_timeout: float | None
     stream_idle_timeout: float | None
     stream_total_timeout: float | None
+    max_stream_bytes: int = 16 * 1024 * 1024
+    max_stream_tool_calls: int = 1000
 
     @property
     def read_timeout(self) -> float:
@@ -126,6 +129,8 @@ def resolve_deadlines(
     call_timeout: float | None,
     stream_idle_timeout: float | None,
     stream_total_timeout: float | None,
+    max_stream_bytes: int = 16 * 1024 * 1024,
+    max_stream_tool_calls: int = 1000,
     stacklevel: int = 3,
 ) -> Deadlines:
     """Validate the deadline kwargs and fold in the deprecated ``timeout=``.
@@ -134,6 +139,12 @@ def resolve_deadlines(
     ``stream_idle_timeout`` to X, except where one was itself set to a
     non-default value (the new kwarg wins), and warns.
     """
+    for name, value in (
+        ("max_stream_bytes", max_stream_bytes),
+        ("max_stream_tool_calls", max_stream_tool_calls),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{owner}: {name} must be a positive integer.")
     call = _check_seconds("call_timeout", call_timeout, owner)
     idle = _check_seconds("stream_idle_timeout", stream_idle_timeout, owner)
     total = _check_seconds("stream_total_timeout", stream_total_timeout, owner)
@@ -149,7 +160,13 @@ def resolve_deadlines(
             call = legacy
         if idle == DEFAULT_STREAM_IDLE_TIMEOUT:
             idle = legacy
-    return Deadlines(call_timeout=call, stream_idle_timeout=idle, stream_total_timeout=total)
+    return Deadlines(
+        call_timeout=call,
+        stream_idle_timeout=idle,
+        stream_total_timeout=total,
+        max_stream_bytes=max_stream_bytes,
+        max_stream_tool_calls=max_stream_tool_calls,
+    )
 
 
 # ------------------------------------------------------------------
@@ -699,6 +716,7 @@ def log_provider_error(error: ProviderError, run_id: str | None) -> None:
         error.safe_provider_code,
         error.timeout_reason,
         error.retryable,
+        extra={"run_id": run_id, "code": error.safe_provider_code or error.category},
     )
 
 
@@ -797,11 +815,60 @@ class StreamClock:
         self._loop = asyncio.get_running_loop()
         self._idle = deadlines.stream_idle_timeout
         self._total = deadlines.stream_total_timeout
+        self._remaining = deadlines.max_stream_bytes
+        self._slot_limit = deadlines.max_stream_tool_calls
+        self._slots: set[object] = set()
         now = self._loop.time()
         self._idle_at = now + self._idle if self._idle is not None else None
         self._total_at = now + self._total if self._total is not None else None
         self.provider = provider
         self.model = model
+
+    def _reject(self, code: str) -> None:
+        raise ProviderResponseError(
+            provider=self.provider, model=self.model, provider_code=code, retryable=False
+        )
+
+    def tool_slot(self, key: object) -> None:
+        """Bound distinct tool-call buffers before an adapter creates one."""
+        if key not in self._slots:
+            if len(self._slots) >= self._slot_limit:
+                self._reject("stream_tool_call_limit")
+            self._slots.add(key)
+
+    def check_tool_count(self, count: int) -> None:
+        """Bound completed calls even when upstream indices or ids are reused."""
+        if count > self._slot_limit:
+            self._reject("stream_tool_call_limit")
+
+    def account(self, value: Any, depth: int = 0) -> None:
+        """Charge raw event text and structural overhead before adapter accumulation.
+
+        Walk SDK fields without serializing or copying the event. Structural
+        charges also bound streams made entirely of empty fragments or nodes.
+        """
+        self._remaining -= 64
+        if self._remaining < 0 or depth > 64:
+            self._reject("stream_size_limit")
+        if isinstance(value, str):
+            if len(value) > self._remaining:
+                self._reject("stream_size_limit")
+            for start in range(0, len(value), 65536):
+                self._remaining -= len(value[start : start + 65536].encode("utf-8"))
+                if self._remaining < 0:
+                    self._reject("stream_size_limit")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                self.account(key, depth + 1)
+                self.account(item, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self.account(item, depth + 1)
+        elif hasattr(value, "__dict__"):
+            self.account(vars(value), depth + 1)
+            extra = getattr(value, "__pydantic_extra__", None)
+            if extra:
+                self.account(extra, depth + 1)
 
     def mark_semantic(self) -> None:
         if self._idle is not None:

@@ -1,4 +1,4 @@
-"""Track D1: opt-in drop-old-images view (§5.10, U-08)."""
+"""opt-in drop-old-images view (§5.10, U-08)."""
 
 from __future__ import annotations
 

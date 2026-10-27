@@ -155,8 +155,7 @@ class PauseStatusMismatchError(_KwargsReduceMixin, RuntimeError):
         self.reason: Literal["status", "pause_id"] = reason
         if reason == "pause_id":
             super().__init__(
-                f"Run '{run_id}' is paused at pause {current_pause_id!r}, "
-                f"not the expected pause {expected_pause_id!r}; the submit is stale."
+                f"Run '{run_id}' is paused at a different generation; the submit is stale."
             )
         else:
             super().__init__(
@@ -789,6 +788,12 @@ class ProviderUnavailableError(ProviderError, ConnectionError):
     default_retryable = True
 
 
+class ProviderResponseError(ProviderError):
+    """A provider response cannot be accepted within the local response contract."""
+
+    default_category = "rejected"
+
+
 class ProviderStreamIncompleteError(ProviderError):
     """A response stream ended without its terminal event."""
 
@@ -974,11 +979,11 @@ class BlobContentionError(_KwargsReduceMixin, RuntimeError):
 
 
 class BudgetConfigurationError(_KwargsReduceMixin, ValueError):
-    """A dollar budget cannot be enforced because the model has no pricing source.
+    """A budget cannot be safely evaluated from pricing or bounded live accounting.
 
-    Raised when ``Budget(max_cost_usd=...)`` is set but neither the provider
-    reports cost nor the agent's ``PriceTable`` prices ``model``. ``reason``
-    is a stable code (``"unpriced_model"``).
+    ``reason="unpriced_model"`` means neither the provider nor ``PriceTable``
+    prices the effective model. ``reason="subtree_limit"`` means the configured
+    node cap prevented complete root-inclusive accounting.
     """
 
     _init_fields = ("model", "reason")
@@ -986,6 +991,9 @@ class BudgetConfigurationError(_KwargsReduceMixin, ValueError):
     def __init__(self, *, model: str | None = None, reason: str = "unpriced_model") -> None:
         self.model = model
         self.reason = reason
+        if reason == "subtree_limit":
+            super().__init__("Budget subtree accounting limit reached; raise max_subtree_nodes.")
+            return
         super().__init__(
             f"Budget max_cost_usd cannot be enforced for model {model!r} ({reason}): add a "
             "PriceTable entry for the model you request, or use a provider that reports cost."
@@ -1086,6 +1094,7 @@ __all__ = [
     "ProviderError",
     "ProviderErrorCategory",
     "ProviderRateLimitError",
+    "ProviderResponseError",
     "ProviderStreamIncompleteError",
     "ProviderTimeoutError",
     "ProviderUnavailableError",

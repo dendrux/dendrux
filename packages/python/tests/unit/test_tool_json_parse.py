@@ -38,7 +38,7 @@ from dendrux.types import (
 DOCSTRING_RAW = (
     '{"path": "build_deck.py", "content": "#!/usr/bin/env python3\\n"""Build the deck"""\\n"}'
 )
-DOCSTRING_ERROR = "Expecting ',' delimiter at char 63"
+DOCSTRING_ERROR = "arguments must be valid JSON"
 
 
 def _bad_call(name: str = "write_file", raw: str = DOCSTRING_RAW, **kwargs: Any) -> ToolCall:
@@ -64,16 +64,16 @@ class TestParseToolJson:
         assert parse_tool_json(raw) == ({}, None)
 
     def test_trailing_garbage(self) -> None:
-        assert parse_tool_json('{"a": 1} trailing') == ({}, "Extra data at char 9")
+        assert parse_tool_json('{"a": 1} trailing') == ({}, "arguments must be valid JSON")
 
     def test_truncated(self) -> None:
-        assert parse_tool_json('{"a": 1, "b":') == ({}, "Expecting value at char 13")
+        assert parse_tool_json('{"a": 1, "b":') == ({}, "arguments must be valid JSON")
 
     def test_unescaped_docstring(self) -> None:
         assert parse_tool_json(DOCSTRING_RAW) == ({}, DOCSTRING_ERROR)
 
     def test_invalid_escape(self) -> None:
-        assert parse_tool_json('{"a": "C:\\q"}') == ({}, "Invalid \\escape at char 9")
+        assert parse_tool_json('{"a": "C:\\q"}') == ({}, "arguments must be valid JSON")
 
     @pytest.mark.parametrize("raw", ["[1, 2]", '"text"', "42", "true"])
     def test_non_object_json_is_an_error(self, raw: str) -> None:
@@ -180,9 +180,9 @@ class TestCheckToolJson:
         assert check_tool_json(ToolCall(name="x", params={"a": 1})) is None
 
     def test_standard_message(self) -> None:
-        assert format_invalid_json("write_file", "Expecting ',' delimiter at char 1234") == (
+        assert format_invalid_json("write_file", "arguments must be valid JSON") == (
             "Your arguments for `write_file` were not valid JSON "
-            "(Expecting ',' delimiter at char 1234). Send the call again with valid JSON; "
+            "(arguments must be valid JSON). Send the call again with valid JSON; "
             "for long content, write it in smaller pieces."
         )
 

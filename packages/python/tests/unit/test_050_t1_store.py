@@ -1,6 +1,6 @@
-"""0.5.0 T1: store behaviour — tenant-scoped idempotency (D-001), store-allocated
-event indexes (D-011), the atomic note cap, RunStore tenant scoping (D-002,
-B11), list-view projection (D-058), UTC filter normalisation (D-020) and B13.
+"""0.5.0: store behaviour — tenant-scoped idempotency, store-allocated
+event indexes, the atomic note cap, RunStore tenant scoping (B11), list-view
+projection, UTC filter normalisation and B13.
 
 Runs on file SQLite (independent connections). The Postgres races are in
 ``tests/integration/test_050_t1_pg_races.py``.
@@ -58,13 +58,13 @@ def _answers(*texts: str) -> MockLLM:
 
 
 # ---------------------------------------------------------------------------
-# D-001: tenant-scoped idempotency
+# tenant-scoped idempotency
 # ---------------------------------------------------------------------------
 
 
 class TestTenantIdempotency:
     async def test_same_key_in_two_tenants_creates_two_runs(self, state: Any) -> None:
-        """The audit repro: tenant B must not get tenant A's run or answer."""
+        """Tenant isolation: tenant B must not get tenant A's run or answer."""
         llm = _answers("A secret balance", "B balance", "unused")
         agent = Agent(name="bank", prompt="p", provider=llm, state_store=state)
         a = await agent.run("What is my balance?", tenant_id="tenantA", idempotency_key="req-42")
@@ -195,7 +195,7 @@ class TestTenantIdempotency:
 
 
 # ---------------------------------------------------------------------------
-# D-011: the store allocates event indexes
+# the store allocates event indexes
 # ---------------------------------------------------------------------------
 
 
@@ -248,7 +248,7 @@ class TestEventAllocation:
             await state.save_run_event("r1", event_type="x", sequence_index=7)  # type: ignore[call-arg]
 
     async def test_retried_write_never_hides_events_from_a_cursor(self, state: Any) -> None:
-        """The D-011 repro: a transient failure used to commit an earlier index late."""
+        """A transient failure: a transient failure used to commit an earlier index late."""
 
         @tool()
         async def a(x: int) -> int:
@@ -380,7 +380,7 @@ class TestNoteCap:
 
 
 # ---------------------------------------------------------------------------
-# RunStore tenant scoping (D-002, B11)
+# RunStore tenant scoping (B11)
 # ---------------------------------------------------------------------------
 
 
@@ -520,7 +520,7 @@ class TestRunStoreScoping:
         assert await store.list_runs(offset=10_000) == []
 
     async def test_started_filters_use_utc_instants(self, state: Any, store: RunStore) -> None:
-        """D-020: a non-UTC offset compares the same instant on SQLite."""
+        """a non-UTC offset compares the same instant on SQLite."""
         await state.create_run("r1", "a")
         created = (await state.get_run("r1")).created_at
         plus5 = dt.timezone(dt.timedelta(hours=5))

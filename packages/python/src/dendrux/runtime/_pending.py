@@ -182,6 +182,26 @@ def approval_calls(
     return result
 
 
+def pause_display_calls(
+    pause: Mapping[str, Any], params: Mapping[str, dict[str, Any]] | None
+) -> Any:
+    calls = pause.get("pending_tool_calls")
+    if pause.get("status") != "paused":
+        return approval_calls(calls, params)
+    targets = pause.get("pending_targets") or {}
+    gates = pause.get("approval_gates") or {}
+    if not isinstance(calls, list):
+        return calls
+    return [
+        call
+        if isinstance(call, dict)
+        and targets.get(call.get("id")) == "client"
+        and call.get("id") not in gates
+        else approval_calls([call], params)[0]
+        for call in calls
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Read-argument validation. Ids, cursors and filters often come straight from
 # a URL: a bad one is a ValueError with a fixed message (never the value, never
@@ -577,12 +597,19 @@ class _PendingReader:
         kind = _KIND_BY_STATUS.get(status)
         if kind is None:
             return None
-        if kind in ("approval", "input"):
+        targets = pause.get("pending_targets") or {}
+        gates = pause.get("approval_gates") or {}
+        paused_server_calls = kind == "paused" and any(
+            isinstance(call, dict)
+            and (targets.get(call.get("id")) != "client" or call.get("id") in gates)
+            for call in pause.get("pending_tool_calls") or ()
+        )
+        if kind in ("approval", "input") or paused_server_calls:
             seq = await self._active_pause_sequence(run_id, tenant_id)
             params = await self._approval_params(run_id, seq, tenant_id)
             pause = {
                 **pause,
-                "pending_tool_calls": approval_calls(pause.get("pending_tool_calls"), params),
+                "pending_tool_calls": pause_display_calls({**pause, "status": status}, params),
             }
         return _pending_from(run_id, status, kind, pause, last_step)
 

@@ -1,4 +1,4 @@
-"""0.5.0 D-014 (parallel siblings stop) and B12 / D-051 (input and result caps)."""
+"""0.5.0 parallel siblings stop and B12 / input and result caps."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ async def _run(agent: Agent, llm: MockLLM, recorder: Recorder | None = None):
 
 
 # ------------------------------------------------------------------
-# D-014: a run-ending failure stops parallel siblings
+# a run-ending failure stops parallel siblings
 # ------------------------------------------------------------------
 
 

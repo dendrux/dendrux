@@ -25,6 +25,7 @@ def test_run_wire_allowlist_and_pii_redaction():
     wire = result.to_dict()
     assert set(wire) == {
         "wire_version",
+        "answer_omitted",
         "run_id",
         "status",
         "pending",

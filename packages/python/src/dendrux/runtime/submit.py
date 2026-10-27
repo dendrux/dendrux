@@ -190,6 +190,11 @@ def pause_validator(
 ) -> Callable[[dict[str, Any]], None]:
     """Validation performed while the claim transaction holds the run row."""
 
+    from dendrux.types import _validate_identifier
+
+    if expected_pause_id is not None:
+        _validate_identifier(expected_pause_id, "expected_pause_id", maximum=26)
+
     def validate(current: dict[str, Any]) -> None:
         current_id = current.get("pause_id")
         if expected_pause_id is not None and expected_pause_id != current_id:
@@ -452,6 +457,34 @@ def build_rejection_results(
             duration_ms=0,
         )
         for tc in pause_state.pending_tool_calls
+    ]
+
+
+def validate_denial_results(agent: Agent, run_id: str, results: list[ToolResult]) -> None:
+    """Reject oversized synthetic denials before claiming the pause."""
+    if any(
+        len(result.payload.encode("utf-8")) > agent._limits.max_tool_result_bytes
+        for result in results
+    ):
+        raise _invalid_tool_result(run_id, "denial result exceeds the result limit")
+    _validated_client_results(agent, run_id, results)
+
+
+def decision_denial_results(
+    pause: PauseState, decisions: Mapping[str, ApprovalDecision]
+) -> list[ToolResult]:
+    import json
+
+    return [
+        ToolResult(
+            name=call.name,
+            call_id=call.id,
+            payload=json.dumps({"denied": decisions[call.id].reason or DEFAULT_DENIAL_REASON}),
+            success=False,
+            error=decisions[call.id].reason or DEFAULT_DENIAL_REASON,
+        )
+        for call in pause.pending_tool_calls
+        if call.id in decisions and not decisions[call.id].approved
     ]
 
 

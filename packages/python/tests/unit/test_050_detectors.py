@@ -1,4 +1,4 @@
-"""0.5.0 T3: built-in detector quality, linear-time scans and off-loop scanning."""
+"""0.5.0: built-in detector quality, linear-time scans and off-loop scanning."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ _EMAIL = "alice@example.com"
 
 
 # ---------------------------------------------------------------------------
-# D-028: detector quality (labelled corpus)
+# detector quality (labelled corpus)
 # ---------------------------------------------------------------------------
 
 _PII_CORPUS: list[tuple[str, set[str]]] = [
@@ -105,7 +105,7 @@ class TestDetectorCorpus:
 
 
 # ---------------------------------------------------------------------------
-# D-056: linear time and off-loop scans
+# linear time and off-loop scans
 # ---------------------------------------------------------------------------
 
 _ADVERSARIAL_UNITS = [

@@ -206,7 +206,7 @@ Index(
     postgresql_where=AgentRun.idempotency_key.isnot(None),
     sqlite_where=AgentRun.idempotency_key.isnot(None),
 )
-# Tenant-scoped run listings, newest first (D-124).
+# Tenant-scoped run listings, newest first.
 Index("ix_agent_runs_tenant_id_created_at", AgentRun.tenant_id, AgentRun.created_at.desc())
 Index("ix_agent_runs_sweep_running", AgentRun.status, AgentRun.id)
 Index("ix_agent_runs_sweep_waiting", AgentRun.status, AgentRun.status_changed_at, AgentRun.id)

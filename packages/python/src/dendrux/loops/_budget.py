@@ -278,7 +278,18 @@ class BudgetTracker:
         measured = local
         if self._store_reader is not None:
             try:
-                rollup = await self._store_reader(self._run_id)
+                import inspect
+
+                if (
+                    self.budget
+                    and self.budget.include_children
+                    and "max_nodes" in inspect.signature(self._store_reader).parameters
+                ):
+                    rollup = await self._store_reader(
+                        self._run_id, max_nodes=self.budget.max_subtree_nodes
+                    )
+                else:
+                    rollup = await self._store_reader(self._run_id)
                 own = await self._own_reader(self._run_id) if self._own_reader else rollup
                 measured = _Usage(
                     tokens=max(local.tokens, self._tokens(own, rollup=True))
@@ -288,7 +299,11 @@ class BudgetTracker:
                     unpriced_calls=max(local.unpriced_calls, own.unpriced_calls)
                     + max(0, rollup.unpriced_calls - own.unpriced_calls),
                 )
-            except Exception:
+            except Exception as exc:
+                from dendrux.errors import BudgetConfigurationError
+
+                if isinstance(exc, BudgetConfigurationError):
+                    raise
                 logger.warning(
                     "Live budget usage read failed for run %s; using in-memory usage",
                     self._run_id,

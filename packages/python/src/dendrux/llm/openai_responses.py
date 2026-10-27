@@ -235,6 +235,8 @@ class OpenAIResponsesProvider(LLMProvider):
         call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
         stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
         stream_total_timeout: float | None = None,
+        max_stream_bytes: int = 16 * 1024 * 1024,
+        max_stream_tool_calls: int = 1000,
     ) -> None:
         """Create an OpenAI Responses API provider.
 
@@ -286,6 +288,9 @@ class OpenAIResponsesProvider(LLMProvider):
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream events (``response.in_progress`` does not count), and
                 before the first one. ``None`` turns it off.
+            max_stream_bytes: Cumulative UTF-8 and structural stream budget.
+                Default 16 MiB. Exceeding it closes the upstream response.
+            max_stream_tool_calls: Maximum retained tool-call slots (default 1,000).
             stream_total_timeout: Wall-clock limit in seconds for a whole
                 stream. ``None`` (default) means no limit.
         """
@@ -312,6 +317,8 @@ class OpenAIResponsesProvider(LLMProvider):
             call_timeout=call_timeout,
             stream_idle_timeout=stream_idle_timeout,
             stream_total_timeout=stream_total_timeout,
+            max_stream_bytes=max_stream_bytes,
+            max_stream_tool_calls=max_stream_tool_calls,
         )
         deadlines = self._deadlines
 
@@ -784,6 +791,7 @@ class OpenAIResponsesProvider(LLMProvider):
                         event = await clock.step(iterator.__anext__())
                     except StopAsyncIteration:
                         break
+                    clock.account(event)
                     event_type = getattr(event, "type", None)
 
                     # --- Failures (they may follow deltas already yielded) ---
@@ -828,6 +836,7 @@ class OpenAIResponsesProvider(LLMProvider):
                         if getattr(item, "type", None) == "message":
                             _message_phase[item.id] = getattr(item, "phase", None)
                         elif getattr(item, "type", None) == "function_call":
+                            clock.tool_slot((len(tool_calls), item.id))
                             item_id = item.id
                             name = item.name
                             call_id = getattr(item, "call_id", item_id)
@@ -839,6 +848,7 @@ class OpenAIResponsesProvider(LLMProvider):
                             )
 
                     elif event_type == "response.function_call_arguments.done":
+                        clock.check_tool_count(len(tool_calls) + 1)
                         item_id = event.item_id
                         raw_args = event.arguments
                         name, call_id = _active_calls.pop(item_id, ("unknown", item_id))

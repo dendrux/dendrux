@@ -580,7 +580,7 @@ _MALFORMED_WRITE_ARGS = (
     + _DRAFT_MARKER
     + '"""\\n"}'
 )
-_MALFORMED_ERROR = "Expecting ',' delimiter at char 63"
+_MALFORMED_ERROR = "arguments must be valid JSON"
 _VALID_WRITE_PARAMS = {
     "path": "build_deck.py",
     "content": '#!/usr/bin/env python3\n"""Build the deck"""\n',

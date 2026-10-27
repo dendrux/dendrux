@@ -1,4 +1,4 @@
-"""Track D1: request view (prepare_request), loop commit protocol, tool images, rejection.
+"""request view (prepare_request), loop commit protocol, tool images, rejection.
 
 The module also hosts the in-test fakes shared by the other D1 test files:
 an in-memory ``BlobCatalog`` + ``BlobResolver``, a PNG generator, an

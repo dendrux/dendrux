@@ -1,4 +1,4 @@
-"""v0.3.0 text-only differential oracle (Dendrux 0.4.0 Track O, U-01 / R-05).
+"""v0.3.0 text-only differential oracle.
 
 Purpose
 -------
@@ -449,7 +449,7 @@ def _chat_usage(usage: Usage, *, openrouter: bool, index: int) -> Fake:
     if openrouter:
         details["cache_write_tokens"] = usage.cache_write
         # OpenRouter's prompt_tokens counts cache writes too (0.5.0 partitions
-        # them out of fresh input, D-127).
+        # them out of fresh input).
         prompt += usage.cache_write
     extra: dict[str, Any] = {"cost": round(0.0001 * (index + 1), 6)} if openrouter else {}
     dump = {
@@ -1800,7 +1800,7 @@ def _strip_050_cache_write_prompt(
 
     The fake OpenRouter wire counts cache writes in ``prompt_tokens`` (as the
     real one does; the v0.3.0 goldens did not). 0.5.0 partitions the writes
-    out of fresh input (D-127), so the normalised usage still matches the
+    out of fresh input, so the normalised usage still matches the
     goldens; only the raw vendor dump differs, by exactly the writes.
     """
     response = row.get("provider_response") if table == "llm_interactions" else None

@@ -679,7 +679,7 @@ class TestUsageAccounting:
             _usage(prompt_tokens_details={"cached_tokens": 40, "cache_write_tokens": 10})
         )
         assert stats.cache_creation_input_tokens == 10
-        # Fresh input excludes both cache reads and cache writes (D-127).
+        # Fresh input excludes both cache reads and cache writes.
         assert stats.cache_read_input_tokens == 40
         assert stats.input_tokens == 50
 

@@ -1,4 +1,4 @@
-"""Tests for the ``before_tool`` policy hook (Track A2 + A-P1-5)."""
+"""Tests for the ``before_tool`` policy hook."""
 
 from __future__ import annotations
 

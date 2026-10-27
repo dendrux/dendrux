@@ -1,4 +1,4 @@
-"""Shape is not provenance (round 3).
+"""Shape is not provenance.
 
 A redacted field survives only when its value is in an enumerated Dendrux set,
 is a number, bool, generated id or digest, or is a developer-declared name the

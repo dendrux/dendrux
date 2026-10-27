@@ -1,14 +1,13 @@
-"""0.5.0 T2: providers, no silent failures.
+"""0.5.0: providers, no silent failures.
 
 Every test drives the real Anthropic / OpenAI SDKs through a fake httpx
 transport (recorded-style bodies, real SDK exception classes). No network.
 
-Covers: the typed error taxonomy (B5/B10, D-039), stream-incomplete detection
-and the one pre-first-yield retry (D-017), Responses failures (D-018),
-refusals and content filters (D-069), per-call deadlines (D-041), SDK
-connection limits (D-080), upstream close on aclose/cancel (D-081), per-loop
-clients (D-086), thinking + structured output (D-042), cache-write usage
-(D-127) and ``reports_cost``.
+Covers: the typed error taxonomy (B5/B10), stream-incomplete detection
+and the one pre-first-yield retry, Responses failures,
+refusals and content filters, per-call deadlines, SDK
+connection limits, upstream close on aclose/cancel, per-loop
+clients, thinking + structured output, cache-write usage and ``reports_cost``.
 """
 
 from __future__ import annotations
@@ -550,7 +549,7 @@ class TestOpenAITaxonomy:
     async def test_4xx_status_decides_over_5xx_like_labels(
         self, status: int, extra: dict[str, Any]
     ) -> None:
-        """Review P2-4: a definite 4xx is never unavailable/retryable."""
+        """a definite 4xx is never unavailable/retryable."""
         provider = chat_provider()
         wire(provider, json_handler(status, {"error": {"message": SECRET, **extra}}))
         with pytest.raises(ProviderError) as info:
@@ -600,7 +599,7 @@ class TestObservability:
 
 
 # ---------------------------------------------------------------------------
-# Stream incomplete (D-017) and the pre-first-yield retry
+# Stream incomplete and the pre-first-yield retry
 # ---------------------------------------------------------------------------
 
 
@@ -660,7 +659,7 @@ class TestStreamIncomplete:
         assert len(w.requests) == 1
 
     async def test_chat_usage_on_every_chunk_is_not_terminal(self) -> None:
-        """Review P2-2: a backend repeating usage on content chunks, cut mid-stream."""
+        """a backend repeating usage on content chunks, cut mid-stream."""
         provider = chat_provider()
         usage = {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
         body = sse(
@@ -717,7 +716,7 @@ class TestStreamIncomplete:
 
 
 # ---------------------------------------------------------------------------
-# Responses failures (D-018)
+# Responses failures
 # ---------------------------------------------------------------------------
 
 
@@ -776,7 +775,7 @@ class TestResponsesFailures:
             await drain(provider.complete_stream(USER))
 
     async def test_agent_run_fails_instead_of_empty_success(self) -> None:
-        """D-018: the run no longer reports success with an empty answer.
+        """the run no longer reports success with an empty answer.
 
         (Persisting ``ErrorInfo`` on the run is T7's wiring.)
         """
@@ -791,7 +790,7 @@ class TestResponsesFailures:
 
 
 # ---------------------------------------------------------------------------
-# Refusals and content filters (D-069)
+# Refusals and content filters
 # ---------------------------------------------------------------------------
 
 
@@ -868,7 +867,7 @@ class TestRefusalAndFilter:
 
 
 # ---------------------------------------------------------------------------
-# Deadlines (D-041)
+# Deadlines
 # ---------------------------------------------------------------------------
 
 
@@ -1224,7 +1223,7 @@ class TestDeadlines:
 
 
 # ---------------------------------------------------------------------------
-# Connection limits (D-080), upstream close (D-081), per-loop clients (D-086)
+# Connection limits, upstream close, per-loop clients
 # ---------------------------------------------------------------------------
 
 
@@ -1450,7 +1449,7 @@ class TestTransport:
 
 
 # ---------------------------------------------------------------------------
-# D-042: Anthropic thinking + structured output
+# Anthropic thinking + structured output
 # ---------------------------------------------------------------------------
 
 SCHEMA = {
@@ -1501,7 +1500,7 @@ class TestAnthropicStructuredThinking:
 
 
 # ---------------------------------------------------------------------------
-# D-127: cache writes and reports_cost
+# cache writes and reports_cost
 # ---------------------------------------------------------------------------
 
 

@@ -109,8 +109,13 @@ def _structured_output(output: Any) -> Any:
 
 
 def _pending_wire(pending: Any, mapping: Any) -> Any:
+    data = pending.to_dict()
+    if pending.kind == "paused":
+        for call in data.get("pending_tool_calls", []):
+            if call.get("target") != "client" or call.get("approval"):
+                call.update(params=None, args_hidden=True)
     projected = _redacted(
-        pending.to_dict(), mapping if pending.kind in ("approval", "input") else None
+        data, mapping if pending.kind in ("approval", "input", "paused") else None
     )
     if projected is not None:
         return projected
@@ -148,12 +153,27 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
     """Browser DTO, deliberately independent of dataclass/package versions."""
     mapping = _result_mapping(result)
     pending = result.pending if result.status.value in _PAUSED else None
+    answer = _wire_answer(result)
+    omitted = (
+        isinstance(result.answer, str)
+        and answer is None
+        and result.status.value not in ("waiting_approval", "waiting_human_input")
+    )
+    if omitted:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Wire answer omitted: run_id=%s code=wire_answer_omitted",
+            result.run_id,
+            extra={"run_id": result.run_id, "code": "wire_answer_omitted"},
+        )
     return {
         "wire_version": WIRE_VERSION,
         "run_id": result.run_id,
         "status": result.status.value,
         "pending": _pending_wire(pending, mapping) if pending else None,
-        "answer": _wire_answer(result),
+        "answer": answer,
+        "answer_omitted": omitted,
         "output": _structured_output(result.output),
         "error_info": _redacted(result.error_info.to_dict(), mapping)
         if result.error_info

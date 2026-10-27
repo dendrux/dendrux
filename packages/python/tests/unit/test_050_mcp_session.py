@@ -1,15 +1,15 @@
 """MCP session expiry, connection recovery and the read cap on a real SDK server.
 
-D-004: after a stateful server forgets a session, the ``tools/call`` POST gets
+after a stateful server forgets a session, the ``tools/call`` POST gets
 HTTP 404 "Session not found". The call never ran, so the runtime opens a new
 session and retries it once. A transport loss mid-call is different: the
 outcome is unknown and nothing is retried. Stateless servers carry no session
 and are never treated this way.
 
-D-045: an Agent whose connection was lost moves to a replacement connection
+an Agent whose connection was lost moves to a replacement connection
 on its next call instead of failing forever.
 
-D-051: the MCP read cap stops reading an oversized ``tools/call`` response.
+the MCP read cap stops reading an oversized ``tools/call`` response.
 
 The server is the SDK's own (``MCPServer.streamable_http_app()``) on a loopback
 socket via uvicorn. Session expiry is produced by the real SDK session manager:
@@ -287,7 +287,7 @@ async def test_transport_loss_mid_call_is_never_retried_and_the_agent_recovers()
         # The tool ran once and was not run again by the runtime.
         assert harness.executions == ["a", "maybe"]
 
-        # D-045: the same Agent moves to a new connection instead of failing.
+        # the same Agent moves to a new connection instead of failing.
         assert await echo(text="after") == {"result": "echo:after"}
         assert harness.executions == ["a", "maybe", "after"]
         assert _status(runtime) == [MCPConnectionStatus.ACTIVE]

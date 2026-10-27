@@ -1,4 +1,4 @@
-"""Redacted views under the untrusted-source threat model (round 5, SQLite + Postgres).
+"""Redacted views under the untrusted-source threat model.
 
 Custom providers, strategies, tools, hooks and MCP servers are untrusted text
 sources for redacted readers.
@@ -173,7 +173,7 @@ async def test_builtin_provider_set_matches_the_adapters() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Round 6: positive evidence only. A missing or partial MCP record never makes
+# positive evidence only. A missing or partial MCP record never makes
 # a tool name safe to show.
 # ---------------------------------------------------------------------------
 

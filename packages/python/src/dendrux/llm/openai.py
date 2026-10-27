@@ -279,6 +279,8 @@ class OpenAIProvider(LLMProvider):
         call_timeout: float | None = DEFAULT_CALL_TIMEOUT,
         stream_idle_timeout: float | None = DEFAULT_STREAM_IDLE_TIMEOUT,
         stream_total_timeout: float | None = None,
+        max_stream_bytes: int = 16 * 1024 * 1024,
+        max_stream_tool_calls: int = 1000,
     ) -> None:
         """Create an OpenAI Chat Completions provider.
 
@@ -329,6 +331,9 @@ class OpenAIProvider(LLMProvider):
                 set a large ``call_timeout`` instead.
             stream_idle_timeout: Maximum gap in seconds between meaningful
                 stream chunks, and before the first one. ``None`` turns it off.
+            max_stream_bytes: Cumulative UTF-8 and structural stream budget.
+                Default 16 MiB. Exceeding it closes the upstream response.
+            max_stream_tool_calls: Maximum retained tool-call slots (default 1,000).
             stream_total_timeout: Wall-clock limit in seconds for a whole
                 stream. ``None`` (default) means no limit.
         """
@@ -345,6 +350,8 @@ class OpenAIProvider(LLMProvider):
             call_timeout=call_timeout,
             stream_idle_timeout=stream_idle_timeout,
             stream_total_timeout=stream_total_timeout,
+            max_stream_bytes=max_stream_bytes,
+            max_stream_tool_calls=max_stream_tool_calls,
             stacklevel=self._deprecation_stacklevel,
         )
         deadlines = self._deadlines
@@ -758,6 +765,7 @@ class OpenAIProvider(LLMProvider):
                         chunk = await clock.step(chunk_iter.__anext__())
                     except StopAsyncIteration:
                         break
+                    clock.account(chunk)
                     semantic = False
 
                     # Usage arrives in the final chunk (``include_usage``: no
@@ -809,6 +817,7 @@ class OpenAIProvider(LLMProvider):
 
                             # Ensure buffer exists for this index
                             if idx not in _tool_buffers:
+                                clock.tool_slot((len(tool_calls), idx))
                                 _tool_buffers[idx] = _ToolCallBuffer()
 
                             buf = _tool_buffers[idx]
@@ -840,6 +849,7 @@ class OpenAIProvider(LLMProvider):
                     if choice.finish_reason is not None:
                         semantic = True
                         finish_reason = choice.finish_reason
+                        clock.check_tool_count(len(tool_calls) + len(_tool_buffers))
                         for flush_event in self._drain_tool_buffers(_tool_buffers, tool_calls):
                             yield flush_event
 

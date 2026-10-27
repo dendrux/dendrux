@@ -2678,6 +2678,21 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                 return None
             return _run_to_record(row)
 
+    async def get_next_trace_index(self, run_id: str) -> int:
+        """Read the next trace order from the run/order index, without payloads."""
+        from sqlalchemy import select
+
+        from dendrux.db.models import ReactTrace
+
+        async with self._session_factory() as session:
+            value = await session.scalar(
+                select(ReactTrace.order_index)
+                .where(ReactTrace.agent_run_id == run_id)
+                .order_by(ReactTrace.order_index.desc())
+                .limit(1)
+            )
+            return int(value) + 1 if value is not None else 0
+
     async def get_traces(
         self,
         run_id: str,
@@ -3265,6 +3280,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         *,
         tenant_id: TenantScope = UNSCOPED,
         light: bool = False,
+        max_nodes: int | None = None,
     ) -> list[tuple[AgentRun, int]]:
         """Descendants of ``root_id`` as ``(row, depth)`` in BFS order, root excluded.
 
@@ -3295,8 +3311,21 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
                         load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id)
                     )
                 stmt = _apply_tenant_scope(stmt, tenant_id)
+                if max_nodes is not None:
+                    stmt = stmt.limit(max_nodes - len(found) - len(rows))
                 result = await session.execute(stmt.order_by(AgentRun.created_at, AgentRun.id))
                 rows.extend(result.scalars().all())
+                if max_nodes is not None and len(found) + len(rows) >= max_nodes:
+                    import logging
+
+                    from dendrux.errors import BudgetConfigurationError
+
+                    logging.getLogger(__name__).warning(
+                        "Budget subtree bound reached: run_id=%s code=subtree_limit",
+                        root_id,
+                        extra={"run_id": root_id, "code": "subtree_limit"},
+                    )
+                    raise BudgetConfigurationError(reason="subtree_limit")
 
             next_level: list[str] = []
             for cr in rows:
@@ -3428,9 +3457,44 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
             ]
             return SubtreeRecord(nodes=nodes, usage=UsageRollup.combine(n.usage for n in nodes))
 
-    async def subtree_usage(self, run_id: str) -> UsageRollup:
+    async def get_descendant_page(
+        self,
+        run_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 500,
+        tenant_id: TenantScope = UNSCOPED,
+    ) -> list[str]:
+        """Read one page of descendant ids, without run payloads.
+
+        A recursive UNION deduplicates ids, including malformed cycles. Each
+        page uses a fresh statement so cancellation writes never hold its cursor.
+        """
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        tree = _apply_tenant_scope(select(AgentRun.id).where(AgentRun.id == run_id), tenant_id).cte(
+            "descendants", recursive=True
+        )
+        children = _apply_tenant_scope(
+            select(AgentRun.id).join(tree, AgentRun.parent_run_id == tree.c.id), tenant_id
+        )
+        tree = tree.union(children)
+        stmt = select(tree.c.id).where(tree.c.id != run_id)
+        if after is not None:
+            stmt = stmt.where(tree.c.id > after)
+        stmt = stmt.order_by(tree.c.id).limit(max(1, min(limit, 500)))
         async with self._session_factory() as session:
-            descendants = await self._bfs_descendants(session, run_id, light=True)
+            return list((await session.scalars(stmt)).all())
+
+    async def subtree_usage(self, run_id: str, *, max_nodes: int = 10000) -> UsageRollup:
+        if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
+            raise ValueError("max_nodes must be a positive integer")
+        async with self._session_factory() as session:
+            descendants = await self._bfs_descendants(
+                session, run_id, light=True, max_nodes=max_nodes
+            )
             usage = await self._usage_by_run(session, [run_id, *(r.id for r, _ in descendants)])
             return UsageRollup.combine(usage.values())
 

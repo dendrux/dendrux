@@ -556,7 +556,7 @@ class TestReActLoopClarification:
 
 class TestReActLoopNonSerializableResults:
     async def test_tool_returning_datetime_reports_error(self) -> None:
-        """H-016: Non-serializable tool return becomes a failed ToolResult, not silent stringify."""
+        """Non-serializable tool return becomes a failed ToolResult, not silent stringify."""
         tc = ToolCall(
             name="return_datetime",
             params={},
@@ -588,7 +588,7 @@ class TestReActLoopNonSerializableResults:
         assert len(tool_steps) == 1
 
     async def test_tool_returning_set_reports_error(self) -> None:
-        """H-016: Non-serializable set return becomes a failed ToolResult."""
+        """Non-serializable set return becomes a failed ToolResult."""
         tc = ToolCall(
             name="return_set",
             params={},

@@ -63,7 +63,7 @@ def test_malformed_markers_are_errors_naming_the_place(tmp_path: Path, marker: s
 
 
 def test_other_reference_notes_are_not_markers(tmp_path: Path) -> None:
-    text = '[//]: # "VERIFY-0.5.0: check this"\n\n```python\nx = 1\n```\n'
+    text = '[//]: # "Implementation note"\n\n```python\nx = 1\n```\n'
     assert _extract(tmp_path, text)[0].skip_reason is None
 
 
