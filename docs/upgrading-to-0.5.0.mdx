@@ -337,7 +337,7 @@ What this does and does not protect is written down on [RunStore: redacted views
 
 ### 16. Strict flags and validated read arguments
 
-Read flags (`include_payloads`, `until_terminal`, `active_pause`, `undelivered_only`) and control flags (`approved`, `cascade`, `include_pii`) must be exactly `True` or `False`; `"false"`, `0` or `1` raise `ValueError` instead of being read as truthy. `follow(max_duration_s=...)` must be a finite positive number or `None`. `RunStore` reads, `get_pending` and `follow` also validate ids, tenants, cursors, limits, offsets, filters and dates before they query, and raise `ValueError` with a fixed message that does not echo the rejected value (the `offset` cap names the cap and the integer you passed): map it to 400. `get_run(None)` now raises instead of returning `None`. See [RunStore](/docs/reference/run-store#arguments-are-validated).
+Read flags (`include_payloads`, `until_terminal`, `active_pause`, `undelivered_only`) and control flags (`approved`, `cascade`, `include_pii`) must be exactly `True` or `False`; `"false"`, `0` or `1` raise `ValueError` instead of being read as truthy. `follow(max_duration_s=...)` must be a finite positive number or `None`. `RunStore` reads, `get_pending` and `follow` also validate ids, tenants, cursors, limits, offsets, filters and dates before they query, and raise `ValueError` with a fixed message that never echoes the rejected value, and log `code=read_argument_invalid` with the argument name: map it to 400. `get_run(None)` now raises instead of returning `None`. See [RunStore](/docs/reference/run-store#arguments-are-validated).
 
 ### 17. Client results and unstorable text
 
@@ -404,7 +404,7 @@ Raw provider records in `llm_interactions` and traces can therefore be missing o
   ```
 
   A result you convert with `from_dict` is validated once; `submit_tool_results` re-checks the current identity, metadata, image and size limits and does not parse the payload a second time. A result changed with `dataclasses.replace` is validated again. Do not send the private validation marker over the wire; Dendrux never accepts it from a wire object.
-- **Cancelling a submit caller after the claim.** If the task awaiting `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume` or `resume` is cancelled right after the run was claimed, Dendrux still finalises the run as `cancelled` (fenced by the claim epoch) before it re-raises that `CancelledError`, so the run is never left `running`. `cancel_run` continues to return its typed `CANCELLED` result as in [item 19](#19-in-process-cancellation-returns-a-result).
+- **Cancelling a submit caller after the claim.** If the task awaiting `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume` or `resume` is cancelled right after the run was claimed, Dendrux finalises the run as `cancelled` (fenced by the claim epoch) before it re-raises that `CancelledError`, so the run is not left `running`. This holds when the database write succeeds. If it fails, Dendrux logs `code=cancel_persist_failed` and still re-raises `CancelledError`; the row can then stay `running` until your `sweep()` job marks it stale, so keep that job scheduled and watch for the log line. `cancel_run` continues to return its typed `CANCELLED` result as in [item 19](#19-in-process-cancellation-returns-a-result).
 
 ## Limits at a glance
 

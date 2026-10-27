@@ -76,7 +76,7 @@ from dendrux import UNSCOPED
 
 ### Arguments are validated
 
-Every read, `get_pending` and `follow` checks its arguments before it queries, and refuses with a `ValueError` whose message is fixed and does not echo the rejected value (Dendrux logs `code=read_argument_invalid` with the argument name). One exception: the `offset` cap on `list_runs` and `count_runs` names the cap and the integer you passed, because the value is a number you chose. A route can map it to HTTP 400.
+Every read, `get_pending` and `follow` checks its arguments before it queries, and refuses with a `ValueError` whose message is fixed and never echoes the rejected value. Every such rejection, including the `list_runs` offset cap, the pause-page `limit` and the `stream_events` poll interval, logs `code=read_argument_invalid` with the argument name. A route can map it to HTTP 400.
 
 - Run ids and string tenant ids are non-empty strings of at most 255 characters with no NUL and no unpaired surrogate. `get_run(None)` therefore raises (it used to return `None`).
 - Cursors fit a 32-bit integer; `limit` and `offset` are integers (not `bool`); `offset` is at most 10,000.

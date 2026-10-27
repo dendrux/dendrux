@@ -64,7 +64,7 @@ Each item links to a before/after note on the upgrade page.
 - `Agent.get_result(include_pii=False)` leaves `pii_mapping` out;
   `RunResult.meta` has no `pause_state`.
 - Read flags and control booleans must be real `bool` values; reads validate ids,
-  cursors, filters and dates and raise `ValueError` with a fixed message (the `offset` cap also names the integer passed).
+  cursors, filters and dates and raise `ValueError` with a fixed message that never echoes the value, and log `code=read_argument_invalid`.
 - NUL and lone surrogates are rejected in input text, keys and metadata; JSON
   must be finite; client tool results are checked against the pending calls.
 - `RunStore.follow` admits 500 followers per store and 100 per tenant scope;

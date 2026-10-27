@@ -133,7 +133,7 @@ The scratchpad below builds an agent with PII redaction *and* an approval gate, 
 [lifecycle] seq=14  iter=0  run.completed
 ```
 
-Six governance rows, eight lifecycle rows, one shared `sequence_index` running straight through. A few things worth noting:
+Six governance rows, nine lifecycle rows, one shared `sequence_index` running straight through. A few things worth noting:
 
 1. **Both iterations scanned.** The PII guardrail runs incoming on iteration 1 (the user's original message) *and* iteration 2 (the history replayed to the LLM after the tool result). It catches the email both times and redacts in place. That is fine, the `pii_mapping` is stable so the same replacement token is reused.
 2. **Correlation id links the approval to the tool.** `approval.requested` at `seq=5` and `tool.completed` at `seq=9` share the same `correlation_id`. A reader can join the two rows to see "this approval decision authorized this specific tool call." `approval.decided` does not carry the correlation id on this path because it is emitted by the resume endpoint, not by the runner's tool dispatcher.
