@@ -80,18 +80,93 @@ def migrate() -> None:
 
 @app.command()
 def status() -> None:
-    """Show current migration revision.
-
-    Set DENDRUX_DATABASE_URL to override the default SQLite path.
-    """
+    """Show the global storage format and resumable activation step."""
     try:
-        from alembic import command
-    except ImportError:
-        console.print("[red]Alembic not installed.[/red] Run: pip install dendrux[db]")
-        raise typer.Exit(1) from None
+        storage_format, step = asyncio.run(_read_activation_status(_database_url()))
+    except Exception:
+        console.print("[red]Could not read database status.[/red] Run `dendrux db check`.")
+        raise typer.Exit(2) from None
+    console.print(f"storage_format={storage_format} activate_step={step}")
 
-    alembic_cfg = _build_alembic_config()
-    command.current(alembic_cfg, verbose=True)
+
+async def _read_activation_status(url: str) -> tuple[str, str]:
+    from sqlalchemy import inspect, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            if not await conn.run_sync(lambda c: inspect(c).has_table("dendrux_settings")):
+                return "1", "not-started"
+            settings = dict(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT key, value FROM dendrux_settings "
+                            "WHERE key IN ('storage_format', 'activate_step')"
+                        )
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            return settings.get("storage_format", "1"), settings.get("activate_step", "not-started")
+    finally:
+        await engine.dispose()
+
+
+@app.command()
+def activate(
+    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+) -> None:
+    """Dedupe and activate format 2 after every writer and reader has been upgraded.
+
+    Stop every other process first when using SQLite. Take a pre-activation backup:
+    activation is one-way. Use a direct PostgreSQL connection for concurrent DDL.
+    """
+    _run_activation(batch_size, dedupe_only=False)
+
+
+@app.command()
+def dedupe(
+    batch_size: int = typer.Option(5000, "--batch-size", min=1, max=5000),
+) -> None:
+    """Only dedupe identical rows, with the same resumable cursors as activate."""
+    _run_activation(batch_size, dedupe_only=True)
+
+
+def _run_activation(batch_size: int, *, dedupe_only: bool) -> None:
+    from dendrux.db._activate import ActivationConflictError
+
+    try:
+        asyncio.run(_activate_database(_database_url(), batch_size, dedupe_only))
+    except ActivationConflictError as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(3) from None
+    except RuntimeError as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(1) from None
+    except Exception:
+        # Driver exceptions can contain tool/trace content in SQL parameters.
+        console.print("[red]Activation failed.[/red] Check database availability and retry.")
+        raise typer.Exit(1) from None
+    console.print(
+        "[green]Dedupe complete.[/green]" if dedupe_only else "[green]Activation complete.[/green]"
+    )
+
+
+async def _activate_database(url: str, batch_size: int, dedupe_only: bool) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dendrux.db._activate import activate_database
+
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await activate_database(engine, batch_size=batch_size, dedupe_only=dedupe_only)
+    finally:
+        await engine.dispose()
 
 
 EXIT_CURRENT = 0
@@ -184,10 +259,7 @@ async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
     from sqlalchemy.pool import NullPool
 
     from dendrux.db._schema_check import (
-        compare_indexes,
-        compare_schema,
-        read_actual_indexes,
-        read_actual_schema,
+        schema_problems,
     )
 
     engine = create_async_engine(url, poolclass=NullPool)
@@ -198,12 +270,7 @@ async def _read_schema_state(url: str) -> tuple[str | None, list[str]]:
             if stamped:
                 row = (await conn.execute(text("SELECT version_num FROM alembic_version"))).first()
                 revision = row[0] if row is not None else None
-            actual = await conn.run_sync(read_actual_schema)
-            missing_tables, missing = compare_schema(actual)
-            missing.extend(f"table {t}" for t in missing_tables)
-            if engine.dialect.name == "postgresql" and actual:
-                indexes = await conn.run_sync(read_actual_indexes)
-                missing.extend(compare_indexes(indexes, actual.keys()))
+            missing = await conn.run_sync(schema_problems)
             return revision, missing
     finally:
         await engine.dispose()

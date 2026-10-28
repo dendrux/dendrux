@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from enum import StrEnum
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -21,18 +22,42 @@ app = typer.Typer(
 console = Console()
 
 
+class StorageFormat(StrEnum):
+    """Storage formats accepted by the runs command."""
+
+    legacy = "1"
+    checkpointed = "2"
+
+
 @app.callback(invoke_without_command=True)
 def list_runs(
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of runs to show."),
     offset: int = typer.Option(0, "--offset", help="Skip this many runs."),
     status: str = typer.Option("", "--status", "-s", help="Filter by status."),
     tenant: str = typer.Option("", "--tenant", "-t", help="Filter by tenant ID."),
+    storage_format: Annotated[
+        StorageFormat | None, typer.Option("--format", help="Filter by storage format.")
+    ] = None,
 ) -> None:
     """List recent agent runs."""
-    asyncio.run(_list_runs(limit, offset, status or None, tenant or None))
+    asyncio.run(
+        _list_runs(
+            limit,
+            offset,
+            status or None,
+            tenant or None,
+            int(storage_format.value) if storage_format else None,
+        )
+    )
 
 
-async def _list_runs(limit: int, offset: int, status: str | None, tenant_id: str | None) -> None:
+async def _list_runs(
+    limit: int,
+    offset: int,
+    status: str | None,
+    tenant_id: str | None,
+    storage_format: int | None = None,
+) -> None:
     try:
         from dendrux.db.session import get_engine, reset_engine
         from dendrux.runtime.state import SQLAlchemyStateStore
@@ -53,12 +78,41 @@ async def _list_runs(limit: int, offset: int, status: str | None, tenant_id: str
         # No --tenant means every tenant: omit the argument (the store's default
         # scope) instead of passing None, which means "untenanted runs only".
         scope: dict[str, Any] = {} if tenant_id is None else {"tenant_id": tenant_id}
-        runs = await store.list_runs(
-            limit=max(1, min(limit, 1000)),
-            offset=max(0, offset),
-            status=status,
-            **scope,
-        )
+        runs: list[Any]
+        if storage_format is None:
+            runs = await store.list_runs(
+                limit=max(1, min(limit, 1000)),
+                offset=max(0, offset),
+                status=status,
+                **scope,
+            )
+        else:
+            from sqlalchemy import select
+
+            from dendrux.db.models import AgentRun
+
+            # Filter before LIMIT/OFFSET without requiring a new store API contract.
+            statement = select(
+                AgentRun.id,
+                AgentRun.agent_name,
+                AgentRun.status,
+                AgentRun.iteration_count,
+                AgentRun.total_input_tokens,
+                AgentRun.total_output_tokens,
+                AgentRun.model,
+                AgentRun.created_at,
+            ).where(AgentRun.storage_format == storage_format)
+            if status:
+                statement = statement.where(AgentRun.status == status)
+            if tenant_id:
+                statement = statement.where(AgentRun.tenant_id == tenant_id)
+            statement = (
+                statement.order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                .limit(max(1, min(limit, 1000)))
+                .offset(max(0, min(offset, 10000)))
+            )
+            async with engine.connect() as conn:
+                runs = list(await conn.execute(statement))
     finally:
         await reset_engine()
 
