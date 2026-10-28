@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import contextmanager
 from pathlib import Path
@@ -181,7 +182,13 @@ def _duplicates(conn: Connection, table: Table, page: list[Any]) -> tuple[list[s
         for id, keeper_id, run_id in group:
             current, keeper = rows[id], rows[keeper_id]
             if current.content_digest == keeper.content_digest and (
-                current.content_digest is not None or tuple(current)[2:] == tuple(keeper)[2:]
+                current.content_digest is not None
+                or json.dumps(
+                    tuple(current)[2:], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                )
+                == json.dumps(
+                    tuple(keeper)[2:], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                )
             ):
                 identical.append(id)
             else:

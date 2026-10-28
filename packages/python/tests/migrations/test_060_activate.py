@@ -607,6 +607,44 @@ async def _seed_rehearsal_runs_only(engine):
         )
 
 
+@pytest.mark.parametrize("table_name", ["react_traces", "tool_calls", "run_events"])
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [(True, 1), (1, 1.0), ("1", 1)],
+    ids=["boolean-integer", "integer-float", "string-number"],
+)
+@pytest.mark.parametrize("digest", [None, "a" * 64], ids=["null-digest", "equal-digest"])
+async def test_b1_typed_json_content_conflicts(
+    rollout_database, monkeypatch, table_name, first, second, digest
+):
+    import asyncio
+
+    engine = rollout_database
+    await _rollout_prior(engine)
+    await _seed_rehearsal_runs_only(engine)
+    await _migrate(engine)
+    table = Base.metadata.tables[table_name]
+    async with engine.begin() as conn:
+        for id, value in [("a", first), ("b", second)]:
+            row = {"id": id, "agent_run_id": "run-00000", "content_digest": digest}
+            payload = {"flag": value}
+            if table_name == "react_traces":
+                row.update(role="assistant", content="same", order_index=0, meta=payload)
+            elif table_name == "tool_calls":
+                row.update(tool_call_id="call", tool_name="t", params=payload)
+            else:
+                row.update(event_type="run.started", sequence_index=0, data=payload)
+            await conn.execute(table.insert(), row)
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+    result = await asyncio.to_thread(runner.invoke, app, ["db", "dedupe"])
+    conflict = digest is None
+    assert result.exit_code == (3 if conflict else 0), (result.output, result.exception)
+    async with engine.connect() as conn:
+        assert (await conn.execute(table.select().order_by(table.c.id))).scalars().all() == (
+            ["a", "b"] if conflict else ["a"]
+        )
+
+
 async def test_b4_pg_blocked_upgrade_retries(rollout_database, monkeypatch):
     import asyncio
     import time
