@@ -318,6 +318,37 @@ def _commentary(steps: list[AgentStep]) -> list[str]:
     ]
 
 
+def _pending_limit_result(
+    *,
+    agent: Agent,
+    state_store: StateStore | None,
+    response: LLMResponse,
+    run_id: str,
+    iteration: int,
+    steps: list[AgentStep],
+    usage: UsageStats,
+    meta: dict[str, Any],
+) -> RunResult | None:
+    if state_store is not None and getattr(state_store, "storage_format", 1) != 2:
+        return None
+    if len(response.tool_calls or ()) <= agent._limits.max_pending_calls:
+        return None
+    logger.warning(
+        "Assistant batch exceeds pending-call limit",
+        extra={"run_id": run_id, "code": "pending_limit"},
+    )
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus.ERROR,
+        error="Assistant batch exceeds the pending-call limit.",
+        steps=steps,
+        commentary=_commentary(steps),
+        iteration_count=iteration,
+        usage=usage,
+        meta={**meta, "failure_reason": "pending_limit"},
+    )
+
+
 def _snapshot_usage(usage: UsageStats) -> UsageStats:
     """Create an independent copy of usage stats for pause state."""
     return UsageStats(
@@ -1879,6 +1910,19 @@ class ReActLoop(Loop):
                 step = replace(step, meta={**step.meta, "reasoning": response.reasoning})
             steps.append(step)
 
+            limited = _pending_limit_result(
+                agent=agent,
+                state_store=state_store,
+                response=response,
+                run_id=resolved_run_id,
+                iteration=iteration,
+                steps=steps,
+                usage=total_usage,
+                meta=guardrail_meta(g_engine, notifier_warnings),
+            )
+            if limited is not None:
+                return limited
+
             if isinstance(step.action, Finish):
                 await _append_assistant(
                     response,
@@ -2468,6 +2512,20 @@ class ReActLoop(Loop):
             if llm_response.reasoning is not None:
                 step = replace(step, meta={**step.meta, "reasoning": llm_response.reasoning})
             steps.append(step)
+
+            limited = _pending_limit_result(
+                agent=agent,
+                state_store=state_store,
+                response=llm_response,
+                run_id=resolved_run_id,
+                iteration=iteration,
+                steps=steps,
+                usage=total_usage,
+                meta={"notifier_warnings": notifier_warnings} if notifier_warnings else {},
+            )
+            if limited is not None:
+                yield RunEvent(type=RunEventType.RUN_ERROR, run_result=limited)
+                return
 
             if isinstance(step.action, Finish):
                 await _append_assistant(

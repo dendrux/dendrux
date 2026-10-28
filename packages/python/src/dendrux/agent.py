@@ -1398,6 +1398,11 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
+        from dendrux.types import _validate_provider_kwargs
+
+        _validate_provider_kwargs(
+            {k: v for k, v in kwargs.items() if k not in {"loop", "strategy", "output_type"}}
+        )
         tenant_id = entry_checks(
             self,
             "run",
@@ -2753,6 +2758,11 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
+        from dendrux.types import _validate_provider_kwargs
+
+        _validate_provider_kwargs(
+            {k: v for k, v in kwargs.items() if k not in {"loop", "strategy", "output_type"}}
+        )
         tenant_id = entry_checks(
             self,
             "stream",

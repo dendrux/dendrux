@@ -85,7 +85,7 @@ from dendrux.runtime.replay import (
     user_trace_message,
     validate_replay_args,
 )
-from dendrux.runtime.state import claimed_store, unclaimed_store
+from dendrux.runtime.state import ClaimResult, claimed_store, unclaimed_store
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
     claim_paused_validated,
@@ -691,10 +691,10 @@ def _terminal_failure_kwargs(state_store: StateStore, result: RunResult) -> dict
     if (
         base is not None
         and result.status == RunStatus.ERROR
-        and result.meta.get("failure_reason") == "guardrail_blocked"
+        and result.meta.get("failure_reason") in ("guardrail_blocked", "pending_limit")
         and _accepts_kwarg(base.finalize_run, "failure_reason")
     ):
-        failure_kwargs["failure_reason"] = "guardrail_blocked"
+        failure_kwargs["failure_reason"] = result.meta["failure_reason"]
     return failure_kwargs
 
 
@@ -1504,6 +1504,9 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
+    from dendrux.types import _validate_provider_kwargs
+
+    _validate_provider_kwargs(kwargs)
     tenant_id = resolve_runner_tenant(agent, "run", tenant_id)
     skill_session = SkillSession.prepare(
         agent, loop=loop or agent.loop or ReActLoop(), explicit=activate_skills
@@ -1702,7 +1705,11 @@ async def run(
 
                     # "created" — use the run_id from the result (same as generated)
                     run_id = create_result.run_id
-                    state_store = claimed_store(state_store, run_id, 0)
+                    state_store = claimed_store(
+                        state_store,
+                        run_id,
+                        ClaimResult(0, create_result.storage_format, None, None),
+                    )
                     owned = True
 
                     # The run is durable: from here cancel_run in this process
@@ -2382,6 +2389,9 @@ async def retry(
     """
     # 1. Validate source run is terminal. A missing run and another tenant's
     # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
+    from dendrux.types import _validate_provider_kwargs
+
+    _validate_provider_kwargs(kwargs)
     tenant_id = resolve_runner_tenant(agent, "retry", tenant_id)
     from dendrux.errors import RunNotFoundError
 
@@ -2532,7 +2542,9 @@ async def retry(
             **input_edges,
         )
         run_id = create_result.run_id
-        state_store = claimed_store(state_store, run_id, 0)
+        state_store = claimed_store(
+            state_store, run_id, ClaimResult(0, create_result.storage_format, None, None)
+        )
 
         # Create persistence recorder
         from dendrux.runtime.persistence import PersistenceRecorder
@@ -2808,6 +2820,9 @@ def run_stream(
     # Full resolution (parent context, clamping) happens inside _generate()
     # because parent_ctx requires async state_store resolution first.
     # But validation of the raw input can fail fast here.
+    from dendrux.types import _validate_provider_kwargs
+
+    _validate_provider_kwargs(kwargs)
     tenant_id = resolve_runner_tenant(agent, "stream", tenant_id)
     if (
         not isinstance(max_delegation_depth, _UnsetType)
@@ -3076,7 +3091,9 @@ def run_stream(
                     return
                 if create_result.outcome == "existing_active":
                     raise RunAlreadyActiveError(run_id, create_result.status)
-                store = claimed_store(store, run_id, 0)
+                store = claimed_store(
+                    store, run_id, ClaimResult(0, create_result.storage_format, None, None)
+                )
                 _shared["state_store"] = store
                 _shared["claimed"] = True
 
@@ -3218,6 +3235,7 @@ def run_stream(
                 async for event in loop_stream:
                     _terminal_types = (
                         RunEventType.RUN_COMPLETED,
+                        RunEventType.RUN_ERROR,
                         RunEventType.RUN_PAUSED,
                         RunEventType.RUN_CANCELLED,
                     )
@@ -5221,6 +5239,7 @@ def resume_stream(
                         event.type
                         in (
                             RunEventType.RUN_COMPLETED,
+                            RunEventType.RUN_ERROR,
                             RunEventType.RUN_PAUSED,
                             RunEventType.RUN_CANCELLED,
                         )

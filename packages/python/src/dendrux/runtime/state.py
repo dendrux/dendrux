@@ -5584,10 +5584,13 @@ def validate_event_index(index: Any) -> None:
 class _ClaimedStateStore:
     """Execution-local epoch binding, preserving undeclared stores' legacy signatures."""
 
-    def __init__(self, store: StateStore, run_id: str, epoch: int) -> None:
+    def __init__(self, store: StateStore, run_id: str, epoch: int | ClaimResult) -> None:
         self._store = store
         self._run_id = run_id
-        self.claim_epoch = epoch
+        self.claim_epoch = epoch.claim_epoch if isinstance(epoch, ClaimResult) else epoch
+        self.storage_format = epoch.storage_format if isinstance(epoch, ClaimResult) else 1
+        self.loop_state = epoch.loop_state if isinstance(epoch, ClaimResult) else None
+        self.submission = epoch.submission if isinstance(epoch, ClaimResult) else None
 
     @property
     def capabilities(self) -> StoreCapabilities:
@@ -5685,9 +5688,13 @@ def claimed_store(store: StateStore, run_id: str, epoch: int | bool | ClaimResul
     """Bind a returned epoch; bool is the pre-0.5 custom-store claim contract."""
     if type(epoch) is bool:
         return store
-    if isinstance(epoch, ClaimResult):
-        epoch = epoch.claim_epoch
     if isinstance(store, _ClaimedStateStore):
+        if (
+            not isinstance(epoch, ClaimResult)
+            and run_id == store._run_id
+            and epoch == store.claim_epoch
+        ):
+            return cast("StateStore", store)
         store = store._store
     return cast("StateStore", _ClaimedStateStore(store, run_id, epoch))
 

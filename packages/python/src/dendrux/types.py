@@ -1073,6 +1073,11 @@ class Limits:
             bytes. Default 64 KiB.
         max_notes_per_run: Most notes ``submit_note`` accepts for one run.
             Default 1000.
+        max_pending_calls: Most calls in one format-2 assistant batch. Default 64.
+        max_rebuild_bytes: Largest recovered conversation, in UTF-8 JSON bytes.
+            Default 16 MiB.
+        max_rebuild_rows: Most expanded entries in a recovered conversation.
+            Default 20,000.
 
     Raises:
         ValueError: If a cap is not a positive integer.
@@ -1082,6 +1087,9 @@ class Limits:
     max_input_bytes: int = _MIB
     max_metadata_bytes: int = 64 * 1024
     max_notes_per_run: int = 1000
+    max_pending_calls: int = 64
+    max_rebuild_bytes: int = 16 * _MIB
+    max_rebuild_rows: int = 20_000
 
     def __post_init__(self) -> None:
         for name in (
@@ -1089,10 +1097,44 @@ class Limits:
             "max_input_bytes",
             "max_metadata_bytes",
             "max_notes_per_run",
+            "max_pending_calls",
+            "max_rebuild_bytes",
+            "max_rebuild_rows",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                if name in {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}:
+                    logger.warning(
+                        "Invalid recovery limit", extra={"run_id": None, "code": "invalid_limit"}
+                    )
                 raise ValueError(f"Limits {name} must be a positive int, got {value!r}.")
+
+
+def _validate_provider_kwargs(value: dict[str, Any], *, run_id: str | None = None) -> None:
+    try:
+        _validate_persistable(value, "provider_kwargs")
+    except InputValidationError:
+        logger.warning(
+            "Invalid provider options", extra={"run_id": run_id, "code": "provider_kwargs_invalid"}
+        )
+        raise
+    size = 0
+    try:
+        for chunk in json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).iterencode(value):
+            size += len(chunk.encode("utf-8"))
+            if size > 2048:
+                break
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid provider options", extra={"run_id": run_id, "code": "provider_kwargs_invalid"}
+        )
+        raise ValueError("provider_kwargs must be JSON serializable") from None
+    if size > 2048:
+        logger.warning(
+            "Provider options exceed checkpoint bound",
+            extra={"run_id": run_id, "code": "provider_kwargs_too_large"},
+        )
+        raise ValueError("provider_kwargs must encode to at most 2048 UTF-8 bytes")
 
 
 @dataclass(frozen=True)

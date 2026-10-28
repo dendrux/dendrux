@@ -934,12 +934,23 @@ def governance_snapshot(agent: Agent) -> dict[str, Any]:
             }
         )
     budget = agent.budget
+    from dendrux.types import Limits
+
+    defaults = Limits()
+    recovery_bounds = {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}
+    # Default recovery bounds must not invalidate pre-0.6 governance snapshots.
+    # Explicit overrides remain governed, so changing one still requires policy.
+    limits = {
+        key: value
+        for key, value in asdict(agent._limits).items()
+        if key not in recovery_bounds or value != getattr(defaults, key)
+    }
     parts = {
         "guardrails": guards,
         "before_tool": qualified(agent.before_tool) if agent.before_tool else None,
         "deny": sorted(agent.deny),
         "require_approval": sorted(agent.require_approval),
-        "limits": asdict(agent._limits),
+        "limits": limits,
         "budget": (
             {
                 "on_exceed": budget.on_exceed,
@@ -990,6 +1001,9 @@ def submission_validator(
     )
 
     def validate(current: dict[str, Any]) -> None:
+        from dendrux.types import _validate_provider_kwargs
+
+        _validate_provider_kwargs(current.get("provider_kwargs") or {}, run_id=run_id)
         base(current)
         if agent is not None and agent._on_governance_change == "raise":
             change = _governance_change(agent, current)
