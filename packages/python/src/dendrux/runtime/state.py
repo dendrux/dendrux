@@ -1503,7 +1503,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         fenced_writes=True,
         retry_ids=True,
         checkpointing=True,
-        atomic_completion=False,
+        atomic_completion=True,
         notify=False,
         recovery=False,
     )
@@ -2096,7 +2096,71 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     async def _patch_fence(
         self, session: AsyncSession, run_id: str, claim_epoch: int, patch: LoopStatePatch
     ) -> None:
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import case, func, literal, select, update
+        from sqlalchemy import cast as sql_cast
+
+        from dendrux.db.models import AgentRun
+        from dendrux.errors import RunFencedError
+
+        if "pending" in patch.set_fields:
+            raise ValueError("A patch cannot replace pending; remove calls by identity")
+        if self._engine.dialect.name == "postgresql":
+            from sqlalchemy import Text
+            from sqlalchemy.dialects.postgresql import JSONB, aggregate_order_by, array
+
+            base = func.coalesce(AgentRun.loop_state, literal({}, JSONB))
+            changed: Any = base
+            if patch.remove_pending or patch.set_call_phase:
+                pending = (
+                    func.jsonb_array_elements(func.coalesce(base["pending"], literal([], JSONB)))
+                    .table_valued("value", with_ordinality="ordinality")
+                    .alias("pending_call")
+                )
+                value = sql_cast(pending.c.value, JSONB)
+                phase_value: Any = value
+                if patch.set_call_phase:
+                    phase_value = case(
+                        *[
+                            (
+                                value["call_id"].astext == call_id,
+                                value.op("||")(literal({"phase": phase}, JSONB)),
+                            )
+                            for call_id, phase in patch.set_call_phase.items()
+                        ],
+                        else_=value,
+                    )
+                kept = (
+                    select(
+                        func.coalesce(
+                            func.jsonb_agg(aggregate_order_by(phase_value, pending.c.ordinality)),
+                            literal([], JSONB),
+                        )
+                    )
+                    .where(value["call_id"].astext.not_in(patch.remove_pending))
+                    .select_from(pending)
+                    .scalar_subquery()
+                )
+                changed = func.jsonb_set(changed, array(["pending"], type_=Text), kept, True)
+            fields = dict(patch.set_fields)
+            if patch.set_phase is not None:
+                fields["phase"] = patch.set_phase
+            if fields:
+                changed = changed.op("||")(literal(fields, JSONB))
+            result = await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == run_id, AgentRun.claim_epoch == claim_epoch)
+                .values(updated_at=_dt.datetime.now(_dt.UTC), loop_state=changed)
+            )
+            if not getattr(result, "rowcount", 0):
+                logger.warning("Run fenced", extra={"run_id": run_id, "code": "run_fenced"})
+                raise RunFencedError(run_id, claim_epoch=claim_epoch)
+        else:
+            await self._fence(session, run_id, claim_epoch)
+            current = await session.scalar(select(AgentRun.loop_state).where(AgentRun.id == run_id))
+            changed = _apply_loop_patch(current or {}, patch)
+            await session.execute(
+                update(AgentRun).where(AgentRun.id == run_id).values(loop_state=changed)
+            )
 
     async def start_tool_call(
         self,
@@ -2117,7 +2181,44 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         blob_refs_scope: str | None = None,
     ) -> None:
         """Commit server-side intent and its event before invoking a tool."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from dendrux.db.models import ToolCallRecord
+        from dendrux.runtime._digest import content_digest
+
+        if target == "client":
+            raise ValueError("Client calls cannot have execution intents")
+        digest = content_digest(
+            dict(tool_call_id=tool_call_id, tool_name=tool_name, target=target, params=params)
+        )
+        async with self._session_factory() as session:
+            await self._fence(session, run_id, claim_epoch)
+            await self._insert_retry(
+                session,
+                ToolCallRecord,
+                dict(
+                    id=row_id,
+                    agent_run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    provider_tool_call_id=provider_tool_call_id,
+                    tool_name=tool_name,
+                    target=target,
+                    params=params,
+                    iteration_index=iteration_index,
+                    outcome="started",
+                    result="",
+                    success=False,
+                    duration_ms=0,
+                    idempotent=idempotent,
+                    meta=meta,
+                    content_digest=digest,
+                ),
+                digest=digest,
+            )
+            if blob_refs:
+                await write_blob_refs(
+                    session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
+                )
+            await _write_event(session, run_id, event)
+            await session.commit()
 
     async def complete_tool_call(
         self,
@@ -2139,7 +2240,72 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         blob_refs_scope: str | None = None,
     ) -> None:
         """Atomically resolve one intent, its reserved observation and pending entry."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select, update
+
+        from dendrux.db.models import ToolCallRecord
+        from dendrux.runtime._digest import content_digest
+
+        if outcome not in ("completed", "failed", "unknown"):
+            raise ValueError("Unsupported tool outcome")
+        digest = content_digest(
+            dict(
+                tool_call_id=tool_call_id,
+                outcome=outcome,
+                result_payload=result_payload,
+                success=success,
+                error_message=error_message,
+            )
+        )
+        try:
+            payload = json.loads(
+                result_payload, parse_constant=_finite_json_float, parse_float=_finite_json_float
+            )
+        except (ValueError, TypeError):
+            payload = {"raw": result_payload}
+        values: dict[str, Any] = dict(
+            outcome=outcome,
+            result=payload,
+            success=success,
+            duration_ms=duration_ms,
+            error_message=error_message,
+            content_digest=digest,
+        )
+        if replayed:
+            values["replayed_at"] = _dt.datetime.now(_dt.UTC)
+        if meta is not None:
+            values["meta"] = meta
+        async with self._session_factory() as session:
+            await self._patch_fence(session, run_id, claim_epoch, loop_state_patch)
+            row_id = (
+                await session.execute(
+                    update(ToolCallRecord)
+                    .where(
+                        ToolCallRecord.agent_run_id == run_id,
+                        ToolCallRecord.tool_call_id == tool_call_id,
+                        ToolCallRecord.outcome == "started",
+                    )
+                    .values(**values)
+                    .returning(ToolCallRecord.id)
+                )
+            ).scalar_one_or_none()
+            if row_id is None:
+                stored = await session.scalar(
+                    select(ToolCallRecord.content_digest).where(
+                        ToolCallRecord.agent_run_id == run_id,
+                        ToolCallRecord.tool_call_id == tool_call_id,
+                    )
+                )
+                await session.rollback()
+                if stored != digest:
+                    self._write_conflict(run_id)
+                return
+            await self._insert_trace(session, run_id, observation)
+            if blob_refs:
+                await write_blob_refs(
+                    session, run_id=run_id, blob_refs=blob_refs, blob_refs_scope=blob_refs_scope
+                )
+            await _write_event(session, run_id, event)
+            await session.commit()
 
     async def consume_submission(
         self,
@@ -2151,7 +2317,35 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         patch: LoopStatePatch,
     ) -> bool:
         """Consume a durable submission once, even after an acknowledgement is lost."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select, update
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            await self._fence(session, run_id, claim_epoch)
+            row = (
+                await session.execute(
+                    select(AgentRun.loop_state, AgentRun.pause_data).where(AgentRun.id == run_id)
+                )
+            ).one()
+            current = row.loop_state or {}
+            if (current.get("submission") or {}).get("submission_id") != submission_id:
+                await session.rollback()
+                return False
+            changed = _apply_loop_patch(current, patch)
+            changed["submission"] = None
+            _validate_checkpoint(run_id, changed)
+            pause = dict(row.pause_data or {})
+            pause.pop("submission", None)
+            for trace in traces:
+                await self._insert_trace(session, run_id, trace)
+            await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == run_id)
+                .values(loop_state=changed, pause_data=pause)
+            )
+            await session.commit()
+            return True
 
     async def set_trace_link(self, run_id: str, *, claim_epoch: int, trace_link: str) -> None:
         """Persist a validated traceparent under the execution fence."""
