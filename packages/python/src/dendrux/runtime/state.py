@@ -1502,7 +1502,7 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
     capabilities: ClassVar[StoreCapabilities] = StoreCapabilities(
         fenced_writes=True,
         retry_ids=True,
-        checkpointing=False,
+        checkpointing=True,
         atomic_completion=False,
         notify=False,
         recovery=False,
@@ -2083,7 +2083,15 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         trace: TraceWrite | None,
     ) -> None:
         """Commit a bounded execution projection and optional trace under one fence."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        _validate_checkpoint(run_id, loop_state)
+        values: dict[str, Any] = {"loop_state": loop_state}
+        if pii_mapping is not None:
+            values["pii_mapping"] = pii_mapping
+        async with self._session_factory() as session:
+            await self._fence(session, run_id, claim_epoch, **values)
+            if trace is not None:
+                await self._insert_trace(session, run_id, trace)
+            await session.commit()
 
     async def _patch_fence(
         self, session: AsyncSession, run_id: str, claim_epoch: int, patch: LoopStatePatch
@@ -2161,13 +2169,31 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
 
     async def get_loop_state(self, run_id: str) -> dict[str, Any] | None:
         """Read the authoritative execution projection."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import AgentRun
+
+        async with self._session_factory() as session:
+            value = await session.scalar(select(AgentRun.loop_state).where(AgentRun.id == run_id))
+            return cast("dict[str, Any] | None", value)
 
     async def get_trace(
         self, run_id: str, trace_id: str, *, tenant_id: TenantScope = UNSCOPED
     ) -> TraceRecord | None:
         """Read a referenced state trace by id, including superseded prefixes."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import ReactTrace
+
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(ReactTrace).where(
+                    ReactTrace.agent_run_id == run_id,
+                    ReactTrace.id == trace_id,
+                    _run_in_scope(run_id, tenant_id),
+                )
+            )
+            return _trace_record(row) if row is not None else None
 
     async def get_traces_after(
         self,
@@ -2179,7 +2205,23 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         tenant_id: TenantScope = UNSCOPED,
     ) -> list[TraceRecord]:
         """Read a bounded keyset page of physical trace rows."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import ReactTrace
+
+        _positive_page(limit)
+        async with self._session_factory() as session:
+            stmt = select(ReactTrace).where(
+                ReactTrace.agent_run_id == run_id,
+                ReactTrace.trace_kind.in_(kinds),
+                _run_in_scope(run_id, tenant_id),
+            )
+            if after_order_index is not None:
+                stmt = stmt.where(ReactTrace.order_index > after_order_index)
+            rows = (
+                await session.scalars(stmt.order_by(ReactTrace.order_index).limit(min(limit, 1000)))
+            ).all()
+            return [_trace_record(row) for row in rows]
 
     async def conversation_traces(
         self,
@@ -2191,7 +2233,71 @@ class SQLAlchemyStateStore(SQLBlobCatalog):
         tenant_id: TenantScope = UNSCOPED,
     ) -> ConversationPage:
         """Project the latest replacement prefix followed by its conversation suffix."""
-        raise NotImplementedError("Store capability is not enabled yet")
+        from sqlalchemy import select
+
+        from dendrux.db.models import ReactTrace
+
+        _positive_page(limit)
+        limit = min(limit, 1000)
+        after = -1 if after_position is None else after_position
+        entries: list[ConversationEntry] = []
+        async with self._session_factory() as session:
+            base = select(ReactTrace).where(
+                ReactTrace.agent_run_id == run_id, _run_in_scope(run_id, tenant_id)
+            )
+            rewrite = None
+            if not include_superseded:
+                rewrite = await session.scalar(
+                    base.where(ReactTrace.trace_kind == "rewrite")
+                    .order_by(ReactTrace.order_index.desc())
+                    .limit(1)
+                )
+            if rewrite is not None:
+                for index, message in enumerate(json.loads(rewrite.content), 1):
+                    position = rewrite.order_index * 1000 + index
+                    if position > after:
+                        entries.append(
+                            ConversationEntry(
+                                position,
+                                message["role"],
+                                message["content"],
+                                {
+                                    **(rewrite.meta or {}),
+                                    **(message.get("meta") or {}),
+                                    "expanded_index": index,
+                                },
+                                "rewrite",
+                                rewrite.id,
+                            )
+                        )
+                        if len(entries) > limit:
+                            break
+            if len(entries) <= limit:
+                kinds = ("seed", "turn", "rewrite") if include_superseded else ("seed", "turn")
+                stmt = base.where(
+                    ReactTrace.trace_kind.in_(kinds), ReactTrace.order_index * 1000 > after
+                )
+                if rewrite is not None:
+                    stmt = stmt.where(ReactTrace.order_index > rewrite.order_index)
+                rows = (
+                    await session.scalars(
+                        stmt.order_by(ReactTrace.order_index).limit(limit + 1 - len(entries))
+                    )
+                ).all()
+                entries.extend(
+                    ConversationEntry(
+                        row.order_index * 1000,
+                        row.role,
+                        row.content,
+                        row.meta or {},
+                        row.trace_kind,
+                        row.id,
+                    )
+                    for row in rows
+                )
+        more = len(entries) > limit
+        entries = entries[:limit]
+        return ConversationPage(entries, entries[-1].position if more else None)
 
     async def get_llm_interactions(
         self,

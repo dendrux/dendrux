@@ -106,6 +106,25 @@ class SkillSession:
             "explicit": self.explicit,
         }
 
+    def snapshot(self) -> dict[str, Any]:
+        """Serialize only versioned activation state; configuration stays on Agent."""
+        return {"v": 1, "activated": sorted(self.activated)}
+
+    def restore_snapshot(self, payload: dict[str, Any]) -> None:
+        """Restore known activations and count unknown names without logging them."""
+        import logging
+
+        if payload.get("v") != 1 or not isinstance(payload.get("activated"), list):
+            raise ValueError("Unsupported skills session snapshot")
+        names = {name for name in payload["activated"] if isinstance(name, str)}
+        self.activated = names.intersection(self.available)
+        unknown = len(names - self.available.keys())
+        if unknown:
+            logging.getLogger(__name__).warning(
+                "Unknown snapshot skills ignored",
+                extra={"run_id": self.run_id, "code": "skills_session_unknown", "count": unknown},
+            )
+
     def fingerprint(self) -> dict[str, Any] | None:
         if not self.configured:
             return None
