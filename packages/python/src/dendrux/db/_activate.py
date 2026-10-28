@@ -240,8 +240,27 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
                 raise ActivationConflictError(
                     table_name, len(conflicts), sorted(set(conflicts))[:20]
                 )
-            for start in range(0, len(identical), 500):
-                conn.execute(delete(table).where(table.c.id.in_(identical[start : start + 500])))
+            run_by_id = {row.id: row.agent_run_id for row in page}
+            for start in range(0, len(identical), 200):
+                ids = identical[start : start + 200]
+                owner_kind = {"react_traces": "trace", "tool_calls": "tool_call"}.get(table_name)
+                if owner_kind is not None:
+                    refs = Base.metadata.tables["dendrux_blob_refs"]
+                    belongs_to_row = (
+                        select(table.c.id)
+                        .where(table.c.id == refs.c.owner_id, table.c.agent_run_id == refs.c.run_id)
+                        .correlate(refs)
+                        .exists()
+                    )
+                    conn.execute(
+                        delete(refs).where(
+                            refs.c.run_id.in_(sorted({run_by_id[id] for id in ids})),
+                            refs.c.owner_kind == owner_kind,
+                            refs.c.owner_id.in_(ids),
+                            belongs_to_row,
+                        )
+                    )
+                conn.execute(delete(table).where(table.c.id.in_(ids)))
             after = page[-1].id
             _checkpoint(conn, table_name, after)
         _checkpoint(conn, table_name, "")

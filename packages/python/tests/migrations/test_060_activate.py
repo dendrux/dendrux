@@ -984,3 +984,88 @@ async def test_activation_never_drops_a_replaced_name_on_another_table(
     async with engine.connect() as conn:
         indexes = await conn.run_sync(lambda c: inspect(c).get_indexes("operator_owned"))
         assert indexes[0]["name"] == "ix_react_traces_agent_run_id_order"
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+async def test_dedupe_blob_edges_follow_removed_rows_atomically(
+    rollout_database, monkeypatch, rollback
+):
+    from dendrux.db import _activate
+    from dendrux.db.models import AgentRun, BlobRef, ReactTrace, ToolCallRecord
+    from dendrux.runtime._blob_catalog import BlobServices
+    from dendrux.runtime.state import SQLAlchemyStateStore
+    from tests.unit.test_blob_catalog import make_png, store_png
+
+    engine = rollout_database
+    await _rollout_prior(engine)
+    await _seed_rehearsal_runs_only(engine)
+    await _migrate(engine)
+    services = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
+    part = await store_png(services, "-", make_png(42))
+    async with engine.begin() as conn:
+        await conn.execute(AgentRun.__table__.insert(), {"id": "unrelated", "agent_name": "a"})
+        await conn.execute(
+            ReactTrace.__table__.insert(),
+            [
+                {
+                    "id": id,
+                    "agent_run_id": "run-00000",
+                    "role": "user",
+                    "content": "same",
+                    "order_index": 0,
+                }
+                for id in ("trace-a", "trace-b")
+            ],
+        )
+        await conn.execute(
+            ToolCallRecord.__table__.insert(),
+            [
+                {"id": id, "agent_run_id": "run-00000", "tool_call_id": "call", "tool_name": "t"}
+                for id in ("tool-a", "tool-b")
+            ],
+        )
+        edges = [
+            ("trace-keep", "trace", "trace-a", "run-00000"),
+            ("trace-drop", "trace", "trace-b", "run-00000"),
+            ("tool-keep", "tool_call", "tool-a", "run-00000"),
+            ("tool-drop", "tool_call", "tool-b", "run-00000"),
+            ("other-kind", "input", "trace-b", "run-00000"),
+            ("other-run", "trace", "trace-b", "unrelated"),
+            ("logical-keeper", "trace", "0", "run-00000"),
+        ]
+        await conn.execute(
+            BlobRef.__table__.insert(),
+            [
+                {
+                    "id": id,
+                    "tenant_scope": "-",
+                    "sha256": part.ref.sha256,
+                    "run_id": run,
+                    "owner_kind": kind,
+                    "owner_id": owner,
+                    "ordinal": 0,
+                }
+                for id, kind, owner, run in edges
+            ],
+        )
+    checkpoint = _activate._checkpoint
+    if rollback:
+
+        def stop(conn, table, cursor):
+            if table == "react_traces" and cursor == "trace-b":
+                raise RuntimeError("before cursor commit")
+            checkpoint(conn, table, cursor)
+
+        monkeypatch.setattr(_activate, "_checkpoint", stop)
+        with pytest.raises(RuntimeError, match="before cursor commit"):
+            await _activate.activate_database(engine, dedupe_only=True)
+        async with engine.connect() as conn:
+            assert (
+                await conn.execute(text("SELECT count(*) FROM dendrux_blob_refs"))
+            ).scalar_one() == 7
+            assert (await conn.execute(text("SELECT count(*) FROM react_traces"))).scalar_one() == 2
+        monkeypatch.setattr(_activate, "_checkpoint", checkpoint)
+    await _activate.activate_database(engine, dedupe_only=True)
+    async with engine.connect() as conn:
+        remaining = set((await conn.execute(text("SELECT id FROM dendrux_blob_refs"))).scalars())
+    assert remaining == {"trace-keep", "tool-keep", "other-kind", "other-run", "logical-keeper"}
