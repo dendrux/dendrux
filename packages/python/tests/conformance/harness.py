@@ -924,7 +924,44 @@ def _step_summary(step: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: The additive 0.6 columns (contracts.md section 1), by table. A closed list: a recorded 0.5
+#: row is compared with a newer row only after exactly these names are projected away; any
+#: other column present on one side and not the other is a real difference.
+ADDITIVE_060_COLUMNS: dict[str, frozenset[str]] = {
+    "agent_runs": frozenset(
+        {
+            "storage_format",
+            "reclaim_attempts",
+            "reclaim_limit",
+            "lease_expired_at",
+            "last_reclaimed_at",
+            "loop_state",
+            "trace_link",
+        }
+    ),
+    "tool_calls": frozenset({"outcome", "idempotent", "replayed_at", "content_digest"}),
+    "react_traces": frozenset({"trace_kind", "content_digest"}),
+    "run_events": frozenset({"content_digest"}),
+}
+
+
+def project_additive_columns(
+    rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Rows without the additive 0.6 columns (other tables and columns untouched)."""
+    return {
+        table: [
+            {k: v for k, v in row.items() if k not in ADDITIVE_060_COLUMNS.get(table, frozenset())}
+            for row in table_rows
+        ]
+        for table, table_rows in rows.items()
+    }
+
+
 def normalised_corpus(view: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a corpus view; its rows are compared without the additive 0.6 columns."""
+    if "rows" in view:
+        view = {**view, "rows": project_additive_columns(view["rows"])}
     return _norm(view)
 
 

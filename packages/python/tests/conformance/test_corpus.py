@@ -177,3 +177,55 @@ def test_regeneration_guard_accepts_a_pristine_tree_and_rejects_every_drift(tmp_
     # a tracked edit
     (pkg / "src" / "dendrux" / "__init__.py").write_text("X = 2\n")
     assert "differs" in (h.regen_refusal(pkg) or "")
+
+
+#: contracts.md section 1, written out independently of the harness list.
+APPROVED_060_COLUMNS = {
+    "agent_runs": [
+        "storage_format",
+        "reclaim_attempts",
+        "reclaim_limit",
+        "lease_expired_at",
+        "last_reclaimed_at",
+        "loop_state",
+        "trace_link",
+    ],
+    "tool_calls": ["content_digest", "idempotent", "outcome", "replayed_at"],
+    "react_traces": ["content_digest", "trace_kind"],
+    "run_events": ["content_digest"],
+}
+
+
+def test_additive_column_projection_is_a_closed_list() -> None:
+    """Only the contracts.md section 1 columns are ignored; any other extra column fails."""
+    recorded = h.read_json(h.corpus_path("server_tool__run"))  # has rows in all four tables
+    base = h.normalised_corpus(recorded)
+
+    def with_extra(table: str, **extra):
+        view = {
+            **recorded,
+            "rows": {t: [dict(r) for r in rs] for t, rs in recorded["rows"].items()},
+        }
+        view["rows"][table][0].update(extra)
+        return h.normalised_corpus(view)
+
+    # every approved column, on every table, is projected away
+    for table, columns in APPROVED_060_COLUMNS.items():
+        approved = {c: "x" for c in columns}  # non-null, whatever the type
+        assert h.diff(base, with_extra(table, **approved)) is None, table
+    # an unapproved non-null column is a difference, on each table
+    for table in APPROVED_060_COLUMNS:
+        assert h.diff(base, with_extra(table, surprise_column="boom")) is not None, table
+    # a similar-looking name from another table is not approved here
+    assert h.diff(base, with_extra("run_events", trace_kind="turn")) is not None
+    assert h.diff(base, with_extra("agent_runs", content_digest="0" * 64)) is not None
+    # a changed value in an existing column is still a difference
+    changed = {**recorded, "rows": {t: [dict(r) for r in rs] for t, rs in recorded["rows"].items()}}
+    changed["rows"]["agent_runs"][0]["status"] = "error"
+    assert h.diff(base, h.normalised_corpus(changed)) is not None
+
+
+def test_the_approved_list_is_exactly_contracts_section_one() -> None:
+    assert {t: sorted(c) for t, c in h.ADDITIVE_060_COLUMNS.items()} == {
+        t: sorted(c) for t, c in APPROVED_060_COLUMNS.items()
+    }

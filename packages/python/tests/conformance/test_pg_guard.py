@@ -26,7 +26,9 @@ def test_the_authorised_database_is_accepted() -> None:
         "other_test",
     ],
 )
-def test_every_other_database_is_refused_before_any_connection(name) -> None:
+def test_every_other_database_is_refused_before_any_connection(name, monkeypatch) -> None:
+    # default-only refusal: an override in the environment would legitimately authorise a name
+    monkeypatch.delenv(pg_guard.EXTRA_NAME_ENV, raising=False)
     with pytest.raises(pytest.UsageError):
         pg_guard.authorize(BASE + name)
 
@@ -88,3 +90,11 @@ def test_the_fixture_refuses_a_shared_database_url_end_to_end() -> None:
     )
     assert proc.returncode != 0
     assert "runs destructive DDL only on" in proc.stdout + proc.stderr
+
+
+def test_an_explicitly_authorised_override_name_is_accepted(monkeypatch) -> None:
+    monkeypatch.setenv(pg_guard.EXTRA_NAME_ENV, "dendrux_060_0b_test")
+    assert pg_guard.authorize(BASE + "dendrux_060_0b_test") == "dendrux_060_0b_test"
+    monkeypatch.delenv(pg_guard.EXTRA_NAME_ENV)
+    with pytest.raises(pytest.UsageError):
+        pg_guard.authorize(BASE + "dendrux_060_0b_test")
