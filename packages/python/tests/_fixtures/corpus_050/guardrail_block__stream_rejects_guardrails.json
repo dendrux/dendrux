@@ -1,0 +1,10 @@
+{
+"id":"guardrail_block__stream_rejects_guardrails",
+"scenario":"guardrail_block",
+"dendrux_version":"0.5.0",
+"agents":[{"name":"Conf","on_governance_change":"warn","strict_tenancy":false}],
+"steps":[{"path":"stream","label":"stream with guardrails","run_id":null,"status":null,"raised":["ValueError","Exception"],"at_pause":null}],
+"calls":[],
+"runs":[],
+"rows":{"agent_runs":[],"react_traces":[],"tool_calls":[],"run_events":[],"run_inbox":[],"dendrux_blobs":[],"dendrux_blob_refs":[]}
+}
