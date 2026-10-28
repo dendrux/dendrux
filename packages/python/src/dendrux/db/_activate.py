@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, func, inspect, select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from dendrux.db._index_check import index_exists, require_index
-from dendrux.db._migration_ddl import build_index_concurrently, drop_index_concurrently
+from dendrux.db._migration_ddl import build_index_concurrently, drop_index_concurrently, sqlstate
 from dendrux.db._schema_check import read_schema_phase, schema_problems
 from dendrux.db._settings import put_setting
 from dendrux.db._storage_schema import ACTIVATION_INDEXES, index_ddl
@@ -59,6 +59,10 @@ class ActivationConflictError(RuntimeError):
             f"Conflicting duplicates: table={table} count={count} "
             f"run_ids={','.join(self.run_ids)}. Resolve these duplicates and retry."
         )
+
+
+class ActivationIndexConflictError(RuntimeError):
+    """A writer introduced a duplicate after the dedupe pass finished."""
 
 
 async def activate_database(
@@ -228,14 +232,14 @@ def _preflight(conn: Connection, batch_size: int) -> None:
 def _dedupe(conn: Connection, batch_size: int) -> None:
     for table_name, column, _ in ACTIVATION_INDEXES.values():
         table = Base.metadata.tables[table_name]
+        after = conn.execute(
+            text("SELECT value FROM dendrux_settings WHERE key=:key"),
+            {"key": f"dedupe_cursor_{table_name}"},
+        ).scalar_one_or_none()
+        if after == "":
+            continue
         put_setting(conn, "activate_step", f"dedupe:{table_name}")
-        after = (
-            conn.execute(
-                text("SELECT value FROM dendrux_settings WHERE key=:key"),
-                {"key": f"dedupe_cursor_{table_name}"},
-            ).scalar_one_or_none()
-            or ""
-        )
+        after = after or ""
         end = conn.execute(select(func.max(table.c.id))).scalar_one()
         conn.commit()
         while end is not None:
@@ -247,26 +251,8 @@ def _dedupe(conn: Connection, batch_size: int) -> None:
                 raise ActivationConflictError(
                     table_name, len(conflicts), sorted(set(conflicts))[:20]
                 )
-            run_by_id = {row.id: row.agent_run_id for row in page}
             for start in range(0, len(identical), 200):
                 ids = identical[start : start + 200]
-                owner_kind = {"react_traces": "trace", "tool_calls": "tool_call"}.get(table_name)
-                if owner_kind is not None:
-                    refs = Base.metadata.tables["dendrux_blob_refs"]
-                    belongs_to_row = (
-                        select(table.c.id)
-                        .where(table.c.id == refs.c.owner_id, table.c.agent_run_id == refs.c.run_id)
-                        .correlate(refs)
-                        .exists()
-                    )
-                    conn.execute(
-                        delete(refs).where(
-                            refs.c.run_id.in_(sorted({run_by_id[id] for id in ids})),
-                            refs.c.owner_kind == owner_kind,
-                            refs.c.owner_id.in_(ids),
-                            belongs_to_row,
-                        )
-                    )
                 conn.execute(delete(table).where(table.c.id.in_(ids)))
             after = page[-1].id
             _checkpoint(conn, table_name, after)
@@ -295,16 +281,39 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
         for name, (table, _, _) in ACTIVATION_INDEXES.items():
             put_setting(conn, "activate_step", f"index:{name}")
             conn.commit()
-            if pg:
-                conn.execution_options(isolation_level="AUTOCOMMIT")
-                build_index_concurrently(
-                    conn, name, table, index_ddl(name, concurrently=True), revision=_REVISION
+            try:
+                if pg:
+                    conn.execution_options(isolation_level="AUTOCOMMIT")
+                    build_index_concurrently(
+                        conn, name, table, index_ddl(name, concurrently=True), revision=_REVISION
+                    )
+                else:
+                    conn.exec_driver_sql("BEGIN EXCLUSIVE")
+                    conn.execute(text(index_ddl(name)))
+                require_index(conn, name, table, index_ddl(name))
+                conn.commit()
+            except IntegrityError as error:
+                if (
+                    sqlstate(error) != "23505"
+                    and getattr(error.orig, "sqlite_errorname", None) != "SQLITE_CONSTRAINT_UNIQUE"
+                ):
+                    raise
+                conn.rollback()
+                if pg:
+                    conn.execution_options(isolation_level="READ COMMITTED")
+                conn.execute(
+                    text("DELETE FROM dendrux_settings WHERE key=:key"),
+                    {"key": f"dedupe_cursor_{table}"},
                 )
-            else:
-                conn.exec_driver_sql("BEGIN EXCLUSIVE")
-                conn.execute(text(index_ddl(name)))
-            require_index(conn, name, table, index_ddl(name))
-            conn.commit()
+                put_setting(conn, "activate_step", f"dedupe:{table}")
+                conn.commit()
+                logger.warning(
+                    "Dendrux activation stopped on duplicates after dedupe",
+                    extra={"code": "activation_conflict", "table": table, "index": name},
+                )
+                raise ActivationIndexConflictError(
+                    "duplicates appeared after dedupe; rerun dendrux db dedupe"
+                ) from None
             if pg:
                 conn.execution_options(isolation_level="READ COMMITTED")
         for table, column, old in ACTIVATION_INDEXES.values():
@@ -314,6 +323,7 @@ def _activate(conn: Connection, batch_size: int, dedupe_only: bool) -> None:
                     old,
                     table,
                     f"CREATE INDEX {old} ON {table} (agent_run_id, {column})",
+                    require_valid=False,
                 )
         conn.commit()
         for _, (_, _, old) in ACTIVATION_INDEXES.items():

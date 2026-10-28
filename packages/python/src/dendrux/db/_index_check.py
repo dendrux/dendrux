@@ -71,11 +71,13 @@ def index_exists(conn: Connection, name: str) -> bool:
     return conn.execute(text(statement), {"name": name}).scalar_one_or_none() is not None
 
 
-def index_matches(conn: Connection, name: str, table: str, expected: str) -> bool:
-    """Require a valid, ready index of the exact intended definition and table."""
+def index_matches(
+    conn: Connection, name: str, table: str, expected: str, *, require_valid: bool = True
+) -> bool:
+    """Check exact definition and table, normally requiring a valid, ready index."""
     if conn.dialect.name == "postgresql":
         entry = read_pg_indexes(conn, tables=[table]).get(name)
-        if entry is None or entry[0] != table or not entry[2]:
+        if entry is None or entry[0] != table or (require_valid and not entry[2]):
             return False
         actual = entry[1]
     elif conn.dialect.name == "sqlite":
@@ -91,8 +93,10 @@ def index_matches(conn: Connection, name: str, table: str, expected: str) -> boo
     return _canonical(actual) == _canonical(expected)
 
 
-def require_index(conn: Connection, name: str, table: str, expected: str) -> None:
-    if not index_matches(conn, name, table, expected):
+def require_index(
+    conn: Connection, name: str, table: str, expected: str, *, require_valid: bool = True
+) -> None:
+    if not index_matches(conn, name, table, expected, require_valid=require_valid):
         raise RuntimeError(
             f"Index {name} has an unexpected definition or is invalid/not ready. "
             "Repair or rebuild it with the migration's exact definition before retrying; "

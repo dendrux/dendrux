@@ -52,26 +52,40 @@ def alembic(url, operation, revision):
 
 def prior_schema(conn):
     """Build the released model schema independently of the current model metadata."""
-    import subprocess
-    import types
+    from tests.migrations._models_v050 import Base as LegacyBase
 
-    source = subprocess.run(
-        ["git", "show", "v0.5.0:packages/python/src/dendrux/db/models.py"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    module = types.ModuleType("dendrux_050_models")
-    import sys
-
-    sys.modules[module.__name__] = module
-    try:
-        exec(compile(source, "v0.5.0/models.py", "exec"), module.__dict__)
-        module.Base.metadata.create_all(conn)
-    finally:
-        del sys.modules[module.__name__]
+    LegacyBase.metadata.create_all(conn)
     conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
     conn.execute(text("INSERT INTO alembic_version VALUES (:revision)"), {"revision": PRIOR})
+
+
+def test_frozen_v050_models_checksum():
+    import hashlib
+
+    fixture = Path(__file__).with_name("_models_v050.py")
+    assert (
+        hashlib.sha256(fixture.read_bytes()).hexdigest()
+        == "8649e1452911d0cf8ab73329eccd546025b60ff7d43e97023a7f56d73b970901"
+    )
+
+
+def test_legacy_schema_does_not_require_git(tmp_path, monkeypatch):
+    import subprocess
+
+    def no_git(*args, **kwargs):
+        pytest.fail("legacy schema fixtures must work in a shallow, untagged checkout")
+
+    monkeypatch.setattr(subprocess, "run", no_git)
+    engine = create_engine(f"sqlite:///{tmp_path / 'no-tags.db'}")
+    try:
+        with engine.begin() as conn:
+            prior_schema(conn)
+            assert "dendrux_settings" not in inspect(conn).get_table_names()
+            assert "storage_format" not in {
+                column["name"] for column in inspect(conn).get_columns("agent_runs")
+            }
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture
@@ -217,6 +231,7 @@ def test_cli_status_and_dedupe_only(legacy):
     engine = migrate_legacy(legacy)
     result = runner.invoke(app, ["db", "status"])
     assert result.exit_code == 0, result.output
+    assert f"revision={HEAD}" in result.output
     assert "storage_format=1" in result.output and "activate_step=" in result.output
     with engine.begin() as conn:
         add_trace(conn, "a")
@@ -232,6 +247,19 @@ def test_cli_status_and_dedupe_only(legacy):
             == "1"
         )
         assert not any(i["unique"] for i in inspect(conn).get_indexes("react_traces"))
+
+
+def test_status_on_legacy_and_unstamped_database(legacy):
+    engine, _ = legacy
+    result = runner.invoke(app, ["db", "status"])
+    assert result.exit_code == 0, result.output
+    assert f"revision={PRIOR}" in result.output
+    assert "storage_format=1 activate_step=not-started" in result.output
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE alembic_version"))
+    result = runner.invoke(app, ["db", "status"])
+    assert result.exit_code == 0, result.output
+    assert "revision=unstamped storage_format=1 activate_step=not-started" in result.output
 
 
 def test_migration_statements_are_bounded():
@@ -992,8 +1020,9 @@ async def test_b3_pg_startup_catalog_queries_remain_bounded(rollout_database):
     assert len(statements) <= 5
 
 
-async def test_activation_never_drops_a_replaced_name_on_another_table(
-    rollout_database, monkeypatch
+@pytest.mark.parametrize("wrong_owner", [True, False], ids=["other-table", "wrong-columns"])
+async def test_activation_never_drops_a_replaced_index_with_wrong_definition(
+    rollout_database, monkeypatch, wrong_owner
 ):
     import asyncio
 
@@ -1013,23 +1042,28 @@ async def test_activation_never_drops_a_replaced_name_on_another_table(
         for name in INDEXES:
             await conn.execute(text(index_ddl(name)))
         await conn.execute(text("DROP INDEX ix_react_traces_agent_run_id_order"))
-        await conn.execute(text("CREATE TABLE operator_owned (value INTEGER)"))
-        await conn.execute(
-            text("CREATE INDEX ix_react_traces_agent_run_id_order ON operator_owned (value)")
-        )
+        if wrong_owner:
+            await conn.execute(text("CREATE TABLE operator_owned (value INTEGER)"))
+            await conn.execute(
+                text("CREATE INDEX ix_react_traces_agent_run_id_order ON operator_owned (value)")
+            )
+        else:
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_react_traces_agent_run_id_order ON react_traces (order_index)"
+                )
+            )
     result = await asyncio.to_thread(runner.invoke, app, ["db", "activate"])
     assert result.exit_code == 1, "a name collision must refuse without dropping an unrelated index"
     async with engine.connect() as conn:
-        indexes = await conn.run_sync(lambda c: inspect(c).get_indexes("operator_owned"))
-        assert indexes[0]["name"] == "ix_react_traces_agent_run_id_order"
+        owner = "operator_owned" if wrong_owner else "react_traces"
+        indexes = await conn.run_sync(lambda c: inspect(c).get_indexes(owner))
+        assert "ix_react_traces_agent_run_id_order" in {index["name"] for index in indexes}
 
 
-@pytest.mark.parametrize("rollback", [False, True])
-async def test_dedupe_blob_edges_follow_removed_rows_atomically(
-    rollout_database, monkeypatch, rollback
-):
-    from dendrux.db import _activate
-    from dendrux.db.models import AgentRun, BlobRef, ReactTrace, ToolCallRecord
+async def test_dedupe_preserves_natural_key_blob_edges(rollout_database):
+    from dendrux.db._activate import activate_database
+    from dendrux.db.models import BlobRef, ReactTrace, ToolCallRecord
     from dendrux.runtime._blob_catalog import BlobServices
     from dendrux.runtime.state import SQLAlchemyStateStore
     from tests.unit.test_blob_catalog import make_png, store_png
@@ -1041,7 +1075,6 @@ async def test_dedupe_blob_edges_follow_removed_rows_atomically(
     services = BlobServices.for_state_store(SQLAlchemyStateStore(engine))
     part = await store_png(services, "-", make_png(42))
     async with engine.begin() as conn:
-        await conn.execute(AgentRun.__table__.insert(), {"id": "unrelated", "agent_name": "a"})
         await conn.execute(
             ReactTrace.__table__.insert(),
             [
@@ -1050,60 +1083,283 @@ async def test_dedupe_blob_edges_follow_removed_rows_atomically(
                     "agent_run_id": "run-00000",
                     "role": "user",
                     "content": "same",
-                    "order_index": 0,
+                    "order_index": order,
                 }
-                for id in ("trace-a", "trace-b")
+                for id, order in [("0", 0), ("1", 0), ("trace-other", 1)]
             ],
         )
         await conn.execute(
             ToolCallRecord.__table__.insert(),
             [
-                {"id": id, "agent_run_id": "run-00000", "tool_call_id": "call", "tool_name": "t"}
-                for id in ("tool-a", "tool-b")
+                {
+                    "id": id,
+                    "agent_run_id": "run-00000",
+                    "tool_call_id": call,
+                    "tool_name": "t",
+                }
+                for id, call in [("a", "call"), ("other-call", "call"), ("z", "other-call")]
             ],
         )
-        edges = [
-            ("trace-keep", "trace", "trace-a", "run-00000"),
-            ("trace-drop", "trace", "trace-b", "run-00000"),
-            ("tool-keep", "tool_call", "tool-a", "run-00000"),
-            ("tool-drop", "tool_call", "tool-b", "run-00000"),
-            ("other-kind", "input", "trace-b", "run-00000"),
-            ("other-run", "trace", "trace-b", "unrelated"),
-            ("logical-keeper", "trace", "0", "run-00000"),
-        ]
         await conn.execute(
             BlobRef.__table__.insert(),
             [
                 {
-                    "id": id,
+                    "id": f"edge-{i}",
                     "tenant_scope": "-",
                     "sha256": part.ref.sha256,
-                    "run_id": run,
+                    "run_id": "run-00000",
                     "owner_kind": kind,
                     "owner_id": owner,
                     "ordinal": 0,
                 }
-                for id, kind, owner, run in edges
+                for i, (kind, owner) in enumerate(
+                    [
+                        ("trace", "0"),
+                        ("trace", "1"),
+                        ("tool_call", "call"),
+                        ("tool_call", "other-call"),
+                    ]
+                )
+            ],
+        )
+        before = (await conn.execute(BlobRef.__table__.select().order_by(BlobRef.id))).all()
+    await activate_database(engine, dedupe_only=True)
+    async with engine.connect() as conn:
+        assert (await conn.execute(text("SELECT count(*) FROM react_traces"))).scalar_one() == 2
+        assert (await conn.execute(text("SELECT count(*) FROM tool_calls"))).scalar_one() == 2
+        assert (await conn.execute(BlobRef.__table__.select().order_by(BlobRef.id))).all() == before
+
+
+async def test_preflight_conflict_in_later_table_deletes_nothing(rollout_database, monkeypatch):
+    import asyncio
+
+    engine = rollout_database
+    await _rollout_prior(engine)
+    await _seed_rehearsal_runs_only(engine)
+    await _migrate(engine)
+    async with engine.begin() as conn:
+        for id in ("a", "b"):
+            await conn.run_sync(lambda c, id=id: add_trace(c, id, run_id="run-00000"))
+        await conn.execute(
+            Base.metadata.tables["run_events"].insert(),
+            [
+                {
+                    "id": id,
+                    "agent_run_id": "run-00000",
+                    "event_type": "run.started",
+                    "sequence_index": 0,
+                    "data": {"value": value},
+                }
+                for id, value in [("a", 1), ("b", 2)]
+            ],
+        )
+        before = {
+            table: (await conn.execute(text(f"SELECT count(*) FROM {table}"))).scalar_one()
+            for table in Base.metadata.tables
+            if table != "dendrux_settings"
+        }
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+    result = await asyncio.to_thread(runner.invoke, app, ["db", "activate", "--batch-size", "1"])
+    assert result.exit_code == 3, (result.output, result.exception)
+    assert "run_events" in result.output
+    async with engine.connect() as conn:
+        after = {
+            table: (await conn.execute(text(f"SELECT count(*) FROM {table}"))).scalar_one()
+            for table in before
+        }
+    assert after == before
+
+
+async def test_resume_skips_completed_dedupe_tables(rollout_database, monkeypatch):
+    from dendrux.db import _activate
+
+    engine = rollout_database
+    await _rollout_prior(engine)
+    await _seed_rehearsal_runs_only(engine)
+    await _migrate(engine)
+    async with engine.begin() as conn:
+        await conn.execute(
+            Base.metadata.tables["run_events"].insert(),
+            [
+                {
+                    "id": id,
+                    "agent_run_id": "run-00000",
+                    "event_type": "run.started",
+                    "sequence_index": seq,
+                }
+                for seq, id in enumerate(["a", "b"])
             ],
         )
     checkpoint = _activate._checkpoint
-    if rollback:
 
-        def stop(conn, table, cursor):
-            if table == "react_traces" and cursor == "trace-b":
-                raise RuntimeError("before cursor commit")
-            checkpoint(conn, table, cursor)
+    def stop(conn, table, cursor):
+        checkpoint(conn, table, cursor)
+        if table == "run_events" and cursor == "a":
+            raise RuntimeError("interrupt in final table")
 
-        monkeypatch.setattr(_activate, "_checkpoint", stop)
-        with pytest.raises(RuntimeError, match="before cursor commit"):
-            await _activate.activate_database(engine, dedupe_only=True)
-        async with engine.connect() as conn:
-            assert (
-                await conn.execute(text("SELECT count(*) FROM dendrux_blob_refs"))
-            ).scalar_one() == 7
-            assert (await conn.execute(text("SELECT count(*) FROM react_traces"))).scalar_one() == 2
-        monkeypatch.setattr(_activate, "_checkpoint", checkpoint)
-    await _activate.activate_database(engine, dedupe_only=True)
+    monkeypatch.setattr(_activate, "_checkpoint", stop)
+    with pytest.raises(RuntimeError, match="interrupt in final table"):
+        await _activate.activate_database(engine, batch_size=1)
+    monkeypatch.setattr(_activate, "_checkpoint", checkpoint)
+    pages = []
+    page = _activate._page
+    dedupe = _activate._dedupe
+    in_dedupe = False
+
+    def capture(conn, table, column, after, end, size):
+        if in_dedupe:
+            pages.append((table.name, after))
+        return page(conn, table, column, after, end, size)
+
+    def only_dedupe(conn, size):
+        nonlocal in_dedupe
+        in_dedupe = True
+        try:
+            dedupe(conn, size)
+        finally:
+            in_dedupe = False
+
+    # Empty tables still reveal a rescan through their MAX(id) query.
+    from sqlalchemy import event
+
+    scanned = []
+
+    def queries(conn, cursor, statement, parameters, context, executemany):
+        if in_dedupe and statement.startswith("SELECT max("):
+            scanned.append(statement)
+
+    monkeypatch.setattr(_activate, "_page", capture)
+    monkeypatch.setattr(_activate, "_dedupe", only_dedupe)
+    event.listen(engine.sync_engine, "before_cursor_execute", queries)
+    try:
+        await _activate.activate_database(engine, batch_size=1)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", queries)
+    assert pages and pages[0] == ("run_events", "a")
+    assert len(scanned) == 1 and "run_events" in scanned[0]
+
+
+@pytest.mark.parametrize("index_name", list(INDEXES))
+async def test_index_build_late_duplicates_restart_that_table(
+    rollout_database, monkeypatch, index_name
+):
+    import asyncio
+
+    from sqlalchemy.util.concurrency import await_only
+
+    from dendrux.db import _activate
+
+    engine = rollout_database
+    await _rollout_prior(engine)
+    await _seed_rehearsal_runs_only(engine)
+    await _migrate(engine)
+    table_name = INDEXES[index_name][0]
+    table = Base.metadata.tables[table_name]
+    row = {"agent_run_id": "run-00000"}
+    if table_name == "react_traces":
+        row.update(role="user", content="private-sentinel", order_index=0)
+    elif table_name == "tool_calls":
+        row.update(tool_call_id="call", tool_name="t", params={"value": "private-sentinel"})
+    else:
+        row.update(event_type="run.started", sequence_index=0, data={"value": "private-sentinel"})
+    async with engine.begin() as conn:
+        await conn.execute(table.insert(), {**row, "id": "z"})
+    original = _activate._dedupe
+    inserted = False
+
+    async def late_writer():
+        async with engine.begin() as conn:
+            await conn.execute(table.insert(), {**row, "id": "a"})
+
+    def insert_after_dedupe(conn, size):
+        nonlocal inserted
+        original(conn, size)
+        if not inserted:
+            inserted = True
+            if engine.dialect.name == "postgresql":
+                await_only(late_writer())
+            else:
+                # SQLite holds EXCLUSIVE; inject on the maintenance connection.
+                conn.execute(table.insert(), {**row, "id": "a"})
+                conn.commit()
+
+    monkeypatch.setattr(_activate, "_dedupe", insert_after_dedupe)
+    monkeypatch.setenv("DENDRUX_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+    result = await asyncio.to_thread(runner.invoke, app, ["db", "activate"])
+    assert result.exit_code == 3, (result.output, result.exception)
+    assert "duplicates appeared after dedupe; rerun dendrux db dedupe" in result.output
+    assert "private-sentinel" not in result.output
     async with engine.connect() as conn:
-        remaining = set((await conn.execute(text("SELECT id FROM dendrux_blob_refs"))).scalars())
-    assert remaining == {"trace-keep", "tool-keep", "other-kind", "other-run", "logical-keeper"}
+        settings = dict((await conn.execute(text("SELECT key, value FROM dendrux_settings"))).all())
+        assert settings["activate_step"] == f"dedupe:{table_name}"
+        assert f"dedupe_cursor_{table_name}" not in settings
+        assert all(
+            settings[f"dedupe_cursor_{name}"] == ""
+            for name in ("react_traces", "tool_calls", "run_events")
+            if name != table_name
+        )
+        assert (await conn.execute(table.select().order_by(table.c.id))).scalars().all() == [
+            "a",
+            "z",
+        ]
+    result = await asyncio.to_thread(runner.invoke, app, ["db", "activate"])
+    assert result.exit_code == 0, (result.output, result.exception)
+    async with engine.connect() as conn:
+        assert (await conn.execute(table.select())).scalars().all() == ["a"]
+        assert (
+            await conn.execute(text("SELECT value FROM dendrux_settings WHERE key='activate_step'"))
+        ).scalar_one() == "done"
+
+
+async def test_pg_resume_after_interrupted_replaced_index_drop(rollout_database, monkeypatch):
+    import time
+
+    from sqlalchemy.util.concurrency import await_only
+
+    from dendrux.db import _activate
+    from dendrux.db._schema_check import schema_problems
+
+    engine = rollout_database
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL concurrent drop invalidation")
+    await _rollout_prior(engine)
+    await _migrate(engine)
+    old = "ix_react_traces_agent_run_id_order"
+    drop = _activate.drop_index_concurrently
+    blocker = None
+
+    async def open_blocker():
+        connection = await engine.connect()
+        await connection.execute(text("SELECT 1 FROM react_traces LIMIT 1"))
+        return connection
+
+    def blocked_drop(conn, name, **kwargs):
+        nonlocal blocker
+        if name == old and blocker is None:
+            blocker = await_only(open_blocker())
+        return drop(conn, name, **kwargs)
+
+    monkeypatch.setattr(_activate, "drop_index_concurrently", blocked_drop)
+    start = time.perf_counter()
+    try:
+        with pytest.raises(RuntimeError, match="5 seconds"):
+            await _activate.activate_database(engine)
+        assert 4.5 <= time.perf_counter() - start < 10
+    finally:
+        if blocker is not None:
+            await blocker.rollback()
+            await blocker.close()
+    monkeypatch.setattr(_activate, "drop_index_concurrently", drop)
+    async with engine.connect() as conn:
+        assert (
+            await conn.execute(
+                text("SELECT indisvalid FROM pg_index WHERE indexrelid=CAST(:name AS regclass)"),
+                {"name": old},
+            )
+        ).scalar_one() is False
+    await _activate.activate_database(engine)
+    async with engine.connect() as conn:
+        assert await conn.run_sync(schema_problems) == []
+        assert (
+            await conn.execute(text("SELECT to_regclass(:name)"), {"name": old})
+        ).scalar_one() is None

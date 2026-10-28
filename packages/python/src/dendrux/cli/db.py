@@ -80,16 +80,16 @@ def migrate() -> None:
 
 @app.command()
 def status() -> None:
-    """Show the global storage format and resumable activation step."""
+    """Show the Alembic revision, storage format and resumable activation step."""
     try:
-        storage_format, step = asyncio.run(_read_activation_status(_database_url()))
+        revision, storage_format, step = asyncio.run(_read_activation_status(_database_url()))
     except Exception:
         console.print("[red]Could not read database status.[/red] Run `dendrux db check`.")
         raise typer.Exit(2) from None
-    console.print(f"storage_format={storage_format} activate_step={step}")
+    console.print(f"revision={revision} storage_format={storage_format} activate_step={step}")
 
 
-async def _read_activation_status(url: str) -> tuple[str, str]:
+async def _read_activation_status(url: str) -> tuple[str, str, str]:
     from sqlalchemy import inspect, text
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
@@ -97,8 +97,14 @@ async def _read_activation_status(url: str) -> tuple[str, str]:
     engine = create_async_engine(url, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
+            revision = None
+            if await conn.run_sync(lambda c: inspect(c).has_table("alembic_version")):
+                revision = (
+                    await conn.execute(text("SELECT version_num FROM alembic_version"))
+                ).scalar_one_or_none()
+            revision = revision or "unstamped"
             if not await conn.run_sync(lambda c: inspect(c).has_table("dendrux_settings")):
-                return "1", "not-started"
+                return revision, "1", "not-started"
             settings = dict(
                 (
                     await conn.execute(
@@ -111,7 +117,11 @@ async def _read_activation_status(url: str) -> tuple[str, str]:
                 .tuples()
                 .all()
             )
-            return settings.get("storage_format", "1"), settings.get("activate_step", "not-started")
+            return (
+                revision,
+                settings.get("storage_format", "1"),
+                settings.get("activate_step", "not-started"),
+            )
     finally:
         await engine.dispose()
 
@@ -137,11 +147,11 @@ def dedupe(
 
 
 def _run_activation(batch_size: int, *, dedupe_only: bool) -> None:
-    from dendrux.db._activate import ActivationConflictError
+    from dendrux.db._activate import ActivationConflictError, ActivationIndexConflictError
 
     try:
         asyncio.run(_activate_database(_database_url(), batch_size, dedupe_only))
-    except ActivationConflictError as error:
+    except (ActivationConflictError, ActivationIndexConflictError) as error:
         console.print(str(error), markup=False)
         raise typer.Exit(3) from None
     except RuntimeError as error:
